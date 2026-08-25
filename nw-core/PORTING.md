@@ -1,0 +1,117 @@
+# Porting conventions: Python → Elisa
+
+Hard-won notes from porting `bwaccel` and the n-back core. Read this before
+writing Elisa in this repo; every item below cost a compile-fail cycle to find.
+
+## Toolchain
+
+```bash
+source nw-core/scripts/env.sh     # pins our worktree compilers; gate ON
+./nw-core/scripts/check.sh        # every differential suite, both stages
+./nw-core/scripts/check.sh stage0 # fast inner loop
+```
+
+- **Never** use `~/.elisac/elisac` or the compilers' main worktrees — another
+  agent works there. `env.sh` points at `worktrees/elisa-core-nw` and
+  `worktrees/elisa-compiler-nw`.
+- Elisa-core has git hooks that rebuild the **global** `~/.elisac/elisac` on
+  commit/checkout. Hooks are disabled in our worktree via a worktree-scoped
+  `core.hooksPath`. Don't re-enable them.
+- Stage0 (`$ELISACORE_BIN`) has **no `-emit exe`** — use `-emit obj` then
+  `clang -o out out.o`. Stage1 (`elisac_stage1`) does have `-emit exe`.
+- Always compile with `ELISA_STAGE1_SEMANTIC_GATE=1` (env.sh sets it). With the
+  gate off, stage1 emits code **without semantic analysis** and accepts
+  programs stage0 rejects.
+- Verify on **both** stages. A divergence is by definition a compiler bug:
+  minimise it, save it under `worktrees/elisa-core-nw/repro/`, and report it.
+
+## Language gotchas
+
+**Reserved words.** `tail` is one. If you get `expected IDENT, got <name>`,
+rename the identifier.
+
+**Locals are immutable by default.** Reassigning needs `x: mutable i64 = 0`.
+The diagnostic says so plainly.
+
+**Loops need capture lists when they touch outer state.**
+
+```elisa
+for item in items |accumulator, limit|:      # names read/written inside
+while index < count |index, total, values|:
+```
+
+**Indexing needs provable bounds.** Inside a `while index < count` loop the
+compiler proves it; across an early-return guard it does not, and you get
+*"implicit `else` index fallback has been removed"*. Use the explicit form:
+
+```elisa
+value: i64 = get history[position.usize()] else 0
+```
+
+**Arenas are explicit, not ambient.** Functions that allocate take
+`a: mutable Arena&` and wrap allocation in `in a:`. Building a `darray` in a
+callee without `in a:` produces dangling storage. A scoped `region` must be
+consumed — `destroy work` before scope exit — and `&work` is a `stack Arena&`,
+so cast it: `arena: mutable Arena& = (&work).cast[mutable Arena&]`.
+
+**f-strings only interpolate string-likes** (`sview`/`dstr`/`cstr`). Integers
+must be converted explicitly.
+
+**Printing integers currently declines under stage1.** `print(42)`,
+`printr(i64)` and `int_to_string_scratch` all reach the std's generic `Store`
+impls, which stage1's backend declines (see
+`repro/nw_generic_protocol_impl_stage1.elisa`). Until that's fixed, sweeps
+carry a hand-rolled `print_i64` writing digits into a stack buffer. Copy it
+from any existing `*_sweep.elisa`.
+
+**Struct literals** are `Point{x: 1, y: 2}`; fixed arrays inside them
+initialise with `cats: zeroed`. Enums match with indented arms and **no `case`
+keyword**; exhaustiveness is a hard error.
+
+**`try value else fallback`** works for value-carrying error unions. A brace
+literal as the fallback confuses the parser — call a helper instead. `catch`
+as an *expression* needs a block form; prefer `try … else`.
+
+## Fidelity rules
+
+These are what the differential harnesses are for. The job is behavioural
+identity, not improvement.
+
+- **Python's `round()` is half-to-even.** Use libm `rint`, never `round`.
+- **Python's negative list indexing wraps to the end.** `xs[-1]` is the last
+  element, not an error. `matching.elisa` reproduces a reference site where
+  this happens by accident; see `nback_trial_index_checked`.
+- **Reproduce upstream bugs, don't fix them silently.** If the reference does
+  something wrong, port it faithfully, document it in a comment, and surface it
+  in the summary. Fixing it is a separate, deliberate decision in both trees.
+- **CPython `random` is reproducible from Elisa** — `elisacore_rng` gives the
+  exact MT19937 and `random()`; `nw-core/src/pyrandom.elisa` adds
+  `getrandbits`/`_randbelow`/`shuffle`/`sample`. Use them rather than inventing
+  a generator, or seeded sessions will diverge.
+- **Prefer exact integers over floats** where the reference's float use is
+  incidental. `board.elisa` scales squared distances by 4 to keep the centre-out
+  ordering integral; `pyrandom.elisa` computes `sample`'s setsize heuristic as
+  an integer ceil-log4 rather than `4 ** ceil(log(k*3, 4))`.
+- **Compare integers in harnesses.** Emit floats scaled and truncated
+  (`(value * 100000.0).i64()`) so a formatting difference never masquerades as
+  a logic difference.
+
+## Adding a suite
+
+1. `nw-core/src/<name>.elisa` — the port. No I/O, no globals; state arrives as
+   an explicit context struct.
+2. `nw-core/test/<name>_sweep.elisa` — prints one CSV line per case over a
+   deterministic grid.
+3. `nw-core/test/<name>_diff.py` — runs the same grid through the original
+   module and diffs line by line.
+4. Add `<name>` to `SUITES` in `scripts/check.sh`.
+
+**Drive the real Python module where you can.** Modules under
+`neural_workshop/` import cleanly with no side effects (only `brainworkshop.py`
+creates a window on import), so a harness can inject stand-in `state.mode` /
+`state.cfg` objects and test the *actual* reference code rather than a
+transcription. `matching_diff.py` shows the pattern.
+
+**Score divergences explicitly.** Where the reference raises, emit an agreed
+code on both sides (`matching` uses `9`) rather than skipping the row — a
+skipped row is an untested row.
