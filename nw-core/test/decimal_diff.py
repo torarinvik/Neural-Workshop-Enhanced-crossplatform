@@ -87,6 +87,21 @@ CHECK_ANSWERS = ("0", "7", "2.5", "0.3333333333333333333333333333", "4")
 CHECK_LEFT = (0, 1, 3, 7, 12)
 CHECK_RIGHT = (0, 2, 3)
 
+# A whole session for score_arithmetic: operands that include the zero divisor,
+# and every fifth operation misspelt, which is the reference's ValueError path.
+# The answers are the values a player would have typed at 2-back with no crab
+# and no variable list -- right on seven trials, wrong on the rest -- so the
+# rights path is exercised too. Three of the hits are deliberately written in a
+# different form from the computed answer (-1.50 for -1.5, 0.00 for 0, and the
+# full 28-digit quotient of 1/3): Decimal equality is numeric, and a port that
+# compared representations would score them wrong.
+SESSION_LENGTH = 14
+SESSION_OPS = ('add', 'subtract', 'multiply', 'divide', 'modulo')
+SESSION_ANSWERS = ("0", "1", "3", "5", "0", "2", "7", "-6", "-1.50", "0",
+                   "-2", "0", "0.00", "0.3333333333333333333333333333")
+SESSION_NUMBERS = [(i % 7) - 3 for i in range(SESSION_LENGTH)]
+SESSION_VARIABLE = [1 + i % 4 for i in range(SESSION_LENGTH)]
+
 
 def render(thunk):
     """`str` of a Decimal-producing call, or the agreed failure code."""
@@ -175,6 +190,39 @@ def python_lines():
                 for given in CHECK_ANSWERS:
                     verdict = check_verdict(op, left, right, Decimal(given))
                     out.append(f"check,{code},{left},{right},{given},{verdict}")
+
+    # The port's error-set surface, which raises where the reference raises.
+    # Same expected values; the sweep reaches them through `catch` rather than
+    # through the status-code functions the sections above use.
+    union = [
+        lambda: Decimal("12.5"),
+        lambda: Decimal("oops"),
+        lambda: "E3",  # 65 significant digits: a documented capacity limit
+        lambda: bwaccel.apply_arithmetic('add', 1, 2),
+        lambda: bwaccel.apply_arithmetic('subtract', 1, 2),
+        lambda: bwaccel.apply_arithmetic('multiply', 3, 4),
+        lambda: bwaccel.apply_arithmetic('divide', 1, 3),
+        lambda: bwaccel.apply_arithmetic('divide', 1, 0),
+        lambda: bwaccel.apply_arithmetic('divide', 0, 0),
+        lambda: Decimal(7) % Decimal(2),
+        lambda: Decimal(1) % Decimal(0),
+    ]
+    for tag, thunk in enumerate(union):
+        out.append(f"union,{tag},{render(thunk)}")
+
+    # Whole-session scoring, through the real bwaccel.score_arithmetic.
+    session = {
+        'numbers': list(SESSION_NUMBERS),
+        'operation': [SESSION_OPS[i % 5] for i in range(SESSION_LENGTH)],
+        'arithmetic_input': [Decimal(s) for s in SESSION_ANSWERS],
+    }
+    for nback in (1, 2, 3):
+        for crab in (0, 1):
+            for varnb in (0, 1):
+                rights, wrongs = bwaccel.score_arithmetic(
+                    nback, bool(crab),
+                    SESSION_VARIABLE if varnb else None, session)
+                out.append(f"score,{nback},{crab},{varnb},{rights},{wrongs}")
     return out
 
 

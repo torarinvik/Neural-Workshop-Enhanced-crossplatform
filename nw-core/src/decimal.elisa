@@ -59,11 +59,15 @@
 #    a computed one anyway.
 #  * Only the four named operations. `apply_arithmetic` takes an enum, so the
 #    reference's `ValueError('unknown arithmetic operation')` is unrepresentable
-#    rather than raised.
+#    rather than raised. `score_arithmetic`, whose operations arrive as codes
+#    from a stored session, does reproduce it.
 #
 # Errors are an Elisa error set. The reference catches InvalidOperation and
 # ZeroDivisionError around the whole comparison and scores the trial INCORRECT;
 # `arithmetic_answer_is_correct` below does the same.
+#
+# `score_arithmetic` calls `resolve_back` from src/nback.elisa, so a program
+# that uses it includes that module too (as the sweep does).
 
 # ---------------------------------------------------------------------------
 # Context constants
@@ -73,8 +77,12 @@ const DECIMAL_PRECISION: i64 = 28
 const DECIMAL_EMAX: i64 = 999999
 const DECIMAL_EMIN: i64 = -999999
 
-# Internal coefficient capacity. The widest intermediate is division's
-# `dividend * 10**shift`, at most MAX_INPUT + PRECISION + 1 digits.
+# Internal coefficient capacity. The widest intermediates are a full product
+# (2 * MAX_INPUT digits) and the aligned pair addition and remainder build,
+# both an order of 2 * MAX_INPUT + 1; division's `dividend * 10**shift` is
+# narrower, at most MAX_INPUT + PRECISION + 1. Every one of them is bounds
+# checked, and a coefficient that would exceed this reports Overflow rather
+# than truncating.
 const DECIMAL_MAX_DIGITS: i64 = 256
 # Significant digits accepted by from_string.
 const DECIMAL_MAX_INPUT_DIGITS: i64 = 64
@@ -1048,8 +1056,60 @@ def arithmetic_answer_is_correct(op: ArithmeticOp, left: Decimal&, right: Decima
         false return if outcome.status != DEC_OK
         return decimal_equals(&outcome.value, given)
 
+struct ArithmeticScore:
+    rights: mutable i64
+    wrongs: mutable i64
+
+# Rights and wrongs for an arithmetic session -- the port of
+# `score_arithmetic`, which the readouts call once per modality.
+#
+# The reference's session dict arrives here as three parallel arrays; as in the
+# reference, a trial is only judged when all three have an entry for it, and a
+# `back` that reaches before the start of the session is skipped. `operations`
+# holds op CODES rather than the enum, which is what restores the reference's
+# `ValueError('unknown arithmetic operation')` path: an out-of-range code is
+# caught and scored wrong, exactly like a misspelt operation name.
+#
+# `numbers` are the shown operands. The reference stores ints there
+# (random.randint) and lets apply_arithmetic convert them; the conversion is
+# the caller's here, so a session of decimals scores too.
+def score_arithmetic(numbers: darray[Decimal]&, operations: darray[i64]&, answers: darray[Decimal]&, nback: i64, crab: bool, variable_list: darray[i64]&, has_variable: bool) -> ArithmeticScore:
+    can Abort.Panic:
+        score: mutable ArithmeticScore = ArithmeticScore{rights: 0, wrongs: 0}
+        limit: mutable i64 = numbers.count.i64()
+        limit <- operations.count.i64() if operations.count.i64() < limit else limit
+        limit <- answers.count.i64() if answers.count.i64() < limit else limit
+        x: mutable i64 = nback
+        while x < limit |x, score, numbers, operations, answers, variable_list, limit, nback, crab, has_variable|:
+            back: i64 = resolve_back(x, nback, crab, variable_list, has_variable)
+            if back <= x:
+                code: i64 = get operations[x.usize()] else -1
+                if code < 0 or code > 3:
+                    # The reference raises ValueError on an unknown operation
+                    # and the caller's except clause scores the trial wrong.
+                    score.wrongs <- score.wrongs + 1
+                else:
+                    left: Decimal = get numbers[(x - back).usize()] else decimal_zero()
+                    right: Decimal = get numbers[x.usize()] else decimal_zero()
+                    given: Decimal = get answers[x.usize()] else decimal_zero()
+                    if arithmetic_answer_is_correct(arithmetic_op_from_code(code), &left, &right, &given):
+                        score.rights <- score.rights + 1
+                    else:
+                        score.wrongs <- score.wrongs + 1
+            x <- x + 1
+        return score
+
 # Stable integer codes, so a harness can carry an operation across the boundary
 # without depending on enum layout.
+def arithmetic_op_from_code(code: i64) -> ArithmeticOp:
+    if code == 0:
+        return ArithmeticOp.Add
+    if code == 1:
+        return ArithmeticOp.Subtract
+    if code == 2:
+        return ArithmeticOp.Multiply
+    return ArithmeticOp.Divide
+
 def arithmetic_op_code(op: ArithmeticOp) -> i64:
     match op:
         ArithmeticOp.Add:

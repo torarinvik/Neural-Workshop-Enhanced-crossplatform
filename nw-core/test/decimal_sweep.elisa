@@ -8,6 +8,9 @@
 # reference raises.
 
 include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+# score_arithmetic reaches for nback.elisa's resolve_back, the port of the
+# reference's _resolve_back.
+include "../src/nback.elisa"
 include "../src/decimal.elisa"
 
 const PARSE_INPUT_COUNT: i64 = 50
@@ -17,6 +20,7 @@ const CHECK_ANSWER_COUNT: i64 = 5
 const CHECK_LEFT_COUNT: i64 = 5
 const CHECK_RIGHT_COUNT: i64 = 3
 const OP_COUNT: i64 = 4
+const SESSION_LENGTH: i64 = 14
 
 # Printing integers still declines under stage1's backend (see PORTING.md), so
 # the sweep carries its own.
@@ -253,6 +257,39 @@ def check_answer(index: i64) -> cstr:
         return "0.3333333333333333333333333333"
     return "4"
 
+# The answers the player typed in the scored session: what a 2-back run with no
+# crab and no variable list would have called correct on seven of the trials.
+# Three hits are spelled differently from the computed answer (-1.50, 0.00, and
+# the full 28-digit quotient of 1/3) because Decimal equality is numeric.
+def session_answer(index: i64) -> cstr:
+    if index == 0:
+        return "0"
+    if index == 1:
+        return "1"
+    if index == 2:
+        return "3"
+    if index == 3:
+        return "5"
+    if index == 4:
+        return "0"
+    if index == 5:
+        return "2"
+    if index == 6:
+        return "7"
+    if index == 7:
+        return "-6"
+    if index == 8:
+        return "-1.50"
+    if index == 9:
+        return "0"
+    if index == 10:
+        return "-2"
+    if index == 11:
+        return "0"
+    if index == 12:
+        return "0.00"
+    return "0.3333333333333333333333333333"
+
 def check_left(index: i64) -> i64:
     if index == 0:
         return 0
@@ -408,8 +445,104 @@ def sweep_check():
                 left <- left + 1
             op_index <- op_index + 1
 
-def main() -> i64:
+# The error-set surface, which the rest of the sweep does not reach: every
+# other section calls the *_checked functions, so these rows are what proves
+# `raise` fires and `catch` sees it. The variant is recovered from the checked
+# call because variant patterns in catch arms are stage0-only (see
+# Code/test_programs/fileio_std.elisa).
+def emit_union_parse(tag: i64, text: cstr):
     can Console.Write, Abort.Panic:
+        printr("union,")
+        emit_i64(tag)
+        catch decimal_from_string(view_of(text)):
+            parsed:
+                rendered: DecimalText = decimal_to_text(&parsed)
+                print_text(&rendered)
+            error e:
+                fallback: DecimalOutcome = decimal_from_string_checked(view_of(text))
+                printr("E")
+                print_i64(fallback.status)
+        print("")
+
+def emit_union_op(tag: i64, op: ArithmeticOp, left: i64, right: i64):
+    can Console.Write, Abort.Panic:
+        a: Decimal = decimal_from_i64(left)
+        b: Decimal = decimal_from_i64(right)
+        printr("union,")
+        emit_i64(tag)
+        catch apply_arithmetic(op, &a, &b):
+            computed:
+                rendered: DecimalText = decimal_to_text(&computed)
+                print_text(&rendered)
+            error e:
+                fallback: DecimalOutcome = apply_arithmetic_checked(op, &a, &b)
+                printr("E")
+                print_i64(fallback.status)
+        print("")
+
+def emit_union_remainder(tag: i64, left: i64, right: i64):
+    can Console.Write, Abort.Panic:
+        a: Decimal = decimal_from_i64(left)
+        b: Decimal = decimal_from_i64(right)
+        printr("union,")
+        emit_i64(tag)
+        catch decimal_remainder(&a, &b):
+            computed:
+                rendered: DecimalText = decimal_to_text(&computed)
+                print_text(&rendered)
+            error e:
+                fallback: DecimalOutcome = decimal_remainder_checked(&a, &b)
+                printr("E")
+                print_i64(fallback.status)
+        print("")
+
+def sweep_error_union():
+    can Console.Write, Abort.Panic:
+        emit_union_parse(0, "12.5")
+        emit_union_parse(1, "oops")
+        emit_union_parse(2, "12345678901234567890123456789012345678901234567890123456789012345")
+        emit_union_op(3, ArithmeticOp.Add, 1, 2)
+        emit_union_op(4, ArithmeticOp.Subtract, 1, 2)
+        emit_union_op(5, ArithmeticOp.Multiply, 3, 4)
+        emit_union_op(6, ArithmeticOp.Divide, 1, 3)
+        emit_union_op(7, ArithmeticOp.Divide, 1, 0)
+        emit_union_op(8, ArithmeticOp.Divide, 0, 0)
+        emit_union_remainder(9, 7, 2)
+        emit_union_remainder(10, 1, 0)
+
+# Whole-session scoring. The session mixes a zero operand (so division fails),
+# answers that are right on some trials, and every fifth operation carrying an
+# out-of-range code -- the reference's unknown-operation ValueError.
+def sweep_score(a: mutable Arena&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        in a:
+            numbers: mutable darray[Decimal] = []
+            operations: mutable darray[i64] = []
+            answers: mutable darray[Decimal] = []
+            variable_list: mutable darray[i64] = []
+            index: mutable i64 = 0
+            while index < SESSION_LENGTH |index, numbers, operations, answers, variable_list|:
+                numbers.push(decimal_from_i64((index % 7) - 3))
+                operations.push(index % 5)
+                answers.push(parse_decimal(session_answer(index)))
+                variable_list.push(1 + index % 4)
+                index <- index + 1
+            for nback in [1, 2, 3] |numbers, operations, answers, variable_list|:
+                for crab in [0, 1] |numbers, operations, answers, variable_list, nback|:
+                    for varnb in [0, 1] |numbers, operations, answers, variable_list, nback, crab|:
+                        score: ArithmeticScore = score_arithmetic(&numbers, &operations, &answers, nback, crab != 0, &variable_list, varnb != 0)
+                        printr("score,")
+                        emit_i64(nback)
+                        emit_i64(crab)
+                        emit_i64(varnb)
+                        emit_i64(score.rights)
+                        print_i64(score.wrongs)
+                        print("")
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region work(4 * 1024 * 1024)
+        arena: mutable Arena& = (&work).cast[mutable Arena&]
         sweep_parse()
         sweep_from_int()
         sweep_game()
@@ -417,4 +550,7 @@ def main() -> i64:
         sweep_remainder()
         sweep_compare()
         sweep_check()
+        sweep_error_union()
+        sweep_score(arena)
+        destroy work
         return 0
