@@ -15,7 +15,7 @@ STAGES="${1:-both}"
 BUILD="$ROOT/build"
 mkdir -p "$BUILD"
 
-SUITES=(scheduling board nback pyrandom stimulus stats matching display config gamemode decimal session)
+SUITES=(scheduling board nback pyrandom stimulus stats matching display config gamemode decimal session maze)
 
 # Suites that cannot yet build under stage1. The generic-protocol-impl gap this list
 # was created for is FIXED (nw-port stage1 552bddca): `config` no longer declines the

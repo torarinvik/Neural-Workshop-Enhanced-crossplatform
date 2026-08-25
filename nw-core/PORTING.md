@@ -27,8 +27,10 @@ source nw-core/scripts/env.sh     # pins our worktree compilers; gate ON
 
 ## Language gotchas
 
-**Reserved words.** `tail` is one. If you get `expected IDENT, got <name>`,
-rename the identifier.
+**Reserved words.** `tail` is one, and so is `move` — which does not announce
+itself: a local called `move` fails at its *next* use with `unexpected token <
+in expression`, not at the declaration. If you get that or `expected IDENT, got
+<name>`, rename the identifier.
 
 **Locals are immutable by default.** Reassigning needs `x: mutable i64 = 0`.
 The diagnostic says so plainly.

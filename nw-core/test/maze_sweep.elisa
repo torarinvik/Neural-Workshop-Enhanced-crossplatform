@@ -1,0 +1,253 @@
+# Differential sweep driver for tasks/maze.elisa. See maze_diff.py for the
+# reference side: the same grid runs through the real neural_workshop/maze.py.
+#
+# The seeded sections all reseed MT19937 the way `random.Random(seed)` does and
+# then drive the port through the same call sequence the reference module
+# takes, so a divergence anywhere in the draw order shows up as a whole maze
+# that differs rather than as a single wrong number.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../src/pyrandom.elisa"
+include "../src/tasks/maze.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+# The braid shares the ladder uses, keyed by hundredths so the harness can name
+# the same float literal on both sides.
+def share_of(hundredths: i64) -> f64:
+    return 0.0 if hundredths == 0 else (0.2 if hundredths == 20 else (0.25 if hundredths == 25 else (0.35 if hundredths == 35 else (0.4 if hundredths == 40 else (0.45 if hundredths == 45 else (0.5 if hundredths == 50 else (0.55 if hundredths == 55 else 0.6)))))))
+
+def seeded(seed: i64) -> MT19937:
+    can Abort.Panic:
+        rng: mutable MT19937 = mt19937_new()
+        mt_seed_int(&rng, seed.u64())
+        return rng
+
+# ------------------------------------------------------------
+
+def sweep_grades():
+    can Console.Write, Abort.Panic:
+        for level in [-3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 40]:
+            grade: MazeGrade = maze_grade(level)
+            printr("grd")
+            emit_cell(level)
+            emit_cell(grade.rooms)
+            emit_cell(grade.doors)
+            emit_cell((grade.braid * 1000.0).i64())
+            emit_cell(grade.floor)
+            emit_cell((grade.planning * 1000.0).i64())
+            print("")
+
+# The corridor set in its own slot order -- the CPython table order the
+# reference's `dead_ends` walks.
+def emit_set_order(work: mutable MazeWork&):
+    can Console.Write, Abort.Panic:
+        emit_cell(work.used)
+        slot: mutable i64 = 0
+        while slot <= work.mask |slot, work|:
+            cell: i64 = maze_at(work.table, slot)
+            if cell >= 0:
+                emit_cell(cell)
+            slot <- slot + 1
+
+def sweep_carve(work: mutable MazeWork&):
+    can Console.Write, Abort.Panic:
+        for rooms in [2, 3, 4, 5, 6, 8, 11, 15] |work|:
+            for seed in [0, 1, 7, 12345] |work, rooms|:
+                rng: mutable MT19937 = seeded(seed)
+                maze_carve(work, &rng, rooms)
+                printr("set")
+                emit_cell(rooms)
+                emit_cell(seed)
+                emit_set_order(work)
+                print("")
+
+                maze_dead_ends(work)
+                printr("de")
+                emit_cell(rooms)
+                emit_cell(seed)
+                emit_cell(work.ends_n)
+                index: mutable i64 = 0
+                while index < work.ends_n |index, work|:
+                    emit_cell(maze_at(work.ends, index))
+                    index <- index + 1
+                print("")
+
+# The shuffled dead-end list and how much of it braiding takes, split out from
+# `maze_braid` so the shuffle and the half-to-even round are checked directly
+# rather than only through their effect on the finished maze.
+def sweep_shuffle(work: mutable MazeWork&):
+    can Console.Write, Abort.Panic:
+        for rooms in [4, 6, 9, 13] |work|:
+            for seed in [0, 3, 99] |work, rooms|:
+                for hundredths in [20, 25, 35, 40, 45, 50, 55, 60] |work, rooms, seed|:
+                    share: f64 = share_of(hundredths)
+                    rng: mutable MT19937 = seeded(seed)
+                    maze_carve(work, &rng, rooms)
+                    maze_dead_ends(work)
+                    py_shuffle_i64_prefix(&rng, &work.ends, work.ends_n)
+                    printr("sh")
+                    emit_cell(rooms)
+                    emit_cell(seed)
+                    emit_cell(hundredths)
+                    emit_cell(rint(work.ends_n.f64() * share).i64())
+                    index: mutable i64 = 0
+                    while index < work.ends_n |index, work|:
+                        emit_cell(maze_at(work.ends, index))
+                        index <- index + 1
+                    print("")
+
+def sweep_braid(work: mutable MazeWork&):
+    can Console.Write, Abort.Panic:
+        for rooms in [3, 5, 7, 10, 14] |work|:
+            for seed in [0, 2, 55] |work, rooms|:
+                for hundredths in [0, 20, 35, 50, 60] |work, rooms, seed|:
+                    rng: mutable MT19937 = seeded(seed)
+                    maze_carve(work, &rng, rooms)
+                    maze_braid(work, &rng, share_of(hundredths))
+                    maze_realise(work)
+                    printr("br")
+                    emit_cell(rooms)
+                    emit_cell(seed)
+                    emit_cell(hundredths)
+                    emit_cell(work.open_n)
+                    index: mutable i64 = 0
+                    while index < work.open_n |index, work|:
+                        emit_cell(maze_at(work.open_list, index))
+                        index <- index + 1
+                    print("")
+
+# A maze the reference reports as None (or, from generate(), as a ValueError)
+# is a single 0 on both sides: its other fields do not exist over there, so
+# comparing them would be comparing this port against itself.
+def emit_maze_fields(maze: mutable Maze&):
+    can Console.Write, Abort.Panic:
+        if not maze.ok:
+            emit_cell(0)
+            return
+        emit_cell(1)
+        emit_cell(maze.width)
+        emit_cell(maze.height)
+        emit_cell(maze.start)
+        emit_cell(maze.way_out)
+        emit_cell(maze.minimum)
+        emit_cell(maze.greedy)
+        emit_cell(maze.door_count)
+        index: mutable i64 = 0
+        while index < maze.door_count and index < MAZE_MOST_DOORS |index, maze|:
+            emit_cell(maze.doors[index])
+            index <- index + 1
+        key_index: mutable i64 = 0
+        while key_index < maze.door_count and key_index < MAZE_MOST_DOORS |key_index, maze|:
+            emit_cell(maze.keys[key_index])
+            key_index <- key_index + 1
+
+# Every attempt of a run, not just the one that wins: a `_deal` that comes back
+# empty still moves the stream on, so the rejected mazes are as much of the
+# contract as the accepted one.
+def sweep_deal(work: mutable MazeWork&):
+    can Console.Write, Abort.Panic:
+        for level in [1, 2, 3, 5, 8, 11, 14] |work|:
+            for seed in [0, 4] |work, level|:
+                grade: MazeGrade = maze_grade(level)
+                rng: mutable MT19937 = seeded(seed)
+                attempt: mutable i64 = 0
+                while attempt < 6 |attempt, work, rng, grade, level, seed|:
+                    maze: mutable Maze = maze_deal(work, &rng, grade)
+                    printr("dl")
+                    emit_cell(level)
+                    emit_cell(seed)
+                    emit_cell(attempt)
+                    emit_maze_fields(&maze)
+                    print("")
+                    attempt <- attempt + 1
+
+# The whole generated maze, cell by cell, plus everything measured about it.
+def sweep_generate(work: mutable MazeWork&):
+    can Console.Write, Abort.Panic:
+        for level in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] |work|:
+            for seed in [1, 2] |work, level|:
+                maze: mutable Maze = maze_generate(work, level, seed, 150)
+                printr("gn")
+                emit_cell(level)
+                emit_cell(seed)
+                emit_maze_fields(&maze)
+                if maze.ok:
+                    emit_cell(work.open_n)
+                    index: mutable i64 = 0
+                    while index < work.open_n |index, work|:
+                        emit_cell(maze_at(work.open_list, index))
+                        index <- index + 1
+                print("")
+
+                if maze.ok:
+                    # `maze_generate` leaves the workspace holding the maze it
+                    # returned, so the solver, the foil and the separators can
+                    # all be run again over it.
+                    printr("sv")
+                    emit_cell(level)
+                    emit_cell(seed)
+                    emit_cell(maze_search(work, &maze))
+                    emit_cell(maze_greedy_walk(work, &maze))
+                    emit_cell((maze_planning_share(&maze) * 1000000.0).i64())
+                    emit_cell(maze_search(work, &maze))
+                    emit_cell(work.route_n)
+                    walk: mutable i64 = 0
+                    while walk < work.route_n |walk, work|:
+                        emit_cell(maze_at(work.route, walk))
+                        walk <- walk + 1
+                    emit_cell(maze_held_after(&maze, work.route, work.route_n))
+                    print("")
+
+                    maze_separators(work, maze.start, maze.way_out)
+                    printr("sp")
+                    emit_cell(level)
+                    emit_cell(seed)
+                    emit_cell(work.beads_n)
+                    bead: mutable i64 = 0
+                    while bead < work.beads_n |bead, work|:
+                        emit_cell(maze_at(work.beads, bead))
+                        bead <- bead + 1
+                    print("")
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region arena_region(256 * 1024 * 1024)
+        arena: mutable Arena& = (&arena_region).cast[mutable Arena&]
+        work: mutable MazeWork = maze_work_new(arena, 18, MAZE_MOST_DOORS)
+        sweep_grades()
+        sweep_carve(&work)
+        sweep_shuffle(&work)
+        sweep_braid(&work)
+        sweep_deal(&work)
+        sweep_generate(&work)
+        destroy arena_region
+        return 0
