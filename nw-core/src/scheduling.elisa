@@ -1,0 +1,92 @@
+# Scheduling kernel: durations in milliseconds vs scheduler ticks.
+#
+# Port of bwaccel/scheduling.py (GPL-2.0-or-later). The game expresses every
+# duration in milliseconds but the scheduler wakes once per tick; these keep
+# the two in agreement so ticks * tick_ms really is the interval asked for.
+#
+# Parity note: Python's round() is round-half-to-even, so we use libm rint()
+# (half-even under the default FP environment), NOT round() (half-away).
+
+# rint: round to nearest integer, ties to even (default FP rounding mode).
+extern rint(x: f64) -> f64
+
+# A trial always gets at least this many ticks.
+const MIN_TRIAL_TICKS: i64 = 3
+
+struct TrialPhases:
+    total_ticks: i64
+    stimulus_ticks: i64
+    blank_ticks: i64
+    feedback_ticks: i64
+    stimulus_ms: i64
+    blank_ms: i64
+    feedback_ms: i64
+
+# Convert a duration in milliseconds to a tick count (at least 1).
+def ms_to_ticks(ms: f64, tick_ms: i64) -> i64:
+    quantum: i64 = tick_ms if tick_ms > 1 else 1
+    ticks: i64 = rint(ms / quantum.f64()).i64()
+    return ticks if ticks > 1 else 1
+
+# Snap a trial interval to the clock grid and to sane bounds.
+def clamp_trial_interval_ms(ms: i64, tick_ms: i64, min_ticks: i64, max_ms: i64) -> i64:
+    quantum: i64 = tick_ms if tick_ms > 1 else 1
+    floor_ticks: i64 = min_ticks if min_ticks > 2 else 2
+    low: i64 = quantum * floor_ticks
+    high: i64 = max_ms if max_ms > low else low
+    clamped: mutable i64 = ms
+    clamped <- low if clamped < low
+    clamped <- high if clamped > high
+    # Snap to the scheduler quantum, so ticks * tick_ms == interval.
+    return ms_to_ticks(clamped.f64(), quantum) * quantum
+
+# Split a trial into stimulus, blank and feedback ticks. The three never
+# overlap and always sum to the trial. If the wanted stimulus and feedback
+# together exceed the trial, both are scaled down proportionally, each keeping
+# at least one tick, and the blank disappears.
+def plan_trial_phases(trial_ms: i64, stim_ms: i64, feedback_ms: i64, tick_ms: i64) -> TrialPhases:
+    quantum: i64 = tick_ms if tick_ms > 1 else 1
+    measured: i64 = ms_to_ticks(trial_ms.f64(), quantum)
+    total: i64 = measured if measured > MIN_TRIAL_TICKS else MIN_TRIAL_TICKS
+    stim_want: i64 = ms_to_ticks(stim_ms.f64(), quantum)
+    fb_want: i64 = ms_to_ticks(feedback_ms.f64(), quantum)
+
+    stim: mutable i64 = stim_want
+    feedback: mutable i64 = fb_want
+    blank: mutable i64 = 0
+    if stim_want + fb_want > total:
+        share: f64 = total.f64() * (stim_want.f64() / (stim_want + fb_want).f64())
+        scaled: mutable i64 = rint(share).i64()
+        scaled <- 1 if scaled < 1
+        scaled <- total - 1 if scaled > total - 1
+        stim <- scaled
+        feedback <- total - scaled
+        blank <- 0
+    else:
+        blank <- total - stim - feedback
+
+    return TrialPhases{
+        total_ticks: total,
+        stimulus_ticks: stim,
+        blank_ticks: blank,
+        feedback_ticks: feedback,
+        stimulus_ms: stim * quantum,
+        blank_ms: blank * quantum,
+        feedback_ms: feedback * quantum,
+    }
+
+# F5/F6 step size: fine at high speed, coarse for long trials.
+def interval_adjust_step(ms: i64) -> i64:
+    return 1 if ms <= 20 else (5 if ms <= 100 else (10 if ms <= 500 else (50 if ms <= 2000 else 100)))
+
+const API_LEVEL: i64 = 1
+
+# TODO(pymodule): the pymodule exporter lives in uncommitted work on the main
+# Elisa-compiler worktree. Once it lands and nw-port rebases onto it, restore:
+#
+# export pymodule nwcore:
+#     fn ms_to_ticks
+#     fn clamp_trial_interval_ms
+#     fn plan_trial_phases
+#     fn interval_adjust_step
+#     const api_level = API_LEVEL
