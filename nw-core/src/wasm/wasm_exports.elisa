@@ -11,6 +11,8 @@ include "../../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisaco
 include "../scheduling.elisa"
 include "../board.elisa"
 include "../nback.elisa"
+include "../display.elisa"
+include "../scene_nback.elisa"
 
 export fn nw_ms_to_ticks(ms: f64, tick_ms: i64) -> i64 = ms_to_ticks
 export fn nw_clamp_trial_interval_ms(ms: i64, tick_ms: i64, min_ticks: i64, max_ms: i64) -> i64 = clamp_trial_interval_ms
@@ -30,3 +32,51 @@ def phase_field(trial_ms: i64, stim_ms: i64, feedback_ms: i64, tick_ms: i64, fie
     return phases.total_ticks if field == 0 else (phases.stimulus_ticks if field == 1 else (phases.blank_ticks if field == 2 else (phases.feedback_ticks if field == 3 else (phases.stimulus_ms if field == 4 else (phases.blank_ms if field == 5 else phases.feedback_ms)))))
 
 export fn nw_phase_field(trial_ms: i64, stim_ms: i64, feedback_ms: i64, tick_ms: i64, field: i64) -> i64 = phase_field
+
+# ------------------------------------------------------------
+# Display-list frames
+# ------------------------------------------------------------
+#
+# The shell allocates one buffer up front and asks for frames into it, then
+# reads the encoded bytes straight out of linear memory as a Uint8Array view.
+# No copy crosses the boundary and nothing is allocated per frame on the JS
+# side.
+#
+# A caller-provided buffer rather than a static: the frame is built in a
+# function-local region that is destroyed on the way out, so the bytes must be
+# copied somewhere that outlives it, and letting the shell own that storage
+# keeps lifetime out of the ABI.
+
+extern malloc(size: usize) -> mutable heap void&? can[Memory.Allocate]
+
+def frame_alloc(size: i64) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            block: mutable heap void&? = malloc(size.usize())
+            0 return if block == null
+            slot: mutable heap void& = block
+            return slot.cast[u8&].uintptr().i64()
+
+# Build one frame into `dest`; returns the byte length written, or 0 if the
+# buffer is too small.
+def frame_write(dest: i64, capacity: i64, trial: i64, nback: i64, position: i64, verdict: i64) -> i64:
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        written: mutable i64 = 0
+        # Built in the AMBIENT region rather than a per-call `region scratch`:
+        # on wasm32 a function-local region that is created and destroyed on
+        # every call returns corrupted string data from the second call onward,
+        # while the same code is correct natively. See
+        # repro/nw_wasm32_region_reuse.md.
+        list: mutable DisplayList = display_list_new()
+        render_nback_frame(&list, trial, nback, position, verdict)
+        encoded: darray[u8] = encode_binary(&list)
+        length: i64 = encoded.count.i64()
+        if length <= capacity and length > 0:
+            trusted Unsafe.PointerCast:
+                target: mutable u8& = dest.uintptr().cast[mutable u8&]
+                memcpy(target.cast[mutable void&], (&encoded[0]).cast[void&], length.usize())
+            written <- length
+        return written
+
+export fn nw_frame_alloc(size: i64) -> i64 = frame_alloc
+export fn nw_frame_write(dest: i64, capacity: i64, trial: i64, nback: i64, position: i64, verdict: i64) -> i64 = frame_write

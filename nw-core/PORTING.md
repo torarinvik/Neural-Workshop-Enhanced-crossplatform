@@ -68,6 +68,13 @@ from any existing `*_sweep.elisa`.
 initialise with `cats: zeroed`. Enums match with indented arms and **no `case`
 keyword**; exhaustiveness is a hard error.
 
+**Struct fields are immutable too**, separately from the local holding them:
+`count: mutable i64` or `record.count <- n` fails with *field "count" is
+immutable*. Assigning *into* a fixed-array field (`record.cats[i] <- v`) does
+not need it.
+
+**There is no `continue`.** Restructure the loop body as `if … else …`.
+
 **`try value else fallback`** works for value-carrying error unions. A brace
 literal as the fallback confuses the parser — call a helper instead. `catch`
 as an *expression* needs a block form; prefer `try … else`.

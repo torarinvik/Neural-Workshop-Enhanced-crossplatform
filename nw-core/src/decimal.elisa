@@ -1,0 +1,1062 @@
+# Exact decimal arithmetic, and the arithmetic n-back's operation table.
+#
+# Port of bwaccel/arithmetic.py's `apply_arithmetic` (GPL-2.0-or-later) plus as
+# much of CPython's `decimal` as that function and matching.py's
+# `_check_arithmetic` need. The player's typed answer is compared against the
+# computed one with `==` on `Decimal`, so the arithmetic has to be EXACT: a
+# float port would mark 0.1 + 0.2 wrong (or right) for the wrong reasons.
+#
+# ---------------------------------------------------------------------------
+# What is modelled
+# ---------------------------------------------------------------------------
+#
+# A value is sign + integer coefficient + base-10 exponent, exactly as CPython
+# stores it (`Decimal.as_tuple()`). The coefficient is a base-10 digit array
+# rather than an i64 pair: division at the default context precision produces 28
+# significant digits (1/3 = 0.3333333333333333333333333333), which does not fit
+# in 64 bits, and a digit array makes alignment, rounding and long division
+# exact by construction. DECIMAL_MAX_DIGITS caps the internal buffer.
+#
+# Every operation follows the algorithm in CPython's `_pydecimal.py` (the pure
+# Python reference for the libmpdec-backed `_decimal` that actually ships), under
+# the DEFAULT context:
+#
+#     Context(prec=28, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999,
+#             capitals=1, clamp=0,
+#             traps=[InvalidOperation, DivisionByZero, Overflow])
+#
+# so: compute the exact result, then round it to 28 significant digits
+# half-to-even. add/subtract/multiply of the game's operands are always exact;
+# division is the operation that actually rounds, and it reproduces CPython's
+# shift-and-divmod with the `coeff % 5` sticky correction and the exact-result
+# "reduce toward the ideal exponent" rule -- so 1/4 is 0.25, 10/5 is 2, and
+# 1.00/10 is 0.10, not 0.1.
+#
+# ---------------------------------------------------------------------------
+# What is NOT modelled (and why that is safe here)
+# ---------------------------------------------------------------------------
+#
+#  * NaN and Infinity. No operation below can produce one (the traps fire
+#    first), and the game's answer field only accepts digits and '.', so
+#    `Decimal('NaN')` is unreachable. from_string reports InvalidOperation for
+#    the Inf/NaN spellings, where CPython would build the special value.
+#  * Underscore digit separators (`Decimal('1_000')` == 1000 in CPython) are
+#    rejected as InvalidOperation. The key handler cannot produce one.
+#  * Subnormals, Etiny and clamping. With clamp=0 and Emax=999999 no game value
+#    comes within six orders of magnitude of the boundary; `_fix` here rounds to
+#    precision and reports Overflow above Etop, but does not implement the
+#    subnormal/Underflow/Clamped path.
+#  * Signals that are not trapped by default (Inexact, Rounded, Subnormal) are
+#    not recorded -- nothing reads them.
+#  * Capacity limits, reported as Overflow, which CPython (arbitrary precision)
+#    would not raise: a coefficient over DECIMAL_MAX_INPUT_DIGITS significant
+#    digits from from_string, an exponent over DECIMAL_MAX_EXPONENT, or an
+#    intermediate over DECIMAL_MAX_DIGITS. The game's operands are
+#    `random.randint(-ARITHMETIC_MAX_NUMBER, ARITHMETIC_MAX_NUMBER)` (default
+#    12) and its answers are typed a digit at a time, so 64 significant digits
+#    is far past anything a session produces; a longer typed answer is reported
+#    as Overflow instead of compared, and an answer that long is never equal to
+#    a computed one anyway.
+#  * Only the four named operations. `apply_arithmetic` takes an enum, so the
+#    reference's `ValueError('unknown arithmetic operation')` is unrepresentable
+#    rather than raised.
+#
+# Errors are an Elisa error set. The reference catches InvalidOperation and
+# ZeroDivisionError around the whole comparison and scores the trial INCORRECT;
+# `arithmetic_answer_is_correct` below does the same.
+
+# ---------------------------------------------------------------------------
+# Context constants
+# ---------------------------------------------------------------------------
+
+const DECIMAL_PRECISION: i64 = 28
+const DECIMAL_EMAX: i64 = 999999
+const DECIMAL_EMIN: i64 = -999999
+
+# Internal coefficient capacity. The widest intermediate is division's
+# `dividend * 10**shift`, at most MAX_INPUT + PRECISION + 1 digits.
+const DECIMAL_MAX_DIGITS: i64 = 256
+# Significant digits accepted by from_string.
+const DECIMAL_MAX_INPUT_DIGITS: i64 = 64
+# Exponent magnitude accepted by from_string, before Emax/Emin are consulted.
+const DECIMAL_MAX_EXPONENT: i64 = 1000000000
+const DECIMAL_TEXT_CAPACITY: i64 = 288
+
+# Status codes, so the same implementation can be surfaced either as an error
+# union or as a plain code (harnesses, and callers that cannot unwind).
+const DEC_OK: i64 = 0
+const DEC_DIVISION_BY_ZERO: i64 = 1
+const DEC_INVALID_OPERATION: i64 = 2
+const DEC_OVERFLOW: i64 = 3
+
+error DecimalError:
+    DivisionByZero
+    InvalidOperation
+    Overflow
+
+# The operations a session may use, in the reference's order (ARITHMETIC_OPS).
+enum ArithmeticOp:
+    Add
+    Subtract
+    Multiply
+    Divide
+
+# ---------------------------------------------------------------------------
+# Representation
+# ---------------------------------------------------------------------------
+
+# An unsigned integer coefficient as base-10 digits, most significant first.
+# Invariant: count >= 1, no leading zeros, and zero is exactly one 0 digit --
+# the same invariant CPython's `_int` string carries.
+struct DecCoeff:
+    count: mutable i64
+    d: mutable u8[256]
+
+# sign is 0 for positive and 1 for negative, matching CPython's `_sign`, so a
+# negative zero is representable (and compares equal to positive zero).
+struct Decimal:
+    sign: mutable i64
+    exponent: mutable i64
+    coefficient: mutable DecCoeff
+
+struct DecimalOutcome:
+    status: mutable i64
+    value: mutable Decimal
+
+# A rendered value, NUL-terminated so a caller can print it directly.
+struct DecimalText:
+    count: mutable i64
+    b: mutable u8[288]
+
+# ---------------------------------------------------------------------------
+# Coefficient primitives
+# ---------------------------------------------------------------------------
+
+def coeff_zero() -> DecCoeff:
+    return DecCoeff{count: 1, d: zeroed}
+
+def decimal_zero() -> Decimal:
+    return Decimal{sign: 0, exponent: 0, coefficient: coeff_zero()}
+
+# Bounds-clamped accessors: every index below is derived from a count, and a
+# stray one would trap rather than diverge.
+def coeff_get(value: DecCoeff&, index: i64) -> i64:
+    can Abort.Panic:
+        0 return if index < 0 or index >= DECIMAL_MAX_DIGITS
+        return value.d[index.usize()].i64()
+
+def coeff_set(value: mutable DecCoeff&, index: i64, digit: i64):
+    can Abort.Panic:
+        return if index < 0 or index >= DECIMAL_MAX_DIGITS
+        value.d[index.usize()] <- digit.u8()
+
+def coeff_is_zero(value: DecCoeff&) -> bool:
+    can Abort.Panic:
+        return value.count <= 1 and coeff_get(value, 0) == 0
+
+def coeff_copy(target: mutable DecCoeff&, source: DecCoeff&):
+    can Abort.Panic:
+        target.count <- source.count
+        index: mutable i64 = 0
+        while index < source.count |index, target, source|:
+            coeff_set(target, index, coeff_get(source, index))
+            index <- index + 1
+
+def coeff_set_zero(target: mutable DecCoeff&):
+    can Abort.Panic:
+        target.count <- 1
+        coeff_set(target, 0, 0)
+
+def coeff_set_i64(target: mutable DecCoeff&, value: i64):
+    can Abort.Panic:
+        coeff_set_zero(target)
+        return if value == 0
+        # Digits are taken off a possibly negative n so that i64's most
+        # negative value, whose magnitude has no i64 representation, still works.
+        scratch: mutable u8[32] = zeroed
+        n: mutable i64 = value
+        length: mutable i64 = 0
+        while n != 0 |n, length, scratch|:
+            digit: i64 = n % 10
+            magnitude: i64 = digit if digit >= 0 else -digit
+            scratch[length.usize()] <- magnitude.u8()
+            n <- n / 10
+            length <- length + 1
+        index: mutable i64 = 0
+        while index < length |index, target, scratch, length|:
+            coeff_set(target, index, scratch[(length - 1 - index).usize()].i64())
+            index <- index + 1
+        target.count <- length
+
+# Drop leading zeros, keeping the one-digit representation of zero.
+def coeff_trim(value: mutable DecCoeff&):
+    can Abort.Panic:
+        lead: mutable i64 = 0
+        while lead < value.count - 1 and coeff_get(value, lead) == 0 |lead, value|:
+            lead <- lead + 1
+        return if lead == 0
+        index: mutable i64 = 0
+        while index < value.count - lead |index, value, lead|:
+            coeff_set(value, index, coeff_get(value, index + lead))
+            index <- index + 1
+        value.count <- value.count - lead
+
+# Magnitude order of two trimmed coefficients: -1, 0 or 1.
+def coeff_cmp(left: DecCoeff&, right: DecCoeff&) -> i64:
+    can Abort.Panic:
+        -1 return if left.count < right.count
+        1 return if left.count > right.count
+        index: mutable i64 = 0
+        while index < left.count |index, left, right|:
+            a: i64 = coeff_get(left, index)
+            b: i64 = coeff_get(right, index)
+            -1 return if a < b
+            1 return if a > b
+            index <- index + 1
+        return 0
+
+# value <- value * 10 + digit. Digits are most-significant-first, so this is an
+# append.
+def coeff_append_digit(value: mutable DecCoeff&, digit: i64) -> i64:
+    can Abort.Panic:
+        DEC_OVERFLOW return if value.count + 1 > DECIMAL_MAX_DIGITS
+        coeff_set(value, value.count, digit)
+        value.count <- value.count + 1
+        coeff_trim(value)
+        return DEC_OK
+
+# out <- source * 10**shift, shift >= 0.
+def coeff_shift_left(out: mutable DecCoeff&, source: DecCoeff&, shift: i64) -> i64:
+    can Abort.Panic:
+        coeff_copy(out, source)
+        DEC_OK return if shift <= 0 or coeff_is_zero(source)
+        DEC_OVERFLOW return if source.count + shift > DECIMAL_MAX_DIGITS
+        index: mutable i64 = 0
+        while index < shift |index, out|:
+            status: i64 = coeff_append_digit(out, 0)
+            status return if status != DEC_OK
+            index <- index + 1
+        return DEC_OK
+
+def coeff_add(out: mutable DecCoeff&, left: DecCoeff&, right: DecCoeff&) -> i64:
+    can Abort.Panic:
+        length: i64 = left.count if left.count > right.count else right.count
+        DEC_OVERFLOW return if length + 1 > DECIMAL_MAX_DIGITS
+        total_length: i64 = length + 1
+        carry: mutable i64 = 0
+        index: mutable i64 = 0
+        while index < length |index, carry, out, left, right, length, total_length|:
+            a: i64 = coeff_get(left, left.count - 1 - index) if index < left.count else 0
+            b: i64 = coeff_get(right, right.count - 1 - index) if index < right.count else 0
+            total: i64 = a + b + carry
+            coeff_set(out, total_length - 1 - index, total % 10)
+            carry <- total / 10
+            index <- index + 1
+        coeff_set(out, 0, carry)
+        out.count <- total_length
+        coeff_trim(out)
+        return DEC_OK
+
+# out <- left - right, which the callers only ever ask for with left >= right.
+def coeff_sub(out: mutable DecCoeff&, left: DecCoeff&, right: DecCoeff&) -> i64:
+    can Abort.Panic:
+        DEC_INVALID_OPERATION return if coeff_cmp(left, right) < 0
+        borrow: mutable i64 = 0
+        index: mutable i64 = 0
+        while index < left.count |index, borrow, out, left, right|:
+            a: i64 = coeff_get(left, left.count - 1 - index)
+            b: i64 = coeff_get(right, right.count - 1 - index) if index < right.count else 0
+            difference: mutable i64 = a - b - borrow
+            if difference < 0:
+                difference <- difference + 10
+                borrow <- 1
+            else:
+                borrow <- 0
+            coeff_set(out, left.count - 1 - index, difference)
+            index <- index + 1
+        out.count <- left.count
+        coeff_trim(out)
+        return DEC_OK
+
+def coeff_mul(out: mutable DecCoeff&, left: DecCoeff&, right: DecCoeff&) -> i64:
+    can Abort.Panic:
+        if coeff_is_zero(left) or coeff_is_zero(right):
+            coeff_set_zero(out)
+            return DEC_OK
+        total_length: i64 = left.count + right.count
+        DEC_OVERFLOW return if total_length > DECIMAL_MAX_DIGITS
+        # Column sums stay far inside i64: at most 9*9*256.
+        columns: mutable i64[256] = zeroed
+        index: mutable i64 = 0
+        while index < left.count |index, columns, left, right|:
+            a: i64 = coeff_get(left, left.count - 1 - index)
+            inner: mutable i64 = 0
+            while inner < right.count |inner, columns, right, index, a|:
+                b: i64 = coeff_get(right, right.count - 1 - inner)
+                columns[(index + inner).usize()] <- columns[(index + inner).usize()] + a * b
+                inner <- inner + 1
+            index <- index + 1
+        carry: mutable i64 = 0
+        position: mutable i64 = 0
+        while position < total_length |position, carry, columns, total_length|:
+            total: i64 = columns[position.usize()] + carry
+            columns[position.usize()] <- total % 10
+            carry <- total / 10
+            position <- position + 1
+        out.count <- total_length
+        write: mutable i64 = 0
+        while write < total_length |write, out, columns, total_length|:
+            coeff_set(out, write, columns[(total_length - 1 - write).usize()])
+            write <- write + 1
+        coeff_trim(out)
+        return DEC_OK
+
+# value <- value + 1.
+def coeff_increment(value: mutable DecCoeff&) -> i64:
+    can Abort.Panic:
+        index: mutable i64 = value.count - 1
+        carry: mutable i64 = 1
+        while index >= 0 and carry > 0 |index, carry, value|:
+            total: i64 = coeff_get(value, index) + carry
+            coeff_set(value, index, total % 10)
+            carry <- total / 10
+            index <- index - 1
+        DEC_OK return if carry == 0
+        DEC_OVERFLOW return if value.count + 1 > DECIMAL_MAX_DIGITS
+        position: mutable i64 = value.count
+        while position > 0 |position, value|:
+            coeff_set(value, position, coeff_get(value, position - 1))
+            position <- position - 1
+        coeff_set(value, 0, 1)
+        value.count <- value.count + 1
+        return DEC_OK
+
+# value <- value / 10, exact only when the last digit is zero (its only use).
+def coeff_drop_last_digit(value: mutable DecCoeff&):
+    can Abort.Panic:
+        if value.count <= 1:
+            coeff_set_zero(value)
+            return
+        value.count <- value.count - 1
+
+# Keep the leading `keep` digits; keep <= 0 leaves zero. CPython's
+# `self._int[:digits] or '0'`.
+def coeff_truncate(value: mutable DecCoeff&, keep: i64):
+    can Abort.Panic:
+        if keep <= 0:
+            coeff_set_zero(value)
+            return
+        return if keep >= value.count
+        value.count <- keep
+        coeff_trim(value)
+
+# quotient <- numerator / divisor, remainder <- numerator % divisor.
+# Schoolbook long division, one decimal digit of quotient at a time.
+def coeff_divmod(quotient: mutable DecCoeff&, remainder: mutable DecCoeff&, numerator: DecCoeff&, divisor: DecCoeff&) -> i64:
+    can Abort.Panic:
+        DEC_DIVISION_BY_ZERO return if coeff_is_zero(divisor)
+        coeff_set_zero(remainder)
+        quotient.count <- numerator.count
+        index: mutable i64 = 0
+        while index < numerator.count |index, quotient, remainder, numerator, divisor|:
+            status: i64 = coeff_append_digit(remainder, coeff_get(numerator, index))
+            status return if status != DEC_OK
+            digit: mutable i64 = 0
+            while coeff_cmp(remainder, divisor) >= 0 |digit, remainder, divisor|:
+                scratch: mutable DecCoeff = coeff_zero()
+                subtract_status: i64 = coeff_sub(&scratch, remainder, divisor)
+                subtract_status return if subtract_status != DEC_OK
+                coeff_copy(remainder, &scratch)
+                digit <- digit + 1
+            coeff_set(quotient, index, digit)
+            index <- index + 1
+        coeff_trim(quotient)
+        return DEC_OK
+
+# Round `value` to `keep` significant digits, ROUND_HALF_EVEN. CPython's
+# `_round_half_even` composed with the truncate-and-maybe-increment in `_fix`.
+def coeff_round_half_even(value: mutable DecCoeff&, keep: i64) -> i64:
+    can Abort.Panic:
+        DEC_OK return if keep >= value.count
+        first: i64 = coeff_get(value, keep)
+        rest_nonzero: mutable bool = false
+        index: mutable i64 = keep + 1
+        while index < value.count |index, rest_nonzero, value|:
+            if coeff_get(value, index) != 0:
+                rest_nonzero <- true
+            index <- index + 1
+        round_up: mutable bool = first > 5
+        if first == 5:
+            if rest_nonzero:
+                round_up <- true
+            else:
+                # An exact half goes to the even neighbour; rounding to no
+                # digits at all means rounding to zero, which is even.
+                if keep > 0:
+                    round_up <- (coeff_get(value, keep - 1) % 2) == 1
+        coeff_truncate(value, keep)
+        DEC_OK return if not round_up
+        return coeff_increment(value)
+
+# ---------------------------------------------------------------------------
+# Value helpers
+# ---------------------------------------------------------------------------
+
+def decimal_copy(target: mutable Decimal&, source: Decimal&):
+    can Abort.Panic:
+        target.sign <- source.sign
+        target.exponent <- source.exponent
+        coeff_copy(&target.coefficient, &source.coefficient)
+
+def decimal_is_zero(value: Decimal&) -> bool:
+    can Abort.Panic:
+        return coeff_is_zero(&value.coefficient)
+
+# CPython's `adjusted()`: the exponent of the most significant digit.
+def decimal_adjusted(value: Decimal&) -> i64:
+    return value.exponent + value.coefficient.count - 1
+
+def decimal_set_i64(target: mutable Decimal&, value: i64):
+    can Abort.Panic:
+        target.sign <- 1 if value < 0 else 0
+        target.exponent <- 0
+        coeff_set_i64(&target.coefficient, value)
+
+# `Decimal(int)`: exact, no rounding, exponent zero.
+def decimal_from_i64(value: i64) -> Decimal:
+    can Abort.Panic:
+        result: mutable Decimal = decimal_zero()
+        decimal_set_i64(&result, value)
+        return result
+
+def decimal_negate_in_place(value: mutable Decimal&):
+    value.sign <- 1 - value.sign
+
+# ---------------------------------------------------------------------------
+# `_fix`: round to context precision and police the exponent range
+# ---------------------------------------------------------------------------
+
+def decimal_fix(value: mutable Decimal&) -> i64:
+    can Abort.Panic:
+        if coeff_is_zero(&value.coefficient):
+            # clamp == 0, so a zero's exponent is only clamped into range.
+            etiny: i64 = DECIMAL_EMIN - DECIMAL_PRECISION + 1
+            value.exponent <- etiny if value.exponent < etiny else value.exponent
+            value.exponent <- DECIMAL_EMAX if value.exponent > DECIMAL_EMAX else value.exponent
+            return DEC_OK
+        etop: i64 = DECIMAL_EMAX - DECIMAL_PRECISION + 1
+        exp_min: i64 = value.coefficient.count + value.exponent - DECIMAL_PRECISION
+        DEC_OVERFLOW return if exp_min > etop
+        # `exponent < exp_min` is exactly "more than `prec` significant digits".
+        # The subnormal case (exp_min < Etiny) is not modelled; see the header.
+        DEC_OK return if value.exponent >= exp_min
+        status: i64 = coeff_round_half_even(&value.coefficient, DECIMAL_PRECISION)
+        status return if status != DEC_OK
+        adjusted_exp: mutable i64 = exp_min
+        if value.coefficient.count > DECIMAL_PRECISION:
+            # The increment carried (999... -> 1000...); shed the trailing zero.
+            coeff_drop_last_digit(&value.coefficient)
+            adjusted_exp <- adjusted_exp + 1
+        DEC_OVERFLOW return if adjusted_exp > etop
+        value.exponent <- adjusted_exp
+        return DEC_OK
+
+# CPython's `_rescale`: restate `value` with exactly `target_exp`, padding with
+# zeros or rounding half-even.
+def decimal_rescale_into(out: mutable Decimal&, value: Decimal&, target_exp: i64) -> i64:
+    can Abort.Panic:
+        out.sign <- value.sign
+        if coeff_is_zero(&value.coefficient):
+            coeff_set_zero(&out.coefficient)
+            out.exponent <- target_exp
+            return DEC_OK
+        if value.exponent >= target_exp:
+            status: i64 = coeff_shift_left(&out.coefficient, &value.coefficient, value.exponent - target_exp)
+            status return if status != DEC_OK
+            out.exponent <- target_exp
+            return DEC_OK
+        digits: i64 = value.coefficient.count + value.exponent - target_exp
+        if digits < 0:
+            # Everything is below the target: a sticky 1 one place down, which
+            # then rounds to zero.
+            coeff_set_zero(&out.coefficient)
+            out.exponent <- target_exp
+            return DEC_OK
+        coeff_copy(&out.coefficient, &value.coefficient)
+        status: i64 = coeff_round_half_even(&out.coefficient, digits)
+        status return if status != DEC_OK
+        out.exponent <- target_exp
+        return DEC_OK
+
+# ---------------------------------------------------------------------------
+# Addition and subtraction
+# ---------------------------------------------------------------------------
+
+# CPython's `_normalize`: bring both operands to a common exponent. An operand
+# whose most significant digit sits far below the other's least significant one
+# is replaced by a sticky 1, which bounds the padding (and is why 1E+30 + 1E-30
+# does not need sixty digits of workspace).
+def decimal_normalize_ordered(high: mutable Decimal&, low: mutable Decimal&) -> i64:
+    can Abort.Panic:
+        step: i64 = high.coefficient.count - DECIMAL_PRECISION - 2
+        cutoff: i64 = high.exponent + (step if step < -1 else -1)
+        if low.coefficient.count + low.exponent - 1 < cutoff:
+            coeff_set_zero(&low.coefficient)
+            coeff_set(&low.coefficient, 0, 1)
+            low.exponent <- cutoff
+        shift: i64 = high.exponent - low.exponent
+        DEC_OK return if shift <= 0
+        DEC_OVERFLOW return if high.coefficient.count + shift > DECIMAL_MAX_DIGITS
+        index: mutable i64 = 0
+        while index < shift |index, high|:
+            status: i64 = coeff_append_digit(&high.coefficient, 0)
+            status return if status != DEC_OK
+            index <- index + 1
+        high.exponent <- low.exponent
+        return DEC_OK
+
+def decimal_normalize_pair(first: mutable Decimal&, second: mutable Decimal&) -> i64:
+    can Abort.Panic:
+        if first.exponent < second.exponent:
+            return decimal_normalize_ordered(second, first)
+        return decimal_normalize_ordered(first, second)
+
+def decimal_add_into(out: mutable Decimal&, left: Decimal&, right: Decimal&) -> i64:
+    can Abort.Panic:
+        exp: i64 = left.exponent if left.exponent < right.exponent else right.exponent
+        left_zero: bool = decimal_is_zero(left)
+        right_zero: bool = decimal_is_zero(right)
+
+        if left_zero and right_zero:
+            # Two zeros keep the smaller exponent; the result is negative only
+            # when both operands are (ROUND_FLOOR would differ, but the default
+            # context is ROUND_HALF_EVEN).
+            out.sign <- left.sign if left.sign < right.sign else right.sign
+            out.exponent <- exp
+            coeff_set_zero(&out.coefficient)
+            return decimal_fix(out)
+
+        if left_zero or right_zero:
+            # Adding zero is a rescale of the other operand, floored at
+            # `exp - prec - 1` so a huge exponent gap cannot pad forever.
+            # This is what makes Decimal('0.00') + Decimal('1') == Decimal('1.00').
+            floor_exp: mutable i64 = left.exponent - DECIMAL_PRECISION - 1
+            if left_zero:
+                floor_exp <- right.exponent - DECIMAL_PRECISION - 1
+            target: i64 = exp if exp > floor_exp else floor_exp
+            status: mutable i64 = DEC_OK
+            if left_zero:
+                status <- decimal_rescale_into(out, right, target)
+            else:
+                status <- decimal_rescale_into(out, left, target)
+            status return if status != DEC_OK
+            return decimal_fix(out)
+
+        first: mutable Decimal = decimal_zero()
+        second: mutable Decimal = decimal_zero()
+        decimal_copy(&first, left)
+        decimal_copy(&second, right)
+        status: i64 = decimal_normalize_pair(&first, &second)
+        status return if status != DEC_OK
+
+        if first.sign != second.sign:
+            order: i64 = coeff_cmp(&first.coefficient, &second.coefficient)
+            if order == 0:
+                # Equal and opposite: a positive zero at the smaller exponent.
+                out.sign <- 0
+                out.exponent <- exp
+                coeff_set_zero(&out.coefficient)
+                return decimal_fix(out)
+            # The larger magnitude decides the sign.
+            subtract_status: mutable i64 = DEC_OK
+            if order < 0:
+                out.sign <- second.sign
+                subtract_status <- coeff_sub(&out.coefficient, &second.coefficient, &first.coefficient)
+            else:
+                out.sign <- first.sign
+                subtract_status <- coeff_sub(&out.coefficient, &first.coefficient, &second.coefficient)
+            subtract_status return if subtract_status != DEC_OK
+            out.exponent <- first.exponent
+            return decimal_fix(out)
+
+        add_status: i64 = coeff_add(&out.coefficient, &first.coefficient, &second.coefficient)
+        add_status return if add_status != DEC_OK
+        out.sign <- first.sign
+        out.exponent <- first.exponent
+        return decimal_fix(out)
+
+# CPython computes `a - b` as `a + b.copy_negate()`, negative zeros and all.
+def decimal_subtract_into(out: mutable Decimal&, left: Decimal&, right: Decimal&) -> i64:
+    can Abort.Panic:
+        negated: mutable Decimal = decimal_zero()
+        decimal_copy(&negated, right)
+        decimal_negate_in_place(&negated)
+        return decimal_add_into(out, left, &negated)
+
+# ---------------------------------------------------------------------------
+# Multiplication
+# ---------------------------------------------------------------------------
+
+def decimal_multiply_into(out: mutable Decimal&, left: Decimal&, right: Decimal&) -> i64:
+    can Abort.Panic:
+        out.sign <- 0 if left.sign == right.sign else 1
+        out.exponent <- left.exponent + right.exponent
+        if decimal_is_zero(left) or decimal_is_zero(right):
+            coeff_set_zero(&out.coefficient)
+            return decimal_fix(out)
+        status: i64 = coeff_mul(&out.coefficient, &left.coefficient, &right.coefficient)
+        status return if status != DEC_OK
+        return decimal_fix(out)
+
+# ---------------------------------------------------------------------------
+# Division
+# ---------------------------------------------------------------------------
+
+def decimal_divide_into(out: mutable Decimal&, left: Decimal&, right: Decimal&) -> i64:
+    can Abort.Panic:
+        if decimal_is_zero(right):
+            # 0/0 is InvalidOperation (DivisionUndefined); x/0 is DivisionByZero,
+            # which surfaces in CPython as ZeroDivisionError.
+            DEC_INVALID_OPERATION return if decimal_is_zero(left)
+            return DEC_DIVISION_BY_ZERO
+        out.sign <- 0 if left.sign == right.sign else 1
+        if decimal_is_zero(left):
+            coeff_set_zero(&out.coefficient)
+            out.exponent <- left.exponent - right.exponent
+            return decimal_fix(out)
+
+        # CPython scales the dividend so the quotient lands with prec+1 or prec+2
+        # digits, divides exactly, and lets `_fix` do the rounding.
+        shift: i64 = right.coefficient.count - left.coefficient.count + DECIMAL_PRECISION + 1
+        exponent: mutable i64 = left.exponent - right.exponent - shift
+        numerator: mutable DecCoeff = coeff_zero()
+        divisor: mutable DecCoeff = coeff_zero()
+        status: mutable i64 = DEC_OK
+        if shift >= 0:
+            status <- coeff_shift_left(&numerator, &left.coefficient, shift)
+            coeff_copy(&divisor, &right.coefficient)
+        else:
+            coeff_copy(&numerator, &left.coefficient)
+            status <- coeff_shift_left(&divisor, &right.coefficient, -shift)
+        status return if status != DEC_OK
+
+        quotient: mutable DecCoeff = coeff_zero()
+        remainder: mutable DecCoeff = coeff_zero()
+        divide_status: i64 = coeff_divmod(&quotient, &remainder, &numerator, &divisor)
+        divide_status return if divide_status != DEC_OK
+
+        if not coeff_is_zero(&remainder):
+            # Inexact: nudge a quotient ending in 0 or 5 so that the later
+            # half-even rounding sees the discarded remainder.
+            if coeff_get(&quotient, quotient.count - 1) % 5 == 0:
+                increment_status: i64 = coeff_increment(&quotient)
+                increment_status return if increment_status != DEC_OK
+        else:
+            # Exact: shed trailing zeros to get as close to the ideal exponent
+            # (exp(dividend) - exp(divisor)) as possible, which is why
+            # Decimal('1.00')/Decimal('10') is 0.10 and not 0.1.
+            ideal_exp: i64 = left.exponent - right.exponent
+            while exponent < ideal_exp and coeff_get(&quotient, quotient.count - 1) == 0 and not coeff_is_zero(&quotient) |exponent, quotient, ideal_exp|:
+                coeff_drop_last_digit(&quotient)
+                exponent <- exponent + 1
+
+        coeff_copy(&out.coefficient, &quotient)
+        out.exponent <- exponent
+        return decimal_fix(out)
+
+# ---------------------------------------------------------------------------
+# Remainder
+# ---------------------------------------------------------------------------
+
+# CPython's `%`: the remainder takes the DIVIDEND's sign (-7 % 2 is -1), and the
+# quotient must fit in `prec` digits or the operation is invalid. The reference
+# uses it in session.py's divisor chooser -- `(frac % 1) in acceptable` -- to
+# offer only divisors whose fractional part is on the allowed list.
+def decimal_remainder_into(out: mutable Decimal&, left: Decimal&, right: Decimal&) -> i64:
+    can Abort.Panic:
+        # Both x % 0 and 0 % 0 are InvalidOperation.
+        DEC_INVALID_OPERATION return if decimal_is_zero(right)
+        ideal_exp: i64 = left.exponent if left.exponent < right.exponent else right.exponent
+        if decimal_is_zero(left):
+            zero_status: i64 = decimal_rescale_into(out, left, ideal_exp)
+            zero_status return if zero_status != DEC_OK
+            return decimal_fix(out)
+        expdiff: i64 = decimal_adjusted(left) - decimal_adjusted(right)
+        if expdiff <= -2:
+            # |left| is at least two orders below |right|: the whole dividend is
+            # the remainder.
+            status: i64 = decimal_rescale_into(out, left, ideal_exp)
+            status return if status != DEC_OK
+            return decimal_fix(out)
+        DEC_INVALID_OPERATION return if expdiff > DECIMAL_PRECISION
+
+        numerator: mutable DecCoeff = coeff_zero()
+        divisor: mutable DecCoeff = coeff_zero()
+        status: mutable i64 = DEC_OK
+        if left.exponent >= right.exponent:
+            status <- coeff_shift_left(&numerator, &left.coefficient, left.exponent - right.exponent)
+            coeff_copy(&divisor, &right.coefficient)
+        else:
+            coeff_copy(&numerator, &left.coefficient)
+            status <- coeff_shift_left(&divisor, &right.coefficient, right.exponent - left.exponent)
+        status return if status != DEC_OK
+
+        quotient: mutable DecCoeff = coeff_zero()
+        remainder: mutable DecCoeff = coeff_zero()
+        divide_status: i64 = coeff_divmod(&quotient, &remainder, &numerator, &divisor)
+        divide_status return if divide_status != DEC_OK
+        # A quotient of prec digits or more is DivisionImpossible.
+        DEC_INVALID_OPERATION return if quotient.count > DECIMAL_PRECISION
+        out.sign <- left.sign
+        out.exponent <- ideal_exp
+        coeff_copy(&out.coefficient, &remainder)
+        return decimal_fix(out)
+
+# ---------------------------------------------------------------------------
+# Comparison
+# ---------------------------------------------------------------------------
+
+# Numeric order, so Decimal('1.0') and Decimal('1') compare equal and every zero
+# equals every other zero regardless of sign or exponent.
+def decimal_compare(left: Decimal&, right: Decimal&) -> i64:
+    can Abort.Panic:
+        left_zero: bool = decimal_is_zero(left)
+        right_zero: bool = decimal_is_zero(right)
+        0 return if left_zero and right_zero
+        if left_zero:
+            return 1 if right.sign == 1 else -1
+        if right_zero:
+            return -1 if left.sign == 1 else 1
+        if left.sign != right.sign:
+            return -1 if left.sign == 1 else 1
+        order: mutable i64 = 0
+        left_adjusted: i64 = decimal_adjusted(left)
+        right_adjusted: i64 = decimal_adjusted(right)
+        if left_adjusted != right_adjusted:
+            order <- -1 if left_adjusted < right_adjusted else 1
+        else:
+            length: i64 = left.coefficient.count if left.coefficient.count > right.coefficient.count else right.coefficient.count
+            index: mutable i64 = 0
+            while index < length and order == 0 |index, order, left, right, length|:
+                a: i64 = coeff_get(&left.coefficient, index) if index < left.coefficient.count else 0
+                b: i64 = coeff_get(&right.coefficient, index) if index < right.coefficient.count else 0
+                if a != b:
+                    order <- -1 if a < b else 1
+                index <- index + 1
+        -order return if left.sign == 1
+        return order
+
+def decimal_equals(left: Decimal&, right: Decimal&) -> bool:
+    can Abort.Panic:
+        return decimal_compare(left, right) == 0
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+def decimal_is_digit(byte: u8) -> bool:
+    return byte >= 48.u8() and byte <= 57.u8()
+
+def decimal_is_space(byte: u8) -> bool:
+    return byte == 32.u8() or (byte >= 9.u8() and byte <= 13.u8())
+
+# `Decimal(str)` for the numeric forms:
+#
+#     [ws] [sign] ( digits [ . [digits] ] | . digits ) [ (e|E) [sign] digits ] [ws]
+#
+# Construction is EXACT -- context precision does not apply -- so '1.50' keeps
+# its trailing zero and reads back as 1.50. Leading zeros are dropped from the
+# coefficient but still count toward the exponent, so '0.0100' is 100E-4.
+def decimal_from_string_into(out: mutable Decimal&, text: sview) -> i64:
+    can Abort.Panic:
+        length: i64 = sview_len(text).i64()
+        start: mutable i64 = 0
+        while start < length and decimal_is_space(sview_at(text, start.usize())) |start, text, length|:
+            start <- start + 1
+        stop: mutable i64 = length
+        while stop > start and decimal_is_space(sview_at(text, (stop - 1).usize())) |stop, start, text|:
+            stop <- stop - 1
+        DEC_INVALID_OPERATION return if stop <= start
+
+        cursor: mutable i64 = start
+        out.sign <- 0
+        first: u8 = sview_at(text, cursor.usize())
+        if first == 43.u8() or first == 45.u8():
+            out.sign <- 1 if first == 45.u8() else 0
+            cursor <- cursor + 1
+
+        coeff_set_zero(&out.coefficient)
+        digit_count: mutable i64 = 0
+        fraction_length: mutable i64 = 0
+        in_fraction: mutable bool = false
+        seen_digit: mutable bool = false
+        seen_significant: mutable bool = false
+        status: mutable i64 = DEC_OK
+        while cursor < stop |cursor, out, digit_count, fraction_length, in_fraction, seen_digit, seen_significant, status, text, stop|:
+            byte: u8 = sview_at(text, cursor.usize())
+            break if byte == 69.u8() or byte == 101.u8()
+            if byte == 46.u8():
+                if in_fraction:
+                    status <- DEC_INVALID_OPERATION
+                    break
+                in_fraction <- true
+            else:
+                if not decimal_is_digit(byte):
+                    status <- DEC_INVALID_OPERATION
+                    break
+                seen_digit <- true
+                if in_fraction:
+                    fraction_length <- fraction_length + 1
+                digit: i64 = (byte - 48.u8()).i64()
+                if seen_significant or digit != 0:
+                    if digit_count >= DECIMAL_MAX_INPUT_DIGITS:
+                        status <- DEC_OVERFLOW
+                        break
+                    coeff_set(&out.coefficient, digit_count, digit)
+                    digit_count <- digit_count + 1
+                    seen_significant <- true
+            cursor <- cursor + 1
+        status return if status != DEC_OK
+        DEC_INVALID_OPERATION return if not seen_digit
+        if digit_count > 0:
+            out.coefficient.count <- digit_count
+        else:
+            coeff_set_zero(&out.coefficient)
+
+        exponent_value: mutable i64 = 0
+        if cursor < stop:
+            # The exponent marker; anything after it must be a signed integer.
+            cursor <- cursor + 1
+            DEC_INVALID_OPERATION return if cursor >= stop
+            exponent_negative: mutable bool = false
+            marker: u8 = sview_at(text, cursor.usize())
+            if marker == 43.u8() or marker == 45.u8():
+                exponent_negative <- marker == 45.u8()
+                cursor <- cursor + 1
+            DEC_INVALID_OPERATION return if cursor >= stop
+            magnitude: mutable i64 = 0
+            exponent_status: mutable i64 = DEC_OK
+            while cursor < stop |cursor, magnitude, exponent_status, text, stop|:
+                byte: u8 = sview_at(text, cursor.usize())
+                if not decimal_is_digit(byte):
+                    exponent_status <- DEC_INVALID_OPERATION
+                    break
+                if magnitude <= DECIMAL_MAX_EXPONENT:
+                    magnitude <- magnitude * 10 + (byte - 48.u8()).i64()
+                cursor <- cursor + 1
+            exponent_status return if exponent_status != DEC_OK
+            DEC_OVERFLOW return if magnitude > DECIMAL_MAX_EXPONENT
+            exponent_value <- -magnitude if exponent_negative else magnitude
+
+        out.exponent <- exponent_value - fraction_length
+        DEC_OVERFLOW return if out.exponent > DECIMAL_MAX_EXPONENT or out.exponent < -DECIMAL_MAX_EXPONENT
+        return DEC_OK
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def decimal_text_push(text: mutable DecimalText&, byte: i64):
+    can Abort.Panic:
+        return if text.count >= DECIMAL_TEXT_CAPACITY - 1
+        text.b[text.count.usize()] <- byte.u8()
+        text.count <- text.count + 1
+
+def decimal_text_push_i64(text: mutable DecimalText&, value: i64):
+    can Abort.Panic:
+        if value == 0:
+            decimal_text_push(text, 48)
+            return
+        scratch: mutable u8[24] = zeroed
+        n: mutable i64 = value
+        length: mutable i64 = 0
+        while n != 0 |n, length, scratch|:
+            digit: i64 = n % 10
+            magnitude: i64 = digit if digit >= 0 else -digit
+            scratch[length.usize()] <- (48 + magnitude).u8()
+            n <- n / 10
+            length <- length + 1
+        index: mutable i64 = 0
+        while index < length |index, text, scratch, length|:
+            decimal_text_push(text, scratch[(length - 1 - index).usize()].i64())
+            index <- index + 1
+
+# `str(Decimal)`: the spec's to-scientific-string, with capitals=1 so the
+# exponent marker is 'E' and always carries a sign.
+def decimal_to_text(value: Decimal&) -> DecimalText:
+    can Abort.Panic:
+        text: mutable DecimalText = DecimalText{count: 0, b: zeroed}
+        if value.sign == 1:
+            decimal_text_push(&text, 45)
+        count: i64 = value.coefficient.count
+        leftdigits: i64 = value.exponent + count
+        dotplace: mutable i64 = 1
+        if value.exponent <= 0 and leftdigits > -6:
+            dotplace <- leftdigits
+        if dotplace <= 0:
+            decimal_text_push(&text, 48)
+            decimal_text_push(&text, 46)
+            pad: mutable i64 = 0
+            while pad < -dotplace |pad, text|:
+                decimal_text_push(&text, 48)
+                pad <- pad + 1
+            index: mutable i64 = 0
+            while index < count |index, text, value, count|:
+                decimal_text_push(&text, 48 + coeff_get(&value.coefficient, index))
+                index <- index + 1
+        else:
+            if dotplace >= count:
+                index: mutable i64 = 0
+                while index < count |index, text, value, count|:
+                    decimal_text_push(&text, 48 + coeff_get(&value.coefficient, index))
+                    index <- index + 1
+                pad: mutable i64 = count
+                while pad < dotplace |pad, text, dotplace|:
+                    decimal_text_push(&text, 48)
+                    pad <- pad + 1
+            else:
+                index: mutable i64 = 0
+                while index < count |index, text, value, count, dotplace|:
+                    if index == dotplace:
+                        decimal_text_push(&text, 46)
+                    decimal_text_push(&text, 48 + coeff_get(&value.coefficient, index))
+                    index <- index + 1
+        if leftdigits != dotplace:
+            decimal_text_push(&text, 69)
+            difference: i64 = leftdigits - dotplace
+            decimal_text_push(&text, 45 if difference < 0 else 43)
+            decimal_text_push_i64(&text, -difference if difference < 0 else difference)
+        text.b[text.count.usize()] <- 0
+        return text
+
+# ---------------------------------------------------------------------------
+# Outcome-and-error-set surface
+# ---------------------------------------------------------------------------
+
+def decimal_unwrap(outcome: DecimalOutcome&) -> Decimal error[DecimalError]:
+    can Abort.Panic:
+        raise DecimalError.DivisionByZero if outcome.status == DEC_DIVISION_BY_ZERO
+        raise DecimalError.InvalidOperation if outcome.status == DEC_INVALID_OPERATION
+        raise DecimalError.Overflow if outcome.status == DEC_OVERFLOW
+        return outcome.value
+
+def decimal_from_string_checked(text: sview) -> DecimalOutcome:
+    can Abort.Panic:
+        outcome: mutable DecimalOutcome = DecimalOutcome{status: DEC_OK, value: decimal_zero()}
+        outcome.status <- decimal_from_string_into(&outcome.value, text)
+        if outcome.status != DEC_OK:
+            decimal_set_i64(&outcome.value, 0)
+        return outcome
+
+def decimal_from_string(text: sview) -> Decimal error[DecimalError]:
+    can Abort.Panic:
+        outcome: DecimalOutcome = decimal_from_string_checked(text)
+        return try decimal_unwrap(&outcome)
+
+def decimal_add_checked(left: Decimal&, right: Decimal&) -> DecimalOutcome:
+    can Abort.Panic:
+        outcome: mutable DecimalOutcome = DecimalOutcome{status: DEC_OK, value: decimal_zero()}
+        outcome.status <- decimal_add_into(&outcome.value, left, right)
+        return outcome
+
+def decimal_add(left: Decimal&, right: Decimal&) -> Decimal error[DecimalError]:
+    can Abort.Panic:
+        outcome: DecimalOutcome = decimal_add_checked(left, right)
+        return try decimal_unwrap(&outcome)
+
+def decimal_subtract_checked(left: Decimal&, right: Decimal&) -> DecimalOutcome:
+    can Abort.Panic:
+        outcome: mutable DecimalOutcome = DecimalOutcome{status: DEC_OK, value: decimal_zero()}
+        outcome.status <- decimal_subtract_into(&outcome.value, left, right)
+        return outcome
+
+def decimal_subtract(left: Decimal&, right: Decimal&) -> Decimal error[DecimalError]:
+    can Abort.Panic:
+        outcome: DecimalOutcome = decimal_subtract_checked(left, right)
+        return try decimal_unwrap(&outcome)
+
+def decimal_multiply_checked(left: Decimal&, right: Decimal&) -> DecimalOutcome:
+    can Abort.Panic:
+        outcome: mutable DecimalOutcome = DecimalOutcome{status: DEC_OK, value: decimal_zero()}
+        outcome.status <- decimal_multiply_into(&outcome.value, left, right)
+        return outcome
+
+def decimal_multiply(left: Decimal&, right: Decimal&) -> Decimal error[DecimalError]:
+    can Abort.Panic:
+        outcome: DecimalOutcome = decimal_multiply_checked(left, right)
+        return try decimal_unwrap(&outcome)
+
+def decimal_divide_checked(left: Decimal&, right: Decimal&) -> DecimalOutcome:
+    can Abort.Panic:
+        outcome: mutable DecimalOutcome = DecimalOutcome{status: DEC_OK, value: decimal_zero()}
+        outcome.status <- decimal_divide_into(&outcome.value, left, right)
+        return outcome
+
+def decimal_divide(left: Decimal&, right: Decimal&) -> Decimal error[DecimalError]:
+    can Abort.Panic:
+        outcome: DecimalOutcome = decimal_divide_checked(left, right)
+        return try decimal_unwrap(&outcome)
+
+def decimal_remainder_checked(left: Decimal&, right: Decimal&) -> DecimalOutcome:
+    can Abort.Panic:
+        outcome: mutable DecimalOutcome = DecimalOutcome{status: DEC_OK, value: decimal_zero()}
+        outcome.status <- decimal_remainder_into(&outcome.value, left, right)
+        return outcome
+
+def decimal_remainder(left: Decimal&, right: Decimal&) -> Decimal error[DecimalError]:
+    can Abort.Panic:
+        outcome: DecimalOutcome = decimal_remainder_checked(left, right)
+        return try decimal_unwrap(&outcome)
+
+# ---------------------------------------------------------------------------
+# The game's operation table
+# ---------------------------------------------------------------------------
+
+def apply_arithmetic_into(out: mutable Decimal&, op: ArithmeticOp, left: Decimal&, right: Decimal&) -> i64:
+    can Abort.Panic:
+        match op:
+            ArithmeticOp.Add:
+                return decimal_add_into(out, left, right)
+            ArithmeticOp.Subtract:
+                return decimal_subtract_into(out, left, right)
+            ArithmeticOp.Multiply:
+                return decimal_multiply_into(out, left, right)
+            ArithmeticOp.Divide:
+                return decimal_divide_into(out, left, right)
+
+def apply_arithmetic_checked(op: ArithmeticOp, left: Decimal&, right: Decimal&) -> DecimalOutcome:
+    can Abort.Panic:
+        outcome: mutable DecimalOutcome = DecimalOutcome{status: DEC_OK, value: decimal_zero()}
+        outcome.status <- apply_arithmetic_into(&outcome.value, op, left, right)
+        return outcome
+
+# Port of bwaccel/arithmetic.py's apply_arithmetic. The reference also accepts
+# non-Decimal operands and converts them with Decimal(); here the conversion is
+# the caller's, via decimal_from_i64 / decimal_from_string.
+def apply_arithmetic(op: ArithmeticOp, left: Decimal&, right: Decimal&) -> Decimal error[DecimalError]:
+    can Abort.Panic:
+        outcome: DecimalOutcome = apply_arithmetic_checked(op, left, right)
+        return try decimal_unwrap(&outcome)
+
+# Port of the verdict in matching.py's `_check_arithmetic`: the trial is correct
+# when the player's answer equals the computed one, and INCORRECT when the
+# operation raises (the reference catches InvalidOperation, ZeroDivisionError,
+# ValueError and TypeError around exactly this).
+def arithmetic_answer_is_correct(op: ArithmeticOp, left: Decimal&, right: Decimal&, given: Decimal&) -> bool:
+    can Abort.Panic:
+        outcome: DecimalOutcome = apply_arithmetic_checked(op, left, right)
+        false return if outcome.status != DEC_OK
+        return decimal_equals(&outcome.value, given)
+
+# Stable integer codes, so a harness can carry an operation across the boundary
+# without depending on enum layout.
+def arithmetic_op_code(op: ArithmeticOp) -> i64:
+    match op:
+        ArithmeticOp.Add:
+            return 0
+        ArithmeticOp.Subtract:
+            return 1
+        ArithmeticOp.Multiply:
+            return 2
+        ArithmeticOp.Divide:
+            return 3

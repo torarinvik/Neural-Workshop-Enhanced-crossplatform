@@ -23,9 +23,12 @@ export function createElisaRuntime() {
     const dv = () => new DataView(memory.buffer);
 
     // Bump allocator over the region above __heap_base. Elisa allocates
-    // arenas, not individual objects, so the arena is the unit that is reused
-    // and this never needs a free list. `free`/`munmap` are honest no-ops:
-    // memory returns when the whole instance is dropped.
+    // ARENAS, not individual objects, so a general free list would be dead
+    // weight -- but the top block MUST be reclaimable. A program that builds a
+    // frame in a scratch region per tick calls mmap/munmap once per frame, and
+    // with a no-op munmap the heap grew ~33MB per frame AND later frames came
+    // back corrupted. Rewinding the bump pointer when the freed block is the
+    // most recent allocation keeps a per-frame region flat in both respects.
     function grow(bytes) {
         const needed = heapNext + bytes;
         if (needed > heapEnd) {
@@ -35,13 +38,32 @@ export function createElisaRuntime() {
         }
     }
 
+    // Most recent allocation, so munmap/free can rewind it.
+    let lastBlock = { at: 0, size: 0 };
+
     function alloc(bytes, align = 16) {
         const size = Number(bytes);
         heapNext = (heapNext + align - 1) & ~(align - 1);
         grow(size);
         const at = heapNext;
         heapNext += size;
+        lastBlock = { at, size };
         return at;
+    }
+
+    // Reclaim `at` if it is the top of the bump; otherwise the space is held
+    // until the instance goes away, which is correct-but-wasteful rather than
+    // wrong.
+    function release(at, size) {
+        const start = Number(at);
+        const length = Number(size);
+        if (start === lastBlock.at && (length === lastBlock.size || length === 0)) {
+            heapNext = start;
+            lastBlock = { at: 0, size: 0 };
+        } else if (start + length === heapNext) {
+            heapNext = start;
+        }
+        return 0;
     }
 
     function readCString(ptr) {
@@ -64,11 +86,16 @@ export function createElisaRuntime() {
     const env = {
         // --- allocation -------------------------------------------------
         malloc: (size) => alloc(size),
-        free: () => {},
+        free: (ptr) => release(ptr, 0),
         // Arena backing. prot/flags/fd are ignored: there is one flat address
         // space and no file mapping in the browser.
+        //
+        // Widths are handled by adapt(): on wasm32 stage0 lowers some
+        // pointer/size externs as i64 and others as i32 (see
+        // repro/nw_wasm32_usize_width.md), so the shim reads each import's
+        // declared signature rather than assuming a convention.
         mmap: (_addr, length) => alloc(length, PAGE),
-        munmap: () => 0,
+        munmap: (addr, length) => release(addr, length),
 
         // --- mem / string -----------------------------------------------
         memcpy: (dest, src, n) => {
@@ -208,28 +235,93 @@ export function createElisaRuntime() {
     };
 }
 
+// Minimal parser for the type and import sections. The shim needs the DECLARED
+// signature of each import so it can hand back i64 results as BigInt: on wasm32
+// stage0 lowers some pointer/size externs as i64 and others as i32 (see
+// repro/nw_wasm32_usize_width.md), so a fixed convention cannot satisfy the
+// module. Reading the signatures adapts to whatever the compiler emitted.
+function importSignatures(bytes) {
+    const VALUE_TYPES = { 0x7f: "i32", 0x7e: "i64", 0x7d: "f32", 0x7c: "f64" };
+    let at = 8; // past the magic and version words
+    const types = [];
+    const signatures = new Map();
+    const leb = () => {
+        let result = 0, shift = 0, byte;
+        do { byte = bytes[at++]; result |= (byte & 0x7f) << shift; shift += 7; } while (byte & 0x80);
+        return result >>> 0;
+    };
+    while (at < bytes.length) {
+        const id = bytes[at++];
+        const size = leb();
+        const end = at + size;
+        if (id === 1) {
+            const count = leb();
+            for (let i = 0; i < count; i++) {
+                at++; // 0x60 function form
+                const params = [];
+                for (let n = leb(), j = 0; j < n; j++) params.push(VALUE_TYPES[bytes[at++]]);
+                const results = [];
+                for (let n = leb(), j = 0; j < n; j++) results.push(VALUE_TYPES[bytes[at++]]);
+                types.push({ params, results });
+            }
+        } else if (id === 2) {
+            const count = leb();
+            for (let i = 0; i < count; i++) {
+                const moduleLen = leb();
+                at += moduleLen;
+                const nameLen = leb();
+                const name = new TextDecoder().decode(bytes.subarray(at, at + nameLen));
+                at += nameLen;
+                const kind = bytes[at++];
+                if (kind !== 0) break; // only function imports need wrapping
+                signatures.set(name, types[leb()]);
+            }
+        }
+        at = end;
+    }
+    return signatures;
+}
+
+// Adapt one implementation to its declared signature: i64 parameters arrive as
+// BigInt and are handed on as Numbers, and an i64 result goes back as BigInt.
+function adapt(fn, signature) {
+    if (!signature) return fn;
+    const returnsI64 = signature.results[0] === "i64";
+    return (...args) => {
+        const result = fn(...args.map((a) => (typeof a === "bigint" ? Number(a) : a)));
+        if (!returnsI64) return result;
+        return BigInt(result === undefined || result === null ? 0 : result);
+    };
+}
+
 // Fill any import this shim does not implement with a stub that THROWS when
 // called. A module then links and runs, and an unported runtime call announces
 // itself by name at the moment it happens instead of failing at instantiation
 // with no indication of which symbol was missing.
-function completeImports(module, imports) {
+function completeImports(module, imports, signatures) {
     const missing = [];
     for (const entry of WebAssembly.Module.imports(module)) {
         const table = (imports[entry.module] ||= {});
+        const signature = signatures.get(entry.name);
         if (table[entry.name] === undefined) {
             missing.push(entry.name);
-            table[entry.name] = (...args) => {
+            table[entry.name] = adapt((...args) => {
                 throw new Error(`elisa: unimplemented host call ${entry.name}(${args.length} args)`);
-            };
+            }, signature);
+        } else {
+            table[entry.name] = adapt(table[entry.name], signature);
         }
     }
     return missing;
 }
 
-export async function instantiateElisa(bytes, { warn = true } = {}) {
+export async function instantiateElisa(source, { warn = true } = {}) {
+    // fetch() hands back an ArrayBuffer and fs.readFileSync a Buffer; the
+    // signature parser indexes bytes, so normalise before touching it.
+    const bytes = source instanceof Uint8Array ? source : new Uint8Array(source);
     const runtime = createElisaRuntime();
     const module = await WebAssembly.compile(bytes);
-    const missing = completeImports(module, runtime.imports);
+    const missing = completeImports(module, runtime.imports, importSignatures(bytes));
     if (warn && missing.length) {
         console.warn(`elisa: ${missing.length} host calls stubbed: ${missing.join(", ")}`);
     }
