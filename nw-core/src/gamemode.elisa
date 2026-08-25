@@ -1,0 +1,1092 @@
+# Game modes: the mode-integer encoding, the generated mode tables, and the
+# mutable per-session game state.
+#
+# Port of neural_workshop/gamemode.py (GPL-2.0-or-later).
+#
+# A mode is an integer whose low bits pick a base combination of modalities and
+# whose high bits switch on variants:
+#
+#   | 128      crab-back    each run of N stimuli is matched in reverse
+#   | 256 * k  multi-stim   k + 1 simultaneous visual stimuli
+#   | 1024     self-paced   the trial waits for an answer
+#
+# HOW THE REFERENCE'S GLOBALS ARE MODELLED
+#
+# The reference reads two mutable module singletons, `state.cfg` and
+# `state.mode`, by bare attribute from every function. A statically linked core
+# cannot rebind a global on a profile switch, so both arrive explicitly:
+#
+#  * `state.cfg` -> `GameCfg`, a typed context struct passed by reference.
+#  * `state.mode` -> `Mode`, an ordinary struct the caller owns.
+#
+# The config reads that cannot be ported literally are the DYNAMIC STRING KEYS:
+#
+#   gamemode.py:132  ('BACK_%i' % mode) in state.cfg   -> GameCfg.back_overrides
+#   gamemode.py:142  ('TICKS_%i' % mode) in cfg        -> GameCfg.ticks_overrides
+#   gamemode.py:147  cfg['BONUS_TICKS_MULTI_%i' % n]   -> GameCfg.bonus_ticks_multi*
+#   gamemode.py:104  cfg['COLOR_%i' % color]           -> Palette.color[i]
+#   gamemode.py:105  cfg['COLOR_%i_BLK' % color]       -> Palette.blk[i]
+#
+# `BACK_<n>` / `TICKS_<n>` are sparse and keyed by an arbitrary mode integer, so
+# they become explicit (mode, value) override tables with a `present` answer --
+# which is exactly what `key in cfg` asks. The `COLOR_<n>` keys are dense and
+# 1-based, so they become 1-based arrays with a `present` flag per slot; the
+# reference's DotDict answers a missing key with None, which `ColorLookup.ok`
+# reports as false rather than inventing a colour.
+#
+# WHAT IS DELIBERATELY NOT HERE
+#
+#  * `base_long_names()` wraps every name in the gettext `_()`. There is no
+#    message catalogue in the tree (res/i18n carries a .po and no .mo), so `_`
+#    is the identity and the msgids below ARE the strings the program shows.
+#    A translated build would differ; the port carries the msgids and the
+#    harness pins `_` to the identity so the comparison stays honest.
+#  * `Mode.soundlist` / `soundlist2` hold pyglet media objects, and
+#    `Mode.sound_mode` / `sound2_mode` name resource sets -- both belong to the
+#    audio/resource layer, which is out of scope for the core.
+#  * `Mode.variable_list` and `Mode.bt_sequence` are variable-length session
+#    buffers filled by the session layer. They are kept OUT of the struct so
+#    `Mode` stays allocation-free: matching.elisa already takes `variable_list`
+#    as an explicit parameter, which is the same decision.
+#  * `Mode.task_category` is a UI navigation string ('working_memory'), not
+#    game state.
+
+# ---------------------------------------------------------------------------
+# Modalities
+# ---------------------------------------------------------------------------
+
+# Every modality name that appears in a mode's modality list, base or derived.
+enum Modality:
+    Position1
+    Position2
+    Position3
+    Position4
+    Color
+    Image
+    Vis1
+    Vis2
+    Vis3
+    Vis4
+    VisVis
+    VisAudio
+    AudioVis
+    Audio
+    Audio2
+    Arithmetic
+
+# Stable integer codes so a harness can carry a modality across the boundary
+# without depending on enum layout. Codes 0..14 are INPUT_MODALITIES in order;
+# 'arithmetic' is 15 because it is matched by typing a number, not by a key,
+# and so is absent from INPUT_MODALITIES upstream as well.
+def modality_code(value: Modality) -> i64:
+    match value:
+        Modality.Position1:
+            return 0
+        Modality.Position2:
+            return 1
+        Modality.Position3:
+            return 2
+        Modality.Position4:
+            return 3
+        Modality.Color:
+            return 4
+        Modality.Image:
+            return 5
+        Modality.Vis1:
+            return 6
+        Modality.Vis2:
+            return 7
+        Modality.Vis3:
+            return 8
+        Modality.Vis4:
+            return 9
+        Modality.VisVis:
+            return 10
+        Modality.VisAudio:
+            return 11
+        Modality.AudioVis:
+            return 12
+        Modality.Audio:
+            return 13
+        Modality.Audio2:
+            return 14
+        Modality.Arithmetic:
+            return 15
+
+# 'position%i' % i and 'vis%i' % i, the two families the multi-stim generator
+# synthesises. i is 1..4; anything else is a programming error upstream too
+# (the labels table stops at 4), so it falls back on the 1 slot.
+def position_modality(index: i64) -> Modality:
+    Modality.Position2 return if index == 2
+    Modality.Position3 return if index == 3
+    Modality.Position4 return if index == 4
+    return Modality.Position1
+
+def vis_modality(index: i64) -> Modality:
+    Modality.Vis2 return if index == 2
+    Modality.Vis3 return if index == 3
+    Modality.Vis4 return if index == 4
+    return Modality.Vis1
+
+# INPUT_MODALITIES: the modalities that can be matched, in screen order.
+const INPUT_MODALITY_COUNT: i64 = 15
+
+def input_modality_at(index: i64) -> Modality:
+    Modality.Position1 return if index == 0
+    Modality.Position2 return if index == 1
+    Modality.Position3 return if index == 2
+    Modality.Position4 return if index == 3
+    Modality.Color return if index == 4
+    Modality.Image return if index == 5
+    Modality.Vis1 return if index == 6
+    Modality.Vis2 return if index == 7
+    Modality.Vis3 return if index == 8
+    Modality.Vis4 return if index == 9
+    Modality.VisVis return if index == 10
+    Modality.VisAudio return if index == 11
+    Modality.AudioVis return if index == 12
+    Modality.Audio return if index == 13
+    return Modality.Audio2
+
+# STIMULUS_FIELDS: every stimulus slot carried in Mode.current_stim. Not the
+# same set as INPUT_MODALITIES -- it has no 'image'/'visvis'/'visaudio'/
+# 'audiovis' and adds 'vis' (the single-stimulus image or letter) and 'number'
+# (the arithmetic operand).
+enum StimField:
+    Position1
+    Position2
+    Position3
+    Position4
+    Color
+    Vis
+    Vis1
+    Vis2
+    Vis3
+    Vis4
+    Audio
+    Audio2
+    Number
+
+const STIMULUS_FIELD_COUNT: i64 = 13
+
+def stimulus_field_code(value: StimField) -> i64:
+    match value:
+        StimField.Position1:
+            return 0
+        StimField.Position2:
+            return 1
+        StimField.Position3:
+            return 2
+        StimField.Position4:
+            return 3
+        StimField.Color:
+            return 4
+        StimField.Vis:
+            return 5
+        StimField.Vis1:
+            return 6
+        StimField.Vis2:
+            return 7
+        StimField.Vis3:
+            return 8
+        StimField.Vis4:
+            return 9
+        StimField.Audio:
+            return 10
+        StimField.Audio2:
+            return 11
+        StimField.Number:
+            return 12
+
+def stimulus_field_at(index: i64) -> StimField:
+    StimField.Position1 return if index == 0
+    StimField.Position2 return if index == 1
+    StimField.Position3 return if index == 2
+    StimField.Position4 return if index == 3
+    StimField.Color return if index == 4
+    StimField.Vis return if index == 5
+    StimField.Vis1 return if index == 6
+    StimField.Vis2 return if index == 7
+    StimField.Vis3 return if index == 8
+    StimField.Vis4 return if index == 9
+    StimField.Audio return if index == 10
+    StimField.Audio2 return if index == 11
+    return StimField.Number
+
+# ---------------------------------------------------------------------------
+# Base mode tables
+# ---------------------------------------------------------------------------
+
+# BASE_SHORT_NAMES' key order. Insertion order is load-bearing: ModeTables
+# iterates `list(self.short_names)` three times and each pass appends to the
+# same dict, so the order below decides the order of every generated variant.
+const BASE_MODE_COUNT: i64 = 28
+
+def base_mode_at(index: i64) -> i64:
+    2 return if index == 0
+    3 return if index == 1
+    4 return if index == 2
+    5 return if index == 3
+    6 return if index == 4
+    7 return if index == 5
+    8 return if index == 6
+    9 return if index == 7
+    10 return if index == 8
+    11 return if index == 9
+    12 return if index == 10
+    20 return if index == 11
+    21 return if index == 12
+    22 return if index == 13
+    23 return if index == 14
+    24 return if index == 15
+    25 return if index == 16
+    26 return if index == 17
+    27 return if index == 18
+    28 return if index == 19
+    100 return if index == 20
+    101 return if index == 21
+    102 return if index == 22
+    103 return if index == 23
+    104 return if index == 24
+    105 return if index == 25
+    106 return if index == 26
+    return 107
+
+# BASE_SHORT_NAMES. Upstream these collide: mode 22 and crab-of-7 are both
+# 'CA', 27 and crab-of-23 are both 'CIA', 102 and crab-of-100 are both 'CAA',
+# 106 and crab-of-103 are both 'CIAA'. Short names go into stats files, so
+# 'CA2B' is ambiguous there. Reproduced as-is; see the note on ModeTables.
+def base_short_name(mode: i64) -> cstr:
+    "D" return if mode == 2
+    "PCA" return if mode == 3
+    "DC" return if mode == 4
+    "TC" return if mode == 5
+    "QC" return if mode == 6
+    "A" return if mode == 7
+    "DA" return if mode == 8
+    "TA" return if mode == 9
+    "Po" return if mode == 10
+    "Au" return if mode == 11
+    "TCC" return if mode == 12
+    "PC" return if mode == 20
+    "PI" return if mode == 21
+    "CA" return if mode == 22
+    "IA" return if mode == 23
+    "CI" return if mode == 24
+    "PCI" return if mode == 25
+    "PIA" return if mode == 26
+    "CIA" return if mode == 27
+    "Q" return if mode == 28
+    "AA" return if mode == 100
+    "PAA" return if mode == 101
+    "CAA" return if mode == 102
+    "IAA" return if mode == 103
+    "PCAA" return if mode == 104
+    "PIAA" return if mode == 105
+    "CIAA" return if mode == 106
+    "P" return if mode == 107
+    return ""
+
+# base_long_names(). The reference builds this dict fresh on every ModeTables
+# construction so a language switch takes effect; here `_` is the identity, so
+# the msgids are constants (see the header note).
+def base_long_name(mode: i64) -> cstr:
+    "Dual" return if mode == 2
+    "Position, Color, Sound" return if mode == 3
+    "Dual Combination" return if mode == 4
+    "Tri Combination" return if mode == 5
+    "Quad Combination" return if mode == 6
+    "Arithmetic" return if mode == 7
+    "Dual Arithmetic" return if mode == 8
+    "Triple Arithmetic" return if mode == 9
+    "Position" return if mode == 10
+    "Sound" return if mode == 11
+    "Tri Combination (Color)" return if mode == 12
+    "Position, Color" return if mode == 20
+    "Position, Image" return if mode == 21
+    "Color, Sound" return if mode == 22
+    "Image, Sound" return if mode == 23
+    "Color, Image" return if mode == 24
+    "Position, Color, Image" return if mode == 25
+    "Position, Image, Sound" return if mode == 26
+    "Color, Image, Sound" return if mode == 27
+    "Quad" return if mode == 28
+    "Sound, Sound2" return if mode == 100
+    "Position, Sound, Sound2" return if mode == 101
+    "Color, Sound, Sound2" return if mode == 102
+    "Image, Sound, Sound2" return if mode == 103
+    "Position, Color, Sound, Sound2" return if mode == 104
+    "Position, Image, Sound, Sound2" return if mode == 105
+    "Color, Image, Sound, Sound2" return if mode == 106
+    "Pentuple" return if mode == 107
+    return ""
+
+# BASE_MODALITIES. Order matters twice over: it is the on-screen order of the
+# feedback labels, and the multi-stim generator inserts at fixed indices into
+# a copy of this list.
+def base_modalities(a: mutable Arena&, mode: i64) -> darray[Modality]:
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            out: mutable darray[Modality] = []
+            if mode == 2:
+                out.push(Modality.Position1)
+                out.push(Modality.Audio)
+            if mode == 3:
+                out.push(Modality.Position1)
+                out.push(Modality.Color)
+                out.push(Modality.Audio)
+            if mode == 4:
+                out.push(Modality.VisVis)
+                out.push(Modality.VisAudio)
+                out.push(Modality.AudioVis)
+                out.push(Modality.Audio)
+            if mode == 5:
+                out.push(Modality.Position1)
+                out.push(Modality.VisVis)
+                out.push(Modality.VisAudio)
+                out.push(Modality.AudioVis)
+                out.push(Modality.Audio)
+            if mode == 6:
+                out.push(Modality.Position1)
+                out.push(Modality.VisVis)
+                out.push(Modality.VisAudio)
+                out.push(Modality.Color)
+                out.push(Modality.AudioVis)
+                out.push(Modality.Audio)
+            if mode == 7:
+                out.push(Modality.Arithmetic)
+            if mode == 8:
+                out.push(Modality.Position1)
+                out.push(Modality.Arithmetic)
+            if mode == 9:
+                out.push(Modality.Position1)
+                out.push(Modality.Arithmetic)
+                out.push(Modality.Color)
+            if mode == 10:
+                out.push(Modality.Position1)
+            if mode == 11:
+                out.push(Modality.Audio)
+            if mode == 12:
+                out.push(Modality.VisVis)
+                out.push(Modality.VisAudio)
+                out.push(Modality.Color)
+                out.push(Modality.AudioVis)
+                out.push(Modality.Audio)
+            if mode == 20:
+                out.push(Modality.Position1)
+                out.push(Modality.Color)
+            if mode == 21:
+                out.push(Modality.Position1)
+                out.push(Modality.Image)
+            if mode == 22:
+                out.push(Modality.Color)
+                out.push(Modality.Audio)
+            if mode == 23:
+                out.push(Modality.Image)
+                out.push(Modality.Audio)
+            if mode == 24:
+                out.push(Modality.Color)
+                out.push(Modality.Image)
+            if mode == 25:
+                out.push(Modality.Position1)
+                out.push(Modality.Color)
+                out.push(Modality.Image)
+            if mode == 26:
+                out.push(Modality.Position1)
+                out.push(Modality.Image)
+                out.push(Modality.Audio)
+            if mode == 27:
+                out.push(Modality.Color)
+                out.push(Modality.Image)
+                out.push(Modality.Audio)
+            if mode == 28:
+                out.push(Modality.Position1)
+                out.push(Modality.Color)
+                out.push(Modality.Image)
+                out.push(Modality.Audio)
+            if mode == 100:
+                out.push(Modality.Audio)
+                out.push(Modality.Audio2)
+            if mode == 101:
+                out.push(Modality.Position1)
+                out.push(Modality.Audio)
+                out.push(Modality.Audio2)
+            if mode == 102:
+                out.push(Modality.Color)
+                out.push(Modality.Audio)
+                out.push(Modality.Audio2)
+            if mode == 103:
+                out.push(Modality.Image)
+                out.push(Modality.Audio)
+                out.push(Modality.Audio2)
+            if mode == 104:
+                out.push(Modality.Position1)
+                out.push(Modality.Color)
+                out.push(Modality.Audio)
+                out.push(Modality.Audio2)
+            if mode == 105:
+                out.push(Modality.Position1)
+                out.push(Modality.Image)
+                out.push(Modality.Audio)
+                out.push(Modality.Audio2)
+            if mode == 106:
+                out.push(Modality.Color)
+                out.push(Modality.Image)
+                out.push(Modality.Audio)
+                out.push(Modality.Audio2)
+            if mode == 107:
+                out.push(Modality.Position1)
+                out.push(Modality.Color)
+                out.push(Modality.Image)
+                out.push(Modality.Audio)
+                out.push(Modality.Audio2)
+            return out
+
+# ---------------------------------------------------------------------------
+# Colours
+# ---------------------------------------------------------------------------
+
+struct Rgba:
+    r: i64
+    g: i64
+    b: i64
+    alpha: i64
+
+# The reference answers a missing config key with None (DotDict.__getattr__).
+# `ok` is false exactly where that happens.
+struct ColorLookup:
+    ok: bool
+    rgba: Rgba
+
+# cfg['COLOR_%i'] / cfg['COLOR_%i_BLK'] as a typed 1-based table; slot 0 is
+# unused so the indices read the same as the config key suffixes. Stock
+# config.ini defines COLOR_1..COLOR_8 and only COLOR_4_BLK / COLOR_7_BLK,
+# which is why the reference only ever asks for _BLK on 4 and 7.
+struct Palette:
+    has_color: mutable bool[9]
+    color: mutable Rgba[9]
+    has_blk: mutable bool[9]
+    blk: mutable Rgba[9]
+
+def palette_empty() -> Palette:
+    return Palette{has_color: zeroed, color: zeroed, has_blk: zeroed, blk: zeroed}
+
+def palette_set_color(palette: mutable Palette&, index: i64, value: Rgba):
+    if index >= 0 and index <= 8:
+        palette.has_color[index.usize()] <- true
+        palette.color[index.usize()] <- value
+
+def palette_set_blk(palette: mutable Palette&, index: i64, value: Rgba):
+    if index >= 0 and index <= 8:
+        palette.has_blk[index.usize()] <- true
+        palette.blk[index.usize()] <- value
+
+# get_color(): RGBA for stimulus colour `color`, honouring the dark theme.
+def get_color(palette: Palette&, black_background: bool, color: i64) -> ColorLookup:
+    miss: ColorLookup = ColorLookup{ok: false, rgba: Rgba{r: 0, g: 0, b: 0, alpha: 0}}
+    if (color == 4 or color == 7) and black_background:
+        miss return if color < 0 or color > 8
+        miss return if not palette.has_blk[color.usize()]
+        return ColorLookup{ok: true, rgba: palette.blk[color.usize()]}
+    miss return if color < 0 or color > 8
+    miss return if not palette.has_color[color.usize()]
+    return ColorLookup{ok: true, rgba: palette.color[color.usize()]}
+
+# CPython's `%` floors towards negative infinity; C truncates towards zero.
+# get_3d_color() reduces its argument mod 8, and a colour index of 0 or below
+# is reachable, so the difference is observable.
+def py_mod(value: i64, modulus: i64) -> i64:
+    remainder: i64 = value % modulus
+    needs_shift: bool = remainder != 0 and ((remainder < 0) != (modulus < 0))
+    return remainder + modulus if needs_shift else remainder
+
+# _3D_FACE_COLORS: a luminance floor so every colour-n-back hue stays readable
+# on the dark cubes. 1-based, wrapping every 8.
+#
+# The reference guards `int(color)` with a bare `except Exception: index = 1`
+# for the case where a non-integer reaches it; an i64 parameter cannot fail
+# that way, so the guard has no port.
+def get_3d_color(color: i64) -> Rgba:
+    index: i64 = py_mod(color - 1, 8) + 1
+    Rgba{r: 56, g: 112, b: 255, alpha: 255} return if index == 1
+    Rgba{r: 0, g: 220, b: 230, alpha: 255} return if index == 2
+    Rgba{r: 46, g: 214, b: 82, alpha: 255} return if index == 3
+    Rgba{r: 232, g: 234, b: 240, alpha: 255} return if index == 4
+    Rgba{r: 232, g: 64, b: 214, alpha: 255} return if index == 5
+    Rgba{r: 240, g: 56, b: 56, alpha: 255} return if index == 6
+    Rgba{r: 198, g: 204, b: 214, alpha: 255} return if index == 7
+    return Rgba{r: 250, g: 214, b: 40, alpha: 255}
+
+# ---------------------------------------------------------------------------
+# Config context
+# ---------------------------------------------------------------------------
+
+# One `BACK_<mode>` / `TICKS_<mode>` config key, as a (mode, value) pair. The
+# reference asks `('BACK_%i' % mode) in state.cfg`, which is a membership test
+# on an arbitrary integer key -- so the port needs a table with an explicit
+# "is this key present" answer, not a defaulted array.
+struct ModeOverride:
+    mode: i64
+    value: i64
+
+struct OverrideLookup:
+    ok: bool
+    value: i64
+
+def override_lookup(table: darray[ModeOverride]&, mode: i64) -> OverrideLookup:
+    can Abort.Panic:
+        count: i64 = table.count.i64()
+        index: mutable i64 = 0
+        while index < count |table, index, count, mode|:
+            entry: ModeOverride = table[index.usize()]
+            if entry.mode == mode:
+                return OverrideLookup{ok: true, value: entry.value}
+            index <- index + 1
+        return OverrideLookup{ok: false, value: 0}
+
+# The slice of state.cfg that gamemode.py reads.
+struct GameCfg:
+    game_mode: i64
+    back_default: i64
+    ticks_default: i64
+    bonus_ticks_crab: i64
+    # cfg['BONUS_TICKS_MULTI_%i' % n] for n = 2, 3, 4. The reference computes
+    # that n as ((mode & 768) / 256 + 1), so only those three keys exist.
+    bonus_ticks_multi2: i64
+    bonus_ticks_multi3: i64
+    bonus_ticks_multi4: i64
+    num_trials: i64
+    num_trials_factor: i64
+    num_trials_exponent: i64
+    manual: bool
+    hide_text: bool
+    skip_title_screen: bool
+    black_background: bool
+    back_overrides: darray[ModeOverride]
+    ticks_overrides: darray[ModeOverride]
+
+def bonus_ticks_multi(cfg: GameCfg&, count: i64) -> i64:
+    cfg.bonus_ticks_multi2 return if count == 2
+    cfg.bonus_ticks_multi3 return if count == 3
+    return cfg.bonus_ticks_multi4
+
+# default_nback_mode(): configured starting n-back level for `mode`.
+#
+# Falls back on the base mode for a crab / multi / self-paced variant, then on
+# BACK_DEFAULT. The recursion terminates because `mode > 127` guarantees
+# `mode % 128 < mode`.
+def default_nback_mode(cfg: GameCfg&, mode: i64) -> i64:
+    can Abort.Panic:
+        hit: OverrideLookup = override_lookup(&cfg.back_overrides, mode)
+        hit.value return if hit.ok
+        if mode > 127:
+            return default_nback_mode(cfg, mode % 128)
+        return cfg.back_default
+
+# default_ticks() returns a Python FLOAT for every variant mode, because the
+# reference writes `((mode & 128) / 128) * cfg.BONUS_TICKS_CRAB` -- true
+# division under `from __future__ import annotations` / Python 3, where `/`
+# never yields an int. The annotation says `-> int` and `Mode.ticks_per_trial`
+# is annotated `int`, so this is an upstream type bug; the VALUE is always
+# integral (the quotient is exactly 0.0 or 1.0 and the bonuses are ints), so
+# reproducing the value in i64 is exact. `is_float` records where the reference
+# hands back a float, so the harness can check the port agrees about that too.
+struct TicksResult:
+    ticks: i64
+    is_float: bool
+
+def default_ticks_checked(cfg: GameCfg&, mode: i64) -> TicksResult:
+    can Abort.Panic:
+        hit: OverrideLookup = override_lookup(&cfg.ticks_overrides, mode)
+        TicksResult{ticks: hit.value, is_float: false} return if hit.ok
+        if mode > 127:
+            bonus: mutable i64 = ((mode & 128) / 128) * cfg.bonus_ticks_crab
+            if (mode & 768) != 0:
+                bonus <- bonus + bonus_ticks_multi(cfg, (mode & 768) / 256 + 1)
+            # The reference prints the bonus here under --debug; the core does
+            # no I/O, so the trace has no port.
+            base: TicksResult = default_ticks_checked(cfg, mode % 128)
+            return TicksResult{ticks: bonus + base.ticks, is_float: true}
+        return TicksResult{ticks: cfg.ticks_default, is_float: false}
+
+def default_ticks(cfg: GameCfg&, mode: i64) -> i64:
+    can Abort.Panic:
+        result: TicksResult = default_ticks_checked(cfg, mode)
+        return result.ticks
+
+# ---------------------------------------------------------------------------
+# String building
+#
+# dstr is darray[u8]. f-strings would be the natural way to build these names,
+# but stage1's backend declines the whole unit when an f-string is present
+# (see repro/nw_gamemode_fstring_stage1.elisa -- same family as the generic
+# `Store` impl decline that already blocks print(i64)), so the names are
+# assembled byte by byte.
+# ---------------------------------------------------------------------------
+
+def dstr_append_sview(a: mutable Arena&, out: mutable dstr&, text: sview):
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            length: i64 = sview_len(text).i64()
+            index: mutable i64 = 0
+            while index < length |out, text, index, length|:
+                out.push(sview_at(text, index.usize()))
+                index <- index + 1
+
+def dstr_append_cstr(a: mutable Arena&, out: mutable dstr&, text: cstr):
+    can Memory.Allocate, Abort.Panic:
+        dstr_append_sview(a, out, sview(text, 0, -1))
+
+def dstr_append_dstr(a: mutable Arena&, out: mutable dstr&, text: dstr):
+    can Memory.Allocate, Abort.Panic:
+        dstr_append_sview(a, out, bytes_view(text))
+
+# '%i' % value, as CPython formats it: no sign for zero or positive, '-' for
+# negative.
+def dstr_append_i64(a: mutable Arena&, out: mutable dstr&, value: i64):
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            if value == 0:
+                out.push(48.u8())
+            else:
+                digits: mutable u8[24] = zeroed
+                slot: mutable i64 = 0
+                remainder: mutable i64 = value
+                negative: bool = value < 0
+                while remainder != 0 |digits, slot, remainder|:
+                    digit: i64 = remainder % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    digits[slot.usize()] <- (48 + magnitude).u8()
+                    slot <- slot + 1
+                    remainder <- remainder / 10
+                if negative:
+                    out.push(45.u8())
+                cursor: mutable i64 = slot - 1
+                while cursor >= 0 |out, digits, cursor|:
+                    out.push(digits[cursor.usize()])
+                    cursor <- cursor - 1
+
+def dstr_of_cstr(a: mutable Arena&, text: cstr) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            out: mutable dstr = []
+            dstr_append_cstr(a, &out, text)
+            return out
+
+# prefix + name, the shape of every generated short/long name.
+def dstr_prefixed(a: mutable Arena&, prefix: cstr, name: dstr) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            out: mutable dstr = []
+            dstr_append_cstr(a, &out, prefix)
+            dstr_append_dstr(a, &out, name)
+            return out
+
+# ---------------------------------------------------------------------------
+# ModeTables
+# ---------------------------------------------------------------------------
+
+struct ModeFlags:
+    crab: i64
+    multi: i64
+    selfpaced: i64
+
+struct ModeEntry:
+    mode: i64
+    flags: ModeFlags
+    modalities: darray[Modality]
+    short_name: dstr
+    long_name: dstr
+
+# The reference keeps four parallel dicts keyed by mode. Here one ordered array
+# carries all four columns, in the dicts' insertion order -- which is not a
+# presentation detail: ModeTables iterates `list(self.short_names)` and appends
+# to it in the same pass, so the order below IS the generation order.
+struct ModeTables:
+    entries: darray[ModeEntry]
+
+def mode_index(tables: ModeTables&, mode: i64) -> i64:
+    can Abort.Panic:
+        count: i64 = tables.entries.count.i64()
+        index: mutable i64 = 0
+        while index < count |tables, index, count, mode|:
+            if tables.entries[index.usize()].mode == mode:
+                return index
+            index <- index + 1
+        return -1
+
+def copy_modalities(a: mutable Arena&, source: darray[Modality]&) -> darray[Modality]:
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            out: mutable darray[Modality] = []
+            count: i64 = source.count.i64()
+            index: mutable i64 = 0
+            while index < count |out, source, index, count|:
+                out.push(source[index.usize()])
+                index <- index + 1
+            return out
+
+def modalities_contain(items: darray[Modality]&, wanted: Modality) -> bool:
+    can Abort.Panic:
+        count: i64 = items.count.i64()
+        index: mutable i64 = 0
+        while index < count |items, index, count, wanted|:
+            true return if items[index.usize()] == wanted
+            index <- index + 1
+        return false
+
+# list.remove(x): drops the FIRST occurrence, and is a no-op here because the
+# reference guards it with `if name in derived`.
+def modalities_remove_first(items: mutable darray[Modality]&, wanted: Modality):
+    can Abort.Panic:
+        count: i64 = items.count.i64()
+        index: mutable i64 = 0
+        while index < count |items, index, count, wanted|:
+            if items[index.usize()] == wanted:
+                dropped: Modality = items.remove_at(index.usize())
+                return
+            index <- index + 1
+
+# The multi-stim filter, in the reference's own order:
+#
+#     if {'color', 'image'}.issubset(modalities) \
+#             or 'position1' not in modalities \
+#             or {'visvis', 'arithmetic'} & set(modalities):
+#         continue
+#
+# Combination and arithmetic modes have no room for extra visual stimuli, and
+# a mode without a position has nothing to multiply.
+def multi_eligible(items: darray[Modality]&) -> bool:
+    can Abort.Panic:
+        has_color: bool = modalities_contain(items, Modality.Color)
+        has_image: bool = modalities_contain(items, Modality.Image)
+        false return if has_color and has_image
+        false return if not modalities_contain(items, Modality.Position1)
+        false return if modalities_contain(items, Modality.VisVis)
+        false return if modalities_contain(items, Modality.Arithmetic)
+        return true
+
+# The modality list of an n-way multi-stim variant.
+#
+#     derived = list(modalities)
+#     for i in range(2, n + 1):
+#         derived.insert(i - 1, 'position%i' % i)
+#     if 'color' in modalities or 'image' in modalities:
+#         for i in range(1, n + 1):
+#             derived.insert(n + i - 1, 'vis%i' % i)
+#     for name in ('image', 'color'):
+#         if name in derived:
+#             derived.remove(name)
+#
+# Note the colour/image test reads the ORIGINAL list, not `derived`, and that
+# the removal order is image-then-colour. Elisa has no list.insert, so each
+# insert is a push followed by a rotate; list.insert clamps an index past the
+# end to an append, and so does this (the loop simply does not run).
+def derive_multi_modalities(a: mutable Arena&, source: darray[Modality]&, count: i64) -> darray[Modality]:
+    can Memory.Allocate, Abort.Panic:
+        wants_vis: bool = modalities_contain(source, Modality.Color) or modalities_contain(source, Modality.Image)
+        in a:
+            derived: mutable darray[Modality] = []
+            length: i64 = source.count.i64()
+            copy_index: mutable i64 = 0
+            while copy_index < length |derived, source, copy_index, length|:
+                derived.push(source[copy_index.usize()])
+                copy_index <- copy_index + 1
+
+            step: mutable i64 = 2
+            while step <= count |derived, step, count|:
+                derived.push(position_modality(step))
+                cursor: mutable i64 = derived.count.i64() - 1
+                target: i64 = step - 1
+                while cursor > target |derived, cursor, target|:
+                    moved: Modality = derived[(cursor - 1).usize()]
+                    derived[(cursor - 1).usize()] <- derived[cursor.usize()]
+                    derived[cursor.usize()] <- moved
+                    cursor <- cursor - 1
+                step <- step + 1
+
+            if wants_vis:
+                slot: mutable i64 = 1
+                while slot <= count |derived, slot, count|:
+                    derived.push(vis_modality(slot))
+                    cursor: mutable i64 = derived.count.i64() - 1
+                    target: i64 = count + slot - 1
+                    while cursor > target |derived, cursor, target|:
+                        moved: Modality = derived[(cursor - 1).usize()]
+                        derived[(cursor - 1).usize()] <- derived[cursor.usize()]
+                        derived[cursor.usize()] <- moved
+                        cursor <- cursor - 1
+                    slot <- slot + 1
+
+            modalities_remove_first(&derived, Modality.Image)
+            modalities_remove_first(&derived, Modality.Color)
+            return derived
+
+# '%ix%s' % (n, short) -- the multi-stim short-name prefix.
+def multi_short_prefix(a: mutable Arena&, count: i64, name: dstr) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            out: mutable dstr = []
+            dstr_append_i64(a, &out, count)
+            dstr_append_cstr(a, &out, "x")
+            dstr_append_dstr(a, &out, name)
+            return out
+
+# '%s %s' % (label, long) -- the multi-stim long-name prefix.
+def multi_long_label(count: i64) -> cstr:
+    "Double-stim " return if count == 2
+    "Triple-stim " return if count == 3
+    return "Quadruple-stim "
+
+# ModeTables(): the base modes plus every generated variant.
+#
+# Each generation pass snapshots `list(self.short_names)` before it runs, so a
+# pass never sees its own output: crab variants are generated from base modes
+# only, multi variants from base + crab, and self-paced from all three. That is
+# why there is no crab-of-self-paced or multi-of-multi mode.
+def mode_tables_new(a: mutable Arena&) -> ModeTables:
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            entries: mutable darray[ModeEntry] = []
+
+            base_index: mutable i64 = 0
+            while base_index < BASE_MODE_COUNT |a, entries, base_index|:
+                mode: i64 = base_mode_at(base_index)
+                entries.push(ModeEntry{
+                    mode: mode,
+                    flags: ModeFlags{crab: 0, multi: 1, selfpaced: 0},
+                    modalities: base_modalities(a, mode),
+                    short_name: dstr_of_cstr(a, base_short_name(mode)),
+                    long_name: dstr_of_cstr(a, base_long_name(mode))})
+                base_index <- base_index + 1
+
+            # _generate_crab_modes: flags[m] is written here too, which is the
+            # only place a BASE mode gets a flags entry.
+            crab_source_count: i64 = entries.count.i64()
+            crab_index: mutable i64 = 0
+            while crab_index < crab_source_count |a, entries, crab_index, crab_source_count|:
+                source: ModeEntry = entries[crab_index.usize()]
+                entries.push(ModeEntry{
+                    mode: source.mode | 128,
+                    flags: ModeFlags{crab: 1, multi: 1, selfpaced: 0},
+                    modalities: copy_modalities(a, &source.modalities),
+                    short_name: dstr_prefixed(a, "C", source.short_name),
+                    long_name: dstr_prefixed(a, "Crab ", source.long_name)})
+                crab_index <- crab_index + 1
+
+            # _generate_multi_modes
+            multi_source_count: i64 = entries.count.i64()
+            multi_index: mutable i64 = 0
+            while multi_index < multi_source_count |a, entries, multi_index, multi_source_count|:
+                source: ModeEntry = entries[multi_index.usize()]
+                if multi_eligible(&source.modalities):
+                    count: mutable i64 = 2
+                    while count <= 4 |a, entries, source, count|:
+                        entries.push(ModeEntry{
+                            mode: source.mode | (256 * (count - 1)),
+                            flags: ModeFlags{crab: source.flags.crab, multi: count, selfpaced: source.flags.selfpaced},
+                            modalities: derive_multi_modalities(a, &source.modalities, count),
+                            short_name: multi_short_prefix(a, count, source.short_name),
+                            long_name: dstr_prefixed(a, multi_long_label(count), source.long_name)})
+                        count <- count + 1
+                multi_index <- multi_index + 1
+
+            # _generate_selfpaced_modes. Note 'Self-paced ' is NOT wrapped in
+            # the gettext `_()` upstream while 'Crab ' is -- an inconsistency
+            # that leaves this one prefix untranslated. Reproduced.
+            selfpaced_source_count: i64 = entries.count.i64()
+            selfpaced_index: mutable i64 = 0
+            while selfpaced_index < selfpaced_source_count |a, entries, selfpaced_index, selfpaced_source_count|:
+                source: ModeEntry = entries[selfpaced_index.usize()]
+                entries.push(ModeEntry{
+                    mode: source.mode | 1024,
+                    flags: ModeFlags{crab: source.flags.crab, multi: source.flags.multi, selfpaced: 1},
+                    modalities: copy_modalities(a, &source.modalities),
+                    short_name: dstr_prefixed(a, "SP-", source.short_name),
+                    long_name: dstr_prefixed(a, "Self-paced ", source.long_name)})
+                selfpaced_index <- selfpaced_index + 1
+
+            return ModeTables{entries: entries}
+
+# ---------------------------------------------------------------------------
+# Mode: the mutable per-session game state
+# ---------------------------------------------------------------------------
+
+# Mode.current_operation, a string upstream ('none' until an arithmetic trial
+# picks one).
+enum ArithOp:
+    NoneOp
+    Add
+    Subtract
+    Multiply
+    Divide
+
+def arith_op_code(value: ArithOp) -> i64:
+    match value:
+        ArithOp.NoneOp:
+            return 0
+        ArithOp.Add:
+            return 1
+        ArithOp.Subtract:
+            return 2
+        ArithOp.Multiply:
+            return 3
+        ArithOp.Divide:
+            return 4
+
+# Mode.phase, an Optional[str] upstream: None before the first trial, then
+# 'stimulus' / 'blank' / 'feedback' / 'done'.
+enum TrialPhase:
+    NotStarted
+    Stimulus
+    Blank
+    Feedback
+    Done
+
+def trial_phase_code(value: TrialPhase) -> i64:
+    match value:
+        TrialPhase.NotStarted:
+            return -1
+        TrialPhase.Stimulus:
+            return 0
+        TrialPhase.Blank:
+            return 1
+        TrialPhase.Feedback:
+            return 2
+        TrialPhase.Done:
+            return 3
+
+# All mutable game state: which mode is selected and how it is going.
+#
+# The two per-modality dicts become fixed arrays indexed by INPUT_MODALITIES
+# order, and current_stim an array indexed by STIMULUS_FIELDS order -- the
+# reference keys them by string, but the key sets are closed and ordered, so an
+# index is the same information without a hash lookup.
+struct Mode:
+    mode: mutable i64
+    back: mutable i64
+    ticks_per_trial: mutable i64
+    # True where the reference's ticks_per_trial is a float; see default_ticks.
+    ticks_per_trial_is_float: mutable bool
+    num_trials: mutable i64
+    num_trials_factor: mutable i64
+    num_trials_exponent: mutable i64
+    num_trials_total: mutable i64
+    manual: mutable bool
+    inputs: mutable bool[15]
+    input_rts: mutable f64[15]
+    hide_text: mutable bool
+    current_stim: mutable i64[13]
+    current_operation: mutable ArithOp
+    started: mutable bool
+    paused: mutable bool
+    show_missed: mutable bool
+    sound_select: mutable bool
+    draw_graph: mutable bool
+    saccadic: mutable bool
+    title_screen: mutable bool
+    session_number: mutable i64
+    trial_number: mutable i64
+    trial_starttime: mutable f64
+    tick: mutable i64
+    progress: mutable i64
+    phase: mutable TrialPhase
+    phase_elapsed: mutable i64
+    step_mode: mutable bool
+    frame_seq: mutable i64
+    session_done: mutable bool
+
+# back ** num_trials_exponent. The reference writes `self.back **
+# self.num_trials_exponent` with ints; a negative exponent would make CPython
+# return a float, but NUM_TRIALS_EXPONENT is a session-length knob that is
+# meaningless below 0, so this port defines it as 1 there and the sweep does
+# not exercise it.
+def ipow(base: i64, exponent: i64) -> i64:
+    result: mutable i64 = 1
+    step: mutable i64 = 0
+    while step < exponent |result, base, step, exponent|:
+        result <- result * base
+        step <- step + 1
+    return result
+
+def session_length(back: i64, trials: i64, factor: i64, exponent: i64) -> i64:
+    return trials + factor * ipow(back, exponent)
+
+# enforce_standard_mode(): reset level and session length to the configured
+# defaults.
+def enforce_standard_mode(game: mutable Mode&, cfg: GameCfg&):
+    can Abort.Panic:
+        ticks: TicksResult = default_ticks_checked(cfg, game.mode)
+        game.back <- default_nback_mode(cfg, game.mode)
+        game.ticks_per_trial <- ticks.ticks
+        game.ticks_per_trial_is_float <- ticks.is_float
+        game.num_trials <- cfg.num_trials
+        game.num_trials_factor <- cfg.num_trials_factor
+        game.num_trials_exponent <- cfg.num_trials_exponent
+        game.num_trials_total <- session_length(game.back, cfg.num_trials, cfg.num_trials_factor, cfg.num_trials_exponent)
+        game.session_number <- 0
+
+# Mode(): the constructor, reading GAME_MODE and the session-length knobs.
+#
+# The reference builds a fresh ModeTables here and hangs it off the instance;
+# the tables are immutable once built and cost an arena, so this port leaves
+# them to the caller -- one ModeTables serves every Mode.
+def mode_new(cfg: GameCfg&) -> Mode:
+    can Abort.Panic:
+        selected: i64 = cfg.game_mode
+        ticks: TicksResult = default_ticks_checked(cfg, selected)
+        back: i64 = default_nback_mode(cfg, selected)
+        game: mutable Mode = Mode{
+            mode: selected,
+            back: back,
+            ticks_per_trial: ticks.ticks,
+            ticks_per_trial_is_float: ticks.is_float,
+            num_trials: cfg.num_trials,
+            num_trials_factor: cfg.num_trials_factor,
+            num_trials_exponent: cfg.num_trials_exponent,
+            num_trials_total: session_length(back, cfg.num_trials, cfg.num_trials_factor, cfg.num_trials_exponent),
+            manual: cfg.manual,
+            inputs: zeroed,
+            input_rts: zeroed,
+            hide_text: cfg.hide_text,
+            current_stim: zeroed,
+            current_operation: ArithOp.NoneOp,
+            started: false,
+            paused: false,
+            show_missed: false,
+            sound_select: false,
+            draw_graph: false,
+            saccadic: false,
+            title_screen: not cfg.skip_title_screen,
+            session_number: 0,
+            trial_number: 0,
+            trial_starttime: 0.0,
+            tick: 0,
+            progress: 0,
+            phase: TrialPhase.NotStarted,
+            phase_elapsed: 0,
+            step_mode: false,
+            frame_seq: 0,
+            session_done: false}
+        # The reference calls enforce_standard_mode() here when MANUAL is off.
+        # Every assignment it makes repeats one __init__ already made, so the
+        # call is observably a no-op -- ported anyway, so a change upstream to
+        # either function stays visible in the diff.
+        if not game.manual:
+            enforce_standard_mode(&game, cfg)
+        return game
+
+# Mode.short_name(): the compact label that goes into stats files, e.g. 'D2B'.
+# The reference indexes short_mode_names[mode] unguarded and raises KeyError
+# for a mode that is not in the tables; this returns an empty dstr there, and
+# mode_index() is the guard a caller should use.
+def mode_short_label(a: mutable Arena&, tables: ModeTables&, mode: i64, back: i64) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            out: mutable dstr = []
+            index: i64 = mode_index(tables, mode)
+            out return if index < 0
+            dstr_append_dstr(a, &out, tables.entries[index.usize()].short_name)
+            dstr_append_i64(a, &out, back)
+            dstr_append_cstr(a, &out, "B")
+            return out
