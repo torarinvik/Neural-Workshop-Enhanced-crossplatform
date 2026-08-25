@@ -1,0 +1,859 @@
+# Per-trial stimulus generation: the heart of the game.
+#
+# Port of `generate_stimulus` and its helpers from neural_workshop/session.py
+# (GPL-2.0-or-later). Every trial draws an independent random stimulus for each
+# field, then rewrites some of them so that matches happen at a controlled rate
+# and near-misses (interference) appear often enough to make the task hard for
+# the right reason.
+#
+# ---------------------------------------------------------------------------
+# RANDOM STREAM FIDELITY
+# ---------------------------------------------------------------------------
+#
+# This is the property that matters most. The reference draws from CPython's
+# `random` in a specific ORDER, and a seeded session is only reproducible if the
+# port consumes pyrandom.elisa's MT19937 in exactly the same order. Per trial,
+# in sequence:
+#
+#   _sample_random_stimuli    sample(active_ids, k)  -> k_multi x randint(1,8)
+#                             -> randint(1,8) x3 (vis, audio, audio2)
+#                             -> randint(1, 8 or 8**cubes) (color)
+#   _choose_arithmetic_operands
+#                             choice(operations)     -> randint(min,max), or a
+#                             rejection loop, or choice(possibilities)
+#   _plant_matches            per modality: random(), random(), and on the
+#                             interference branch shuffle(offsets)
+#   _plant_multi_reversal     random(), maybe random(), choice(range(1,multi))
+#
+# Two short-circuits are load-bearing and easy to get wrong:
+#
+#  * `elif r2 < CHANCE_OF_INTERFERENCE and mode.back > 1` -- `r2` is ALWAYS
+#    drawn (it is the second half of the `r1, r2 = random(), random()` tuple),
+#    even when `r1` already forced a match and even when back == 1.
+#  * `if 'vis1' in modalities and random.random() < .5` -- the draw happens
+#    only when vis1 is present. Testing the modality first is not a style
+#    choice; swapping the operands shifts every later draw.
+#
+# ---------------------------------------------------------------------------
+# HOW THE REFERENCE'S GLOBALS ARE MODELLED
+# ---------------------------------------------------------------------------
+#
+# session.py reads three mutable module singletons by bare attribute:
+#
+#   state.cfg           -> SessionCfg, below. gamemode.elisa's GameCfg already
+#                          carries gamemode.py's slice of the same config; this
+#                          is session.py's slice, which does not overlap it.
+#   state.mode          -> gamemode.elisa's Mode, unchanged, plus the mode
+#                          tables (Mode.modalities / Mode.flags are the tables'
+#                          dicts, so ModeTables answers both).
+#   state.stats.session -> SessionHistory, one i64 stream per stimulus field.
+#
+# The variable-n-back list and the Jaeggi sequence are variable-length session
+# buffers that gamemode.elisa deliberately keeps out of `Mode`; they arrive in
+# SessionBuffers alongside the history, which is the same decision.
+#
+# ---------------------------------------------------------------------------
+# WHAT IS DELIBERATELY NOT HERE
+# ---------------------------------------------------------------------------
+#
+#  * `_queue_audio()` -- queues pyglet media players and reads Mode.soundlist,
+#    which holds decoded audio objects. Audio layer, not core. It draws nothing
+#    from the random stream, so leaving it out does not shift a single draw.
+#  * `_spawn_visuals()` -- drives state.visuals sprites. Render layer; likewise
+#    draws nothing.
+#  * `runtime.DEBUG` tracing. The core does no I/O.
+#  * The session lifecycle around generation (`new_session`, `end_session`,
+#    `_prepare_stimulus_sets`, `update_all_labels`, `set_user`, `get_users`):
+#    resource loading, widget updates and file system, none of it core.
+#
+# ---------------------------------------------------------------------------
+# UPSTREAM BEHAVIOUR REPRODUCED RATHER THAN CORRECTED
+# ---------------------------------------------------------------------------
+#
+#  * `_real_back` indexes `mode.variable_list[trial_number - back - 1]` on
+#    EVERY trial, including the first `back` trials where that index is
+#    negative -- Python silently wraps to the end of the list. Same latent bug
+#    matching.elisa reproduces in `nback_trial_index_checked`.
+#  * `_plant_matches` writes `if not back: continue`, so a planted lag of 0
+#    would be skipped as falsy rather than used. Unreachable today (every lag
+#    the two branches can produce is >= 1), preserved as written.
+#  * `_sample_random_stimuli` fills only position1..k_multi where
+#    k_multi = min(4, len(active_ids)). On a board capped below the mode's
+#    multi count the later position fields keep the PREVIOUS trial's values,
+#    and `_resolve_position_conflict` / `_plant_multi_reversal` then index
+#    `positions` past its end and raise IndexError. GenerateStatus.PositionIndex
+#    marks exactly where the reference raises.
+#  * `_resolve_position_conflict` finds the conflicting slot with
+#    `positions.index(matching_stim)`, which scans the WHOLE list including the
+#    modality's own slot -- reachable once an earlier modality has planted a
+#    duplicate into `positions`.
+#
+# ---------------------------------------------------------------------------
+# A NOTE ON pyrandom.py_randint
+# ---------------------------------------------------------------------------
+#
+# `py_randint(rng, a, b)` returns `a` WITHOUT consuming the stream when b <= a,
+# whereas CPython's `randint(a, a)` is `randrange(a, a+1)` = `a +
+# _randbelow(1)`, and `_randbelow(1)` draws `getrandbits(1)` until it comes up
+# 0 -- so it does consume. The only reachable a == b here is
+# `randint(min_number, max_number)` with ARITHMETIC_MAX_NUMBER = 0 and
+# negatives off, which makes arithmetic mode degenerate anyway (and turns the
+# divide-with-no-history loop below into an infinite one upstream). Left alone
+# rather than patched in a shared module; the sweep does not exercise it.
+
+# ---------------------------------------------------------------------------
+# The slice of state.cfg that session.py reads
+# ---------------------------------------------------------------------------
+
+# One entry of ARITHMETIC_ACCEPTABLE_DECIMALS, as an exact rational.
+#
+# The reference builds `list(map(Decimal, cfg.ARITHMETIC_ACCEPTABLE_DECIMALS))`
+# and tests `(Decimal(abs(nb)) / Decimal(abs(x))) % 1 in acceptable`. Every
+# listed value is a terminating decimal strictly between 0 and 1, so num/den
+# with den a power of ten represents it exactly, and the membership test becomes
+# an exact integer cross-multiplication -- see fraction_is_acceptable.
+struct Rational:
+    numerator: i64
+    denominator: i64
+
+struct SessionCfg:
+    # CHANCE_OF_GUARANTEED_MATCH / CHANCE_OF_INTERFERENCE, compared against
+    # random() and against random() * 3/2 respectively.
+    chance_of_guaranteed_match: f64
+    chance_of_interference: f64
+    variable_nback: bool
+    jaeggi_mode: bool
+    # MULTI_MODE, which is 'color' or 'image'. Only the 'color' test is reached
+    # by the ported code (_apply_static_defaults); _spawn_visuals reads it too.
+    multi_mode_color: bool
+    # VISUAL_COLORS. _apply_static_defaults reads [0]; the rest is carried so a
+    # future _spawn_visuals port has it.
+    visual_colors: darray[i64]
+    arithmetic_use_addition: bool
+    arithmetic_use_subtraction: bool
+    arithmetic_use_multiplication: bool
+    arithmetic_use_division: bool
+    arithmetic_use_negatives: bool
+    arithmetic_max_number: i64
+    acceptable_fractions: darray[Rational]
+    # grid.py's slice, reached through current_active_position_ids() and
+    # current_grid_3d() / current_3d_color_count().
+    grid_size: i64
+    grid_size_min: i64
+    grid_size_max: i64
+    grid_include_center: bool
+    grid_3d: bool
+    grid_3d_cubes: i64
+    active_position_cells: i64
+    position_cell_count: i64
+
+# grid.current_grid_bounds(): (max(2, GRID_SIZE_MIN), max(gmin, GRID_SIZE_MAX)).
+# The reference's try/except around int() guards a non-numeric config value; an
+# i64 field cannot fail that way, so the fallbacks (2 and 32) have no port --
+# they are the configured defaults instead.
+def session_grid_min(cfg: SessionCfg&) -> i64:
+    return cfg.grid_size_min if cfg.grid_size_min > 2 else 2
+
+def session_grid_max(cfg: SessionCfg&) -> i64:
+    low: i64 = session_grid_min(cfg)
+    return cfg.grid_size_max if cfg.grid_size_max > low else low
+
+# grid.current_grid_size(): max(gmin, min(gmax, GRID_SIZE)).
+def session_grid_size(cfg: SessionCfg&) -> i64:
+    low: i64 = session_grid_min(cfg)
+    high: i64 = session_grid_max(cfg)
+    size: mutable i64 = cfg.grid_size
+    size <- high if size > high
+    size <- low if size < low
+    return size
+
+# grid.current_3d_cube_count(): max(1, min(6, GRID_3D_CUBES)).
+def session_3d_cube_count(cfg: SessionCfg&) -> i64:
+    count: mutable i64 = cfg.grid_3d_cubes
+    count <- 6 if count > 6
+    count <- 1 if count < 1
+    return count
+
+# grid.current_3d_color_count(): 8 ** cubes, the palette size raised to the
+# number of cubes. `ipow` comes from gamemode.elisa.
+def session_3d_color_count(cfg: SessionCfg&) -> i64:
+    return ipow(8, session_3d_cube_count(cfg))
+
+# grid.current_cell_count() on a 3D board: 6 ** cubes.
+def session_3d_cell_count(cfg: SessionCfg&) -> i64:
+    return ipow(6, session_3d_cube_count(cfg))
+
+# grid.current_active_cell_limit(): ACTIVE_POSITION_CELLS, then the legacy
+# POSITION_CELL_COUNT alias, then 0 meaning "the whole board".
+def session_active_cell_limit(cfg: SessionCfg&) -> i64:
+    cfg.active_position_cells return if cfg.active_position_cells > 0
+    cfg.position_cell_count return if cfg.position_cell_count > 0
+    return 0
+
+# grid.current_active_position_ids(). On a 3D board every pattern id is usable
+# and the curriculum cap does not apply; otherwise board.elisa's
+# active_position_ids answers, always in 2D (the reference computes
+# `dim = 3 if current_grid_3d() else 2` inside the branch where it is False).
+def session_active_position_ids(a: mutable Arena&, cfg: SessionCfg&) -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        if cfg.grid_3d:
+            in a:
+                ids: mutable darray[i64] = []
+                total: i64 = session_3d_cell_count(cfg)
+                index: mutable i64 = 1
+                while index <= total |ids, index, total|:
+                    ids.push(index)
+                    index <- index + 1
+                return ids
+        return active_position_ids(a, session_grid_size(cfg), cfg.grid_include_center, session_active_cell_limit(cfg), 2)
+
+# ---------------------------------------------------------------------------
+# state.stats.session: the per-field history streams
+# ---------------------------------------------------------------------------
+
+# One i64 stream per STIMULUS_FIELDS entry, indexed by stimulus_field_code.
+# The reference's dict has more keys than this -- the `_input` / `_rt` answer
+# streams, and an 'image' stream that mirrors 'vis' -- but stimulus generation
+# reads only the stimulus streams, and 'image' is never a history key ('image'
+# as a MODALITY resolves its history to 'vis'; see current_and_history_keys).
+struct SessionHistory:
+    streams: darray[darray[i64]]
+
+def session_history_new(a: mutable Arena&) -> SessionHistory:
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            streams: mutable darray[darray[i64]] = []
+            index: mutable i64 = 0
+            while index < STIMULUS_FIELD_COUNT |streams, index|:
+                empty: mutable darray[i64] = []
+                streams.push(empty)
+                index <- index + 1
+            return SessionHistory{streams: streams}
+
+def history_stream(hist: SessionHistory&, field: StimField) -> darray[i64]:
+    can Abort.Panic:
+        return hist.streams[stimulus_field_code(field).usize()]
+
+def history_length(hist: SessionHistory&, field: StimField) -> i64:
+    can Abort.Panic:
+        stream: darray[i64] = history_stream(hist, field)
+        return stream.count.i64()
+
+struct HistoryLookup:
+    ok: bool
+    value: i64
+
+# `session[key][index]` with Python's list semantics: a negative index counts
+# back from the end, anything still out of range raises IndexError. `ok` is
+# false exactly where the reference would raise.
+def history_lookup(hist: SessionHistory&, field: StimField, index: i64) -> HistoryLookup:
+    can Abort.Panic:
+        stream: darray[i64] = history_stream(hist, field)
+        length: i64 = stream.count.i64()
+        wrapped: i64 = index + length if index < 0 else index
+        HistoryLookup{ok: false, value: 0} return if wrapped < 0 or wrapped >= length
+        return HistoryLookup{ok: true, value: get stream[wrapped.usize()] else 0}
+
+# The stimulus half of stats.save_input(): append this trial's current_stim to
+# the history streams. It lives here rather than in a stats port because
+# generate_stimulus is meaningless without the history it reads back, and the
+# reference's loop is over `mode.current_stim.items()` -- which is exactly
+# STIMULUS_FIELDS order. The 'numbers' stream is current_stim['number'] (the
+# only key the reference renames), so the field code carries it unchanged.
+def history_record_stimulus(a: mutable Arena&, hist: mutable SessionHistory&, game: Mode&):
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            index: mutable i64 = 0
+            while index < STIMULUS_FIELD_COUNT |a, hist, game, index|:
+                stream: mutable darray[i64] = hist.streams[index.usize()]
+                stream.push(game.current_stim[index.usize()])
+                hist.streams[index.usize()] <- stream
+                index <- index + 1
+
+# The variable-length session buffers that hang off state.mode upstream.
+struct SessionBuffers:
+    # Mutable because the caller records each finished trial into it between
+    # calls; generate_stimulus itself only ever reads.
+    history: mutable SessionHistory
+    # Mode.variable_list: per-trial n-back levels, VARIABLE_NBACK only.
+    variable_list: darray[i64]
+    # Mode.bt_sequence: the fixed Jaeggi sequence, [positions, audio].
+    bt_positions: darray[i64]
+    bt_audio: darray[i64]
+
+# ---------------------------------------------------------------------------
+# Stimulus fields
+# ---------------------------------------------------------------------------
+
+# 'position%i' % index and 'vis%i' % index as stimulus fields. index is 1..4;
+# the reference's format string would happily build 'position5', but every call
+# site is bounded by multi <= 4, so out-of-range falls back on slot 1 the same
+# way gamemode.elisa's position_modality does.
+def position_field(index: i64) -> StimField:
+    StimField.Position2 return if index == 2
+    StimField.Position3 return if index == 3
+    StimField.Position4 return if index == 4
+    return StimField.Position1
+
+def vis_field(index: i64) -> StimField:
+    StimField.Vis2 return if index == 2
+    StimField.Vis3 return if index == 3
+    StimField.Vis4 return if index == 4
+    return StimField.Vis1
+
+def stim_get(game: Mode&, field: StimField) -> i64:
+    can Abort.Panic:
+        code: i64 = stimulus_field_code(field)
+        0 return if code < 0 or code >= STIMULUS_FIELD_COUNT
+        return game.current_stim[code.usize()]
+
+def stim_set(game: mutable Mode&, field: StimField, value: i64):
+    can Abort.Panic:
+        code: i64 = stimulus_field_code(field)
+        if code >= 0 and code < STIMULUS_FIELD_COUNT:
+            game.current_stim[code.usize()] <- value
+
+# `mod.startswith('position')`, and the 1-based slot it names.
+def modality_position_slot(value: Modality) -> i64:
+    1 return if value == Modality.Position1
+    2 return if value == Modality.Position2
+    3 return if value == Modality.Position3
+    4 return if value == Modality.Position4
+    return 0
+
+# _current_and_history_keys: which stimulus a modality SHOWS, and which history
+# stream it is MATCHED against. The combination modes cross the channels --
+# 'visaudio' shows the visual stimulus and matches the audio history, and
+# 'audiovis' the reverse.
+#
+# `ok` is false for 'arithmetic', whose pair ('arithmetic', 'arithmetic') names
+# no stimulus field and no history stream at all. _plant_matches skips it before
+# ever asking, so the reference never notices.
+struct StimKeys:
+    ok: bool
+    current: StimField
+    history: StimField
+
+def current_and_history_keys(value: Modality) -> StimKeys:
+    match value:
+        Modality.VisVis:
+            return StimKeys{ok: true, current: StimField.Vis, history: StimField.Vis}
+        Modality.VisAudio:
+            return StimKeys{ok: true, current: StimField.Vis, history: StimField.Audio}
+        Modality.AudioVis:
+            return StimKeys{ok: true, current: StimField.Audio, history: StimField.Vis}
+        Modality.Image:
+            return StimKeys{ok: true, current: StimField.Vis, history: StimField.Vis}
+        Modality.Position1:
+            return StimKeys{ok: true, current: StimField.Position1, history: StimField.Position1}
+        Modality.Position2:
+            return StimKeys{ok: true, current: StimField.Position2, history: StimField.Position2}
+        Modality.Position3:
+            return StimKeys{ok: true, current: StimField.Position3, history: StimField.Position3}
+        Modality.Position4:
+            return StimKeys{ok: true, current: StimField.Position4, history: StimField.Position4}
+        Modality.Color:
+            return StimKeys{ok: true, current: StimField.Color, history: StimField.Color}
+        Modality.Vis1:
+            return StimKeys{ok: true, current: StimField.Vis1, history: StimField.Vis1}
+        Modality.Vis2:
+            return StimKeys{ok: true, current: StimField.Vis2, history: StimField.Vis2}
+        Modality.Vis3:
+            return StimKeys{ok: true, current: StimField.Vis3, history: StimField.Vis3}
+        Modality.Vis4:
+            return StimKeys{ok: true, current: StimField.Vis4, history: StimField.Vis4}
+        Modality.Audio:
+            return StimKeys{ok: true, current: StimField.Audio, history: StimField.Audio}
+        Modality.Audio2:
+            return StimKeys{ok: true, current: StimField.Audio2, history: StimField.Audio2}
+        Modality.Arithmetic:
+            return StimKeys{ok: false, current: StimField.Number, history: StimField.Number}
+
+# ---------------------------------------------------------------------------
+# Outcomes
+# ---------------------------------------------------------------------------
+
+# Where the reference raises rather than returning, the port reports a status.
+# A session that reaches anything other than Ok is over -- the exception
+# escapes generate_stimulus and takes the trial phase machine with it.
+enum GenerateStatus:
+    Ok
+    # short_mode_names[mode] / modalities[mode]: KeyError on an unknown mode.
+    UnknownMode
+    # random.choice([]) with every ARITHMETIC_USE_* switched off.
+    NoArithmeticOperations
+    # random.choice([]) with no acceptable divisor, i.e. max_number == 0.
+    NoDivisors
+    # `while number == 0: number = randint(min, max)` cannot terminate.
+    ZeroOperandStall
+    # mode.variable_list[...]: IndexError.
+    VariableIndex
+    # positions[...]: IndexError on a board capped below the multi count.
+    PositionIndex
+    # session[key][...]: IndexError.
+    HistoryIndex
+    # mode.bt_sequence[...][trial - 1]: IndexError in Jaeggi mode.
+    JaeggiIndex
+
+def generate_status_code(value: GenerateStatus) -> i64:
+    match value:
+        GenerateStatus.Ok:
+            return 0
+        GenerateStatus.UnknownMode:
+            return 1
+        GenerateStatus.NoArithmeticOperations:
+            return 2
+        GenerateStatus.NoDivisors:
+            return 3
+        GenerateStatus.ZeroOperandStall:
+            return 4
+        GenerateStatus.VariableIndex:
+            return 5
+        GenerateStatus.PositionIndex:
+            return 6
+        GenerateStatus.HistoryIndex:
+            return 7
+        GenerateStatus.JaeggiIndex:
+            return 8
+
+struct GenerateOutcome:
+    status: GenerateStatus
+    # _real_back() for this trial, and _current_variable_back(), both of which
+    # the reference computes internally and hands to _spawn_visuals.
+    real_back: i64
+    variable: i64
+
+# ---------------------------------------------------------------------------
+# _sample_random_stimuli
+# ---------------------------------------------------------------------------
+
+# Draw an independent random value for every stimulus field, and return the
+# sampled position ids so the planting pass can keep them consistent.
+#
+# `random.sample(active_ids, k)` draws from an arbitrary list, while
+# pyrandom's py_sample_range draws from a contiguous range. They are the same
+# call: CPython's sample() picks INDICES into the population and only then
+# looks values up, so sampling [0, n-1] yields exactly the indices sample()
+# would have used, and mapping them through active_ids finishes the job. The
+# random stream sees an identical sequence either way.
+def sample_random_stimuli(a: mutable Arena&, rng: mutable MT19937&, cfg: SessionCfg&, game: mutable Mode&) -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        active: darray[i64] = session_active_position_ids(a, cfg)
+        count: i64 = active.count.i64()
+        k_multi: i64 = 4 if count > 4 else count
+        in a:
+            positions: mutable darray[i64] = []
+            picks: darray[i64] = py_sample_range(a, rng, 0, count - 1, k_multi)
+            for pick in picks |positions, active|:
+                positions.push(get active[pick.usize()] else 0)
+            # zip(range(1, k+1), positions): the position is stored and a fresh
+            # vis value drawn for the SAME slot before moving on, so the draws
+            # interleave with the slots rather than coming in one block.
+            slot: mutable i64 = 1
+            while slot <= k_multi |game, positions, rng, slot, k_multi|:
+                stim_set(game, position_field(slot), get positions[(slot - 1).usize()] else 0)
+                stim_set(game, vis_field(slot), py_randint(rng, 1, 8))
+                slot <- slot + 1
+            stim_set(game, StimField.Vis, py_randint(rng, 1, 8))
+            stim_set(game, StimField.Audio, py_randint(rng, 1, 8))
+            stim_set(game, StimField.Audio2, py_randint(rng, 1, 8))
+            if cfg.grid_3d:
+                stim_set(game, StimField.Color, py_randint(rng, 1, session_3d_color_count(cfg)))
+            else:
+                stim_set(game, StimField.Color, py_randint(rng, 1, 8))
+            return positions
+
+# ---------------------------------------------------------------------------
+# _choose_arithmetic_operands
+# ---------------------------------------------------------------------------
+
+# `(Decimal(abs(nb)) / Decimal(abs(x))) % 1 in acceptable`, in exact integers.
+#
+# The quotient's fractional part is (|nb| mod |x|) / |x| exactly, so the
+# membership test is a cross-multiplication against each listed rational. That
+# is the same answer CPython's Decimal gives as long as the quotient fits the
+# default 28-digit context, which it does by a wide margin: operands are
+# bounded by ARITHMETIC_MAX_NUMBER (12 by default), so the quotient has at most
+# two integer digits and a terminating expansion never runs past a handful of
+# fractional ones. Only an ARITHMETIC_MAX_NUMBER around 10**25 could push the
+# rounding far enough to land on a listed value that the exact fraction misses.
+def fraction_is_acceptable(cfg: SessionCfg&, number_nback: i64, divisor: i64) -> bool:
+    can Abort.Panic:
+        numerator: i64 = number_nback if number_nback >= 0 else -number_nback
+        denominator: i64 = divisor if divisor >= 0 else -divisor
+        false return if denominator == 0
+        remainder: i64 = numerator % denominator
+        count: i64 = cfg.acceptable_fractions.count.i64()
+        index: mutable i64 = 0
+        while index < count |cfg, index, count, remainder, denominator|:
+            entry: Rational = cfg.acceptable_fractions[index.usize()]
+            true return if remainder * entry.denominator == entry.numerator * denominator
+            index <- index + 1
+        return false
+
+# Pick the operation and the operand for this trial.
+#
+# Called on EVERY trial of EVERY mode, not just arithmetic ones -- the operand
+# draw is part of the stream regardless of whether anything shows it. Only the
+# divisor search is conditional on the mode actually being an arithmetic one.
+def choose_arithmetic_operands(a: mutable Arena&, rng: mutable MT19937&, cfg: SessionCfg&, game: mutable Mode&, modalities: darray[Modality]&, hist: SessionHistory&) -> GenerateStatus:
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            operations: mutable darray[ArithOp] = []
+            if cfg.arithmetic_use_addition:
+                operations.push(ArithOp.Add)
+            if cfg.arithmetic_use_subtraction:
+                operations.push(ArithOp.Subtract)
+            if cfg.arithmetic_use_multiplication:
+                operations.push(ArithOp.Multiply)
+            if cfg.arithmetic_use_division:
+                operations.push(ArithOp.Divide)
+            enabled: i64 = operations.count.i64()
+            GenerateStatus.NoArithmeticOperations return if enabled == 0
+            # random.choice(seq) is seq[_randbelow(len(seq))].
+            picked: i64 = py_randbelow(rng, enabled.u64()).i64()
+            game.current_operation <- get operations[picked.usize()] else ArithOp.NoneOp
+
+            max_number: i64 = cfg.arithmetic_max_number
+            min_number: i64 = -max_number if cfg.arithmetic_use_negatives else 0
+
+            divides: bool = game.current_operation == ArithOp.Divide and modalities_contain(modalities, Modality.Arithmetic)
+            if not divides:
+                stim_set(game, StimField.Number, py_randint(rng, min_number, max_number))
+                return GenerateStatus.Ok
+
+            # No history to divide into yet; any non-zero operand will do. The
+            # reference loops until it draws one, which is a real rejection
+            # loop on the stream.
+            if history_length(hist, StimField.Position1) < game.back:
+                number: mutable i64 = 0
+                spins: mutable i64 = 0
+                while number == 0 and spins < 1000 |number, spins, rng, min_number, max_number|:
+                    number <- py_randint(rng, min_number, max_number)
+                    spins <- spins + 1
+                # Upstream this loop cannot exit when min == max == 0; the port
+                # reports a status instead of hanging.
+                GenerateStatus.ZeroOperandStall return if number == 0
+                stim_set(game, StimField.Number, number)
+                return GenerateStatus.Ok
+
+            # Only offer divisors that give an acceptable result. The guard
+            # above means trial_number - back - 1 >= 0 here.
+            behind: HistoryLookup = history_lookup(hist, StimField.Number, game.trial_number - game.back - 1)
+            GenerateStatus.HistoryIndex return if not behind.ok
+            number_nback: i64 = behind.value
+            possibilities: mutable darray[i64] = []
+            candidate: mutable i64 = min_number
+            while candidate <= max_number |cfg, possibilities, candidate, max_number, number_nback|:
+                if candidate != 0:
+                    # `number_nback % x == 0` asks about divisibility, which C's
+                    # truncating % and Python's flooring % agree on exactly.
+                    if number_nback % candidate == 0:
+                        possibilities.push(candidate)
+                    else:
+                        if fraction_is_acceptable(cfg, number_nback, candidate):
+                            possibilities.push(candidate)
+                candidate <- candidate + 1
+            offered: i64 = possibilities.count.i64()
+            GenerateStatus.NoDivisors return if offered == 0
+            choice: i64 = py_randbelow(rng, offered.u64()).i64()
+            stim_set(game, StimField.Number, get possibilities[choice.usize()] else 0)
+            return GenerateStatus.Ok
+
+# ---------------------------------------------------------------------------
+# _real_back and _current_variable_back
+# ---------------------------------------------------------------------------
+
+struct BackLookup:
+    ok: bool
+    value: i64
+
+# The lag this trial's matches should be planted at.
+#
+# Crab-back reverses each run of N stimuli, so the lag changes trial to trial.
+# Under VARIABLE_NBACK the lag is read out of the pre-drawn list instead -- with
+# the negative-index wrap noted at the top of the file, because _real_back runs
+# on every trial including the first `back`, where the index is negative.
+def real_back_checked(cfg: SessionCfg&, game: Mode&, crab: bool, variable_list: darray[i64]&) -> BackLookup:
+    can Abort.Panic:
+        back: mutable i64 = game.back
+        if crab:
+            back <- 1 + 2 * py_mod(game.trial_number - 1, game.back)
+        BackLookup{ok: true, value: back} return if not cfg.variable_nback
+        length: i64 = variable_list.count.i64()
+        raw: i64 = game.trial_number - back - 1
+        wrapped: i64 = raw + length if raw < 0 else raw
+        BackLookup{ok: false, value: 0} return if wrapped < 0 or wrapped >= length
+        return BackLookup{ok: true, value: get variable_list[wrapped.usize()] else 0}
+
+# The n this trial is really testing, under variable n-back; 0 otherwise.
+# Guarded by trial_number > back, so unlike _real_back this index is never
+# negative.
+def current_variable_back_checked(cfg: SessionCfg&, game: Mode&, variable_list: darray[i64]&) -> BackLookup:
+    can Abort.Panic:
+        BackLookup{ok: true, value: 0} return if not cfg.variable_nback
+        BackLookup{ok: true, value: 0} return if game.trial_number <= game.back
+        length: i64 = variable_list.count.i64()
+        raw: i64 = game.trial_number - 1 - game.back
+        wrapped: i64 = raw + length if raw < 0 else raw
+        BackLookup{ok: false, value: 0} return if wrapped < 0 or wrapped >= length
+        return BackLookup{ok: true, value: get variable_list[wrapped.usize()] else 0}
+
+# ---------------------------------------------------------------------------
+# _interference_back
+# ---------------------------------------------------------------------------
+
+struct InterferenceResult:
+    # False where the reference would raise IndexError reading the history.
+    ok: bool
+    # False for the reference's None: no offset produced a different stimulus.
+    found: bool
+    back: i64
+
+# A lag near real_back whose stimulus differs: a near miss.
+#
+# The candidate offsets are one trial early, one trial late, and a whole cycle
+# late. At a real lag below 3 the "one early" candidate is dropped -- crab mode
+# and 2-back cannot look back one further. The list is then SHUFFLED, which
+# matters twice over: it consumes the random stream (two draws for three
+# offsets, one for two), and the loop keeps the LAST offset that works, so the
+# order decides which near miss is planted.
+def interference_back(a: mutable Arena&, rng: mutable MT19937&, game: Mode&, hist: SessionHistory&, field: StimField, real_back: i64) -> InterferenceResult:
+    can Memory.Allocate, Abort.Panic:
+        in a:
+            offsets: mutable darray[i64] = []
+            if real_back >= 3:
+                offsets.push(-1)
+            offsets.push(1)
+            offsets.push(game.back)
+            py_shuffle_i64(rng, &offsets)
+
+            target: HistoryLookup = history_lookup(hist, field, game.trial_number - real_back - 1)
+            InterferenceResult{ok: false, found: false, back: 0} return if not target.ok
+
+            ok: mutable bool = true
+            chosen: mutable i64 = real_back
+            for offset in offsets |ok, chosen, game, hist, field, real_back, target|:
+                index: i64 = game.trial_number - (real_back + offset) - 1
+                if index >= 0:
+                    entry: HistoryLookup = history_lookup(hist, field, index)
+                    if entry.ok:
+                        if entry.value != target.value:
+                            chosen <- real_back + offset
+                    else:
+                        ok <- false
+            InterferenceResult{ok: false, found: false, back: 0} return if not ok
+            InterferenceResult{ok: true, found: false, back: 0} return if chosen == real_back
+            return InterferenceResult{ok: true, found: true, back: chosen}
+
+# ---------------------------------------------------------------------------
+# _resolve_position_conflict
+# ---------------------------------------------------------------------------
+
+# Two stimuli must never land on the same cell; swap if they would.
+#
+# `others` is every OTHER multi slot. The reference materialises
+# `[positions[i - 1] for i in others]` before testing membership, so a slot
+# beyond the sampled positions raises IndexError even when an earlier slot
+# already matched -- that is why the bound check below comes before the
+# comparison and does not stop at the first hit.
+#
+# `positions.index(matching_stim)` then scans the WHOLE list, the modality's own
+# slot included. That can find the own slot once an earlier modality has planted
+# a duplicate, in which case the write is a no-op. Reproduced as written.
+def resolve_position_conflict(game: mutable Mode&, own_slot: i64, current: StimField, matching_stim: i64, positions: mutable darray[i64]&, multi: i64) -> bool:
+    can Abort.Panic:
+        length: i64 = positions.count.i64()
+        conflicts: mutable bool = false
+        slot: mutable i64 = 1
+        while slot <= multi |positions, conflicts, slot, multi, own_slot, matching_stim, length|:
+            if slot != own_slot:
+                false return if slot - 1 >= length
+                if (get positions[(slot - 1).usize()] else 0) == matching_stim:
+                    conflicts <- true
+            slot <- slot + 1
+        true return if not conflicts
+
+        found: mutable i64 = -1
+        scan: mutable i64 = 0
+        while scan < length and found < 0 |positions, found, scan, length, matching_stim|:
+            if (get positions[scan.usize()] else 0) == matching_stim:
+                found <- scan
+            scan <- scan + 1
+        true return if found < 0
+
+        moved: i64 = stim_get(game, current)
+        stim_set(game, position_field(found + 1), moved)
+        positions[found.usize()] <- moved
+        return true
+
+# ---------------------------------------------------------------------------
+# _plant_matches
+# ---------------------------------------------------------------------------
+
+# Rewrite some stimuli into matches or near-misses.
+#
+# Two random() draws per modality, always both, in that order. r1 forces a
+# guaranteed match; r2 -- scaled by 3/2 in multi-stim modes, leaving 33% of its
+# range for the multi reversal that follows -- forces a near miss instead.
+def plant_matches(a: mutable Arena&, rng: mutable MT19937&, cfg: SessionCfg&, game: mutable Mode&, modalities: darray[Modality]&, hist: SessionHistory&, positions: mutable darray[i64]&, multi: i64, real_back: i64) -> GenerateStatus:
+    can Memory.Allocate, Abort.Panic:
+        count: i64 = modalities.count.i64()
+        index: mutable i64 = 0
+        while index < count |a, rng, cfg, game, modalities, hist, positions, index, count, multi, real_back|:
+            modality: Modality = modalities[index.usize()]
+            if modality != Modality.Arithmetic:
+                keys: StimKeys = current_and_history_keys(modality)
+                r1: f64 = py_random(rng)
+                r2: mutable f64 = py_random(rng)
+                if multi > 1:
+                    r2 <- (3.0 / 2.0) * r2
+
+                # 0 stands in for the reference's None. `if not back: continue`
+                # treats a lag of 0 as absent too; see the header note.
+                back: mutable i64 = 0
+                if r1 < cfg.chance_of_guaranteed_match:
+                    back <- real_back
+                else:
+                    if r2 < cfg.chance_of_interference and game.back > 1:
+                        near: InterferenceResult = interference_back(a, rng, game, hist, keys.history, real_back)
+                        GenerateStatus.HistoryIndex return if not near.ok
+                        if near.found:
+                            back <- near.back
+
+                if back != 0:
+                    behind: HistoryLookup = history_lookup(hist, keys.history, game.trial_number - back - 1)
+                    GenerateStatus.HistoryIndex return if not behind.ok
+                    matching_stim: i64 = behind.value
+                    slot: i64 = modality_position_slot(modality)
+                    if multi > 1 and slot > 0:
+                        resolved: bool = resolve_position_conflict(game, slot, keys.current, matching_stim, positions, multi)
+                        GenerateStatus.PositionIndex return if not resolved
+                        # positions[int(current[-1]) - 1] = matching_stim, and
+                        # the reference raises here too on a capped board.
+                        GenerateStatus.PositionIndex return if slot - 1 >= positions.count.i64()
+                        positions[(slot - 1).usize()] <- matching_stim
+                    stim_set(game, keys.current, matching_stim)
+            index <- index + 1
+        return GenerateStatus.Ok
+
+# ---------------------------------------------------------------------------
+# _plant_multi_reversal
+# ---------------------------------------------------------------------------
+
+# Occasionally present the n-back stimuli in a rotated order: every slot shows
+# the value another slot showed `real_back` trials ago.
+#
+# The first draw always happens. The second happens ONLY when vis1 is among the
+# modalities, because `and` short-circuits -- get that backwards and every
+# later draw shifts.
+def plant_multi_reversal(rng: mutable MT19937&, cfg: SessionCfg&, game: mutable Mode&, modalities: darray[Modality]&, hist: SessionHistory&, positions: mutable darray[i64]&, multi: i64, real_back: i64) -> GenerateStatus:
+    can Abort.Panic:
+        GenerateStatus.Ok return if py_random(rng) >= cfg.chance_of_interference / 3.0
+        use_vis: mutable bool = false
+        if modalities_contain(modalities, Modality.Vis1):
+            use_vis <- py_random(rng) < 0.5
+        # random.choice(range(1, multi)) == 1 + _randbelow(multi - 1). For
+        # multi == 2 that is _randbelow(1), which still draws: CPython rejects
+        # every getrandbits(1) until it comes up 0.
+        offset: i64 = 1 + py_randbelow(rng, (multi - 1).u64()).i64()
+        length: i64 = positions.count.i64()
+        index: mutable i64 = 0
+        while index < multi |game, hist, positions, index, multi, offset, use_vis, real_back, length|:
+            source_slot: i64 = py_mod(index + offset, multi) + 1
+            source: StimField = vis_field(source_slot) if use_vis else position_field(source_slot)
+            behind: HistoryLookup = history_lookup(hist, source, game.trial_number - real_back - 1)
+            GenerateStatus.HistoryIndex return if not behind.ok
+            target: StimField = vis_field(index + 1) if use_vis else position_field(index + 1)
+            stim_set(game, target, behind.value)
+            if not use_vis:
+                GenerateStatus.PositionIndex return if index >= length
+                positions[index.usize()] <- behind.value
+            index <- index + 1
+        return GenerateStatus.Ok
+
+# ---------------------------------------------------------------------------
+# _apply_static_defaults
+# ---------------------------------------------------------------------------
+
+# Stimuli a mode does not use are pinned to a fixed value: position 0 is the
+# centre of the field, colour VISUAL_COLORS[0] is the default square colour, and
+# vis 0 is a plain square. Audio is never static -- it is simply not played.
+def apply_static_defaults(cfg: SessionCfg&, game: mutable Mode&, modalities: darray[Modality]&, multi: i64):
+    can Abort.Panic:
+        first_color: i64 = get cfg.visual_colors[0.usize()] else 0
+        if not modalities_contain(modalities, Modality.Color):
+            stim_set(game, StimField.Color, first_color)
+        if not modalities_contain(modalities, Modality.Position1):
+            stim_set(game, StimField.Position1, 0)
+        uses_vis: bool = modalities_contain(modalities, Modality.VisVis) or modalities_contain(modalities, Modality.Arithmetic) or modalities_contain(modalities, Modality.Image)
+        if not uses_vis:
+            stim_set(game, StimField.Vis, 0)
+        if multi > 1 and not modalities_contain(modalities, Modality.Vis1):
+            # range(1, 5): all four slots, whatever the multi count is.
+            filler: i64 = 0 if cfg.multi_mode_color else first_color
+            slot: mutable i64 = 1
+            while slot <= 4 |game, slot, filler|:
+                stim_set(game, vis_field(slot), filler)
+                slot <- slot + 1
+
+# ---------------------------------------------------------------------------
+# generate_stimulus
+# ---------------------------------------------------------------------------
+
+# `mode.modalities[mode.mode] != ['arithmetic']`: the pure arithmetic mode has
+# nothing to plant, so it skips the whole rewriting pass.
+def modalities_are_arithmetic_only(modalities: darray[Modality]&) -> bool:
+    can Abort.Panic:
+        false return if modalities.count.i64() != 1
+        return modalities[0.usize()] == Modality.Arithmetic
+
+# Choose and present the stimuli for the next trial.
+#
+# `game.trial_number` has already been incremented by the caller, and the
+# history holds trial_number - 1 completed trials -- the phase machine calls
+# stats.save_input() for the PREVIOUS trial just before bumping the counter.
+#
+# _queue_audio() and _spawn_visuals() are the two steps left out; neither draws
+# from the random stream, so the sequence below is complete.
+def generate_stimulus(a: mutable Arena&, rng: mutable MT19937&, cfg: SessionCfg&, tables: ModeTables&, game: mutable Mode&, buffers: SessionBuffers&) -> GenerateOutcome:
+    can Memory.Allocate, Abort.Panic:
+        miss: GenerateOutcome = GenerateOutcome{status: GenerateStatus.UnknownMode, real_back: 0, variable: 0}
+        entry_index: i64 = mode_index(tables, game.mode)
+        miss return if entry_index < 0
+        entry: ModeEntry = tables.entries[entry_index.usize()]
+        modalities: darray[Modality] = entry.modalities
+        multi: i64 = entry.flags.multi
+        crab: bool = entry.flags.crab == 1
+
+        positions: mutable darray[i64] = sample_random_stimuli(a, rng, cfg, game)
+
+        arithmetic: GenerateStatus = choose_arithmetic_operands(a, rng, cfg, game, &modalities, &buffers.history)
+        GenerateOutcome{status: arithmetic, real_back: 0, variable: 0} return if arithmetic != GenerateStatus.Ok
+
+        lag: BackLookup = real_back_checked(cfg, game, crab, &buffers.variable_list)
+        GenerateOutcome{status: GenerateStatus.VariableIndex, real_back: 0, variable: 0} return if not lag.ok
+        real_back: i64 = lag.value
+
+        if not modalities_are_arithmetic_only(&modalities) and game.trial_number > game.back:
+            planted: GenerateStatus = plant_matches(a, rng, cfg, game, &modalities, &buffers.history, &positions, multi, real_back)
+            GenerateOutcome{status: planted, real_back: real_back, variable: 0} return if planted != GenerateStatus.Ok
+            if multi > 1:
+                reversed: GenerateStatus = plant_multi_reversal(rng, cfg, game, &modalities, &buffers.history, &positions, multi, real_back)
+                GenerateOutcome{status: reversed, real_back: real_back, variable: 0} return if reversed != GenerateStatus.Ok
+
+        apply_static_defaults(cfg, game, &modalities, multi)
+
+        if cfg.jaeggi_mode:
+            slot: i64 = game.trial_number - 1
+            jaeggi_miss: GenerateOutcome = GenerateOutcome{status: GenerateStatus.JaeggiIndex, real_back: real_back, variable: 0}
+            jaeggi_miss return if slot < 0 or slot >= buffers.bt_positions.count.i64()
+            jaeggi_miss return if slot >= buffers.bt_audio.count.i64()
+            stim_set(game, StimField.Position1, get buffers.bt_positions[slot.usize()] else 0)
+            stim_set(game, StimField.Audio, get buffers.bt_audio[slot.usize()] else 0)
+
+        # _queue_audio() would play the sound here.
+        variable: BackLookup = current_variable_back_checked(cfg, game, &buffers.variable_list)
+        GenerateOutcome{status: GenerateStatus.VariableIndex, real_back: real_back, variable: 0} return if not variable.ok
+        # _spawn_visuals(multi, variable.value) would show the stimuli here.
+        return GenerateOutcome{status: GenerateStatus.Ok, real_back: real_back, variable: variable.value}
