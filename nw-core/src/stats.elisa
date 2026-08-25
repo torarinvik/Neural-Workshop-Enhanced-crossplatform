@@ -1,0 +1,239 @@
+# Stats-file parsing and day-score aggregation.
+#
+# Port of the stats kernels in bwaccel/fallback.py (GPL-2.0-or-later). The file
+# format is load-bearing: users have years of stats.txt history, so the parser
+# must accept exactly what the original accepted and reject exactly what it
+# skipped -- including the fixed CHARACTER offsets for the timestamp (the
+# reference slices line[0:4], line[5:7], ... before splitting on the separator).
+
+extern strtod(text: u8&, end: mutable u8&?&) -> f64
+extern rint(x: f64) -> f64
+
+const STATS_CATEGORY_COUNT: i64 = 16
+
+struct StatsRecord:
+    year: i64
+    month: i64
+    day: i64
+    hour: i64
+    minute: i64
+    second: i64
+    percent: i64
+    mode: i64
+    nback: i64
+    ticks: i64
+    trials: i64
+    manual: i64
+    session: i64
+    sesstime: i64
+    cats: mutable i64[16]
+
+struct ParsedInt:
+    ok: bool
+    value: i64
+
+def is_ascii_digit(byte: u8) -> bool:
+    return byte >= 48.u8() and byte <= 57.u8()
+
+def is_ascii_space(byte: u8) -> bool:
+    return byte == 32.u8() or (byte >= 9.u8() and byte <= 13.u8())
+
+# CPython's int(str): optional surrounding whitespace, optional sign, then one
+# or more digits and nothing else. (Underscore digit separators are legal in
+# CPython but never appear in a machine-written stats file; they are rejected
+# here and the sweep does not exercise them.)
+def py_parse_int(view: sview) -> ParsedInt:
+    can Abort.Panic:
+        length: i64 = sview_len(view).i64()
+        start: mutable i64 = 0
+        while start < length and is_ascii_space(sview_at(view, start.usize())) |start, view, length|:
+            start <- start + 1
+        stop: mutable i64 = length
+        while stop > start and is_ascii_space(sview_at(view, (stop - 1).usize())) |stop, start, view|:
+            stop <- stop - 1
+        ParsedInt{ok: false, value: 0} return if stop <= start
+
+        negative: mutable bool = false
+        cursor: mutable i64 = start
+        first: u8 = sview_at(view, cursor.usize())
+        if first == 43.u8() or first == 45.u8():
+            negative <- first == 45.u8()
+            cursor <- cursor + 1
+        ParsedInt{ok: false, value: 0} return if cursor >= stop
+
+        magnitude: mutable i64 = 0
+        while cursor < stop |cursor, magnitude, view, stop|:
+            byte: u8 = sview_at(view, cursor.usize())
+            if not is_ascii_digit(byte):
+                return ParsedInt{ok: false, value: 0}
+            magnitude <- magnitude * 10 + (byte - 48.u8()).i64()
+            cursor <- cursor + 1
+        return ParsedInt{ok: true, value: -magnitude if negative else magnitude}
+
+# The reference reads the timestamp by fixed character offsets, before any
+# splitting, and skips the line if any field is not an integer.
+def parse_int_span(view: sview, start: i64, stop: i64) -> ParsedInt:
+    can Abort.Panic:
+        return py_parse_int(string_view_slice(view, start, stop))
+
+# Score for one session under the selected graph style, matching the
+# reference's five cases.
+def day_score(style: i64, nback: f64, percent: f64, advance: f64, fallback: f64) -> f64:
+    if style == 0:
+        return nback
+    if style == 1:
+        return 0.01 * percent
+    if style == 2:
+        return nback + 0.01 * percent
+    if style == 3:
+        return nback - 1.0 + 2.0 * 0.01 * percent
+    # Style 4 rescales percent so that `fallback` maps to +0 and `advance` to +1.
+    denominator: f64 = advance - fallback
+    span: f64 = denominator if denominator != 0.0 else 1.0
+    slope: f64 = 1.0 / span
+    intercept: f64 = -slope * fallback
+    return nback + intercept + slope * percent
+
+struct DayScores:
+    mean: f64
+    best: f64
+
+# Collapse one day's sessions into a (mean, max) pair. `nbacks` and `percents`
+# are parallel, one entry per session.
+def aggregate_day_scores(style: i64, nbacks: darray[f64]&, percents: darray[f64]&, advance: f64, fallback: f64) -> DayScores:
+    can Abort.Panic:
+        count: i64 = nbacks.count.i64()
+        DayScores{mean: 0.0, best: 0.0} return if count == 0
+        total: mutable f64 = 0.0
+        best: mutable f64 = 0.0
+        index: mutable i64 = 0
+        while index < count |index, total, best, nbacks, percents, count, style, advance, fallback|:
+            nback: f64 = get nbacks[index.usize()] else 0.0
+            percent: f64 = get percents[index.usize()] else 0.0
+            score: f64 = day_score(style, nback, percent, advance, fallback)
+            total <- total + score
+            best <- score if index == 0 or score > best
+            index <- index + 1
+        return DayScores{mean: total / count.f64(), best: best}
+
+# CPython's float(str) for a column: whitespace-tolerant, whole-string. strtod
+# does the conversion so the rounding matches libm exactly; anything left over
+# other than whitespace makes it a failure, as float() would raise.
+# (Hex-float literals, which strtod accepts and float() rejects, are not
+# exercised by any stats file.)
+struct ParsedFloat:
+    ok: bool
+    value: f64
+
+def py_parse_float(view: sview) -> ParsedFloat:
+    can Abort.Panic:
+        trusted Unsafe.PointerCast:
+            length: i64 = sview_len(view).i64()
+            ParsedFloat{ok: false, value: 0.0} return if length <= 0 or length >= 63
+            buffer: u8[64] = zeroed
+            index: mutable i64 = 0
+            while index < length |index, buffer, view|:
+                buffer[index.usize()] <- sview_at(view, index.usize())
+                index <- index + 1
+            buffer[length.usize()] <- 0
+            tail_pointer: mutable u8&? = null
+            parsed: f64 = strtod(&buffer[0], &tail_pointer)
+            ParsedFloat{ok: false, value: 0.0} return if tail_pointer == null
+            consumed: mutable i64 = (tail_pointer.uintptr() - (&buffer[0]).uintptr()).i64()
+            ParsedFloat{ok: false, value: 0.0} return if consumed == 0
+            while consumed < length and is_ascii_space(buffer[consumed.usize()]) |consumed, buffer, length|:
+                consumed <- consumed + 1
+            ParsedFloat{ok: false, value: 0.0} return if consumed != length
+            return ParsedFloat{ok: true, value: parsed}
+
+# One column of a separator-split line, or an empty view past the end.
+def column_at(columns: darray[sview]&, index: i64) -> sview:
+    can Abort.Panic:
+        return get columns[index.usize()] else ""
+
+# `_ival`: the column as an int, or `fallback` when absent or unparseable.
+def column_int(columns: darray[sview]&, index: i64, fallback: i64) -> i64:
+    can Abort.Panic:
+        fallback return if index >= columns.count.i64()
+        parsed: ParsedInt = py_parse_int(column_at(columns, index))
+        return parsed.value if parsed.ok else fallback
+
+# Parse a whole stats file into one record per recorded session. Lines that do
+# not start with a digit, are shorter than a timestamp, carry a malformed
+# timestamp, or have fewer than nine columns are skipped in silence -- exactly
+# as the reference does, so an old or hand-edited file reads the same.
+def parse_stats_text(a: mutable Arena&, text: sview) -> darray[StatsRecord]:
+    can Memory.Allocate, Abort.Panic:
+        length: i64 = sview_len(text).i64()
+        in a:
+            records: mutable darray[StatsRecord] = []
+            line_start: mutable i64 = 0
+            while line_start <= length |line_start, records, text, length|:
+                # Find the end of this line, accepting \n, \r\n and a lone \r.
+                line_end: mutable i64 = line_start
+                while line_end < length |line_end, text, length|:
+                    byte: u8 = sview_at(text, line_end.usize())
+                    break if byte == 10.u8() or byte == 13.u8()
+                    line_end <- line_end + 1
+                next_start: mutable i64 = line_end + 1
+                if line_end < length and sview_at(text, line_end.usize()) == 13.u8():
+                    if line_end + 1 < length and sview_at(text, (line_end + 1).usize()) == 10.u8():
+                        next_start <- line_end + 2
+                line: sview = string_view_slice(text, line_start, line_end)
+                line_length: i64 = line_end - line_start
+                parse_line_into(a, line, line_length, &records)
+
+                break if line_end >= length
+                line_start <- next_start
+            return records
+
+def parse_line_into(a: mutable Arena&, line: sview, line_length: i64, records: mutable darray[StatsRecord]&):
+    can Memory.Allocate, Abort.Panic:
+        return if line_length < 19
+        return if not is_ascii_digit(sview_at(line, 0.usize()))
+
+        year: ParsedInt = parse_int_span(line, 0, 4)
+        month: ParsedInt = parse_int_span(line, 5, 7)
+        day: ParsedInt = parse_int_span(line, 8, 10)
+        hour: ParsedInt = parse_int_span(line, 11, 13)
+        minute: ParsedInt = parse_int_span(line, 14, 16)
+        second: ParsedInt = parse_int_span(line, 17, 19)
+        return if not (year.ok and month.ok and day.ok and hour.ok and minute.ok and second.ok)
+
+        separator: u8 = 9.u8() if sview_contains_byte(line, 9.u8()) else 44.u8()
+        in a:
+            columns: mutable darray[sview] = []
+            field_start: mutable i64 = 0
+            index: mutable i64 = 0
+            while index <= line_length |index, field_start, columns, line, line_length, separator|:
+                at_end: bool = index == line_length
+                if at_end or sview_at(line, index.usize()) == separator:
+                    columns.push(string_view_slice(line, field_start, index))
+                    field_start <- index + 1
+                index <- index + 1
+            return if columns.count.i64() < 9
+
+            sesstime: mutable i64 = 0
+            if columns.count.i64() > 25:
+                seconds: ParsedFloat = py_parse_float(column_at(columns, 25))
+                if seconds.ok:
+                    sesstime <- rint(seconds.value).i64()
+
+            record: mutable StatsRecord = StatsRecord{
+                year: year.value, month: month.value, day: day.value,
+                hour: hour.value, minute: minute.value, second: second.value,
+                percent: column_int(&columns, 2, 0),
+                mode: column_int(&columns, 3, 0),
+                nback: column_int(&columns, 4, 0),
+                ticks: column_int(&columns, 5, 0),
+                trials: column_int(&columns, 6, 0),
+                manual: column_int(&columns, 7, 0),
+                session: column_int(&columns, 8, 0),
+                sesstime: sesstime,
+                cats: zeroed,
+            }
+            category: mutable i64 = 0
+            while category < STATS_CATEGORY_COUNT |category, record, columns|:
+                record.cats[category.usize()] <- column_int(&columns, 9 + category, 0)
+                category <- category + 1
+            records.push(record)

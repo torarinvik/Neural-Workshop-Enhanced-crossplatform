@@ -15,7 +15,7 @@ STAGES="${1:-both}"
 BUILD="$ROOT/build"
 mkdir -p "$BUILD"
 
-SUITES=(scheduling board nback pyrandom stimulus)
+SUITES=(scheduling board nback pyrandom stimulus stats)
 
 failures=0
 run_suite() {
