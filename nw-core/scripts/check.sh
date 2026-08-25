@@ -15,7 +15,7 @@ STAGES="${1:-both}"
 BUILD="$ROOT/build"
 mkdir -p "$BUILD"
 
-SUITES=(scheduling board nback pyrandom stimulus stats matching display config)
+SUITES=(scheduling board nback pyrandom stimulus stats matching display config gamemode)
 
 # Suites that cannot yet build under stage1. `config` uses darray[sview], which
 # instantiates the std's `impl[T] Store for darray[T]` -- a generic protocol
