@@ -1,0 +1,104 @@
+# Stimulus construction: the random-draw kernels of bwaccel/fallback.py.
+#
+# These consume the Mersenne Twister stream in CPython's exact order (see
+# pyrandom.elisa), so a session seeded the same way produces the same trials as
+# the original game. That is the whole point: stats files, replays and the
+# Jaeggi protocol all assume a reproducible sequence.
+
+extern pow(base: f64, exponent: f64) -> f64
+
+error StimulusError:
+    BadTrialCount
+    UnrealizableMatches
+    TooFewChoices
+
+# A value in [1, high] deliberately not equal to `previous`.
+def nonmatch_choice(rng: mutable MT19937&, previous: i64, high: i64) -> i64:
+    can Abort.Panic:
+        drawn: mutable i64 = py_randint(rng, 1, high)
+        if drawn == previous:
+            drawn <- 1 if drawn == high else drawn + 1
+        return drawn
+
+# Per-trial n-back levels for variable n-back mode. Beta(back/2, 1) == U^(2/back).
+def variable_nback_list(a: mutable Arena&, rng: mutable MT19937&, count: i64, back: i64) -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        inverse: f64 = 2.0 / back.f64()
+        in a:
+            levels: mutable darray[i64] = []
+            index: mutable i64 = 0
+            while index < count |index, levels, rng, inverse, back|:
+                drawn: mutable f64 = py_random(rng)
+                drawn <- 0.000000000001 if drawn <= 0.0
+                level: mutable i64 = (pow(drawn, inverse) * back.f64() + 1.0).i64()
+                level <- 1 if level < 1
+                level <- back if level > back
+                levels.push(level)
+                index <- index + 1
+            return levels
+
+# k distinct integers drawn from [low, high].
+def sample_unique(a: mutable Arena&, rng: mutable MT19937&, low: i64, high: i64, k: i64) -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        return py_sample_range(a, rng, low, high, k)
+
+struct BtSequence:
+    positions: darray[i64]
+    audio: darray[i64]
+
+# Construct a dual n-back sequence with EXACT match counts in O(T).
+#
+# n_both trials match in both modalities, n_pos/n_audio are the per-modality
+# totals (so each includes the both-matches), and the remainder match in
+# neither. The kind vector is shuffled, then each trial either copies the value
+# n back or deliberately avoids it.
+def compute_bt_sequence(a: mutable Arena&, rng: mutable MT19937&, num_trials: i64, nback: i64, n_pos: i64, n_audio: i64, n_both: i64, pos_choices: i64, audio_choices: i64) -> BtSequence error[StimulusError]:
+    can Memory.Allocate, Abort.Panic:
+        span: i64 = num_trials - nback
+        if num_trials < 1 or nback < 1 or span < 1:
+            raise StimulusError.BadTrialCount
+        if n_both < 0 or n_pos < n_both or n_audio < n_both:
+            raise StimulusError.UnrealizableMatches
+        if pos_choices < 2 or audio_choices < 2:
+            raise StimulusError.TooFewChoices
+        n_pos_only: i64 = n_pos - n_both
+        n_aud_only: i64 = n_audio - n_both
+        n_neither: i64 = span - n_pos_only - n_aud_only - n_both
+        if n_neither < 0:
+            raise StimulusError.UnrealizableMatches
+
+        in a:
+            # Bit 0 = position matches, bit 1 = audio matches.
+            kinds: mutable darray[i64] = []
+            for _both in 0..<n_both |kinds|:
+                kinds.push(3)
+            for _pos in 0..<n_pos_only |kinds|:
+                kinds.push(1)
+            for _aud in 0..<n_aud_only |kinds|:
+                kinds.push(2)
+            for _none in 0..<n_neither |kinds|:
+                kinds.push(0)
+            py_shuffle_i64(rng, &kinds)
+
+            positions: mutable darray[i64] = []
+            audio: mutable darray[i64] = []
+            # The reference fills both priming runs before the main loop, so the
+            # draws interleave as position-run then audio-run, not pairwise.
+            for _prime in 0..<nback |positions, rng, pos_choices|:
+                positions.push(py_randint(rng, 1, pos_choices))
+            for _prime in 0..<nback |audio, rng, audio_choices|:
+                audio.push(py_randint(rng, 1, audio_choices))
+
+            for kind in kinds |positions, audio, rng, nback, pos_choices, audio_choices|:
+                previous_position: i64 = get positions[(positions.count.i64() - nback).usize()] else 1
+                if kind % 2 == 1:
+                    positions.push(previous_position)
+                else:
+                    positions.push(nonmatch_choice(rng, previous_position, pos_choices))
+                previous_audio: i64 = get audio[(audio.count.i64() - nback).usize()] else 1
+                if kind >= 2:
+                    audio.push(previous_audio)
+                else:
+                    audio.push(nonmatch_choice(rng, previous_audio, audio_choices))
+
+            return BtSequence{positions: positions, audio: audio}
