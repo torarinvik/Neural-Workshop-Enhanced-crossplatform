@@ -1,0 +1,128 @@
+# CPython `random` compatibility layer over the std's MT19937.
+#
+# elisacore_rng gives us the Mersenne Twister core and CPython's exact
+# random()/seeding. This adds the derived operations the ported kernels need --
+# getrandbits, _randbelow, randint, shuffle and sample -- reproducing CPython's
+# algorithms step for step so a seeded stream matches the original game's.
+#
+# Reference: Lib/random.py and Modules/_randommodule.c. The algorithms below
+# have been stable across CPython 3.9-3.13; sample()'s setsize heuristic is the
+# one piece that has moved historically, so it is differentially tested.
+
+# genrand_uint32() >> (32 - k) for k <= 32; little-endian word pair above that.
+# CPython builds an arbitrary-width integer here; we cap at 64 bits, which
+# covers every use in this port.
+def py_getrandbits(rng: mutable MT19937&, k: i64) -> u64:
+    can Abort.Panic:
+        0.u64() return if k <= 0
+        if k <= 32:
+            return mt_genrand_uint32(rng).u64() >> (32 - k).u64()
+        low: u64 = mt_genrand_uint32(rng).u64()
+        remaining: i64 = k - 32
+        high: u64 = mt_genrand_uint32(rng).u64() >> (32 - remaining).u64()
+        return low | (high << 32.u64())
+
+# Number of bits needed to represent `value`; 0 for 0, as int.bit_length() does.
+def py_bit_length(value: u64) -> i64:
+    bits: mutable i64 = 0
+    rest: mutable u64 = value
+    while rest != 0.u64():
+        bits <- bits + 1
+        rest <- rest >> 1.u64()
+    return bits
+
+# _randbelow_with_getrandbits: a uniform int in [0, n) by rejection on the
+# bit_length of n. Note CPython uses n.bit_length(), not (n-1), so for a power
+# of two it draws one bit more than strictly needed and rejects half.
+def py_randbelow(rng: mutable MT19937&, n: u64) -> u64:
+    can Abort.Panic:
+        0.u64() return if n == 0.u64()
+        k: i64 = py_bit_length(n)
+        drawn: mutable u64 = py_getrandbits(rng, k)
+        while drawn >= n |drawn, rng, k|:
+            drawn <- py_getrandbits(rng, k)
+        return drawn
+
+# randint(a, b) == randrange(a, b + 1) == a + _randbelow(b + 1 - a).
+def py_randint(rng: mutable MT19937&, low: i64, high: i64) -> i64:
+    can Abort.Panic:
+        low return if high <= low
+        width: u64 = (high + 1 - low).u64()
+        return low + py_randbelow(rng, width).i64()
+
+# random.random(): the 53-bit double CPython produces.
+def py_random(rng: mutable MT19937&) -> f64:
+    can Abort.Panic:
+        return mt_random_res53(rng)
+
+# random.shuffle(x): Fisher-Yates walking down from the last index.
+def py_shuffle_i64(rng: mutable MT19937&, values: mutable darray[i64]&):
+    can Abort.Panic:
+        count: i64 = values.count.i64()
+        return if count < 2
+        index: mutable i64 = count - 1
+        while index >= 1 |index, values, rng|:
+            pick: i64 = py_randbelow(rng, (index + 1).u64()).i64()
+            swapped: i64 = get values[index.usize()] else 0
+            values[index.usize()] <- get values[pick.usize()] else 0
+            values[pick.usize()] <- swapped
+            index <- index - 1
+
+# ceil(log(m, 4)) as CPython computes it for sample()'s setsize, but in exact
+# integers: the smallest e with 4**e >= m. The float form (`4 ** _ceil(_log(k *
+# 3, 4))`) can land either side of an exact power of four depending on libm, so
+# the integer form is both faithful and reproducible.
+def py_ceil_log4(m: i64) -> i64:
+    exponent: mutable i64 = 0
+    power: mutable i64 = 1
+    while power < m |power, exponent, m|:
+        power <- power * 4
+        exponent <- exponent + 1
+    return exponent
+
+# random.sample(range(lo, hi + 1), k). CPython picks between a pool copy and a
+# selected-set by comparing the population size against a setsize heuristic;
+# the two consume the random stream differently, so the branch must match.
+def py_sample_range(a: mutable Arena&, rng: mutable MT19937&, low: i64, high: i64, k: i64) -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        population: i64 = high + 1 - low
+        in a:
+            result: mutable darray[i64] = []
+            result return if k <= 0 or population <= 0 or k > population
+
+            setsize: mutable i64 = 21
+            if k > 5:
+                power: mutable i64 = 1
+                steps: i64 = py_ceil_log4(k * 3)
+                for _step in 0..<steps |power|:
+                    power <- power * 4
+                setsize <- setsize + power
+
+            if population <= setsize:
+                pool: mutable darray[i64] = []
+                for offset in 0..<population |pool, low|:
+                    pool.push(low + offset)
+                index: mutable i64 = 0
+                while index < k |index, pool, result, rng, population|:
+                    pick: i64 = py_randbelow(rng, (population - index).u64()).i64()
+                    result.push(get pool[pick.usize()] else 0)
+                    # Move a non-selected item into the vacancy.
+                    pool[pick.usize()] <- get pool[(population - index - 1).usize()] else 0
+                    index <- index + 1
+                return result
+
+            selected: mutable darray[i64] = []
+            index: mutable i64 = 0
+            while index < k |index, selected, result, rng, population, low|:
+                pick: mutable i64 = py_randbelow(rng, population.u64()).i64()
+                taken: mutable bool = true
+                while taken |taken, pick, selected, rng, population|:
+                    taken <- false
+                    for seen in selected |taken, pick|:
+                        taken <- true if seen == pick
+                    if taken:
+                        pick <- py_randbelow(rng, population.u64()).i64()
+                selected.push(pick)
+                result.push(low + pick)
+                index <- index + 1
+            return result
