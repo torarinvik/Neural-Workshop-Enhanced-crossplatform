@@ -18,4 +18,10 @@ wasm-ld --no-entry --export-dynamic --allow-undefined \
     -o "$ROOT/build/nwcore.wasm" "$ROOT/build/nwcore_wasm.o"
 
 printf 'wasm: %s bytes\n' "$(wc -c < "$ROOT/build/nwcore.wasm" | tr -d ' ')"
+
+# Typed JS/TS bindings, the web twin of `-emit pymodule-pyi`. Derived from the
+# emitted binary, so they cannot drift from what was actually built.
+python3 "$ROOT/scripts/gen_wasm_bindings.py" "$ROOT/build/nwcore.wasm" \
+    --out "$ROOT/build/nwcore" >/dev/null
+
 node "$ROOT/test/wasm_diff.mjs"
