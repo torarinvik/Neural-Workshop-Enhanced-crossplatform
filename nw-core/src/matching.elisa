@@ -1,0 +1,138 @@
+# Deciding whether the current stimulus matches the one N trials back.
+#
+# Port of neural_workshop/matching.py (GPL-2.0-or-later). This is the scoring
+# rule of the whole game.
+#
+# The reference reads mutable module singletons (state.mode, state.cfg); here
+# the same values arrive in an explicit MatchContext, which is the refactor the
+# port needs anyway -- a statically linked core cannot rebind a global on a
+# profile switch.
+#
+# Arithmetic n-back is deliberately absent: its verdict compares exact Decimal
+# values, so it waits on a decimal implementation.
+
+enum Verdict:
+    Correct
+    Incorrect
+    Missed
+    Unknown
+
+# Which stimulus stream supplies the value, and which supplies the history.
+# The combination modes cross the channels: `visaudio` compares the current
+# VISUAL stimulus against the AUDIO history, and `audiovis` the reverse.
+enum StimChannel:
+    Vis
+    Audio
+    Own
+
+enum MatchInput:
+    VisVis
+    VisAudio
+    AudioVis
+    Image
+    Direct
+
+struct ChannelPair:
+    current: StimChannel
+    history: StimChannel
+
+def channels_for(input_type: MatchInput) -> ChannelPair:
+    match input_type:
+        MatchInput.VisVis:
+            return ChannelPair{current: StimChannel.Vis, history: StimChannel.Vis}
+        MatchInput.Image:
+            return ChannelPair{current: StimChannel.Vis, history: StimChannel.Vis}
+        MatchInput.VisAudio:
+            return ChannelPair{current: StimChannel.Vis, history: StimChannel.Audio}
+        MatchInput.AudioVis:
+            return ChannelPair{current: StimChannel.Audio, history: StimChannel.Vis}
+        MatchInput.Direct:
+            return ChannelPair{current: StimChannel.Own, history: StimChannel.Own}
+
+struct MatchContext:
+    crab: bool
+    back: i64
+    trial_number: i64
+    variable_nback: bool
+
+# How many trials back the comparison reaches on THIS trial. Crab-back
+# reverses each run of N stimuli, so the distance changes trial to trial
+# rather than staying at N.
+def effective_back(ctx: MatchContext&) -> i64:
+    if ctx.crab:
+        return 1 + 2 * ((ctx.trial_number - 1) % ctx.back)
+    return ctx.back
+
+struct IndexLookup:
+    ok: bool
+    index: i64
+
+# Index into the session history of the trial being compared against.
+#
+# Two upstream behaviours are reproduced deliberately rather than corrected:
+#
+#  * The reference carries a FIXME noting that whether crab-back composes with
+#    VARIABLE_NBACK is unresolved. Preserved as-is; this port is not the place
+#    to decide it.
+#  * `variable_list[trial_number - back - 1]` can go NEGATIVE on early trials,
+#    and Python silently wraps a negative index to the end of the list -- so the
+#    offset comes from the LAST entries rather than raising. Differential
+#    testing caught this; it looks like a latent upstream bug, but the port's
+#    job is to behave identically, not to fix it quietly. `ok` is false exactly
+#    where Python would raise IndexError instead.
+def nback_trial_index_checked(ctx: MatchContext&, back: i64, variable_list: darray[i64]&) -> IndexLookup:
+    can Abort.Panic:
+        if not ctx.variable_nback:
+            return IndexLookup{ok: true, index: ctx.trial_number - back - 1}
+        length: i64 = variable_list.count.i64()
+        raw: i64 = ctx.trial_number - back - 1
+        wrapped: i64 = raw + length if raw < 0 else raw
+        IndexLookup{ok: false, index: 0} return if wrapped < 0 or wrapped >= length
+        offset: i64 = get variable_list[wrapped.usize()] else 0
+        return IndexLookup{ok: true, index: ctx.trial_number - offset - 1}
+
+def nback_trial_index(ctx: MatchContext&, back: i64, variable_list: darray[i64]&) -> i64:
+    can Abort.Panic:
+        lookup: IndexLookup = nback_trial_index_checked(ctx, back, variable_list)
+        return lookup.index
+
+# Verdict for one modality on the current trial.
+#
+# `current` and `history` are the already-resolved streams (see channels_for).
+# `position_count` is the length of the session's position1 history, which the
+# reference uses to decide the session has not yet run far enough to judge.
+#
+# With `check_missed`, a true match reports Missed rather than Correct: that is
+# the caller asking "should the player have pressed this?", not "did they press
+# it correctly?".
+def check_match(ctx: MatchContext&, current: i64, history: darray[i64]&, variable_list: darray[i64]&, position_count: i64, check_missed: bool) -> Verdict:
+    can Abort.Panic:
+        Verdict.Unknown return if position_count < ctx.back
+
+        back: i64 = effective_back(ctx)
+        lookup: IndexLookup = nback_trial_index_checked(ctx, back, variable_list)
+        # Where the reference would raise IndexError, report Unknown rather
+        # than crashing a session; see nback_trial_index_checked.
+        Verdict.Unknown return if not lookup.ok
+        nback_trial: i64 = lookup.index
+
+        # is_nback_match returns -1 for the reference's None (out of range),
+        # which the reference scores as Incorrect rather than Unknown.
+        matched: i64 = is_nback_match(current, history, nback_trial)
+        Verdict.Incorrect return if matched < 0
+        if matched == 1:
+            return Verdict.Missed if check_missed else Verdict.Correct
+        return Verdict.Incorrect
+
+# Stable integer codes for the verdicts, so a harness or a shell can carry
+# them across the boundary without depending on enum layout.
+def verdict_code(verdict: Verdict) -> i64:
+    match verdict:
+        Verdict.Correct:
+            return 0
+        Verdict.Incorrect:
+            return 1
+        Verdict.Missed:
+            return 2
+        Verdict.Unknown:
+            return 3
