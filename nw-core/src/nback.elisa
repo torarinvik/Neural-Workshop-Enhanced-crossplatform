@@ -1,0 +1,84 @@
+# The n-back matching rule and session scoring.
+#
+# Port of the deterministic kernels in bwaccel/fallback.py (GPL-2.0-or-later):
+# crab-back lag, variable-n-back lookup, the match test, per-stream scoring and
+# window means. The random-draw kernels (compute_bt_sequence, variable_nback_list,
+# sample_unique) live elsewhere: they reproduce CPython's `random` stream and
+# belong with the RNG port.
+#
+# Stimulus values are opaque i64 tokens here. The reference compares Python
+# objects with ==, and every caller passes ints (positions, colour ids, letter
+# indices), so identity of the token is the whole contract.
+
+# How many trials back is compared: crab-back reverses each run of N, so the
+# lag varies by trial.
+def crab_back(x: i64, nback: i64) -> i64:
+    return 1 + 2 * (x % nback)
+
+# variable_list is optional in the reference; an empty list here means absent,
+# matching `variable_list is None`.
+def resolve_back(x: i64, nback: i64, crab: bool, variable_list: darray[i64]&, has_variable: bool) -> i64:
+    can Abort.Panic:
+        back: mutable i64 = crab_back(x, nback) if crab else nback
+        if has_variable:
+            index: i64 = x - back
+            if index >= 0 and index < variable_list.count.i64():
+                back <- variable_list[index.usize()]
+        return back if back > 1 else 1
+
+# Whether `current` matches history[nback_trial]. Returns -1 for the
+# reference's None (index out of range), 0 for false, 1 for true.
+def is_nback_match(current: i64, history: darray[i64]&, nback_trial: i64) -> i64:
+    can Abort.Panic:
+        -1 return if nback_trial < 0 or nback_trial >= history.count.i64()
+        # The guard above already excludes the out-of-range case; the `else`
+        # arm is unreachable and only satisfies the explicit-bounds rule.
+        recalled: i64 = get history[nback_trial.usize()] else current - 1
+        return 1 if current == recalled else 0
+
+struct Score:
+    rights: i64
+    wrongs: i64
+
+# Rights and wrongs for one stimulus stream matched against itself.
+#
+# `inputs` holds the player's key presses as 0/1 per trial; an entry beyond its
+# end counts as no press, as the reference's `x < len(inp)` guard does.
+# has_inputs distinguishes an empty stream from the reference's `inp is None`
+# (both behave identically here, since every out-of-range read is False).
+def score_direct(data: darray[i64]&, inputs: darray[i64]&, has_inputs: bool, nback: i64, crab: bool, jaeggi: bool, variable_list: darray[i64]&, has_variable: bool) -> Score:
+    can Abort.Panic:
+        rights: mutable i64 = 0
+        wrongs: mutable i64 = 0
+        total: i64 = data.count.i64()
+        x: mutable i64 = nback
+        while x < total |rights, wrongs, x, data, inputs, variable_list, total|:
+            back: i64 = resolve_back(x, nback, crab, variable_list, has_variable)
+            if back <= x:
+                matched: bool = data[x.usize()] == data[(x - back).usize()]
+                pressed: mutable bool = false
+                if has_inputs and x < inputs.count.i64():
+                    pressed <- inputs[x.usize()] != 0
+                rights <- rights + 1 if matched and pressed
+                # `match ^ inpv`: exactly one of the two, i.e. a miss or a false alarm.
+                wrongs <- wrongs + 1 if matched != pressed
+                # Jaeggi scoring also credits a correctly withheld press.
+                if jaeggi and (not matched) and (not pressed):
+                    rights <- rights + 1
+            x <- x + 1
+        return Score{rights: rights, wrongs: wrongs}
+
+# Mean of the last `window` items; window <= 0 means the whole sequence.
+def mean_tail(seq: darray[f64]&, window: i64) -> f64:
+    can Abort.Panic:
+        count: i64 = seq.count.i64()
+        0.0 return if count == 0
+        start: mutable i64 = 0
+        if window > 0 and window < count:
+            start <- count - window
+        total: mutable f64 = 0.0
+        index: mutable i64 = start
+        while index < count |total, index, seq, count|:
+            total <- total + seq[index.usize()]
+            index <- index + 1
+        return total / (count - start).f64()
