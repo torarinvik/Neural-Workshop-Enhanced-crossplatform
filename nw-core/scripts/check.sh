@@ -17,10 +17,13 @@ mkdir -p "$BUILD"
 
 SUITES=(scheduling board nback pyrandom stimulus stats matching display config gamemode decimal)
 
-# Suites that cannot yet build under stage1. `config` uses darray[sview], which
-# instantiates the std's `impl[T] Store for darray[T]` -- a generic protocol
-# impl the stage1 backend declines (worktrees/elisa-core-nw/repro/
-# nw_generic_protocol_impl_stage1.elisa). Remove from this list once that lands.
+# Suites that cannot yet build under stage1. The generic-protocol-impl gap this list
+# was created for is FIXED (nw-port stage1 552bddca): `config` no longer declines the
+# std's `impl[T] Store for darray[T]` members, and its decline count fell from 25 to 2.
+# What is left is its own `main` -- `try read_entire_file_cstr(...) else ""` and the
+# sview/cstr plumbing around it -- which is a separate gap and has not been diagnosed.
+# Re-check with:
+#   scripts/elisac_stage1.sh -emit exe -O2 -o /tmp/cfg test/config_sweep.elisa
 STAGE0_ONLY=(config)
 
 failures=0
