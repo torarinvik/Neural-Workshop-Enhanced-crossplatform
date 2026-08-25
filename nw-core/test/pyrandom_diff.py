@@ -35,6 +35,13 @@ def python_lines():
             draws = [random.randint(1, high) for _ in range(6)]
             out.append(",".join(str(v) for v in ["ri", seed, high] + draws))
 
+    for seed in (11, 4242):
+        for repeats in (1, 2, 5):
+            random.seed(seed)
+            for _ in range(repeats):
+                random.randint(7, 7)
+            out.append(f"rieq,{seed},{repeats},{as_signed(random.getrandbits(32))}")
+
     for seed in (1, 42, 777):
         for count in (2, 3, 8, 20):
             random.seed(seed)
