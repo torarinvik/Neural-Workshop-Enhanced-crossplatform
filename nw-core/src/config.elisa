@@ -1,0 +1,279 @@
+# Configuration: a typed replacement for `eval()`-ed config values.
+#
+# The reference reads config.ini and runs every value through `eval()`
+# (config.py:_try_eval), producing a DotDict where a missing key reads as None.
+# That is unportable and unsafe, but the SHAPE it produces is not: across the
+# 342 defaults in configdefaults.py there are exactly six value forms --
+# 188 ints, 106 bools, 16 floats, 15 tuples (colours), 9 strings, 5 lists.
+#
+# So this is a typed store with the same NAME-KEYED lookup the game relies on
+# (`cfg['COLOR_%i' % n]`, `cfg['BONUS_TICKS_MULTI_%i' % n]`), minus the eval.
+# Keeping name lookup matters: those dynamic reads are everywhere, and a struct
+# with 342 fields would not serve them.
+
+const CONFIG_INT: u8 = 1
+const CONFIG_BOOL: u8 = 2
+const CONFIG_FLOAT: u8 = 3
+const CONFIG_TUPLE: u8 = 4
+const CONFIG_LIST: u8 = 5
+const CONFIG_TEXT: u8 = 6
+
+struct Config:
+    names: mutable darray[sview]
+    kinds: mutable darray[u8]
+    ints: mutable darray[i64]
+    floats: mutable darray[f64]
+    texts: mutable darray[sview]
+    # Tuples and lists index a shared element pool by (start, count).
+    element_start: mutable darray[usize]
+    element_count: mutable darray[usize]
+    elements: mutable darray[i64]
+    element_texts: mutable darray[sview]
+
+def config_new() -> Config:
+    can Memory.Allocate, Abort.Panic:
+        names: mutable darray[sview] = []
+        kinds: mutable darray[u8] = []
+        ints: mutable darray[i64] = []
+        floats: mutable darray[f64] = []
+        texts: mutable darray[sview] = []
+        element_start: mutable darray[usize] = []
+        element_count: mutable darray[usize] = []
+        elements: mutable darray[i64] = []
+        element_texts: mutable darray[sview] = []
+        return Config{names: names, kinds: kinds, ints: ints, floats: floats, texts: texts, element_start: element_start, element_count: element_count, elements: elements, element_texts: element_texts}
+
+# Index of `name`, or -1. Later entries win, matching the reference's
+# layering of defaults then user file then CLI overrides, so the search runs
+# from the end.
+def config_find(cfg: Config&, name: sview) -> i64:
+    can Abort.Panic:
+        index: mutable i64 = cfg.names.count.i64() - 1
+        while index >= 0 |index, cfg, name|:
+            candidate: sview = get cfg.names[index.usize()] else ""
+            index return if sview_eq(candidate, name)
+            index <- index - 1
+        return -1
+
+def config_has(cfg: Config&, name: sview) -> bool:
+    can Abort.Panic:
+        return config_find(cfg, name) >= 0
+
+# ------------------------------------------------------------
+# Typed reads. A missing or wrong-typed key yields the caller's fallback,
+# which is how the reference's None-returning DotDict is used in practice.
+# ------------------------------------------------------------
+
+def config_int(cfg: Config&, name: sview, fallback: i64) -> i64:
+    can Abort.Panic:
+        slot: i64 = config_find(cfg, name)
+        fallback return if slot < 0
+        kind: u8 = get cfg.kinds[slot.usize()] else 0.u8()
+        if kind == CONFIG_INT or kind == CONFIG_BOOL:
+            return get cfg.ints[slot.usize()] else fallback
+        if kind == CONFIG_FLOAT:
+            return (get cfg.floats[slot.usize()] else fallback.f64()).i64()
+        return fallback
+
+def config_bool(cfg: Config&, name: sview, fallback: bool) -> bool:
+    can Abort.Panic:
+        slot: i64 = config_find(cfg, name)
+        fallback return if slot < 0
+        kind: u8 = get cfg.kinds[slot.usize()] else 0.u8()
+        if kind == CONFIG_BOOL or kind == CONFIG_INT:
+            return (get cfg.ints[slot.usize()] else 0) != 0
+        return fallback
+
+def config_float(cfg: Config&, name: sview, fallback: f64) -> f64:
+    can Abort.Panic:
+        slot: i64 = config_find(cfg, name)
+        fallback return if slot < 0
+        kind: u8 = get cfg.kinds[slot.usize()] else 0.u8()
+        if kind == CONFIG_FLOAT:
+            return get cfg.floats[slot.usize()] else fallback
+        if kind == CONFIG_INT or kind == CONFIG_BOOL:
+            return (get cfg.ints[slot.usize()] else 0).f64()
+        return fallback
+
+def config_text(cfg: Config&, name: sview, fallback: sview) -> sview:
+    can Abort.Panic:
+        slot: i64 = config_find(cfg, name)
+        fallback return if slot < 0
+        kind: u8 = get cfg.kinds[slot.usize()] else 0.u8()
+        fallback return if kind != CONFIG_TEXT
+        return get cfg.texts[slot.usize()] else fallback
+
+# Element `position` of a tuple or list value, e.g. a colour channel.
+def config_element(cfg: Config&, name: sview, position: i64, fallback: i64) -> i64:
+    can Abort.Panic:
+        slot: i64 = config_find(cfg, name)
+        fallback return if slot < 0
+        kind: u8 = get cfg.kinds[slot.usize()] else 0.u8()
+        fallback return if kind != CONFIG_TUPLE and kind != CONFIG_LIST
+        count: i64 = (get cfg.element_count[slot.usize()] else 0.usize()).i64()
+        fallback return if position < 0 or position >= count
+        start: i64 = (get cfg.element_start[slot.usize()] else 0.usize()).i64()
+        return get cfg.elements[(start + position).usize()] else fallback
+
+def config_element_count(cfg: Config&, name: sview) -> i64:
+    can Abort.Panic:
+        slot: i64 = config_find(cfg, name)
+        0 return if slot < 0
+        return (get cfg.element_count[slot.usize()] else 0.usize()).i64()
+
+# ------------------------------------------------------------
+# Parsing
+# ------------------------------------------------------------
+
+def config_is_space(byte: u8) -> bool:
+    return byte == 32.u8() or (byte >= 9.u8() and byte <= 13.u8())
+
+def config_trim(view: sview) -> sview:
+    can Abort.Panic:
+        length: i64 = sview_len(view).i64()
+        start: mutable i64 = 0
+        while start < length and config_is_space(sview_at(view, start.usize())) |start, view, length|:
+            start <- start + 1
+        stop: mutable i64 = length
+        while stop > start and config_is_space(sview_at(view, (stop - 1).usize())) |stop, start, view|:
+            stop <- stop - 1
+        return string_view_slice(view, start, stop)
+
+def config_is_digits(view: sview, allow_sign: bool) -> bool:
+    can Abort.Panic:
+        length: i64 = sview_len(view).i64()
+        false return if length == 0
+        index: mutable i64 = 0
+        if allow_sign and (sview_at(view, 0.usize()) == 45.u8() or sview_at(view, 0.usize()) == 43.u8()):
+            index <- 1
+        false return if index >= length
+        digits: mutable bool = true
+        while index < length |index, digits, view, length|:
+            byte: u8 = sview_at(view, index.usize())
+            digits <- false if byte < 48.u8() or byte > 57.u8()
+            index <- index + 1
+        return digits
+
+# Strip one layer of matching brackets or quotes.
+def config_unwrap(view: sview, open_byte: u8, close_byte: u8) -> sview:
+    can Abort.Panic:
+        length: i64 = sview_len(view).i64()
+        view return if length < 2
+        view return if sview_at(view, 0.usize()) != open_byte
+        view return if sview_at(view, (length - 1).usize()) != close_byte
+        return string_view_slice(view, 1, length - 1)
+
+# Append one parsed `KEY = value` pair. Value forms follow the six shapes the
+# reference's eval() actually produces; anything else is kept as text, which is
+# what _try_eval's except-branch does.
+def config_set(cfg: mutable Config&, name: sview, raw: sview):
+    can Memory.Allocate, Abort.Panic:
+        value: sview = config_trim(raw)
+        cfg.names.push(name)
+
+        if sview_eq(value, "True") or sview_eq(value, "False"):
+            cfg.kinds.push(CONFIG_BOOL)
+            cfg.ints.push(1 if sview_eq(value, "True") else 0)
+            cfg.floats.push(0.0)
+            cfg.texts.push("")
+            cfg.element_start.push(cfg.elements.count)
+            cfg.element_count.push(0.usize())
+            return
+
+        if config_is_digits(value, true):
+            parsed: ParsedInt = py_parse_int(value)
+            cfg.kinds.push(CONFIG_INT)
+            cfg.ints.push(parsed.value)
+            cfg.floats.push(0.0)
+            cfg.texts.push("")
+            cfg.element_start.push(cfg.elements.count)
+            cfg.element_count.push(0.usize())
+            return
+
+        first: u8 = sview_at(value, 0.usize()) if sview_len(value) > 0.usize() else 0.u8()
+        last: u8 = sview_at(value, (sview_len(value).i64() - 1).usize()) if sview_len(value) > 0.usize() else 0.u8()
+
+        if (first == 40.u8() and last == 41.u8()) or (first == 91.u8() and last == 93.u8()):
+            inner: sview = config_unwrap(value, first, 41.u8() if first == 40.u8() else 93.u8())
+            cfg.kinds.push(CONFIG_TUPLE if first == 40.u8() else CONFIG_LIST)
+            cfg.ints.push(0)
+            cfg.floats.push(0.0)
+            cfg.texts.push("")
+            start: usize = cfg.elements.count
+            cfg.element_start.push(start)
+            # Split on commas; numeric elements land in the pool, others are
+            # ignored (no config default mixes them).
+            length: i64 = sview_len(inner).i64()
+            field_start: mutable i64 = 0
+            index: mutable i64 = 0
+            emitted: mutable i64 = 0
+            while index <= length |index, field_start, emitted, cfg, inner, length|:
+                at_end: bool = index == length
+                if at_end or sview_at(inner, index.usize()) == 44.u8():
+                    piece: sview = config_trim(string_view_slice(inner, field_start, index))
+                    if config_is_digits(piece, true):
+                        parsed_piece: ParsedInt = py_parse_int(piece)
+                        cfg.elements.push(parsed_piece.value)
+                        emitted <- emitted + 1
+                    field_start <- index + 1
+                index <- index + 1
+            cfg.element_count.push(emitted.usize())
+            return
+
+        if first == 39.u8() or first == 34.u8():
+            cfg.kinds.push(CONFIG_TEXT)
+            cfg.ints.push(0)
+            cfg.floats.push(0.0)
+            cfg.texts.push(config_unwrap(value, first, first))
+            cfg.element_start.push(cfg.elements.count)
+            cfg.element_count.push(0.usize())
+            return
+
+        number: ParsedFloat = py_parse_float(value)
+        if number.ok:
+            cfg.kinds.push(CONFIG_FLOAT)
+            cfg.ints.push(0)
+            cfg.floats.push(number.value)
+            cfg.texts.push("")
+            cfg.element_start.push(cfg.elements.count)
+            cfg.element_count.push(0.usize())
+            return
+
+        cfg.kinds.push(CONFIG_TEXT)
+        cfg.ints.push(0)
+        cfg.floats.push(0.0)
+        cfg.texts.push(value)
+        cfg.element_start.push(cfg.elements.count)
+        cfg.element_count.push(0.usize())
+
+# Parse a whole config.ini body. Blank lines, `#` and `;` comments and
+# `[section]` headers are skipped; keys are upper-cased by the reference, and
+# the defaults template is already upper-case, so names pass through as written.
+def parse_config_text(cfg: mutable Config&, text: sview):
+    can Memory.Allocate, Abort.Panic:
+        length: i64 = sview_len(text).i64()
+        line_start: mutable i64 = 0
+        while line_start <= length |line_start, cfg, text, length|:
+            line_end: mutable i64 = line_start
+            while line_end < length |line_end, text, length|:
+                byte: u8 = sview_at(text, line_end.usize())
+                break if byte == 10.u8() or byte == 13.u8()
+                line_end <- line_end + 1
+            next_start: mutable i64 = line_end + 1
+            if line_end < length and sview_at(text, line_end.usize()) == 13.u8():
+                if line_end + 1 < length and sview_at(text, (line_end + 1).usize()) == 10.u8():
+                    next_start <- line_end + 2
+
+            line: sview = config_trim(string_view_slice(text, line_start, line_end))
+            line_length: i64 = sview_len(line).i64()
+            if line_length > 0:
+                head: u8 = sview_at(line, 0.usize())
+                if head != 35.u8() and head != 59.u8() and head != 91.u8():
+                    separator: i64 = sview_find_byte(line, 61.u8())
+                    if separator > 0:
+                        name: sview = config_trim(string_view_slice(line, 0, separator))
+                        raw: sview = string_view_slice(line, separator + 1, line_length)
+                        config_set(cfg, name, raw)
+
+            break if line_end >= length
+            line_start <- next_start

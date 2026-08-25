@@ -15,7 +15,13 @@ STAGES="${1:-both}"
 BUILD="$ROOT/build"
 mkdir -p "$BUILD"
 
-SUITES=(scheduling board nback pyrandom stimulus stats matching display)
+SUITES=(scheduling board nback pyrandom stimulus stats matching display config)
+
+# Suites that cannot yet build under stage1. `config` uses darray[sview], which
+# instantiates the std's `impl[T] Store for darray[T]` -- a generic protocol
+# impl the stage1 backend declines (worktrees/elisa-core-nw/repro/
+# nw_generic_protocol_impl_stage1.elisa). Remove from this list once that lands.
+STAGE0_ONLY=(config)
 
 failures=0
 run_suite() {
@@ -53,6 +59,10 @@ for stage in stage0 stage1; do
     [[ "$STAGES" == "both" || "$STAGES" == "$stage" ]] || continue
     echo "== $stage"
     for suite in "${SUITES[@]}"; do
+        if [[ "$stage" == "stage1" ]] && [[ " ${STAGE0_ONLY[*]} " == *" $suite "* ]]; then
+            echo "  ${suite} [${stage}]: SKIPPED (blocked on the stage1 generic-impl gap)"
+            continue
+        fi
         run_suite "$suite" "$stage" || failures=$((failures + 1))
     done
 done

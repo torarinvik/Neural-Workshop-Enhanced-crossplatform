@@ -13,5 +13,5 @@ OUT="$ROOT/build/pymod"
 mkdir -p "$OUT"
 cd "$OUT"
 ELISA_STAGE1_SEMANTIC_GATE=1 "$UPSTREAM/scripts/elisac_stage1.sh" \
-    -emit pymodule-so "$ROOT/src/scheduling.elisa"
+    -emit pymodule-so "$ROOT/src/pymodule_exports.elisa"
 echo "built in $OUT"
