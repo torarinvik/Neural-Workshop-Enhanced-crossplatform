@@ -1,0 +1,153 @@
+# Are all the branches' gains in `work`? — an audit, 2026-08-26
+
+Short answer: **no, and now they are** — except one branch, for a reason that
+has not changed.
+
+Both `work` branches were left UNTOUCHED by this audit. Every merge happened on
+a new branch in a scratch worktree, so nothing in the other agent's checkouts
+moved.
+
+## The audit
+
+Ancestry alone is not the question — a cherry-picked or rebased commit is a gain
+that has landed under a different id, and a branch can be "ahead" while carrying
+nothing anyone wants. So each branch was checked by ancestry AND by content.
+
+### Elisa-core (stage0) — was missing 29 commits, now complete
+
+`work` lacked the whole of `nw-integration-2026-08-26` (verified by a prior
+session, never landed) and our four newest `nw-port` commits, `-fstrict-fp`
+among them. `nw-consolidate-2026-08-26` now contains **every branch in the
+repository and every detached-HEAD worktree commit** — nothing is outstanding.
+
+### Elisa-compiler (stage1) — was missing 3 commits plus a stranded fixture
+
+`work` had already absorbed the "safe" integration, so the gap was small: our
+three `nw-port` commits, and one orphaned test fixture (below). Landing diff is
+6 files, +138 lines.
+
+### What was NOT a gain, and why
+
+| branch | ahead | verdict |
+| --- | --- | --- |
+| `codex/worktree-save-elisa-qol-validation{,2}` | 1, 2 | earlier DRAFTS of the stdlib that `codex/idiomatic-self-hosting` later committed properly; `-validation2` also commits 78 build droppings (`probe_bytes.stdout`, `final-stage1-*.stderr`) |
+| `codex/worktree-save-integration-idio` | 105 | `codex/idiomatic-self-hosting` plus one wip tip |
+| `codex/worktree-save-structpy-stage1-codex2` | 46 | its 45-commit body is INSIDE `codex/idiomatic-self-hosting` |
+| `codex/wasm-support`, `integration`, `worktree-agent-*`, both `main`s | 0 | already contained |
+
+The four `codex/worktree-save-*` branches are parking snapshots — an agent
+committing a dirty worktree so it could be moved — not curated work.
+
+## The one branch still out: `codex/idiomatic-self-hosting` (105)
+
+Its payload is real and large: **85 new stdlib modules** — json, http, net,
+regex, uuid, base64, datetime, process, concurrency, utf8, path, iter — plus a
+lexer/parser refactor.
+
+It stays out because **it cannot self-host**, which was measured three ways in
+`INTEGRATION_2026-08-26.md` and is unchanged. Landing it costs `work` its
+fixpoint, which is the opposite of a gain.
+
+The cost has since gone UP, and that is new. `work`'s 23 newest commits
+(`refactor: share quoted literal scanning machine`, `scan f-strings with a lexer
+machine`, `classify keywords with a when table`, ...) rewrite the lexer, and
+that branch rewrites the same lexer. Merging it today conflicts in **15 files**
+— `lexer_core`, `lexer_numbers`, `lexer_strings`, `lexer_tokens`, `tokens`,
+`parser_decl_impl`, six `codegen_*`, `elisac.elisa`, `arena.elisa`. This is a
+project, not a consolidation step, and it grows every day both sides move.
+
+## A gain worth naming
+
+`codex/stage0-idiomatic` is one commit, and it fixes a real stage0 crash. The
+fixture that reproduces it was stranded on a WIP branch
+(`test/repro/generic_optional_helpers.elisa`, 10 lines, on no other branch):
+
+    def choose[T](value: T?, fallback: T) -> T:
+        return present if value is present else fallback
+
+On the pre-merge stage0 that is not a diagnostic, it is a compiler crash:
+
+    error: PHI node operands are not the same type as the result!
+      %termp = phi i64 [ %present, %ternary.then ], [ %fallback1, %ternary.else ]
+
+The consolidated stage0 compiles it, and stage1 agrees. The fixture was carried
+across as the regression test it should always have been.
+
+## Merge decisions that needed judgement
+
+**The same fix, twice, in two voices.** The one conflict in Elisa-core was
+`emitStringViewStaticLiteralEqual`: both `work` and `nw-port` had independently
+found the sview-through-a-reference crash, and the CODE was identical
+(`emitStringCompareOperandValue`) — only the comments differed. Ours recorded
+the SIGSEGV symptom, theirs the triggering expression. Kept one comment carrying
+both facts; taking either side alone would have thrown away a real explanation.
+
+**A stale generated artefact, caught by a test.**
+`TestRuntimeCollectionsInterfaceMatchesImplementation` failed after the merge.
+`collections.elisa` is byte-identical on every branch — but the INTERFACE the
+compiler emits from it changed, because the merge changed what the compiler
+knows about wasm: `ELISA_TARGET_OS_WASM` is now a known target constant, and
+`ARENA_BACKEND_WASM_HEAPBASE` is now actually SELECTED rather than merely
+defined, so the emitted interface carries `ARENA_WASM_USES_HOST_ALLOCATOR`
+instead of the older bump-pointer externs. Regenerated. The generator's input
+never moved; its behaviour did.
+
+**`.DS_Store` is tracked in Elisa-compiler** (`.DS_Store` and `src/.DS_Store`,
+while `.gitignore` covers only `test/.DS_Store`), so it churns whenever two
+checkouts meet. The merge carried a meaningless binary delta; it was dropped so
+the landing diff is 6 real files.
+
+## Verification
+
+Not "it merged cleanly" — the merged trees were BUILT and RUN. A clean merge has
+silently duplicated a function in this repository before.
+
+### Elisa-core `nw-consolidate-2026-08-26`
+
+  * `go build ./src` — clean
+  * `go test ./...` — **14/14 packages ok, 0 failures**
+  * `-fstrict-fp` survived intact: both arg parsers, the backend tier that beats
+    every other, and `strict_fp_test.go`. Three ported modules depend on it.
+
+### Elisa-compiler `nw-consolidate-2026-08-26`
+
+  * seeds from the consolidated stage0, then `self_host_gen2 OK`
+  * **FIXPOINT: `gen3.o == gen4.o` byte-identical**
+    (`01121904a46b58cef0451505e3270235a9325003261d7292f6dda08acb52b480`)
+
+### The port, on the consolidated toolchain
+
+  * **60/60 differential suite runs, 0 failures** — every module, both compilers,
+    against the Python reference. Run TWICE: once before the `collections.elisai`
+    regeneration and once after, since that file is read from the source tree at
+    runtime rather than embedded, so the first run had not exercised it.
+
+  * all three repro fixtures compile, link AND return the right value on stage1 --
+    not merely "it compiles":
+
+        cross_module_const        18   (documented in the fixture)
+        inline_loop_value         17   (9 + 8, with a -1 guard proving the inline
+                                        and block loop forms agree)
+        generic_optional_helpers   4   (choose[i64](maybe_value(4), 10))
+
+### Nothing was disturbed
+
+  * `~/.elisac/elisac` byte-identical before and after (`e2f0caf537fc143372c57ec5`),
+    mtime unchanged. Elisa-compiler has no hooks; Elisa-core's were bypassed with
+    `-c core.hooksPath=<empty>` on every git operation.
+  * Elisa-core `work` still `da8cb230`, still 26 modified + 7 untracked.
+  * Elisa-compiler `work` still `3fa962a5`, still clean.
+
+## Landing: two different costs
+
+**Elisa-compiler — cheap.** No git hooks in that repo, the main worktree is
+CLEAN, and the landing is a 6-file fast-forward. Reversible with a branch reset.
+
+**Elisa-core — not cheap.** `core.hooksPath` is repo-wide and its post-merge /
+post-commit / post-checkout hooks rebuild the shared `~/.elisac/elisac` from
+whatever tree they fire in. And `work` is checked out in the other agent's
+worktree with 33 files of live work, which git will not merge over: landing
+means stashing their work and having them reapply it. That cost was paid once
+already this week and produced 10 conflicts.
+
+Neither was done. Both wait on a decision.

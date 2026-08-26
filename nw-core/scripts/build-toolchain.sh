@@ -23,7 +23,9 @@ HERE="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NW_ROOT="$(cd -- "$HERE/../.." && pwd)"
 CORE="${ELISA_CORE:-$NW_ROOT/worktrees/elisa-core-nw}"
 STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$NW_ROOT/worktrees/elisa-compiler-nw}"
-OUT="$HERE/../toolchain"
+# Overridable so a candidate toolchain (an integration branch, say) can be built
+# and tested without disturbing the verified one.
+OUT="${ELISA_TOOLCHAIN_OUT:-$HERE/../toolchain}"
 
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
