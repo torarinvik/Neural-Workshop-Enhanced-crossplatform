@@ -356,21 +356,28 @@ in `worktrees/elisa-core-nw/repro/`.
      `sview` LOCAL always worked, and the struct having an sview FIELD had
      nothing to do with it.
 
-  4. **A sibling call lost to a stdlib generic on stage0** -- FIXED. Inside a
-     module, an unqualified `add(...)` bound to `Flags[T]::add` rather than the
-     module's own `add`. stage1 already got this right, so the two compilers
-     disagreed about a module member calling its own sibling by its own name.
+  4. **A sibling call lost to a stdlib generic** -- FIXED, on BOTH compilers.
+     Inside a module, an unqualified `add(...)` bound to the stdlib's `add[T]`
+     rather than the module's own `add`.
 
-     Identifier resolution reaches the global scope through the ordinary scope
-     chain, so the stdlib's `add` was found there and returned before the
-     enclosing module was ever consulted. The namespace-aware lookup already
-     existed; nothing on the call path used it.
+     This was recorded as "stage0 is wrong, stage1 already gets this right".
+     Wrong: stage1 emitted `add__i64`, which TYPE-CHECKS, so the program
+     compiled clean and returned 0 instead of 7. I had verified stage1 by
+     COMPILING the repro rather than running it, and then used it as the
+     reference for fixing stage0. Both were broken; stage1 was the quieter one,
+     and a silent wrong answer is worse than a hard error.
 
-     It RENAMES the callee rather than just resolving its type. The first
-     attempt preferred the member in ident analysis alone, and the call then
-     type-checked against the module's signature while codegen still emitted the
-     stdlib symbol -- the repro compiled clean and returned 0 instead of 7. Only
-     running it showed that, which is why the guard is a runtime test.
+     Two causes, the same shape one layer apart. stage0: identifier resolution
+     reaches the global scope through the ordinary scope chain, so the stdlib
+     name was found before the enclosing module was consulted. stage1: the
+     generic dispatch ran before the enclosing-module scan.
+
+     stage0's fix RENAMES the callee rather than just resolving its type -- the
+     first attempt type-checked against the module's signature while codegen
+     still emitted the stdlib symbol, so it compiled and returned 0 again.
+
+     Both guards check the EXIT CODE. A compile-only guard passes against this
+     bug, which is exactly how it survived.
 
   5. **Struct names were not namespaced** -- FIXED. Two modules may now each
      declare a `Work`, which is what the task modules want (SyWork, GoWork,
@@ -386,6 +393,13 @@ in `worktrees/elisa-core-nw/repro/`.
      the construct-site field checks.
 
 All five are closed. The task modules can now be modules.
+
+One habit this cost enough to be worth writing down: a repro is not verified
+until it has RUN. Three of the five notes above were wrong about their own
+cause, and the one that was wrong in the dangerous direction -- claiming a
+compiler was correct when it was silently miscompiling -- was wrong because it
+had only ever been compiled. Every fixed repro here now records the exit code
+it must produce, on both stages.
 
 One formatting trap, since it cost real time: a comment at column 0 inside a
 module body is a dedent. The sed-based MenuText conversion left three, and they
