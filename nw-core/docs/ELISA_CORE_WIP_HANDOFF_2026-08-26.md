@@ -42,13 +42,36 @@ consolidation merged. You and it had converged.
 
 The stash is also still on the stash list. `git stash list` will show it.
 
-## `~/.elisac/elisac` was NOT rebuilt
+## `~/.elisac/elisac` WAS replaced at 16:23 — but not by these hooks
 
-Hooks were suppressed for every git operation here, so the shared binary is
-exactly as you left it (`e2f0caf5...`, mtime 11:52) — built from the OLD `work`.
-It is now stale relative to `work`. Your next commit in this repo will fire the
-post-commit hook and rebuild it; that was left to you deliberately rather than
-swapping your compiler out from under you mid-session.
+Correcting an earlier draft of this note, which claimed it was untouched.
+
+Every git operation here passed `-c core.hooksPath=<empty dir>`, and that
+suppression demonstrably works: a controlled `git checkout work` under the same
+override left the binary's mtime unchanged. The hooks' own log,
+`/tmp/elisac-autoinstall.log`, is still stamped **11:52** — `install-elisac.sh`
+has not run since. So the rebuild did not come from the hook path.
+
+What IS certain is what the binary now contains. Two feature probes, each
+isolating a commit that only the consolidation carries:
+
+    -fstrict-fp accepted                       -> present (nw-port's commit)
+    test/repro/generic_optional_helpers.elisa  -> compiles, no LLVM PHI crash
+                                                  (codex/stage0-idiomatic's fix)
+
+The pre-landing `work` (`da8cb230`) had neither. So the binary at 16:23 was
+built from the landed `work` (`c84f1429`) or an identical tree — it is CURRENT,
+not stale, and it matches the branch this note describes.
+
+What is NOT certain is what invoked it. It was not the git hook and not a
+scripted step here (the only writer in either repository is
+`install-elisac.sh`). The likeliest explanation is a build run by hand or by
+another session out of the main worktree after the fast-forward landed.
+
+If you want certainty rather than inference, rebuild it yourself from a clean
+tree:
+
+    go build -C "$(git rev-parse --show-toplevel)/compiler" -o ~/.elisac/elisac ./src
 
 ## Note on `codex/stage0-idiomatic`
 

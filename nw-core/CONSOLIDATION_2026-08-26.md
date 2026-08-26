@@ -274,13 +274,27 @@ Worth noting for later: their untracked `ternary_byte_ref_literal_runtime_test.g
 is the stage0 counterpart of the ternary byte-ref fix salvaged into stage1 above.
 Both stages were being fixed for the same gap, in two repositories, by two agents.
 
-## `~/.elisac/elisac` deliberately NOT rebuilt
+## `~/.elisac/elisac`: replaced at 16:23, and I cannot attribute it
 
-Elisa-core's hooks rebuild the shared binary on every commit/merge/checkout, and
-they were suppressed throughout, so it is exactly as found (`e2f0caf537fc143372c57ec5`,
-mtime 11:52) — now stale relative to `work`. Swapping another agent's compiler
-mid-session is worse than leaving it: their next commit fires the hook and
-rebuilds it themselves.
+Reported here rather than quietly, because an earlier draft of the handoff note
+asserted the binary was untouched, and that turned out to be wrong.
+
+Hooks were suppressed on every git operation, and that suppression works — a
+controlled `git checkout work` under the same override left the mtime unchanged,
+and `/tmp/elisac-autoinstall.log` is still stamped 11:52, so `install-elisac.sh`
+has not run since. Yet the binary's mtime is 16:23.
+
+Two feature probes place its provenance exactly. `-fstrict-fp` is accepted, and
+`generic_optional_helpers.elisa` compiles instead of dying on the LLVM PHI
+verifier — the first commit is nw-port's, the second is
+`codex/stage0-idiomatic`'s, and pre-landing `work` had neither. So it was built
+from the landed tree: current, not stale.
+
+The first fingerprint attempt got this WRONG in the safe-looking direction. The
+probe was written `elisac ... 2>&1 | head -3; echo rc=$?`, which reports HEAD's
+status, not the compiler's — the same shell trap already recorded in
+INTEGRATION_2026-08-26.md, in its pipeline form. Both probes were rerun without
+a pipe before anything above was concluded.
 
 ## Branches: core 6 -> 4
 
