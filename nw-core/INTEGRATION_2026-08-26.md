@@ -174,15 +174,14 @@ and was unavoidable once the merge had to happen in their checkout.
     and one decline drops the whole unit, so this single construct reported as
     467 declined functions. Fixed; the same build now reports 465.
 
-  * NOT fixed, and the reason idiomatic-self-hosting still cannot land: a bare
-    call inside `module M` resolves by scanning ALL functions for the name and
-    declines when several share name+arity across owners
-    (codegen_call.elisa:507-521). It never consults the ENCLOSING module, though
-    the comment above it says siblings "are stored under owner M". So `abs(x)`
-    inside Std::Math loses to the other `abs` and declines; stage0 resolves it.
-    The backend carries no module context at all -- the tractable fix is a
-    current-owner field on StructTable, which is already threaded through every
-    function involved, set while emitting a module's members.
+  * a bare call inside `module M` resolved by scanning ALL functions for the
+    name and declined when several shared name+arity across owners. It never
+    consulted the ENCLOSING module, though the comment above it said siblings
+    "are stored under owner M" -- the backend carried no module context at all.
+    Fixed: StructTable gains `current_owner`, set by emit_function_body (it is
+    already threaded everywhere, so no signature changes), and the resolver
+    prefers the enclosing module's member on an exact arity match before
+    declining. Narrows the ambiguous set rather than guessing in it.
 
 ### Runtime drift is NOT from this landing
 
@@ -194,3 +193,43 @@ that tree. It clears when they commit and re-vendor.
 Elisa-core's `nw-integration-2026-08-26` (27 commits, 14/14 Go packages, 22/22
 nw-core suites) is verified and NOT landed -- doing so would mean stashing their
 work in a second worktree, which was not asked for.
+
+
+## Final state of Elisa-compiler `work` (2026-08-26)
+
+`e377b1de`, 20 commits ahead of where it started, tree clean. Verified IN THE
+MAIN WORKTREE:
+
+  * `gen3.o == gen4.o byte-identical (FIXPOINT)`
+  * 22/22 nw-core differential suites on stage1 (39,757 cases)
+
+codex/wasm-support and nw-port in full, plus the two backend fixes above.
+
+## Why codex/idiomatic-self-hosting is still out
+
+It has never self-hosted, and `declined 467` was never one blocker. Measured
+across the two fixes: 467 -> 465 -> 460, and each new head of the decline list
+was a structurally different function hitting a different gap:
+
+    join        discarded container growth      fixed
+    approx_equal bare call inside a module      fixed
+    file_size   (top-level; different again)    open
+
+Landing it would cost `work` its fixpoint, which is the opposite of a gain.
+
+For whoever finishes it, the method is cheap and repeatable, and is how both
+fixes above fell out:
+
+  1. the decline report NAMES the functions; take the first one;
+  2. compile just that function in a minimal unit against the same stage1 --
+     `declined N` reproduces in seconds rather than in a full gen2;
+  3. bisect the function's body by deleting constructs until it compiles;
+  4. check stage0 on the same construct. A construct stage0 accepts and stage1
+     declines is the bug; one decline drops the WHOLE unit, which is why the
+     symptom is always enormous and never localized.
+
+Two shell traps cost real time here and are worth repeating: `cmd && … ; echo
+"rc=$?"` reports the FIRST command's status when the chain short-circuits (a
+failing seed reads as a failing gen2), and diagnosing by COPYING a file between
+branches clobbers the branch's own version -- that mixture made stage0 SIGSEGV
+and sent the investigation sideways twice.
