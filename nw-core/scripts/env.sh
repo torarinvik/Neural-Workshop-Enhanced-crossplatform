@@ -16,6 +16,15 @@ export ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac-nw}"
 export ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_STAGE1_ROOT/bin/elisac-stage1}"
 export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_STAGE1_ROOT/build/runtime/elisacore_runtime.o}"
 
+# Strict IEEE floating point, both stages. Stage0 stamps LLVM's `contract` flag
+# on every FP op by default (clang's -ffp-contract=on), so `a + b * c` may fuse
+# into a single-rounding fma; stage1 never has. The two therefore disagreed in
+# the last ulp wherever an add cancelled -- Python's `uniform(a, b)` is
+# `a + (b - a) * random()`, and for a negative `a` roughly a quarter of all
+# draws came out different. This whole port is a bit-exact differential against
+# CPython, so relaxed FP is worth nothing here and costs correctness.
+export ELISACORE_STRICT_FP=1
+
 # Type-check for real: stage1 emits without analysis when the gate is off.
 export ELISA_STAGE1_SEMANTIC_GATE=1
 

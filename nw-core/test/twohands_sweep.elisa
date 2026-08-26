@@ -1,0 +1,138 @@
+# Differential sweep driver for tasks/twohands.elisa.
+#
+# Whole roads and whole plays, not summaries. Three things here desynchronise
+# silently and each is emitted in full:
+#
+# * the deal -- `_lay` and `_fly` draw a variable number of times per sub-row,
+#   so one miscounted draw shifts every hazard and target after it;
+# * the solved line -- its layers are dicts and the tie-break is INSERTION
+#   order, so a wrong order picks a different line of the same length, which a
+#   tick count would hide completely;
+# * the plays -- a policy that diverges one tick still returns a plausible
+#   ride, so the port list goes out rather than the verdict.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/tasks/twohands.elisa"
+
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+# The ladder itself, including the clamped ends.
+# Floats go out as raw IEEE bits: exact, and matched on the Python side with
+# `struct`. A decimal rendering would only ever be a claim about the formatter.
+def emit_f64(value: f64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            holder: f64[1] = [value]
+            bits: mutable i64[1] = [0]
+            memcpy((&bits[0]).cast[mutable void&], (&holder[0]).cast[void&], 8.usize())
+            emit_cell(bits[0])
+
+def emit_ride(ride: TwoRide):
+    can Console.Write, Abort.Panic:
+        emit_cell(ride.at)
+        emit_cell(ride.lane)
+        emit_cell(ride.into)
+        emit_cell(ride.cross)
+        emit_cell(ride.air)
+        emit_cell(ride.speed)
+        emit_cell(ride.ticks)
+        emit_cell(1 if ride.hit else 0)
+        emit_cell(ride.passed)
+        emit_cell(ride.clipped)
+        emit_cell(ride.points)
+
+def emit_play(tag: cstr, road: TwoRoad&, want: i64, look: f64, shoot: i64):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        done: TwoPlay = th_play(road, want, look, shoot)
+        printr(",")
+        printr(tag)
+        emit_ride(done.ride)
+        emit_cell(1 if done.home else 0)
+        emit_cell(done.shot)
+        emit_cell(done.port_n)
+        index: mutable i64 = 0
+        while index < done.port_n |index, done|:
+            emit_cell(Ints::at(done.ports, index))
+            index <- index + 1
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(512 * 1024 * 1024)
+        in w:
+            road: mutable TwoRoad = th_road_new()
+            solver: mutable TwoSolver = th_solver_new()
+            for level in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+                for seed in [0, 1, 2, 3, 4, 5, 6, 7, 11, 19, 23, 42] |level, road, solver|:
+                    th_generate(level, seed, &road, &solver)
+                    printr("road")
+                    emit_cell(level)
+                    emit_cell(seed)
+                    emit_cell(road.length)
+                    emit_cell(road.start)
+                    emit_cell(road.clock)
+                    emit_cell(road.par)
+                    emit_cell(road.haz_n)
+                    index: mutable i64 = 0
+                    while index < road.haz_n |index, road|:
+                        emit_cell(Ints::at(road.haz_at, index))
+                        emit_cell(Ints::at(road.haz_lane, index))
+                        emit_cell(Ints::at(road.haz_kind, index))
+                        index <- index + 1
+                    printr(",s")
+                    emit_cell(road.sky_n)
+                    star: mutable i64 = 0
+                    while star < road.sky_n |star, road|:
+                        emit_cell(Ints::at(road.sky_at, star))
+                        emit_f64(Floats::at(road.sky_across, star))
+                        emit_f64(Floats::at(road.sky_up, star))
+                        emit_f64(Floats::at(road.sky_drift, star))
+                        star <- star + 1
+                    # The clean line, then the ride `exact` gets out of driving it.
+                    printr(",p")
+                    found: i64 = th_line(&solver, &road)
+                    emit_cell(found)
+                    port: mutable i64 = 0
+                    while port < found |port, solver|:
+                        emit_cell(Ints::at_ref(&solver.ports, port))
+                        port <- port + 1
+                    printr(",x")
+                    emit_ride(th_drive(&road, solver.ports, found if found > 0 else 0))
+                    # crawl, reactive, aimed, gunner, sniper -- the five shallow
+                    # policies `sky_toll` measures, on the road it just dealt.
+                    emit_play("c", &road, 1, 1.0, TH_SHOOT_NEVER)
+                    emit_play("r", &road, TH_TOP, 0.34, TH_SHOOT_NEVER)
+                    emit_play("a", &road, TH_TOP, 1.0, TH_SHOOT_NEVER)
+                    emit_play("g", &road, TH_TOP, 1.0, TH_SHOOT_SPARE)
+                    emit_play("n", &road, TH_TOP, 1.0, TH_SHOOT_ALWAYS)
+                    print("")
+        destroy w
+        return 0
