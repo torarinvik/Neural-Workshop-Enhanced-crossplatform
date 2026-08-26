@@ -10,13 +10,25 @@
 # So this is setobject.c -- probe loop, linear-probe window, perturb shift and
 # growth rule -- and nothing else.
 #
-# ADD-ONLY for now. `removals` discards from a set whose order it then observes,
-# which needs CPython's dummy slots modelled exactly: a discarded entry becomes a
-# marker rather than an empty, so probing continues past it, `fill` stays put
-# while `used` drops, and iteration skips it. That is a real extension, not a
-# one-liner, and it is deliberately not faked here -- a set that silently emptied
-# a slot would diverge only in the shuffle, which is the hardest kind of bug to
-# see.
+# Add AND discard. A discarded entry becomes a DUMMY marker rather than an empty
+# one, and the distinction is not cosmetic:
+#
+#   * probing continues past a dummy (an empty slot ends the probe, a dummy does
+#     not), so a key that collided past the discarded one is still findable;
+#   * `used` drops but `fill` does NOT, because
+#   * a later add SKIPS the dummy and inserts at the first EMPTY slot, bumping
+#     `fill` again. Dummies are never refilled.
+#
+# That last rule is the one worth stating, because the plausible alternative --
+# reuse the dummy, as a hand-written table would -- is wrong in a way nothing
+# local reveals. Reusing it leaves `fill` low, the table misses its
+# `fill * 5 >= mask * 3` resize, and every subsequent iteration order differs.
+# Minimised from `add 8; discard 8; add 24; add 11; add 28; add 23`, where a real
+# set resizes to 32 slots and a reusing model stays at 8.
+#
+# The rules above were derived by validating a model against a real `set` over
+# 8000 randomised add/discard sequences, not from reading them off; see
+# test/pyset_diff.py, which is that check kept as a suite.
 #
 # Where a set is only asked about MEMBERSHIP, or is run through `sorted()`, the
 # order is not observable and a flat array is the right port. Reach for this
@@ -27,6 +39,9 @@
 module PySet:
     # setobject.c constants.
     const MINSIZE: i64 = 8
+    # Slot sentinels. Keys are non-negative, so negatives are free for these.
+    const EMPTY: i64 = -1
+    const DUMMY: i64 = -2
     const LINEAR_PROBES: i64 = 9
     const PERTURB_SHIFT: i64 = 5
 
@@ -85,14 +100,15 @@ module PySet:
                 step: mutable i64 = 0
                 while step <= probes and verdict == 0 |step, probes, slot, table, key, verdict|:
                     entry: i64 = Ints::at(table.slots, slot)
-                    if entry < 0:
+                    if entry == EMPTY:
                         verdict <- 2
+                    elif entry == key:
+                        verdict <- 1
                     else:
-                        if entry == key:
-                            verdict <- 1
-                        else:
-                            slot <- slot + 1
-                            step <- step + 1
+                        # A DUMMY lands here too: it is not the key and not the end
+                        # of the probe, so the scan continues past it.
+                        slot <- slot + 1
+                        step <- step + 1
                 if verdict == 0:
                     perturb <- perturb >> PERTURB_SHIFT
                     index <- (index * 5 + 1 + perturb) & mask
@@ -107,7 +123,7 @@ module PySet:
             perturb: mutable i64 = key
             placed: mutable bool = false
             while not placed |placed, index, perturb, mask, table, key|:
-                if Ints::at(table.slots, index) < 0:
+                if Ints::at(table.slots, index) == EMPTY:
                     Ints::put(&table.slots, index, key)
                     placed <- true
                 else:
@@ -116,7 +132,7 @@ module PySet:
                         step: mutable i64 = 0
                         while step < LINEAR_PROBES and not placed |step, slot, table, key, placed|:
                             slot <- slot + 1
-                            if Ints::at(table.slots, slot) < 0:
+                            if Ints::at(table.slots, slot) == EMPTY:
                                 Ints::put(&table.slots, slot, key)
                                 placed <- true
                             else:
@@ -165,14 +181,16 @@ module PySet:
                 step: mutable i64 = 0
                 while step <= probes and vacancy < 0 and not present |step, probes, slot, table, key, vacancy, present|:
                     entry: i64 = Ints::at(table.slots, slot)
-                    if entry < 0:
+                    # ONLY an empty slot is a vacancy. A dummy is skipped and never
+                    # refilled -- see the header; refilling it would hold `fill` down
+                    # and skip the resize that decides every later iteration order.
+                    if entry == EMPTY:
                         vacancy <- slot
+                    elif entry == key:
+                        present <- true
                     else:
-                        if entry == key:
-                            present <- true
-                        else:
-                            slot <- slot + 1
-                            step <- step + 1
+                        slot <- slot + 1
+                        step <- step + 1
                 if vacancy < 0 and not present:
                     perturb <- perturb >> PERTURB_SHIFT
                     index <- (index * 5 + 1 + perturb) & mask
@@ -184,6 +202,34 @@ module PySet:
             # CPython grows to `used * 2` above 50000 live entries; nothing here
             # gets within two orders of magnitude of that.
             PySet::resize(table, table.used * 4)
+
+    # Remove `key` if present. The slot becomes a DUMMY rather than an EMPTY, so a
+    # key that probed past it is still reachable; `used` drops and `fill` holds.
+    def discard(table: mutable Table&, key: i64):
+        can Abort.Panic:
+            mask: i64 = table.mask
+            index: mutable i64 = key & mask
+            perturb: mutable i64 = key
+            # 0 still looking, 1 removed, 2 absent.
+            verdict: mutable i64 = 0
+            while verdict == 0 |verdict, index, perturb, mask, table, key|:
+                probes: i64 = LINEAR_PROBES if index + LINEAR_PROBES <= mask else 0
+                slot: mutable i64 = index
+                step: mutable i64 = 0
+                while step <= probes and verdict == 0 |step, probes, slot, table, key, verdict|:
+                    entry: i64 = Ints::at(table.slots, slot)
+                    if entry == EMPTY:
+                        verdict <- 2
+                    elif entry == key:
+                        Ints::put(&table.slots, slot, DUMMY)
+                        table.used <- table.used - 1
+                        verdict <- 1
+                    else:
+                        slot <- slot + 1
+                        step <- step + 1
+                if verdict == 0:
+                    perturb <- perturb >> PERTURB_SHIFT
+                    index <- (index * 5 + 1 + perturb) & mask
 
     # The set's keys in ITERATION order -- the whole reason this file exists.
     # `out` is filled from slot 0 up and its live count returned.
