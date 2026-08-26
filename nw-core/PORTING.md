@@ -6,17 +6,38 @@ writing Elisa in this repo; every item below cost a compile-fail cycle to find.
 ## Toolchain
 
 ```bash
-source nw-core/scripts/env.sh     # pins our worktree compilers; gate ON
-./nw-core/scripts/check.sh        # every differential suite, both stages
-./nw-core/scripts/check.sh stage0 # fast inner loop
+./nw-core/scripts/build-toolchain.sh   # our own compilers -> nw-core/toolchain/
+source nw-core/scripts/env.sh          # pins them; gate ON
+./nw-core/scripts/check.sh             # every differential suite, both stages
+./nw-core/scripts/check.sh stage0      # fast inner loop
 ```
 
-- **Never** use `~/.elisac/elisac` or the compilers' main worktrees — another
-  agent works there. `env.sh` points at `worktrees/elisa-core-nw` and
-  `worktrees/elisa-compiler-nw`.
-- Elisa-core has git hooks that rebuild the **global** `~/.elisac/elisac` on
-  commit/checkout. Hooks are disabled in our worktree via a worktree-scoped
-  `core.hooksPath`. Don't re-enable them.
+**The compilers are ours, and they live in `nw-core/toolchain/`.** Three
+artefacts, because stage1 bootstraps through stage0: `elisac-stage0` (Go +
+cgo), `elisacore_runtime.o` (compiled by stage0), `elisac-stage1` (seeded by
+stage0). `toolchain/PROVENANCE` records which branch and commit each came
+from. The directory is gitignored — rebuild it, don't commit it.
+
+- **Never** use `~/.elisac/elisac`. It is shared, and it is rebuilt behind your
+  back: elisa-core installs git hooks that reinstall it on every commit, merge
+  and checkout in **any** worktree of the repository, from whatever branch that
+  worktree happens to be on. Another agent committing in their tree silently
+  swaps your compiler. Two sessions were spent chasing results that came from
+  it.
+- The hooks are disabled in our worktree via a worktree-scoped
+  `core.hooksPath`. Don't re-enable them. Any git command that reads the
+  compiler repos from a script should pass `-c core.hooksPath=/dev/null`, so
+  that reading a commit id cannot rebuild someone else's binary.
+- `env.sh` **refuses to source** if any of the three is missing, and
+  `check.sh` exits on that. Without the guard a missing compiler falls through
+  to a downstream script's own `${ELISAC:-$HOME/.elisac/elisac}` default —
+  which is how a suite once compared the other agent's compiler against itself
+  and passed.
+- **Do not build the toolchain from the compilers' `work` branch.** `nw-port`
+  carries compiler fixes that `work` does not, and the port depends on one of
+  them: without `-fstrict-fp`, stage0 contracts `a + b * c` into an fma and
+  twohands, buzzwire and marblemaze stop matching CPython. Check with
+  `git log --oneline work..nw-port` before assuming the branches agree.
 - Stage0 (`$ELISACORE_BIN`) has **no `-emit exe`** — use `-emit obj` then
   `clang -o out out.o`. Stage1 (`elisac_stage1`) does have `-emit exe`.
 - Always compile with `ELISA_STAGE1_SEMANTIC_GATE=1` (env.sh sets it). With the

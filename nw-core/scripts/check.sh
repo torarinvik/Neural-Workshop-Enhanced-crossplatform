@@ -9,7 +9,10 @@ set -uo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=/dev/null
-source "$ROOT/scripts/env.sh"
+# `set -u -o pipefail` without -e, so the toolchain check has to be explicit:
+# without it a missing compiler falls through to whatever a downstream script
+# defaults to, which is the shared ~/.elisac/elisac.
+source "$ROOT/scripts/env.sh" || exit 1
 
 STAGES="${1:-both}"
 BUILD="$ROOT/build"
