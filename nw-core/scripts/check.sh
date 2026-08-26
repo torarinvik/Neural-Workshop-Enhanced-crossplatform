@@ -15,7 +15,7 @@ STAGES="${1:-both}"
 BUILD="$ROOT/build"
 mkdir -p "$BUILD"
 
-SUITES=(scheduling board nback pyrandom stimulus stats matching display config gamemode decimal session maze fogworld numberology)
+SUITES=(scheduling board nback pyrandom stimulus stats matching display config gamemode decimal session maze fogworld numberology ninarow)
 
 # Suites that cannot yet build under stage1. EMPTY -- every suite now builds and
 # runs on both stages.

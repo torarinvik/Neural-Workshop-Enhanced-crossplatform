@@ -1,0 +1,549 @@
+# Five-in-a-row positions with exactly one winning move to find.
+#
+# Port of neural_workshop/ninarow.py (GPL-2.0-or-later). Not a game against an
+# opponent: a position is dealt with both colours already down and the player
+# has one move, which is right when it completes the dealt line length. Every
+# dealt position has exactly one such cell, so the task is a visual search
+# rather than a reaction game.
+#
+# ## Why the sets here are safe as flat arrays
+#
+# maze.elisa carries a CPython set emulation because `dead_ends` iterates a set
+# and the order changes the maze. Nothing here needs it: every set in this
+# module (`found` in winning_moves and _winning_moves_through) is returned
+# through `sorted()`, and the rest are membership tests. Ascending arrays are
+# exactly what sorted() produces, so the order is pinned by the sort and not by
+# any hash table.
+#
+# ## Random-stream fidelity
+#
+# Per attempt, in this order:
+#   choice(patterns)              one _randbelow over the pattern list
+#   shuffle(order)                a full Fisher-Yates over size*size
+#   random() per noise cell       one float draw each, and ONLY for cells that
+#                                 are still empty and not the target
+#
+# The last one is the subtle one: the draw happens after the empty/target
+# filter, so cells that are skipped consume nothing. Drawing first and then
+# filtering would desynchronise the whole board.
+
+const NAR_EMPTY: i64 = 0
+const NAR_PLAYER: i64 = 1
+const NAR_OPPONENT: i64 = -1
+const NAR_MIN_LENGTH: i64 = 3
+const NAR_WIN_LENGTH: i64 = 5
+const NAR_MAX_SIZE: i64 = 128
+const NAR_GRADE_COUNT: i64 = 9
+
+struct NarGrade:
+    size: mutable i64
+    pellets: mutable i64
+    length: mutable i64
+    attempts: mutable i64
+
+# The ladder. Early rungs are approachable three-in-a-row; the middle returns
+# to classic five; the upper rungs grow the objective itself, ending in a
+# hundred-in-a-row search meant for a program rather than a glance.
+def nar_grade_at(rung: i64) -> NarGrade:
+    can Abort.Panic:
+        index: mutable i64 = rung
+        index <- 1 if index < 1 else index
+        index <- NAR_GRADE_COUNT if index > NAR_GRADE_COUNT else index
+        grade: mutable NarGrade = zeroed
+        grade.attempts <- 80
+        if index == 1:
+            grade.size <- 5
+            grade.pellets <- 7
+            grade.length <- 3
+        elif index == 2:
+            grade.size <- 6
+            grade.pellets <- 12
+            grade.length <- 3
+        elif index == 3:
+            grade.size <- 8
+            grade.pellets <- 22
+            grade.length <- 4
+        elif index == 4:
+            grade.size <- 12
+            grade.pellets <- 45
+            grade.length <- 5
+        elif index == 5:
+            grade.size <- 16
+            grade.pellets <- 80
+            grade.length <- 5
+        elif index == 6:
+            grade.size <- 24
+            grade.pellets <- 150
+            grade.length <- 8
+        elif index == 7:
+            grade.size <- 32
+            grade.pellets <- 300
+            grade.length <- 15
+        elif index == 8:
+            grade.size <- 64
+            grade.pellets <- 1200
+            grade.length <- 40
+        else:
+            grade.size <- 128
+            grade.pellets <- 6000
+            grade.length <- 100
+        return grade
+
+# Four orientations cover every line: (1,0), (0,1), (1,1), (1,-1).
+# DIRECTIONS = ((1, 0), (0, 1), (1, 1), (1, -1)) as (dr, dc) -- ROW delta
+# first. Transposing these still produces a perfectly plausible board (the four
+# orientations are the same set, just visited in a different order), but it
+# changes which pattern `choice(patterns)` lands on and therefore the answer.
+def nar_dir_dr(index: i64) -> i64:
+    return 1 if index == 0 else (0 if index == 1 else 1)
+
+def nar_dir_dc(index: i64) -> i64:
+    return 0 if index == 0 else (1 if index == 1 else (1 if index == 2 else -1))
+
+# The line tables for one (size, length). The reference memoises these in
+# module-level dicts; here they are built once into a workspace, which is the
+# same thing without global state.
+struct NarLines:
+    size: mutable i64
+    length: mutable i64
+    # Every in-bounds line, flattened: line `i` occupies [i*length, (i+1)*length).
+    cells: mutable darray[i64]
+    count: mutable i64
+    # Lines through each cell, as indices into `cells`, in a CSR layout.
+    through: mutable darray[i64]
+    through_start: mutable darray[i64]
+    through_n: mutable darray[i64]
+
+def nar_at(values: mutable darray[i64]&, index: i64) -> i64:
+    can Abort.Panic:
+        return get values[index.usize()] else 0
+
+def nar_inside(size: i64, row: i64, col: i64) -> bool:
+    return row >= 0 and row < size and col >= 0 and col < size
+
+def nar_index(size: i64, row: i64, col: i64) -> i64:
+    return row * size + col
+
+# Build every line of `length` on a size x size board, then invert into the
+# per-cell index. The reference walks row, then col, then direction; the order
+# is preserved because _candidate_patterns picks from it by index.
+def nar_lines_new(a: mutable Arena&, size: i64, length: i64) -> NarLines:
+    can Memory.Allocate, Abort.Panic:
+        area: i64 = size * size
+        # Upper bound: every (cell, direction) start that could be in bounds.
+        max_lines: i64 = area * 4
+        table: mutable NarLines = zeroed
+        table.size <- size
+        table.length <- length
+        table.cells <- maze_zeros(a, max_lines * length + 1)
+        table.through_start <- maze_zeros(a, area + 1)
+        table.through_n <- maze_zeros(a, area + 1)
+        table.count <- 0
+
+        row: mutable i64 = 0
+        while row < size |row, size, length, table|:
+            col: mutable i64 = 0
+            while col < size |col, row, size, length, table|:
+                dir: mutable i64 = 0
+                while dir < 4 |dir, row, col, size, length, table|:
+                    dr: i64 = nar_dir_dr(dir)
+                    dc: i64 = nar_dir_dc(dir)
+                    fits: mutable bool = true
+                    step: mutable i64 = 0
+                    while step < length |step, length, row, col, dr, dc, size, fits|:
+                        if not nar_inside(size, row + dr * step, col + dc * step):
+                            fits <- false
+                        step <- step + 1
+                    if fits:
+                        base: i64 = table.count * length
+                        write: mutable i64 = 0
+                        while write < length |write, length, base, row, col, dr, dc, size, table|:
+                            maze_put(&table.cells, base + write, nar_index(size, row + dr * write, col + dc * write))
+                            write <- write + 1
+                        table.count <- table.count + 1
+                    dir <- dir + 1
+                col <- col + 1
+            row <- row + 1
+
+        # Count lines per cell, prefix-sum into starts, then fill.
+        line: mutable i64 = 0
+        while line < table.count |line, table, length|:
+            slot: mutable i64 = 0
+            while slot < length |slot, length, line, table|:
+                cell: i64 = maze_at(table.cells, line * length + slot)
+                maze_put(&table.through_n, cell, maze_at(table.through_n, cell) + 1)
+                slot <- slot + 1
+            line <- line + 1
+        total: mutable i64 = 0
+        cell_index: mutable i64 = 0
+        while cell_index < area |cell_index, area, table, total|:
+            maze_put(&table.through_start, cell_index, total)
+            total <- total + maze_at(table.through_n, cell_index)
+            cell_index <- cell_index + 1
+        table.through <- maze_zeros(a, total + 1)
+        fill: mutable darray[i64] = maze_zeros(a, area + 1)
+        line <- 0
+        while line < table.count |line, table, length, fill|:
+            slot: mutable i64 = 0
+            while slot < length |slot, length, line, table, fill|:
+                cell: i64 = maze_at(table.cells, line * length + slot)
+                at: i64 = maze_at(table.through_start, cell) + maze_at(fill, cell)
+                maze_put(&table.through, at, line)
+                maze_put(&fill, cell, maze_at(fill, cell) + 1)
+                slot <- slot + 1
+            line <- line + 1
+        return table
+
+def nar_line_cell(table: NarLines&, line: i64, slot: i64) -> i64:
+    can Abort.Panic:
+        return maze_at(table.cells, line * table.length + slot)
+
+# Whether `player` occupies a complete line anywhere.
+def nar_winner(table: NarLines&, cells: mutable darray[i64]&, player: i64) -> bool:
+    can Abort.Panic:
+        line: mutable i64 = 0
+        while line < table.count |line, table, cells, player|:
+            whole: mutable bool = true
+            slot: mutable i64 = 0
+            while slot < table.length |slot, table, line, cells, player, whole|:
+                if nar_at(cells, nar_line_cell(table, line, slot)) != player:
+                    whole <- false
+                slot <- slot + 1
+            true return if whole
+            line <- line + 1
+        return false
+
+# Every empty cell that gives `player` an immediate line, ascending -- which is
+# what the reference's sorted(found) produces.
+def nar_winning_moves(table: NarLines&, cells: mutable darray[i64]&, player: i64, out: mutable darray[i64]&) -> i64:
+    can Abort.Panic:
+        found: mutable i64 = 0
+        line: mutable i64 = 0
+        while line < table.count |line, table, cells, player, out, found|:
+            held: mutable i64 = 0
+            empty_cell: mutable i64 = -1
+            empties: mutable i64 = 0
+            slot: mutable i64 = 0
+            while slot < table.length |slot, table, line, cells, player, held, empty_cell, empties|:
+                value: i64 = nar_at(cells, nar_line_cell(table, line, slot))
+                held <- held + 1 if value == player
+                if value == NAR_EMPTY:
+                    empty_cell <- nar_line_cell(table, line, slot)
+                    empties <- empties + 1
+                slot <- slot + 1
+            if held == table.length - 1 and empties == 1:
+                # Insertion sort into an ascending, duplicate-free list: the
+                # reference collects into a set and sorts, so both the order and
+                # the de-duplication are part of the answer.
+                at: mutable i64 = 0
+                seen: mutable bool = false
+                while at < found |at, out, empty_cell, seen|:
+                    seen <- true if nar_at(out, at) == empty_cell
+                    at <- at + 1
+                if not seen:
+                    pos: mutable i64 = found
+                    while pos > 0 and nar_at(out, pos - 1) > empty_cell |pos, out|:
+                        maze_put(out, pos, nar_at(out, pos - 1))
+                        pos <- pos - 1
+                    maze_put(out, pos, empty_cell)
+                    found <- found + 1
+            line <- line + 1
+        return found
+
+# Whether a move at `cell` has just completed a line -- checked only on the
+# lines through that cell, which is the reference's optimisation and not a
+# behavioural difference.
+def nar_winner_through(table: NarLines&, cells: mutable darray[i64]&, cell: i64, player: i64) -> bool:
+    can Abort.Panic:
+        start: i64 = maze_at(table.through_start, cell)
+        count: i64 = maze_at(table.through_n, cell)
+        index: mutable i64 = 0
+        while index < count |index, count, start, table, cells, player|:
+            line: i64 = maze_at(table.through, start + index)
+            whole: mutable bool = true
+            slot: mutable i64 = 0
+            while slot < table.length |slot, table, line, cells, player, whole|:
+                if nar_at(cells, nar_line_cell(table, line, slot)) != player:
+                    whole <- false
+                slot <- slot + 1
+            true return if whole
+            index <- index + 1
+        return false
+
+# New immediate wins on lines touched by a newly placed pellet, ascending.
+def nar_winning_moves_through(table: NarLines&, cells: mutable darray[i64]&, cell: i64, player: i64, out: mutable darray[i64]&) -> i64:
+    can Abort.Panic:
+        found: mutable i64 = 0
+        start: i64 = maze_at(table.through_start, cell)
+        count: i64 = maze_at(table.through_n, cell)
+        index: mutable i64 = 0
+        while index < count |index, count, start, table, cells, player, out, found|:
+            line: i64 = maze_at(table.through, start + index)
+            held: mutable i64 = 0
+            empty_cell: mutable i64 = -1
+            empties: mutable i64 = 0
+            slot: mutable i64 = 0
+            while slot < table.length |slot, table, line, cells, player, held, empty_cell, empties|:
+                value: i64 = nar_at(cells, nar_line_cell(table, line, slot))
+                held <- held + 1 if value == player
+                if value == NAR_EMPTY:
+                    empty_cell <- nar_line_cell(table, line, slot)
+                    empties <- empties + 1
+                slot <- slot + 1
+            if held == table.length - 1 and empties == 1:
+                at: mutable i64 = 0
+                seen: mutable bool = false
+                while at < found |at, out, empty_cell, seen|:
+                    seen <- true if nar_at(out, at) == empty_cell
+                    at <- at + 1
+                if not seen:
+                    pos: mutable i64 = found
+                    while pos > 0 and nar_at(out, pos - 1) > empty_cell |pos, out|:
+                        maze_put(out, pos, nar_at(out, pos - 1))
+                        pos <- pos - 1
+                    maze_put(out, pos, empty_cell)
+                    found <- found + 1
+            index <- index + 1
+        return found
+
+# True when `target` is the sole immediate player win and nobody has already won.
+def nar_safe(table: NarLines&, cells: mutable darray[i64]&, target: i64, scratch: mutable darray[i64]&) -> bool:
+    can Abort.Panic:
+        false return if nar_winner(table, cells, NAR_PLAYER)
+        false return if nar_winner(table, cells, NAR_OPPONENT)
+        moves: i64 = nar_winning_moves(table, cells, NAR_PLAYER, scratch)
+        return moves == 1 and nar_at(scratch, 0) == target
+
+# ------------------------------------------------------------
+# Dealing
+# ------------------------------------------------------------
+
+# Patterns with `length - 1` player pellets and a blocked back end. The blocked
+# end matters: without it a line has two equivalent answers, one at each end.
+#
+# Stored as three parallel arrays -- line index, blocker cell (-1 when the
+# board edge is the blocker), and the target cell -- in the reference's own
+# row/col/direction order, because _try_deal picks from this list by index and
+# the order is therefore part of the random stream.
+struct NarPatterns:
+    line: mutable darray[i64]
+    blocked: mutable darray[i64]
+    target: mutable darray[i64]
+    count: mutable i64
+
+def nar_candidate_patterns(a: mutable Arena&, table: NarLines&) -> NarPatterns:
+    can Memory.Allocate, Abort.Panic:
+        size: i64 = table.size
+        length: i64 = table.length
+        patterns: mutable NarPatterns = zeroed
+        patterns.line <- maze_zeros(a, table.count + 1)
+        patterns.blocked <- maze_zeros(a, table.count + 1)
+        patterns.target <- maze_zeros(a, table.count + 1)
+        patterns.count <- 0
+
+        # Walk the same row/col/direction nest that built `table`, so line
+        # indices line up without a lookup.
+        line: mutable i64 = 0
+        row: mutable i64 = 0
+        while row < size |row, size, length, table, patterns, line|:
+            col: mutable i64 = 0
+            while col < size |col, row, size, length, table, patterns, line|:
+                dir: mutable i64 = 0
+                while dir < 4 |dir, row, col, size, length, table, patterns, line|:
+                    dr: i64 = nar_dir_dr(dir)
+                    dc: i64 = nar_dir_dc(dir)
+                    fits: mutable bool = true
+                    step: mutable i64 = 0
+                    while step < length |step, length, row, col, dr, dc, size, fits|:
+                        if not nar_inside(size, row + dr * step, col + dc * step):
+                            fits <- false
+                        step <- step + 1
+                    if fits:
+                        before_row: i64 = row - dr
+                        before_col: i64 = col - dc
+                        after_row: i64 = row + dr * length
+                        after_col: i64 = col + dc * length
+                        blocked: mutable i64 = -1
+                        if nar_inside(size, before_row, before_col):
+                            blocked <- nar_index(size, before_row, before_col)
+                        elif nar_inside(size, after_row, after_col):
+                            blocked <- nar_index(size, after_row, after_col)
+                        maze_put(&patterns.line, patterns.count, line)
+                        maze_put(&patterns.blocked, patterns.count, blocked)
+                        maze_put(&patterns.target, patterns.count, nar_line_cell(table, line, length - 1))
+                        patterns.count <- patterns.count + 1
+                        line <- line + 1
+                    dir <- dir + 1
+                col <- col + 1
+            row <- row + 1
+        return patterns
+
+struct NarPuzzle:
+    ok: mutable bool
+    size: mutable i64
+    pellets: mutable i64
+    length: mutable i64
+    cells: mutable darray[i64]
+    answer: mutable i64
+    rung: mutable i64
+
+# One deal attempt. Returns ok=false where the reference returns None, and the
+# caller retries -- which matters because a failed attempt has still consumed
+# random values, and the next attempt continues from there rather than
+# restarting the stream.
+def nar_try_deal(a: mutable Arena&, table: NarLines&, patterns: NarPatterns&, rng: mutable MT19937&, want_pellets: i64, cells: mutable darray[i64]&, scratch: mutable darray[i64]&, extras: mutable darray[i64]&, order: mutable darray[i64]&) -> NarPuzzle:
+    can Memory.Allocate, Abort.Panic:
+        size: i64 = table.size
+        length: i64 = table.length
+        area: i64 = size * size
+
+        pick: i64 = py_choice_index(rng, patterns.count)
+        line: i64 = maze_at(patterns.line, pick)
+        blocked: i64 = maze_at(patterns.blocked, pick)
+        target: i64 = maze_at(patterns.target, pick)
+
+        clear: mutable i64 = 0
+        while clear < area |clear, area, cells|:
+            maze_put(cells, clear, NAR_EMPTY)
+            clear <- clear + 1
+        if blocked >= 0:
+            maze_put(cells, blocked, NAR_OPPONENT)
+        slot: mutable i64 = 0
+        while slot < length - 1 |slot, length, table, line, cells|:
+            maze_put(cells, nar_line_cell(table, line, slot), NAR_PLAYER)
+            slot <- slot + 1
+
+        want: mutable i64 = want_pellets
+        want <- area - 1 if want > area - 1 else want
+        want <- length if want < length else want
+
+        placed: mutable i64 = 0
+        count_cell: mutable i64 = 0
+        while count_cell < area |count_cell, area, cells, placed|:
+            placed <- placed + 1 if nar_at(cells, count_cell) != NAR_EMPTY
+            count_cell <- count_cell + 1
+
+        result: mutable NarPuzzle = zeroed
+        result.ok <- false
+
+        # Close accidental alternative answers created by crossing threats.
+        repair: mutable i64 = 0
+        failed: mutable bool = false
+        done: mutable bool = false
+        while repair < area and not done and not failed |repair, area, table, cells, scratch, extras, target, placed, done, failed, length|:
+            moves: i64 = nar_winning_moves(table, cells, NAR_PLAYER, scratch)
+            extra_n: mutable i64 = 0
+            index: mutable i64 = 0
+            while index < moves |index, moves, scratch, extras, target, extra_n|:
+                found_move: i64 = nar_at(scratch, index)
+                if found_move != target:
+                    maze_put(extras, extra_n, found_move)
+                    extra_n <- extra_n + 1
+                index <- index + 1
+            if extra_n == 0:
+                done <- true
+            else:
+                repaired: mutable bool = false
+                extra_index: mutable i64 = 0
+                while extra_index < extra_n and not repaired |extra_index, extra_n, extras, table, cells, target, placed, repaired, length|:
+                    extra: i64 = nar_at(extras, extra_index)
+                    start: i64 = maze_at(table.through_start, extra)
+                    through: i64 = maze_at(table.through_n, extra)
+                    line_index: mutable i64 = 0
+                    while line_index < through and not repaired |line_index, through, start, table, cells, target, placed, repaired, length|:
+                        candidate: i64 = maze_at(table.through, start + line_index)
+                        held: mutable i64 = 0
+                        scan: mutable i64 = 0
+                        while scan < length |scan, length, table, candidate, cells, held|:
+                            held <- held + 1 if nar_at(cells, nar_line_cell(table, candidate, scan)) == NAR_PLAYER
+                            scan <- scan + 1
+                        if held == length - 1:
+                            place: mutable i64 = 0
+                            while place < length and not repaired |place, length, table, candidate, cells, target, placed, repaired|:
+                                blocker: i64 = nar_line_cell(table, candidate, place)
+                                if nar_at(cells, blocker) == NAR_EMPTY and blocker != target:
+                                    maze_put(cells, blocker, NAR_OPPONENT)
+                                    if not nar_winner_through(table, cells, blocker, NAR_OPPONENT):
+                                        repaired <- true
+                                        placed <- placed + 1
+                                    else:
+                                        maze_put(cells, blocker, NAR_EMPTY)
+                                place <- place + 1
+                        line_index <- line_index + 1
+                    extra_index <- extra_index + 1
+                if not repaired:
+                    failed <- true
+            repair <- repair + 1
+        result return if failed
+        result return if placed > want
+
+        # Noise, one pellet at a time, keeping only placements that cannot
+        # create a winner or a second answer.
+        fill: mutable i64 = 0
+        while fill < area |fill, area, order|:
+            maze_put(order, fill, fill)
+            fill <- fill + 1
+        py_shuffle_i64_prefix(rng, order, area)
+
+        step: mutable i64 = 0
+        while step < area and placed < want |step, area, order, cells, target, table, rng, placed, scratch, length|:
+            cell: i64 = nar_at(order, step)
+            # The float draw happens AFTER this filter, so a skipped cell
+            # consumes nothing from the stream.
+            if nar_at(cells, cell) == NAR_EMPTY and cell != target:
+                value: i64 = NAR_OPPONENT if py_random(rng) < 0.62 else NAR_PLAYER
+                maze_put(cells, cell, value)
+                bad: mutable bool = nar_winner_through(table, cells, cell, value)
+                if not bad and value == NAR_PLAYER:
+                    through_moves: i64 = nar_winning_moves_through(table, cells, cell, NAR_PLAYER, scratch)
+                    other: mutable i64 = 0
+                    while other < through_moves |other, through_moves, scratch, target, bad|:
+                        bad <- true if nar_at(scratch, other) != target
+                        other <- other + 1
+                if bad:
+                    maze_put(cells, cell, NAR_EMPTY)
+                else:
+                    placed <- placed + 1
+            step <- step + 1
+
+        result return if placed < want
+        result return if not nar_safe(table, cells, target, scratch)
+        result.ok <- true
+        result.size <- size
+        result.pellets <- placed
+        result.length <- length
+        result.answer <- target
+        return result
+
+# Deal a deterministic position with exactly one winning cell. `size`,
+# `pellets` and `length` of 0 mean "take it from the rung", matching the
+# reference's None.
+def nar_generate(a: mutable Arena&, table: NarLines&, patterns: NarPatterns&, rung: i64, seed: i64, pellets_in: i64, cells: mutable darray[i64]&, scratch: mutable darray[i64]&, extras: mutable darray[i64]&, order: mutable darray[i64]&) -> NarPuzzle:
+    can Memory.Allocate, Abort.Panic:
+        grade: NarGrade = nar_grade_at(rung)
+        board_size: i64 = table.size
+        target_length: i64 = table.length
+        count: mutable i64 = grade.pellets if pellets_in <= 0 else pellets_in
+        count <- NAR_MIN_LENGTH if count < NAR_MIN_LENGTH else count
+        limit: i64 = board_size * board_size - 1
+        count <- limit if count > limit else count
+        count <- target_length if count < target_length else count
+
+        rng: mutable MT19937 = mt19937_new()
+        mt_seed_int(&rng, seed.u64())
+
+        attempts: i64 = 1 if grade.attempts < 1 else grade.attempts
+        attempt: mutable i64 = 0
+        while attempt < attempts |attempt, attempts, a, table, patterns, rng, count, cells, scratch, extras, order, rung|:
+            made: NarPuzzle = nar_try_deal(a, table, patterns, &rng, count, cells, scratch, extras, order)
+            if made.ok:
+                result: mutable NarPuzzle = made
+                clamped: mutable i64 = rung
+                clamped <- 1 if clamped < 1 else clamped
+                clamped <- NAR_GRADE_COUNT if clamped > NAR_GRADE_COUNT else clamped
+                result.rung <- clamped
+                return result
+            attempt <- attempt + 1
+        blank: mutable NarPuzzle = zeroed
+        blank.ok <- false
+        return blank
