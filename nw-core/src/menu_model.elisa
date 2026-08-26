@@ -1,0 +1,146 @@
+# What a menu ROW says, as opposed to where it sits.
+#
+# scene_menu.elisa lays rows out; this builds their text. The split matters
+# because every menu screen in the game -- game mode, images, sounds, user,
+# configuration, and one per task -- shares this formatting exactly, while the
+# content differs. Porting it once is what makes a screen a table of names and
+# value kinds rather than new code.
+#
+# The shape is Menu._label_text:
+#
+#     '%s: %7s' % (self.names[option].ljust(51), self.textify(value))
+#
+# so the name is padded to a fixed column, the value is right-aligned in seven,
+# and a row with no value is just the name. A spacer row is empty.
+
+const MENU_VALUE_SPACER: i64 = 0
+const MENU_VALUE_COMMAND: i64 = 1     # a row that acts, with no value column
+const MENU_VALUE_BOOL: i64 = 2
+const MENU_VALUE_INT: i64 = 3
+const MENU_VALUE_TEXT: i64 = 4
+const MENU_VALUE_PERCENT: i64 = 5     # PercentCycler: a fraction shown as %
+const MENU_VALUE_ALL: i64 = 6         # AllCycler: zero means "no limit"
+
+const MENU_NAME_WIDTH: i64 = 51
+const MENU_VALUE_WIDTH: i64 = 7
+
+def dstr_append_spaces(out: mutable dstr&, count: i64):
+    can Memory.Allocate, Abort.Panic:
+        remaining: mutable i64 = count
+        while remaining > 0 |out, remaining|:
+            out.push(32.u8())
+            remaining <- remaining - 1
+
+# Round half to even, for a NON-NEGATIVE value only.
+#
+# This is py_round_half_even's arithmetic with its `floor` removed. floor and
+# truncation agree on non-negative inputs, and dstr_append_fixed takes the
+# magnitude before calling, so the results are identical over the whole domain
+# this sees -- which the menurow differential checks against CPython's own %f.
+#
+# Worth the duplication: floor is libm, and pulling libm in for one call would
+# make elisacore_math (and with it pyrandom, which pymath needs) a dependency of
+# every menu screen, including the wasm build, which links neither.
+def menu_round_half_even(value: f64) -> i64:
+    can Abort.Panic:
+        whole: i64 = value.i64()
+        part: f64 = value - whole.f64()
+        if part > 0.5:
+            return whole + 1
+        if part < 0.5:
+            return whole
+        return whole if whole % 2 == 0 else whole + 1
+
+# '%.<places>f'. CPython formats the double it is given, rounding half to even,
+# so a half-even rounder is required rather than a naive +0.5.
+def dstr_append_fixed(out: mutable dstr&, value: f64, places: i64):
+    can Memory.Allocate, Abort.Panic:
+        scale: mutable f64 = 1.0
+        step: mutable i64 = 0
+        while step < places |scale, step, places|:
+            scale <- scale * 10.0
+            step <- step + 1
+        negative: bool = value < 0.0
+        magnitude: f64 = -value if negative else value
+        units: i64 = menu_round_half_even(magnitude * scale)
+        divisor: i64 = scale.i64()
+        whole: i64 = units / divisor
+        fraction: i64 = units % divisor
+        if negative and units != 0:
+            out.push(45.u8())
+        dstr_append_i64(out, whole)
+        if places > 0:
+            out.push(46.u8())
+            # Leading zeros of the fractional part: 0.05 at two places is "05",
+            # and appending the integer 5 alone would print "0.5".
+            guard: mutable i64 = divisor / 10
+            while guard > 1 and fraction < guard |guard, out, fraction|:
+                out.push(48.u8())
+                guard <- guard / 10
+            dstr_append_i64(out, fraction)
+
+# PercentCycler.__str__: two decimals out at the extremes, one in the middle,
+# and the endpoints 0 and 1 are explicitly NOT extremes.
+def menu_percent_places(fraction: f64) -> i64:
+    can Abort.Panic:
+        if fraction == 0.0 or fraction == 1.0:
+            return 1
+        if fraction < 0.1 or fraction > 0.9:
+            return 2
+        return 1
+
+def menu_append_value(out: mutable dstr&, kind: i64, number: f64, text: sview):
+    can Memory.Allocate, Abort.Panic:
+        if kind == MENU_VALUE_BOOL:
+            # Menu.textify: True is 'Yes', False is 'No'.
+            if number != 0.0:
+                dstr_append_cstr(out, "Yes")
+            else:
+                dstr_append_cstr(out, "No")
+        elif kind == MENU_VALUE_INT:
+            dstr_append_i64(out, number.i64())
+        elif kind == MENU_VALUE_TEXT:
+            dstr_append_sview(out, text)
+        elif kind == MENU_VALUE_PERCENT:
+            dstr_append_fixed(out, number * 100.0, menu_percent_places(number))
+            out.push(37.u8())
+        elif kind == MENU_VALUE_ALL:
+            if number == 0.0:
+                dstr_append_cstr(out, "all")
+            else:
+                dstr_append_i64(out, number.i64())
+
+# One row's text, ready for scene_menu to place.
+def menu_row_text(name: sview, kind: i64, number: f64, text: sview) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        if kind == MENU_VALUE_SPACER:
+            return out
+        if kind == MENU_VALUE_COMMAND:
+            dstr_append_sview(&out, name)
+            return out
+
+        dstr_append_sview(&out, name)
+        # ljust pads, and never truncates: a name longer than the column pushes
+        # the value column right, which is what the original does too.
+        dstr_append_spaces(&out, MENU_NAME_WIDTH - sview_len(name).i64())
+        dstr_append_cstr(&out, ": ")
+
+        rendered: mutable dstr = []
+        menu_append_value(&rendered, kind, number, text)
+        dstr_append_spaces(&out, MENU_VALUE_WIDTH - rendered.count.i64())
+        dstr_append_dstr(&out, rendered)
+        return out
+
+# A screen's content: what each row says, before anything knows where it sits.
+struct MenuRow:
+    name: sview
+    kind: i64
+    number: f64
+    text: sview
+
+def menu_row(name: sview, kind: i64, number: f64, text: sview) -> MenuRow:
+    return MenuRow{name: name, kind: kind, number: number, text: text}
+
+def menu_spacer() -> MenuRow:
+    return MenuRow{name: "", kind: MENU_VALUE_SPACER, number: 0.0, text: ""}
