@@ -299,29 +299,82 @@ brace form. See `repro/nw_ctor_overload_sview_field.elisa`.
 
 ## Module blocks: what actually works today
 
-`src/menu_model.elisa` is `module MenuText:` and passes on both stages, so leaf
-modules whose API is values (not growable references) are ready now.
+`src/display.elisa` is `module Display:` and `src/menu_model.elisa` is
+`module MenuText:`; both pass on both stages. Display is the significant one --
+its whole API is `mutable DisplayList&`, which is what a module block could not
+carry until the region fix below.
 
-Four things block converting the rest, each with a minimal repro in
-`worktrees/elisa-core-nw/repro/`:
+Of the four things that blocked converting the rest, three are fixed. Repros are
+in `worktrees/elisa-core-nw/repro/`.
 
   1. **Constants were not namespaced** -- FIXED. Two modules each declaring
      `SIZE` collapsed onto one table row and the second silently overwrote the
      first. A wrong answer, and qualifying the use site did not help because the
      collision was in the table. Constants are now keyed by (owner, name).
-  2. **Struct names still are not.** Two modules cannot both declare a `Work`,
-     which is exactly what the task modules would want (SyWork, GoWork,
-     MazeWork, SokWork, RemWork). Same fix shape as constants, bigger job: six
-     registration sites, ~37 lookups, and type resolution reaches the semantic
-     phase. `nw_module_struct_name_collision.elisa`.
-  3. **Region inference does not forward through a qualified call.** A function
-     holding `mutable X&` cannot pass it to `Module::helper(x, ...)`. Every
-     renderer here does exactly that, so `Display::rect(list, ...)` is
-     unreachable from a function that received `list` as a parameter. Both
-     compilers. `nw_region_forward_through_module_call.elisa`.
-  4. **A sibling call loses to a stdlib generic on stage0.** Inside a module,
-     an unqualified `add(...)` binds to `Flags[T]::add` rather than the module's
-     own `add`. stage1 gets this RIGHT -- it prefers the enclosing module's
-     member -- so the compilers disagree. Until stage0 matches, module members
-     must avoid every name the stdlib uses generically, which is prefixing again
-     wearing a module block. `nw_stage0_module_sibling_shadowed.elisa`.
+
+     A second half turned up when Display became a module: the qualified fix
+     covered expression USE sites, but the two const FOLDERS still matched
+     `Expr.Ident` alone, so `const ROWS_TOP: f64 = Display::REFERENCE_HEIGHT * 8.0 / 10.0`
+     never resolved -- and an unresolved const declines every function that
+     reads it, which drops the whole unit. Also fixed;
+     `test/repro/module_const_in_const_initializer.elisa` in the compiler repo.
+
+  2. **Region inference did not forward through a qualified call** -- FIXED.
+     A function holding `mutable X&` could not pass it to
+     `Module::helper(x, ...)`, so `Display::rect(list, ...)` was unreachable
+     from any function that received `list` as a parameter, which is every
+     renderer.
+
+     This was recorded here as a language-level gap affecting both compilers.
+     That was wrong: stage0 rejected it, stage1 compiled and ran it correctly.
+     Region-param inference keyed call targets by the FuncDecl's bare name
+     ("stow") while `Box::stow(...)` parses to one joined Ident ("Box.stow"), so
+     no module member ever matched.
+
+     Fixing it exposed a second defect in the same pass, which the fix itself
+     introduced: the region-valued PROBE resolves a callee's declared return
+     type, and a module member's return type is written BARE inside its module.
+     Resolved from the caller's namespace it does not resolve -- and
+     `resolveType` REPORTS, so a probe emitted a real "unknown type Row" against
+     the callee's own signature. It needs a darray PARAMETER to reach:
+
+         def fill(rows: mutable darray[M::Row]&):
+             rows.push(M::spacer())
+
+     Worth knowing how it was caught: `scripts/check.sh` was 66/66 green with the
+     regression in place. `scripts/gate.sh` found it, because the wasm build is a
+     gate step and not a check step. 66/66 is not the gate.
+
+  3. **A constructor overload was refused for an `sview` parameter** -- FIXED.
+     `def Row(k: i64, s: sview) -> Row` was not recognised, and `Row(3, "x")`
+     fell through to the all-fields positional path, which rejected it while
+     asking for the constructor defined three lines above.
+
+     Recorded here as "it is the view type, not the arity". Closer: it is a
+     string LITERAL passed to an `sview` parameter. A literal approximates to
+     `u8& static`, which is not `AssignableTo` an sview, so the overload was
+     discarded as a candidate -- the overload FILTER disagreeing with the
+     language, since the ordinary call path accepts the same literal. Passing an
+     `sview` LOCAL always worked, and the struct having an sview FIELD had
+     nothing to do with it.
+
+  4. **A sibling call loses to a stdlib generic on stage0.** STILL OPEN. Inside
+     a module, an unqualified `add(...)` binds to `Flags[T]::add` rather than the
+     module's own `add`. stage1 gets this RIGHT -- it prefers the enclosing
+     module's member -- so the compilers disagree. Until stage0 matches, module
+     members must avoid every name the stdlib uses generically, which is
+     prefixing again wearing a module block.
+     `nw_stage0_module_sibling_shadowed.elisa`.
+
+  5. **Struct names are still not namespaced.** STILL OPEN. Two modules cannot
+     both declare a `Work`, which is exactly what the task modules would want
+     (SyWork, GoWork, MazeWork, SokWork, RemWork). Same fix shape as constants,
+     bigger job: the parser records struct names in a flat ownerless list
+     parallel to their member spans, so the owner has to be threaded from the
+     parser through `Ast::File` before the backend's six registration sites and
+     ~37 lookups can key on it. `nw_module_struct_name_collision.elisa`.
+
+One formatting trap, since it cost real time: a comment at column 0 inside a
+module body is a dedent. The sed-based MenuText conversion left three, and they
+read as ordinary comments. `src/menu_model.elisa` is fixed; the check is "a
+column-0 comment whose next code line is indented".
