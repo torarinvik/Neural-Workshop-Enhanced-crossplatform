@@ -1,0 +1,1607 @@
+# Sokoban: push every box onto a goal, in a warren carved to make it hard.
+#
+# Port of neural_workshop/sokoban.py (GPL-2.0-or-later). A board is a flat grid
+# of `width * height` cells; walls, goals and boxes are cell sets, and the
+# player is one cell. Difficulty runs on three ranked axes: the certified push
+# count, the share of floor that is DEAD (a box pushed there can never reach a
+# goal), and the share of OPENING pushes that lose the level outright.
+#
+# ## Where CPython's set order is observable, and where it is not
+#
+# `_pull_walk` and `_climbing_walk` both do `for box in boxes:` to build their
+# option list, and then `rng.choice` reads that list positionally -- so the set's
+# iteration order picks the pull. It is a PySet::Table for that reason.
+#
+# The ascending shortcut that `removals` relies on does NOT apply here. A box set
+# holds between one and thirteen entries, so its table is at most 64 slots, while
+# cell ids run to 255: `key & mask` is not the key and the order is genuinely
+# scrambled. Measured -- 67 of 96 sampled box sets iterate out of order, e.g.
+# {10, 17} comes out [17, 10] because 17 & 7 = 1 precedes 10 & 7 = 2.
+#
+# Everywhere else the order is NOT observable and a flat membership array is the
+# right port, which matters because those sets are the big ones:
+#   * `_convoy_walk` walks `sorted(boxes)`;
+#   * `_dig_traps` iterates its wall set, but walls always outnumber about two
+#     thirds of the grid, so that table is far larger than the largest cell id
+#     and its order IS ascending (verified structurally, tightest margin 92);
+#   * `live_cells`, `_reachable` and friends return closures -- the SET is the
+#     answer, and only membership is ever asked of it;
+#   * the solver's `seen` is asked only whether it contains a state.
+#
+# ## Random-stream fidelity
+#
+# `generate` runs up to three ROUNDS, each a fresh `Random(seed + n * 7919)`, and
+# each round deals up to `attempts` rooms off that one stream. So a single
+# misplaced draw does not just spoil its own deal -- it shifts every later deal in
+# the round. The draw order per attempt is:
+#   _carve_room    one `choice(DIRECTIONS)`, then per dug cell a `random()` and
+#                  sometimes another `choice(DIRECTIONS)`
+#   _blob_goals    one `choice(open_floor)`, then one `choice(grow)` per goal
+#   the walk       _pull_walk, or (nine boxes and up) _convoy_walk then
+#                  _climbing_walk, in that order
+#   _dig_traps     one `shuffle(candidates)` per round that still owes traps
+
+const SOK_MOST_CELLS: i64 = 256
+const SOK_MOST_BOXES: i64 = 13
+const SOK_GRADE_COUNT: i64 = 16
+const SOK_BIG: i64 = 1000000
+const SOK_NODE_BUDGET: i64 = 400000
+const SOK_GENERATION_BUDGET: i64 = 80000
+
+# The four steps as cell offsets, in the reference's DIRECTIONS order:
+# (0,-1), (0,1), (-1,0), (1,0) == -width, +width, -1, +1.
+const SOK_STEP_COUNT: i64 = 4
+
+struct SokGrade:
+    width: mutable i64
+    height: mutable i64
+    boxes: mutable i64
+    floor_share: mutable f64
+    pulls: mutable i64
+    floor: mutable i64
+    trap_share: mutable f64
+    deceit: mutable f64
+
+def sok_grade_of(level_number: i64) -> SokGrade:
+    can Abort.Panic:
+        index: mutable i64 = level_number - 1
+        index <- 0 if index < 0
+        index <- SOK_GRADE_COUNT - 1 if index > SOK_GRADE_COUNT - 1
+        #                       w   h  bx  share pulls floor trap  deceit
+        return SokGrade{width: 5, height: 5, boxes: 1, floor_share: 0.9, pulls: 6, floor: 2, trap_share: 0.0, deceit: 0.0} if index == 0
+        return SokGrade{width: 6, height: 6, boxes: 1, floor_share: 0.65, pulls: 20, floor: 4, trap_share: 0.0, deceit: 0.0} if index == 1
+        return SokGrade{width: 6, height: 6, boxes: 2, floor_share: 0.65, pulls: 24, floor: 5, trap_share: 0.0, deceit: 0.0} if index == 2
+        return SokGrade{width: 7, height: 7, boxes: 2, floor_share: 0.6, pulls: 30, floor: 7, trap_share: 0.2, deceit: 0.0} if index == 3
+        return SokGrade{width: 7, height: 7, boxes: 3, floor_share: 0.6, pulls: 40, floor: 8, trap_share: 0.2, deceit: 0.1} if index == 4
+        return SokGrade{width: 8, height: 8, boxes: 3, floor_share: 0.55, pulls: 50, floor: 12, trap_share: 0.3, deceit: 0.15} if index == 5
+        return SokGrade{width: 9, height: 9, boxes: 4, floor_share: 0.55, pulls: 70, floor: 14, trap_share: 0.3, deceit: 0.2} if index == 6
+        return SokGrade{width: 9, height: 9, boxes: 5, floor_share: 0.55, pulls: 90, floor: 17, trap_share: 0.35, deceit: 0.25} if index == 7
+        return SokGrade{width: 10, height: 10, boxes: 5, floor_share: 0.52, pulls: 110, floor: 20, trap_share: 0.35, deceit: 0.25} if index == 8
+        return SokGrade{width: 10, height: 10, boxes: 6, floor_share: 0.52, pulls: 130, floor: 23, trap_share: 0.4, deceit: 0.3} if index == 9
+        return SokGrade{width: 11, height: 11, boxes: 7, floor_share: 0.5, pulls: 160, floor: 26, trap_share: 0.4, deceit: 0.3} if index == 10
+        return SokGrade{width: 11, height: 11, boxes: 8, floor_share: 0.48, pulls: 190, floor: 28, trap_share: 0.45, deceit: 0.3} if index == 11
+        return SokGrade{width: 13, height: 13, boxes: 9, floor_share: 0.46, pulls: 240, floor: 45, trap_share: 0.45, deceit: 0.35} if index == 12
+        return SokGrade{width: 14, height: 14, boxes: 11, floor_share: 0.45, pulls: 300, floor: 52, trap_share: 0.5, deceit: 0.35} if index == 13
+        return SokGrade{width: 15, height: 15, boxes: 13, floor_share: 0.43, pulls: 380, floor: 52, trap_share: 0.5, deceit: 0.4} if index == 14
+        return SokGrade{width: 16, height: 16, boxes: 13, floor_share: 0.46, pulls: 500, floor: 60, trap_share: 0.55, deceit: 0.4}
+
+# `(-width, width, -1, 1)` -- the reference's _steps, in its order.
+def sok_step_of(width: i64, index: i64) -> i64:
+    return 0 - width if index == 0
+    return width if index == 1
+    return -1 if index == 2
+    return 1
+
+# One level: the room, the load, and what was certified about it.
+struct SokLevel:
+    ok: mutable bool
+    width: mutable i64
+    height: mutable i64
+    cells: mutable i64
+    walls_in: mutable darray[i64]
+    goals_in: mutable darray[i64]
+    boxes_in: mutable darray[i64]
+    player: mutable i64
+    # Exact minimum pushes when the solver finished, else -1.
+    minimum: mutable i64
+    # A proven lower bound -- equal to the minimum when known, else what the
+    # breadth-first frontier certified before the budget ran out. Never a guess.
+    at_least: mutable i64
+    # Pushes the generator's own walk needs: an upper bound, and the fallback par.
+    bound: mutable i64
+    # Floor squares a box dies on.
+    traps_in: mutable darray[i64]
+    traps_n: mutable i64
+
+def sok_level_new() -> SokLevel:
+    can Memory.Allocate, Abort.Panic:
+        level: mutable SokLevel = zeroed
+        level.walls_in <- Ints::zeros(SOK_MOST_CELLS)
+        level.goals_in <- Ints::zeros(SOK_MOST_CELLS)
+        level.boxes_in <- Ints::zeros(SOK_MOST_CELLS)
+        level.traps_in <- Ints::zeros(SOK_MOST_CELLS)
+        return level
+
+# Scratch for one generator run, sized once from the largest rung. `generate`
+# deals hundreds of rooms per round, so nothing here may allocate per attempt.
+struct SokWork:
+    width: mutable i64
+    height: mutable i64
+    cells: mutable i64
+    floor_ok: mutable darray[i64]
+    # Flood-fill scratch: `seen` is stamped with a generation counter so it never
+    # needs clearing between the thousands of reachability queries a walk makes.
+    seen: mutable darray[i64]
+    seen_gen: mutable i64
+    queue: mutable darray[i64]
+    alive_in: mutable darray[i64]
+    dead_in: mutable darray[i64]
+    far: mutable darray[i64]
+    # `assumed` for the freeze recursion, likewise generation-stamped.
+    assumed: mutable darray[i64]
+    assumed_gen: mutable i64
+    # Reusable candidate lists.
+    pick: mutable darray[i64]
+    pick_n: mutable i64
+    pick_b: mutable darray[i64]
+    pick_c: mutable darray[i64]
+    scratch: mutable darray[i64]
+    # The carved room, as (x, y) membership over the grid.
+    carved_in: mutable darray[i64]
+    # Goal tables: one relaxed push-distance map per goal.
+    tables: mutable darray[i64]
+    goal_list: mutable darray[i64]
+    goal_n: mutable i64
+    # The assignment DP over 2^goals.
+    dp: mutable darray[i64]
+    cost: mutable darray[i64]
+
+def sok_work_new() -> SokWork:
+    can Memory.Allocate, Abort.Panic:
+        work: mutable SokWork = zeroed
+        work.floor_ok <- Ints::zeros(SOK_MOST_CELLS)
+        work.seen <- Ints::zeros(SOK_MOST_CELLS)
+        work.queue <- Ints::zeros(SOK_MOST_CELLS + 4)
+        work.alive_in <- Ints::zeros(SOK_MOST_CELLS)
+        work.dead_in <- Ints::zeros(SOK_MOST_CELLS)
+        work.far <- Ints::zeros(SOK_MOST_CELLS)
+        work.assumed <- Ints::zeros(SOK_MOST_CELLS)
+        work.pick <- Ints::zeros(SOK_MOST_CELLS * 4)
+        work.pick_b <- Ints::zeros(SOK_MOST_CELLS * 4)
+        work.pick_c <- Ints::zeros(SOK_MOST_CELLS * 4)
+        work.scratch <- Ints::zeros(SOK_MOST_CELLS)
+        work.carved_in <- Ints::zeros(SOK_MOST_CELLS)
+        work.tables <- Ints::zeros(SOK_MOST_BOXES * SOK_MOST_CELLS)
+        work.goal_list <- Ints::zeros(SOK_MOST_BOXES)
+        work.dp <- Ints::zeros(1 << SOK_MOST_BOXES)
+        work.cost <- Ints::zeros(SOK_MOST_BOXES * SOK_MOST_BOXES)
+        work.seen_gen <- 0
+        work.assumed_gen <- 0
+        return work
+
+# Interior floor: inside the border and not a wall. The border is always rock,
+# which is what lets every neighbour lookup skip a bounds test.
+def sok_floor_flags(work: mutable SokWork&, walls_in: mutable darray[i64]&):
+    can Abort.Panic:
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work, walls_in|:
+            x: i64 = cell % work.width
+            y: i64 = cell / work.width
+            inside: bool = x > 0 and x < work.width - 1 and y > 0 and y < work.height - 1
+            open_cell: bool = inside and Ints::at_ref(walls_in, cell) == 0
+            Ints::put(&work.floor_ok, cell, 1 if open_cell else 0)
+            cell <- cell + 1
+
+# Every cell the player can walk to without pushing anything. Returns the count
+# and stamps `work.seen` with the current generation; `sok_walked` reads it.
+def sok_reachable(work: mutable SokWork&, boxes_in: mutable darray[i64]&, start: i64) -> i64:
+    can Abort.Panic:
+        work.seen_gen <- work.seen_gen + 1
+        stamp: i64 = work.seen_gen
+        Ints::put(&work.seen, start, stamp)
+        Ints::put(&work.queue, 0, start)
+        queue_head: mutable i64 = 0
+        queue_end: mutable i64 = 1
+        while queue_head < queue_end |queue_head, queue_end, work, boxes_in, stamp|:
+            cell: i64 = Ints::at(work.queue, queue_head)
+            queue_head <- queue_head + 1
+            probe: mutable i64 = 0
+            while probe < SOK_STEP_COUNT |probe, cell, work, boxes_in, stamp, queue_end|:
+                near: i64 = cell + sok_step_of(work.width, probe)
+                if near >= 0 and near < work.cells:
+                    if Ints::at(work.seen, near) != stamp and Ints::at(work.floor_ok, near) == 1 and Ints::at_ref(boxes_in, near) == 0:
+                        Ints::put(&work.seen, near, stamp)
+                        Ints::put(&work.queue, queue_end, near)
+                        queue_end <- queue_end + 1
+                probe <- probe + 1
+        return queue_end
+
+def sok_walked(work: SokWork&, cell: i64) -> bool:
+    can Abort.Panic:
+        return Ints::at(work.seen, cell) == work.seen_gen
+
+# Cells a lone box could still be pushed to a goal from, computed BACKWARDS: a
+# goal is live, and a cell is live when a box on it can be PULLED from a live
+# cell -- pulling being pushing seen from the other end. A box anywhere else is
+# already lost, which is what lets the solver prune the state the moment it
+# appears.
+def sok_live_cells(work: mutable SokWork&, goals_in: mutable darray[i64]&):
+    can Abort.Panic:
+        cell: mutable i64 = 0
+        queue_head: mutable i64 = 0
+        queue_end: mutable i64 = 0
+        while cell < work.cells |cell, work, goals_in, queue_end|:
+            live: bool = Ints::at_ref(goals_in, cell) == 1
+            Ints::put(&work.alive_in, cell, 1 if live else 0)
+            if live:
+                Ints::put(&work.queue, queue_end, cell)
+                queue_end <- queue_end + 1
+            cell <- cell + 1
+        while queue_head < queue_end |queue_head, queue_end, work|:
+            at: i64 = Ints::at(work.queue, queue_head)
+            queue_head <- queue_head + 1
+            probe: mutable i64 = 0
+            while probe < SOK_STEP_COUNT |probe, at, work, queue_end|:
+                step: i64 = sok_step_of(work.width, probe)
+                back: i64 = at - step
+                beyond: i64 = at - step - step
+                if back >= 0 and back < work.cells and beyond >= 0 and beyond < work.cells:
+                    if Ints::at(work.alive_in, back) == 0 and Ints::at(work.floor_ok, back) == 1 and Ints::at(work.floor_ok, beyond) == 1:
+                        Ints::put(&work.alive_in, back, 1)
+                        Ints::put(&work.queue, queue_end, back)
+                        queue_end <- queue_end + 1
+                probe <- probe + 1
+
+# Is the box on `cell` frozen where it stands, for good?
+#
+# A box travels an axis only when BOTH squares along it are free floor: the
+# player needs one to stand on and the box needs the other to land on. So the
+# axis is shut when either side is rock, when both sides are squares nothing
+# returns from, or when either side holds a box that is itself stuck. Shut on
+# both axes and off a goal means the level is already lost.
+#
+# The recursion treats any box it is ALREADY ASKING ABOUT as immovable, which is
+# the standard reading and the right one: two boxes that block only each other
+# are both stuck. `assumed` carries that set, generation-stamped.
+def sok_stuck(work: mutable SokWork&, boxes_in: mutable darray[i64]&, cell: i64) -> bool:
+    can Abort.Panic:
+        true return if Ints::at(work.assumed, cell) == work.assumed_gen
+        Ints::put(&work.assumed, cell, work.assumed_gen)
+        # The two axes: horizontal (step 1) and vertical (step width).
+        axis: mutable i64 = 0
+        open_axis: mutable bool = false
+        while axis < 2 and not open_axis |axis, work, boxes_in, cell, open_axis|:
+            step: i64 = 1 if axis == 0 else work.width
+            low: i64 = cell - step
+            high: i64 = cell + step
+            shut: mutable bool = false
+            shut <- true if low < 0 or high >= work.cells
+            shut <- true if not shut and (Ints::at(work.floor_ok, low) == 0 or Ints::at(work.floor_ok, high) == 0)
+            shut <- true if not shut and Ints::at(work.dead_in, low) == 1 and Ints::at(work.dead_in, high) == 1
+            if not shut and Ints::at_ref(boxes_in, low) == 1:
+                shut <- true if sok_stuck(work, boxes_in, low)
+            if not shut and Ints::at_ref(boxes_in, high) == 1:
+                shut <- true if sok_stuck(work, boxes_in, high)
+            open_axis <- true if not shut
+            axis <- axis + 1
+        return not open_axis
+
+# `dead` = floor a box can never return from. Recomputed whenever `alive` is.
+def sok_mark_dead(work: mutable SokWork&):
+    can Abort.Panic:
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work|:
+            dead: bool = Ints::at(work.floor_ok, cell) == 1 and Ints::at(work.alive_in, cell) == 0
+            Ints::put(&work.dead_in, cell, 1 if dead else 0)
+            cell <- cell + 1
+
+# Relaxed push-distance from every cell to one goal, for a lone box. The
+# relaxation ignores the player and every other box, so it can only UNDERCOUNT --
+# which is exactly what makes the assignment bound below admissible.
+def sok_push_distances(work: mutable SokWork&, goal: i64, out_base: i64):
+    can Abort.Panic:
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work, out_base|:
+            Ints::put(&work.tables, out_base + cell, SOK_BIG)
+            cell <- cell + 1
+        Ints::put(&work.tables, out_base + goal, 0)
+        Ints::put(&work.queue, 0, goal)
+        queue_head: mutable i64 = 0
+        queue_end: mutable i64 = 1
+        while queue_head < queue_end |queue_head, queue_end, work, out_base|:
+            at: i64 = Ints::at(work.queue, queue_head)
+            queue_head <- queue_head + 1
+            here: i64 = Ints::at(work.tables, out_base + at)
+            probe: mutable i64 = 0
+            while probe < SOK_STEP_COUNT |probe, at, here, work, out_base, queue_end|:
+                step: i64 = sok_step_of(work.width, probe)
+                back: i64 = at - step
+                beyond: i64 = at - step - step
+                if back >= 0 and back < work.cells and beyond >= 0 and beyond < work.cells:
+                    if Ints::at(work.floor_ok, back) == 1 and Ints::at(work.floor_ok, beyond) == 1:
+                        if Ints::at(work.tables, out_base + back) > here + 1:
+                            Ints::put(&work.tables, out_base + back, here + 1)
+                            Ints::put(&work.queue, queue_end, back)
+                            queue_end <- queue_end + 1
+                probe <- probe + 1
+
+# One relaxed-distance map per goal, in SORTED goal order. The walls never change
+# while boxes are pulled around a room, so these are computed once and price
+# thousands of arrangements.
+def sok_goal_tables(work: mutable SokWork&, goals_in: mutable darray[i64]&):
+    can Abort.Panic:
+        work.goal_n <- 0
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work, goals_in|:
+            if Ints::at_ref(goals_in, cell) == 1:
+                Ints::put(&work.goal_list, work.goal_n, cell)
+                work.goal_n <- work.goal_n + 1
+            cell <- cell + 1
+        index: mutable i64 = 0
+        while index < work.goal_n |index, work|:
+            sok_push_distances(work, Ints::at(work.goal_list, index), index * work.cells)
+            index <- index + 1
+
+# The cheapest perfect assignment of boxes to goals, as a bitmask DP over the
+# goals. An unreachable pairing prices at SOK_BIG, so an impossible assignment
+# comes back enormous rather than lying small.
+#
+# `boxes` must be in SORTED cell order -- the reference passes `sorted(boxes)`,
+# and the DP walks boxes by popcount, so the order fixes which box each layer is.
+def sok_assignment(work: mutable SokWork&, boxes: mutable darray[i64]&, count: i64) -> i64:
+    can Abort.Panic:
+        n: i64 = work.goal_n
+        0 return if n == 0 or count != n
+        box_index: mutable i64 = 0
+        while box_index < n |box_index, n, work, boxes|:
+            goal_index: mutable i64 = 0
+            while goal_index < n |goal_index, n, box_index, work, boxes|:
+                reach: i64 = Ints::at(work.tables, goal_index * work.cells + Ints::at_ref(boxes, box_index))
+                Ints::put(&work.cost, box_index * n + goal_index, SOK_BIG if reach > SOK_BIG else reach)
+                goal_index <- goal_index + 1
+            box_index <- box_index + 1
+        limit: i64 = 1 << n
+        ceiling: i64 = SOK_BIG * n
+        mask: mutable i64 = 0
+        while mask < limit |mask, limit, work, ceiling|:
+            Ints::put(&work.dp, mask, ceiling)
+            mask <- mask + 1
+        Ints::put(&work.dp, 0, 0)
+        state: mutable i64 = 0
+        while state < limit |state, limit, n, work, ceiling|:
+            here: i64 = Ints::at(work.dp, state)
+            if here < ceiling:
+                # The box this layer places is fixed by how many goals are taken.
+                taken: mutable i64 = 0
+                bit: mutable i64 = 0
+                while bit < n |bit, n, state, taken|:
+                    taken <- taken + 1 if (state >> bit) & 1 == 1
+                    bit <- bit + 1
+                if taken < n:
+                    goal_index: mutable i64 = 0
+                    while goal_index < n |goal_index, n, state, taken, here, work|:
+                        if (state >> goal_index) & 1 == 0:
+                            after: i64 = state | (1 << goal_index)
+                            score: i64 = here + Ints::at(work.cost, taken * n + goal_index)
+                            Ints::put(&work.dp, after, score) if score < Ints::at(work.dp, after)
+                        goal_index <- goal_index + 1
+            state <- state + 1
+        total: i64 = Ints::at(work.dp, limit - 1)
+        return ceiling if total > ceiling else total
+
+# --- the solver ----------------------------------------------------------
+#
+# Breadth-first over (box configuration, player region). The FIRST solved state
+# found is minimal in pushes, because the frontier advances one push at a time.
+# Walking costs nothing on purpose: pushes are what Sokoban difficulty is made
+# of, and a par in pushes survives whatever route the player strolls.
+#
+# A state is keyed by the box set as a BITMASK over cells -- four u64 words cover
+# the 256-cell maximum -- plus the smallest cell the player can reach, which is
+# the canonical name for "which side of the boxes the player is on". Two
+# positions with the same boxes and the same reachable region are the same
+# position however the player got there.
+#
+# The visited table is open-addressed with linear probing. Its ITERATION order is
+# never used -- only membership -- so it owes CPython nothing and is a plain hash
+# set.
+
+const SOK_STATE_WORDS: i64 = 4
+const SOK_TABLE_SLOTS: i64 = 262144
+const SOK_TABLE_MASK: i64 = 262143
+
+struct SokSearch:
+    # Visited states: `stamp` marks a live slot for the current search, so the
+    # table never needs clearing between the hundreds of solves one deal runs.
+    stamp: mutable darray[i64]
+    key: mutable darray[i64]
+    generation: mutable i64
+    # The frontier, as parallel arrays: box bitmask, player anchor, push count.
+    frontier: mutable darray[i64]
+    anchor: mutable darray[i64]
+    pushes: mutable darray[i64]
+    frontier_cap: mutable i64
+    # Scratch box membership for expanding one state.
+    boxes_in: mutable darray[i64]
+    moved_in: mutable darray[i64]
+
+def sok_search_new(capacity: i64) -> SokSearch:
+    can Memory.Allocate, Abort.Panic:
+        search: mutable SokSearch = zeroed
+        search.stamp <- Ints::zeros(SOK_TABLE_SLOTS)
+        search.key <- Ints::zeros(SOK_TABLE_SLOTS * (SOK_STATE_WORDS + 1))
+        search.frontier <- Ints::zeros(capacity * SOK_STATE_WORDS)
+        search.anchor <- Ints::zeros(capacity)
+        search.pushes <- Ints::zeros(capacity)
+        search.frontier_cap <- capacity
+        search.boxes_in <- Ints::zeros(SOK_MOST_CELLS)
+        search.moved_in <- Ints::zeros(SOK_MOST_CELLS)
+        search.generation <- 0
+        return search
+
+# Mix the state's five words into a slot index. Any spreading function does --
+# the table is a membership set, so a collision only costs a probe.
+def sok_state_hash(words: mutable darray[i64]&, base: i64, anchor: i64) -> i64:
+    can Abort.Panic:
+        mixed: mutable i64 = anchor * 1099511628211
+        index: mutable i64 = 0
+        while index < SOK_STATE_WORDS |index, mixed, words, base|:
+            mixed <- (mixed ^ Ints::at_ref(words, base + index)) * 1099511628211
+            index <- index + 1
+        mixed <- mixed ^ (mixed >> 29)
+        return mixed & SOK_TABLE_MASK if mixed >= 0 else (0 - mixed) & SOK_TABLE_MASK
+
+# Insert (words, anchor) when absent; true when it was NEW.
+def sok_state_add(search: mutable SokSearch&, words: mutable darray[i64]&, base: i64, anchor: i64) -> bool:
+    can Abort.Panic:
+        slot: mutable i64 = sok_state_hash(words, base, anchor)
+        placed: mutable i64 = 0
+        while placed == 0 |placed, slot, search, words, base, anchor|:
+            if Ints::at(search.stamp, slot) != search.generation:
+                Ints::put(&search.stamp, slot, search.generation)
+                entry: i64 = slot * (SOK_STATE_WORDS + 1)
+                word: mutable i64 = 0
+                while word < SOK_STATE_WORDS |word, entry, search, words, base|:
+                    Ints::put(&search.key, entry + word, Ints::at_ref(words, base + word))
+                    word <- word + 1
+                Ints::put(&search.key, entry + SOK_STATE_WORDS, anchor)
+                placed <- 1
+            else:
+                entry: i64 = slot * (SOK_STATE_WORDS + 1)
+                same: mutable bool = Ints::at(search.key, entry + SOK_STATE_WORDS) == anchor
+                word: mutable i64 = 0
+                while word < SOK_STATE_WORDS and same |word, entry, search, words, base, same|:
+                    same <- false if Ints::at(search.key, entry + word) != Ints::at_ref(words, base + word)
+                    word <- word + 1
+                if same:
+                    placed <- 2
+                else:
+                    slot <- (slot + 1) & SOK_TABLE_MASK
+        return placed == 1
+
+def sok_mask_set(words: mutable darray[i64]&, base: i64, cell: i64):
+    can Abort.Panic:
+        word: i64 = base + cell / 64
+        Ints::put(words, word, Ints::at_ref(words, word) | (1 << (cell % 64)))
+
+def sok_mask_clear(words: mutable darray[i64]&, base: i64, cell: i64):
+    can Abort.Panic:
+        word: i64 = base + cell / 64
+        Ints::put(words, word, Ints::at_ref(words, word) & (0 - 1 - (1 << (cell % 64))))
+
+# (exact minimum or -1, proven lower bound).
+#
+# The lower bound costs nothing extra: breadth-first visits states in PUSH order,
+# so when the budget dies at depth k, every solution still out there needs more
+# than k pushes. The ladder's top rungs lean on exactly this -- a level too hard
+# to certify exactly can still PROVE it clears its floor.
+#
+# Writes the bound into `out_bound` and returns the minimum, or -1.
+def sok_solve_bounded(work: mutable SokWork&, search: mutable SokSearch&, level: mutable SokLevel&, budget: i64, out_bound: mutable i64&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        out_bound <- 0
+        sok_floor_flags(work, &level.walls_in)
+        sok_live_cells(work, &level.goals_in)
+        # Born dead: a box already off the live set can never come home. The
+        # generator never produces one, but a hand-built level might.
+        cell: mutable i64 = 0
+        born_dead: mutable bool = false
+        boxes_left: mutable i64 = 0
+        while cell < work.cells |cell, work, level, born_dead, boxes_left|:
+            if Ints::at(level.boxes_in, cell) == 1:
+                born_dead <- true if Ints::at(work.alive_in, cell) == 0
+                boxes_left <- boxes_left + 1 if Ints::at(level.goals_in, cell) == 0
+            cell <- cell + 1
+        -1 return if born_dead
+        0 return if boxes_left == 0
+
+        search.generation <- search.generation + 1
+        copy: mutable i64 = 0
+        while copy < work.cells |copy, work, level, search|:
+            Ints::put(&search.boxes_in, copy, Ints::at(level.boxes_in, copy))
+            copy <- copy + 1
+        # The start state: boxes as a bitmask, the player's region anchored at
+        # its smallest cell.
+        word: mutable i64 = 0
+        while word < SOK_STATE_WORDS |word, search|:
+            Ints::put(&search.frontier, word, 0)
+            word <- word + 1
+        mark: mutable i64 = 0
+        while mark < work.cells |mark, work, search|:
+            sok_mask_set(&search.frontier, 0, mark) if Ints::at(search.boxes_in, mark) == 1
+            mark <- mark + 1
+        _ = sok_reachable(work, &search.boxes_in, level.player)
+        anchor: mutable i64 = -1
+        scan: mutable i64 = 0
+        while scan < work.cells and anchor < 0 |scan, work, anchor|:
+            anchor <- scan if sok_walked(work, scan)
+            scan <- scan + 1
+        Ints::put(&search.anchor, 0, anchor)
+        Ints::put(&search.pushes, 0, 0)
+        _ = sok_state_add(search, &search.frontier, 0, anchor)
+
+        queue_head: mutable i64 = 0
+        queue_end: mutable i64 = 1
+        seen_count: mutable i64 = 1
+        answer: mutable i64 = -1
+        while queue_head < queue_end and answer < 0 |queue_head, queue_end, seen_count, answer, work, search, level, budget, out_bound|:
+            base: i64 = queue_head * SOK_STATE_WORDS
+            here_pushes: i64 = Ints::at(search.pushes, queue_head)
+            if seen_count > budget:
+                out_bound <- here_pushes + 1
+                answer <- -2
+            else:
+                # Rebuild this state's box membership from its bitmask.
+                fill: mutable i64 = 0
+                while fill < work.cells |fill, work, search, base|:
+                    word_at: i64 = base + fill / 64
+                    bit: i64 = (Ints::at(search.frontier, word_at) >> (fill % 64)) & 1
+                    Ints::put(&search.boxes_in, fill, bit)
+                    fill <- fill + 1
+                _ = sok_reachable(work, &search.boxes_in, Ints::at(search.anchor, queue_head))
+                box: mutable i64 = 0
+                while box < work.cells and answer < 0 |box, work, search, level, base, here_pushes, queue_end, seen_count, answer|:
+                    if Ints::at(search.boxes_in, box) == 1:
+                        probe: mutable i64 = 0
+                        while probe < SOK_STEP_COUNT and answer < 0 |probe, box, work, search, level, base, here_pushes, queue_end, seen_count, answer|:
+                            step: i64 = sok_step_of(work.width, probe)
+                            behind: i64 = box - step
+                            ahead: i64 = box + step
+                            legal: mutable bool = behind >= 0 and behind < work.cells and ahead >= 0 and ahead < work.cells
+                            legal <- false if legal and not sok_walked(work, behind)
+                            legal <- false if legal and Ints::at(work.floor_ok, ahead) == 0
+                            legal <- false if legal and Ints::at(search.boxes_in, ahead) == 1
+                            legal <- false if legal and Ints::at(work.alive_in, ahead) == 0
+                            if legal:
+                                # The pushed position, as a fresh bitmask.
+                                next_base: i64 = queue_end * SOK_STATE_WORDS
+                                word_copy: mutable i64 = 0
+                                while word_copy < SOK_STATE_WORDS |word_copy, search, base, next_base|:
+                                    Ints::put(&search.frontier, next_base + word_copy, Ints::at(search.frontier, base + word_copy))
+                                    word_copy <- word_copy + 1
+                                sok_mask_clear(&search.frontier, next_base, box)
+                                sok_mask_set(&search.frontier, next_base, ahead)
+                                # Solved? Every box on a goal.
+                                Ints::put(&search.moved_in, box, 0)
+                                Ints::put(&search.moved_in, ahead, 1)
+                                home: mutable bool = true
+                                check: mutable i64 = 0
+                                while check < work.cells and home |check, work, search, level, box, ahead, home|:
+                                    held: i64 = 1 if check == ahead else (0 if check == box else Ints::at(search.boxes_in, check))
+                                    home <- false if held == 1 and Ints::at(level.goals_in, check) == 0
+                                    check <- check + 1
+                                if home:
+                                    answer <- here_pushes + 1
+                                    out_bound <- here_pushes + 1
+                                else:
+                                    # The player ends where the box was; anchor the
+                                    # new region at its smallest cell.
+                                    Ints::put(&search.boxes_in, box, 0)
+                                    Ints::put(&search.boxes_in, ahead, 1)
+                                    _ = sok_reachable(work, &search.boxes_in, box)
+                                    next_anchor: mutable i64 = -1
+                                    look: mutable i64 = 0
+                                    while look < work.cells and next_anchor < 0 |look, work, next_anchor|:
+                                        next_anchor <- look if sok_walked(work, look)
+                                        look <- look + 1
+                                    if sok_state_add(search, &search.frontier, next_base, next_anchor):
+                                        Ints::put(&search.anchor, queue_end, next_anchor)
+                                        Ints::put(&search.pushes, queue_end, here_pushes + 1)
+                                        queue_end <- queue_end + 1 if queue_end + 1 < search.frontier_cap
+                                        seen_count <- seen_count + 1
+                                    # Restore this state's boxes and region for the
+                                    # remaining pushes out of it.
+                                    Ints::put(&search.boxes_in, box, 1)
+                                    Ints::put(&search.boxes_in, ahead, 0)
+                                    _ = sok_reachable(work, &search.boxes_in, Ints::at(search.anchor, queue_head))
+                            probe <- probe + 1
+                    box <- box + 1
+            queue_head <- queue_head + 1
+        return -1 if answer < 0
+        return answer
+
+# --- carving a room ------------------------------------------------------
+
+# A warren carved out of solid rock by a wandering digger.
+#
+# The board starts as SOLID WALL and a drunkard's walk digs it out, with a strong
+# straight-line bias so the diggings come out as corridors and small chambers
+# rather than a cavern. Open space is what makes Sokoban easy -- room to swing any
+# box around any other -- so the floor share is the rung's difficulty dial.
+# Connectivity is free: a walk can only carve where it has walked.
+#
+# `carved` in the reference is a set of (x, y) TUPLES, but it is only ever
+# membership-tested and the result is built by walking `range(cells)` in order,
+# so its iteration order is not observable and a flat grid is exact.
+def sok_carve_room(work: mutable SokWork&, grade: SokGrade&, rng: mutable MT19937&, walls_in: mutable darray[i64]&):
+    can Memory.Allocate, Abort.Panic:
+        width: i64 = grade.width
+        height: i64 = grade.height
+        interior: i64 = (width - 2) * (height - 2)
+        share_target: i64 = (interior.f64() * grade.floor_share).i64()
+        least: i64 = grade.boxes * 3 + 4
+        target: i64 = least if least > share_target else share_target
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work|:
+            Ints::put(&work.carved_in, cell, 0)
+            cell <- cell + 1
+        x: mutable i64 = width / 2
+        y: mutable i64 = height / 2
+        Ints::put(&work.carved_in, y * width + x, 1)
+        dug: mutable i64 = 1
+        # DIRECTIONS order is (0,-1), (0,1), (-1,0), (1,0).
+        direction: mutable i64 = py_choice_index(rng, SOK_STEP_COUNT)
+        while dug < target |dug, target, x, y, direction, work, width, height, rng|:
+            direction <- py_choice_index(rng, SOK_STEP_COUNT) if py_random(rng) < 0.35
+            dx: i64 = 0 if direction < 2 else (-1 if direction == 2 else 1)
+            dy: i64 = (-1 if direction == 0 else 1) if direction < 2 else 0
+            nx: i64 = x + dx
+            ny: i64 = y + dy
+            if nx >= 1 and nx < width - 1 and ny >= 1 and ny < height - 1:
+                x <- nx
+                y <- ny
+                at: i64 = ny * width + nx
+                if Ints::at(work.carved_in, at) == 0:
+                    Ints::put(&work.carved_in, at, 1)
+                    dug <- dug + 1
+            else:
+                direction <- py_choice_index(rng, SOK_STEP_COUNT)
+        # Walls are every cell the digger never stood on.
+        out: mutable i64 = 0
+        while out < work.cells |out, work, walls_in|:
+            Ints::put(walls_in, out, 1 if Ints::at(work.carved_in, out) == 0 else 0)
+            out <- out + 1
+
+# A connected blob of goal squares, grown one neighbour at a time. Returns false
+# when the room has too little floor to hold them.
+def sok_blob_goals(work: mutable SokWork&, walls_in: mutable darray[i64]&, count: i64, rng: mutable MT19937&, goals_in: mutable darray[i64]&, goal_set: mutable PySet::Table&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        sok_floor_flags(work, walls_in)
+        work.pick_n <- 0
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work|:
+            if Ints::at(work.floor_ok, cell) == 1:
+                Ints::put(&work.pick, work.pick_n, cell)
+                work.pick_n <- work.pick_n + 1
+            cell <- cell + 1
+        false return if work.pick_n < count
+        clear: mutable i64 = 0
+        while clear < work.cells |clear, work, goals_in|:
+            Ints::put(goals_in, clear, 0)
+            clear <- clear + 1
+        PySet::reset(goal_set)
+        first: i64 = Ints::at(work.pick, py_choice_index(rng, work.pick_n))
+        Ints::put(goals_in, first, 1)
+        # `blob` is a LIST in the reference and its APPEND order drives the next
+        # round's candidate list, so it is kept here rather than re-derived from
+        # the grid -- walking cells in ascending order would build `grow` in a
+        # different order and pick a different neighbour.
+        Ints::put(&work.scratch, 0, first)
+        # The goal SET is built in blob-append order, because that order decides
+        # its slot layout and the walk's box set is a copy of it.
+        PySet::add(goal_set, first)
+        grown: mutable i64 = 1
+        ok: mutable bool = true
+        while grown < count and ok |grown, count, work, goals_in, rng, ok|:
+            # `grow` is built by walking the blob in CELL order and each cell's
+            # four steps in DIRECTIONS order -- the reference's comprehension
+            # order, which `choice` then reads positionally. Duplicates are kept:
+            # a cell reachable from two blob cells appears twice and is twice as
+            # likely, exactly as in the reference.
+            work.pick_n <- 0
+            slot: mutable i64 = 0
+            while slot < grown |slot, grown, work, goals_in|:
+                at: i64 = Ints::at(work.scratch, slot)
+                probe: mutable i64 = 0
+                while probe < SOK_STEP_COUNT |probe, at, work, goals_in|:
+                    near: i64 = at + sok_step_of(work.width, probe)
+                    if near >= 0 and near < work.cells:
+                        if Ints::at(work.floor_ok, near) == 1 and Ints::at_ref(goals_in, near) == 0:
+                            Ints::put(&work.pick, work.pick_n, near)
+                            work.pick_n <- work.pick_n + 1
+                    probe <- probe + 1
+                slot <- slot + 1
+            if work.pick_n == 0:
+                ok <- false
+            else:
+                chosen: i64 = Ints::at(work.pick, py_choice_index(rng, work.pick_n))
+                Ints::put(goals_in, chosen, 1)
+                PySet::add(goal_set, chosen)
+                Ints::put(&work.scratch, grown, chosen)
+                grown <- grown + 1
+        return ok
+
+# Each cell's PULL-distance to its nearest goal. The same backwards flood as
+# sok_live_cells, but keeping the step count: the walks use it to prefer pulls
+# that take a box genuinely FURTHER from home. An unbiased walk mostly cancels
+# itself out -- measured in the reference, forty unweighted pulls were leaving
+# four-push levels behind.
+def sok_goal_distance(work: mutable SokWork&, goals_in: mutable darray[i64]&):
+    can Abort.Panic:
+        cell: mutable i64 = 0
+        queue_end: mutable i64 = 0
+        while cell < work.cells |cell, work, goals_in, queue_end|:
+            if Ints::at_ref(goals_in, cell) == 1:
+                Ints::put(&work.far, cell, 0)
+                Ints::put(&work.queue, queue_end, cell)
+                queue_end <- queue_end + 1
+            else:
+                Ints::put(&work.far, cell, SOK_BIG)
+            cell <- cell + 1
+        queue_head: mutable i64 = 0
+        while queue_head < queue_end |queue_head, queue_end, work|:
+            at: i64 = Ints::at(work.queue, queue_head)
+            queue_head <- queue_head + 1
+            here: i64 = Ints::at(work.far, at)
+            probe: mutable i64 = 0
+            while probe < SOK_STEP_COUNT |probe, at, here, work, queue_end|:
+                step: i64 = sok_step_of(work.width, probe)
+                back: i64 = at - step
+                beyond: i64 = at - step - step
+                if back >= 0 and back < work.cells and beyond >= 0 and beyond < work.cells:
+                    if Ints::at(work.floor_ok, back) == 1 and Ints::at(work.floor_ok, beyond) == 1:
+                        if Ints::at(work.far, back) > here + 1:
+                            Ints::put(&work.far, back, here + 1)
+                            Ints::put(&work.queue, queue_end, back)
+                            queue_end <- queue_end + 1
+                probe <- probe + 1
+
+# Dig one-cell pockets until `share` of the floor is dead.
+#
+# A pocket has a single entrance, so a box pushed into it can never come out --
+# the player would have to stand beyond it, inside the rock. Dug AFTER the
+# backwards walk on purpose: adding floor can only widen the forward solution's
+# options, so solvability survives while every pocket is a fresh landmine.
+# Pockets can also REVIVE other squares, so the tally is recomputed until the
+# share genuinely holds.
+#
+# The candidate list iterates the wall set. That set holds about two thirds of
+# the grid, so its CPython table is far larger than the largest cell id and its
+# order is plain ascending -- verified structurally, tightest margin 92 cells.
+def sok_dig_traps(work: mutable SokWork&, goals_in: mutable darray[i64]&, share: f64, rng: mutable MT19937&, walls_in: mutable darray[i64]&):
+    can Memory.Allocate, Abort.Panic:
+        round_index: mutable i64 = 0
+        done: mutable bool = false
+        while round_index < 6 and not done |round_index, work, goals_in, share, rng, walls_in, done|:
+            sok_floor_flags(work, walls_in)
+            sok_live_cells(work, goals_in)
+            floor_count: mutable i64 = 0
+            dead_count: mutable i64 = 0
+            cell: mutable i64 = 0
+            while cell < work.cells |cell, work, floor_count, dead_count|:
+                if Ints::at(work.floor_ok, cell) == 1:
+                    floor_count <- floor_count + 1
+                    dead_count <- dead_count + 1 if Ints::at(work.alive_in, cell) == 0
+                cell <- cell + 1
+            missing: i64 = (share * floor_count.f64()).i64() - dead_count
+            if missing <= 0:
+                done <- true
+            else:
+                # Wall cells inside the border with exactly ONE floor neighbour:
+                # dig one and it becomes a dead-end pocket.
+                work.pick_n <- 0
+                at: mutable i64 = 0
+                while at < work.cells |at, work, walls_in|:
+                    if Ints::at_ref(walls_in, at) == 1:
+                        x: i64 = at % work.width
+                        y: i64 = at / work.width
+                        if x > 0 and x < work.width - 1 and y > 0 and y < work.height - 1:
+                            open_sides: mutable i64 = 0
+                            probe: mutable i64 = 0
+                            while probe < SOK_STEP_COUNT |probe, at, work, open_sides|:
+                                near: i64 = at + sok_step_of(work.width, probe)
+                                if near >= 0 and near < work.cells:
+                                    open_sides <- open_sides + 1 if Ints::at(work.floor_ok, near) == 1
+                                probe <- probe + 1
+                            if open_sides == 1:
+                                Ints::put(&work.pick, work.pick_n, at)
+                                work.pick_n <- work.pick_n + 1
+                    at <- at + 1
+                py_shuffle_i64_prefix(rng, &work.pick, work.pick_n)
+                take: mutable i64 = missing + 2
+                take <- work.pick_n if take > work.pick_n
+                dig: mutable i64 = 0
+                while dig < take |dig, take, work, walls_in|:
+                    Ints::put(walls_in, Ints::at(work.pick, dig), 0)
+                    dig <- dig + 1
+            round_index <- round_index + 1
+
+# The result of a backwards walk: where the boxes ended, where the player stands,
+# and how many pulls it took (which is the forward solution's push count, and so
+# an upper bound on the minimum).
+struct SokWalk:
+    ok: mutable bool
+    boxes_in: mutable darray[i64]
+    player: mutable i64
+    pulls: mutable i64
+
+def sok_walk_new() -> SokWalk:
+    can Memory.Allocate, Abort.Panic:
+        walk: mutable SokWalk = zeroed
+        walk.boxes_in <- Ints::zeros(SOK_MOST_CELLS)
+        return walk
+
+# The first floor cell no box stands on -- the reference's
+# `next((cell for cell in range(cells) if floor_ok[cell] and cell not in boxes), None)`.
+def sok_first_free(work: SokWork&, boxes: PySet::Table&) -> i64:
+    can Abort.Panic:
+        cell: mutable i64 = 0
+        found: mutable i64 = -1
+        while cell < work.cells and found < 0 |cell, work, boxes, found|:
+            if Ints::at(work.floor_ok, cell) == 1 and not PySet::contains(boxes, cell):
+                found <- cell
+            cell <- cell + 1
+        return found
+
+# Copy a PySet's live keys into a membership array, for the flood fills.
+def sok_boxes_to_flags(work: mutable SokWork&, boxes: PySet::Table&, flags: mutable darray[i64]&):
+    can Abort.Panic:
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work, boxes, flags|:
+            Ints::put(flags, cell, 1 if PySet::contains(boxes, cell) else 0)
+            cell <- cell + 1
+
+# Collect the legal pulls out of the current position, in the reference's order:
+# the BOX SET's iteration order outermost, each box's four steps in DIRECTIONS
+# order. `rng.choice` reads this list positionally, which is the whole reason the
+# box set is a PySet::Table and not a flat array.
+#
+# `last` is the pull that would exactly undo the previous one; it is never taken.
+def sok_pull_options(work: mutable SokWork&, boxes: PySet::Table&, order: mutable darray[i64]&, last_near: i64, last_box: i64) -> i64:
+    can Abort.Panic:
+        count: i64 = PySet::to_list(boxes, order)
+        work.pick_n <- 0
+        index: mutable i64 = 0
+        while index < count |index, count, work, boxes, order, last_near, last_box|:
+            box: i64 = Ints::at_ref(order, index)
+            probe: mutable i64 = 0
+            while probe < SOK_STEP_COUNT |probe, box, work, boxes, last_near, last_box|:
+                step: i64 = sok_step_of(work.width, probe)
+                near: i64 = box + step
+                away: i64 = box + step + step
+                legal: mutable bool = near >= 0 and near < work.cells and away >= 0 and away < work.cells
+                legal <- false if legal and not sok_walked(work, near)
+                legal <- false if legal and Ints::at(work.floor_ok, near) == 0
+                legal <- false if legal and Ints::at(work.floor_ok, away) == 0
+                legal <- false if legal and PySet::contains(boxes, away)
+                legal <- false if legal and PySet::contains(boxes, near)
+                # CROSSED on purpose. The reference keeps `last = (box, near)` of the
+                # previous pull and rejects the next when `(near, box) == last` --
+                # that is exactly the pull that would put the box back where it
+                # came from. Comparing uncrossed never rejects anything, and the
+                # walk then oscillates one box in and out of its goal until the
+                # pull budget runs out, ending with nothing off-goal.
+                legal <- false if legal and near == last_box and box == last_near
+                if legal:
+                    Ints::put(&work.pick, work.pick_n, box)
+                    Ints::put(&work.pick_b, work.pick_n, near)
+                    Ints::put(&work.pick_c, work.pick_n, away)
+                    work.pick_n <- work.pick_n + 1
+                probe <- probe + 1
+            index <- index + 1
+        return work.pick_n
+
+# Narrow the option list to the preferred pool, exactly as the reference does:
+# boxes still ON a goal first (evacuate before wandering -- in a tight warren the
+# boxes pulled early park in the corridors and seal the rest onto their goals),
+# then, four times out of five, only the pulls that shift a box FURTHER from home.
+#
+# Compacts in place and returns the pool size. The `random()` draw happens ONLY
+# when an outward subset exists, matching the reference's `if outward and
+# rng.random() < 0.8` short-circuit -- drawing unconditionally would spend a
+# value the reference never spends.
+def sok_pull_pool(work: mutable SokWork&, goals_in: mutable darray[i64]&, count: i64, rng: mutable MT19937&) -> i64:
+    can Abort.Panic:
+        stuck: mutable i64 = 0
+        scan: mutable i64 = 0
+        while scan < count |scan, count, work, goals_in, stuck|:
+            if Ints::at_ref(goals_in, Ints::at(work.pick, scan)) == 1:
+                Ints::put(&work.pick, stuck, Ints::at(work.pick, scan))
+                Ints::put(&work.pick_b, stuck, Ints::at(work.pick_b, scan))
+                Ints::put(&work.pick_c, stuck, Ints::at(work.pick_c, scan))
+                stuck <- stuck + 1
+            scan <- scan + 1
+        pool: mutable i64 = stuck if stuck > 0 else count
+        # When no box sits on a goal the pool is the whole option list, which the
+        # compaction above has already overwritten -- so rebuild it.
+        if stuck == 0:
+            pool <- count
+        outward: mutable i64 = 0
+        look: mutable i64 = 0
+        while look < pool |look, pool, work, outward|:
+            if Ints::at(work.far, Ints::at(work.pick_b, look)) > Ints::at(work.far, Ints::at(work.pick, look)):
+                outward <- outward + 1
+            look <- look + 1
+        return pool if outward == 0
+        return pool if py_random(rng) >= 0.8
+        keep: mutable i64 = 0
+        shift: mutable i64 = 0
+        while shift < pool |shift, pool, work, keep|:
+            if Ints::at(work.far, Ints::at(work.pick_b, shift)) > Ints::at(work.far, Ints::at(work.pick, shift)):
+                Ints::put(&work.pick, keep, Ints::at(work.pick, shift))
+                Ints::put(&work.pick_b, keep, Ints::at(work.pick_b, shift))
+                Ints::put(&work.pick_c, keep, Ints::at(work.pick_c, shift))
+                keep <- keep + 1
+            shift <- shift + 1
+        return keep
+
+# Drag the boxes backwards off their goals; the result is the START position.
+#
+# Each pull is one forward push, so the walk length is an upper bound on the
+# solution -- the bound the scoring falls back on when the exact minimum is out
+# of reach. Returns false when the walk went nowhere, or when too few boxes came
+# off their goals to be worth solving.
+def sok_pull_walk(work: mutable SokWork&, grade: SokGrade&, walls_in: mutable darray[i64]&, goals_in: mutable darray[i64]&, goal_set: PySet::Table&, rng: mutable MT19937&, out: mutable SokWalk&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        out.ok <- false
+        sok_floor_flags(work, walls_in)
+        sok_goal_distance(work, goals_in)
+        boxes: mutable PySet::Table = PySet::new(SOK_MOST_BOXES + 4)
+        order: mutable darray[i64] = Ints::zeros(SOK_MOST_BOXES + 4)
+        # `boxes = set(goals)` COPIES the goal table's layout. Rebuilding it by
+        # walking cells ascending gives a different iteration order whenever the
+        # goal cells collide, and the option list -- which `choice` reads
+        # positionally -- then differs from the first pull onwards.
+        PySet::copy_from(goal_set, &boxes)
+        goal_count: mutable i64 = goal_set.used
+        player: mutable i64 = sok_first_free(work, boxes)
+        false return if player < 0
+        pulls: mutable i64 = 0
+        last_near: mutable i64 = -1
+        last_box: mutable i64 = -1
+        step_index: mutable i64 = 0
+        stalled: mutable bool = false
+        while step_index < grade.pulls and not stalled |step_index, grade, work, goals_in, rng, boxes, order, player, pulls, last_near, last_box, stalled|:
+            sok_boxes_to_flags(work, boxes, &work.scratch)
+            _ = sok_reachable(work, &work.scratch, player)
+            count: i64 = sok_pull_options(work, boxes, &order, last_near, last_box)
+            if count == 0:
+                stalled <- true
+            else:
+                pool: i64 = sok_pull_pool(work, goals_in, count, rng)
+                choice: i64 = py_choice_index(rng, pool)
+                box: i64 = Ints::at(work.pick, choice)
+                near: i64 = Ints::at(work.pick_b, choice)
+                away: i64 = Ints::at(work.pick_c, choice)
+                PySet::discard(&boxes, box)
+                PySet::add(&boxes, near)
+                player <- away
+                last_near <- near
+                last_box <- box
+                pulls <- pulls + 1
+            step_index <- step_index + 1
+        off_goal: mutable i64 = 0
+        walk_count: i64 = PySet::to_list(boxes, &order)
+        index: mutable i64 = 0
+        while index < walk_count |index, walk_count, order, goals_in, off_goal|:
+            off_goal <- off_goal + 1 if Ints::at_ref(goals_in, Ints::at_ref(&order, index)) == 0
+            index <- index + 1
+        least: mutable i64 = goal_count / 2
+        least <- 1 if least < 1
+        false return if pulls == 0 or off_goal < least
+        sok_boxes_to_flags(work, boxes, &out.boxes_in)
+        out.player <- player
+        out.pulls <- pulls
+        out.ok <- true
+        return true
+
+# Score one arrangement against the precomputed goal tables. `sorted(boxes)` in
+# the reference, so the box order is ascending regardless of the set's layout.
+def sok_score_boxes(work: mutable SokWork&, boxes: PySet::Table&, order: mutable darray[i64]&) -> i64:
+    can Abort.Panic:
+        count: mutable i64 = 0
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work, boxes, order, count|:
+            if PySet::contains(boxes, cell):
+                Ints::put(order, count, cell)
+                count <- count + 1
+            cell <- cell + 1
+        return sok_assignment(work, order, count)
+
+# A backwards walk that CLIMBS the certificate instead of hoping for it.
+#
+# The plain walk is a lottery: it wanders, stalls, and whatever the assignment
+# bound says at the end is the ticket you got. This one walks in short legs,
+# prices the position after each leg, and remembers the best start it has stood
+# on; when a stretch of legs fails to improve it, the walk teleports back to that
+# best start and spends the rest of its budget exploring differently from there.
+# Same pull mechanics, same guarantees -- only the selection changed, from "keep
+# the last state" to "keep the best state ever seen".
+def sok_climbing_walk(work: mutable SokWork&, grade: SokGrade&, walls_in: mutable darray[i64]&, goals_in: mutable darray[i64]&, goal_set: PySet::Table&, rng: mutable MT19937&, out: mutable SokWalk&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        out.ok <- false
+        sok_floor_flags(work, walls_in)
+        sok_goal_distance(work, goals_in)
+        sok_goal_tables(work, goals_in)
+        boxes: mutable PySet::Table = PySet::new(SOK_MOST_BOXES + 4)
+        best_set: mutable PySet::Table = PySet::new(SOK_MOST_BOXES + 4)
+        order: mutable darray[i64] = Ints::zeros(SOK_MOST_BOXES + 4)
+        PySet::copy_from(goal_set, &boxes)
+        goal_count: i64 = goal_set.used
+        player: mutable i64 = sok_first_free(work, boxes)
+        false return if player < 0
+        best_score: mutable i64 = -1
+        best_player: mutable i64 = -1
+        best_pulls: mutable i64 = 0
+        have_best: mutable bool = false
+        pulls: mutable i64 = 0
+        dry_legs: mutable i64 = 0
+        last_near: mutable i64 = -1
+        last_box: mutable i64 = -1
+        leg: mutable i64 = grade.boxes
+        leg <- 6 if leg < 6
+        legs: mutable i64 = grade.pulls / leg
+        legs <- 1 if legs < 1
+        least: mutable i64 = goal_count / 2
+        least <- 1 if least < 1
+        leg_index: mutable i64 = 0
+        while leg_index < legs |leg_index, legs, leg, work, grade, goals_in, rng, boxes, best_set, order, player, pulls, dry_legs, last_near, last_box, best_score, best_player, best_pulls, have_best, least|:
+            pull_index: mutable i64 = 0
+            stalled: mutable bool = false
+            while pull_index < leg and not stalled |pull_index, leg, work, goals_in, rng, boxes, order, player, pulls, last_near, last_box, stalled|:
+                sok_boxes_to_flags(work, boxes, &work.scratch)
+                _ = sok_reachable(work, &work.scratch, player)
+                count: i64 = sok_pull_options(work, boxes, &order, last_near, last_box)
+                if count == 0:
+                    stalled <- true
+                else:
+                    pool: i64 = sok_pull_pool(work, goals_in, count, rng)
+                    choice: i64 = py_choice_index(rng, pool)
+                    box: i64 = Ints::at(work.pick, choice)
+                    near: i64 = Ints::at(work.pick_b, choice)
+                    PySet::discard(&boxes, box)
+                    PySet::add(&boxes, near)
+                    player <- Ints::at(work.pick_c, choice)
+                    last_near <- near
+                    last_box <- box
+                    pulls <- pulls + 1
+                pull_index <- pull_index + 1
+            off_goal: mutable i64 = 0
+            live: i64 = PySet::to_list(boxes, &order)
+            scan: mutable i64 = 0
+            while scan < live |scan, live, order, goals_in, off_goal|:
+                off_goal <- off_goal + 1 if Ints::at_ref(goals_in, Ints::at_ref(&order, scan)) == 0
+                scan <- scan + 1
+            if pulls > 0 and off_goal >= least:
+                score: i64 = sok_score_boxes(work, boxes, &order)
+                if score < SOK_BIG and score > best_score:
+                    best_score <- score
+                    PySet::copy_from(boxes, &best_set)
+                    best_player <- player
+                    best_pulls <- pulls
+                    have_best <- true
+                    dry_legs <- 0
+                else:
+                    dry_legs <- dry_legs + 1
+            if have_best and dry_legs >= 4:
+                # Enough wandering: go back to the best start found and explore a
+                # different line out of it.
+                PySet::copy_from(best_set, &boxes)
+                player <- best_player
+                pulls <- best_pulls
+                last_near <- -1
+                last_box <- -1
+                dry_legs <- 0
+            leg_index <- leg_index + 1
+        false return if not have_best
+        sok_boxes_to_flags(work, best_set, &out.boxes_in)
+        out.player <- best_player
+        out.pulls <- best_pulls
+        out.ok <- true
+        return true
+
+# Drag each box outward in turn, as far as it will go.
+#
+# The climbing walk spreads random pulls across the flock; this one is a CONVOY
+# -- box by box, each pulled along rising pull-distance until it stalls, over
+# several rounds so early boxes can make way for late ones. In the tightest
+# warrens it reaches arrangements the random walk never finds, which is why the
+# two are run side by side with the better certificate kept.
+#
+# The box set's ITERATION order is not observable here: the round order is
+# `sorted(boxes)` and everything else is a membership test. Only the shuffle of
+# that sorted list draws from the stream.
+def sok_convoy_walk(work: mutable SokWork&, grade: SokGrade&, walls_in: mutable darray[i64]&, goals_in: mutable darray[i64]&, goal_set: PySet::Table&, rng: mutable MT19937&, out: mutable SokWalk&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        out.ok <- false
+        sok_floor_flags(work, walls_in)
+        sok_goal_distance(work, goals_in)
+        sok_goal_tables(work, goals_in)
+        boxes: mutable PySet::Table = PySet::new(SOK_MOST_BOXES + 4)
+        best_set: mutable PySet::Table = PySet::new(SOK_MOST_BOXES + 4)
+        order: mutable darray[i64] = Ints::zeros(SOK_MOST_BOXES + 4)
+        round_order: mutable darray[i64] = Ints::zeros(SOK_MOST_BOXES + 4)
+        PySet::copy_from(goal_set, &boxes)
+        goal_count: i64 = goal_set.used
+        player: mutable i64 = sok_first_free(work, boxes)
+        false return if player < 0
+        pulls: mutable i64 = 0
+        best_score: mutable i64 = -1
+        best_player: mutable i64 = -1
+        best_pulls: mutable i64 = 0
+        have_best: mutable bool = false
+        least: mutable i64 = goal_count / 2
+        least <- 1 if least < 1
+        round_index: mutable i64 = 0
+        while round_index < 6 |round_index, work, grade, goals_in, rng, boxes, best_set, order, round_order, player, pulls, best_score, best_player, best_pulls, have_best, least|:
+            # `sorted(boxes)` then shuffle -- ascending, so the set's own layout
+            # never reaches the stream.
+            listed: mutable i64 = 0
+            cell: mutable i64 = 0
+            while cell < work.cells |cell, work, boxes, round_order, listed|:
+                if PySet::contains(boxes, cell):
+                    Ints::put(&round_order, listed, cell)
+                    listed <- listed + 1
+                cell <- cell + 1
+            py_shuffle_i64_prefix(rng, &round_order, listed)
+            slot: mutable i64 = 0
+            while slot < listed |slot, listed, work, grade, rng, boxes, round_order, player, pulls|:
+                target: i64 = Ints::at(round_order, slot)
+                if PySet::contains(boxes, target):
+                    box: mutable i64 = target
+                    slides: mutable i64 = 0
+                    running: mutable bool = true
+                    while pulls < grade.pulls and slides < 3 and running |pulls, slides, running, box, work, grade, rng, boxes, player|:
+                        sok_boxes_to_flags(work, boxes, &work.scratch)
+                        _ = sok_reachable(work, &work.scratch, player)
+                        # Options for THIS box only, in DIRECTIONS order.
+                        work.pick_n <- 0
+                        probe: mutable i64 = 0
+                        while probe < SOK_STEP_COUNT |probe, box, work, boxes|:
+                            step: i64 = sok_step_of(work.width, probe)
+                            near: i64 = box + step
+                            away: i64 = box + step + step
+                            legal: mutable bool = near >= 0 and near < work.cells and away >= 0 and away < work.cells
+                            legal <- false if legal and not sok_walked(work, near)
+                            legal <- false if legal and Ints::at(work.floor_ok, near) == 0
+                            legal <- false if legal and Ints::at(work.floor_ok, away) == 0
+                            legal <- false if legal and PySet::contains(boxes, away)
+                            legal <- false if legal and PySet::contains(boxes, near)
+                            if legal:
+                                Ints::put(&work.pick_b, work.pick_n, near)
+                                Ints::put(&work.pick_c, work.pick_n, away)
+                                work.pick_n <- work.pick_n + 1
+                            probe <- probe + 1
+                        # Rising first; failing that, level ground three times in
+                        # five. The `random()` is drawn ONLY when there is a level
+                        # option and no rising one, matching the reference's
+                        # `elif level_ and rng.random() < 0.6`.
+                        rising: mutable i64 = 0
+                        here: i64 = Ints::at(work.far, box)
+                        keep: mutable i64 = 0
+                        scan: mutable i64 = 0
+                        while scan < work.pick_n |scan, work, here, rising|:
+                            rising <- rising + 1 if Ints::at(work.far, Ints::at(work.pick_b, scan)) > here
+                            scan <- scan + 1
+                        if rising > 0:
+                            compact: mutable i64 = 0
+                            while compact < work.pick_n |compact, work, here, keep|:
+                                if Ints::at(work.far, Ints::at(work.pick_b, compact)) > here:
+                                    Ints::put(&work.pick_b, keep, Ints::at(work.pick_b, compact))
+                                    Ints::put(&work.pick_c, keep, Ints::at(work.pick_c, compact))
+                                    keep <- keep + 1
+                                compact <- compact + 1
+                            choice: i64 = py_choice_index(rng, keep)
+                            near: i64 = Ints::at(work.pick_b, choice)
+                            PySet::discard(&boxes, box)
+                            PySet::add(&boxes, near)
+                            player <- Ints::at(work.pick_c, choice)
+                            box <- near
+                            pulls <- pulls + 1
+                            slides <- 0
+                        else:
+                            level_count: mutable i64 = 0
+                            flat: mutable i64 = 0
+                            while flat < work.pick_n |flat, work, here, level_count|:
+                                level_count <- level_count + 1 if Ints::at(work.far, Ints::at(work.pick_b, flat)) == here
+                                flat <- flat + 1
+                            if level_count == 0:
+                                running <- false
+                            elif py_random(rng) >= 0.6:
+                                running <- false
+                            else:
+                                compact: mutable i64 = 0
+                                while compact < work.pick_n |compact, work, here, keep|:
+                                    if Ints::at(work.far, Ints::at(work.pick_b, compact)) == here:
+                                        Ints::put(&work.pick_b, keep, Ints::at(work.pick_b, compact))
+                                        Ints::put(&work.pick_c, keep, Ints::at(work.pick_c, compact))
+                                        keep <- keep + 1
+                                    compact <- compact + 1
+                                choice: i64 = py_choice_index(rng, keep)
+                                near: i64 = Ints::at(work.pick_b, choice)
+                                PySet::discard(&boxes, box)
+                                PySet::add(&boxes, near)
+                                player <- Ints::at(work.pick_c, choice)
+                                box <- near
+                                pulls <- pulls + 1
+                                slides <- slides + 1
+                slot <- slot + 1
+            off_goal: mutable i64 = 0
+            live: i64 = PySet::to_list(boxes, &order)
+            check: mutable i64 = 0
+            while check < live |check, live, order, goals_in, off_goal|:
+                off_goal <- off_goal + 1 if Ints::at_ref(goals_in, Ints::at_ref(&order, check)) == 0
+                check <- check + 1
+            if pulls > 0 and off_goal >= least:
+                score: i64 = sok_score_boxes(work, boxes, &order)
+                if score < SOK_BIG and score > best_score:
+                    best_score <- score
+                    PySet::copy_from(boxes, &best_set)
+                    best_player <- player
+                    best_pulls <- pulls
+                    have_best <- true
+            round_index <- round_index + 1
+        false return if not have_best
+        sok_boxes_to_flags(work, best_set, &out.boxes_in)
+        out.player <- best_player
+        out.pulls <- best_pulls
+        out.ok <- true
+        return true
+
+# The most the room could possibly certify, cheaply estimated: a box's
+# contribution to the assignment bound can never beat its pull-distance from the
+# goal clump, so the sum of the `boxes` deepest pull-distances is a ceiling on
+# any walk. Most carved rooms are shallow -- measured in the reference, walks
+# failed on three superhuman rooms out of four -- and this one flood fill lets
+# the generator skip them without walking at all.
+def sok_room_potential(work: mutable SokWork&, goals_in: mutable darray[i64]&, boxes: i64) -> i64:
+    can Abort.Panic:
+        sok_goal_distance(work, goals_in)
+        count: mutable i64 = 0
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work, count|:
+            if Ints::at(work.far, cell) < SOK_BIG:
+                Ints::put(&work.pick, count, Ints::at(work.far, cell))
+                count <- count + 1
+            cell <- cell + 1
+        Ints::sort_prefix(&work.pick, count)
+        total: mutable i64 = 0
+        taken: mutable i64 = 0
+        index: mutable i64 = count - 1
+        while taken < boxes and index >= 0 |taken, index, boxes, work, total|:
+            total <- total + Ints::at(work.pick, index)
+            taken <- taken + 1
+            index <- index - 1
+        return total
+
+# Every push available from the start, as (box cell, where to), in the
+# reference's order: boxes SORTED, each box's four steps in DIRECTIONS order.
+def sok_opening_pushes(work: mutable SokWork&, level: mutable SokLevel&) -> i64:
+    can Abort.Panic:
+        _ = sok_reachable(work, &level.boxes_in, level.player)
+        work.pick_n <- 0
+        box: mutable i64 = 0
+        while box < work.cells |box, work, level|:
+            if Ints::at(level.boxes_in, box) == 1:
+                probe: mutable i64 = 0
+                while probe < SOK_STEP_COUNT |probe, box, work, level|:
+                    step: i64 = sok_step_of(work.width, probe)
+                    behind: i64 = box - step
+                    ahead: i64 = box + step
+                    legal: mutable bool = behind >= 0 and behind < work.cells and ahead >= 0 and ahead < work.cells
+                    legal <- false if legal and not sok_walked(work, behind)
+                    legal <- false if legal and Ints::at(work.floor_ok, ahead) == 0
+                    legal <- false if legal and Ints::at(level.boxes_in, ahead) == 1
+                    if legal:
+                        Ints::put(&work.pick, work.pick_n, box)
+                        Ints::put(&work.pick_b, work.pick_n, ahead)
+                        work.pick_n <- work.pick_n + 1
+                    probe <- probe + 1
+            box <- box + 1
+        return work.pick_n
+
+# The share of opening pushes that lose the level on the spot.
+#
+# The third axis, and the one the player actually stands in front of. Push count
+# says how long the work is; the trap share says how much of the room is lethal;
+# this says how much of what you can do RIGHT NOW is lethal.
+#
+# Returned scaled by 1e6 and truncated, so the comparison stays integral.
+def sok_fatal_share(work: mutable SokWork&, level: mutable SokLevel&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        sok_floor_flags(work, &level.walls_in)
+        sok_live_cells(work, &level.goals_in)
+        sok_mark_dead(work)
+        count: i64 = sok_opening_pushes(work, level)
+        0 return if count == 0
+        after: mutable darray[i64] = Ints::zeros(SOK_MOST_CELLS)
+        moves: mutable darray[i64] = Ints::zeros(SOK_MOST_CELLS * 4)
+        keep: mutable i64 = 0
+        while keep < count |keep, count, work, moves|:
+            Ints::put(&moves, keep * 2, Ints::at(work.pick, keep))
+            Ints::put(&moves, keep * 2 + 1, Ints::at(work.pick_b, keep))
+            keep <- keep + 1
+        lost: mutable i64 = 0
+        index: mutable i64 = 0
+        while index < count |index, count, work, level, after, moves, lost|:
+            box: i64 = Ints::at(moves, index * 2)
+            ahead: i64 = Ints::at(moves, index * 2 + 1)
+            copy: mutable i64 = 0
+            while copy < work.cells |copy, work, level, after|:
+                Ints::put(&after, copy, Ints::at(level.boxes_in, copy))
+                copy <- copy + 1
+            Ints::put(&after, box, 0)
+            Ints::put(&after, ahead, 1)
+            if Ints::at(work.alive_in, ahead) == 0:
+                lost <- lost + 1
+            else:
+                frozen: mutable bool = false
+                cell: mutable i64 = 0
+                while cell < work.cells and not frozen |cell, work, level, after, frozen|:
+                    if Ints::at(after, cell) == 1 and Ints::at(level.goals_in, cell) == 0:
+                        work.assumed_gen <- work.assumed_gen + 1
+                        frozen <- true if sok_stuck(work, &after, cell)
+                    cell <- cell + 1
+                lost <- lost + 1 if frozen
+            index <- index + 1
+        return lost * 1000000 / count
+
+# A proven lower bound that scales to any board. Each box must end on its own
+# goal, and a box's pushes cannot beat its relaxed push-distance to whichever
+# goal it gets, so the cheapest perfect assignment bounds the whole solution
+# from below. This is the certificate the superhuman rungs stand on where
+# breadth-first search cannot reach any more.
+def sok_matching_bound(work: mutable SokWork&, level: mutable SokLevel&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        sok_floor_flags(work, &level.walls_in)
+        sok_goal_tables(work, &level.goals_in)
+        order: mutable darray[i64] = Ints::zeros(SOK_MOST_BOXES + 4)
+        count: mutable i64 = 0
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work, level, order, count|:
+            if Ints::at(level.boxes_in, cell) == 1:
+                Ints::put(&order, count, cell)
+                count <- count + 1
+            cell <- cell + 1
+        total: i64 = sok_assignment(work, &order, count)
+        return 0 if total >= SOK_BIG
+        return total
+
+def sok_level_copy(from_level: SokLevel&, to_level: mutable SokLevel&, cells: i64):
+    can Abort.Panic:
+        to_level.ok <- from_level.ok
+        to_level.width <- from_level.width
+        to_level.height <- from_level.height
+        to_level.cells <- from_level.cells
+        to_level.player <- from_level.player
+        to_level.minimum <- from_level.minimum
+        to_level.at_least <- from_level.at_least
+        to_level.bound <- from_level.bound
+        to_level.traps_n <- from_level.traps_n
+        cell: mutable i64 = 0
+        while cell < cells |cell, cells, from_level, to_level|:
+            Ints::put(&to_level.walls_in, cell, Ints::at(from_level.walls_in, cell))
+            Ints::put(&to_level.goals_in, cell, Ints::at(from_level.goals_in, cell))
+            Ints::put(&to_level.boxes_in, cell, Ints::at(from_level.boxes_in, cell))
+            Ints::put(&to_level.traps_in, cell, Ints::at(from_level.traps_in, cell))
+            cell <- cell + 1
+
+# One round of attempts: rooms, walks, and what they certified.
+#
+# Retries fresh rooms until the floor is certified -- either the exact minimum,
+# or, past the solver's budget, the breadth-first frontier's proven lower bound.
+# Either way "level 9" carries a certificate that it takes at least level-9 work,
+# and the walk length stays as the par when the exact minimum is unknown.
+#
+# Two axes, RANKED rather than merged. A rung's push floor is what the ladder
+# promises and what the screen reports, so a deal that clears it never loses to
+# one that does not -- the deception floor decides between deals of equal
+# standing, it does not veto depth.
+def sok_deal(work: mutable SokWork&, search: mutable SokSearch&, grade: SokGrade&, rng: mutable MT19937&, attempts: i64, out: mutable SokLevel&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        walls: mutable darray[i64] = Ints::zeros(SOK_MOST_CELLS)
+        goals: mutable darray[i64] = Ints::zeros(SOK_MOST_CELLS)
+        goal_set: mutable PySet::Table = PySet::new(SOK_MOST_BOXES + 4)
+        pulled: mutable SokWalk = sok_walk_new()
+        deepest: mutable SokWalk = sok_walk_new()
+        level: mutable SokLevel = sok_level_new()
+        strong: mutable SokLevel = sok_level_new()
+        fallback: mutable SokLevel = sok_level_new()
+        desperate: mutable SokLevel = sok_level_new()
+        have_strong: mutable bool = false
+        have_fallback: mutable bool = false
+        have_desperate: mutable bool = false
+        rounds: mutable i64 = attempts
+        rounds <- attempts * 6 if grade.boxes >= 9
+        attempt: mutable i64 = 0
+        answered: mutable bool = false
+        while attempt < rounds and not answered |attempt, rounds, work, search, grade, rng, out, walls, goals, goal_set, pulled, deepest, level, strong, fallback, desperate, have_strong, have_fallback, have_desperate, answered|:
+            sok_carve_room(work, grade, rng, &walls)
+            sok_floor_flags(work, &walls)
+            open_floor: mutable i64 = 0
+            cell: mutable i64 = 0
+            while cell < work.cells |cell, work, open_floor|:
+                open_floor <- open_floor + 1 if Ints::at(work.floor_ok, cell) == 1
+                cell <- cell + 1
+            if open_floor >= grade.boxes * 2 + 2:
+                if sok_blob_goals(work, &walls, grade.boxes, rng, &goals, &goal_set):
+                    walked: mutable bool = false
+                    if grade.boxes >= 9:
+                        # Rooms are a thousand times cheaper than walks, so deal
+                        # many and walk few: a room whose potential cannot cover
+                        # the floor with margin is skipped before a single pull.
+                        potential: i64 = sok_room_potential(work, &goals, grade.boxes)
+                        if potential >= grade.floor * 5 / 4 or attempt >= rounds - 40:
+                            got_convoy: bool = sok_convoy_walk(work, grade, &walls, &goals, goal_set, rng, &pulled)
+                            got_climb: bool = sok_climbing_walk(work, grade, &walls, &goals, goal_set, rng, &deepest)
+                            walked <- got_convoy
+                            if got_climb:
+                                take_climb: mutable bool = not got_convoy
+                                if got_convoy:
+                                    sok_walk_into_level(work, &walls, &goals, &deepest, &level)
+                                    climb_bound: i64 = sok_matching_bound(work, &level)
+                                    sok_walk_into_level(work, &walls, &goals, &pulled, &level)
+                                    take_climb <- climb_bound > sok_matching_bound(work, &level)
+                                if take_climb:
+                                    sok_walk_copy(&deepest, &pulled, work.cells)
+                                    walked <- true
+                    else:
+                        walked <- sok_pull_walk(work, grade, &walls, &goals, goal_set, rng, &pulled)
+                    if walked:
+                        sok_dig_traps(work, &goals, grade.trap_share, rng, &walls)
+                        sok_floor_flags(work, &walls)
+                        sok_live_cells(work, &goals)
+                        floor_count: mutable i64 = 0
+                        dead_count: mutable i64 = 0
+                        mark: mutable i64 = 0
+                        while mark < work.cells |mark, work, floor_count, dead_count|:
+                            if Ints::at(work.floor_ok, mark) == 1:
+                                floor_count <- floor_count + 1
+                                dead_count <- dead_count + 1 if Ints::at(work.alive_in, mark) == 0
+                            mark <- mark + 1
+                        sok_walk_into_level(work, &walls, &goals, &pulled, &level)
+                        trap: mutable i64 = 0
+                        level.traps_n <- 0
+                        while trap < work.cells |trap, work, level|:
+                            trapped: bool = Ints::at(work.floor_ok, trap) == 1 and Ints::at(work.alive_in, trap) == 0
+                            Ints::put(&level.traps_in, trap, 1 if trapped else 0)
+                            level.traps_n <- level.traps_n + 1 if trapped
+                            trap <- trap + 1
+                        if not have_desperate:
+                            sok_level_copy(level, &desperate, work.cells)
+                            have_desperate <- true
+                        # Enough landmines yet?
+                        if dead_count.f64() >= grade.trap_share * floor_count.f64():
+                            minimum: mutable i64 = -1
+                            proven: mutable i64 = 0
+                            if work.cells > 121:
+                                # Beyond exact solving by design: the assignment
+                                # bound is the certificate, and it is cheap at
+                                # any size.
+                                proven <- sok_matching_bound(work, &level)
+                            else:
+                                budget: mutable i64 = SOK_GENERATION_BUDGET
+                                budget <- SOK_GENERATION_BUDGET / 4 if work.cells > 100
+                                minimum <- sok_solve_bounded(work, search, &level, budget, &proven)
+                                if minimum < 0:
+                                    matched: i64 = sok_matching_bound(work, &level)
+                                    proven <- matched if matched > proven
+                            if minimum < 0 and proven >= level.bound:
+                                # The proof met the walk: the lower bound reached
+                                # an achievable solution, so the minimum is known
+                                # exactly by squeeze.
+                                minimum <- level.bound
+                                proven <- level.bound
+                            level.minimum <- minimum
+                            certified: mutable i64 = proven
+                            certified <- minimum if minimum > certified
+                            level.at_least <- certified
+                            if certified >= grade.floor:
+                                tame: mutable bool = false
+                                if grade.deceit > 0.0:
+                                    tame <- sok_fatal_share(work, &level).f64() / 1000000.0 < grade.deceit
+                                if not tame:
+                                    sok_level_copy(level, out, work.cells)
+                                    answered <- true
+                                elif not have_strong or certified > strong.at_least:
+                                    sok_level_copy(level, &strong, work.cells)
+                                    have_strong <- true
+                            elif not have_fallback or certified > fallback.at_least:
+                                sok_level_copy(level, &fallback, work.cells)
+                                have_fallback <- true
+            attempt <- attempt + 1
+        true return if answered
+        if have_strong:
+            sok_level_copy(strong, out, work.cells)
+            return true
+        if have_fallback:
+            sok_level_copy(fallback, out, work.cells)
+            return true
+        if have_desperate:
+            proven: mutable i64 = 0
+            minimum: i64 = sok_solve_bounded(work, search, &desperate, SOK_GENERATION_BUDGET / 4, &proven)
+            certified: mutable i64 = proven
+            if minimum < 0:
+                matched: i64 = sok_matching_bound(work, &desperate)
+                certified <- matched if matched > certified
+            else:
+                certified <- minimum
+            desperate.minimum <- minimum
+            desperate.at_least <- certified
+            sok_level_copy(desperate, out, work.cells)
+            return true
+        return false
+
+def sok_walk_copy(from_walk: SokWalk&, to_walk: mutable SokWalk&, cells: i64):
+    can Abort.Panic:
+        to_walk.ok <- from_walk.ok
+        to_walk.player <- from_walk.player
+        to_walk.pulls <- from_walk.pulls
+        cell: mutable i64 = 0
+        while cell < cells |cell, cells, from_walk, to_walk|:
+            Ints::put(&to_walk.boxes_in, cell, Ints::at(from_walk.boxes_in, cell))
+            cell <- cell + 1
+
+def sok_walk_into_level(work: SokWork&, walls_in: mutable darray[i64]&, goals_in: mutable darray[i64]&, walk: SokWalk&, level: mutable SokLevel&):
+    can Abort.Panic:
+        level.width <- work.width
+        level.height <- work.height
+        level.cells <- work.cells
+        level.player <- walk.player
+        level.bound <- walk.pulls
+        level.minimum <- -1
+        level.at_least <- 0
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work, walls_in, goals_in, walk, level|:
+            Ints::put(&level.walls_in, cell, Ints::at_ref(walls_in, cell))
+            Ints::put(&level.goals_in, cell, Ints::at_ref(goals_in, cell))
+            Ints::put(&level.boxes_in, cell, Ints::at(walk.boxes_in, cell))
+            cell <- cell + 1
+
+# A solvable level of the given rung, at or above its floor.
+#
+# A round of attempts misses the floor now and then -- measured in the reference
+# at the superhuman rung, one deal in eight -- and a certificate that fails one
+# deal in eight is not a certificate. Rooms are drawn independently, so a fresh
+# ROUND is a fresh draw: two more take the miss rate from an eighth to a
+# thousandth, and cost the extra time only on the deals that needed it. Same
+# seed, same level, still -- each round reseeds at `seed + round * 7919`.
+def sok_generate(work: mutable SokWork&, search: mutable SokSearch&, level_number: i64, seed: i64, attempts: i64, out: mutable SokLevel&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        grade: SokGrade = sok_grade_of(level_number)
+        work.width <- grade.width
+        work.height <- grade.height
+        work.cells <- grade.width * grade.height
+        best: mutable SokLevel = sok_level_new()
+        have_best: mutable bool = false
+        best_certified: mutable i64 = -1
+        round_number: mutable i64 = 0
+        answered: mutable bool = false
+        while round_number < 3 and not answered |round_number, work, search, grade, level_number, seed, attempts, out, best, have_best, best_certified, answered|:
+            turn: i64 = seed if round_number == 0 else seed + round_number * 7919
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, turn.u64())
+            if sok_deal(work, search, &grade, &rng, attempts, out):
+                certified: i64 = out.minimum if out.minimum >= 0 else out.at_least
+                if certified >= grade.floor:
+                    answered <- true
+                elif not have_best or certified > best_certified:
+                    sok_level_copy(out, &best, work.cells)
+                    best_certified <- certified
+                    have_best <- true
+            round_number <- round_number + 1
+        true return if answered
+        if have_best:
+            sok_level_copy(best, out, work.cells)
+            return true
+        return false
