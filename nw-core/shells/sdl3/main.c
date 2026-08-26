@@ -234,6 +234,7 @@ static void render_frame(SDL_Renderer *r, const nw_view *v, const nw_frame *fram
             break;
         }
         case NW_SPRITE:
+        case NW_SPRITE_FIT:
         default:
             break;                          /* no atlas yet */
         }

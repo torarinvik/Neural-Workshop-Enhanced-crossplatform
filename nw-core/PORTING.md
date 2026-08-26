@@ -228,3 +228,47 @@ Revisit once stage1's module handling is fixed. The mechanical transform is
 straightforward -- the one trap is that substitutions must be applied in a
 SINGLE pass, because rewriting `MazeWork` to `Maze::Work` and then letting a
 `Maze` rule fire again on its own output gives `Maze::Dealt::Work`.
+
+## Screens: measure the original, do not read it
+
+`scene_title.elisa` and `scene_menu.elisa` were built from numbers MEASURED off
+the running application (`scripts/extract_title.py`, `scripts/extract_menu.py`),
+not from the constants written in `ui/hud.py` and `ui/menu.py`. Three things
+make reading those files insufficient, and each was found the hard way:
+
+  * **The window is retina-doubled.** Every geometry helper returns physical
+    pixels, so `from_top_edge(25)` lays out at 1318 on a 1368-tall framebuffer,
+    not at 659. Each extractor divides by the window's OWN measured scale rather
+    than by an assumed factor, so the reference file is in 912x684 space
+    whatever display it was produced on.
+
+  * **A field can be dead.** `Menu.build_chrome` computes `self.bgcolor` and
+    nothing ever reads it -- a menu's background is the GL clear colour, like
+    every other screen. Porting it because it looks authoritative would have
+    inverted the menu background on one theme.
+
+  * **The flags decide the content.** The title screen's key list is assembled
+    from JAEGGI_MODE and CLINICAL_MODE, so the only way to know what a build
+    offers is to set them and rebuild the label. Driving the original for every
+    combination is what turned up the trailing empty line clinical mode leaves
+    behind.
+
+Both harnesses drive the real class per case rather than comparing against a
+stored snapshot, so they keep working when the original moves.
+
+### Text blocks become one command per line
+
+pyglet advances a multiline label by the FONT's ascent-minus-descent -- 16.5
+reference pixels at size 12 on the title screen's face. No shell can be asked
+to reproduce another toolkit's font metrics, so the core resolves a block into
+one `CMD_TEXT` per line at a measured step. Wrapping is not modelled because
+nothing on these screens wraps; a screen that needs it should carry the width
+in the command rather than have four renderers each guess.
+
+### `CMD_SPRITE_FIT`
+
+The core cannot know an image's pixel size -- artwork is a resource anyone may
+replace -- so it names a ROOM and the shell fits into it:
+`scale = min(room_w/image_w, room_h/image_h)`, drawn centred. That is
+`bootstrap._place_splash` exactly, and it is why a 2000x500 logo lands in the
+same gap as a square one.

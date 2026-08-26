@@ -13,7 +13,7 @@ export const REFERENCE_HEIGHT = 684;
 export const Kind = {
     RECT: 1, BORDERED_RECT: 2, BOX: 3, CIRCLE: 4, ARC: 5, LINE: 6,
     TRIANGLE: 7, POLYGON: 8, POLY_POINT: 9, SPRITE: 10, TEXT: 11,
-    VERDICT: 12, SOUND: 13, MARKER: 14,
+    VERDICT: 12, SOUND: 13, MARKER: 14, SPRITE_FIT: 15,
 };
 
 const ANCHORS = [
@@ -158,6 +158,22 @@ export function render(ctx, commands, { width, height, assets = {} } = {}) {
                     ctx.translate(cmd.a, cmd.b);
                     ctx.rotate((cmd.e * Math.PI) / 180);
                     ctx.scale(cmd.c, -cmd.c); // un-flip: images are y-down
+                    ctx.drawImage(image, -image.width / 2, -image.height / 2);
+                    ctx.restore();
+                }
+                break;
+            }
+            case Kind.SPRITE_FIT: {
+                // The core names a room; the shell owns the fit, because only
+                // the shell has decoded the image and knows its size. Same rule
+                // as bootstrap._place_splash: keep the aspect, land inside.
+                const image = assets[cmd.ref];
+                if (image) {
+                    const scale = Math.min(cmd.c / image.width, cmd.d / image.height);
+                    ctx.save();
+                    ctx.translate(cmd.a, cmd.b);
+                    ctx.rotate((cmd.e * Math.PI) / 180);
+                    ctx.scale(scale, -scale); // un-flip: images are y-down
                     ctx.drawImage(image, -image.width / 2, -image.height / 2);
                     ctx.restore();
                 }

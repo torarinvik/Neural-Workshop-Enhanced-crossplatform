@@ -15,10 +15,30 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/env.sh" || exit 1
 
 STAGES="${1:-both}"
+# An unrecognised argument used to select NO stage, run NO suite, and still
+# print "All differential suites match" and exit 0. `check.sh title` reads as
+# "run the title suite" and silently verified nothing at all.
+case "$STAGES" in
+    both|stage0|stage1) ;;
+    *)
+        echo "check.sh: unknown argument '$STAGES' (expected: both, stage0, stage1)" >&2
+        echo "check.sh: to run one suite, use SUITE=<name>" >&2
+        exit 2
+        ;;
+esac
 BUILD="$ROOT/build"
 mkdir -p "$BUILD"
 
-SUITES=(pyset scheduling board nback pyrandom stimulus stats matching display config gamemode decimal session maze fogworld numberology ninarow inthedark crossedwires cookiethief custody donkey tetris removals sokoban go twohands buzzwire marblemaze syllogism)
+SUITES=(pyset scheduling board nback pyrandom stimulus stats matching display config gamemode decimal session maze fogworld numberology ninarow inthedark crossedwires cookiethief custody donkey tetris removals sokoban go twohands buzzwire marblemaze syllogism title menu)
+
+# One suite by name, for the inner loop.
+if [[ -n "${SUITE:-}" ]]; then
+    if [[ " ${SUITES[*]} " != *" $SUITE "* ]]; then
+        echo "check.sh: unknown suite '$SUITE'" >&2
+        exit 2
+    fi
+    SUITES=("$SUITE")
+fi
 
 # Suites that cannot yet build under stage1. EMPTY -- every suite now builds and
 # runs on both stages.

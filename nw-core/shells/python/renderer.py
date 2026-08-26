@@ -272,6 +272,20 @@ def plan(commands: Sequence[Mapping[str, Any]], viewport: Viewport,
                     "color": rgba(cmd["color"]),
                 }))
 
+        elif kind == "sprite_fit":
+            # The core names a ROOM, not a scale: it cannot know the artwork's
+            # pixel size, so the fit happens here where the image is loaded.
+            asset = cmd["asset"]
+            if assets is None or asset in assets:
+                x, y = viewport.point(cmd["x"], cmd["y"])
+                ops.append(DrawOp("sprite_fit", {
+                    "asset": asset, "x": x, "y": y,
+                    "room_w": cmd["room_w"] * viewport.scale,
+                    "room_h": cmd["room_h"] * viewport.scale,
+                    "rotation": -cmd["rotation"],
+                    "color": rgba(cmd["color"]),
+                }))
+
         elif kind == "text":
             x, y = viewport.point(cmd["x"], cmd["y"])
             anchor = cmd.get("anchor", "left_bottom")
@@ -386,6 +400,17 @@ class PygletFactory:
         drawable.color = color[:3]
         drawable.opacity = color[3]
         return drawable
+
+    def _build_sprite_fit(self, batch, asset, x, y, room_w, room_h, rotation, color):
+        image = self.assets.get(asset)
+        if image is None:
+            return None
+        # scale = min(room/image) on both axes: the artwork keeps its aspect
+        # ratio and lands inside the room whatever shape it arrives in. This is
+        # bootstrap._place_splash's rule, kept in the shell because only the
+        # shell knows image.width.
+        scale = min(room_w / image.width, room_h / image.height)
+        return self._build_sprite(batch, asset, x, y, scale, rotation, color)
 
     def _build_text(self, batch, text, x, y, font_size, color, anchor_x, anchor_y):
         return self.text.Label(text, x=x, y=y, font_size=font_size, color=color,

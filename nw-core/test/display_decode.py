@@ -21,6 +21,7 @@ KIND_NAMES = {
     1: "rect", 2: "bordered_rect", 3: "box", 4: "circle", 5: "arc",
     6: "line", 7: "triangle", 8: "polygon", 9: "poly_point", 10: "sprite",
     11: "text", 12: "verdict", 13: "sound", 14: "marker",
+    15: "sprite_fit",
 }
 
 ANCHOR_NAMES = ["left_bottom", "center_bottom", "right_bottom",
@@ -91,6 +92,9 @@ def _fill(cmd, kind, color, a, b, c, d, e, f, ref, ln):
         cmd.update(verdict=ref)
     elif kind == 13:
         cmd.update(asset=ref, gain=a)
+    elif kind == 15:                           # sprite fitted into a room box
+        cmd.update(asset=ref, x=a, y=b, room_w=c, room_h=d, rotation=e,
+                   color=color)
 
 
 def rgba(color: int):
