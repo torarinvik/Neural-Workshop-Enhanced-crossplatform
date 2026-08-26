@@ -1,0 +1,505 @@
+# Syllogisms: read the premises, put them together, say what follows.
+#
+# Port of neural_workshop/syllogism.py. Seven families of question -- parity,
+# order, two direction families, categorical, one made of relations about
+# relations, and one made of other questions joined by connectives -- plus the
+# read-back verifier that parses the printed lines and solves them again.
+#
+# Three things shape this port and are worth stating up front.
+#
+# 1. THE NAMES ARE A COSTUME. `things()` takes exactly ONE number from the
+#    caller's stream and starts a second stream off it, so the same seed deals
+#    the same premises with the same answer whether the things are called
+#    `harbour` and `beetle` or `vartok` and `misoosk`. That is what lets the
+#    word data be a bundled table rather than a dependency of the reasoning.
+#
+# 2. THE WORD DATA IS BUNDLED, not read. The reference draws names from a
+#    12.7 MB frequency index fetched into the user's Application Support
+#    directory -- data a browser or a phone build cannot reach. Two derived
+#    tables are compiled in instead (see scripts/words.py): the 3,450-word noun
+#    pool, and the 7,159 real English words the syllable machine could invent
+#    by accident. The second is small for a reason worth knowing: `nonsense()`
+#    checks against 142,000 words, but can only ever spell 2.55 million
+#    strings, and only 7,159 of those are words. Nothing else can ever be
+#    rejected, so nothing else needs carrying.
+#
+# 3. DICTS HERE ARE INSERTION-ORDERED, NOT HASHED. `_askable`, `_which` and
+#    the binary family group results in dicts and then either `sorted(...)`
+#    them -- alphabetically, deterministic -- or iterate them in insertion
+#    order. No string hashing is involved, so none is modelled.
+#
+# NOTE: needs elisacore_math, pyrandom, pymath, strings and syllogism_words
+# included by the driver.
+
+# --- families ---
+const SY_PARITY: i64 = 0
+const SY_ORDER: i64 = 1
+const SY_PLANE: i64 = 2
+const SY_SPACE: i64 = 3
+const SY_CATEGORICAL: i64 = 4
+const SY_META: i64 = 5
+const SY_BINARY: i64 = 6
+
+def sy_axes(family: i64) -> i64:
+    can Abort.Panic:
+        if family == SY_PLANE:
+            return 2
+        if family == SY_SPACE:
+            return 3
+        return 1
+
+def sy_has_axes(family: i64) -> bool:
+    can Abort.Panic:
+        return family == SY_PLANE or family == SY_SPACE
+
+# --- the four categorical forms, in the order they are offered ---
+const SY_ALL: i64 = 0
+const SY_NONE: i64 = 1
+const SY_SOME: i64 = 2
+const SY_SOME_NOT: i64 = 3
+const SY_NOTHING: i64 = 4
+
+def sy_opposite_form(form: i64) -> i64:
+    can Abort.Panic:
+        if form == SY_ALL:
+            return SY_SOME_NOT
+        if form == SY_SOME_NOT:
+            return SY_ALL
+        if form == SY_NONE:
+            return SY_SOME
+        return SY_NONE
+
+# COMPASS = (('north', 'south'), ('east', 'west'), ('above', 'below'))
+def sy_compass(axis: i64, which: i64) -> cstr:
+    can Abort.Panic:
+        if axis == 0:
+            return "north" if which == 0 else "south"
+        if axis == 1:
+            return "east" if which == 0 else "west"
+        return "above" if which == 0 else "below"
+
+struct SyGrade:
+    family: mutable i64
+    items: mutable i64
+    extra: mutable i64
+    negate: mutable bool
+    inner_count: mutable i64
+    inner: mutable i64[3]
+
+const SY_GRADE_COUNT: i64 = 12
+
+def sy_grade_of(rung: i64) -> SyGrade:
+    can Abort.Panic:
+        index: mutable i64 = rung - 1
+        index <- 0 if index < 0
+        index <- SY_GRADE_COUNT - 1 if index > SY_GRADE_COUNT - 1
+        g: mutable SyGrade = zeroed
+        g.items <- 4
+        if index == 0:
+            g.family <- SY_PARITY
+            g.items <- 6
+        if index == 1:
+            g.family <- SY_ORDER
+            g.items <- 6
+        if index == 2:
+            g.family <- SY_PARITY
+            g.items <- 7
+            g.extra <- 1
+        if index == 3:
+            g.family <- SY_ORDER
+            g.items <- 7
+            g.extra <- 1
+            g.negate <- true
+        if index == 4:
+            g.family <- SY_CATEGORICAL
+            g.items <- 3
+        if index == 5:
+            g.family <- SY_PLANE
+            g.items <- 5
+        if index == 6:
+            g.family <- SY_ORDER
+            g.items <- 9
+            g.extra <- 1
+            g.negate <- true
+        if index == 7:
+            g.family <- SY_CATEGORICAL
+            g.items <- 4
+        if index == 8:
+            g.family <- SY_SPACE
+            g.items <- 6
+        if index == 9:
+            g.family <- SY_META
+            g.items <- 8
+            g.extra <- 1
+            g.inner_count <- 1
+            g.inner[0] <- SY_ORDER
+        if index == 10:
+            g.family <- SY_BINARY
+            g.inner_count <- 2
+            g.inner[0] <- SY_PARITY
+            g.inner[1] <- SY_ORDER
+        if index == 11:
+            g.family <- SY_BINARY
+            g.negate <- true
+            g.inner_count <- 3
+            g.inner[0] <- SY_ORDER
+            g.inner[1] <- SY_PLANE
+            g.inner[2] <- SY_PARITY
+        return g
+
+# A grade for one part of a question made of several. Negation survives only
+# into the two families where a negative has exactly one reading.
+def sy_sub_grade(g: SyGrade, family: i64, items: i64, extra: i64) -> SyGrade:
+    can Abort.Panic:
+        out: mutable SyGrade = zeroed
+        out.family <- family
+        out.items <- items
+        out.extra <- extra
+        out.negate <- g.negate and (family == SY_PARITY or family == SY_ORDER)
+        return out
+
+# --- how many options each family offers ---
+def sy_option_count(family: i64) -> i64:
+    can Abort.Panic:
+        if family == SY_PLANE:
+            return 9
+        if family == SY_SPACE:
+            return 27
+        if family == SY_CATEGORICAL:
+            return 5
+        return 3
+
+# `itertools.product((1, 0, -1), repeat=axes)` is lexicographic with axis 0
+# most significant, so the option index is a base-3 numeral read that way.
+def sy_option_part(index: i64, axis: i64, axes: i64) -> i64:
+    can Abort.Panic:
+        divisor: mutable i64 = 1
+        step: mutable i64 = axes - 1 - axis
+        while step > 0 |step, divisor|:
+            divisor <- divisor * 3
+            step <- step - 1
+        digit: i64 = (index / divisor) % 3
+        if digit == 0:
+            return 1
+        if digit == 1:
+            return 0
+        return -1
+
+# `'north and east'`, or `'the same place'`.
+def sy_append_direction(out: mutable dstr&, part0: i64, part1: i64, part2: i64, axes: i64):
+    can Memory.Allocate, Abort.Panic:
+        said: mutable i64 = 0
+        axis: mutable i64 = 0
+        while axis < axes |axis, axes, part0, part1, part2, out, said|:
+            part: i64 = part0 if axis == 0 else (part1 if axis == 1 else part2)
+            if part != 0:
+                dstr_append_cstr(out, " and ") if said > 0
+                dstr_append_cstr(out, sy_compass(axis, 0 if part > 0 else 1))
+                said <- said + 1
+            axis <- axis + 1
+        dstr_append_cstr(out, "the same place") if said == 0
+
+def sy_sign(value: i64) -> i64:
+    can Abort.Panic:
+        return 1 if value > 0 else (-1 if value < 0 else 0)
+
+const SY_UNTOLD: i64 = -1
+
+# The label for a direction family's option index, as text.
+def sy_option_text(family: i64, index: i64) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        if family == SY_PARITY:
+            dstr_append_cstr(&out, "the same" if index == 0 else ("the opposite" if index == 1 else "cannot be told"))
+            return out
+        if family == SY_ORDER:
+            dstr_append_cstr(&out, "more" if index == 0 else ("less" if index == 1 else "cannot be told"))
+            return out
+        if family == SY_META:
+            dstr_append_cstr(&out, "the same" if index == 0 else ("different" if index == 1 else "cannot be told"))
+            return out
+        if family == SY_BINARY:
+            dstr_append_cstr(&out, "true" if index == 0 else ("false" if index == 1 else "cannot be told"))
+            return out
+        axes: i64 = sy_axes(family)
+        sy_append_direction(&out, sy_option_part(index, 0, axes), sy_option_part(index, 1, axes), sy_option_part(index, 2, axes), axes)
+        return out
+
+# The option index a direction VALUE lands on, which is the same base-3 numeral
+# read backwards.
+def sy_direction_index(part0: i64, part1: i64, part2: i64, axes: i64) -> i64:
+    can Abort.Panic:
+        index: mutable i64 = 0
+        axis: mutable i64 = 0
+        while axis < axes |axis, axes, part0, part1, part2, index|:
+            part: i64 = sy_sign(part0 if axis == 0 else (part1 if axis == 1 else part2))
+            digit: i64 = 0 if part > 0 else (1 if part == 0 else 2)
+            index <- index * 3 + digit
+            axis <- axis + 1
+        return index
+
+# --- the names ---
+#
+# Names live as offsets into one flat byte buffer, so a name is an sview and
+# nothing is copied to pass one around.
+#
+# The buffer is PRE-SIZED and written by index rather than grown with `push`.
+# That is not a micro-optimisation: handing a container field of a struct ref
+# to a helper that grows it is rejected by region inference ("cannot infer
+# region parameter"), and the obvious compiler fix is unsound -- see
+# elisa-core docs/REGION_FIELD_FORWARD_GAP.md, which records the measurement.
+# Writing an element needs no region, so this shape sidesteps it entirely, and
+# it is what every other module in this port already does.
+const SY_MOST_NAMES: i64 = 48
+const SY_NAME_BYTES: i64 = 1024
+
+struct SyNames:
+    bytes: mutable darray[u8]
+    used: mutable i64
+    start: mutable darray[i64]
+    length: mutable darray[i64]
+    count: mutable i64
+
+def sy_names_new() -> SyNames:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable SyNames = zeroed
+        out.bytes <- Bytes::zeros(SY_NAME_BYTES)
+        out.start <- Ints::zeros(SY_MOST_NAMES)
+        out.length <- Ints::zeros(SY_MOST_NAMES)
+        return out
+
+def sy_names_reset(names: mutable SyNames&):
+    can Abort.Panic:
+        names.used <- 0
+        names.count <- 0
+
+def sy_names_push(names: mutable SyNames&, word: sview):
+    can Abort.Panic:
+        slot: i64 = names.count
+        length: i64 = sview_len(word).i64()
+        Ints::put(&names.start, slot, names.used)
+        index: mutable i64 = 0
+        while index < length |index, length, word, names|:
+            Bytes::put(&names.bytes, names.used + index, sview_at(word, index.usize()))
+            index <- index + 1
+        names.used <- names.used + length
+        Ints::put(&names.length, slot, length)
+        names.count <- slot + 1
+
+def sy_name(names: SyNames&, index: i64) -> sview:
+    can Abort.Panic:
+        start: i64 = Ints::at(names.start, index)
+        return string_view_slice(bytes_view(names.bytes), start, start + Ints::at(names.length, index))
+
+# Binary search of the bundled "words the syllable machine could invent by
+# accident" table. See the module header for why 7,159 is the whole of it.
+def sy_is_taken(word: sview) -> bool:
+    can Abort.Panic:
+        low: mutable i64 = 0
+        high: mutable i64 = SY_TAKEN_COUNT - 1
+        found: mutable bool = false
+        while low <= high and not found |low, high, word, found|:
+            mid: i64 = (low + high) / 2
+            other: sview = sview(sy_taken_at(mid), 0, -1)
+            order: i64 = sy_compare(word, other)
+            if order == 0:
+                found <- true
+            else:
+                if order < 0:
+                    high <- mid - 1
+                else:
+                    low <- mid + 1
+        return found
+
+# Byte-wise ordering, which for these lowercase ASCII words is Python's own.
+def sy_compare(left: sview, right: sview) -> i64:
+    can Abort.Panic:
+        left_len: i64 = sview_len(left).i64()
+        right_len: i64 = sview_len(right).i64()
+        shortest: i64 = left_len if left_len < right_len else right_len
+        index: mutable i64 = 0
+        answer: mutable i64 = 2
+        while index < shortest and answer == 2 |index, shortest, left, right, answer|:
+            a: i64 = sview_at(left, index.usize()).i64()
+            b: i64 = sview_at(right, index.usize()).i64()
+            if a < b:
+                answer <- -1
+            if a > b:
+                answer <- 1
+            index <- index + 1
+        if answer != 2:
+            return answer
+        if left_len < right_len:
+            return -1
+        if left_len > right_len:
+            return 1
+        return 0
+
+# `count` made-up words, no two of them opening alike. Distinct first two
+# letters on purpose: the difficulty is meant to be in putting the premises
+# together, not in telling `vartok` from `vartop` at a glance.
+def sy_nonsense(rng: mutable MT19937&, count: i64, names: mutable SyNames&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        sy_names_reset(names)
+        used: mutable darray[i64] = Ints::zeros(1024)
+        used_n: mutable i64 = 0
+        attempt: mutable i64 = 0
+        while attempt < 400 * count and names.count < count |attempt, count, rng, names, used, used_n|:
+            word: mutable dstr = []
+            dstr_append_cstr(&word, sy_onset(py_choice_index(rng, 16)))
+            dstr_append_cstr(&word, sy_nucleus(py_choice_index(rng, 8)))
+            dstr_append_cstr(&word, sy_coda(py_choice_index(rng, 13)))
+            head: i64 = sy_head_key(bytes_view(word))
+            seen: mutable bool = false
+            scan: mutable i64 = 0
+            while scan < used_n |scan, used_n, used, head, seen|:
+                seen <- true if Ints::at(used, scan) == head
+                scan <- scan + 1
+            if not seen:
+                # The second syllable is drawn AFTER the duplicate-opening
+                # test, so a rejected word still costs the one draw and no
+                # more. Getting that order wrong shifts the whole stream.
+                if py_random(rng) < 0.55:
+                    dstr_append_cstr(&word, sy_onset(py_choice_index(rng, 16)))
+                    dstr_append_cstr(&word, sy_nucleus(py_choice_index(rng, 8)))
+                    dstr_append_cstr(&word, sy_coda(py_choice_index(rng, 13)))
+                size: i64 = word.count.i64()
+                if size >= 4 and size <= 8 and not sy_is_taken(bytes_view(word)):
+                    Ints::put(&used, used_n, head)
+                    used_n <- used_n + 1
+                    sy_names_push(names, bytes_view(word))
+            attempt <- attempt + 1
+        return names.count >= count
+
+def sy_head_key(word: sview) -> i64:
+    can Abort.Panic:
+        if sview_len(word).i64() < 2:
+            return sview_at(word, 0.usize()).i64() * 256
+        return sview_at(word, 0.usize()).i64() * 256 + sview_at(word, 1.usize()).i64()
+
+def sy_onset(index: i64) -> cstr:
+    can Abort.Panic:
+        if index < 8:
+            if index < 4:
+                return "b" if index == 0 else ("d" if index == 1 else ("f" if index == 2 else "g"))
+            return "h" if index == 4 else ("j" if index == 5 else ("k" if index == 6 else "l"))
+        if index < 12:
+            return "m" if index == 8 else ("n" if index == 9 else ("p" if index == 10 else "r"))
+        return "s" if index == 12 else ("t" if index == 13 else ("v" if index == 14 else "z"))
+
+def sy_nucleus(index: i64) -> cstr:
+    can Abort.Panic:
+        if index < 4:
+            return "a" if index == 0 else ("e" if index == 1 else ("i" if index == 2 else "o"))
+        return "u" if index == 4 else ("ai" if index == 5 else ("ee" if index == 6 else "oo"))
+
+def sy_coda(index: i64) -> cstr:
+    can Abort.Panic:
+        if index < 4:
+            return "" if index == 0 else ("l" if index == 1 else ("m" if index == 2 else "n"))
+        if index < 8:
+            return "r" if index == 4 else ("s" if index == 5 else ("k" if index == 6 else "p"))
+        if index < 11:
+            return "t" if index == 8 else ("v" if index == 9 else "sk")
+        return "st" if index == 11 else "nd"
+
+# `count` things to reason about, no two of them opening alike.
+#
+# EXACTLY ONE NUMBER is taken from the caller's stream whichever way this goes,
+# and the words are drawn from a second stream started off it. That is what
+# makes the naming a costume rather than a variable: the same seed deals the
+# same premises, with the same answer, whether the things are called `harbour`
+# and `beetle` or `vartok` and `misoosk`.
+def sy_things(rng: mutable MT19937&, count: i64, made_up: bool, names: mutable SyNames&):
+    can Memory.Allocate, Abort.Panic:
+        words: mutable MT19937 = mt19937_new()
+        mt_seed_int(&words, py_randrange(rng, 0, 4294967296).u64())
+        # The pool has to be forty times what the question needs before it is
+        # drawn from at all, so the distinct-openings rule never turns into a
+        # search.
+        pool: i64 = 0 if made_up else SY_NOUN_COUNT
+        if pool < 40 * count:
+            _ = sy_nonsense(&words, count, names)
+            return
+        sy_names_reset(names)
+        used: mutable darray[i64] = Ints::zeros(1024)
+        used_n: mutable i64 = 0
+        attempt: mutable i64 = 0
+        while attempt < 400 * count and names.count < count |attempt, count, words, names, used, used_n, pool|:
+            word: sview = sview(sy_noun_at(py_randrange(&words, 0, pool)), 0, -1)
+            head: i64 = sy_head_key(word)
+            seen: mutable bool = false
+            scan: mutable i64 = 0
+            while scan < used_n |scan, used_n, used, head, seen|:
+                seen <- true if Ints::at(used, scan) == head
+                scan <- scan + 1
+            if not seen:
+                Ints::put(&used, used_n, head)
+                used_n <- used_n + 1
+                sy_names_push(names, word)
+            attempt <- attempt + 1
+        # The reference falls back to invented names on the same `words`
+        # stream, already part-consumed, rather than a fresh one.
+        if names.count < count:
+            _ = sy_nonsense(&words, count, names)
+
+# `a` or `an`, for a name printed after it. The rule is about the SOUND rather
+# than the spelling, and with made-up names the question never came up: it is
+# "a idiot" that gave it away.
+def sy_article(word: sview) -> cstr:
+    can Memory.Allocate, Abort.Panic:
+        if sy_starts_any(word, 0):
+            return "an"
+        if sy_starts_any(word, 1):
+            return "a"
+        first: u8 = sview_at(word, 0.usize())
+        vowel: bool = first == 97 or first == 101 or first == 105 or first == 111 or first == 117
+        return "an" if vowel else "a"
+
+# SOUNDS_VOWEL (which = 0) and SOUNDS_CONSONANT (which = 1), as prefixes so
+# that `union` covers `unions`.
+def sy_starts_any(word: sview, which: i64) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        count: i64 = 5 if which == 0 else 10
+        index: mutable i64 = 0
+        found: mutable bool = false
+        while index < count and not found |index, count, which, word, found|:
+            prefix: cstr = sy_sound_prefix(which, index)
+            found <- true if sview_starts_with(word, sview(prefix, 0, -1))
+            index <- index + 1
+        return found
+
+def sy_sound_prefix(which: i64, index: i64) -> cstr:
+    can Abort.Panic:
+        if which == 0:
+            if index < 3:
+                return "hour" if index == 0 else ("honest" if index == 1 else "honor")
+            return "honour" if index == 3 else "heir"
+        if index < 4:
+            return "uni" if index == 0 else ("use" if index == 1 else ("usu" if index == 2 else "uti"))
+        if index < 8:
+            return "uto" if index == 4 else ("ura" if index == 5 else ("ute" if index == 6 else "eu"))
+        return "ewe" if index == 8 else "one"
+
+# One categorical line about two named things.
+def sy_append_says(out: mutable dstr&, form: i64, subject: sview, other: sview):
+    can Memory.Allocate, Abort.Panic:
+        if form == SY_ALL:
+            dstr_append_cstr(out, "every ")
+            dstr_append_sview(out, subject)
+            dstr_append_cstr(out, " is ")
+        if form == SY_NONE:
+            dstr_append_cstr(out, "no ")
+            dstr_append_sview(out, subject)
+            dstr_append_cstr(out, " is ")
+        if form == SY_SOME:
+            dstr_append_cstr(out, "at least one ")
+            dstr_append_sview(out, subject)
+            dstr_append_cstr(out, " is ")
+        if form == SY_SOME_NOT:
+            dstr_append_cstr(out, "at least one ")
+            dstr_append_sview(out, subject)
+            dstr_append_cstr(out, " is not ")
+        dstr_append_cstr(out, sy_article(other))
+        dstr_append_cstr(out, " ")
+        dstr_append_sview(out, other)
