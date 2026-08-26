@@ -1,0 +1,925 @@
+diff --git a/compiler/runtime/elisacore_std/arena.elisa b/compiler/runtime/elisacore_std/arena.elisa
+index 63d9b0d83..e0930ba67 100644
+--- a/compiler/runtime/elisacore_std/arena.elisa
++++ b/compiler/runtime/elisacore_std/arena.elisa
+@@ -721,6 +721,15 @@ def arena_free(a: mutable Arena&):
+     can Memory.Release, Abort.Panic:
+         r: mutable heap Region&? = a.begin
+ 
++        # Detach the chain BEFORE releasing any block.  Backend epilogues may emit more than
++        # one cleanup edge for the same owned carrier (for example, an ordinary fallthrough
++        # plus a generated contract/defer edge).  Clearing the header first makes arena_free
++        # genuinely idempotent: a second call observes begin == null and cannot traverse or
++        # release already-freed memory.
++        a.begin as ! <- null
++        a.end as ! <- null
++        a.end_index <- 0
++
+         trusted Unsafe.AssumeProgress:
+             while r != null:
+                 r0: mutable heap Region& = r
+@@ -728,9 +737,6 @@ def arena_free(a: mutable Arena&):
+                 trusted Unsafe.RawExtern:
+                     free_region_backend(r0, a.strategy)
+ 
+-        a.begin as ! <- null
+-        a.end as ! <- null
+-        a.end_index <- 0
+ 
+ def arena_trim(a: mutable Arena&):
+     can Memory.Release, Abort.Panic:
+diff --git a/compiler/runtime/elisacore_std/debug_referee.elisa b/compiler/runtime/elisacore_std/debug_referee.elisa
+index a7dc94d35..94ee033ec 100644
+--- a/compiler/runtime/elisacore_std/debug_referee.elisa
++++ b/compiler/runtime/elisacore_std/debug_referee.elisa
+@@ -80,7 +80,11 @@ const ELISA_TRACE_CAP: usize = 256
+ # not a stable cross-platform symbol, e.g. it is __stderrp on macOS.)
+ extern snprintf(buf: mutable u8&?, bufsize: usize, fmt: u8&, ...) -> int can[Console.Format]
+ extern write(fd: int, buf: void&, count: usize) -> isize can[Console]
+-extern getenv(name: u8&) -> u8&?
++# Keep the libc declaration canonical across the standard library and the LLVM-C
++# backend.  `getenv` takes a NUL-terminated C string; declaring the same symbol as
++# `u8&` as well created an ambiguous global binding in a self-hosted compiler after
++# include flattening, so gen2 selected the byte-reference overload for every cstr call.
++extern getenv(name: cstr) -> u8&?
+ extern signal(sig: int, handler: void&?) -> void&?
+ # `raise` is a reserved keyword in Elisa, so re-raise via kill(getpid(), sig).
+ extern getpid() -> int
+@@ -195,7 +199,7 @@ def elisa_trace_install_fault_handler() -> void:
+ def elisa_trace_maybe_install_fault_handler() -> void:
+     return if elisa_trace_fault_checked
+     elisa_trace_fault_checked <- true
+-    elisa_trace_install_fault_handler() if getenv("ELISA_TRACE_ON_FAULT".cast[u8&]) != null
++    elisa_trace_install_fault_handler() if getenv("ELISA_TRACE_ON_FAULT") != null
+ 
+ def elisa_trace_dump() -> void:
+     entries: u64 = elisa_trace_pos
+diff --git a/compiler/src/backend/llvm_aggregate_abi.go b/compiler/src/backend/llvm_aggregate_abi.go
+index 4a592c684..8a4d3ed79 100644
+--- a/compiler/src/backend/llvm_aggregate_abi.go
++++ b/compiler/src/backend/llvm_aggregate_abi.go
+@@ -280,9 +280,10 @@ func (g *llvmGenerator) addFuncEnumAttr(fn C.LLVMValueRef, llvmParamPos int, nam
+ // pointeeEligibleForNoalias reports whether a `mutable T&` parameter whose pointee
+ // is `elem` belongs to the subset for which `noalias` is sound to stamp.
+ //
+-// Limited to scalar (numeric) and darray pointees — the subset the aliasing model
+-// proves free of laundered aliases (see memory: noalias-blocked-by-region-escape,
+-// alias-laundering-hole). Struct/enum/view/void pointees are EXCLUDED: struct refs
++// Limited to scalar (numeric) pointees. Darray references are deliberately excluded:
++// checker/runtime code commonly forwards the same mutable darray through nested calls,
++// so an ABI-level noalias promise would be unsound even though the source borrow checker
++// permits those internal forwarding patterns. Struct/enum/view/void pointees are EXCLUDED:
+ // still have open laundering residuals (field-rebind, nested carriers) and `void&`
+ // is the type-erased aliasing escape hatch the trusted runtime relies on.
+ func pointeeEligibleForNoalias(elem semantic.Type) bool {
+@@ -292,19 +293,15 @@ func pointeeEligibleForNoalias(elem semantic.Type) bool {
+ 	if semantic.IsNumericType(elem) {
+ 		return true
+ 	}
+-	if _, ok := elem.(*semantic.DArrayType); ok {
+-		return true
+-	}
+ 	return false
+ }
+ 
+ // applyMutableRefNoaliasAttrs stamps LLVM `noalias` on the eligible subset of
+ // `mutable T&` parameters when opted in (ELISACORE_NOALIAS_MUTABLE_REFS).
+ //
+-// Soundness rests on the aliasing checker rejecting two live mutable references to
+-// the same storage (call-arg alias check + escape analysis + closed laundering
+-// vectors), so a `mutable T&` is the unique mutator of its pointee for the call —
+-// exactly the restrict semantics `noalias` encodes. This is OFF by default: a
++// Soundness rests on the aliasing checker rejecting two live mutable scalar references to
++// the same storage. Darray refs are excluded because internal forwarding can preserve the
++// same darray across nested calls. This is OFF by default: a
+ // noalias miscompile is silent, so it stays an explicit opt-in pending empirical
+ // validation before it can become a default.
+ func (g *llvmGenerator) applyMutableRefNoaliasAttrs(fn C.LLVMValueRef, fnType *semantic.FuncType, base int) {
+diff --git a/compiler/src/backend/llvm_bodies_clonecapturedcodegenscope_to_emitstmt.go b/compiler/src/backend/llvm_bodies_clonecapturedcodegenscope_to_emitstmt.go
+index a50ea30d6..5ec31d591 100644
+--- a/compiler/src/backend/llvm_bodies_clonecapturedcodegenscope_to_emitstmt.go
++++ b/compiler/src/backend/llvm_bodies_clonecapturedcodegenscope_to_emitstmt.go
+@@ -266,15 +266,16 @@ func (s *functionState) emitRegionDeclImpl(n *ast.RegionStmt, loopReset bool) er
+ 			return err
+ 		}
+ 	} else {
+-		alloca, err = s.createEntryAlloca(n.Name, arenaType)
++		// The declaration may itself be nested in a conditional or loop.  Its cleanup is
++		// emitted at the scope's CFG merge, which can also be reached when the declaration
++		// was not entered.  Initialize the entry-dominating arena slot on every path so that
++		// that merge cleanup sees a valid zero arena instead of uninitialized stack bytes.
++		// Non-lazy regions are initialized with their first block below on the path that
++		// enters the declaration; this entry store is only the fail-safe empty state.
++		alloca, err = s.createEntryAllocaZeroed(n.Name, arenaType)
+ 		if err != nil {
+ 			return err
+ 		}
+-		zero, zerr := s.zeroValue(arenaType)
+-		if zerr != nil {
+-			return zerr
+-		}
+-		C.LLVMBuildStore(s.builder, zero, alloca)
+ 	}
+ 	s.defineBinding(n.Name, valueBinding{ptr: alloca, typ: arenaType})
+ 	s.regions = append(s.regions, regionBinding{name: n.Name, ptr: alloca, typ: arenaType, owned: true})
+@@ -466,15 +467,13 @@ func (s *functionState) emitRegionExtraStacks(n *ast.RegionStmt, loopReset bool)
+ 				return noop, err
+ 			}
+ 		} else {
+-			alloca, err = s.createEntryAlloca(name, arenaType)
++			// As with the primary region slot, this stack can be cleaned up at a
++			// merge that is reachable without entering the scoped region.  Give it
++			// an entry-dominating empty state before any path-specific initialization.
++			alloca, err = s.createEntryAllocaZeroed(name, arenaType)
+ 			if err != nil {
+ 				return noop, err
+ 			}
+-			zero, zerr := s.zeroValue(arenaType)
+-			if zerr != nil {
+-				return noop, zerr
+-			}
+-			C.LLVMBuildStore(s.builder, zero, alloca)
+ 		}
+ 		// Lazy arena: first block allocated on demand, free is a no-op if unused -> an unused
+ 		// parallel stack costs only the stack slot.
+diff --git a/compiler/src/backend/llvm_consteval_consts_to_cstringfree.go b/compiler/src/backend/llvm_consteval_consts_to_cstringfree.go
+index 8a316401b..44fb90165 100644
+--- a/compiler/src/backend/llvm_consteval_consts_to_cstringfree.go
++++ b/compiler/src/backend/llvm_consteval_consts_to_cstringfree.go
+@@ -16,8 +16,50 @@ import (
+ 	"math"
+ 	"strconv"
+ 	"strings"
++	"sync"
++	"unsafe"
+ )
+ 
++var moduleCStringState struct {
++	sync.Mutex
++	owned  []*C.char
++	byName map[string]*C.char
++	users  int
++}
++
++// LLVM retains some C API names until the containing value or module is
++// disposed, so freeing a name immediately after a builder call corrupts the
++// generated module. Keep one deduplicated owner pool for the active generator
++// lifetime and release it only after LLVMContextDispose. The reference count
++// also makes concurrent generators safe: one generator cannot release another
++// generator's names while its module is still alive.
++func beginModuleCStringLifetime() {
++	moduleCStringState.Lock()
++	defer moduleCStringState.Unlock()
++	if moduleCStringState.users == 0 {
++		moduleCStringState.owned = nil
++		moduleCStringState.byName = make(map[string]*C.char)
++	}
++	moduleCStringState.users++
++}
++
++func endModuleCStringLifetime() {
++	moduleCStringState.Lock()
++	defer moduleCStringState.Unlock()
++	if moduleCStringState.users == 0 {
++		return
++	}
++	moduleCStringState.users--
++	if moduleCStringState.users != 0 {
++		return
++	}
++	for _, ptr := range moduleCStringState.owned {
++		C.free(unsafe.Pointer(ptr))
++	}
++	moduleCStringState.owned = nil
++	moduleCStringState.byName = nil
++}
++
+ const smallExactArenaFillUnrollLimit = 4
+ const smallExactArenaCopyUnrollLimit = 4
+ const smallExactArenaEqUnrollByteLimit = 16
+@@ -1548,6 +1590,19 @@ func cStringFree(s string) *C.char {
+ 	if s == "" {
+ 		return nil
+ 	}
++	moduleCStringState.Lock()
++	defer moduleCStringState.Unlock()
++	if ptr := moduleCStringState.byName[s]; ptr != nil {
++		return ptr
++	}
+ 	ptr := C.CString(s)
++	if moduleCStringState.byName == nil {
++		// Production callers are enclosed by begin/endModuleCStringLifetime.
++		// Keep the helper total for isolated backend tests too; those tests must
++		// use the same lifetime pair when they exercise LLVM builders.
++		moduleCStringState.byName = make(map[string]*C.char)
++	}
++	moduleCStringState.byName[s] = ptr
++	moduleCStringState.owned = append(moduleCStringState.owned, ptr)
+ 	return ptr
+ }
+diff --git a/compiler/src/backend/llvm_exprs_emitlistlitexpr_to_emitisexpr_emitlistlitexpr_to_emitisexpr_emitlistlitexpr_to_emitmembershipcomparevalueandexpr.go b/compiler/src/backend/llvm_exprs_emitlistlitexpr_to_emitisexpr_emitlistlitexpr_to_emitisexpr_emitlistlitexpr_to_emitmembershipcomparevalueandexpr.go
+index adfaed86c..ca9a98796 100644
+--- a/compiler/src/backend/llvm_exprs_emitlistlitexpr_to_emitisexpr_emitlistlitexpr_to_emitisexpr_emitlistlitexpr_to_emitmembershipcomparevalueandexpr.go
++++ b/compiler/src/backend/llvm_exprs_emitlistlitexpr_to_emitisexpr_emitlistlitexpr_to_emitisexpr_emitlistlitexpr_to_emitmembershipcomparevalueandexpr.go
+@@ -1570,6 +1570,13 @@ func (s *functionState) emitBinaryExpr(expr *ast.BinaryExpr) (C.LLVMValueRef, se
+ 	if value, actualType, handled, err := s.emitPointerArithmeticExpr(expr, leftType, rightType, resultType); handled {
+ 		return value, actualType, err
+ 	}
++	if (expr.Op == lexer.TOKEN_EQEQ || expr.Op == lexer.TOKEN_BANGEQ) &&
++		semantic.IsAggregateValueEqualityUnsupported(leftType) && semantic.IsAggregateValueEqualityUnsupported(rightType) {
++		// Semantic analysis rejects this shape first. Keep the backend total as
++		// well: a missed/externally-built AST must never reach LLVMBuildICmp with
++		// an aggregate operand and leave an invalid module behind.
++		return nil, nil, fmt.Errorf("aggregate values do not support %s", lexer.TokenName(expr.Op))
++	}
+ 	operandType := s.binaryOperandType(expr.Op, leftType, rightType)
+ 	// Auto-deref a reference operand to its numeric/bool pointee for `==`/`!=`.
+ 	// binaryOperandType leaves a ref as-is for equality (so the genuine pointer/null
+diff --git a/compiler/src/backend/llvm_generatellvmir_to_flattenllvmtreememberdecls.go b/compiler/src/backend/llvm_generatellvmir_to_flattenllvmtreememberdecls.go
+index 9d3fc74ee..1c4789475 100644
+--- a/compiler/src/backend/llvm_generatellvmir_to_flattenllvmtreememberdecls.go
++++ b/compiler/src/backend/llvm_generatellvmir_to_flattenllvmtreememberdecls.go
+@@ -24,6 +24,7 @@ import (
+ 	"elisacore/src/semantic"
+ 	"fmt"
+ 	"os"
++	"path/filepath"
+ 	"unsafe"
+ )
+ 
+@@ -205,6 +206,7 @@ type llvmGenerator struct {
+ 	globalFastMath            bool
+ 	noaliasMutableRefs        bool
+ 	perfWarnings              []string
++	transientCStringLifetime  bool
+ }
+ type typeMemoKey struct {
+ 	id  semantic.TypeID
+@@ -218,12 +220,26 @@ func noteTypeKeyFor(t semantic.Type) typeMemoKey {
+ 	return typeMemoKey{typ: t}
+ }
+ func newLLVMGenerator(result *semantic.Result) (*llvmGenerator, error) {
++	if result == nil {
++		return nil, fmt.Errorf("backend requires a semantic result with file and global scope")
++	}
+ 	activeFile := result.ActiveFile()
+-	if result == nil || activeFile == nil || result.GlobalScope == nil {
++	if activeFile == nil || result.GlobalScope == nil {
+ 		return nil, fmt.Errorf("backend requires a semantic result with file and global scope")
+ 	}
+ 	ctx := C.LLVMContextCreate()
+-	moduleName := cString(activeFile.Filename)
++	// LLVM's module identifier is not semantic source metadata.  Keeping the
++	// caller's absolute path here made object code depend on whether the same
++	// source was invoked as `src/file.elisa` or `/abs/.../src/file.elisa` on
++	// Darwin/AArch64.  The generated IR differed only in its module header, but
++	// LLVM's backend then took different machine-code paths and one variant
++	// could miscompile.  Use the stable basename for the module identity; source
++	// locations and compiler diagnostics still retain activeFile.Filename.
++	moduleID := filepath.Base(activeFile.Filename)
++	if moduleID == "." || moduleID == "" {
++		moduleID = "module.elisa"
++	}
++	moduleName := cString(moduleID)
+ 	defer C.free(unsafe.Pointer(moduleName))
+ 	mod := C.LLVMModuleCreateWithNameInContext(moduleName, ctx)
+ 	g := &llvmGenerator{
+@@ -247,6 +263,8 @@ func newLLVMGenerator(result *semantic.Result) (*llvmGenerator, error) {
+ 		noteTypeDone:              map[typeMemoKey]bool{},
+ 		wordBits:                  int(unsafe.Sizeof(uintptr(0)) * 8),
+ 	}
++	beginModuleCStringLifetime()
++	g.transientCStringLifetime = true
+ 	for _, sym := range result.GlobalScope.Symbols {
+ 		if sym == nil || sym.Node == nil {
+ 			continue
+@@ -313,6 +331,10 @@ func (g *llvmGenerator) dispose() {
+ 	if g.context != nil {
+ 		C.LLVMContextDispose(g.context)
+ 	}
++	if g.transientCStringLifetime {
++		endModuleCStringLifetime()
++		g.transientCStringLifetime = false
++	}
+ }
+ func (g *llvmGenerator) emitModule() error {
+ 	if g.emitDebugInfo {
+diff --git a/compiler/src/backend/llvm_noalias_mutable_ref_test.go b/compiler/src/backend/llvm_noalias_mutable_ref_test.go
+index a75f7fc60..f81ac198a 100644
+--- a/compiler/src/backend/llvm_noalias_mutable_ref_test.go
++++ b/compiler/src/backend/llvm_noalias_mutable_ref_test.go
+@@ -91,3 +91,21 @@ func TestNoaliasNotStampedOnImmutableRef(t *testing.T) {
+ 		t.Fatalf("expected NO noalias on an immutable ref param, got:\n%s", output)
+ 	}
+ }
++
++// Mutable darray refs may be forwarded to nested calls that reuse the same storage.
++// They must not receive an ABI-level noalias promise even with the opt-in enabled.
++const noaliasDarrayRefSrc = `def take(xs: mutable darray[i32]&) -> void:
++    return
++`
++
++func TestNoaliasNotStampedOnDarrayRef(t *testing.T) {
++	t.Setenv("ELISACORE_NOALIAS_MUTABLE_REFS", "1")
++	result := parseAndAnalyzeBackendTest(t, "na_darray.elisa", noaliasDarrayRefSrc)
++	output, err := GenerateLLVMIRWithOpt(result, OptimizationLevel0)
++	if err != nil {
++		t.Fatalf("GenerateLLVMIRWithOpt returned error: %v", err)
++	}
++	if defineLineHasNoalias(output) {
++		t.Fatalf("expected NO noalias on a mutable darray ref, got:\n%s", output)
++	}
++}
+diff --git a/compiler/src/backend/llvm_target_test.go b/compiler/src/backend/llvm_target_test.go
+index 563301e2f..7bf9fc107 100644
+--- a/compiler/src/backend/llvm_target_test.go
++++ b/compiler/src/backend/llvm_target_test.go
+@@ -24,3 +24,24 @@ func TestWriteLLVMObjectFileWithOptO0InitializesTargetMachineForEmission(t *test
+ 		t.Fatalf("expected object output %s to be non-empty", outputPath)
+ 	}
+ }
++
++func TestWriteLLVMObjectFileForExplicitAArch64Target(t *testing.T) {
++	result := parseAndAnalyzeBackendTest(t, "emit_object_aarch64_machine_cse.elisa", `def main() -> int:
++	return 0
++`)
++	outputPath := filepath.Join(t.TempDir(), "emit_object_aarch64_machine_cse.o")
++	if err := WriteLLVMObjectFileWithOptions(result, outputPath, LLVMObjectEmitOptions{
++		OptLevel:      OptimizationLevel2,
++		PackedProfile: DefaultPackedLoweringProfile(),
++		TargetTriple:  "arm64-apple-darwin",
++	}); err != nil {
++		t.Fatalf("WriteLLVMObjectFileWithOptions returned error: %v", err)
++	}
++	info, err := os.Stat(outputPath)
++	if err != nil {
++		t.Fatalf("expected object output %s: %v", outputPath, err)
++	}
++	if info.Size() == 0 {
++		t.Fatalf("expected object output %s to be non-empty", outputPath)
++	}
++}
+diff --git a/compiler/src/backend/parity_backend_record.go b/compiler/src/backend/parity_backend_record.go
+index 5924287cf..2781f3493 100644
+--- a/compiler/src/backend/parity_backend_record.go
++++ b/compiler/src/backend/parity_backend_record.go
+@@ -31,7 +31,7 @@ func recordBackendParityCase(result *semantic.Result, optLevel OptimizationLevel
+ 	if path == "" || result == nil || result.File == nil {
+ 		return
+ 	}
+-	src, ok := lexer.ParitySourceFor(result.File.Filename)
++	src, ok := lexer.ConsumeParitySource(result.File.Filename)
+ 	if !ok {
+ 		return
+ 	}
+diff --git a/compiler/src/lexer/lexer_lexer_to_readident.go b/compiler/src/lexer/lexer_lexer_to_readident.go
+index da3a9e9e7..58c852cfc 100644
+--- a/compiler/src/lexer/lexer_lexer_to_readident.go
++++ b/compiler/src/lexer/lexer_lexer_to_readident.go
+@@ -172,10 +172,10 @@ func (l *Lexer) skipBlockComment() {
+ // from rather than the flattened include buffer. Returns false for ordinary `#`
+ // comments, which are skipped normally. Called with l.peek() == '#'.
+ func (l *Lexer) tryConsumeLineDirective() bool {
++	// Include expansion emits the canonical `#line` spelling. Do not accept
++	// whitespace between `#` and `line`: ordinary documentation comments such as
++	// `#   line 1: ...` must remain comments and must not reset the source position.
+ 	i := l.pos + 1
+-	for i < len(l.src) && (l.src[i] == ' ' || l.src[i] == '\t') {
+-		i++
+-	}
+ 	const kw = "line"
+ 	if i+len(kw) > len(l.src) {
+ 		return false
+diff --git a/compiler/src/lexer/parity_source_record.go b/compiler/src/lexer/parity_source_record.go
+index facc14ac7..93f3c06da 100644
+--- a/compiler/src/lexer/parity_source_record.go
++++ b/compiler/src/lexer/parity_source_record.go
+@@ -12,21 +12,43 @@ import (
+ // the environment variable is set.
+ var (
+ 	paritySourceMu      sync.Mutex
+-	paritySources       map[string]string
++	paritySources       map[string]paritySourceEntry
+ 	parityRecordEnabled = os.Getenv("ELISA_SEMANTIC_INTERNAL_PARITY_OUT") != "" ||
+-				os.Getenv("ELISA_BACKEND_PARITY_OUT") != ""
++		os.Getenv("ELISA_BACKEND_PARITY_OUT") != ""
+ )
+ 
++type paritySourceEntry struct {
++	source    string
++	consumers uint8
++}
++
++func paritySourceConsumerCount() uint8 {
++	var consumers uint8
++	if os.Getenv("ELISA_SEMANTIC_INTERNAL_PARITY_OUT") != "" {
++		consumers++
++	}
++	if os.Getenv("ELISA_BACKEND_PARITY_OUT") != "" {
++		consumers++
++	}
++	return consumers
++}
++
+ func recordParitySource(filename string, src []byte) {
+ 	if !parityRecordEnabled {
+ 		return
+ 	}
++	consumers := paritySourceConsumerCount()
++	if consumers == 0 {
++		return
++	}
+ 	paritySourceMu.Lock()
+ 	defer paritySourceMu.Unlock()
+ 	if paritySources == nil {
+-		paritySources = make(map[string]string)
++		paritySources = make(map[string]paritySourceEntry)
+ 	}
+-	paritySources[filename] = string(src)
++	// A filename is the identity used by the recorders. Re-lexing it replaces the prior
++	// entry, so repeated in-process checks do not retain every historical source snapshot.
++	paritySources[filename] = paritySourceEntry{source: string(src), consumers: consumers}
+ }
+ 
+ // ParitySourceFor returns the most recently lexed source registered under
+@@ -38,6 +60,41 @@ func ParitySourceFor(filename string) (string, bool) {
+ 	}
+ 	paritySourceMu.Lock()
+ 	defer paritySourceMu.Unlock()
+-	src, ok := paritySources[filename]
+-	return src, ok
++	entry, ok := paritySources[filename]
++	return entry.source, ok
++}
++
++// ConsumeParitySource returns the source and releases one recorder's ownership of it.
++// The semantic and backend parity recorders can both consume the same source when both
++// output modes are enabled; after the final consumer, the global map no longer retains
++// the source bytes (or their backing allocation).
++func ConsumeParitySource(filename string) (string, bool) {
++	if !parityRecordEnabled {
++		return "", false
++	}
++	paritySourceMu.Lock()
++	defer paritySourceMu.Unlock()
++	entry, ok := paritySources[filename]
++	if !ok {
++		return "", false
++	}
++	src := entry.source
++	if entry.consumers <= 1 {
++		delete(paritySources, filename)
++	} else {
++		entry.consumers--
++		paritySources[filename] = entry
++	}
++	return src, true
++}
++
++// DropParitySource releases a source whose parse never reached a parity recorder.
++// This is used on lexer/parser failures and is intentionally a no-op when parity is off.
++func DropParitySource(filename string) {
++	if !parityRecordEnabled {
++		return
++	}
++	paritySourceMu.Lock()
++	defer paritySourceMu.Unlock()
++	delete(paritySources, filename)
+ }
+diff --git a/compiler/src/main_main_to_aggregatestateplaceholders.go b/compiler/src/main_main_to_aggregatestateplaceholders.go
+index a86ba2f25..f234a571c 100644
+--- a/compiler/src/main_main_to_aggregatestateplaceholders.go
++++ b/compiler/src/main_main_to_aggregatestateplaceholders.go
+@@ -92,6 +92,7 @@ func parseProgram(filename string, src []byte, stderr io.Writer) (*ast.File, boo
+ 	tokens := l.Tokenize()
+ 	frontendTimingLog("lex", lexStart)
+ 	if errs := l.Errors(); len(errs) > 0 {
++		lexer.DropParitySource(filename)
+ 		for _, e := range errs {
+ 			fmt.Fprintf(stderr, "%s\n", e)
+ 		}
+@@ -111,6 +112,7 @@ func parseProgram(filename string, src []byte, stderr io.Writer) (*ast.File, boo
+ 		}
+ 	}
+ 	if errs := p.Errors(); len(errs) > 0 {
++		lexer.DropParitySource(filename)
+ 		for _, e := range errs {
+ 			fmt.Fprintf(stderr, "%s\n", e)
+ 		}
+@@ -327,10 +329,10 @@ func parseArgs(args []string) (cliOptions, error) {
+ 			// reassociated tree reduction for FP folds. Read at codegen time (in-process build).
+ 			_ = os.Setenv("ELISACORE_FAST_MATH", "1")
+ 		case arg == "-fnoalias":
+-			// Stamp LLVM `noalias` on the eligible `mutable T&` param subset (scalar/darray
+-			// pointee). Sound (the alias checker makes a `mutable T&` the unique mutator of its
+-			// pointee) but OFF by default: a noalias miscompile is silent. Read at codegen time
+-			// (in-process build), same env the backend generator already consults.
++			// Stamp LLVM `noalias` only on the eligible numeric-scalar `mutable T&` subset.
++			// Mutable darray references are forwarded through nested calls and are deliberately
++			// excluded. The opt-in stays OFF by default because a noalias miscompile is silent.
++			// Read at codegen time (in-process build), same env the backend generator consults.
+ 			_ = os.Setenv("ELISACORE_NOALIAS_MUTABLE_REFS", "1")
+ 		case arg == "-Wperf":
+ 			// Graduated strictness (docs/70): promote the performance-friction lints
+diff --git a/compiler/src/operator_overload_test.go b/compiler/src/operator_overload_test.go
+index bf948ad11..a5ed9efb9 100644
+--- a/compiler/src/operator_overload_test.go
++++ b/compiler/src/operator_overload_test.go
+@@ -395,3 +395,23 @@ def same(x: P, y: P) -> bool:
+ 		t.Fatalf("a struct with an __eq__ impl must still compare, got: %v", errs)
+ 	}
+ }
++
++// Built-in aggregate values have no scalar equality lowering. They must be
++// diagnosed before the backend can attempt an invalid LLVM `icmp` over the
++// aggregate representation.
++func TestAggregateValueEqualityWithoutLoweringIsRejected(t *testing.T) {
++	result := analyzeOverloadSource(t, `
++def same(xs: darray[i64], ys: darray[i64]) -> bool:
++    return xs == ys
++`)
++	errs := result.Errors()
++	found := false
++	for _, err := range errs {
++		if strings.Contains(err, "aggregate values do not support ==") {
++			found = true
++		}
++	}
++	if !found {
++		t.Fatalf("expected aggregate equality diagnostic before LLVM lowering, got: %v", errs)
++	}
++}
+diff --git a/compiler/src/parser/parser_estimate.go b/compiler/src/parser/parser_estimate.go
+index feeeb6bac..a6dc1ce72 100644
+--- a/compiler/src/parser/parser_estimate.go
++++ b/compiler/src/parser/parser_estimate.go
+@@ -83,6 +83,10 @@ func (p *Parser) estimateCommaSeparatedCount(close lexer.TokenKind) int {
+ 			} else if depth > 0 {
+ 				depth--
+ 			}
++		case lexer.TOKEN_COLON:
++			if close == lexer.TOKEN_COLON && depth == 0 {
++				return count
++			}
+ 		case lexer.TOKEN_COMMA:
+ 			if depth == 0 {
+ 				count++
+diff --git a/compiler/src/parser/parser_expr_parsebuiltintypeexpr_to_parsecatchexpr.go b/compiler/src/parser/parser_expr_parsebuiltintypeexpr_to_parsecatchexpr.go
+index 586e2b913..22dcaa79f 100644
+--- a/compiler/src/parser/parser_expr_parsebuiltintypeexpr_to_parsecatchexpr.go
++++ b/compiler/src/parser/parser_expr_parsebuiltintypeexpr_to_parsecatchexpr.go
+@@ -964,8 +964,8 @@ func (p *Parser) parseQualifiedVariantTarget() (string, string, lexer.Pos) {
+ }
+ func (p *Parser) parseVariantIsTestExpr() ast.Expr {
+ 	enumName, variant, pos := p.parseQualifiedVariantTarget()
+-	args := make([]ast.MatchPatternArg, 0, p.estimateCommaSeparatedCount(lexer.TOKEN_RPAREN))
+ 	p.expect(lexer.TOKEN_LPAREN)
++	args := make([]ast.MatchPatternArg, 0, p.estimateCommaSeparatedCount(lexer.TOKEN_RPAREN))
+ 	if p.peek() != lexer.TOKEN_RPAREN {
+ 		for {
+ 			args = append(args, p.parseMatchPatternArg())
+diff --git a/compiler/src/parser/parser_parsegenericparamlistafterlbracket_to_parseexportdecl.go b/compiler/src/parser/parser_parsegenericparamlistafterlbracket_to_parseexportdecl.go
+index e81ea6213..81d1a5745 100644
+--- a/compiler/src/parser/parser_parsegenericparamlistafterlbracket_to_parseexportdecl.go
++++ b/compiler/src/parser/parser_parsegenericparamlistafterlbracket_to_parseexportdecl.go
+@@ -150,7 +150,11 @@ func (p *Parser) parsePermissionRefs(bracketed bool) []ast.PermissionRef {
+ 	} else if p.match(lexer.TOKEN_LBRACKET) {
+ 		bracketed = true
+ 	}
+-	refs := make([]ast.PermissionRef, 0, p.estimateCommaSeparatedCount(lexer.TOKEN_RBRACKET))
++	capacity := 1
++	if bracketed {
++		capacity = p.estimateCommaSeparatedCount(lexer.TOKEN_RBRACKET)
++	}
++	refs := make([]ast.PermissionRef, 0, capacity)
+ 	for {
+ 		refs = append(refs, p.parsePermissionRefGroup()...)
+ 		if !p.match(lexer.TOKEN_COMMA) {
+diff --git a/compiler/src/parser/parser_parsequalifieddeclname_to_parsefuncgenericparams.go b/compiler/src/parser/parser_parsequalifieddeclname_to_parsefuncgenericparams.go
+index d68f4dd0e..ac04054bf 100644
+--- a/compiler/src/parser/parser_parsequalifieddeclname_to_parsefuncgenericparams.go
++++ b/compiler/src/parser/parser_parsequalifieddeclname_to_parsefuncgenericparams.go
+@@ -308,8 +308,9 @@ func (p *Parser) parseEnumCommonFieldsInline() []ast.FieldDecl {
+ func (p *Parser) parseEnumVariantDecl() ast.EnumVariantDecl {
+ 	pos := p.cur().Pos
+ 	name := p.expect(lexer.TOKEN_IDENT).Text
+-	payload := make([]ast.EnumPayloadDecl, 0, p.estimateCommaSeparatedCount(lexer.TOKEN_RPAREN))
++	var payload []ast.EnumPayloadDecl
+ 	if p.match(lexer.TOKEN_LPAREN) {
++		payload = make([]ast.EnumPayloadDecl, 0, p.estimateCommaSeparatedCount(lexer.TOKEN_RPAREN))
+ 		if p.peek() != lexer.TOKEN_RPAREN {
+ 			for {
+ 				payload = append(payload, p.parseEnumPayloadDecl())
+diff --git a/compiler/src/parser/parser_statements_parseforheaderexpr_to_parsebracematchstructpatternarg.go b/compiler/src/parser/parser_statements_parseforheaderexpr_to_parsebracematchstructpatternarg.go
+index 152fa2b7f..408316852 100644
+--- a/compiler/src/parser/parser_statements_parseforheaderexpr_to_parsebracematchstructpatternarg.go
++++ b/compiler/src/parser/parser_statements_parseforheaderexpr_to_parsebracematchstructpatternarg.go
+@@ -1357,8 +1357,9 @@ func (p *Parser) parseNestedMatchPattern() ast.MatchPattern {
+ 	}
+ 	name := strings.Join(parts[:len(parts)-1], ".")
+ 	variant := parts[len(parts)-1]
+-	args := make([]ast.MatchPatternArg, 0, p.estimateCommaSeparatedCount(lexer.TOKEN_RPAREN))
++	var args []ast.MatchPatternArg
+ 	if p.match(lexer.TOKEN_LPAREN) {
++		args = make([]ast.MatchPatternArg, 0, p.estimateCommaSeparatedCount(lexer.TOKEN_RPAREN))
+ 		if p.peek() != lexer.TOKEN_RPAREN {
+ 			for {
+ 				args = append(args, p.parseMatchPatternArg())
+diff --git a/compiler/src/project_system_consts_to_loadresolvedproject.go b/compiler/src/project_system_consts_to_loadresolvedproject.go
+index e42c2382a..8d173225e 100644
+--- a/compiler/src/project_system_consts_to_loadresolvedproject.go
++++ b/compiler/src/project_system_consts_to_loadresolvedproject.go
+@@ -447,9 +447,10 @@ func parseProjectCLIArgs(args []string) (projectCLIOptions, error) {
+ 			// reassociated tree reduction for FP folds. Read at codegen time (in-process build).
+ 			_ = os.Setenv("ELISACORE_FAST_MATH", "1")
+ 		case arg == "-fnoalias":
+-			// Stamp LLVM `noalias` on the eligible `mutable T&` param subset (scalar/darray
+-			// pointee). Sound but OFF by default (a noalias miscompile is silent). Read at
+-			// codegen time, same env the backend generator consults.
++			// Stamp LLVM `noalias` only on the eligible numeric-scalar `mutable T&` subset.
++			// Mutable darray references are forwarded through nested calls and are deliberately
++			// excluded. Keep the opt-in OFF by default because a noalias miscompile is silent.
++			// Read at codegen time, same env the backend generator consults.
+ 			_ = os.Setenv("ELISACORE_NOALIAS_MUTABLE_REFS", "1")
+ 		case arg == "-Wperf":
+ 			options.perfStrict = true
+diff --git a/compiler/src/refinement_discharge_runtime_test.go b/compiler/src/refinement_discharge_runtime_test.go
+index fc212e1e0..28b319b65 100644
+--- a/compiler/src/refinement_discharge_runtime_test.go
++++ b/compiler/src/refinement_discharge_runtime_test.go
+@@ -194,7 +194,9 @@ func TestRefinementDischargeViolatedTrapsInDebug(t *testing.T) {
+ // -fbounds-check (ELISACORE_FORCE_BOUNDS_CHECK) legitimately forces the check even in release, so
+ // clear it here to assert the pure-release elision (other tests in the suite may leave it set).
+ func TestRefinementDischargeElidedInRelease(t *testing.T) {
+-	t.Parallel()
++	// These are process-wide backend switches. Running this test in parallel with a test that
++	// enables -fbounds-check or -fnoalias races the environment and can turn a valid release
++	// build into a spurious trap.
+ 	for _, key := range []string{"ELISACORE_FORCE_BOUNDS_CHECK", "ELISACORE_NOALIAS_MUTABLE_REFS"} {
+ 		if prev, had := os.LookupEnv(key); had {
+ 			_ = os.Unsetenv(key)
+@@ -363,7 +365,8 @@ func TestInvariantRecheckViolatedTrapsInDebug(t *testing.T) {
+ // The standing invariant is debug-only: at -O3 the re-checks are elided, so the same violating run
+ // does NOT trap (debug verifies what release assumes).
+ func TestInvariantRecheckElidedInRelease(t *testing.T) {
+-	t.Parallel()
++	// Keep this environment-sensitive release assertion out of the parallel test group; the
++	// backend reads these process-wide switches while compiling the child program.
+ 	for _, key := range []string{"ELISACORE_FORCE_BOUNDS_CHECK", "ELISACORE_NOALIAS_MUTABLE_REFS"} {
+ 		if prev, had := os.LookupEnv(key); had {
+ 			_ = os.Unsetenv(key)
+diff --git a/compiler/src/region_reclaim_runtime_test.go b/compiler/src/region_reclaim_runtime_test.go
+index 1156c0bc3..695d1c766 100644
+--- a/compiler/src/region_reclaim_runtime_test.go
++++ b/compiler/src/region_reclaim_runtime_test.go
+@@ -484,6 +484,22 @@ def na_loop() -> void:
+ 	runSingleTestProgramExpectOK(t, "na_loop", src, "new[auto] loop produced wrong result")
+ }
+ 
++// A scoped region can be declared below a conditional inside a loop.  Its arena slot is
++// allocated in the function entry block, while initialization happens only on the branch that
++// enters the region.  Cleanup must therefore be safe on the loop/conditional merge even on an
++// iteration that skipped the declaration.  This guards the stage0 codegen regression where the
++// merge cleanup traversed uninitialized stack bytes as a Region chain.
++func TestConditionalScopedRegionCleanupUsesEmptyEntryState(t *testing.T) {
++	runSingleTestProgramExpectOK(t, "conditional_region_cleanup", `@test
++def conditional_region_cleanup() -> void:
++    can Memory.Allocate, Memory.Release, Abort.Panic:
++        for i in 0..<3:
++            if i == 1:
++                region scratch(4096):
++                    pass
++`, "conditional scoped-region cleanup must not free an uninitialized arena")
++}
++
+ // runSingleTestProgramExpectOK builds `src` as a native test binary, runs the single @test named
+ // `testName`, and fails if the child exits non-zero (a segfault/panic from the regression).
+ func runSingleTestProgramExpectOK(t *testing.T, testName, src, failHint string) {
+diff --git a/compiler/src/semantic/analyzer_expr_operators_analyzebinaryexpr_to_analyzeenumispayloadpattern.go b/compiler/src/semantic/analyzer_expr_operators_analyzebinaryexpr_to_analyzeenumispayloadpattern.go
+index d5b78a923..f7ef939f5 100644
+--- a/compiler/src/semantic/analyzer_expr_operators_analyzebinaryexpr_to_analyzeenumispayloadpattern.go
++++ b/compiler/src/semantic/analyzer_expr_operators_analyzebinaryexpr_to_analyzeenumispayloadpattern.go
+@@ -80,6 +80,14 @@ func (a *Analyzer) analyzeBinaryExpr(expr *ast.BinaryExpr) Type {
+ 			// "Invalid operand types for ICmp instruction" naming an internal temp. Say what
+ 			// is actually wrong, at the comparison.
+ 			a.errorf(expr.Pos(), "struct %s has no == operator; implement Eq (`def __eq__(self, other) -> bool`) to compare values of this type", st.Name)
++		} else if IsAggregateValueEqualityUnsupported(compareLeft) && IsAggregateValueEqualityUnsupported(compareRight) {
++			// The generic assignability rule above also makes aggregate values appear
++			// comparable. They do not have a scalar LLVM equality lowering, though:
++			// falling through to the integer comparison emitter would construct an
++			// invalid `icmp` over an aggregate (most visibly for darray). Reject the
++			// source expression here, where the user can act on it, until a content
++			// equality protocol is provided for that aggregate type.
++			a.errorf(expr.Pos(), "aggregate values do not support ==; compare their contents explicitly")
+ 		}
+ 		// Footgun guard: comparing two raw `u8&` C-string pointers with == / !=
+ 		// compares addresses, not contents (unlike cstr/sview/dstr, which content-
+@@ -267,6 +275,7 @@ func (a *Analyzer) analyzeSpanAlgebraExpr(expr *ast.BinaryExpr, left Type, right
+ 	expr.LoweredCall = call
+ 	return result, true
+ }
++
+ // analyzeOperatorOverload dispatches a binary operator to a user protocol impl when the left operand's
+ // type provides the operator's dunder method (`+` -> `__add__`, …). It desugars `a OP b` to the static
+ // interface-method call `T.__add__(a, b)` and records it as `expr.LoweredCall`, so the backend emits the
+@@ -637,6 +646,32 @@ func typesComparableForEquality(left Type, right Type) bool {
+ 	}
+ 	return AssignableTo(left, right) || AssignableTo(right, left) || refsComparableIgnoringMutability(left, right) || (IsNullType(left) && isRefLike(right)) || (IsNullType(right) && isRefLike(left))
+ }
++
++// IsAggregateValueEqualityUnsupported reports aggregate values that do not have a
++// value-equality lowering in the backend. Keep this predicate in semantic so both
++// the source diagnostic and the backend's defensive check use the same ABI contract.
++// Runtime string carriers and payload enums are intentionally absent: each has an
++// explicit equality path of its own.
++func IsAggregateValueEqualityUnsupported(t Type) bool {
++	// Some runtime string views are represented as ordinary structs (for
++	// example a user-visible StringView) but have a dedicated content-equality
++	// lowering. Keep them out of the aggregate fallback guard.
++	if runtimeStringKindOf(t) != runtimeStringNone {
++		return false
++	}
++	switch value := StripAggregateStateType(t).(type) {
++	case *ArrayType, *DArrayType, *TupleType, *ViewType, *DictType, *SetType, *DictEntryType, *StoreRowsViewType, *StoreRowViewType:
++		return true
++	case *StructType:
++		return value != nil
++	case *GenericInstanceType:
++		_, ok := value.Base.(*StructType)
++		return ok
++	default:
++		return false
++	}
++}
++
+ func refsComparableIgnoringMutability(left Type, right Type) bool {
+ 	leftRef, ok := left.(*RefType)
+ 	if !ok || leftRef == nil {
+diff --git a/compiler/src/semantic/analyzer_region_param_inference.go b/compiler/src/semantic/analyzer_region_param_inference.go
+index 798d7f49a..62cd09fb5 100644
+--- a/compiler/src/semantic/analyzer_region_param_inference.go
++++ b/compiler/src/semantic/analyzer_region_param_inference.go
+@@ -43,6 +43,24 @@ var containerGrowthMethods = map[string]bool{
+ // arena comes from.
+ func (a *Analyzer) inferRegionParamsForGrownContainerParams(decls []scopedDecl) {
+ 	cands := collectRegionPolyCandidateFuncs(decls)
++	// This pass runs before collectValueSymbols, so funcDeclUsings has not been
++	// populated yet. Keep the lexical resolution context alongside the function
++	// declarations: the region-valued argument probe below may need to resolve a
++	// callee's return annotation, and doing that in the caller's ambient context
++	// makes a perfectly valid unqualified module-local type look unknown.
++	funcScopes := map[*ast.FuncDecl]scopedDecl{}
++	for _, scoped := range decls {
++		switch n := scoped.Decl.(type) {
++		case *ast.FuncDecl:
++			funcScopes[n] = scoped
++		case *ast.ImplDecl:
++			for _, member := range n.Members {
++				if fn, ok := member.(*ast.FuncDecl); ok {
++					funcScopes[fn] = scoped
++				}
++			}
++		}
++	}
+ 	// Resolve direct free-function call targets by name for the forwarding trigger. Overloads/last-wins
+ 	// is acceptable: a wrong match only forgoes (or, at worst, conservatively adds) an inferred region
+ 	// param — soundness is unaffected (the region threading is still verified at the real call site).
+@@ -78,7 +96,7 @@ func (a *Analyzer) inferRegionParamsForGrownContainerParams(decls []scopedDecl)
+ 			if fn == nil || explicit[fn] {
+ 				continue
+ 			}
+-			if a.inferRegionParamsForGrownContainerParamsIn(fn, funcByName, permRoots) {
++			if a.inferRegionParamsForGrownContainerParamsIn(fn, funcByName, permRoots, funcScopes) {
+ 				changed = true
+ 			}
+ 		}
+@@ -88,7 +106,7 @@ func (a *Analyzer) inferRegionParamsForGrownContainerParams(decls []scopedDecl)
+ 	}
+ }
+ 
+-func (a *Analyzer) inferRegionParamsForGrownContainerParamsIn(fn *ast.FuncDecl, funcByName map[string]*ast.FuncDecl, permRoots map[string]bool) bool {
++func (a *Analyzer) inferRegionParamsForGrownContainerParamsIn(fn *ast.FuncDecl, funcByName map[string]*ast.FuncDecl, permRoots map[string]bool, funcScopes map[*ast.FuncDecl]scopedDecl) bool {
+ 	if fn == nil || len(fn.Body) == 0 {
+ 		return false
+ 	}
+@@ -116,7 +134,7 @@ func (a *Analyzer) inferRegionParamsForGrownContainerParamsIn(fn *ast.FuncDecl,
+ 		if cstamp, ok := regionlessRefContainer(p.Type); ok {
+ 			// A grown / literal-reassigned container ref param, OR one merely FORWARDED to a callee that
+ 			// requires a region there (so the region must thread through this function too).
+-			grownWithRegionValue := a.containerParamGrownWithRegionValue(fn, p.Name, funcByName)
++			grownWithRegionValue := a.containerParamGrownWithRegionValue(fn, p.Name, funcByName, funcScopes)
+ 			if paramContainerIsGrownNeedingRegion(fn.Body, p.Name, permRoots) || paramContainerReassignedFromLiteral(fn.Body, p.Name) || a.paramForwardedToRegionRequiringCallee(fn.Body, p.Name, funcByName) || grownWithRegionValue {
+ 				stamp = cstamp
+ 				if grownWithRegionValue && ambientGrownParam == "" && containerParamCount == 1 {
+@@ -690,11 +708,11 @@ func paramContainerIsGrown(stmts []ast.Stmt, name string) bool {
+ // producing expression. Conservative both ways: an unresolved insert simply doesn't trigger (the prior
+ // behavior, sound), and over-triggering only threads a region the caller — which owns the container —
+ // can always supply.
+-func (a *Analyzer) containerParamGrownWithRegionValue(fn *ast.FuncDecl, name string, funcByName map[string]*ast.FuncDecl) bool {
++func (a *Analyzer) containerParamGrownWithRegionValue(fn *ast.FuncDecl, name string, funcByName map[string]*ast.FuncDecl, funcScopes map[*ast.FuncDecl]scopedDecl) bool {
+ 	if fn == nil {
+ 		return false
+ 	}
+-	argIsRegionValued := a.regionValueTester(fn, funcByName)
++	argIsRegionValued := a.regionValueTester(fn, funcByName, funcScopes)
+ 
+ 	// Scan for `name.<growth>(ARG…)` where any inserted ARG is region-valued.
+ 	found := false
+@@ -807,7 +825,7 @@ func (a *Analyzer) functionWritesHandleToScalarOutParam(fn *ast.FuncDecl) bool {
+ // returns a tester that classifies from RESOLVED TYPES only (callee return types, packed-enum
+ // constructors, owned-less list literals/comprehensions) — never region-poly classification, which runs
+ // after this pass. Conservative both ways: an unresolved value simply returns false.
+-func (a *Analyzer) regionValueTester(fn *ast.FuncDecl, funcByName map[string]*ast.FuncDecl) func(ast.Expr) bool {
++func (a *Analyzer) regionValueTester(fn *ast.FuncDecl, funcByName map[string]*ast.FuncDecl, funcScopes map[*ast.FuncDecl]scopedDecl) func(ast.Expr) bool {
+ 	// 1. Map each local name to the expression it was bound from, so an inserted ident resolves to its
+ 	//    producer: a var-decl value, an assignment, or an `if EXPR is x:` refinement scrutinee.
+ 	boundExpr := map[string]ast.Expr{}
+@@ -892,6 +910,29 @@ func (a *Analyzer) regionValueTester(fn *ast.FuncDecl, funcByName map[string]*as
+ 		}
+ 	}
+ 	collectBindings(fn.Body)
++	resolveCalleeReturnType := func(callee *ast.FuncDecl) Type {
++		if callee == nil || callee.ReturnType == nil {
++			return invalidType
++		}
++		resolve := func() Type {
++			// This is a conservative pre-classification probe. A malformed or
++			// not-yet-bound generic return type must not emit a second diagnostic;
++			// body analysis reports the authoritative error later.
++			savedSuppress := a.suppressDiagnostics
++			a.suppressDiagnostics = true
++			resolved := a.resolveType(callee.ReturnType)
++			a.suppressDiagnostics = savedSuppress
++			return resolved
++		}
++		if scoped, ok := funcScopes[callee]; ok {
++			var resolved Type
++			a.withResolutionContext(scoped.Namespace, scoped.Usings, func() {
++				resolved = resolve()
++			})
++			return resolved
++		}
++		return resolve()
++	}
+ 
+ 	// 2. Decide whether an expression produces a region-carrying value (resolved types only).
+ 	argIsRegionValued := func(arg ast.Expr) bool {
+@@ -938,7 +979,7 @@ func (a *Analyzer) regionValueTester(fn *ast.FuncDecl, funcByName map[string]*as
+ 				// Otherwise resolve the callee's RETURN TYPE (region-carrying ⇒ region-valued).
+ 				if cn, _, isCall := ast.PrepassCallShape(n); isCall {
+ 					if callee, ok := funcByName[cn]; ok && callee != nil && callee.ReturnType != nil {
+-						return a.typeIsRegionValued(a.resolveType(callee.ReturnType))
++						return a.typeIsRegionValued(resolveCalleeReturnType(callee))
+ 					}
+ 				}
+ 				return false
+@@ -946,7 +987,7 @@ func (a *Analyzer) regionValueTester(fn *ast.FuncDecl, funcByName map[string]*as
+ 				// Pre-analysis `Name(args)` parses as a StructLitExpr; resolve it as a call.
+ 				if cn, _, isCall := ast.PrepassCallShape(n); isCall {
+ 					if callee, ok := funcByName[cn]; ok && callee != nil && callee.ReturnType != nil {
+-						return a.typeIsRegionValued(a.resolveType(callee.ReturnType))
++						return a.typeIsRegionValued(resolveCalleeReturnType(callee))
+ 					}
+ 				}
+ 				// A brace construction `Ty{field: value, …}` carries region storage when any
+diff --git a/compiler/src/semantic/parity_internal_record.go b/compiler/src/semantic/parity_internal_record.go
+index f3fae522e..b680ce665 100644
+--- a/compiler/src/semantic/parity_internal_record.go
++++ b/compiler/src/semantic/parity_internal_record.go
+@@ -28,7 +28,7 @@ func recordInternalParityCase(file *ast.File, options AnalyzeOptions, result *Re
+ 	if path == "" || file == nil || result == nil {
+ 		return
+ 	}
+-	src, ok := lexer.ParitySourceFor(file.Filename)
++	src, ok := lexer.ConsumeParitySource(file.Filename)
+ 	if !ok {
+ 		return
+ 	}
+diff --git a/compiler/test/lexer/lexer_test.go b/compiler/test/lexer/lexer_test.go
+index 3a50e93b1..5e4faf24e 100644
+--- a/compiler/test/lexer/lexer_test.go
++++ b/compiler/test/lexer/lexer_test.go
+@@ -42,6 +42,23 @@ func TestSimpleIdent(t *testing.T) {
+ 	}
+ }
+ 
++func TestLineWordDocumentationCommentDoesNotRetargetPosition(t *testing.T) {
++	l := lexer.New("original.elisa", []byte("#   line 7 generated.elisa\nx\n"))
++	tokens := l.Tokenize()
++	if len(tokens) == 0 {
++		t.Fatal("expected tokens")
++	}
++	if tokens[0].Kind != lexer.TOKEN_IDENT || tokens[0].Text != "x" {
++		t.Fatalf("expected identifier x, got %v", tokens[0])
++	}
++	if tokens[0].Pos.Line != 2 {
++		t.Fatalf("expected identifier on line 2, got %d", tokens[0].Pos.Line)
++	}
++	if tokens[0].Pos.File != "original.elisa" {
++		t.Fatalf("expected original filename, got %q", tokens[0].Pos.File)
++	}
++}
++
+ func TestKeyword(t *testing.T) {
+ 	tokens := collectTokens("def foo:\n")
+ 	expect := []lexer.TokenKind{lexer.TOKEN_DEF, lexer.TOKEN_IDENT, lexer.TOKEN_COLON, lexer.TOKEN_NEWLINE, lexer.TOKEN_EOF}

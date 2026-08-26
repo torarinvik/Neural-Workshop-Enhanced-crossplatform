@@ -238,3 +238,65 @@ request.
 Our own stage0 worktree was moved onto `nw-consolidate-2026-08-26` so the port
 builds against the consolidated compiler, which is what all of the above was
 verified with.
+
+---
+
+# LANDED on Elisa-core `work` (2026-08-26)
+
+`work` fast-forwarded `da8cb230` -> `c84f1429`, 36 commits. The landed tree is
+BYTE-IDENTICAL to the branch already verified above (14/14 Go packages, 60/60
+differential suites), so the landing carried no untested content.
+
+## The other agent's 33 files: 31 back in place, 2 handed back
+
+Backed up three ways BEFORE anything moved — tarball, tracked diff, and a stash
+tagged `wip-snapshot-2026-08-26-core` — then reapplied.
+
+Only **2 conflicts**, down from the 10 the previous landing hit, because the
+consolidation already contained most of what they had been working against.
+Neither was resolved by guessing:
+
+  * `parser_estimate.go` — a real behavioural difference (`boundedEstimate(count)`
+    landed, `count` theirs) next to an untracked `parser_estimate_test.go`. That
+    is live work with an intent only its author knows.
+  * `analyzer_expr_operators_...go` — comment rewrites around
+    `IsAggregateValueEqualityUnsupported`.
+
+Both were restored to the landed version, so their tree has NO conflict markers,
+and each was extracted as an apply-ready patch. See
+`docs/ELISA_CORE_WIP_HANDOFF_2026-08-26.md`.
+
+**One of their files needed nothing at all**: `llvm_aggregate_abi.go` is now
+byte-identical to their edit, because the same change arrived via
+`codex/stage0-idiomatic`. They had converged with the branch independently.
+
+Worth noting for later: their untracked `ternary_byte_ref_literal_runtime_test.go`
+is the stage0 counterpart of the ternary byte-ref fix salvaged into stage1 above.
+Both stages were being fixed for the same gap, in two repositories, by two agents.
+
+## `~/.elisac/elisac` deliberately NOT rebuilt
+
+Elisa-core's hooks rebuild the shared binary on every commit/merge/checkout, and
+they were suppressed throughout, so it is exactly as found (`e2f0caf537fc143372c57ec5`,
+mtime 11:52) — now stale relative to `work`. Swapping another agent's compiler
+mid-session is worse than leaving it: their next commit fires the hook and
+rebuilds it themselves.
+
+## Branches: core 6 -> 4
+
+Deleted `nw-consolidate-2026-08-26` and `nw-integration-2026-08-26` (both fully
+merged; the latter's stale scratch worktree was removed first).
+`codex/stage0-idiomatic` is redundant now but was LEFT — it is checked out in
+their `Elisa-core-codex` worktree and deleting it would strand that worktree.
+
+Remaining: `work`, `main`, `nw-port` (ours, identical to `work`),
+`codex/stage0-idiomatic` (theirs).
+
+# Final state
+
+    Elisa-core     work c84f1429   (was da8cb230, +36)
+    Elisa-compiler work 6921b84a   (was 3fa962a5, +7)
+
+Both `work` branches are now supersets of every branch in their repository. The
+port builds from them and passes **60/60 differential suite runs**, with
+`gen3.o == gen4.o` byte-identical.
