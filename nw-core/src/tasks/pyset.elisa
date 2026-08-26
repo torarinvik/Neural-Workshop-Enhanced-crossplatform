@@ -1,0 +1,200 @@
+# CPython's set, for non-negative int keys, in the one respect that matters:
+# ITERATION ORDER.
+#
+# A Python `set` iterates in the slot order of its open-addressed table, which
+# is a pure function of the insertion sequence and the resize schedule. That is
+# not an implementation detail we may ignore: several task generators build a
+# set, turn it into a list, and SHUFFLE it. A different iteration order gives a
+# different shuffle for the same seed, and the whole deal diverges.
+#
+# So this is setobject.c -- probe loop, linear-probe window, perturb shift and
+# growth rule -- and nothing else.
+#
+# ADD-ONLY for now. `removals` discards from a set whose order it then observes,
+# which needs CPython's dummy slots modelled exactly: a discarded entry becomes a
+# marker rather than an empty, so probing continues past it, `fill` stays put
+# while `used` drops, and iteration skips it. That is a real extension, not a
+# one-liner, and it is deliberately not faked here -- a set that silently emptied
+# a slot would diverge only in the shuffle, which is the hardest kind of bug to
+# see.
+#
+# Where a set is only asked about MEMBERSHIP, or is run through `sorted()`, the
+# order is not observable and a flat array is the right port. Reach for this
+# only where the reference genuinely iterates.
+#
+# Differentially tested against a real `set` by every suite that uses it.
+
+module PySet:
+    # setobject.c constants.
+    const MINSIZE: i64 = 8
+    const LINEAR_PROBES: i64 = 9
+    const PERTURB_SHIFT: i64 = 5
+
+    struct Table:
+        # -1 marks an unused slot, which is why keys must be non-negative.
+        slots: mutable darray[i64]
+        mask: mutable i64
+        fill: mutable i64
+        used: mutable i64
+        # Scratch for resize: the live keys in old slot order.
+        snap: mutable darray[i64]
+        snap_n: mutable i64
+
+    # `capacity` sizes the backing arrays once; the table never allocates again,
+    # so a caller must pass a bound on the number of inserts (a resize needs
+    # room for `snap` too). Rounded up to a power of two at or above MINSIZE.
+    def new(capacity: i64) -> Table:
+        can Memory.Allocate, Abort.Panic:
+            size: mutable i64 = MINSIZE
+            while size < capacity * 4 |size, capacity|:
+                size <- size * 2
+            table: mutable Table = zeroed
+            table.slots <- Ints::zeros(size)
+            table.snap <- Ints::zeros(size)
+            table.mask <- MINSIZE - 1
+            table.fill <- 0
+            table.used <- 0
+            table.snap_n <- 0
+            slot: mutable i64 = 0
+            while slot < size |slot, size, table|:
+                Ints::put(&table.slots, slot, -1)
+                slot <- slot + 1
+            return table
+
+    def reset(table: mutable Table&):
+        can Abort.Panic:
+            table.mask <- MINSIZE - 1
+            table.fill <- 0
+            table.used <- 0
+            table.snap_n <- 0
+            slot: mutable i64 = 0
+            while slot < table.slots.count.i64() |slot, table|:
+                Ints::put(&table.slots, slot, -1)
+                slot <- slot + 1
+
+    def contains(table: Table&, key: i64) -> bool:
+        can Abort.Panic:
+            mask: i64 = table.mask
+            index: mutable i64 = key & mask
+            perturb: mutable i64 = key
+            # 0 still looking, 1 present, 2 absent.
+            verdict: mutable i64 = 0
+            while verdict == 0 |verdict, index, perturb, mask, table, key|:
+                probes: i64 = LINEAR_PROBES if index + LINEAR_PROBES <= mask else 0
+                slot: mutable i64 = index
+                step: mutable i64 = 0
+                while step <= probes and verdict == 0 |step, probes, slot, table, key, verdict|:
+                    entry: i64 = Ints::at(table.slots, slot)
+                    if entry < 0:
+                        verdict <- 2
+                    else:
+                        if entry == key:
+                            verdict <- 1
+                        else:
+                            slot <- slot + 1
+                            step <- step + 1
+                if verdict == 0:
+                    perturb <- perturb >> PERTURB_SHIFT
+                    index <- (index * 5 + 1 + perturb) & mask
+            return verdict == 1
+
+    # set_insert_clean: no equality tests, because the table is known not to
+    # hold the key. Used only from the resize path.
+    def insert_clean(table: mutable Table&, key: i64):
+        can Abort.Panic:
+            mask: i64 = table.mask
+            index: mutable i64 = key & mask
+            perturb: mutable i64 = key
+            placed: mutable bool = false
+            while not placed |placed, index, perturb, mask, table, key|:
+                if Ints::at(table.slots, index) < 0:
+                    Ints::put(&table.slots, index, key)
+                    placed <- true
+                else:
+                    if index + LINEAR_PROBES <= mask:
+                        slot: mutable i64 = index
+                        step: mutable i64 = 0
+                        while step < LINEAR_PROBES and not placed |step, slot, table, key, placed|:
+                            slot <- slot + 1
+                            if Ints::at(table.slots, slot) < 0:
+                                Ints::put(&table.slots, slot, key)
+                                placed <- true
+                            else:
+                                step <- step + 1
+                    if not placed:
+                        perturb <- perturb >> PERTURB_SHIFT
+                        index <- (index * 5 + 1 + perturb) & mask
+
+    # set_table_resize: the old table is walked in SLOT order and re-inserted,
+    # so the new order is a function of the old one and not of the original
+    # insertion sequence.
+    def resize(table: mutable Table&, minused: i64):
+        can Abort.Panic:
+            newsize: mutable i64 = MINSIZE
+            while newsize <= minused |newsize, minused|:
+                newsize <- newsize * 2
+            table.snap_n <- 0
+            slot: mutable i64 = 0
+            while slot <= table.mask |slot, table|:
+                key: i64 = Ints::at(table.slots, slot)
+                if key >= 0:
+                    Ints::put(&table.snap, table.snap_n, key)
+                    table.snap_n <- table.snap_n + 1
+                slot <- slot + 1
+            table.mask <- newsize - 1
+            blank: mutable i64 = 0
+            while blank < newsize |blank, newsize, table|:
+                Ints::put(&table.slots, blank, -1)
+                blank <- blank + 1
+            index: mutable i64 = 0
+            while index < table.snap_n |index, table|:
+                PySet::insert_clean(table, Ints::at(table.snap, index))
+                index <- index + 1
+            table.fill <- table.used
+
+    def add(table: mutable Table&, key: i64):
+        can Abort.Panic:
+            mask: i64 = table.mask
+            index: mutable i64 = key & mask
+            perturb: mutable i64 = key
+            vacancy: mutable i64 = -1
+            present: mutable bool = false
+            while vacancy < 0 and not present |vacancy, present, index, perturb, mask, table, key|:
+                probes: i64 = LINEAR_PROBES if index + LINEAR_PROBES <= mask else 0
+                slot: mutable i64 = index
+                step: mutable i64 = 0
+                while step <= probes and vacancy < 0 and not present |step, probes, slot, table, key, vacancy, present|:
+                    entry: i64 = Ints::at(table.slots, slot)
+                    if entry < 0:
+                        vacancy <- slot
+                    else:
+                        if entry == key:
+                            present <- true
+                        else:
+                            slot <- slot + 1
+                            step <- step + 1
+                if vacancy < 0 and not present:
+                    perturb <- perturb >> PERTURB_SHIFT
+                    index <- (index * 5 + 1 + perturb) & mask
+            return if present
+            table.fill <- table.fill + 1
+            table.used <- table.used + 1
+            Ints::put(&table.slots, vacancy, key)
+            return if table.fill * 5 < mask * 3
+            # CPython grows to `used * 2` above 50000 live entries; nothing here
+            # gets within two orders of magnitude of that.
+            PySet::resize(table, table.used * 4)
+
+    # The set's keys in ITERATION order -- the whole reason this file exists.
+    # `out` is filled from slot 0 up and its live count returned.
+    def to_list(table: Table&, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            count: mutable i64 = 0
+            slot: mutable i64 = 0
+            while slot <= table.mask |slot, table, out, count|:
+                key: i64 = Ints::at(table.slots, slot)
+                if key >= 0:
+                    Ints::put(out, count, key)
+                    count <- count + 1
+                slot <- slot + 1
+            return count

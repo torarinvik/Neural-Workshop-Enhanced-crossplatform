@@ -11,11 +11,10 @@
 # `carve` returns a Python `set` of corridor cells and `dead_ends` iterates it.
 # That order is not incidental: the dead-end list is shuffled and then sliced,
 # so a different iteration order gives a different braid, a different maze and
-# a different minimum for the same seed. CPython's set order is the slot order
-# of its open-addressed table, which is fully determined by the insertion
-# sequence -- so `mset_*` below is CPython's `setobject.c` for non-negative int
-# keys: probe loop, resize schedule and all. It is differentially tested
-# against a real `set` in maze_sweep/maze_diff.
+# a different minimum for the same seed. The corridor set is therefore a
+# PySet::Table (pyset.elisa), CPython's setobject.c for non-negative int keys,
+# and not a flat array. It is differentially tested against a real `set` in
+# maze_sweep/maze_diff.
 #
 # Everywhere else the reference's containers are order-insensitive: `dict`s are
 # insertion-ordered and every set is only ever asked about membership or run
@@ -38,11 +37,6 @@ extern rint(x: f64) -> f64
 # ask for.
 const MAZE_MOST_DOORS: i64 = 6
 const MAZE_GRADE_COUNT: i64 = 15
-
-# CPython setobject.c constants.
-const MAZE_SET_MINSIZE: i64 = 8
-const MAZE_LINEAR_PROBES: i64 = 9
-const MAZE_PERTURB_SHIFT: i64 = 5
 
 # One rung of the ladder. `braid` is the share of dead ends opened back into
 # the maze; `floor` the least minimum a maze may have; `planning` the least
@@ -137,13 +131,8 @@ struct MazeWork:
     height: mutable i64
     cells: mutable i64
     span: mutable i64
-    # CPython set of corridor cells: -1 is an unused slot.
-    table: mutable darray[i64]
-    mask: mutable i64
-    fill: mutable i64
-    used: mutable i64
-    snap: mutable darray[i64]
-    snap_n: mutable i64
+    # CPython set of corridor cells -- see pyset.elisa for why the order matters.
+    corridor: mutable PySet::Table
     # Grid state.
     open_flag: mutable darray[i64]
     open_list: mutable darray[i64]
@@ -184,15 +173,6 @@ struct MazeWork:
     route: mutable darray[i64]
     route_n: mutable i64
 
-# Smallest power of two strictly greater than `value`, which is how big the
-# corridor set's table can ever get: CPython resizes to `used * 4` and picks
-# the first power of two above that, and `used` never exceeds the grid.
-def maze_pow2_above(value: i64) -> i64:
-    size: mutable i64 = MAZE_SET_MINSIZE
-    while size <= value |size, value|:
-        size <- size * 2
-    return size
-
 # `rooms` is the largest lattice and `max_doors` the most doors any maze built
 # in this workspace will carry; the (cell, keys held) search space is sized
 # from them.
@@ -210,9 +190,7 @@ def maze_work_new(rooms: i64, max_doors: i64) -> MazeWork:
         work.height <- width
         work.cells <- cells
         work.span <- span
-        work.table <- Ints::zeros(maze_pow2_above(4 * cells))
-        work.mask <- MAZE_SET_MINSIZE - 1
-        work.snap <- Ints::zeros(cells)
+        work.corridor <- PySet::new(cells)
         work.open_flag <- Ints::zeros(cells)
         work.open_list <- Ints::zeros(cells)
         work.adj <- Ints::zeros(cells * 4)
@@ -248,129 +226,6 @@ def maze_work_new(rooms: i64, max_doors: i64) -> MazeWork:
 # below is the simple `set_insert_clean` one.
 # ------------------------------------------------------------
 
-def mset_reset(work: mutable MazeWork&):
-    can Abort.Panic:
-        work.mask <- MAZE_SET_MINSIZE - 1
-        work.fill <- 0
-        work.used <- 0
-        slot: mutable i64 = 0
-        while slot < work.table.count.i64() |slot, work|:
-            Ints::put(&work.table, slot, -1)
-            slot <- slot + 1
-
-def mset_contains(work: mutable MazeWork&, key: i64) -> bool:
-    can Abort.Panic:
-        mask: i64 = work.mask
-        index: mutable i64 = key & mask
-        perturb: mutable i64 = key
-        # 0 still looking, 1 present, 2 absent.
-        verdict: mutable i64 = 0
-        while verdict == 0 |verdict, index, perturb, mask, work, key|:
-            probes: i64 = MAZE_LINEAR_PROBES if index + MAZE_LINEAR_PROBES <= mask else 0
-            slot: mutable i64 = index
-            step: mutable i64 = 0
-            while step <= probes and verdict == 0 |step, probes, slot, work, key, verdict|:
-                entry: i64 = Ints::at(work.table, slot)
-                if entry < 0:
-                    verdict <- 2
-                else:
-                    if entry == key:
-                        verdict <- 1
-                    else:
-                        slot <- slot + 1
-                        step <- step + 1
-            if verdict == 0:
-                perturb <- perturb >> MAZE_PERTURB_SHIFT
-                index <- (index * 5 + 1 + perturb) & mask
-        return verdict == 1
-
-# set_insert_clean: no equality tests, because the table is known not to hold
-# the key. Used only from the resize path.
-def mset_insert_clean(work: mutable MazeWork&, key: i64):
-    can Abort.Panic:
-        mask: i64 = work.mask
-        index: mutable i64 = key & mask
-        perturb: mutable i64 = key
-        placed: mutable bool = false
-        while not placed |placed, index, perturb, mask, work, key|:
-            if Ints::at(work.table, index) < 0:
-                Ints::put(&work.table, index, key)
-                placed <- true
-            else:
-                if index + MAZE_LINEAR_PROBES <= mask:
-                    slot: mutable i64 = index
-                    step: mutable i64 = 0
-                    while step < MAZE_LINEAR_PROBES and not placed |step, slot, work, key, placed|:
-                        slot <- slot + 1
-                        if Ints::at(work.table, slot) < 0:
-                            Ints::put(&work.table, slot, key)
-                            placed <- true
-                        else:
-                            step <- step + 1
-                if not placed:
-                    perturb <- perturb >> MAZE_PERTURB_SHIFT
-                    index <- (index * 5 + 1 + perturb) & mask
-
-# set_table_resize: the old table is walked in slot order and re-inserted, so
-# the new order is a function of the old one and not of the original insertion
-# sequence.
-def mset_resize(work: mutable MazeWork&, minused: i64):
-    can Abort.Panic:
-        newsize: mutable i64 = MAZE_SET_MINSIZE
-        while newsize <= minused |newsize, minused|:
-            newsize <- newsize * 2
-        work.snap_n <- 0
-        slot: mutable i64 = 0
-        while slot <= work.mask |slot, work|:
-            key: i64 = Ints::at(work.table, slot)
-            if key >= 0:
-                Ints::put(&work.snap, work.snap_n, key)
-                work.snap_n <- work.snap_n + 1
-            slot <- slot + 1
-        work.mask <- newsize - 1
-        blank: mutable i64 = 0
-        while blank < newsize |blank, newsize, work|:
-            Ints::put(&work.table, blank, -1)
-            blank <- blank + 1
-        index: mutable i64 = 0
-        while index < work.snap_n |index, work|:
-            mset_insert_clean(work, Ints::at(work.snap, index))
-            index <- index + 1
-        work.fill <- work.used
-
-def mset_add(work: mutable MazeWork&, key: i64):
-    can Abort.Panic:
-        mask: i64 = work.mask
-        index: mutable i64 = key & mask
-        perturb: mutable i64 = key
-        vacancy: mutable i64 = -1
-        present: mutable bool = false
-        while vacancy < 0 and not present |vacancy, present, index, perturb, mask, work, key|:
-            probes: i64 = MAZE_LINEAR_PROBES if index + MAZE_LINEAR_PROBES <= mask else 0
-            slot: mutable i64 = index
-            step: mutable i64 = 0
-            while step <= probes and vacancy < 0 and not present |step, probes, slot, work, key, vacancy, present|:
-                entry: i64 = Ints::at(work.table, slot)
-                if entry < 0:
-                    vacancy <- slot
-                else:
-                    if entry == key:
-                        present <- true
-                    else:
-                        slot <- slot + 1
-                        step <- step + 1
-            if vacancy < 0 and not present:
-                perturb <- perturb >> MAZE_PERTURB_SHIFT
-                index <- (index * 5 + 1 + perturb) & mask
-        return if present
-        work.fill <- work.fill + 1
-        work.used <- work.used + 1
-        Ints::put(&work.table, vacancy, key)
-        return if work.fill * 5 < mask * 3
-        # CPython grows to `used * 2` above 50000 live entries; a corridor set
-        # never gets within two orders of magnitude of that.
-        mset_resize(work, work.used * 4)
-
 # ------------------------------------------------------------
 # Geometry
 # ------------------------------------------------------------
@@ -403,7 +258,7 @@ def maze_carve(work: mutable MazeWork&, rng: mutable MT19937&, rooms: i64):
         work.width <- width
         work.height <- width
         work.cells <- width * width
-        mset_reset(work)
+        PySet::reset(&work.corridor)
         clear: mutable i64 = 0
         while clear < rooms * rooms |clear, rooms, work|:
             Ints::put(&work.room_seen, clear, 0)
@@ -412,7 +267,7 @@ def maze_carve(work: mutable MazeWork&, rng: mutable MT19937&, rooms: i64):
         here_x: i64 = py_randbelow(rng, rooms.u64()).i64()
         here_y: i64 = py_randbelow(rng, rooms.u64()).i64()
         Ints::put(&work.room_seen, here_y * rooms + here_x, 1)
-        mset_add(work, maze_cell_of(width, 2 * here_x + 1, 2 * here_y + 1))
+        PySet::add(&work.corridor, maze_cell_of(width, 2 * here_x + 1, 2 * here_y + 1))
         Ints::put(&work.stack_x, 0, here_x)
         Ints::put(&work.stack_y, 0, here_y)
         depth: mutable i64 = 1
@@ -449,26 +304,26 @@ def maze_carve(work: mutable MazeWork&, rng: mutable MT19937&, rooms: i64):
                 next_x: i64 = x + maze_dir_dx(chosen)
                 next_y: i64 = y + maze_dir_dy(chosen)
                 Ints::put(&work.room_seen, next_y * rooms + next_x, 1)
-                mset_add(work, maze_cell_of(width, x + next_x + 1, y + next_y + 1))
-                mset_add(work, maze_cell_of(width, 2 * next_x + 1, 2 * next_y + 1))
+                PySet::add(&work.corridor, maze_cell_of(width, x + next_x + 1, y + next_y + 1))
+                PySet::add(&work.corridor, maze_cell_of(width, 2 * next_x + 1, 2 * next_y + 1))
                 Ints::put(&work.stack_x, depth, next_x)
                 Ints::put(&work.stack_y, depth, next_y)
                 depth <- depth + 1
 
 # Corridor cells with exactly one way out, in the corridor set's own iteration
-# order -- the reason mset_* exists.
+# order -- the reason the corridor set is a PySet::Table.
 def maze_dead_ends(work: mutable MazeWork&):
     can Abort.Panic:
         work.ends_n <- 0
         slot: mutable i64 = 0
-        while slot <= work.mask |slot, work|:
-            cell: i64 = Ints::at(work.table, slot)
+        while slot <= work.corridor.mask |slot, work|:
+            cell: i64 = Ints::at(work.corridor.slots, slot)
             if cell >= 0:
                 links: mutable i64 = 0
                 probe: mutable i64 = 0
                 while probe < 4 |probe, cell, work, links|:
                     near: i64 = maze_neighbour(work.width, work.height, cell, probe)
-                    if near >= 0 and mset_contains(work, near):
+                    if near >= 0 and PySet::contains(work.corridor, near):
                         links <- links + 1
                     probe <- probe + 1
                 if links == 1:
@@ -498,7 +353,7 @@ def maze_braid_wall(work: mutable MazeWork&, cell: i64, pick: i64) -> i64:
             if x + 2 * dx > 0 and x + 2 * dx < width - 1 and y + 2 * dy > 0 and y + 2 * dy < height - 1:
                 wall: i64 = maze_cell_of(width, x + dx, y + dy)
                 beyond: i64 = maze_cell_of(width, x + 2 * dx, y + 2 * dy)
-                if not mset_contains(work, wall) and mset_contains(work, beyond):
+                if not PySet::contains(work.corridor, wall) and PySet::contains(work.corridor, beyond):
                     chosen <- wall if seen_so_far == pick
                     seen_so_far <- seen_so_far + 1
             probe <- probe + 1
@@ -522,7 +377,7 @@ def maze_braid(work: mutable MazeWork&, rng: mutable MT19937&, share: f64):
             if walls > 0:
                 opened: i64 = maze_braid_wall(work, cell, py_choice_index(rng, walls))
                 if opened >= 0:
-                    mset_add(work, opened)
+                    PySet::add(&work.corridor, opened)
             index <- index + 1
 
 # The corridor graph: for every open cell, the open cells next to it, in
@@ -553,8 +408,8 @@ def maze_realise(work: mutable MazeWork&):
             Ints::put(&work.open_flag, cell, 0)
             cell <- cell + 1
         slot: mutable i64 = 0
-        while slot <= work.mask |slot, work|:
-            key: i64 = Ints::at(work.table, slot)
+        while slot <= work.corridor.mask |slot, work|:
+            key: i64 = Ints::at(work.corridor.slots, slot)
             if key >= 0:
                 Ints::put(&work.open_flag, key, 1)
             slot <- slot + 1
