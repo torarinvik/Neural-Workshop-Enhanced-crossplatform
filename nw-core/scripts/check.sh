@@ -17,14 +17,16 @@ mkdir -p "$BUILD"
 
 SUITES=(scheduling board nback pyrandom stimulus stats matching display config gamemode decimal session maze)
 
-# Suites that cannot yet build under stage1. The generic-protocol-impl gap this list
-# was created for is FIXED (nw-port stage1 552bddca): `config` no longer declines the
-# std's `impl[T] Store for darray[T]` members, and its decline count fell from 25 to 2.
-# What is left is its own `main` -- `try read_entire_file_cstr(...) else ""` and the
-# sview/cstr plumbing around it -- which is a separate gap and has not been diagnosed.
-# Re-check with:
+# Suites that cannot yet build under stage1. EMPTY -- every suite now builds and
+# runs on both stages.
+#
+# `config` lived here for two separate reasons, both now fixed: the generic
+# protocol-impl gap (nw-port stage1 552bddca), and then its own `main` --
+# `try read_entire_file_cstr(...) else ""` plus the sview/cstr plumbing around it.
+# Verified by building and RUNNING it, not by assuming the second gap went with
+# the first:
 #   scripts/elisac_stage1.sh -emit exe -O2 -o /tmp/cfg test/config_sweep.elisa
-STAGE0_ONLY=(config)
+STAGE0_ONLY=()
 
 failures=0
 run_suite() {
@@ -62,8 +64,10 @@ for stage in stage0 stage1; do
     [[ "$STAGES" == "both" || "$STAGES" == "$stage" ]] || continue
     echo "== $stage"
     for suite in "${SUITES[@]}"; do
-        if [[ "$stage" == "stage1" ]] && [[ " ${STAGE0_ONLY[*]} " == *" $suite "* ]]; then
-            echo "  ${suite} [${stage}]: SKIPPED (blocked on the stage1 generic-impl gap)"
+        # :-  because the list is now EMPTY, and bash 3.2 under `set -u` treats
+        # ${empty_array[*]} as an unbound variable rather than an empty string.
+        if [[ "$stage" == "stage1" ]] && [[ " ${STAGE0_ONLY[*]:-} " == *" $suite "* ]]; then
+            echo "  ${suite} [${stage}]: SKIPPED (stage1 cannot build this suite)"
             continue
         fi
         run_suite "$suite" "$stage" || failures=$((failures + 1))

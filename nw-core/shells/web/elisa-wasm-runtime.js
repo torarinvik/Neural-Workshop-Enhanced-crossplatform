@@ -18,6 +18,7 @@ export function createElisaRuntime() {
     let memory = null;
     let heapNext = 0;
     let heapEnd = 0;
+    let heapBase = 0;   // __heap_base: static data lives below it, never reclaim past it
 
     const u8 = () => new Uint8Array(memory.buffer);
     const dv = () => new DataView(memory.buffer);
@@ -33,13 +34,29 @@ export function createElisaRuntime() {
         const needed = heapNext + bytes;
         if (needed > heapEnd) {
             const pages = Math.ceil((needed - heapEnd) / PAGE) + 16;
-            memory.grow(pages);
+            // memory.grow returns -1 rather than throwing. Ignoring that and
+            // advancing heapEnd anyway hands out addresses PAST the end of
+            // linear memory, and the failure then surfaces as an unrelated
+            // "memory access out of bounds" deep inside arena_alloc. Fail here,
+            // where the cause is still legible.
+            if (memory.grow(pages) < 0) {
+                throw new RangeError(
+                    `elisa: out of wasm memory (wanted ${pages} more pages, ` +
+                    `have ${heapEnd / PAGE})`);
+            }
             heapEnd += pages * PAGE;
         }
     }
 
-    // Most recent allocation, so munmap/free can rewind it.
-    let lastBlock = { at: 0, size: 0 };
+    // Live blocks, innermost last. A stack rather than a single `lastBlock`,
+    // because regions nest: a frame opens a region, opens a second one inside
+    // it, then frees them innermost-first. With only the top block rewindable,
+    // the OUTER free was silently dropped and its bytes leaked -- and since
+    // alloc() aligns heapNext UP before recording `at`, the alternative
+    // `start + length === heapNext` test can never match once any padding has
+    // been inserted between two blocks. A frame leaked its whole outer region
+    // every tick until memory.grow failed.
+    const blocks = [];
 
     function alloc(bytes, align = 16) {
         const size = Number(bytes);
@@ -47,22 +64,26 @@ export function createElisaRuntime() {
         grow(size);
         const at = heapNext;
         heapNext += size;
-        lastBlock = { at, size };
+        blocks.push({ at, size });
         return at;
     }
 
-    // Reclaim `at` if it is the top of the bump; otherwise the space is held
-    // until the instance goes away, which is correct-but-wasteful rather than
-    // wrong.
+    // Reclaim `at`, and with it any already-freed blocks it was holding down.
+    // Freeing out of order is legal and common (the runtime frees a region
+    // chain in list order, not address order), so a freed block that is not
+    // currently on top is marked dead and collected when the block below it
+    // goes; that keeps a LIFO workload -- which is what every per-frame region
+    // is -- exactly flat.
     function release(at, size) {
         const start = Number(at);
-        const length = Number(size);
-        if (start === lastBlock.at && (length === lastBlock.size || length === 0)) {
-            heapNext = start;
-            lastBlock = { at: 0, size: 0 };
-        } else if (start + length === heapNext) {
-            heapNext = start;
+        const index = blocks.findIndex((b) => b !== null && b.at === start);
+        if (index < 0) return 0;
+        blocks[index] = null;
+        while (blocks.length && blocks[blocks.length - 1] === null) {
+            blocks.pop();
         }
+        const top = blocks[blocks.length - 1];
+        heapNext = top ? top.at + top.size : heapBase;
         return 0;
     }
 
@@ -220,8 +241,23 @@ export function createElisaRuntime() {
         // and place its heap above the module's static data.
         attach(instance) {
             memory = instance.exports.memory;
-            const base = instance.exports.__heap_base;
-            heapNext = typeof base === "number" ? base : 65536;
+            // __heap_base comes across as a WebAssembly.Global, not a number.
+            // The old `typeof base === "number"` test was therefore ALWAYS false
+            // and the 65536 fallback always fired, putting the heap on top of the
+            // module's static data: string literals were overwritten mid-run, and
+            // the damage read as corrupt program logic rather than a bad heap
+            // base. Guessing here is worse than failing, so it fails.
+            const raw = instance.exports.__heap_base;
+            const base = raw instanceof WebAssembly.Global ? raw.value
+                       : typeof raw === "number" ? raw : null;
+            if (base === null) {
+                throw new Error(
+                    "elisa: module does not export __heap_base -- link with " +
+                    "`wasm-ld --export=__heap_base`. Refusing to guess a heap " +
+                    "base: a wrong one silently overwrites static data.");
+            }
+            heapNext = base;
+            heapBase = base;
             heapEnd = memory.buffer.byteLength;
             if (instance.exports.__wasm_call_ctors) instance.exports.__wasm_call_ctors();
             return instance;

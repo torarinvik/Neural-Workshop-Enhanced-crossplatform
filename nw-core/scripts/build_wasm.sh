@@ -14,7 +14,10 @@ mkdir -p "$ROOT/build"
 
 # --export-dynamic keeps the `export fn` symbols; -O2 gives everything else
 # private linkage, which is what we want for size.
-wasm-ld --no-entry --export-dynamic --allow-undefined \
+# --export=__heap_base is NOT implied by --export-dynamic: the symbol is
+# linker-synthesized, not a definition in the object, so it has to be named.
+# Without it the shim has no idea where static data ends.
+wasm-ld --no-entry --export-dynamic --allow-undefined --export=__heap_base \
     -o "$ROOT/build/nwcore.wasm" "$ROOT/build/nwcore_wasm.o"
 
 printf 'wasm: %s bytes\n' "$(wc -c < "$ROOT/build/nwcore.wasm" | tr -d ' ')"
