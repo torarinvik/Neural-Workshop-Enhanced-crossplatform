@@ -2621,6 +2621,763 @@ def sy_binary_option(value: i64) -> i64:
             return 1
         return 2
 
+# --- read back off the page ---
+#
+# A generator that checks itself proves only that it is consistent. So the
+# printed lines are parsed back into relations by something that never saw the
+# web, and solved again. This catches what a self-check cannot: a negation
+# rendered the wrong way round, a direction written in a frame that says
+# something else, a premise the shuffle dropped.
+#
+# The reference does it with regular expressions; here it is a scanner over the
+# same six frames, in the same order, because a frame that matches earlier wins.
+
+struct SyScan:
+    text: mutable sview
+    at: mutable i64
+    ok: mutable bool
+
+def sy_scan_new(text: sview) -> SyScan:
+    can Abort.Panic:
+        out: mutable SyScan = zeroed
+        out.text <- text
+        out.ok <- true
+        return out
+
+def sy_scan_done(scan: SyScan&) -> bool:
+    can Abort.Panic:
+        return scan.at >= sview_len(scan.text).i64()
+
+# `\w+` -- letters, digits and underscore, which for these names is letters.
+def sy_is_word_byte(byte: u8) -> bool:
+    can Abort.Panic:
+        code: i64 = byte.i64()
+        return (code >= 97 and code <= 122) or (code >= 65 and code <= 90) or (code >= 48 and code <= 57) or code == 95
+
+def sy_take_word(scan: mutable SyScan&) -> sview:
+    can Abort.Panic:
+        start: i64 = scan.at
+        while not sy_scan_done(scan) and sy_is_word_byte(sview_at(scan.text, scan.at.usize())) |scan|:
+            scan.at <- scan.at + 1
+        if scan.at == start:
+            scan.ok <- false
+        return string_view_slice(scan.text, start, scan.at)
+
+def sy_take_literal(scan: mutable SyScan&, word: cstr) -> bool:
+    can Abort.Panic:
+        wanted: sview = sview(word, 0, -1)
+        length: i64 = sview_len(wanted).i64()
+        if scan.at + length > sview_len(scan.text).i64():
+            return false
+        index: mutable i64 = 0
+        same: mutable bool = true
+        while index < length and same |index, length, wanted, scan, same|:
+            same <- false if sview_at(scan.text, (scan.at + index).usize()) != sview_at(wanted, index.usize())
+            index <- index + 1
+        if same:
+            scan.at <- scan.at + length
+        return same
+
+# The parsed premise. `family` is -1 when the line did not read back at all.
+struct SyParsed:
+    family: mutable i64
+    left: mutable i64
+    right: mutable i64
+    value0: mutable i64
+    value1: mutable i64
+    value2: mutable i64
+    axes: mutable i64
+    form: mutable i64
+
+# Names are interned as they are met, so a re-read works with indices while
+# knowing nothing but what is printed.
+def sy_intern(table: mutable SyNames&, word: sview) -> i64:
+    can Abort.Panic:
+        index: mutable i64 = 0
+        while index < table.count |index, table, word|:
+            if sview_eq(sy_name(table, index), word):
+                return index
+            index <- index + 1
+        sy_names_push(table, word)
+        return table.count - 1
+
+# `north`/`south`/`east`/`west`/`above`/`below` to (axis, sign), or axis -1.
+def sy_word_axis(word: sview) -> i64:
+    can Abort.Panic:
+        if sview_eq(word, sview("north", 0, -1)):
+            return 0
+        if sview_eq(word, sview("south", 0, -1)):
+            return 1
+        if sview_eq(word, sview("east", 0, -1)):
+            return 2
+        if sview_eq(word, sview("west", 0, -1)):
+            return 3
+        if sview_eq(word, sview("above", 0, -1)):
+            return 4
+        if sview_eq(word, sview("below", 0, -1)):
+            return 5
+        return -1
+
+# One printed premise, back into what it says. The value is what the WORDS
+# mean, not what built them, so a negation written wrongly reads back wrongly.
+def sy_parse_line(text: sview, table: mutable SyNames&) -> SyParsed:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable SyParsed = zeroed
+        out.family <- -1
+        # ORDER: `X is (not )?(more|less) than Y`
+        scan: mutable SyScan = sy_scan_new(text)
+        left: sview = sy_take_word(&scan)
+        if scan.ok and sy_take_literal(&scan, " is "):
+            negated: bool = sy_take_literal(&scan, "not ")
+            more_word: mutable bool = false
+            less_word: mutable bool = false
+            more_word <- sy_take_literal(&scan, "more than ")
+            less_word <- sy_take_literal(&scan, "less than ") if not more_word
+            if more_word or less_word:
+                right: sview = sy_take_word(&scan)
+                if scan.ok and sy_scan_done(&scan):
+                    more: bool = more_word != negated
+                    out.family <- SY_ORDER
+                    out.value0 <- 1
+                    out.axes <- 1
+                    if more:
+                        out.left <- sy_intern(table, right)
+                        out.right <- sy_intern(table, left)
+                    else:
+                        out.left <- sy_intern(table, left)
+                        out.right <- sy_intern(table, right)
+                    return out
+        # PARITY: `X is (not )?the (same as|opposite of) Y`
+        scan <- sy_scan_new(text)
+        left2: sview = sy_take_word(&scan)
+        if scan.ok and sy_take_literal(&scan, " is "):
+            negated: bool = sy_take_literal(&scan, "not ")
+            if sy_take_literal(&scan, "the "):
+                same_word: mutable bool = sy_take_literal(&scan, "same as ")
+                opposite_word: mutable bool = false
+                opposite_word <- sy_take_literal(&scan, "opposite of ") if not same_word
+                if same_word or opposite_word:
+                    right: sview = sy_take_word(&scan)
+                    if scan.ok and sy_scan_done(&scan):
+                        same: bool = same_word != negated
+                        out.family <- SY_PARITY
+                        out.left <- sy_intern(table, left2)
+                        out.right <- sy_intern(table, right)
+                        out.value0 <- 0 if same else 1
+                        out.axes <- 1
+                        return out
+        # STILL: `X is in the same place as Y` -- never a premise (a step is a
+        # step) but a claim can say it.
+        scan <- sy_scan_new(text)
+        right3: sview = sy_take_word(&scan)
+        if scan.ok and sy_take_literal(&scan, " is in the same place as "):
+            left3: sview = sy_take_word(&scan)
+            if scan.ok and sy_scan_done(&scan):
+                out.family <- SY_PLANE
+                out.left <- sy_intern(table, left3)
+                out.right <- sy_intern(table, right3)
+                out.axes <- 2
+                return out
+        # FLAT: `X is ((above|below) and )?to the <flat> of Y`
+        scan <- sy_scan_new(text)
+        right4: sview = sy_take_word(&scan)
+        if scan.ok and sy_take_literal(&scan, " is "):
+            up_axis: mutable i64 = -1
+            if sy_take_literal(&scan, "above and "):
+                up_axis <- 4
+            else:
+                up_axis <- 5 if sy_take_literal(&scan, "below and ") else -1
+            if sy_take_literal(&scan, "to the "):
+                first: sview = sy_take_word(&scan)
+                second: mutable sview = first
+                have_second: mutable bool = false
+                if scan.ok and sy_take_literal(&scan, " and "):
+                    second <- sy_take_word(&scan)
+                    have_second <- true
+                if scan.ok and sy_take_literal(&scan, " of "):
+                    left4: sview = sy_take_word(&scan)
+                    if scan.ok and sy_scan_done(&scan):
+                        return sy_direction_parsed(table, left4, right4, sy_word_axis(first), sy_word_axis(second) if have_second else -1, up_axis)
+        # UPRIGHT: `X is (above|below) Y`
+        scan <- sy_scan_new(text)
+        right5: sview = sy_take_word(&scan)
+        if scan.ok and sy_take_literal(&scan, " is "):
+            only: mutable i64 = -1
+            if sy_take_literal(&scan, "above "):
+                only <- 4
+            else:
+                only <- 5 if sy_take_literal(&scan, "below ") else -1
+            if only >= 0:
+                left5: sview = sy_take_word(&scan)
+                if scan.ok and sy_scan_done(&scan):
+                    return sy_direction_parsed(table, left5, right5, -1, -1, only)
+        # FORM: `(every|no|at least one) X is (not )?an? Y`
+        scan <- sy_scan_new(text)
+        form: mutable i64 = -1
+        if sy_take_literal(&scan, "every "):
+            form <- SY_ALL
+        if form < 0 and sy_take_literal(&scan, "no "):
+            form <- SY_NONE
+        if form < 0 and sy_take_literal(&scan, "at least one "):
+            form <- SY_SOME
+        if form >= 0:
+            subject: sview = sy_take_word(&scan)
+            if scan.ok and sy_take_literal(&scan, " is "):
+                negated: bool = sy_take_literal(&scan, "not ")
+                if sy_take_literal(&scan, "an ") or sy_take_literal(&scan, "a "):
+                    predicate: sview = sy_take_word(&scan)
+                    if scan.ok and sy_scan_done(&scan):
+                        out.family <- SY_CATEGORICAL
+                        out.left <- sy_intern(table, subject)
+                        out.right <- sy_intern(table, predicate)
+                        out.form <- SY_SOME_NOT if form == SY_SOME and negated else form
+                        return out
+        return out
+
+# The direction frames all end here: the words that were read become a value,
+# and the axis count is 3 only when something upright was said.
+def sy_direction_parsed(table: mutable SyNames&, left: sview, right: sview, first_axis: i64, second_axis: i64, up_axis: i64) -> SyParsed:
+    can Abort.Panic:
+        out: mutable SyParsed = zeroed
+        out.family <- -1
+        value: mutable darray[i64] = Ints::zeros(3)
+        axes: mutable i64 = 2
+        slot: mutable i64 = 0
+        while slot < 3 |slot, first_axis, second_axis, up_axis, value, axes, out|:
+            word: i64 = first_axis if slot == 0 else (second_axis if slot == 1 else up_axis)
+            if word >= 0:
+                axis: i64 = word / 2
+                sign: i64 = 1 if word % 2 == 0 else -1
+                Ints::put(&value, axis, sign)
+                axes <- axis + 1 if axis + 1 > axes else axes
+            slot <- slot + 1
+        if up_axis >= 0:
+            axes <- 3
+        out.family <- SY_PLANE if axes == 2 else SY_SPACE
+        out.left <- sy_intern(table, left)
+        out.right <- sy_intern(table, right)
+        out.value0 <- Ints::at(value, 0)
+        out.value1 <- Ints::at(value, 1)
+        out.value2 <- Ints::at(value, 2)
+        out.axes <- axes
+        return out
+
+# The parsed premises, grouped by which question they belong to. A direction
+# premise with nothing vertical in it reads as FLAT whether it came from a flat
+# question or an upright one, so the directions are banked together and padded
+# to the widest of them.
+struct SyBank:
+    family: mutable darray[i64]
+    left: mutable darray[i64]
+    right: mutable darray[i64]
+    value0: mutable darray[i64]
+    value1: mutable darray[i64]
+    value2: mutable darray[i64]
+    count: mutable i64
+    axes: mutable i64
+    # Which families are present, and how many edges each has.
+    present: mutable darray[i64]
+
+def sy_bank_new() -> SyBank:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable SyBank = zeroed
+        out.family <- Ints::zeros(SY_MOST_LINES)
+        out.left <- Ints::zeros(SY_MOST_LINES)
+        out.right <- Ints::zeros(SY_MOST_LINES)
+        out.value0 <- Ints::zeros(SY_MOST_LINES)
+        out.value1 <- Ints::zeros(SY_MOST_LINES)
+        out.value2 <- Ints::zeros(SY_MOST_LINES)
+        out.present <- Ints::zeros(8)
+        return out
+
+def sy_bank(parsed: darray[i64], count: i64, bank: mutable SyBank&):
+    can Abort.Panic:
+        # parsed is a flat run of SyParsed fields, eight per line.
+        widest: mutable i64 = 0
+        at: mutable i64 = 0
+        while at < count |at, count, parsed, widest|:
+            family: i64 = Ints::at(parsed, at * 8)
+            if family == SY_PLANE or family == SY_SPACE:
+                axes: i64 = Ints::at(parsed, at * 8 + 6)
+                widest <- axes if axes > widest else widest
+            at <- at + 1
+        bank.axes <- widest
+        bank.count <- 0
+        slot: mutable i64 = 0
+        while slot < 8 |slot, bank|:
+            Ints::put(&bank.present, slot, 0)
+            slot <- slot + 1
+        line: mutable i64 = 0
+        while line < count |line, count, parsed, widest, bank|:
+            family: mutable i64 = Ints::at(parsed, line * 8)
+            if family == SY_PLANE or family == SY_SPACE:
+                family <- SY_PLANE if widest == 2 else SY_SPACE
+            here: i64 = bank.count
+            Ints::put(&bank.family, here, family)
+            Ints::put(&bank.left, here, Ints::at(parsed, line * 8 + 1))
+            Ints::put(&bank.right, here, Ints::at(parsed, line * 8 + 2))
+            Ints::put(&bank.value0, here, Ints::at(parsed, line * 8 + 3))
+            Ints::put(&bank.value1, here, Ints::at(parsed, line * 8 + 4))
+            Ints::put(&bank.value2, here, Ints::at(parsed, line * 8 + 5))
+            # The categorical form rides in value0 for that family.
+            Ints::put(&bank.value0, here, Ints::at(parsed, line * 8 + 7)) if family == SY_CATEGORICAL
+            Ints::put(&bank.present, family, Ints::at_ref(&bank.present, family) + 1)
+            bank.count <- here + 1
+            line <- line + 1
+
+def sy_bank_families(bank: SyBank&) -> i64:
+    can Abort.Panic:
+        count: mutable i64 = 0
+        family: mutable i64 = 0
+        while family < 8 |family, bank, count|:
+            count <- count + 1 if Ints::at(bank.present, family) > 0
+            family <- family + 1
+        return count
+
+# Solve the parsed premises without ever having seen the web. Returns a label
+# in the family's option space, or SY_UNTOLD.
+def sy_reread(bank: SyBank&, family: i64, subject: i64, other: i64, names: i64) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        if family == SY_ORDER:
+            # `more` walks low-to-high from `other`; `less` the other way.
+            want: mutable i64 = 0
+            while want < 2 |want, bank, family, subject, other, names|:
+                start: i64 = other if want == 0 else subject
+                goal: i64 = subject if want == 0 else other
+                if sy_order_reaches(bank, start, goal, names):
+                    return want
+                want <- want + 1
+            return SY_UNTOLD
+        seen: mutable darray[i64] = Ints::zeros(SY_MOST_NAMES)
+        got0: mutable darray[i64] = Ints::zeros(SY_MOST_NAMES)
+        got1: mutable darray[i64] = Ints::zeros(SY_MOST_NAMES)
+        got2: mutable darray[i64] = Ints::zeros(SY_MOST_NAMES)
+        frontier: mutable darray[i64] = Ints::zeros(SY_MOST_NAMES)
+        next_frontier: mutable darray[i64] = Ints::zeros(SY_MOST_NAMES)
+        Ints::put(&seen, other, 1)
+        Ints::put(&frontier, 0, other)
+        frontier_n: mutable i64 = 1
+        while frontier_n > 0 |frontier_n, bank, family, seen, got0, got1, got2, frontier, next_frontier|:
+            next_n: mutable i64 = 0
+            at: mutable i64 = 0
+            while at < frontier_n |at, frontier_n, bank, family, seen, got0, got1, got2, frontier, next_frontier, next_n|:
+                node: i64 = Ints::at(frontier, at)
+                edge: mutable i64 = 0
+                while edge < bank.count |edge, bank, family, node, seen, got0, got1, got2, next_frontier, next_n|:
+                    if Ints::at(bank.family, edge) == family:
+                        side: mutable i64 = 0
+                        while side < 2 |side, edge, bank, node, seen, got0, got1, got2, next_frontier, next_n|:
+                            near: i64 = Ints::at(bank.left, edge) if side == 0 else Ints::at(bank.right, edge)
+                            far: i64 = Ints::at(bank.right, edge) if side == 0 else Ints::at(bank.left, edge)
+                            way: i64 = 1 if side == 0 else -1
+                            if near == node and Ints::at(seen, far) == 0:
+                                Ints::put(&got0, far, Ints::at(got0, node) + way * Ints::at(bank.value0, edge))
+                                Ints::put(&got1, far, Ints::at(got1, node) + way * Ints::at(bank.value1, edge))
+                                Ints::put(&got2, far, Ints::at(got2, node) + way * Ints::at(bank.value2, edge))
+                                Ints::put(&seen, far, 1)
+                                Ints::put(&next_frontier, next_n, far)
+                                next_n <- next_n + 1
+                            side <- side + 1
+                    edge <- edge + 1
+                at <- at + 1
+            shift: mutable i64 = 0
+            while shift < next_n |shift, next_n, next_frontier, frontier|:
+                Ints::put(&frontier, shift, Ints::at(next_frontier, shift))
+                shift <- shift + 1
+            frontier_n <- next_n
+        if Ints::at(seen, subject) == 0:
+            return SY_UNTOLD
+        if family == SY_PARITY:
+            apart: i64 = Ints::at(got0, subject) % 2
+            return 1 if apart != 0 else 0
+        axes: i64 = sy_axes(family)
+        return sy_direction_index(Ints::at(got0, subject), Ints::at(got1, subject), Ints::at(got2, subject), axes)
+
+def sy_order_reaches(bank: SyBank&, start: i64, goal: i64, names: i64) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        seen: mutable darray[i64] = Ints::zeros(SY_MOST_NAMES)
+        frontier: mutable darray[i64] = Ints::zeros(SY_MOST_NAMES)
+        next_frontier: mutable darray[i64] = Ints::zeros(SY_MOST_NAMES)
+        Ints::put(&seen, start, 1)
+        Ints::put(&frontier, 0, start)
+        frontier_n: mutable i64 = 1
+        found: mutable bool = false
+        while frontier_n > 0 and not found |frontier_n, bank, goal, seen, frontier, next_frontier, found|:
+            next_n: mutable i64 = 0
+            at: mutable i64 = 0
+            while at < frontier_n and not found |at, frontier_n, bank, goal, seen, frontier, next_frontier, next_n, found|:
+                node: i64 = Ints::at(frontier, at)
+                edge: mutable i64 = 0
+                while edge < bank.count and not found |edge, bank, node, goal, seen, next_frontier, next_n, found|:
+                    if Ints::at(bank.family, edge) == SY_ORDER and Ints::at(bank.left, edge) == node:
+                        high: i64 = Ints::at(bank.right, edge)
+                        if Ints::at(seen, high) == 0:
+                            if high == goal:
+                                found <- true
+                            else:
+                                Ints::put(&seen, high, 1)
+                                Ints::put(&next_frontier, next_n, high)
+                                next_n <- next_n + 1
+                    edge <- edge + 1
+                at <- at + 1
+            shift: mutable i64 = 0
+            while shift < next_n |shift, next_n, next_frontier, frontier|:
+                Ints::put(&frontier, shift, Ints::at(next_frontier, shift))
+                shift <- shift + 1
+            frontier_n <- next_n
+        return found
+
+# A bracketed piece off the front of `text`, and what is left.
+def sy_take_group(text: sview, rest_start: mutable i64&) -> sview:
+    can Abort.Panic:
+        length: i64 = sview_len(text).i64()
+        if length == 0 or sview_at(text, 0.usize()) != 40.u8():
+            rest_start <- length
+            return text
+        depth: mutable i64 = 0
+        spot: mutable i64 = 0
+        close: mutable i64 = -1
+        while spot < length and close < 0 |spot, length, text, depth, close|:
+            byte: u8 = sview_at(text, spot.usize())
+            depth <- depth + 1 if byte == 40.u8()
+            depth <- depth - 1 if byte == 41.u8()
+            close <- spot if depth == 0
+            spot <- spot + 1
+        if close < 0:
+            rest_start <- length
+            return text
+        rest_start <- close + 1
+        return string_view_slice(text, 1, close)
+
+# The printed question of a made-of-others rung, back into a tree. Nodes live
+# in flat arrays: `op` is -1 for a leaf, whose text is the (start, length) pair.
+const SY_MOST_TREE: i64 = 32
+
+struct SyTree:
+    op: mutable darray[i64]
+    left: mutable darray[i64]
+    right: mutable darray[i64]
+    start: mutable darray[i64]
+    length: mutable darray[i64]
+    count: mutable i64
+    ok: mutable bool
+
+def sy_tree_new() -> SyTree:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable SyTree = zeroed
+        out.op <- Ints::zeros(SY_MOST_TREE)
+        out.left <- Ints::zeros(SY_MOST_TREE)
+        out.right <- Ints::zeros(SY_MOST_TREE)
+        out.start <- Ints::zeros(SY_MOST_TREE)
+        out.length <- Ints::zeros(SY_MOST_TREE)
+        return out
+
+def sy_read_claim(whole: sview, start: i64, length: i64, tree: mutable SyTree&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        text: mutable sview = string_view_slice(whole, start, start + length)
+        # `.strip()` -- only spaces occur here.
+        low: mutable i64 = 0
+        high: mutable i64 = sview_len(text).i64()
+        while low < high and sview_at(text, low.usize()) == 32.u8() |low, high, text|:
+            low <- low + 1
+        while high > low and sview_at(text, (high - 1).usize()) == 32.u8() |low, high, text|:
+            high <- high - 1
+        text <- string_view_slice(text, low, high)
+        base: i64 = start + low
+        size: i64 = high - low
+        if sview_starts_with(text, sview("exactly one of ", 0, -1)):
+            after: i64 = 15
+            rest_at: mutable i64 = 0
+            left_view: sview = sy_take_group(string_view_slice(text, after, size), &rest_at)
+            rest: sview = string_view_slice(text, after + rest_at, size)
+            if not sview_starts_with(rest, sview(" and ", 0, -1)):
+                tree.ok <- false
+                return -1
+            more_at: mutable i64 = 0
+            right_view: sview = sy_take_group(string_view_slice(rest, 5, sview_len(rest).i64()), &more_at)
+            left_node: i64 = sy_read_claim(whole, base + after + 1, sview_len(left_view).i64(), tree)
+            right_node: i64 = sy_read_claim(whole, base + after + rest_at + 5 + 1, sview_len(right_view).i64(), tree)
+            return sy_tree_push(tree, SY_EXACTLY_ONE, left_node, right_node, 0, 0)
+        if size > 0 and sview_at(text, 0.usize()) == 40.u8():
+            rest_at: mutable i64 = 0
+            left_view: sview = sy_take_group(text, &rest_at)
+            rest: sview = string_view_slice(text, rest_at, size)
+            word: mutable i64 = -1
+            width: mutable i64 = 0
+            if sview_starts_with(rest, sview(" and ", 0, -1)):
+                word <- SY_AND
+                width <- 5
+            if word < 0 and sview_starts_with(rest, sview(" or ", 0, -1)):
+                word <- SY_OR
+                width <- 4
+            if word >= 0:
+                more_at: mutable i64 = 0
+                right_view: sview = sy_take_group(string_view_slice(rest, width, size - rest_at), &more_at)
+                left_node: i64 = sy_read_claim(whole, base + 1, sview_len(left_view).i64(), tree)
+                right_node: i64 = sy_read_claim(whole, base + rest_at + width + 1, sview_len(right_view).i64(), tree)
+                return sy_tree_push(tree, word, left_node, right_node, 0, 0)
+            return sy_read_claim(whole, base + 1, sview_len(left_view).i64(), tree)
+        return sy_tree_push(tree, -1, 0, 0, base, size)
+
+def sy_tree_push(tree: mutable SyTree&, op: i64, left: i64, right: i64, start: i64, length: i64) -> i64:
+    can Abort.Panic:
+        slot: i64 = tree.count
+        if slot >= SY_MOST_TREE:
+            tree.ok <- false
+            return -1
+        Ints::put(&tree.op, slot, op)
+        Ints::put(&tree.left, slot, left)
+        Ints::put(&tree.right, slot, right)
+        Ints::put(&tree.start, slot, start)
+        Ints::put(&tree.length, slot, length)
+        tree.count <- slot + 1
+        return slot
+
+# Whether a claim sentence is true of the premises, or unsettled.
+def sy_holds(bank: SyBank&, parsed: SyParsed, names: i64, ok: mutable bool&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        family: mutable i64 = parsed.family
+        subject: mutable i64 = 0
+        other: mutable i64 = 0
+        said: mutable i64 = 0
+        if family == SY_PLANE or family == SY_SPACE:
+            family <- SY_PLANE if Ints::at(bank.present, SY_PLANE) > 0 else SY_SPACE
+            if Ints::at(bank.present, family) == 0:
+                return SY_UNSETTLED
+            said <- sy_direction_index(parsed.value0, parsed.value1, parsed.value2, sy_axes(family))
+            subject <- parsed.right
+            other <- parsed.left
+        else:
+            if family == SY_ORDER:
+                if Ints::at(bank.present, SY_ORDER) == 0:
+                    return SY_UNSETTLED
+                said <- 0
+                subject <- parsed.right
+                other <- parsed.left
+            else:
+                if Ints::at(bank.present, SY_PARITY) == 0:
+                    return SY_UNSETTLED
+                said <- 0 if parsed.value0 == 0 else 1
+                subject <- parsed.left
+                other <- parsed.right
+        got: i64 = sy_reread(bank, family, subject, other, names)
+        if got == SY_UNTOLD:
+            return SY_UNSETTLED
+        return SY_TRUE if got == said else SY_FALSE
+
+def sy_value_of(whole: sview, tree: SyTree&, node: i64, bank: SyBank&, table: mutable SyNames&, ok: mutable bool&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        if node < 0:
+            ok <- false
+            return SY_UNSETTLED
+        op: i64 = Ints::at(tree.op, node)
+        if op < 0:
+            text: sview = string_view_slice(whole, Ints::at(tree.start, node), Ints::at(tree.start, node) + Ints::at(tree.length, node))
+            parsed: SyParsed = sy_parse_line(text, table)
+            if parsed.family < 0:
+                ok <- false
+                return SY_UNSETTLED
+            return sy_holds(bank, parsed, table.count, ok)
+        left: i64 = sy_value_of(whole, tree, Ints::at(tree.left, node), bank, table, ok)
+        right: i64 = sy_value_of(whole, tree, Ints::at(tree.right, node), bank, table, ok)
+        return sy_kleene(op, left, right)
+
+# The answer, worked out again from the printed page alone. Returns -2 where
+# the page cannot be read back at all, which is a FAULT rather than a wrong
+# answer, and is why `checks_out` treats it as one.
+def sy_read_back(q: SyQuestion&, family: i64, bank: mutable SyBank&, table: mutable SyNames&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        sy_names_reset(table)
+        parsed: mutable darray[i64] = Ints::zeros(SY_MOST_LINES * 8)
+        line: mutable i64 = 0
+        while line < q.line_count |line, q, table, parsed|:
+            got: SyParsed = sy_parse_line(sy_line(q, line), table)
+            if got.family < 0:
+                return -2
+            Ints::put(&parsed, line * 8, got.family)
+            Ints::put(&parsed, line * 8 + 1, got.left)
+            Ints::put(&parsed, line * 8 + 2, got.right)
+            Ints::put(&parsed, line * 8 + 3, got.value0)
+            Ints::put(&parsed, line * 8 + 4, got.value1)
+            Ints::put(&parsed, line * 8 + 5, got.value2)
+            Ints::put(&parsed, line * 8 + 6, got.axes)
+            Ints::put(&parsed, line * 8 + 7, got.form)
+            line <- line + 1
+        sy_bank(parsed, q.line_count, bank)
+        asked: sview = sy_slice(q, q.asked_start, q.asked_len)
+        if family == SY_META:
+            scan: mutable SyScan = sy_scan_new(asked)
+            if not sy_take_literal(&scan, "Is the way "):
+                return -2
+            first: sview = sy_take_word(&scan)
+            if not sy_take_literal(&scan, " stands to "):
+                return -2
+            second: sview = sy_take_word(&scan)
+            if not sy_take_literal(&scan, " the same as the way "):
+                return -2
+            third: sview = sy_take_word(&scan)
+            if not sy_take_literal(&scan, " stands to "):
+                return -2
+            fourth: sview = sy_take_word(&scan)
+            if not (sy_take_literal(&scan, "?") and sy_scan_done(&scan)) or sy_bank_families(bank) != 1:
+                return -2
+            inner: mutable i64 = -1
+            look: mutable i64 = 0
+            while look < 8 |look, bank, inner|:
+                inner <- look if Ints::at(bank.present, look) > 0 and inner < 0
+                look <- look + 1
+            one: i64 = sy_reread(bank, inner, sy_find_name(table, first), sy_find_name(table, second), table.count)
+            two: i64 = sy_reread(bank, inner, sy_find_name(table, third), sy_find_name(table, fourth), table.count)
+            if one == SY_UNTOLD or two == SY_UNTOLD:
+                return 2
+            return 0 if one == two else 1
+        if family == SY_BINARY:
+            scan: mutable SyScan = sy_scan_new(asked)
+            if not sy_take_literal(&scan, "Is this true?"):
+                return -2
+            while not sy_scan_done(&scan) and sview_at(asked, scan.at.usize()) == 32.u8() |scan, asked|:
+                scan.at <- scan.at + 1
+            tree: mutable SyTree = sy_tree_new()
+            tree.ok <- true
+            root: i64 = sy_read_claim(asked, scan.at, sview_len(asked).i64() - scan.at, &tree)
+            if not tree.ok:
+                return -2
+            ok: mutable bool = true
+            value: i64 = sy_value_of(asked, &tree, root, bank, table, &ok)
+            if not ok:
+                return -2
+            return sy_binary_option(value)
+        if family == SY_CATEGORICAL:
+            scan: mutable SyScan = sy_scan_new(asked)
+            if not sy_take_literal(&scan, "What follows about "):
+                return -2
+            subject_word: sview = sy_take_word(&scan)
+            if not sy_take_literal(&scan, " and "):
+                return -2
+            other_word: sview = sy_take_word(&scan)
+            if not (sy_take_literal(&scan, "?") and sy_scan_done(&scan)):
+                return -2
+            if sy_bank_families(bank) != 1 or Ints::at(bank.present, SY_CATEGORICAL) == 0:
+                return -2
+            # The terms in the order the question and then the premises name
+            # them, which is what the statement indices are into.
+            terms: mutable darray[i64] = Ints::zeros(SY_MOST_NAMES)
+            where: mutable darray[i64] = Ints::zeros(SY_MOST_NAMES)
+            fill: mutable i64 = 0
+            while fill < SY_MOST_NAMES |fill, where|:
+                Ints::put(&where, fill, -1)
+                fill <- fill + 1
+            subject: i64 = sy_find_name(table, subject_word)
+            other: i64 = sy_find_name(table, other_word)
+            count: mutable i64 = 0
+            Ints::put(&terms, count, subject)
+            Ints::put(&where, subject, count)
+            count <- count + 1
+            Ints::put(&terms, count, other)
+            Ints::put(&where, other, count)
+            count <- count + 1
+            edge: mutable i64 = 0
+            while edge < bank.count |edge, bank, terms, where, count|:
+                side: mutable i64 = 0
+                while side < 2 |side, edge, bank, terms, where, count|:
+                    word: i64 = Ints::at(bank.left, edge) if side == 0 else Ints::at(bank.right, edge)
+                    if Ints::at_ref(&where, word) < 0:
+                        Ints::put(&terms, count, word)
+                        Ints::put(&where, word, count)
+                        count <- count + 1
+                    side <- side + 1
+                edge <- edge + 1
+            statements: mutable SyStatements = sy_statements_new(SY_MOST_LINES)
+            at: mutable i64 = 0
+            while at < bank.count |at, bank, where, statements|:
+                sy_statement_put(&statements, at, Ints::at(bank.value0, at), Ints::at_ref(&where, Ints::at(bank.left, at)), Ints::at_ref(&where, Ints::at(bank.right, at)))
+                at <- at + 1
+            statements.count <- bank.count
+            holds: mutable i64 = 0
+            first: mutable i64 = -1
+            form: mutable i64 = 0
+            while form < 4 |form, count, statements, where, subject, other, holds, first|:
+                if sy_entails(count, &statements, form, Ints::at_ref(&where, subject), Ints::at_ref(&where, other)):
+                    first <- form if holds == 0
+                    holds <- holds + 1
+                form <- form + 1
+            if holds != 1:
+                return 4
+            return first
+        # The chain families.
+        scan: mutable SyScan = sy_scan_new(asked)
+        subject_word: mutable sview = asked
+        other_word: mutable sview = asked
+        matched: mutable bool = false
+        if family == SY_PARITY:
+            if sy_take_literal(&scan, "Is "):
+                subject_word <- sy_take_word(&scan)
+                if sy_take_literal(&scan, " the same as "):
+                    other_word <- sy_take_word(&scan)
+                    matched <- sy_take_literal(&scan, ", or the opposite?") and sy_scan_done(&scan)
+        if family == SY_ORDER:
+            if sy_take_literal(&scan, "Is "):
+                subject_word <- sy_take_word(&scan)
+                if sy_take_literal(&scan, " more than "):
+                    other_word <- sy_take_word(&scan)
+                    matched <- sy_take_literal(&scan, ", or less?") and sy_scan_done(&scan)
+        if family == SY_PLANE or family == SY_SPACE:
+            if sy_take_literal(&scan, "Which way is "):
+                subject_word <- sy_take_word(&scan)
+                if sy_take_literal(&scan, " from "):
+                    other_word <- sy_take_word(&scan)
+                    matched <- sy_take_literal(&scan, "?") and sy_scan_done(&scan)
+        if not matched:
+            return -2
+        # A flat question whose premises all read back flat is banked as PLANE;
+        # the widest thing said is what decides.
+        banked_family: mutable i64 = family
+        if family == SY_PLANE or family == SY_SPACE:
+            banked_family <- SY_SPACE if Ints::at(bank.present, SY_SPACE) > 0 else SY_PLANE
+        if Ints::at(bank.present, banked_family) == 0:
+            return -2
+        got: i64 = sy_reread(bank, banked_family, sy_find_name(table, subject_word), sy_find_name(table, other_word), table.count)
+        if got == SY_UNTOLD:
+            untold: i64 = sy_untold_label(family)
+            return untold if untold != SY_UNTOLD else -2
+        # A direction read back at three axes has to be said in the question's
+        # own option space, which may be two.
+        if (family == SY_PLANE or family == SY_SPACE) and banked_family != family:
+            return -2
+        return got if got < sy_option_count(family) else -2
+
+def sy_find_name(table: SyNames&, word: sview) -> i64:
+    can Abort.Panic:
+        index: mutable i64 = 0
+        while index < table.count |index, table, word|:
+            if sview_eq(sy_name(table, index), word):
+                return index
+            index <- index + 1
+        return -1
+
+# Whether the question survives being read back off its own page.
+def sy_checks_out(q: SyQuestion&, family: i64, bank: mutable SyBank&, table: mutable SyNames&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        if q.answer < 0 or q.answer >= q.option_count:
+            return false
+        if q.surface < 0 or q.surface >= q.option_count:
+            return false
+        if q.steps < 1 or q.decoys < 0:
+            return false
+        # `len(set(options)) != len(options)` -- two options spelling the same
+        # thing would make one of them unanswerable.
+        one: mutable i64 = 0
+        while one < q.option_count |one, q|:
+            two: mutable i64 = one + 1
+            while two < q.option_count |two, one, q|:
+                if sview_eq(sy_option(q, one), sy_option(q, two)):
+                    return false
+                two <- two + 1
+            one <- one + 1
+        # A page that will not read back is a fault rather than a wrong answer,
+        # and it is dealt again rather than handed over.
+        return sy_read_back(q, family, bank, table) == q.answer
+
 # --- dealing one ---
 
 struct SyWork:
@@ -2630,6 +3387,8 @@ struct SyWork:
     meta: mutable SyMeta
     pool: mutable SyNames
     parts: mutable darray[SyPart]
+    bank: mutable SyBank
+    table: mutable SyNames
 
 def sy_work_new() -> SyWork:
     can Memory.Allocate, Abort.Panic:
@@ -2642,11 +3401,24 @@ def sy_work_new() -> SyWork:
         out.parts <- []
         for _slot in 0..<3 |out|:
             out.parts.push(sy_part_new())
+        out.bank <- sy_bank_new()
+        out.table <- sy_names_new()
         return out
 
-# One question at `grade`. The chain families only, for now: the categorical,
-# meta and binary builders are separate and land beside this one.
+# One question at `grade`, READ BACK before it is handed over. Up to twelve
+# tries: a page that will not read back is dealt again rather than handed over,
+# which is why the verifier is part of the generation path and not a test.
 def sy_deal_one(g: SyGrade, rng: mutable MT19937&, made_up: bool, work: mutable SyWork&, q: mutable SyQuestion&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        attempt: mutable i64 = 0
+        while attempt < 12 |attempt, g, rng, made_up, work, q|:
+            if sy_build_one(g, rng, made_up, work, q):
+                if sy_checks_out(q, g.family, &work.bank, &work.table):
+                    return true
+            attempt <- attempt + 1
+        return false
+
+def sy_build_one(g: SyGrade, rng: mutable MT19937&, made_up: bool, work: mutable SyWork&, q: mutable SyQuestion&) -> bool:
     can Memory.Allocate, Abort.Panic:
         family: i64 = g.family
         if family == SY_PARITY or family == SY_ORDER or family == SY_PLANE or family == SY_SPACE:

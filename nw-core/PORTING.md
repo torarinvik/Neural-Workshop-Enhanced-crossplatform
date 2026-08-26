@@ -27,10 +27,11 @@ source nw-core/scripts/env.sh     # pins our worktree compilers; gate ON
 
 ## Language gotchas
 
-**Reserved words.** `tail` is one, and so is `move` — which does not announce
-itself: a local called `move` fails at its *next* use with `unexpected token <
-in expression`, not at the declaration. If you get that or `expected IDENT, got
-<name>`, rename the identifier.
+**Reserved words.** The full list met so far: `tail`, `move`, `stack`, `to`,
+`heap`, `emit`. Most do not announce themselves — a local called `move` fails
+at its *next* use with `unexpected token < in expression`, not at the
+declaration. If you get that or `expected IDENT, got <name>`, rename the
+identifier and look at the line ABOVE the one the error points at.
 
 **Locals are immutable by default.** Reassigning needs `x: mutable i64 = 0`.
 The diagnostic says so plainly.
@@ -81,6 +82,40 @@ not need it.
 literal as the fallback confuses the parser — call a helper instead. `catch`
 as an *expression* needs a block form; prefer `try … else`.
 
+## Floating point
+
+Settled by measurement, not by reading the source. Four findings, each of which
+cost a wrong port before it was found:
+
+- **Compile with `-fstrict-fp`** (env.sh sets `ELISACORE_STRICT_FP=1`).
+  Stage0 stamps LLVM's `contract` flag on every FP op, so `a + b * c` may fuse
+  into a single-rounding fma; stage1 never has. The two stages therefore
+  disagreed. Python's `uniform(a, b)` is `a + (b - a) * random()`, and for a
+  negative `a` the add cancels: 37 of 160 draws came out different.
+- **`math.hypot` is not libm's and is not correctly rounded.** Use `py_hypot`
+  (`src/pymath.elisa`), which is the classic `max * sqrt(1 + (min/max)^2)` and
+  matches this CPython exactly. Where a hypot is only *compared* the difference
+  is invisible; where its value is *kept* it is not.
+- **`math.radians` is one multiply**, by a precomputed `pi/180`. Writing
+  `x * pi / 180.0` is two roundings and differs for a third of arguments.
+- **Everything else in libm agrees.** sin, cos, exp, atan2, sqrt, asin and pow
+  all matched CPython bit-for-bit over 300 random arguments each.
+
+When a module's floats worry you, do what these did: monkey-patch the suspect
+function in the *reference*, re-run a few thousand cases, and see whether any
+output changes. That answers the question; reading the C source only raises it.
+
+## Structs: pre-size buffers, do not grow them through a helper
+
+`helper(&thing.buffer, x)` — handing a container FIELD of a struct ref to a
+function that grows it — is rejected with "cannot infer region parameter", and
+the obvious compiler fix is unsound (elisa-core
+`docs/REGION_FIELD_FORWARD_GAP.md` records the measurement). Growing the field
+*in place* is fine, and so is building a local `dstr` and returning it.
+
+So: pre-size with `Ints::zeros` / `Bytes::zeros` and write by index, keeping
+the used length beside it. Every task module here does this.
+
 ## Fidelity rules
 
 These are what the differential harnesses are for. The job is behavioural
@@ -104,6 +139,24 @@ identity, not improvement.
 - **Compare integers in harnesses.** Emit floats scaled and truncated
   (`(value * 100000.0).i64()`) so a formatting difference never masquerades as
   a logic difference.
+
+## Order, everywhere
+
+Python's containers are ordered and the reference leans on it constantly.
+Three distinct things, and conflating them is the most common way a port
+diverges while still looking right:
+
+- **Dict insertion order.** `for k in d`, `list(d)`, `min(d, key=...)` all
+  follow the order keys were first inserted. Model it with an ordered list plus
+  a lookup table. No hashing is involved. (twohands' solver layers, syllogism's
+  `_askable`.)
+- **`sorted(d)` sorts the KEYS.** When those keys are label strings, the order
+  is alphabetical over what is *printed*, which is rarely the order of any
+  index you have chosen. Render and compare.
+- **Set iteration order IS hashed**, and there you have to model CPython's
+  table exactly — see `src/tasks/pyset.elisa`. Check whether the reference
+  actually iterates the set or only tests membership; membership needs no
+  order at all.
 
 ## Adding a suite
 
