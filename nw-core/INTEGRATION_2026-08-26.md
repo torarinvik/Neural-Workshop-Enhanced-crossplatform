@@ -20,8 +20,41 @@ it was found.
 table (see below).
 
   * self-hosts to the FIXPOINT: `gen3.o == gen4.o byte-identical`
-  * the 193-script stage1 parity gate: see run log
-  * nw-core suites on stage1: see run log
+  * nw-core suites on stage1: 22/22, 39,757 cases
+  * stage1 parity gate: 188 of 190, both remainders traced to other branches
+
+### The parity gate's 7 failures, accounted for
+
+Two were REAL and are fixed:
+
+  * **runtime drift guard** -- arena.elisa had diverged between the repos, since
+    codex/wasm-support changed only the vendored copy. Fixing it surfaced more
+    than a file mismatch: Elisa-core's copy never SELECTED
+    ARENA_BACKEND_WASM_HEAPBASE (defined, implemented, absent from the selection
+    chain), so a wasm target fell through to LIBC_MALLOC, and its free arm was
+    `pass`, leaking every region block.
+  * **ELISA_TARGET_OS_WASM unknown to stage0** -- stage0 defined
+    ELISA_TARGET_OS_WASI while stage1 and the std use ELISA_TARGET_OS_WASM.
+    Registered as an ALIAS: the std declares that const itself for bootstrap, so
+    defining a symbol makes it a duplicate and breaks every std build.
+
+Two were MY errors running the gate, not defects:
+
+  * **project_report_smoke** and **diagnostic breadth baseline** resolve stage0
+    as `${ELISAC:-$HOME/.elisac/elisac}`, NOT `$ELISACORE_BIN`, so they compared
+    against the stale shared binary. Both pass when ELISAC is pointed at the
+    integration stage0 (project report: 91 passed, 0 failed).
+
+Three belong to other branches and are catch-up items, not merge damage:
+
+  * **diagnostics message parity** -- `aggregate values do not support ==` is a
+    diagnostic codex/stage0-idiomatic ADDS (absent from `work`); stage1 has not
+    implemented it yet, which is exactly what a "stage1 covers stage0" gate is
+    for.
+  * **emit_ast / emit_header / emit_unsafe** -- all three fail on one fixture,
+    `test/repro/wasm_minimal.elisa`, which codex/wasm-support introduces. stage0
+    and stage1 disagree on the AST shape of `static if ELISA_TARGET_OS_WASM`
+    (15 declarations vs 16: one keeps the node, the other expands the branch).
 
 ## What is NOT ready, and why
 
