@@ -61,5 +61,6 @@ print(json.dumps(dict(
     key_line_height=(keys.keys.content_height / len(keys.keys.text.split("\n"))) / SY,
     splash=dict(x=graphic.x / SX, y=graphic.y / SY,
                 w=graphic.width / SX, h=graphic.height / SY),
+    splash_variant=("splash-black" if black else "splash"),
     black_background=black, jaeggi=jaeggi, clinical=clinical,
 ), indent=1))

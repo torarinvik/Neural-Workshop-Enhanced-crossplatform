@@ -95,6 +95,10 @@ def check_frame(cmds, ref, label, problems):
     if fit["kind"] != "sprite_fit":
         problems.append("%s: second command is %s, not the splash" % (label, fit["kind"]))
     else:
+        want_asset = 2 if ref["splash_variant"] == "splash-black" else 1
+        if fit["asset"] != want_asset:
+            problems.append("%s: splash asset %d != %d (%s)"
+                            % (label, fit["asset"], want_asset, ref["splash_variant"]))
         s = ref["splash"]
         for axis, centre in (("x", s["x"] + s["w"] / 2.0), ("y", s["y"] + s["h"] / 2.0)):
             if not close(fit[axis], centre):
