@@ -151,3 +151,90 @@ means stashing their work and having them reapply it. That cost was paid once
 already this week and produced 10 conflicts.
 
 Neither was done. Both wait on a decision.
+
+---
+
+# LANDED on Elisa-compiler `work`, and the branch sweep
+
+## `work`: `3fa962a5` -> `6921b84a`, 7 commits
+
+Two fast-forwards, each gated on its own before it moved:
+
+  1. **`3fa962a5 -> 6207394f`** (6 commits) — the consolidation: our three
+     `nw-port` commits plus the stranded crash fixture. Verified IN THE MAIN
+     WORKTREE after landing, not only in the scratch checkout: 60/60 suites.
+
+  2. **`6207394f -> 6921b84a`** (1 commit) — a fix SALVAGED from a branch that
+     was then deleted (below).
+
+The main worktree was clean and the repo has no git hooks, so nothing was
+stashed and `~/.elisac/elisac` never moved (`e2f0caf537fc143372c57ec5`, mtime
+unchanged throughout).
+
+## The salvage: reading the wip branches before deleting them
+
+The `codex/worktree-save-*` branches looked like parking snapshots, and mostly
+were. But "delete the non-gains" still requires OPENING them, and two carried
+content that existed nowhere else:
+
+  * `codex/worktree-save-integration-idio`'s tip added `push`/`extend` to the
+    discarded-call list — **already in `work`** under a different sha. Nothing
+    to save.
+
+  * `codex/worktree-save-structpy-stage1-codex2`'s tip was NOT in work, and
+    all four files it touches exist on `work`. Cherry-picked onto `work` ALONE
+    — independent of the 105-commit stack it was sitting on — and it applied
+    cleanly:
+
+      - `struct_contains_darray` was a tree walk over a GRAPH. Recursive and
+        mutually recursive records are legal, so it could fail to terminate;
+        now memoized (0 unknown / 1 visiting / 2 no / 3 yes), which both breaks
+        the cycle and makes later ABI queries O(1).
+      - a string literal is a static `u8` reference and stage0 merges it with
+        the plain `u8&` spelling; the coarse table saw `u8` and reported a FALSE
+        ternary mismatch. The exception is narrow by design: only a direct
+        identifier recorded as `u8&`, never an arbitrary numeric expression,
+        cstr or sview.
+
+    Gated on its own: `self_host_gen2 OK`, **`gen3.o == gen4.o` byte-identical**,
+    60/60 suites. Its commit message was `wip: save stage1 backend changes`;
+    rewritten to say what it does, authorship preserved.
+
+## Branches: 20 -> 4
+
+Deleted 8 with `git branch -d` (git itself refused to delete anything not fully
+merged): `codex/wasm-support`, `integration`, `nw-integration-safe-2026-08-26`,
+and five August-8 `worktree-agent-*` snapshots.
+
+Deleted 7 more as non-gains, each archived as a tag FIRST — a convention this
+repo already used (`archive/niche-optional-abi-wip` predates this sweep):
+
+    archive/idiomatic-self-hosting     archive/nw-integration-full
+    archive/integration-idio           archive/structpy-stage1-codex2
+    archive/qol-validation             archive/qol-validation2
+    archive/generic-debug-fixture
+
+Nothing was destroyed. Every deleted tip is still reachable by tag, and any of
+them comes back with `git branch <name> <tag>`. To purge one for real:
+`git tag -d archive/<name>`.
+
+Remaining: `work`, `main`, `codex/main-worktree` (the other agent's checkout),
+`nw-port` (ours, now identical to `work`).
+
+**`codex/idiomatic-self-hosting` is the one to think about again later.** It is
+archived rather than merged because it still cannot self-host, but its 85 stdlib
+modules — json, http, net, regex, uuid, base64, datetime, process, concurrency —
+exist in no other ref. The salvage above shows the shape of the cheap win:
+individual fixes on that stack can be cherry-picked onto `work` and gated one at
+a time, without taking the branch as a whole.
+
+## Elisa-core is untouched and still pending
+
+Its `work` is `da8cb230`, 36 commits behind `nw-consolidate-2026-08-26`, with 33
+files of the other agent's live work in the checkout. Landing there means
+stashing their work AND its hooks rebuild the shared binary. Deferred by
+request.
+
+Our own stage0 worktree was moved onto `nw-consolidate-2026-08-26` so the port
+builds against the consolidated compiler, which is what all of the above was
+verified with.
