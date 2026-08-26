@@ -124,3 +124,33 @@ transcription. `matching_diff.py` shows the pattern.
 **Score divergences explicitly.** Where the reference raises, emit an agreed
 code on both sides (`matching` uses `9`) rather than skipping the row — a
 skipped row is an untested row.
+
+## Module blocks: use them for NEW leaf modules, not yet for the task modules
+
+Elisa has real namespaces -- `module Name:` with `::` for namespace members and
+`.` for value members. They are the right tool and the `maze_`/`nar_`/`cw_`
+prefixes scattered through src/tasks are not; prefixes are C-style scoping in a
+language that has the real thing.
+
+`src/tasks/ints.elisa` uses them (`Ints::at`, `Floats::zeros`) and passes on
+BOTH stages, so simple leaf modules are safe and new code should be written
+that way.
+
+Converting the six existing task modules is NOT safe yet. All six passed on
+stage0 and ALL SIX FAILED ON STAGE1, with errors like
+
+    cannot call non-function value of type Grade
+
+and, in a reduced probe, a SILENT WRONG ANSWER rather than a decline. See
+worktrees/elisa-core-nw/repro/nw_stage1_module_member_wrong_answer.elisa, which
+also lists the six shapes that were tried and DO work on stage1, so a
+minimisation does not repeat them.
+
+The conversion was reverted rather than kept stage0-only. Every suite passing
+on both compilers is the property this port is actually for; a tidier namespace
+that only one compiler can build is a worse trade than a prefix.
+
+Revisit once stage1's module handling is fixed. The mechanical transform is
+straightforward -- the one trap is that substitutions must be applied in a
+SINGLE pass, because rewriting `MazeWork` to `Maze::Work` and then letting a
+`Maze` rule fire again on its own output gives `Maze::Dealt::Work`.
