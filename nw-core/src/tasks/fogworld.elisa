@@ -1,0 +1,244 @@
+# Fog of war: the world behind the fog, and what the eye reaches from a cell.
+#
+# Port of neural_workshop/fogworld.py (GPL-2.0-or-later). A braided maze with
+# most dead ends opened back up -- 0.85 against the maze's much lower share --
+# which is what turns a puzzle into somewhere to walk: loops mean there is more
+# than one way anywhere, so exploring is covering ground rather than solving a
+# tree.
+#
+# ## What this reuses, and the one thing it cannot
+#
+# The reference imports DIRECTIONS, adjacency, braid, cell_of and reachable
+# straight from maze.py and carves only its own rectangle, "because a fog world
+# is wider than it is tall and a maze is square". This file does the same
+# against tasks/maze.elisa, so the ORDER-SENSITIVE machinery -- the CPython set
+# emulation and the braid that iterates it -- has exactly one implementation.
+# That matters more here than it looks: braid shuffles the dead ends and slices
+# them, so a different set iteration order gives a different world for the same
+# seed, and a second copy of mset_* would be a second chance to get it wrong.
+#
+# MazeWork already carries width and height separately, so it is rectangular
+# already; only its CONSTRUCTOR and carve assumed square. fog_work_new and
+# fog_carve are those two generalised, and everything downstream (braid,
+# adjacency, realise, distances) is called unchanged.
+#
+# ## Random-stream fidelity
+#
+# The generator draws in a fixed order, and this is the whole contract:
+#   carve     randrange(rooms_x), then randrange(rooms_y)   <- x FIRST
+#             then one choice(fresh) per carved edge
+#   braid     one shuffle(ends), then one choice(walls) per opened dead end
+#   generate  one choice(sorted(open_cells)) for the start
+#
+# The x-then-y order in carve is load-bearing: `rng.randrange(rooms_x)` is
+# evaluated before `rng.randrange(rooms_y)` inside the tuple, and on a
+# rectangle the two bounds differ, so swapping them consumes different numbers
+# of bits and desynchronises everything after.
+
+# Rooms across and down: a 25 by 15 grid. Wider than tall because a screen is.
+const FOG_ROOMS_ACROSS: i64 = 12
+const FOG_ROOMS_DOWN: i64 = 7
+
+# How many dead ends are opened back into the world.
+const FOG_OPENNESS: f64 = 0.85
+
+# How far the eye reaches, in cells.
+const FOG_DEFAULT_RADIUS: i64 = 2
+
+struct FogWorld:
+    width: mutable i64
+    height: mutable i64
+    start: mutable i64
+    # 1 where the cell is floor. Walls are the complement, which is how the
+    # reference stores it (`walls`), but a flag array answers both questions.
+    open_flag: mutable darray[i64]
+    open_n: mutable i64
+
+# A workspace for a rooms_x by rooms_y lattice. `span` is 1 because a fog world
+# has no doors, so the (cell, keys held) search space collapses to the grid and
+# the big per-state arrays stay small.
+def fog_work_new(a: mutable Arena&, rooms_x: i64, rooms_y: i64) -> MazeWork:
+    can Memory.Allocate, Abort.Panic:
+        width: i64 = 2 * rooms_x + 1
+        height: i64 = 2 * rooms_y + 1
+        cells: i64 = width * height
+        rooms: i64 = rooms_x * rooms_y
+        work: mutable MazeWork = zeroed
+        work.rooms <- rooms_x
+        work.width <- width
+        work.height <- height
+        work.cells <- cells
+        work.span <- 1
+        work.table <- maze_zeros(a, maze_pow2_above(4 * cells))
+        work.mask <- MAZE_SET_MINSIZE - 1
+        work.snap <- maze_zeros(a, cells)
+        work.open_flag <- maze_zeros(a, cells)
+        work.open_list <- maze_zeros(a, cells)
+        work.adj <- maze_zeros(a, cells * 4)
+        work.adj_n <- maze_zeros(a, cells)
+        work.dist <- maze_zeros(a, cells)
+        work.stamp <- maze_zeros(a, cells)
+        work.blocked <- maze_zeros(a, cells)
+        work.order <- maze_zeros(a, cells)
+        work.room_seen <- maze_zeros(a, rooms)
+        work.stack_x <- maze_zeros(a, rooms)
+        work.stack_y <- maze_zeros(a, rooms)
+        work.ends <- maze_zeros(a, cells)
+        work.from_start <- maze_zeros(a, cells)
+        work.from_exit <- maze_zeros(a, cells)
+        work.walk_order <- maze_zeros(a, cells)
+        work.beads <- maze_zeros(a, cells)
+        work.room <- maze_zeros(a, cells)
+        work.taken <- maze_zeros(a, cells)
+        work.svisit <- maze_zeros(a, cells)
+        work.sparent <- maze_zeros(a, cells)
+        work.ssteps <- maze_zeros(a, cells)
+        work.squeue <- maze_zeros(a, cells)
+        work.route <- maze_zeros(a, cells)
+        return work
+
+# The depth-first backtracker on a rooms_x by rooms_y lattice. maze_carve with
+# the square bound split in two; the draw order is identical.
+def fog_carve(work: mutable MazeWork&, rng: mutable MT19937&, rooms_x: i64, rooms_y: i64):
+    can Abort.Panic:
+        width: i64 = 2 * rooms_x + 1
+        height: i64 = 2 * rooms_y + 1
+        work.rooms <- rooms_x
+        work.width <- width
+        work.height <- height
+        work.cells <- width * height
+        mset_reset(work)
+        clear: mutable i64 = 0
+        while clear < rooms_x * rooms_y |clear, rooms_x, rooms_y, work|:
+            maze_put(&work.room_seen, clear, 0)
+            clear <- clear + 1
+
+        # x before y: see the header. On a rectangle the bounds differ, so the
+        # two draws are not interchangeable.
+        here_x: i64 = py_randbelow(rng, rooms_x.u64()).i64()
+        here_y: i64 = py_randbelow(rng, rooms_y.u64()).i64()
+        maze_put(&work.room_seen, here_y * rooms_x + here_x, 1)
+        mset_add(work, maze_cell_of(width, 2 * here_x + 1, 2 * here_y + 1))
+        maze_put(&work.stack_x, 0, here_x)
+        maze_put(&work.stack_y, 0, here_y)
+        depth: mutable i64 = 1
+
+        while depth > 0 |depth, work, rng, rooms_x, rooms_y, width|:
+            x: i64 = maze_at(work.stack_x, depth - 1)
+            y: i64 = maze_at(work.stack_y, depth - 1)
+            # choice() only takes an index from the stream, so counting the
+            # unvisited neighbours and walking to the chosen one is the same
+            # draw as materialising the list.
+            fresh: mutable i64 = 0
+            probe: mutable i64 = 0
+            while probe < 4 |probe, x, y, rooms_x, rooms_y, work, fresh|:
+                nx: i64 = x + maze_dir_dx(probe)
+                ny: i64 = y + maze_dir_dy(probe)
+                if nx >= 0 and nx < rooms_x and ny >= 0 and ny < rooms_y and maze_at(work.room_seen, ny * rooms_x + nx) == 0:
+                    fresh <- fresh + 1
+                probe <- probe + 1
+            if fresh == 0:
+                depth <- depth - 1
+            else:
+                pick: i64 = py_choice_index(rng, fresh)
+                seen_so_far: mutable i64 = 0
+                chosen: mutable i64 = 0
+                scan: mutable i64 = 0
+                while scan < 4 |scan, x, y, rooms_x, rooms_y, work, seen_so_far, chosen, pick|:
+                    nx: i64 = x + maze_dir_dx(scan)
+                    ny: i64 = y + maze_dir_dy(scan)
+                    if nx >= 0 and nx < rooms_x and ny >= 0 and ny < rooms_y and maze_at(work.room_seen, ny * rooms_x + nx) == 0:
+                        chosen <- scan if seen_so_far == pick
+                        seen_so_far <- seen_so_far + 1
+                    scan <- scan + 1
+                next_x: i64 = x + maze_dir_dx(chosen)
+                next_y: i64 = y + maze_dir_dy(chosen)
+                maze_put(&work.room_seen, next_y * rooms_x + next_x, 1)
+                mset_add(work, maze_cell_of(width, x + next_x + 1, y + next_y + 1))
+                mset_add(work, maze_cell_of(width, 2 * next_x + 1, 2 * next_y + 1))
+                maze_put(&work.stack_x, depth, next_x)
+                maze_put(&work.stack_y, depth, next_y)
+                depth <- depth + 1
+
+# How many cells the eye reaches from `at`, and which. A plain disc: a cell is
+# in view when it is within `radius` as the crow flies. Walls do NOT cast
+# shadows, which the reference calls a real choice rather than an oversight --
+# a walker can see the far side of a wall it cannot reach, so seeing a place
+# and getting to it stay separate problems.
+#
+# Writes the visible cells into `out` (ascending, which is what a frozenset of
+# small ints iterates as under sorted()) and returns how many.
+def fog_visible(width: i64, height: i64, at: i64, radius: i64, out: mutable darray[i64]&) -> i64:
+    can Abort.Panic:
+        count: mutable i64 = 0
+        0 return if at < 0 or at >= width * height
+        at_x: i64 = at % width
+        at_y: i64 = at / width
+        reach: i64 = 0 if radius < 0 else radius
+        dy: mutable i64 = 0 - reach
+        while dy <= reach |dy, reach, at_x, at_y, width, height, out, count|:
+            dx: mutable i64 = 0 - reach
+            while dx <= reach |dx, dy, reach, at_x, at_y, width, height, out, count|:
+                if dx * dx + dy * dy <= reach * reach:
+                    x: i64 = at_x + dx
+                    y: i64 = at_y + dy
+                    if x >= 0 and x < width and y >= 0 and y < height:
+                        maze_put(out, count, y * width + x)
+                        count <- count + 1
+                dx <- dx + 1
+            dy <- dy + 1
+        return count
+
+# A world under `seed`: same seed, same walls, same starting cell.
+#
+# The walker is stood on a floor cell that can reach every other one. Braiding
+# this hard almost always leaves the floor in one piece, but the reference
+# refuses to rest a run on "almost always", so the largest connected piece is
+# what the walker is put in and everything the braid stranded is walled off
+# again.
+def fog_generate(work: mutable MazeWork&, a: mutable Arena&, rng: mutable MT19937&, rooms_x: i64, rooms_y: i64, openness: f64) -> FogWorld:
+    can Memory.Allocate, Abort.Panic:
+        fog_carve(work, rng, rooms_x, rooms_y)
+        maze_braid(work, rng, openness)
+        maze_realise(work)
+
+        # choice(sorted(open_cells)); open_list is already ascending.
+        start: i64 = maze_at(work.open_list, py_choice_index(rng, work.open_n))
+
+        # reachable(links, start): everything the start can walk to.
+        maze_distances(work, start, false)
+
+        world: mutable FogWorld = zeroed
+        world.width <- work.width
+        world.height <- work.height
+        world.start <- start
+        world.open_flag <- maze_zeros(a, work.cells)
+        world.open_n <- 0
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work, world|:
+            # Open AND reached. A cell the braid left stranded is floor in the
+            # corridor set but unreachable, and the reference walls it back up.
+            if maze_at(work.open_flag, cell) == 1 and maze_reached(work, cell):
+                maze_put(&world.open_flag, cell, 1)
+                world.open_n <- world.open_n + 1
+            cell <- cell + 1
+        return world
+
+def fog_walkable(world: FogWorld&, cell: i64) -> bool:
+    can Abort.Panic:
+        false return if cell < 0 or cell >= world.width * world.height
+        return maze_at(world.open_flag, cell) == 1
+
+# What share of the walkable world `seen` covers. `seen` is a cell list; only
+# its floor cells count, and each is counted once.
+def fog_coverage(world: FogWorld&, seen: darray[i64], seen_n: i64) -> f64:
+    can Abort.Panic:
+        0.0 return if world.open_n == 0
+        hits: mutable i64 = 0
+        index: mutable i64 = 0
+        while index < seen_n |index, seen, world, hits|:
+            cell: i64 = maze_at(seen, index)
+            if cell >= 0 and cell < world.width * world.height and maze_at(world.open_flag, cell) == 1:
+                hits <- hits + 1
+            index <- index + 1
+        return hits.f64() / world.open_n.f64()

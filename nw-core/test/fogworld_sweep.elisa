@@ -1,0 +1,163 @@
+# Differential sweep driver for tasks/fogworld.elisa. See fogworld_diff.py for
+# the reference side: the same grid runs through the real
+# neural_workshop/fogworld.py.
+#
+# Every seeded section reseeds MT19937 the way `random.Random(seed)` does and
+# then drives the port through the same call sequence the reference takes, so a
+# divergence in draw ORDER shows up as a whole world that differs rather than
+# as one wrong number. That matters most for carve: on a rectangle the two
+# randrange bounds differ, so x-then-y and y-then-x consume different bits and
+# everything downstream desynchronises.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../src/pyrandom.elisa"
+include "../src/tasks/maze.elisa"
+include "../src/tasks/fogworld.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+def seeded(seed: i64) -> MT19937:
+    can Abort.Panic:
+        rng: mutable MT19937 = mt19937_new()
+        mt_seed_int(&rng, seed.u64())
+        return rng
+
+# Openness values keyed by hundredths so the harness names the same float
+# literal on both sides rather than parsing one.
+def openness_of(hundredths: i64) -> f64:
+    return 0.0 if hundredths == 0 else (0.25 if hundredths == 25 else (0.5 if hundredths == 50 else (0.85 if hundredths == 85 else 1.0)))
+
+# ------------------------------------------------------------
+
+# carve alone: the corridor set after the backtracker, before any braiding.
+# Emitted as the ascending open-cell list, which is `sorted(open_cells)`.
+def sweep_carve(work: mutable MazeWork&):
+    can Console.Write, Abort.Panic:
+        for rx in [2, 3, 5, 8, 12] |work|:
+            for ry in [2, 3, 7] |work, rx|:
+                for seed in [0, 1, 7, 12345] |work, rx, ry|:
+                    rng: mutable MT19937 = seeded(seed)
+                    fog_carve(work, &rng, rx, ry)
+                    maze_realise(work)
+                    printr("carve")
+                    emit_cell(rx)
+                    emit_cell(ry)
+                    emit_cell(seed)
+                    emit_cell(work.open_n)
+                    index: mutable i64 = 0
+                    while index < work.open_n |index, work|:
+                        emit_cell(maze_at(work.open_list, index))
+                        index <- index + 1
+                    print("")
+
+# visible(): a plain disc, walls included, clipped to the grid.
+def sweep_visible(a: mutable Arena&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        out: mutable darray[i64] = maze_zeros(a, 4096)
+        for width in [5, 11, 25] |out|:
+            for height in [5, 15] |out, width|:
+                for at in [0, 1, 7, 12, 37, 60, 124, -1, 9999] |out, width, height|:
+                    for radius in [0, 1, 2, 3, -1] |out, width, height, at|:
+                        count: i64 = fog_visible(width, height, at, radius, &out)
+                        printr("vis")
+                        emit_cell(width)
+                        emit_cell(height)
+                        emit_cell(at)
+                        emit_cell(radius)
+                        emit_cell(count)
+                        index: mutable i64 = 0
+                        while index < count |index, out|:
+                            emit_cell(maze_at(out, index))
+                            index <- index + 1
+                        print("")
+
+# The whole generator: carve, braid, pick a start, wall off whatever the braid
+# stranded. This is the one that catches a draw-order divergence.
+def sweep_generate(work: mutable MazeWork&, a: mutable Arena&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        for rx in [3, 5, 12] |work, a|:
+            for ry in [2, 7] |work, a, rx|:
+                for hundredths in [0, 25, 50, 85] |work, a, rx, ry|:
+                    for seed in [0, 1, 7, 12345, 99991] |work, a, rx, ry, hundredths|:
+                        rng: mutable MT19937 = seeded(seed)
+                        world: FogWorld = fog_generate(work, a, &rng, rx, ry, openness_of(hundredths))
+                        printr("gen")
+                        emit_cell(rx)
+                        emit_cell(ry)
+                        emit_cell(hundredths)
+                        emit_cell(seed)
+                        emit_cell(world.width)
+                        emit_cell(world.height)
+                        emit_cell(world.start)
+                        emit_cell(world.open_n)
+                        cell: mutable i64 = 0
+                        while cell < world.width * world.height |cell, world|:
+                            if maze_at(world.open_flag, cell) == 1:
+                                emit_cell(cell)
+                            cell <- cell + 1
+                        print("")
+
+# coverage(): the share of walkable cells a seen-list covers. Driven with the
+# disc the walker would actually have, so the two modules are composed the same
+# way the game composes them.
+def sweep_coverage(work: mutable MazeWork&, a: mutable Arena&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        out: mutable darray[i64] = maze_zeros(a, 4096)
+        for rx in [3, 5] |work, a, out|:
+            for ry in [2, 7] |work, a, out, rx|:
+                for seed in [1, 7, 12345] |work, a, out, rx, ry|:
+                    rng: mutable MT19937 = seeded(seed)
+                    world: FogWorld = fog_generate(work, a, &rng, rx, ry, FOG_OPENNESS)
+                    for radius in [0, 1, 2, 4] |world, out, rx, ry, seed|:
+                        count: i64 = fog_visible(world.width, world.height, world.start, radius, &out)
+                        share: f64 = fog_coverage(&world, out, count)
+                        printr("cov")
+                        emit_cell(rx)
+                        emit_cell(ry)
+                        emit_cell(seed)
+                        emit_cell(radius)
+                        emit_cell(count)
+                        # Coverage as parts-per-million, so the comparison is on
+                        # integers and no float formatting has to agree.
+                        emit_cell(rint(share * 1000000.0).i64())
+                        print("")
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region arena_region(256 * 1024 * 1024)
+        arena: mutable Arena& = (&arena_region).cast[mutable Arena&]
+        work: mutable MazeWork = fog_work_new(arena, FOG_ROOMS_ACROSS, FOG_ROOMS_DOWN)
+        sweep_carve(&work)
+        sweep_visible(arena)
+        sweep_generate(&work, arena)
+        sweep_coverage(&work, arena)
+        destroy arena_region
+        return 0
