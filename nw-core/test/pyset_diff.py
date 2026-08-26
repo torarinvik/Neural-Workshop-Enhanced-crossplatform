@@ -41,12 +41,35 @@ def trial_line(trial, span, ops):
     return ",".join(str(v) for v in cells)
 
 
+def point_trial_line(trial, size, ops):
+    """The 2-tuple keyed variant: the slot comes from CPython's TUPLE hash, so
+    this exercises a different probe sequence over the same table."""
+    got = set()
+    state = trial * 6271 + 5
+    for _step in range(ops):
+        state = lcg(state); x = state % size
+        state = lcg(state); y = state % size
+        state = lcg(state)
+        if state % 100 < 70:
+            got.add((x, y))
+        else:
+            got.discard((x, y))
+    cells = ["pt", trial, size, ops, len(got)]
+    for x, y in got:
+        cells += [x, y]
+    return ",".join(str(v) for v in cells)
+
+
 def python_lines():
     out = []
     for span in (8, 32, 256, 1024):
         for ops in (1, 2, 5, 13, 40, 90):
             for trial in range(25):
                 out.append(trial_line(trial, span, ops))
+    for size in (5, 7, 9, 13):
+        for ops in (1, 3, 8, 20, 50):
+            for trial in range(20):
+                out.append(point_trial_line(trial, size, ops))
     return out
 
 

@@ -282,3 +282,231 @@ module PySet:
                     count <- count + 1
                 slot <- slot + 1
             return count
+
+# CPython's set again, but keyed by 2-TUPLES of small non-negative ints -- the
+# `(x, y)` points `go` keeps in sets and then reads positionally through
+# `rng.choice(tuple(boundary))`.
+#
+# Everything about the table is the same; what changes is that the slot comes
+# from the TUPLE HASH rather than from the key, so key and hash are no longer the
+# same number. Keys are stored encoded as `x * STRIDE + y` and the hash is
+# recomputed from that encoding, which keeps one array instead of two.
+#
+# The hash is CPython's xxHash-derived tuplehash. It was checked against
+# `hash((x, y))` for every point in 0..11 squared, and the whole table against
+# real `set` behaviour over 4000 random add/discard sequences, before being
+# written here.
+module PyPoint:
+    const STRIDE: i64 = 32
+    const XXPRIME_1: u64 = 11400714785074694791
+    const XXPRIME_2: u64 = 14029467366897019727
+    const XXPRIME_5: u64 = 2870177450012600261
+
+    def encode(x: i64, y: i64) -> i64:
+        return x * STRIDE + y
+
+    def decode_x(key: i64) -> i64:
+        return key / STRIDE
+
+    def decode_y(key: i64) -> i64:
+        return key % STRIDE
+
+    # `acc` rotated left by 31, which is CPython's _PyHASH_XXROTATE.
+    def rotate(value: u64) -> u64:
+        return (value << 31.u64()) | (value >> 33.u64())
+
+    # tuplehash for a 2-tuple of non-negative ints. A small int hashes to itself,
+    # so the lane IS the coordinate.
+    def hash_of(x: i64, y: i64) -> u64:
+        acc: mutable u64 = XXPRIME_5
+        acc <- acc + x.u64() * XXPRIME_2
+        acc <- PyPoint::rotate(acc)
+        acc <- acc * XXPRIME_1
+        acc <- acc + y.u64() * XXPRIME_2
+        acc <- PyPoint::rotate(acc)
+        acc <- acc * XXPRIME_1
+        return acc + (2.u64() ^ (XXPRIME_5 ^ 3527539.u64()))
+
+    def hash_of_key(key: i64) -> u64:
+        return PyPoint::hash_of(PyPoint::decode_x(key), PyPoint::decode_y(key))
+
+    struct PointTable:
+        slots: mutable darray[i64]
+        mask: mutable i64
+        fill: mutable i64
+        used: mutable i64
+        snap: mutable darray[i64]
+        snap_n: mutable i64
+
+    def new(capacity: i64) -> PointTable:
+        can Memory.Allocate, Abort.Panic:
+            size: mutable i64 = PySet::MINSIZE
+            while size < capacity * 4 |size, capacity|:
+                size <- size * 2
+            table: mutable PointTable = zeroed
+            table.slots <- Ints::zeros(size)
+            table.snap <- Ints::zeros(size)
+            table.mask <- PySet::MINSIZE - 1
+            table.fill <- 0
+            table.used <- 0
+            table.snap_n <- 0
+            slot: mutable i64 = 0
+            while slot < size |slot, size, table|:
+                Ints::put(&table.slots, slot, PySet::EMPTY)
+                slot <- slot + 1
+            return table
+
+    def reset(table: mutable PointTable&):
+        can Abort.Panic:
+            table.mask <- PySet::MINSIZE - 1
+            table.fill <- 0
+            table.used <- 0
+            table.snap_n <- 0
+            slot: mutable i64 = 0
+            while slot < table.slots.count.i64() |slot, table|:
+                Ints::put(&table.slots, slot, PySet::EMPTY)
+                slot <- slot + 1
+
+    def contains(table: PointTable&, x: i64, y: i64) -> bool:
+        can Abort.Panic:
+            key: i64 = PyPoint::encode(x, y)
+            mask: i64 = table.mask
+            hash_value: u64 = PyPoint::hash_of(x, y)
+            index: mutable i64 = (hash_value & mask.u64()).i64()
+            perturb: mutable u64 = hash_value
+            verdict: mutable i64 = 0
+            while verdict == 0 |verdict, index, perturb, mask, table, key|:
+                probes: i64 = PySet::LINEAR_PROBES if index + PySet::LINEAR_PROBES <= mask else 0
+                slot: mutable i64 = index
+                step: mutable i64 = 0
+                while step <= probes and verdict == 0 |step, probes, slot, table, key, verdict|:
+                    entry: i64 = Ints::at(table.slots, slot)
+                    if entry == PySet::EMPTY:
+                        verdict <- 2
+                    elif entry == key:
+                        verdict <- 1
+                    else:
+                        slot <- slot + 1
+                        step <- step + 1
+                if verdict == 0:
+                    perturb <- perturb >> PySet::PERTURB_SHIFT.u64()
+                    index <- ((index * 5 + 1).u64() + perturb).i64() & mask
+            return verdict == 1
+
+    def insert_clean(table: mutable PointTable&, key: i64):
+        can Abort.Panic:
+            mask: i64 = table.mask
+            hash_value: u64 = PyPoint::hash_of_key(key)
+            index: mutable i64 = (hash_value & mask.u64()).i64()
+            perturb: mutable u64 = hash_value
+            placed: mutable bool = false
+            while not placed |placed, index, perturb, mask, table, key|:
+                probes: i64 = PySet::LINEAR_PROBES if index + PySet::LINEAR_PROBES <= mask else 0
+                slot: mutable i64 = index
+                step: mutable i64 = 0
+                while step <= probes and not placed |step, probes, slot, table, key, placed|:
+                    if Ints::at(table.slots, slot) == PySet::EMPTY:
+                        Ints::put(&table.slots, slot, key)
+                        placed <- true
+                    else:
+                        slot <- slot + 1
+                        step <- step + 1
+                if not placed:
+                    perturb <- perturb >> PySet::PERTURB_SHIFT.u64()
+                    index <- ((index * 5 + 1).u64() + perturb).i64() & mask
+
+    def resize(table: mutable PointTable&, minused: i64):
+        can Abort.Panic:
+            newsize: mutable i64 = PySet::MINSIZE
+            while newsize <= minused |newsize, minused|:
+                newsize <- newsize * 2
+            table.snap_n <- 0
+            slot: mutable i64 = 0
+            while slot <= table.mask |slot, table|:
+                key: i64 = Ints::at(table.slots, slot)
+                if key >= 0:
+                    Ints::put(&table.snap, table.snap_n, key)
+                    table.snap_n <- table.snap_n + 1
+                slot <- slot + 1
+            table.mask <- newsize - 1
+            blank: mutable i64 = 0
+            while blank < newsize |blank, newsize, table|:
+                Ints::put(&table.slots, blank, PySet::EMPTY)
+                blank <- blank + 1
+            index: mutable i64 = 0
+            while index < table.snap_n |index, table|:
+                PyPoint::insert_clean(table, Ints::at(table.snap, index))
+                index <- index + 1
+            table.fill <- table.used
+
+    def add(table: mutable PointTable&, x: i64, y: i64):
+        can Abort.Panic:
+            key: i64 = PyPoint::encode(x, y)
+            mask: i64 = table.mask
+            hash_value: u64 = PyPoint::hash_of(x, y)
+            index: mutable i64 = (hash_value & mask.u64()).i64()
+            perturb: mutable u64 = hash_value
+            vacancy: mutable i64 = -1
+            present: mutable bool = false
+            while vacancy < 0 and not present |vacancy, present, index, perturb, mask, table, key|:
+                probes: i64 = PySet::LINEAR_PROBES if index + PySet::LINEAR_PROBES <= mask else 0
+                slot: mutable i64 = index
+                step: mutable i64 = 0
+                while step <= probes and vacancy < 0 and not present |step, probes, slot, table, key, vacancy, present|:
+                    entry: i64 = Ints::at(table.slots, slot)
+                    if entry == PySet::EMPTY:
+                        vacancy <- slot
+                    elif entry == key:
+                        present <- true
+                    else:
+                        slot <- slot + 1
+                        step <- step + 1
+                if vacancy < 0 and not present:
+                    perturb <- perturb >> PySet::PERTURB_SHIFT.u64()
+                    index <- ((index * 5 + 1).u64() + perturb).i64() & mask
+            return if present
+            table.fill <- table.fill + 1
+            table.used <- table.used + 1
+            Ints::put(&table.slots, vacancy, key)
+            return if table.fill * 5 < mask * 3
+            PyPoint::resize(table, table.used * 4)
+
+    def discard(table: mutable PointTable&, x: i64, y: i64):
+        can Abort.Panic:
+            key: i64 = PyPoint::encode(x, y)
+            mask: i64 = table.mask
+            hash_value: u64 = PyPoint::hash_of(x, y)
+            index: mutable i64 = (hash_value & mask.u64()).i64()
+            perturb: mutable u64 = hash_value
+            verdict: mutable i64 = 0
+            while verdict == 0 |verdict, index, perturb, mask, table, key|:
+                probes: i64 = PySet::LINEAR_PROBES if index + PySet::LINEAR_PROBES <= mask else 0
+                slot: mutable i64 = index
+                step: mutable i64 = 0
+                while step <= probes and verdict == 0 |step, probes, slot, table, key, verdict|:
+                    entry: i64 = Ints::at(table.slots, slot)
+                    if entry == PySet::EMPTY:
+                        verdict <- 2
+                    elif entry == key:
+                        Ints::put(&table.slots, slot, PySet::DUMMY)
+                        table.used <- table.used - 1
+                        verdict <- 1
+                    else:
+                        slot <- slot + 1
+                        step <- step + 1
+                if verdict == 0:
+                    perturb <- perturb >> PySet::PERTURB_SHIFT.u64()
+                    index <- ((index * 5 + 1).u64() + perturb).i64() & mask
+
+    # The encoded keys in ITERATION order -- the whole reason this exists.
+    def to_list(table: PointTable&, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            count: mutable i64 = 0
+            slot: mutable i64 = 0
+            while slot <= table.mask |slot, table, out, count|:
+                key: i64 = Ints::at(table.slots, slot)
+                if key >= 0:
+                    Ints::put(out, count, key)
+                    count <- count + 1
+                slot <- slot + 1
+            return count
