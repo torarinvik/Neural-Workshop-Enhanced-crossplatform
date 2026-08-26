@@ -503,3 +503,1016 @@ def sy_append_says(out: mutable dstr&, form: i64, subject: sview, other: sview):
         dstr_append_cstr(out, sy_article(other))
         dstr_append_cstr(out, " ")
         dstr_append_sview(out, other)
+
+# --- the premises, as a graph ---
+#
+# An edge means different things per family and one shape carries all of them:
+# for an order `right` is more than `left`; for a parity the value is 0 for the
+# same and 1 for the opposite; for a direction `right` stands one step `value`
+# away from `left`.
+const SY_MOST_EDGES: i64 = 32
+const SY_MOST_ITEMS: i64 = 16
+
+struct SyWeb:
+    grade: mutable SyGrade
+    items: mutable i64
+    left: mutable darray[i64]
+    right: mutable darray[i64]
+    value0: mutable darray[i64]
+    value1: mutable darray[i64]
+    value2: mutable darray[i64]
+    edges: mutable i64
+    # Where each item sits: a rank, a parity, or a point. Every edge is read
+    # off this, which is what makes the premises consistent without anything
+    # having to check them.
+    place0: mutable darray[i64]
+    place1: mutable darray[i64]
+    place2: mutable darray[i64]
+    # Which piece of the web each item is in. Two pieces is what makes
+    # `cannot be told` an answer.
+    part: mutable darray[i64]
+
+def sy_web_new() -> SyWeb:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable SyWeb = zeroed
+        out.left <- Ints::zeros(SY_MOST_EDGES)
+        out.right <- Ints::zeros(SY_MOST_EDGES)
+        out.value0 <- Ints::zeros(SY_MOST_EDGES)
+        out.value1 <- Ints::zeros(SY_MOST_EDGES)
+        out.value2 <- Ints::zeros(SY_MOST_EDGES)
+        out.place0 <- Ints::zeros(SY_MOST_ITEMS)
+        out.place1 <- Ints::zeros(SY_MOST_ITEMS)
+        out.place2 <- Ints::zeros(SY_MOST_ITEMS)
+        out.part <- Ints::zeros(SY_MOST_ITEMS)
+        return out
+
+def sy_edge_value(web: SyWeb&, edge: i64, axis: i64) -> i64:
+    can Abort.Panic:
+        if axis == 0:
+            return Ints::at(web.value0, edge)
+        if axis == 1:
+            return Ints::at(web.value1, edge)
+        return Ints::at(web.value2, edge)
+
+def sy_place(web: SyWeb&, item: i64, axis: i64) -> i64:
+    can Abort.Panic:
+        if axis == 0:
+            return Ints::at(web.place0, item)
+        if axis == 1:
+            return Ints::at(web.place1, item)
+        return Ints::at(web.place2, item)
+
+def sy_place_put(web: mutable SyWeb&, item: i64, axis: i64, value: i64):
+    can Abort.Panic:
+        Ints::put(&web.place0, item, value) if axis == 0
+        Ints::put(&web.place1, item, value) if axis == 1
+        Ints::put(&web.place2, item, value) if axis == 2
+
+# `count` items in one piece or two, never a piece of one: a piece of one item
+# is an item no premise mentions, and a word that appears nowhere gives the
+# answer away without any reasoning at all.
+#
+# Returns the size of the first group; the shuffled node order is in `nodes`.
+def sy_split(rng: mutable MT19937&, count: i64, parts: i64, nodes: mutable darray[i64]&) -> i64:
+    can Abort.Panic:
+        index: mutable i64 = 0
+        while index < count |index, count, nodes|:
+            Ints::put(nodes, index, index)
+            index <- index + 1
+        py_shuffle_i64_prefix(rng, nodes, count)
+        if parts < 2 or count < 5:
+            return count
+        return py_randint(rng, 2, count - 2)
+
+# One premise's worth of movement. For a direction family it re-rolls until
+# something moves, which costs a draw per rejected roll.
+def sy_step(rng: mutable MT19937&, family: i64, out: mutable darray[i64]&):
+    can Abort.Panic:
+        if family == SY_PARITY:
+            Ints::put(out, 0, py_randint(rng, 0, 1))
+            return
+        axes: i64 = sy_axes(family)
+        rolling: mutable bool = true
+        while rolling |rolling, axes, rng, out|:
+            any_move: mutable bool = false
+            axis: mutable i64 = 0
+            while axis < axes |axis, axes, rng, out, any_move|:
+                got: i64 = py_randint(rng, -1, 1)
+                Ints::put(out, axis, got)
+                any_move <- true if got != 0
+                axis <- axis + 1
+            rolling <- false if any_move
+
+def sy_joined(web: SyWeb&, one: i64, two: i64) -> bool:
+    can Abort.Panic:
+        edge: mutable i64 = 0
+        found: mutable bool = false
+        while edge < web.edges and not found |edge, web, one, two, found|:
+            left: i64 = Ints::at(web.left, edge)
+            right: i64 = Ints::at(web.right, edge)
+            found <- true if (left == one and right == two) or (left == two and right == one)
+            edge <- edge + 1
+        return found
+
+def sy_add_edge(web: mutable SyWeb&, left: i64, right: i64, v0: i64, v1: i64, v2: i64):
+    can Abort.Panic:
+        slot: i64 = web.edges
+        Ints::put(&web.left, slot, left)
+        Ints::put(&web.right, slot, right)
+        Ints::put(&web.value0, slot, v0)
+        Ints::put(&web.value1, slot, v1)
+        Ints::put(&web.value2, slot, v2)
+        web.edges <- slot + 1
+
+# A web of premises for `grade`, in `parts` pieces. False when there were not
+# enough unjoined pairs to hang the extra premises off.
+#
+# THE NUMBER OF PRINTED PREMISES DOES NOT DEPEND ON THE NUMBER OF PIECES, and
+# that is the whole reason `extra` moves with `parts`: a rung where two pieces
+# mean one line fewer is a rung where counting the lines answers the question.
+def sy_grow(rng: mutable MT19937&, g: SyGrade, parts: i64, names: mutable SyNames&, made_up: bool, have_names: bool, web: mutable SyWeb&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        if not have_names:
+            sy_things(rng, g.items, made_up, names)
+        web.grade <- g
+        web.items <- g.items
+        web.edges <- 0
+        family: i64 = g.family
+        nodes: mutable darray[i64] = Ints::zeros(SY_MOST_ITEMS)
+        cut: i64 = sy_split(rng, g.items, parts, &nodes)
+        group_count: i64 = 1 if cut >= g.items else 2
+        wipe: mutable i64 = 0
+        while wipe < g.items |wipe, g, web|:
+            sy_place_put(web, wipe, 0, 0)
+            sy_place_put(web, wipe, 1, 0)
+            sy_place_put(web, wipe, 2, 0)
+            wipe <- wipe + 1
+        if family == SY_ORDER:
+            ranks: mutable darray[i64] = Ints::zeros(SY_MOST_ITEMS)
+            rank: mutable i64 = 0
+            while rank < g.items |rank, g, ranks|:
+                Ints::put(&ranks, rank, rank)
+                rank <- rank + 1
+            py_shuffle_i64_prefix(rng, &ranks, g.items)
+            spot: mutable i64 = 0
+            while spot < g.items |spot, g, ranks, web|:
+                sy_place_put(web, spot, 0, Ints::at(ranks, spot))
+                spot <- spot + 1
+        axes: i64 = 1 if family == SY_PARITY else sy_axes(family)
+        step: mutable darray[i64] = Ints::zeros(4)
+        group: mutable i64 = 0
+        while group < group_count |group, group_count, cut, g, nodes, family, axes, rng, web, step|:
+            low: i64 = 0 if group == 0 else cut
+            high: i64 = cut if group == 0 else g.items
+            if family != SY_ORDER:
+                first: i64 = Ints::at(nodes, low)
+                axis: mutable i64 = 0
+                while axis < axes |axis, axes, first, web|:
+                    sy_place_put(web, first, axis, 0)
+                    axis <- axis + 1
+            position: mutable i64 = low + 1
+            while position < high |position, low, high, nodes, family, axes, rng, web, step|:
+                node: i64 = Ints::at(nodes, position)
+                # Mostly hang it off the last one, which grows CHAINS rather
+                # than stars: a star answers everything in two steps whatever
+                # its size, and a rung called "six in a row" ought to be six
+                # in a row.
+                parent: mutable i64 = 0
+                if py_random(rng) < 0.7:
+                    parent <- Ints::at(nodes, position - 1)
+                else:
+                    parent <- Ints::at(nodes, low + py_choice_index(rng, position - low))
+                if family == SY_ORDER:
+                    if sy_place(web, node, 0) > sy_place(web, parent, 0):
+                        sy_add_edge(web, parent, node, 1, 0, 0)
+                    else:
+                        sy_add_edge(web, node, parent, 1, 0, 0)
+                else:
+                    sy_step(rng, family, &step)
+                    if family == SY_PARITY:
+                        sy_place_put(web, node, 0, (sy_place(web, parent, 0) + Ints::at(step, 0)) % 2)
+                    else:
+                        axis: mutable i64 = 0
+                        while axis < axes |axis, axes, node, parent, step, web|:
+                            sy_place_put(web, node, axis, sy_place(web, parent, axis) + Ints::at(step, axis))
+                            axis <- axis + 1
+                    sy_add_edge(web, parent, node, Ints::at(step, 0), Ints::at(step, 1), Ints::at(step, 2))
+                position <- position + 1
+            group <- group + 1
+        wanted: i64 = g.extra + group_count - 1
+        if wanted > 0:
+            # `itertools.combinations(sorted(group), 2)` over each group in
+            # turn, keeping the pairs no edge already states.
+            free_one: mutable darray[i64] = Ints::zeros(256)
+            free_two: mutable darray[i64] = Ints::zeros(256)
+            free_n: mutable i64 = 0
+            sorted_group: mutable darray[i64] = Ints::zeros(SY_MOST_ITEMS)
+            band: mutable i64 = 0
+            while band < group_count |band, group_count, cut, g, nodes, sorted_group, web, free_one, free_two, free_n|:
+                low: i64 = 0 if band == 0 else cut
+                high: i64 = cut if band == 0 else g.items
+                size: i64 = high - low
+                copy: mutable i64 = 0
+                while copy < size |copy, size, low, nodes, sorted_group|:
+                    Ints::put(&sorted_group, copy, Ints::at(nodes, low + copy))
+                    copy <- copy + 1
+                Ints::sort_prefix(&sorted_group, size)
+                a: mutable i64 = 0
+                while a < size |a, size, sorted_group, web, free_one, free_two, free_n|:
+                    b: mutable i64 = a + 1
+                    while b < size |b, a, size, sorted_group, web, free_one, free_two, free_n|:
+                        one: i64 = Ints::at(sorted_group, a)
+                        two: i64 = Ints::at(sorted_group, b)
+                        if not sy_joined(web, one, two):
+                            Ints::put(&free_one, free_n, one)
+                            Ints::put(&free_two, free_n, two)
+                            free_n <- free_n + 1
+                        b <- b + 1
+                    a <- a + 1
+                band <- band + 1
+            if free_n < wanted:
+                return false
+            # The shuffle is over PAIRS, so the two arrays move together.
+            order: mutable darray[i64] = Ints::zeros(256)
+            fill: mutable i64 = 0
+            while fill < free_n |fill, free_n, order|:
+                Ints::put(&order, fill, fill)
+                fill <- fill + 1
+            py_shuffle_i64_prefix(rng, &order, free_n)
+            take: mutable i64 = 0
+            while take < wanted |take, wanted, order, free_one, free_two, family, web|:
+                slot: i64 = Ints::at(order, take)
+                one: i64 = Ints::at(free_one, slot)
+                two: i64 = Ints::at(free_two, slot)
+                if family == SY_ORDER:
+                    if sy_place(web, two, 0) > sy_place(web, one, 0):
+                        sy_add_edge(web, one, two, 1, 0, 0)
+                    else:
+                        sy_add_edge(web, two, one, 1, 0, 0)
+                else:
+                    if family == SY_PARITY:
+                        sy_add_edge(web, one, two, (sy_place(web, two, 0) - sy_place(web, one, 0)) % 2, 0, 0)
+                    else:
+                        # A direction family's extra premise is not renderable
+                        # exactly, so the reference declines the whole web.
+                        return false
+                take <- take + 1
+        mark: mutable i64 = 0
+        while mark < g.items |mark, g, cut, nodes, web|:
+            Ints::put(&web.part, Ints::at(nodes, mark), 0 if mark < cut else 1)
+            mark <- mark + 1
+        return true
+
+# --- reading it back ---
+
+# `cannot be told` is one of the three options for the families that offer it,
+# so it must use THAT index or the dict would grow two keys spelling the same
+# thing. The direction families never offer it, so there it is a key of its own.
+def sy_untold_label(family: i64) -> i64:
+    can Abort.Panic:
+        if family == SY_PARITY or family == SY_ORDER or family == SY_META or family == SY_BINARY:
+            return 2
+        return SY_UNTOLD
+
+def sy_label_text(family: i64, label: i64) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        if label == SY_UNTOLD:
+            out: mutable dstr = []
+            dstr_append_cstr(&out, "cannot be told")
+            return out
+        return sy_option_text(family, label)
+
+# Shortest path from `start` to `goal`, as premise numbers. `directed` follows
+# an order UPWARDS only, which is what makes an order different from the
+# others: two things in one piece of the web can still be incomparable.
+#
+# Writes the path into `path` and returns its length, or -1 when there is none.
+# A length of 0 means start == goal.
+def sy_route(web: SyWeb&, start: i64, goal: i64, directed: bool, path: mutable darray[i64]&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        if start == goal:
+            return 0
+        # `seen` holds each reached node's path, as a flat pool: one row of at
+        # most SY_MOST_EDGES premise numbers per item.
+        seen: mutable darray[i64] = Ints::zeros(SY_MOST_ITEMS)
+        pool: mutable darray[i64] = Ints::zeros(SY_MOST_ITEMS * SY_MOST_EDGES)
+        length: mutable darray[i64] = Ints::zeros(SY_MOST_ITEMS)
+        frontier: mutable darray[i64] = Ints::zeros(SY_MOST_ITEMS)
+        next_frontier: mutable darray[i64] = Ints::zeros(SY_MOST_ITEMS)
+        Ints::put(&seen, start, 1)
+        Ints::put(&length, start, 0)
+        Ints::put(&frontier, 0, start)
+        frontier_n: mutable i64 = 1
+        answer: mutable i64 = -1
+        while frontier_n > 0 and answer < 0 |frontier_n, web, goal, directed, seen, pool, length, frontier, next_frontier, path, answer|:
+            next_n: mutable i64 = 0
+            at: mutable i64 = 0
+            while at < frontier_n and answer < 0 |at, frontier_n, web, goal, directed, seen, pool, length, frontier, next_frontier, next_n, path, answer|:
+                node: i64 = Ints::at(frontier, at)
+                number: mutable i64 = 0
+                while number < web.edges and answer < 0 |number, web, node, goal, directed, seen, pool, length, next_frontier, next_n, path, answer|:
+                    left: i64 = Ints::at(web.left, number)
+                    right: i64 = Ints::at(web.right, number)
+                    other: mutable i64 = -1
+                    if left == node:
+                        other <- right
+                    else:
+                        other <- left if right == node and not directed
+                    if other >= 0 and Ints::at(seen, other) == 0:
+                        was: i64 = Ints::at(length, node)
+                        copy: mutable i64 = 0
+                        while copy < was |copy, was, node, other, pool|:
+                            Ints::put(&pool, other * SY_MOST_EDGES + copy, Ints::at(pool, node * SY_MOST_EDGES + copy))
+                            copy <- copy + 1
+                        Ints::put(&pool, other * SY_MOST_EDGES + was, number)
+                        Ints::put(&length, other, was + 1)
+                        Ints::put(&seen, other, 1)
+                        if other == goal:
+                            out: mutable i64 = 0
+                            while out <= was |out, was, other, pool, path|:
+                                Ints::put(path, out, Ints::at(pool, other * SY_MOST_EDGES + out))
+                                out <- out + 1
+                            answer <- was + 1
+                        else:
+                            Ints::put(&next_frontier, next_n, other)
+                            next_n <- next_n + 1
+                    number <- number + 1
+                at <- at + 1
+            shift: mutable i64 = 0
+            while shift < next_n |shift, next_n, next_frontier, frontier|:
+                Ints::put(&frontier, shift, Ints::at(next_frontier, shift))
+                shift <- shift + 1
+            frontier_n <- next_n
+        return answer
+
+# What `subject` is to `other`, and the premises that say so. Returns the label
+# and writes the path; the path length comes back in `path_len`.
+def sy_relation(web: SyWeb&, subject: i64, other: i64, path: mutable darray[i64]&, path_len: mutable i64&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        family: i64 = web.grade.family
+        path_len <- 0
+        if family == SY_ORDER:
+            up: i64 = sy_route(web, other, subject, true, path)
+            if up > 0:
+                path_len <- up
+                return 0
+            down: i64 = sy_route(web, subject, other, true, path)
+            if down > 0:
+                path_len <- down
+                return 1
+            return sy_untold_label(family)
+        if Ints::at(web.part, subject) != Ints::at(web.part, other):
+            return sy_untold_label(family)
+        walked: i64 = sy_route(web, other, subject, false, path)
+        path_len <- walked if walked > 0
+        if family == SY_PARITY:
+            apart: i64 = (sy_place(web, subject, 0) - sy_place(web, other, 0)) % 2
+            return 1 if apart != 0 else 0
+        axes: i64 = sy_axes(family)
+        return sy_direction_index(sy_place(web, subject, 0) - sy_place(web, other, 0), sy_place(web, subject, 1) - sy_place(web, other, 1), sy_place(web, subject, 2) - sy_place(web, other, 2), axes)
+
+# What a reader that never composes two premises answers: the first line that
+# names the thing asked about, and that line's relation, turned round if it
+# has to be. This is the atmosphere effect written down.
+def sy_surface(web: SyWeb&, order: darray[i64], subject: i64) -> i64:
+    can Abort.Panic:
+        family: i64 = web.grade.family
+        at: mutable i64 = 0
+        while at < web.edges |at, web, order, subject, family|:
+            number: i64 = Ints::at(order, at)
+            left: i64 = Ints::at(web.left, number)
+            right: i64 = Ints::at(web.right, number)
+            if subject == left or subject == right:
+                if family == SY_ORDER:
+                    return 0 if subject == right else 1
+                if family == SY_PARITY:
+                    return 0 if sy_edge_value(web, number, 0) == 0 else 1
+                axes: i64 = sy_axes(family)
+                if subject == right:
+                    return sy_direction_index(sy_edge_value(web, number, 0), sy_edge_value(web, number, 1), sy_edge_value(web, number, 2), axes)
+                return sy_direction_index(-sy_edge_value(web, number, 0), -sy_edge_value(web, number, 1), -sy_edge_value(web, number, 2), axes)
+            at <- at + 1
+        return sy_untold_label(family)
+
+# Every pair worth asking about, grouped by its answer. A pair one premise
+# states outright is not worth asking about, so it is not here; grouping by the
+# answer and then picking a GROUP is what keeps one option from being right
+# more often than the rest.
+const SY_MOST_PAIRS: i64 = 512
+
+struct SyAskable:
+    subject: mutable darray[i64]
+    other: mutable darray[i64]
+    label: mutable darray[i64]
+    path: mutable darray[i64]
+    path_len: mutable darray[i64]
+    count: mutable i64
+    # The distinct labels, in the order they were first seen -- the dict's own
+    # order, which is what `found[label]` and `len(found)` are read off.
+    labels: mutable darray[i64]
+    label_count: mutable i64
+
+def sy_askable_new() -> SyAskable:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable SyAskable = zeroed
+        out.subject <- Ints::zeros(SY_MOST_PAIRS)
+        out.other <- Ints::zeros(SY_MOST_PAIRS)
+        out.label <- Ints::zeros(SY_MOST_PAIRS)
+        out.path <- Ints::zeros(SY_MOST_PAIRS * SY_MOST_EDGES)
+        out.path_len <- Ints::zeros(SY_MOST_PAIRS)
+        out.labels <- Ints::zeros(64)
+        return out
+
+def sy_askable(web: SyWeb&, found: mutable SyAskable&):
+    can Memory.Allocate, Abort.Panic:
+        found.count <- 0
+        found.label_count <- 0
+        untold: i64 = sy_untold_label(web.grade.family)
+        scratch: mutable darray[i64] = Ints::zeros(SY_MOST_EDGES)
+        subject: mutable i64 = 0
+        while subject < web.items |subject, web, found, untold, scratch|:
+            other: mutable i64 = 0
+            while other < web.items |other, subject, web, found, untold, scratch|:
+                if other != subject and not sy_joined(web, subject, other):
+                    walked: mutable i64 = 0
+                    label: i64 = sy_relation(web, subject, other, &scratch, &walked)
+                    # A pair one premise away is not worth asking about, but a
+                    # pair nothing links is: proving a negative takes the lot.
+                    if label == untold or walked >= 2:
+                        slot: i64 = found.count
+                        Ints::put(&found.subject, slot, subject)
+                        Ints::put(&found.other, slot, other)
+                        Ints::put(&found.label, slot, label)
+                        Ints::put(&found.path_len, slot, walked)
+                        copy: mutable i64 = 0
+                        while copy < walked |copy, walked, slot, scratch, found|:
+                            Ints::put(&found.path, slot * SY_MOST_EDGES + copy, Ints::at(scratch, copy))
+                            copy <- copy + 1
+                        found.count <- slot + 1
+                        seen: mutable bool = false
+                        scan: mutable i64 = 0
+                        while scan < found.label_count |scan, found, label, seen|:
+                            seen <- true if Ints::at_ref(&found.labels, scan) == label
+                            scan <- scan + 1
+                        if not seen:
+                            Ints::put(&found.labels, found.label_count, label)
+                            found.label_count <- found.label_count + 1
+                other <- other + 1
+            subject <- subject + 1
+
+# Whether anything but `cannot be told` can be asked of this web. A piece of
+# three items with an extra premise across it is a triangle, and a triangle
+# states every pair outright: consistent, connected, and nothing left to ask.
+def sy_usable(found: SyAskable&, family: i64) -> bool:
+    can Abort.Panic:
+        untold: i64 = sy_untold_label(family)
+        at: mutable i64 = 0
+        any_told: mutable bool = false
+        while at < found.label_count |at, found, untold, any_told|:
+            any_told <- true if Ints::at(found.labels, at) != untold
+            at <- at + 1
+        return any_told
+
+# `sorted(found)` sorts the dict's keys, which are the label TEXTS, so the
+# order is alphabetical over what is printed rather than over any index.
+def sy_sorted_labels(family: i64, labels: darray[i64], count: i64, out: mutable darray[i64]&):
+    can Memory.Allocate, Abort.Panic:
+        copy: mutable i64 = 0
+        while copy < count |copy, count, labels, out|:
+            Ints::put(out, copy, Ints::at(labels, copy))
+            copy <- copy + 1
+        index: mutable i64 = 1
+        while index < count |index, count, family, out|:
+            held: i64 = Ints::at_ref(out, index)
+            held_text: dstr = sy_label_text(family, held)
+            at: mutable i64 = index - 1
+            placing: mutable bool = true
+            while placing and at >= 0 |placing, at, family, held, held_text, out|:
+                other_text: dstr = sy_label_text(family, Ints::at_ref(out, at))
+                if sy_compare(bytes_view(other_text), bytes_view(held_text)) > 0:
+                    Ints::put(out, at + 1, Ints::at_ref(out, at))
+                    at <- at - 1
+                else:
+                    placing <- false
+            Ints::put(out, at + 1, held)
+            index <- index + 1
+
+# --- putting it into words ---
+
+# A direction as a SENTENCE rather than as a label: `north of` and `below` do
+# not take the same frame, and "hust is down of mailnet" is not English.
+def sy_append_lies(out: mutable dstr&, subject: sview, family: i64, label: i64, other: sview):
+    can Memory.Allocate, Abort.Panic:
+        axes: i64 = sy_axes(family)
+        part0: i64 = sy_option_part(label, 0, axes)
+        part1: i64 = sy_option_part(label, 1, axes)
+        part2: i64 = sy_option_part(label, 2, axes)
+        if part0 == 0 and part1 == 0 and part2 == 0:
+            dstr_append_sview(out, subject)
+            dstr_append_cstr(out, " is in the same place as ")
+            dstr_append_sview(out, other)
+            return
+        # The reference splits the LABEL on " and " and sorts the pieces into
+        # the upright one (the third axis) and the flat ones, then picks one of
+        # three frames. Three frames, not one with optional pieces: `north of`
+        # and `below` do not take the same frame, and "hust is down of mailnet"
+        # is not English.
+        upright: bool = axes > 2 and part2 != 0
+        flat: bool = part0 != 0 or part1 != 0
+        dstr_append_sview(out, subject)
+        dstr_append_cstr(out, " is ")
+        if flat and upright:
+            dstr_append_cstr(out, sy_compass(2, 0 if part2 > 0 else 1))
+            dstr_append_cstr(out, " and to the ")
+            sy_append_flat(out, part0, part1)
+            dstr_append_cstr(out, " of ")
+        else:
+            if flat:
+                dstr_append_cstr(out, "to the ")
+                sy_append_flat(out, part0, part1)
+                dstr_append_cstr(out, " of ")
+            else:
+                dstr_append_cstr(out, sy_compass(2, 0 if part2 > 0 else 1))
+                dstr_append_cstr(out, " ")
+        dstr_append_sview(out, other)
+
+# `' and '.join(flat)` -- the north/south piece before the east/west one,
+# which is the order the label was built in.
+def sy_append_flat(out: mutable dstr&, part0: i64, part1: i64):
+    can Memory.Allocate, Abort.Panic:
+        said: mutable bool = false
+        if part0 != 0:
+            dstr_append_cstr(out, sy_compass(0, 0 if part0 > 0 else 1))
+            said <- true
+        if part1 != 0:
+            dstr_append_cstr(out, " and ") if said
+            dstr_append_cstr(out, sy_compass(1, 0 if part1 > 0 else 1))
+
+# One premise, said one of the ways it can be said. Every branch that reads
+# `rng.random()` costs a draw whether or not the grade negates, so the order
+# below is the reference's exactly.
+def sy_render(web: SyWeb&, number: i64, names: SyNames&, rng: mutable MT19937&) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        left: i64 = Ints::at(web.left, number)
+        right: i64 = Ints::at(web.right, number)
+        family: i64 = web.grade.family
+        negate: bool = web.grade.negate and py_random(rng) < 0.5
+        if family == SY_ORDER:
+            if negate:
+                if py_random(rng) < 0.5:
+                    dstr_append_sview(&out, sy_name(names, left))
+                    dstr_append_cstr(&out, " is not more than ")
+                    dstr_append_sview(&out, sy_name(names, right))
+                else:
+                    dstr_append_sview(&out, sy_name(names, right))
+                    dstr_append_cstr(&out, " is not less than ")
+                    dstr_append_sview(&out, sy_name(names, left))
+                return out
+            if py_random(rng) < 0.5:
+                dstr_append_sview(&out, sy_name(names, right))
+                dstr_append_cstr(&out, " is more than ")
+                dstr_append_sview(&out, sy_name(names, left))
+            else:
+                dstr_append_sview(&out, sy_name(names, left))
+                dstr_append_cstr(&out, " is less than ")
+                dstr_append_sview(&out, sy_name(names, right))
+            return out
+        if family == SY_PARITY:
+            same: bool = sy_edge_value(web, number, 0) == 0
+            dstr_append_sview(&out, sy_name(names, left))
+            if negate:
+                # With two ways to be and no third, "not the opposite of" says
+                # "the same as" and nothing else. That is why the direction
+                # families are not offered negation: there, "not north of"
+                # says six other things.
+                dstr_append_cstr(&out, " is not the ")
+                dstr_append_cstr(&out, "opposite of " if same else "same as ")
+            else:
+                dstr_append_cstr(&out, " is the ")
+                dstr_append_cstr(&out, "same as " if same else "opposite of ")
+            dstr_append_sview(&out, sy_name(names, right))
+            return out
+        axes: i64 = sy_axes(family)
+        label: i64 = sy_direction_index(sy_edge_value(web, number, 0), sy_edge_value(web, number, 1), sy_edge_value(web, number, 2), axes)
+        sy_append_lies(&out, sy_name(names, right), family, label, sy_name(names, left))
+        return out
+
+# The answer as a sentence, for the working.
+def sy_conclusion(family: i64, subject: sview, other: sview, label: i64) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        if label == sy_untold_label(family):
+            dstr_append_cstr(&out, "nothing in the premises links ")
+            dstr_append_sview(&out, subject)
+            dstr_append_cstr(&out, " to ")
+            dstr_append_sview(&out, other)
+            return out
+        if family == SY_PARITY:
+            dstr_append_sview(&out, subject)
+            dstr_append_cstr(&out, " is ")
+            dstr_append_cstr(&out, "the same as " if label == 0 else "the opposite of ")
+            dstr_append_sview(&out, other)
+            return out
+        if family == SY_ORDER:
+            dstr_append_sview(&out, subject)
+            dstr_append_cstr(&out, " is ")
+            dstr_append_cstr(&out, "more" if label == 0 else "less")
+            dstr_append_cstr(&out, " than ")
+            dstr_append_sview(&out, other)
+            return out
+        sy_append_lies(&out, subject, family, label, other)
+        return out
+
+# Whether this deal should be one the surface reader gets right.
+#
+# NEVER when the answer is one that reader cannot give: it does not say
+# `cannot be told`, because a reader that composes nothing never finds out
+# that nothing composes. Otherwise one time in as many answers as it can give,
+# which with the answers spread evenly over the options is exactly chance.
+def sy_agreeable(rng: mutable MT19937&, family: i64, option_count: i64, label: i64) -> bool:
+    can Abort.Panic:
+        # `label in (UNTOLD, NOTHING)` -- for the categorical family the
+        # option that means "nothing follows" is the fifth, not the third.
+        if label == sy_untold_label(family) or (family == SY_CATEGORICAL and label == SY_NOTHING):
+            return false
+        return py_random(rng) < 1.0 / sy_sayable(family, option_count).f64()
+
+# How many of these answers a reader that never composes can give: the options
+# less `cannot be told` and `nothing follows`, neither of which it ever says.
+# The direction families offer neither, so for them it is all of them.
+def sy_sayable(family: i64, option_count: i64) -> i64:
+    can Abort.Panic:
+        unsayable: mutable i64 = 0
+        unsayable <- 1 if sy_untold_label(family) != SY_UNTOLD
+        unsayable <- 1 if family == SY_CATEGORICAL
+        told: i64 = option_count - unsayable
+        return 1 if told < 1 else told
+
+# The question sentence for a chain family.
+def sy_asked_chain(family: i64, subject: sview, other: sview) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        if family == SY_PARITY:
+            dstr_append_cstr(&out, "Is ")
+            dstr_append_sview(&out, subject)
+            dstr_append_cstr(&out, " the same as ")
+            dstr_append_sview(&out, other)
+            dstr_append_cstr(&out, ", or the opposite?")
+            return out
+        if family == SY_ORDER:
+            dstr_append_cstr(&out, "Is ")
+            dstr_append_sview(&out, subject)
+            dstr_append_cstr(&out, " more than ")
+            dstr_append_sview(&out, other)
+            dstr_append_cstr(&out, ", or less?")
+            return out
+        dstr_append_cstr(&out, "Which way is ")
+        dstr_append_sview(&out, subject)
+        dstr_append_cstr(&out, " from ")
+        dstr_append_sview(&out, other)
+        dstr_append_cstr(&out, "?")
+        return out
+
+# --- one dealt question ---
+const SY_MOST_LINES: i64 = 40
+const SY_TEXT_BYTES: i64 = 32768
+const SY_MOST_WORKING: i64 = 64
+
+struct SyQuestion:
+    found: mutable bool
+    family: mutable i64
+    lines: mutable darray[i64]
+    line_count: mutable i64
+    # Pre-sized and written by index, for the reason in the SyNames note.
+    text: mutable darray[u8]
+    used: mutable i64
+    asked_start: mutable i64
+    asked_len: mutable i64
+    working: mutable darray[i64]
+    working_count: mutable i64
+    options: mutable darray[i64]
+    option_count: mutable i64
+    answer: mutable i64
+    surface: mutable i64
+    steps: mutable i64
+    decoys: mutable i64
+
+# Every string a question prints goes into one buffer; `lines`, `working` and
+# `options` hold (start, length) pairs into it. One buffer keeps the question a
+# value that can be handed around without a web of separate allocations.
+def sy_question_new() -> SyQuestion:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable SyQuestion = zeroed
+        out.text <- Bytes::zeros(SY_TEXT_BYTES)
+        out.lines <- Ints::zeros(SY_MOST_LINES * 2)
+        out.working <- Ints::zeros(SY_MOST_WORKING * 2)
+        out.options <- Ints::zeros(32 * 2)
+        return out
+
+def sy_question_reset(q: mutable SyQuestion&):
+    can Abort.Panic:
+        q.used <- 0
+        q.line_count <- 0
+        q.working_count <- 0
+        q.option_count <- 0
+        q.found <- false
+
+def sy_take_text(q: mutable SyQuestion&, text: dstr) -> i64:
+    can Abort.Panic:
+        start: i64 = q.used
+        length: i64 = text.count.i64()
+        index: mutable i64 = 0
+        while index < length |index, length, text, q, start|:
+            Bytes::put(&q.text, start + index, get text[index.usize()] else 0.u8())
+            index <- index + 1
+        q.used <- start + length
+        return start
+
+def sy_add_line(q: mutable SyQuestion&, text: dstr):
+    can Memory.Allocate, Abort.Panic:
+        slot: i64 = q.line_count
+        Ints::put(&q.lines, slot * 2, sy_take_text(q, text))
+        Ints::put(&q.lines, slot * 2 + 1, text.count.i64())
+        q.line_count <- slot + 1
+
+def sy_add_working(q: mutable SyQuestion&, text: dstr):
+    can Memory.Allocate, Abort.Panic:
+        slot: i64 = q.working_count
+        Ints::put(&q.working, slot * 2, sy_take_text(q, text))
+        Ints::put(&q.working, slot * 2 + 1, text.count.i64())
+        q.working_count <- slot + 1
+
+def sy_add_option(q: mutable SyQuestion&, text: dstr):
+    can Memory.Allocate, Abort.Panic:
+        slot: i64 = q.option_count
+        Ints::put(&q.options, slot * 2, sy_take_text(q, text))
+        Ints::put(&q.options, slot * 2 + 1, text.count.i64())
+        q.option_count <- slot + 1
+
+def sy_set_asked(q: mutable SyQuestion&, text: dstr):
+    can Memory.Allocate, Abort.Panic:
+        q.asked_start <- sy_take_text(q, text)
+        q.asked_len <- text.count.i64()
+
+def sy_slice(q: SyQuestion&, start: i64, length: i64) -> sview:
+    can Abort.Panic:
+        return string_view_slice(bytes_view(q.text), start, start + length)
+
+def sy_line(q: SyQuestion&, index: i64) -> sview:
+    can Abort.Panic:
+        return sy_slice(q, Ints::at(q.lines, index * 2), Ints::at(q.lines, index * 2 + 1))
+
+def sy_working_line(q: SyQuestion&, index: i64) -> sview:
+    can Abort.Panic:
+        return sy_slice(q, Ints::at(q.working, index * 2), Ints::at(q.working, index * 2 + 1))
+
+def sy_option(q: SyQuestion&, index: i64) -> sview:
+    can Abort.Panic:
+        return sy_slice(q, Ints::at(q.options, index * 2), Ints::at(q.options, index * 2 + 1))
+
+# `options.index(label) if label in options else 0`
+def sy_index_of(family: i64, label: i64, option_count: i64) -> i64:
+    can Abort.Panic:
+        if label >= 0 and label < option_count:
+            return label
+        return 0
+
+# A chosen pair, written out and measured.
+def sy_dress(rng: mutable MT19937&, web: SyWeb&, names: SyNames&, label: i64, found: SyAskable&, keep: darray[i64], keep_n: i64, order: darray[i64], q: mutable SyQuestion&):
+    can Memory.Allocate, Abort.Panic:
+        g: SyGrade = web.grade
+        family: i64 = g.family
+        option_count: i64 = sy_option_count(family)
+        # The LONGEST way round, among the pairs still standing: picked evenly,
+        # a nine-premise rung mostly asks two-premise questions, because short
+        # paths outnumber long ones badly.
+        longest: mutable i64 = 0
+        at: mutable i64 = 0
+        while at < keep_n |at, keep_n, keep, found, longest|:
+            here: i64 = Ints::at(found.path_len, Ints::at(keep, at))
+            longest <- here if at == 0 or here > longest
+            at <- at + 1
+        best: mutable darray[i64] = Ints::zeros(SY_MOST_PAIRS)
+        best_n: mutable i64 = 0
+        scan: mutable i64 = 0
+        while scan < keep_n |scan, keep_n, keep, found, longest, best, best_n|:
+            slot: i64 = Ints::at(keep, scan)
+            if Ints::at(found.path_len, slot) == longest:
+                Ints::put(&best, best_n, slot)
+                best_n <- best_n + 1
+            scan <- scan + 1
+        chosen: i64 = Ints::at(best, py_choice_index(rng, best_n))
+        subject: i64 = Ints::at(found.subject, chosen)
+        other: i64 = Ints::at(found.other, chosen)
+        path_len: i64 = Ints::at(found.path_len, chosen)
+        sy_question_reset(q)
+        q.found <- true
+        q.family <- family
+        # WRITTEN ONCE: the working has to quote the lines the player was
+        # shown, and a premise rendered twice is a premise said two ways.
+        said_start: mutable darray[i64] = Ints::zeros(SY_MOST_EDGES)
+        said_len: mutable darray[i64] = Ints::zeros(SY_MOST_EDGES)
+        write: mutable i64 = 0
+        while write < web.edges |write, web, order, names, rng, q, said_start, said_len|:
+            number: i64 = Ints::at(order, write)
+            text: dstr = sy_render(web, number, names, rng)
+            Ints::put(&said_start, number, sy_take_text(q, text))
+            Ints::put(&said_len, number, text.count.i64())
+            write <- write + 1
+        place: mutable i64 = 0
+        while place < web.edges |place, web, order, said_start, said_len, q|:
+            number: i64 = Ints::at(order, place)
+            slot: i64 = q.line_count
+            Ints::put(&q.lines, slot * 2, Ints::at(said_start, number))
+            Ints::put(&q.lines, slot * 2 + 1, Ints::at(said_len, number))
+            q.line_count <- slot + 1
+            place <- place + 1
+        sy_set_asked(q, sy_asked_chain(family, sy_name(names, subject), sy_name(names, other)))
+        option: mutable i64 = 0
+        while option < option_count |option, option_count, family, q|:
+            sy_add_option(q, sy_option_text(family, option))
+            option <- option + 1
+        q.answer <- sy_index_of(family, label, option_count)
+        q.surface <- sy_index_of(family, sy_surface(web, order, subject), option_count)
+        # PROVING A NEGATIVE TAKES EVERY LINE: to be sure nothing links two
+        # things you have to have read all of it.
+        q.steps <- path_len if path_len > 0 else q.line_count
+        q.decoys <- q.line_count - q.steps
+        step: mutable i64 = 0
+        while step < path_len |step, path_len, chosen, found, said_start, said_len, q|:
+            number: i64 = Ints::at(found.path, chosen * SY_MOST_EDGES + step)
+            slot: i64 = q.working_count
+            Ints::put(&q.working, slot * 2, Ints::at(said_start, number))
+            Ints::put(&q.working, slot * 2 + 1, Ints::at(said_len, number))
+            q.working_count <- slot + 1
+            step <- step + 1
+        closing: mutable dstr = []
+        dstr_append_cstr(&closing, "so ")
+        dstr_append_dstr(&closing, sy_conclusion(family, sy_name(names, subject), sy_name(names, other), label))
+        sy_add_working(q, closing)
+
+# One question from an order, a parity or a direction.
+#
+# The answer wanted and whether the surface reader should get it are both
+# decided BEFORE any web is built, and then webs are grown until one can supply
+# both. Deciding either after the fact lets whatever the web happens to be good
+# at set the odds.
+def sy_chain_question(g: SyGrade, rng: mutable MT19937&, made_up: bool, names: mutable SyNames&, web: mutable SyWeb&, found: mutable SyAskable&, q: mutable SyQuestion&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        family: i64 = g.family
+        option_count: i64 = sy_option_count(family)
+        want: i64 = py_randrange(rng, 0, option_count)
+        agree: bool = sy_agreeable(rng, family, option_count, want)
+        keep: mutable darray[i64] = Ints::zeros(SY_MOST_PAIRS)
+        order: mutable darray[i64] = Ints::zeros(SY_MOST_EDGES)
+        sorted_labels: mutable darray[i64] = Ints::zeros(64)
+        # `kept` is the fallback: the first usable web, with a label chosen off
+        # its own sorted keys. It is dressed only if nothing better turns up.
+        kept_web: mutable SyWeb = sy_web_new()
+        kept_names: mutable SyNames = sy_names_new()
+        kept_found: mutable SyAskable = sy_askable_new()
+        kept_order: mutable darray[i64] = Ints::zeros(SY_MOST_EDGES)
+        kept_label: mutable i64 = -2
+        attempt: mutable i64 = 0
+        while attempt < 40 |attempt, g, family, option_count, want, agree, rng, made_up, names, web, found, q, keep, order, sorted_labels, kept_web, kept_names, kept_found, kept_order, kept_label|:
+            parts: i64 = 1 if sy_has_axes(family) else (1 if py_choice_index(rng, 2) == 0 else 2)
+            if sy_grow(rng, g, parts, names, made_up, false, web):
+                sy_askable(web, found)
+                if sy_usable(found, family):
+                    fill: mutable i64 = 0
+                    while fill < web.edges |fill, web, order|:
+                        Ints::put(&order, fill, fill)
+                        fill <- fill + 1
+                    py_shuffle_i64_prefix(rng, &order, web.edges)
+                    if kept_label == -2:
+                        sy_sorted_labels(family, found.labels, found.label_count, &sorted_labels)
+                        kept_label <- Ints::at(sorted_labels, py_choice_index(rng, found.label_count))
+                        sy_copy_web(&kept_web, web)
+                        sy_copy_names(&kept_names, names)
+                        sy_copy_askable(&kept_found, found)
+                        sy_copy_order(&kept_order, order, web.edges)
+                    # `want not in found` -- the label has to be on offer.
+                    present: mutable bool = false
+                    look: mutable i64 = 0
+                    while look < found.label_count |look, found, want, present|:
+                        present <- true if Ints::at_ref(&found.labels, look) == want
+                        look <- look + 1
+                    if present:
+                        keep_n: mutable i64 = 0
+                        pick: mutable i64 = 0
+                        while pick < found.count |pick, found, want, web, order, agree, keep, keep_n|:
+                            if Ints::at_ref(&found.label, pick) == want:
+                                got: i64 = sy_surface(web, order, Ints::at_ref(&found.subject, pick))
+                                if (got == want) == agree:
+                                    Ints::put(&keep, keep_n, pick)
+                                    keep_n <- keep_n + 1
+                            pick <- pick + 1
+                        if keep_n > 0:
+                            sy_dress(rng, web, names, want, found, keep, keep_n, order, q)
+                            return true
+            attempt <- attempt + 1
+        if kept_label == -2:
+            return false
+        keep_n: mutable i64 = 0
+        pick: mutable i64 = 0
+        while pick < kept_found.count |pick, kept_found, kept_label, keep, keep_n|:
+            if Ints::at_ref(&kept_found.label, pick) == kept_label:
+                Ints::put(&keep, keep_n, pick)
+                keep_n <- keep_n + 1
+            pick <- pick + 1
+        sy_dress(rng, &kept_web, &kept_names, kept_label, &kept_found, keep, keep_n, kept_order, q)
+        return true
+
+def sy_copy_web(out: mutable SyWeb&, web: SyWeb&):
+    can Abort.Panic:
+        out.grade <- web.grade
+        out.items <- web.items
+        out.edges <- web.edges
+        index: mutable i64 = 0
+        while index < web.edges |index, web, out|:
+            Ints::put(&out.left, index, Ints::at(web.left, index))
+            Ints::put(&out.right, index, Ints::at(web.right, index))
+            Ints::put(&out.value0, index, Ints::at(web.value0, index))
+            Ints::put(&out.value1, index, Ints::at(web.value1, index))
+            Ints::put(&out.value2, index, Ints::at(web.value2, index))
+            index <- index + 1
+        item: mutable i64 = 0
+        while item < web.items |item, web, out|:
+            Ints::put(&out.place0, item, Ints::at(web.place0, item))
+            Ints::put(&out.place1, item, Ints::at(web.place1, item))
+            Ints::put(&out.place2, item, Ints::at(web.place2, item))
+            Ints::put(&out.part, item, Ints::at(web.part, item))
+            item <- item + 1
+
+def sy_copy_names(out: mutable SyNames&, names: SyNames&):
+    can Abort.Panic:
+        out.used <- names.used
+        out.count <- names.count
+        index: mutable i64 = 0
+        while index < names.used |index, names, out|:
+            Bytes::put(&out.bytes, index, Bytes::at(names.bytes, index))
+            index <- index + 1
+        slot: mutable i64 = 0
+        while slot < names.count |slot, names, out|:
+            Ints::put(&out.start, slot, Ints::at(names.start, slot))
+            Ints::put(&out.length, slot, Ints::at(names.length, slot))
+            slot <- slot + 1
+
+def sy_copy_askable(out: mutable SyAskable&, found: SyAskable&):
+    can Abort.Panic:
+        out.count <- found.count
+        out.label_count <- found.label_count
+        index: mutable i64 = 0
+        while index < found.count |index, found, out|:
+            Ints::put(&out.subject, index, Ints::at(found.subject, index))
+            Ints::put(&out.other, index, Ints::at(found.other, index))
+            Ints::put(&out.label, index, Ints::at(found.label, index))
+            length: i64 = Ints::at(found.path_len, index)
+            Ints::put(&out.path_len, index, length)
+            step: mutable i64 = 0
+            while step < length |step, length, index, found, out|:
+                Ints::put(&out.path, index * SY_MOST_EDGES + step, Ints::at(found.path, index * SY_MOST_EDGES + step))
+                step <- step + 1
+            index <- index + 1
+        label: mutable i64 = 0
+        while label < found.label_count |label, found, out|:
+            Ints::put(&out.labels, label, Ints::at(found.labels, label))
+            label <- label + 1
+
+def sy_copy_order(out: mutable darray[i64]&, order: darray[i64], count: i64):
+    can Abort.Panic:
+        index: mutable i64 = 0
+        while index < count |index, count, order, out|:
+            Ints::put(out, index, Ints::at(order, index))
+            index <- index + 1
+
+# --- dealing one ---
+
+struct SyWork:
+    names: mutable SyNames
+    web: mutable SyWeb
+    found: mutable SyAskable
+
+def sy_work_new() -> SyWork:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable SyWork = zeroed
+        out.names <- sy_names_new()
+        out.web <- sy_web_new()
+        out.found <- sy_askable_new()
+        return out
+
+# One question at `grade`. The chain families only, for now: the categorical,
+# meta and binary builders are separate and land beside this one.
+def sy_deal_one(g: SyGrade, rng: mutable MT19937&, made_up: bool, work: mutable SyWork&, q: mutable SyQuestion&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        family: i64 = g.family
+        if family == SY_PARITY or family == SY_ORDER or family == SY_PLANE or family == SY_SPACE:
+            return sy_chain_question(g, rng, made_up, &work.names, &work.web, &work.found, q)
+        return false
+
+def sy_generate(level: i64, seed: i64, made_up: bool, work: mutable SyWork&, q: mutable SyQuestion&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        rng: mutable MT19937 = mt19937_new()
+        mt_seed_int(&rng, seed.u64())
+        return sy_deal_one(sy_grade_of(level), &rng, made_up, work, q)
