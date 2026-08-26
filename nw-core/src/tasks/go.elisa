@@ -1,0 +1,671 @@
+# Go: the one move that captures the most stones.
+#
+# Port of neural_workshop/go.py (GPL-2.0-or-later). A board is `size x size` of
+# 0 empty, 1 black, 2 white. Each problem plants one target group in atari plus a
+# few decoys, scatters clutter, and is kept only if exactly one move captures the
+# target and nothing captures more.
+#
+# ## The one place CPython's set order is observable
+#
+# `_place_atari_group` picks the group's single liberty with
+# `rng.choice(tuple(boundary))`, and `boundary` is a SET of (x, y) POINTS. Tuple
+# keys hash through CPython's xxHash tuplehash, not to themselves, so the order
+# is genuinely scrambled and there is no ascending shortcut of the kind
+# `removals` and sokoban's wall sets get. That set is a PyPoint::PointTable.
+#
+# Everywhere else the order is not observable, and those are the big containers:
+#   * `group` and `liberties` return sets that are only ever counted, tested for
+#     membership, or written through uniformly (`board[y][x] = 0` for every
+#     stone, whatever the order);
+#   * `shape` is iterated only to paint the same colour into every cell;
+#   * `_add_clutter` walks a list comprehension over `range`, and shuffles it;
+#   * `capture_moves` walks rows and columns in order, so its dict is already
+#     in a fixed order.
+#
+# ## Random-stream fidelity
+#
+# `generate_problem` retries up to 300 times off one stream, so a misplaced draw
+# shifts every later attempt as well as its own. Per attempt the draws are:
+#   _place_atari_group   up to 700 tries, each a _grown_shape (two randrange for
+#                        the seed point, then one random() per frontier point per
+#                        growth step) and then one choice(boundary)
+#   _add_clutter         one shuffle, then one choice((1, 2)) per stone placed
+
+const GO_MOST_SIZE: i64 = 19
+const GO_MOST_CELLS: i64 = 361
+const GO_DIFFICULTY_COUNT: i64 = 10
+const GO_MOST_DECOYS: i64 = 6
+
+struct GoDifficulty:
+    size: mutable i64
+    target_size: mutable i64
+    decoy_count: mutable i64
+    decoys: mutable i64[6]
+    clutter: mutable f64
+    show_target: mutable bool
+    show_move: mutable bool
+
+def go_difficulty_of(level: i64) -> GoDifficulty:
+    can Abort.Panic:
+        index: mutable i64 = level - 1
+        index <- 0 if index < 0
+        index <- GO_DIFFICULTY_COUNT - 1 if index > GO_DIFFICULTY_COUNT - 1
+        profile: mutable GoDifficulty = zeroed
+        profile.show_move <- false
+        if index == 0:
+            profile.size <- 5
+            profile.target_size <- 1
+            profile.decoy_count <- 0
+            profile.clutter <- 0.0
+            profile.show_target <- true
+            profile.show_move <- true
+        elif index == 1:
+            profile.size <- 5
+            profile.target_size <- 2
+            profile.decoy_count <- 0
+            profile.clutter <- 0.03
+            profile.show_target <- true
+        elif index == 2:
+            profile.size <- 7
+            profile.target_size <- 3
+            profile.decoy_count <- 0
+            profile.clutter <- 0.06
+            profile.show_target <- true
+        elif index == 3:
+            profile.size <- 9
+            profile.target_size <- 5
+            profile.decoy_count <- 1
+            profile.decoys[0] <- 1
+            profile.clutter <- 0.08
+            profile.show_target <- true
+        elif index == 4:
+            profile.size <- 9
+            profile.target_size <- 6
+            profile.decoy_count <- 2
+            profile.decoys[0] <- 4
+            profile.decoys[1] <- 2
+            profile.clutter <- 0.10
+            profile.show_target <- false
+        elif index == 5:
+            profile.size <- 13
+            profile.target_size <- 8
+            profile.decoy_count <- 2
+            profile.decoys[0] <- 6
+            profile.decoys[1] <- 3
+            profile.clutter <- 0.13
+            profile.show_target <- false
+        elif index == 6:
+            profile.size <- 13
+            profile.target_size <- 10
+            profile.decoy_count <- 3
+            profile.decoys[0] <- 8
+            profile.decoys[1] <- 6
+            profile.decoys[2] <- 3
+            profile.clutter <- 0.16
+            profile.show_target <- false
+        elif index == 7:
+            profile.size <- 19
+            profile.target_size <- 12
+            profile.decoy_count <- 4
+            profile.decoys[0] <- 10
+            profile.decoys[1] <- 8
+            profile.decoys[2] <- 6
+            profile.decoys[3] <- 3
+            profile.clutter <- 0.18
+            profile.show_target <- false
+        elif index == 8:
+            profile.size <- 19
+            profile.target_size <- 15
+            profile.decoy_count <- 5
+            profile.decoys[0] <- 14
+            profile.decoys[1] <- 11
+            profile.decoys[2] <- 8
+            profile.decoys[3] <- 5
+            profile.decoys[4] <- 2
+            profile.clutter <- 0.20
+            profile.show_target <- false
+        else:
+            profile.size <- 19
+            profile.target_size <- 24
+            profile.decoy_count <- 6
+            profile.decoys[0] <- 23
+            profile.decoys[1] <- 20
+            profile.decoys[2] <- 16
+            profile.decoys[3] <- 12
+            profile.decoys[4] <- 8
+            profile.decoys[5] <- 4
+            profile.clutter <- 0.23
+            profile.show_target <- false
+        return profile
+
+# The four orthogonal neighbours, in the reference's order:
+# (x-1, y), (x+1, y), (x, y-1), (x, y+1). Off-board directions are skipped, so
+# a caller asks for the count and then reads each in turn.
+def go_neighbour_x(x: i64, index: i64) -> i64:
+    return x - 1 if index == 0
+    return x + 1 if index == 1
+    return x
+
+def go_neighbour_y(y: i64, index: i64) -> i64:
+    return y - 1 if index == 2
+    return y + 1 if index == 3
+    return y
+
+def go_on_board(size: i64, x: i64, y: i64) -> bool:
+    return x >= 0 and x < size and y >= 0 and y < size
+
+# Scratch for one problem run, sized once from the largest board.
+struct GoWork:
+    size: mutable i64
+    cells: mutable i64
+    board: mutable darray[i64]
+    scratch_board: mutable darray[i64]
+    # Flood-fill scratch, generation-stamped so it never needs clearing.
+    seen: mutable darray[i64]
+    seen_gen: mutable i64
+    visit_stack: mutable darray[i64]
+    group_cells: mutable darray[i64]
+    group_n: mutable i64
+    # `forbidden` and per-shape membership, as flat grids: only ever tested.
+    forbidden: mutable darray[i64]
+    shape_in: mutable darray[i64]
+    # The same shape as a POINT SET. `_grown_shape` returns a set and
+    # `_place_atari_group` iterates it to build the boundary, so the boundary's
+    # insertion order -- and thus its own slot order, and thus `rng.choice` --
+    # follows THIS table's layout, not any ascending cell walk.
+    shape_set: mutable PyPoint::PointTable
+    frontier: mutable darray[i64]
+    frontier_n: mutable i64
+    pick: mutable darray[i64]
+    pick_n: mutable i64
+    # Capture moves, in row-major order.
+    move_x: mutable darray[i64]
+    move_y: mutable darray[i64]
+    move_count: mutable darray[i64]
+    move_n: mutable i64
+
+def go_work_new() -> GoWork:
+    can Memory.Allocate, Abort.Panic:
+        work: mutable GoWork = zeroed
+        work.board <- Ints::zeros(GO_MOST_CELLS)
+        work.scratch_board <- Ints::zeros(GO_MOST_CELLS)
+        work.seen <- Ints::zeros(GO_MOST_CELLS)
+        work.visit_stack <- Ints::zeros(GO_MOST_CELLS)
+        work.group_cells <- Ints::zeros(GO_MOST_CELLS)
+        work.forbidden <- Ints::zeros(GO_MOST_CELLS)
+        work.shape_in <- Ints::zeros(GO_MOST_CELLS)
+        work.shape_set <- PyPoint::new(GO_MOST_CELLS)
+        work.frontier <- Ints::zeros(GO_MOST_CELLS)
+        work.pick <- Ints::zeros(GO_MOST_CELLS)
+        work.move_x <- Ints::zeros(GO_MOST_CELLS)
+        work.move_y <- Ints::zeros(GO_MOST_CELLS)
+        work.move_count <- Ints::zeros(GO_MOST_CELLS)
+        work.seen_gen <- 0
+        return work
+
+def go_at(board: mutable darray[i64]&, size: i64, x: i64, y: i64) -> i64:
+    can Abort.Panic:
+        return Ints::at_ref(board, y * size + x)
+
+def go_set(board: mutable darray[i64]&, size: i64, x: i64, y: i64, value: i64):
+    can Abort.Panic:
+        Ints::put(board, y * size + x, value)
+
+# The connected group of like-coloured stones containing (x, y), written into
+# `work.group_cells` as encoded points. The reference uses a STACK (`todo.pop()`),
+# but the result is a set that is only counted or written through uniformly, so
+# the visit order is not observable and neither is this one's.
+def go_group(work: mutable GoWork&, board: mutable darray[i64]&, x: i64, y: i64) -> i64:
+    can Abort.Panic:
+        work.group_n <- 0
+        0 return if not go_on_board(work.size, x, y)
+        colour: i64 = go_at(board, work.size, x, y)
+        0 return if colour != 1 and colour != 2
+        work.seen_gen <- work.seen_gen + 1
+        stamp: i64 = work.seen_gen
+        Ints::put(&work.seen, y * work.size + x, stamp)
+        Ints::put(&work.visit_stack, 0, y * work.size + x)
+        depth: mutable i64 = 1
+        while depth > 0 |depth, work, board, colour, stamp|:
+            depth <- depth - 1
+            cell: i64 = Ints::at(work.visit_stack, depth)
+            Ints::put(&work.group_cells, work.group_n, cell)
+            work.group_n <- work.group_n + 1
+            cx: i64 = cell % work.size
+            cy: i64 = cell / work.size
+            probe: mutable i64 = 0
+            while probe < 4 |probe, cx, cy, work, board, colour, stamp, depth|:
+                nx: i64 = go_neighbour_x(cx, probe)
+                ny: i64 = go_neighbour_y(cy, probe)
+                if go_on_board(work.size, nx, ny):
+                    slot: i64 = ny * work.size + nx
+                    if Ints::at(work.seen, slot) != stamp and go_at(board, work.size, nx, ny) == colour:
+                        Ints::put(&work.seen, slot, stamp)
+                        Ints::put(&work.visit_stack, depth, slot)
+                        depth <- depth + 1
+                probe <- probe + 1
+        return work.group_n
+
+# Does the group currently in `work.group_cells` have a liberty? The reference
+# builds the whole set and tests it for emptiness, so only the answer matters.
+def go_group_has_liberty(work: GoWork&, board: mutable darray[i64]&) -> bool:
+    can Abort.Panic:
+        index: mutable i64 = 0
+        found: mutable bool = false
+        while index < work.group_n and not found |index, work, board, found|:
+            cell: i64 = Ints::at(work.group_cells, index)
+            cx: i64 = cell % work.size
+            cy: i64 = cell / work.size
+            probe: mutable i64 = 0
+            while probe < 4 and not found |probe, cx, cy, work, board, found|:
+                nx: i64 = go_neighbour_x(cx, probe)
+                ny: i64 = go_neighbour_y(cy, probe)
+                if go_on_board(work.size, nx, ny):
+                    found <- true if go_at(board, work.size, nx, ny) == 0
+                probe <- probe + 1
+            index <- index + 1
+        return found
+
+# Play `colour` at (x, y) into `out`, or return false when the move is illegal.
+#
+# Ko is irrelevant to these static one-move positions; occupancy, captures and
+# suicide use normal rules. Captured stones are cleared in whatever order the
+# group walk found them -- every one becomes 0, so the order cannot show.
+def go_play(work: mutable GoWork&, board: mutable darray[i64]&, x: i64, y: i64, colour: i64, out: mutable darray[i64]&) -> bool:
+    can Abort.Panic:
+        false return if colour != 1 and colour != 2
+        false return if not go_on_board(work.size, x, y)
+        false return if go_at(board, work.size, x, y) != 0
+        copy: mutable i64 = 0
+        while copy < work.cells |copy, work, board, out|:
+            Ints::put(out, copy, Ints::at_ref(board, copy))
+            copy <- copy + 1
+        go_set(out, work.size, x, y, colour)
+        opponent: i64 = 3 - colour
+        # Enemy groups next to the new stone, each captured when it has no
+        # liberty left. A group already visited by an earlier neighbour is
+        # simply found again and re-tested, which is what the reference's
+        # `checked` set avoids doing and cannot change the outcome of.
+        probe: mutable i64 = 0
+        while probe < 4 |probe, x, y, work, out, opponent|:
+            nx: i64 = go_neighbour_x(x, probe)
+            ny: i64 = go_neighbour_y(y, probe)
+            if go_on_board(work.size, nx, ny) and go_at(out, work.size, nx, ny) == opponent:
+                _ = go_group(work, out, nx, ny)
+                if not go_group_has_liberty(work, out):
+                    index: mutable i64 = 0
+                    while index < work.group_n |index, work, out|:
+                        cell: i64 = Ints::at(work.group_cells, index)
+                        Ints::put(out, cell, 0)
+                        index <- index + 1
+            probe <- probe + 1
+        # Suicide check, after the captures.
+        _ = go_group(work, out, x, y)
+        return go_group_has_liberty(work, out)
+
+def go_stone_count(work: GoWork&, board: mutable darray[i64]&, colour: i64) -> i64:
+    can Abort.Panic:
+        total: mutable i64 = 0
+        cell: mutable i64 = 0
+        while cell < work.cells |cell, work, board, colour, total|:
+            total <- total + 1 if Ints::at_ref(board, cell) == colour
+            cell <- cell + 1
+        return total
+
+# Every legal capturing move, with how many stones it removes, in ROW-MAJOR
+# order -- the reference walks `enumerate(board)` and its dict keeps that
+# insertion order, which `best_moves` below then compares as a list.
+def go_capture_moves(work: mutable GoWork&, board: mutable darray[i64]&, colour: i64) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        before: i64 = go_stone_count(work, board, 3 - colour)
+        work.move_n <- 0
+        after: mutable darray[i64] = Ints::zeros(GO_MOST_CELLS)
+        y: mutable i64 = 0
+        while y < work.size |y, work, board, colour, before, after|:
+            x: mutable i64 = 0
+            while x < work.size |x, y, work, board, colour, before, after|:
+                if go_at(board, work.size, x, y) == 0:
+                    if go_play(work, board, x, y, colour, &after):
+                        captured: i64 = before - go_stone_count(work, &after, 3 - colour)
+                        if captured > 0:
+                            Ints::put(&work.move_x, work.move_n, x)
+                            Ints::put(&work.move_y, work.move_n, y)
+                            Ints::put(&work.move_count, work.move_n, captured)
+                            work.move_n <- work.move_n + 1
+                x <- x + 1
+            y <- y + 1
+        return work.move_n
+
+# Whether every stone belongs to a group with at least one liberty.
+def go_legal_position(work: mutable GoWork&, board: mutable darray[i64]&) -> bool:
+    can Abort.Panic:
+        work.seen_gen <- work.seen_gen + 1
+        outer: i64 = work.seen_gen
+        scan: mutable i64 = 0
+        legal: mutable bool = true
+        while scan < work.cells and legal |scan, work, board, outer, legal|:
+            if Ints::at_ref(board, scan) != 0:
+                sx: i64 = scan % work.size
+                sy: i64 = scan / work.size
+                _ = go_group(work, board, sx, sy)
+                legal <- go_group_has_liberty(work, board)
+            scan <- scan + 1
+        return legal
+
+# A compact but irregular connected polyomino, grown from a random seed point.
+#
+# Each step scores every frontier point by how many of its neighbours are
+# already in the shape, plus noise, and takes the highest. The noise is what
+# keeps the groups winding and unlike one another; the reference draws ONE
+# `random()` per frontier point per step, so the draw count depends on the
+# frontier's size and a miscount desynchronises everything after it.
+#
+# `max(scored)` compares (score, point) TUPLES, so an exact score tie falls
+# through to comparing the points -- effectively impossible with the noise, but
+# the tie-break is `(x, y)` ascending if it ever happens.
+def go_grown_shape(work: mutable GoWork&, amount: i64, rng: mutable MT19937&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        size: i64 = work.size
+        start_x: i64 = py_randrange(rng, 0, size)
+        start_y: i64 = py_randrange(rng, 0, size)
+        clear: mutable i64 = 0
+        while clear < work.cells |clear, work|:
+            Ints::put(&work.shape_in, clear, 0)
+            clear <- clear + 1
+        Ints::put(&work.shape_in, start_y * size + start_x, 1)
+        PyPoint::reset(&work.shape_set)
+        PyPoint::add(&work.shape_set, start_x, start_y)
+        held: mutable i64 = 1
+        # `frontier` is a LIST in the reference and its order drives the scoring
+        # order, so it is kept as one rather than re-derived from the grid.
+        work.frontier_n <- 0
+        seed_probe: mutable i64 = 0
+        while seed_probe < 4 |seed_probe, start_x, start_y, size, work|:
+            nx: i64 = go_neighbour_x(start_x, seed_probe)
+            ny: i64 = go_neighbour_y(start_y, seed_probe)
+            if go_on_board(size, nx, ny):
+                Ints::put(&work.frontier, work.frontier_n, ny * size + nx)
+                work.frontier_n <- work.frontier_n + 1
+            seed_probe <- seed_probe + 1
+        while held < amount and work.frontier_n > 0 |held, amount, work, size, rng|:
+            best_score: mutable f64 = -1.0
+            best_slot: mutable i64 = -1
+            best_cell: mutable i64 = -1
+            index: mutable i64 = 0
+            while index < work.frontier_n |index, work, size, rng, best_score, best_slot, best_cell|:
+                cell: i64 = Ints::at(work.frontier, index)
+                cx: i64 = cell % size
+                cy: i64 = cell / size
+                touching: mutable i64 = 0
+                probe: mutable i64 = 0
+                while probe < 4 |probe, cx, cy, size, work, touching|:
+                    nx: i64 = go_neighbour_x(cx, probe)
+                    ny: i64 = go_neighbour_y(cy, probe)
+                    if go_on_board(size, nx, ny):
+                        touching <- touching + 1 if Ints::at(work.shape_in, ny * size + nx) == 1
+                    probe <- probe + 1
+                score: f64 = touching.f64() + py_random(rng) * 1.4
+                # STRICTLY greater, so the FIRST maximum wins. The reference's
+                # `max(scored)` would fall through to comparing the POINT on an
+                # exact score tie -- but the scores carry a `random() * 1.4`
+                # term, so two of them tying bit-for-bit does not occur.
+                if score > best_score:
+                    best_score <- score
+                    best_slot <- index
+                    best_cell <- cell
+                index <- index + 1
+            # `frontier.remove(point)` -- close the gap, order preserved.
+            shift: mutable i64 = best_slot
+            while shift < work.frontier_n - 1 |shift, work|:
+                Ints::put(&work.frontier, shift, Ints::at(work.frontier, shift + 1))
+                shift <- shift + 1
+            work.frontier_n <- work.frontier_n - 1
+            Ints::put(&work.shape_in, best_cell, 1)
+            held <- held + 1
+            bx: i64 = best_cell % size
+            by: i64 = best_cell / size
+            PyPoint::add(&work.shape_set, bx, by)
+            grow: mutable i64 = 0
+            while grow < 4 |grow, bx, by, size, work|:
+                nx: i64 = go_neighbour_x(bx, grow)
+                ny: i64 = go_neighbour_y(by, grow)
+                if go_on_board(size, nx, ny):
+                    slot: i64 = ny * size + nx
+                    if Ints::at(work.shape_in, slot) == 0:
+                        already: mutable bool = false
+                        scan: mutable i64 = 0
+                        while scan < work.frontier_n |scan, work, slot, already|:
+                            already <- true if Ints::at(work.frontier, scan) == slot
+                            scan <- scan + 1
+                        if not already:
+                            Ints::put(&work.frontier, work.frontier_n, slot)
+                            work.frontier_n <- work.frontier_n + 1
+                grow <- grow + 1
+        return held
+
+# Plant one group in atari: a grown shape of `amount` stones, surrounded by
+# enemy stones except at a single liberty.
+#
+# THE one place the set order shows. `boundary` is a SET of (x, y) points and the
+# liberty is `rng.choice(tuple(boundary))`, so the table's iteration order picks
+# it. Tuple keys hash through CPython's tuplehash, so the order is scrambled and
+# there is no ascending shortcut -- hence PyPoint.
+#
+# Returns the liberty's cell, or -1 when 700 tries found no room.
+def go_place_atari_group(work: mutable GoWork&, amount: i64, rng: mutable MT19937&, target_out: mutable darray[i64]&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        size: i64 = work.size
+        boundary: mutable PyPoint::PointTable = PyPoint::new(GO_MOST_CELLS)
+        order: mutable darray[i64] = Ints::zeros(GO_MOST_CELLS)
+        shape_order: mutable darray[i64] = Ints::zeros(GO_MOST_CELLS)
+        attempt: mutable i64 = 0
+        answer: mutable i64 = -1
+        while attempt < 700 and answer < 0 |attempt, work, size, amount, rng, target_out, boundary, order, shape_order, answer|:
+            held: i64 = go_grown_shape(work, amount, rng)
+            usable: mutable bool = held == amount
+            if usable:
+                # `shape & forbidden` -- any overlap disqualifies.
+                cell: mutable i64 = 0
+                while cell < work.cells and usable |cell, work, usable|:
+                    usable <- false if Ints::at(work.shape_in, cell) == 1 and Ints::at(work.forbidden, cell) == 1
+                    cell <- cell + 1
+            if usable:
+                # The boundary, built by walking the SHAPE SET in its own slot
+                # order -- the comprehension iterates `shape`, a set -- and each
+                # stone's four neighbours in the reference's direction order.
+                # That is the boundary's insertion order, which fixes its layout
+                # and so decides which point `rng.choice` lands on.
+                PyPoint::reset(&boundary)
+                stones: i64 = PyPoint::to_list(work.shape_set, &shape_order)
+                at: mutable i64 = 0
+                while at < stones |at, stones, shape_order, work, size, boundary|:
+                    stone: i64 = Ints::at(shape_order, at)
+                    ax: i64 = PyPoint::decode_x(stone)
+                    ay: i64 = PyPoint::decode_y(stone)
+                    probe: mutable i64 = 0
+                    while probe < 4 |probe, ax, ay, size, work, boundary|:
+                        nx: i64 = go_neighbour_x(ax, probe)
+                        ny: i64 = go_neighbour_y(ay, probe)
+                        if go_on_board(size, nx, ny) and Ints::at(work.shape_in, ny * size + nx) == 0:
+                            PyPoint::add(&boundary, nx, ny)
+                        probe <- probe + 1
+                    at <- at + 1
+                usable <- false if boundary.used < 2
+                if usable:
+                    listed: i64 = PyPoint::to_list(boundary, &order)
+                    scan: mutable i64 = 0
+                    while scan < listed and usable |scan, listed, order, size, work, usable|:
+                        key: i64 = Ints::at(order, scan)
+                        bx: i64 = PyPoint::decode_x(key)
+                        by: i64 = PyPoint::decode_y(key)
+                        usable <- false if Ints::at(work.forbidden, by * size + bx) == 1
+                        scan <- scan + 1
+                if usable:
+                    listed: i64 = PyPoint::to_list(boundary, &order)
+                    chosen: i64 = Ints::at(order, py_choice_index(rng, listed))
+                    liberty_x: i64 = PyPoint::decode_x(chosen)
+                    liberty_y: i64 = PyPoint::decode_y(chosen)
+                    # `footprint = shape | boundary` must be entirely empty.
+                    clear: mutable bool = true
+                    look: mutable i64 = 0
+                    while look < work.cells and clear |look, work, clear|:
+                        clear <- false if Ints::at(work.shape_in, look) == 1 and Ints::at_ref(&work.board, look) != 0
+                        look <- look + 1
+                    spot: mutable i64 = 0
+                    while spot < listed and clear |spot, listed, order, size, work, clear|:
+                        key: i64 = Ints::at(order, spot)
+                        cellx: i64 = PyPoint::decode_x(key)
+                        celly: i64 = PyPoint::decode_y(key)
+                        clear <- false if go_at(&work.board, size, cellx, celly) != 0
+                        spot <- spot + 1
+                    if clear:
+                        paint: mutable i64 = 0
+                        while paint < work.cells |paint, work, target_out|:
+                            if Ints::at(work.shape_in, paint) == 1:
+                                Ints::put(&work.board, paint, 2)
+                                Ints::put(&work.forbidden, paint, 1)
+                                Ints::put(target_out, paint, 1)
+                            paint <- paint + 1
+                        edge: mutable i64 = 0
+                        while edge < listed |edge, listed, order, size, work, liberty_x, liberty_y|:
+                            key: i64 = Ints::at(order, edge)
+                            ex: i64 = PyPoint::decode_x(key)
+                            ey: i64 = PyPoint::decode_y(key)
+                            Ints::put(&work.forbidden, ey * size + ex, 1)
+                            if ex != liberty_x or ey != liberty_y:
+                                go_set(&work.board, size, ex, ey, 1)
+                            edge <- edge + 1
+                        answer <- liberty_y * size + liberty_x
+            attempt <- attempt + 1
+        return answer
+
+# Scatter isolated stones, so the board is busy without merging two sized
+# candidates. `choices` is a list comprehension over the grid, shuffled.
+def go_add_clutter(work: mutable GoWork&, density: f64, rng: mutable MT19937&):
+    can Memory.Allocate, Abort.Panic:
+        size: i64 = work.size
+        wanted: i64 = (size.f64() * size.f64() * density).i64()
+        work.pick_n <- 0
+        y: mutable i64 = 0
+        while y < size |y, size, work|:
+            x: mutable i64 = 0
+            while x < size |x, y, size, work|:
+                if go_at(&work.board, size, x, y) == 0 and Ints::at(work.forbidden, y * size + x) == 0:
+                    Ints::put(&work.pick, work.pick_n, y * size + x)
+                    work.pick_n <- work.pick_n + 1
+                x <- x + 1
+            y <- y + 1
+        py_shuffle_i64_prefix(rng, &work.pick, work.pick_n)
+        added: mutable i64 = 0
+        index: mutable i64 = 0
+        while index < work.pick_n and added < wanted |index, work, size, rng, added, wanted|:
+            cell: i64 = Ints::at(work.pick, index)
+            cx: i64 = cell % size
+            cy: i64 = cell / size
+            touching: mutable bool = false
+            probe: mutable i64 = 0
+            while probe < 4 |probe, cx, cy, size, work, touching|:
+                nx: i64 = go_neighbour_x(cx, probe)
+                ny: i64 = go_neighbour_y(cy, probe)
+                if go_on_board(size, nx, ny):
+                    touching <- true if go_at(&work.board, size, nx, ny) != 0
+                probe <- probe + 1
+            if not touching:
+                Ints::put(&work.board, cell, 1 + py_choice_index(rng, 2))
+                added <- added + 1
+            index <- index + 1
+
+# One fully validated problem. `found` is false only when 300 attempts all
+# failed, which is the reference's RuntimeError.
+struct GoProblem:
+    size: mutable i64
+    board: mutable darray[i64]
+    target: mutable darray[i64]
+    winning: mutable i64
+    difficulty: mutable i64
+    best: mutable i64
+    capture_options: mutable i64
+    show_target: mutable bool
+    show_move: mutable bool
+    found: mutable bool
+
+def go_generate_problem(seed: i64, difficulty: i64) -> GoProblem:
+    can Memory.Allocate, Abort.Panic:
+        level: mutable i64 = difficulty
+        level <- 1 if level < 1
+        level <- GO_DIFFICULTY_COUNT if level > GO_DIFFICULTY_COUNT
+        profile: GoDifficulty = go_difficulty_of(level)
+        rng: mutable MT19937 = mt19937_new()
+        mt_seed_int(&rng, seed.u64())
+        work: mutable GoWork = go_work_new()
+        work.size <- profile.size
+        work.cells <- profile.size * profile.size
+        problem: mutable GoProblem = zeroed
+        problem.board <- Ints::zeros(GO_MOST_CELLS)
+        problem.target <- Ints::zeros(GO_MOST_CELLS)
+        problem.size <- profile.size
+        problem.difficulty <- level
+        problem.show_target <- profile.show_target
+        problem.show_move <- profile.show_move
+        problem.found <- false
+        scrap: mutable darray[i64] = Ints::zeros(GO_MOST_CELLS)
+        attempt: mutable i64 = 0
+        while attempt < 300 and not problem.found |attempt, work, profile, rng, problem, scrap|:
+            wipe: mutable i64 = 0
+            while wipe < work.cells |wipe, work, problem|:
+                Ints::put(&work.board, wipe, 0)
+                Ints::put(&work.forbidden, wipe, 0)
+                Ints::put(&problem.target, wipe, 0)
+                wipe <- wipe + 1
+            # The target group first, then the decoys, all from one RNG stream.
+            winning: mutable i64 = -1
+            complete: mutable bool = true
+            candidate: mutable i64 = 0
+            while candidate <= profile.decoy_count and complete |candidate, profile, work, rng, problem, scrap, winning, complete|:
+                amount: i64 = profile.target_size if candidate == 0 else profile.decoys[(candidate - 1).usize()]
+                made: mutable i64 = -1
+                if candidate == 0:
+                    made <- go_place_atari_group(&work, amount, &rng, &problem.target)
+                    winning <- made
+                else:
+                    made <- go_place_atari_group(&work, amount, &rng, &scrap)
+                complete <- false if made < 0
+                candidate <- candidate + 1
+            if complete:
+                go_add_clutter(&work, profile.clutter, &rng)
+                if go_legal_position(&work, &work.board):
+                    _ = go_capture_moves(&work, &work.board, 1)
+                    # `captures.get(winning)`, the single best, and how many
+                    # points reach it -- the reference's four accept tests.
+                    at_winning: mutable i64 = -1
+                    best: mutable i64 = 0
+                    best_moves: mutable i64 = 0
+                    only_best: mutable i64 = -1
+                    index: mutable i64 = 0
+                    while index < work.move_n |index, work, winning, at_winning, best|:
+                        cell: i64 = Ints::at(work.move_y, index) * work.size + Ints::at(work.move_x, index)
+                        amount: i64 = Ints::at(work.move_count, index)
+                        at_winning <- amount if cell == winning
+                        best <- amount if amount > best
+                        index <- index + 1
+                    scan: mutable i64 = 0
+                    while scan < work.move_n |scan, work, best, best_moves, only_best|:
+                        if Ints::at(work.move_count, scan) == best:
+                            only_best <- Ints::at(work.move_y, scan) * work.size + Ints::at(work.move_x, scan)
+                            best_moves <- best_moves + 1
+                        scan <- scan + 1
+                    accept: mutable bool = at_winning == profile.target_size
+                    accept <- false if best != profile.target_size or best_moves != 1 or only_best != winning
+                    accept <- false if level <= 3 and work.move_n != 1
+                    accept <- false if level >= 5 and work.move_n < profile.decoy_count + 1
+                    if accept:
+                        copy: mutable i64 = 0
+                        while copy < work.cells |copy, work, problem|:
+                            Ints::put(&problem.board, copy, Ints::at(work.board, copy))
+                            copy <- copy + 1
+                        problem.winning <- winning
+                        problem.best <- best
+                        problem.capture_options <- work.move_n
+                        problem.found <- true
+            attempt <- attempt + 1
+        return problem
