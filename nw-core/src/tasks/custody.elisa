@@ -1,0 +1,425 @@
+# Custody: keep hold of which box is which, on a belt that keeps changing them.
+#
+# Port of neural_workshop/custody.py (GPL-2.0-or-later). A ring of slots, boxes
+# riding it, machines that charge, cool and repaint whatever the claw sets down
+# in them, and one box -- the Core -- shown once and never marked again.
+#
+# ## What the belt does NOT do
+#
+# The belt does not work the machines. It used to, and the reference records
+# what that cost: a box left to ride would pass the charger and then the cooler
+# on its own, arrive prepared, and the plan the middle rungs are named for came
+# free. A machine now acts only on a box the claw sets down in it.
+#
+# The one exception is the PAINTER, which the belt still works, because it is
+# not a service anybody asks for -- it is a hazard. Its whole job is to repaint
+# boxes without being asked, which is what stops a player following a colour
+# instead of following the box. And it is why the claw has a second reason to
+# exist: a held box keeps its coat.
+#
+# ## Jams
+#
+# A box moves only if the slot in front is free, so a box put down in front of
+# a queue holds it up rather than being driven through. The pass loop repeats
+# because the ring WRAPS -- there is no first box to start from -- and each
+# pass moves whatever can move, stopping as soon as a pass moves nothing. The
+# once-per-step guard matters: without it the passes that unpick a jam carried
+# the same box round again and again, and the reference measured a box crossing
+# five or six slots in one step, which put it past the claw every time.
+#
+# ## Random-stream fidelity
+#
+#   generate      shuffle(free slots)   ONCE, then a greedy non-adjacent scan
+#                                       over that shuffled order, per machine
+#                 randrange(boxes)      which box is the Core
+#   fresh_boxes   shuffle(free)         then take the first `boxes` and SORT
+#                 shuffle(places)
+#                 shuffle(looks)        looks are dealt round-robin first, so
+#                                       the counts are as even as they can be
+#
+# Four shuffles and one randrange, in that order, off one stream.
+
+const CU_CHARGER: i64 = 0
+const CU_COOLER: i64 = 1
+const CU_PAINTER: i64 = 2
+
+const CU_CHARGE_STEP: i64 = 45
+const CU_CHARGE_HEAT: i64 = 30
+const CU_COOL_STEP: i64 = 35
+const CU_OFF_BELT: i64 = -1
+const CU_GRADE_COUNT: i64 = 10
+const CU_NO_MACHINE: i64 = -1
+
+struct CuGrade:
+    boxes: mutable i64
+    looks: mutable i64
+    width: mutable i64
+    chargers: mutable i64
+    coolers: mutable i64
+    painters: mutable i64
+    need_charge: mutable i64
+    max_heat: mutable i64
+    decay: mutable i64
+    moving: mutable bool
+    budget: mutable i64
+
+# Toddler to hard. The first rung is a box and a bay and nothing else, which is
+# deliberate: a ladder whose bottom rung already needs a plan has no bottom.
+# Each rung after adds exactly one thing, so a run that fails says which.
+def cu_grade_at(level_number: i64) -> CuGrade:
+    can Abort.Panic:
+        index: mutable i64 = level_number - 1
+        index <- 0 if index < 0 else index
+        index <- CU_GRADE_COUNT - 1 if index > CU_GRADE_COUNT - 1 else index
+        g: mutable CuGrade = zeroed
+        g.max_heat <- 100
+        g.moving <- true
+        if index == 0:
+            g.boxes <- 1
+            g.looks <- 1
+            g.width <- 5
+            g.budget <- 40
+            g.moving <- false
+        elif index == 1:
+            g.boxes <- 2
+            g.looks <- 1
+            g.width <- 5
+            g.budget <- 40
+            g.moving <- false
+        elif index == 2:
+            g.boxes <- 5
+            g.looks <- 2
+            g.width <- 6
+            g.budget <- 70
+        elif index == 3:
+            g.boxes <- 5
+            g.looks <- 2
+            g.width <- 6
+            g.chargers <- 1
+            g.need_charge <- 40
+            g.budget <- 100
+        elif index == 4:
+            g.boxes <- 6
+            g.looks <- 2
+            g.width <- 7
+            g.chargers <- 1
+            g.coolers <- 1
+            g.need_charge <- 40
+            g.max_heat <- 25
+            g.budget <- 150
+        elif index == 5:
+            g.boxes <- 7
+            g.looks <- 2
+            g.width <- 7
+            g.chargers <- 1
+            g.coolers <- 1
+            g.painters <- 1
+            g.need_charge <- 40
+            g.max_heat <- 25
+            g.budget <- 150
+        elif index == 6:
+            g.boxes <- 8
+            g.looks <- 2
+            g.width <- 8
+            g.chargers <- 1
+            g.coolers <- 1
+            g.painters <- 1
+            g.need_charge <- 40
+            g.max_heat <- 25
+            g.decay <- 1
+            g.budget <- 160
+        elif index == 7:
+            g.boxes <- 9
+            g.looks <- 2
+            g.width <- 8
+            g.chargers <- 1
+            g.coolers <- 1
+            g.painters <- 1
+            g.need_charge <- 40
+            g.max_heat <- 25
+            g.decay <- 1
+            g.budget <- 180
+        elif index == 8:
+            g.boxes <- 10
+            g.looks <- 2
+            g.width <- 9
+            g.chargers <- 1
+            g.coolers <- 1
+            g.painters <- 2
+            g.need_charge <- 40
+            g.max_heat <- 25
+            g.decay <- 2
+            g.budget <- 200
+        else:
+            g.boxes <- 12
+            g.looks <- 2
+            g.width <- 10
+            g.chargers <- 2
+            g.coolers <- 1
+            g.painters <- 2
+            g.need_charge <- 40
+            g.max_heat <- 20
+            g.decay <- 2
+            g.budget <- 220
+        return g
+
+struct CuLayout:
+    width: mutable i64
+    slots: mutable i64
+    boxes: mutable i64
+    looks: mutable i64
+    bay: mutable i64
+    need_charge: mutable i64
+    max_heat: mutable i64
+    decay: mutable i64
+    moving: mutable bool
+    budget: mutable i64
+    core: mutable i64
+    # Machine kind per slot, CU_NO_MACHINE where there is none.
+    machine: mutable darray[i64]
+
+# Boxes as parallel arrays: the belt is the live state and a struct-of-arrays
+# keeps a step over all of them one pass per field.
+struct CuBoxes:
+    look: mutable darray[i64]
+    charge: mutable darray[i64]
+    heat: mutable darray[i64]
+    slot: mutable darray[i64]
+    held: mutable darray[i64]
+    delivered: mutable darray[i64]
+    stalled: mutable darray[i64]
+    count: mutable i64
+
+# Slots between two positions, the short way round the ring. The claw may
+# travel either way, so this is what a move changes by exactly one.
+def cu_gap(one: i64, other: i64, slots: i64) -> i64:
+    can Abort.Panic:
+        delta: i64 = one - other
+        magnitude: i64 = delta if delta >= 0 else 0 - delta
+        straight: i64 = magnitude % slots
+        back: i64 = slots - straight
+        return straight if straight < back else back
+
+def cu_ahead(slot: i64, slots: i64) -> i64:
+    return (slot + 1) % slots
+
+def cu_machine_at(layout: CuLayout&, slot: i64) -> i64:
+    can Abort.Panic:
+        return CU_NO_MACHINE if slot < 0 or slot >= layout.slots else Ints::at(layout.machine, slot)
+
+# What a machine does to a box, in place. The charger HEATS what it charges,
+# which is the whole of why the order matters: a pass clears the mark and
+# leaves the box over the heat limit, so the cooler comes after.
+def cu_treat(boxes: mutable CuBoxes&, index: i64, kind: i64, layout: CuLayout&):
+    can Abort.Panic:
+        if kind == CU_CHARGER:
+            charge: i64 = Ints::at_ref(&boxes.charge, index) + CU_CHARGE_STEP
+            Ints::put(&boxes.charge, index, 100 if charge > 100 else charge)
+            heat: i64 = Ints::at_ref(&boxes.heat, index) + CU_CHARGE_HEAT
+            Ints::put(&boxes.heat, index, 100 if heat > 100 else heat)
+        elif kind == CU_COOLER:
+            heat: i64 = Ints::at_ref(&boxes.heat, index) - CU_COOL_STEP
+            Ints::put(&boxes.heat, index, 0 if heat < 0 else heat)
+        elif kind == CU_PAINTER:
+            # Moved on ONE colour rather than set to a fixed one. The reference
+            # measured both: a fixed colour drove every box to the same coat
+            # within three laps, killing the colour channel outright. Cycling
+            # keeps the coats spread and repaints the Core about once a lap --
+            # an identity that has to survive its own appearance changing.
+            Ints::put(&boxes.look, index, (Ints::at_ref(&boxes.look, index) + 1) % layout.looks)
+
+def cu_riding(boxes: CuBoxes&, index: i64) -> bool:
+    can Abort.Panic:
+        return Ints::at(boxes.held, index) == 0 and Ints::at(boxes.delivered, index) == 0
+
+# Carry the belt on one slot, and bleed the charge of what rides it.
+def cu_step_belt(boxes: mutable CuBoxes&, layout: CuLayout&, order: mutable darray[i64]&, taken: mutable darray[i64]&, gone: mutable darray[i64]&):
+    can Abort.Panic:
+        if layout.moving:
+            clear: mutable i64 = 0
+            while clear < layout.slots |clear, layout, taken|:
+                Ints::put(taken, clear, -1)
+                clear <- clear + 1
+            reset: mutable i64 = 0
+            while reset < boxes.count |reset, boxes, gone, taken|:
+                Ints::put(gone, reset, 0)
+                if cu_riding(boxes, reset):
+                    Ints::put(taken, Ints::at_ref(&boxes.slot, reset), reset)
+                reset <- reset + 1
+
+            pass_index: mutable i64 = 0
+            keep_going: mutable bool = true
+            while pass_index < boxes.count and keep_going |pass_index, boxes, layout, order, taken, gone, keep_going|:
+                # sorted(riding, key=slot, reverse=True): highest slot first.
+                count: mutable i64 = 0
+                collect: mutable i64 = 0
+                while collect < boxes.count |collect, boxes, order, count|:
+                    if cu_riding(boxes, collect):
+                        Ints::put(order, count, collect)
+                        count <- count + 1
+                    collect <- collect + 1
+                outer: mutable i64 = 1
+                while outer < count |outer, count, order, boxes|:
+                    held_box: i64 = Ints::at_ref(order, outer)
+                    held_slot: i64 = Ints::at_ref(&boxes.slot, held_box)
+                    inner: mutable i64 = outer
+                    while inner > 0 and Ints::at_ref(&boxes.slot, Ints::at_ref(order, inner - 1)) < held_slot |inner, order, boxes, held_slot|:
+                        Ints::put(order, inner, Ints::at_ref(order, inner - 1))
+                        inner <- inner - 1
+                    Ints::put(order, inner, held_box)
+                    outer <- outer + 1
+
+                moved: mutable bool = false
+                walk: mutable i64 = 0
+                while walk < count |walk, count, order, boxes, layout, taken, gone, moved|:
+                    index: i64 = Ints::at_ref(order, walk)
+                    # One slot each, per step.
+                    if Ints::at_ref(gone, index) == 0:
+                        if Ints::at_ref(&boxes.stalled, index) != 0:
+                            Ints::put(&boxes.stalled, index, 0)
+                            Ints::put(gone, index, 1)
+                        else:
+                            here: i64 = Ints::at_ref(&boxes.slot, index)
+                            front: i64 = cu_ahead(here, layout.slots)
+                            if Ints::at_ref(taken, front) < 0:
+                                Ints::put(taken, here, -1)
+                                Ints::put(&boxes.slot, index, front)
+                                Ints::put(taken, front, index)
+                                Ints::put(gone, index, 1)
+                                moved <- true
+                    walk <- walk + 1
+                keep_going <- moved
+                pass_index <- pass_index + 1
+
+        ride: mutable i64 = 0
+        while ride < boxes.count |ride, boxes, layout|:
+            if cu_riding(boxes, ride):
+                if cu_machine_at(layout, Ints::at_ref(&boxes.slot, ride)) == CU_PAINTER:
+                    cu_treat(boxes, ride, CU_PAINTER, layout)
+                if layout.decay != 0:
+                    # Only what RIDES: a held box holds its charge, so the claw
+                    # is somewhere safe and the belt is the only way to reach a
+                    # machine. That trade is the whole of what decay adds.
+                    left: i64 = Ints::at_ref(&boxes.charge, ride) - layout.decay
+                    Ints::put(&boxes.charge, ride, 0 if left < 0 else left)
+            ride <- ride + 1
+
+# Deal one round. Machines are placed so that none sits on the bay (a machine
+# there could never be used -- setting a box down delivers it) and no two are
+# adjacent (a box left standing in a machine rides into its neighbour on the
+# next step, and a cooler behind a charger would quietly undo work the player
+# had just paid two actions for). Both rules were found by an oracle failing.
+def cu_generate(a: mutable Arena&, rng: mutable MT19937&, level_number: i64) -> CuLayout:
+    can Memory.Allocate, Abort.Panic:
+        g: CuGrade = cu_grade_at(level_number)
+        slots: i64 = g.width * 2
+        bay: i64 = g.width + g.width / 2
+
+        layout: mutable CuLayout = zeroed
+        layout.width <- g.width
+        layout.slots <- slots
+        layout.boxes <- g.boxes
+        layout.looks <- g.looks
+        layout.bay <- bay
+        layout.need_charge <- g.need_charge
+        layout.max_heat <- g.max_heat
+        layout.decay <- g.decay
+        layout.moving <- g.moving
+        layout.budget <- g.budget
+        layout.machine <- Ints::zeros(a, slots + 1)
+        blank: mutable i64 = 0
+        while blank < slots |blank, slots, layout|:
+            Ints::put(&layout.machine, blank, CU_NO_MACHINE)
+            blank <- blank + 1
+
+        free: mutable darray[i64] = Ints::zeros(a, slots + 1)
+        free_n: mutable i64 = 0
+        slot: mutable i64 = 0
+        while slot < slots |slot, slots, bay, free, free_n|:
+            if slot != bay:
+                Ints::put(&free, free_n, slot)
+                free_n <- free_n + 1
+            slot <- slot + 1
+        py_shuffle_i64_prefix(rng, &free, free_n)
+
+        # chargers, then coolers, then painters -- the order the reference
+        # builds `wants` in, and the order the greedy scan consumes slots in.
+        placed: mutable darray[i64] = Ints::zeros(a, slots + 1)
+        placed_n: mutable i64 = 0
+        kind: mutable i64 = 0
+        while kind < 3 |kind, g, slots, free, free_n, placed, placed_n, layout|:
+            wanted: i64 = g.chargers if kind == CU_CHARGER else (g.coolers if kind == CU_COOLER else g.painters)
+            made: mutable i64 = 0
+            while made < wanted |made, wanted, kind, slots, free, free_n, placed, placed_n, layout|:
+                scan: mutable i64 = 0
+                done: mutable bool = false
+                while scan < free_n and not done |scan, free_n, free, slots, placed, placed_n, layout, kind, done|:
+                    candidate: i64 = Ints::at_ref(&free, scan)
+                    clash: mutable bool = false
+                    other: mutable i64 = 0
+                    while other < placed_n |other, placed_n, placed, candidate, slots, clash|:
+                        at: i64 = Ints::at_ref(&placed, other)
+                        if at == candidate or at == (candidate - 1 + slots) % slots or at == (candidate + 1) % slots:
+                            clash <- true
+                        other <- other + 1
+                    if not clash:
+                        Ints::put(&placed, placed_n, candidate)
+                        placed_n <- placed_n + 1
+                        Ints::put(&layout.machine, candidate, kind)
+                        done <- true
+                    scan <- scan + 1
+                made <- made + 1
+            kind <- kind + 1
+
+        layout.core <- py_randbelow(rng, g.boxes.u64()).i64()
+        return layout
+
+# Lay the boxes out on the belt, spread and dealt their looks. Looks are dealt
+# round-robin and THEN shuffled, so the count of each is as even as it can be
+# -- an appearance worn by one box would be an appearance that answers the
+# question.
+def cu_fresh_boxes(a: mutable Arena&, rng: mutable MT19937&, layout: CuLayout&) -> CuBoxes:
+    can Memory.Allocate, Abort.Panic:
+        boxes: mutable CuBoxes = zeroed
+        boxes.look <- Ints::zeros(a, layout.boxes + 1)
+        boxes.charge <- Ints::zeros(a, layout.boxes + 1)
+        boxes.heat <- Ints::zeros(a, layout.boxes + 1)
+        boxes.slot <- Ints::zeros(a, layout.boxes + 1)
+        boxes.held <- Ints::zeros(a, layout.boxes + 1)
+        boxes.delivered <- Ints::zeros(a, layout.boxes + 1)
+        boxes.stalled <- Ints::zeros(a, layout.boxes + 1)
+        boxes.count <- layout.boxes
+
+        free: mutable darray[i64] = Ints::zeros(a, layout.slots + 1)
+        free_n: mutable i64 = 0
+        slot: mutable i64 = 0
+        while slot < layout.slots |slot, layout, free, free_n|:
+            if slot != layout.bay and cu_machine_at(layout, slot) == CU_NO_MACHINE:
+                Ints::put(&free, free_n, slot)
+                free_n <- free_n + 1
+            slot <- slot + 1
+        py_shuffle_i64_prefix(rng, &free, free_n)
+
+        # sorted(free[:boxes]) -- the shuffle picks WHICH slots, the sort puts
+        # them in order, and the next shuffle decides which box gets which.
+        places: mutable darray[i64] = Ints::zeros(a, layout.boxes + 1)
+        take: mutable i64 = 0
+        while take < layout.boxes |take, layout, free, places|:
+            Ints::put(&places, take, Ints::at_ref(&free, take))
+            take <- take + 1
+        Ints::sort_prefix(&places, layout.boxes)
+        py_shuffle_i64_prefix(rng, &places, layout.boxes)
+
+        looks: mutable darray[i64] = Ints::zeros(a, layout.boxes + 1)
+        deal: mutable i64 = 0
+        while deal < layout.boxes |deal, layout, looks|:
+            Ints::put(&looks, deal, deal % layout.looks)
+            deal <- deal + 1
+        py_shuffle_i64_prefix(rng, &looks, layout.boxes)
+
+        index: mutable i64 = 0
+        while index < layout.boxes |index, layout, boxes, looks, places|:
+            Ints::put(&boxes.look, index, Ints::at_ref(&looks, index))
+            Ints::put(&boxes.slot, index, Ints::at_ref(&places, index))
+            index <- index + 1
+        return boxes
