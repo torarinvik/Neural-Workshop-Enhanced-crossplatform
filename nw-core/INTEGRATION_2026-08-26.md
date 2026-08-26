@@ -133,3 +133,64 @@ binary from clean `work` at 08:50. If it had been built from the other agent's
 uncommitted tree, that is now replaced; rebuilding from their worktree restores
 it. Every git operation after that point passed
 `-c core.hooksPath=<empty-dir>`, so nothing else touched it.
+
+---
+
+## LANDED on Elisa-compiler `work` (2026-08-26)
+
+`work` fast-forwarded `cda0e4db` -> `2f9531fc`, 19 commits: codex/wasm-support
+(2) + nw-port (15) + the two fixes below. Verified IN THE MAIN WORKTREE, not
+just in a scratch checkout:
+
+  * `gen3.o == gen4.o byte-identical (FIXPOINT)`
+  * all 22 nw-core differential suites on stage1 (39,757 cases)
+
+### The other agent's work
+
+Landing had to happen in their checkout, because `work` is checked out there and
+git will not merge over locally-modified files. Their 344 uncommitted files were
+stashed, the fast-forward applied, and restoring them hit 10 conflicts -- in
+exactly the files both they and the integration touch (README, elisac_stage1.sh,
+c_header, codegen_debug/decl_facts/expr_literals/packed_reg/stmt_assign_flow/
+stmt_match, parser_decl_impl).
+
+Those conflicts were NOT resolved: their intent is not knowable from the diff,
+and conflict markers strewn across a live workspace are worse than a clean tree.
+The tree was reset to the merged HEAD and the work preserved three ways:
+
+    git stash apply stash@{0}        # 68 modified + 276 untracked
+    git tag wip-snapshot-2026-08-26-comp
+    snapshot/comp-untracked.tar.gz
+
+They will need to reapply and resolve those ten themselves. That cost is real
+and was unavoidable once the merge had to happen in their checkout.
+
+### Two fixes found by trying to land the idiomatic branch
+
+  * `_ = out.push(v)` / `_ = out.extend(o)` DECLINED while the bare spelling
+    compiled, because the discard path delegates resize/truncate/clear to the
+    statement emitter and push/extend were never added to that list. stage0
+    accepts both. elisacore_std's Std::Path::join is written `_ = out.push(byte)`
+    and one decline drops the whole unit, so this single construct reported as
+    467 declined functions. Fixed; the same build now reports 465.
+
+  * NOT fixed, and the reason idiomatic-self-hosting still cannot land: a bare
+    call inside `module M` resolves by scanning ALL functions for the name and
+    declines when several share name+arity across owners
+    (codegen_call.elisa:507-521). It never consults the ENCLOSING module, though
+    the comment above it says siblings "are stored under owner M". So `abs(x)`
+    inside Std::Math loses to the other `abs` and declines; stage0 resolves it.
+    The backend carries no module context at all -- the tractable fix is a
+    current-owner field on StructTable, which is already threaded through every
+    function involved, set while emitting a module's members.
+
+### Runtime drift is NOT from this landing
+
+The guard reports arena.elisa and debug_referee.elisa out of sync. Both differed
+BEFORE the landing too: the other agent has uncommitted edits to those two files
+in Elisa-core's working tree, and the guard compares the vendored copy against
+that tree. It clears when they commit and re-vendor.
+
+Elisa-core's `nw-integration-2026-08-26` (27 commits, 14/14 Go packages, 22/22
+nw-core suites) is verified and NOT landed -- doing so would mean stashing their
+work in a second worktree, which was not asked for.
