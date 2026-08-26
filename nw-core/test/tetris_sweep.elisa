@@ -1,0 +1,164 @@
+# Differential sweep driver for tasks/tetris.elisa.
+#
+# Pieces are compared cell by cell, and placements as whole lists. The two
+# tie-breaks in this module -- `min(cut, key=...)` for the window and
+# `min(range(cols), key=sky)` for the bar column -- both keep the FIRST
+# minimum, and taking the last instead yields a perfectly legal piece from a
+# different window. Only comparing the actual cells catches that.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../src/pyrandom.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/tasks/tetris.elisa"
+
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+def sweep_grades():
+    can Console.Write, Abort.Panic:
+        for rung in [-2, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 40]:
+            g: TtGrade = tt_grade_at(rung)
+            printr("grd")
+            emit_cell(rung)
+            emit_cell(g.least)
+            emit_cell(g.most)
+            emit_cell(g.narrowest)
+            emit_cell(g.widest)
+            emit_cell(g.step)
+            emit_cell(g.roughness)
+            print("")
+
+# A board built from a fixed, seed-independent pattern, then its skyline,
+# holes, and the placements of a few hand-made pieces. This checks the geometry
+# without any random draw in the way.
+def sweep_geometry(a: mutable Arena&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        quarters: mutable darray[i64] = Ints::zeros(a, 4096)
+        cols_out: mutable darray[i64] = Ints::zeros(a, 4096)
+        rows_out: mutable darray[i64] = Ints::zeros(a, 4096)
+        for pattern in [0, 1, 2, 3] |a, quarters, cols_out, rows_out|:
+            board: mutable TtBoard = tt_board_new(a, 12, 10)
+            x: mutable i64 = 0
+            while x < 12 |x, board, pattern|:
+                height: i64 = (x * x + pattern * 3) % 5 + (pattern % 2)
+                y: mutable i64 = 0
+                while y < height |y, x, board|:
+                    tt_fill(&board, x, y, 1)
+                    y <- y + 1
+                x <- x + 1
+            tt_skyline(&board)
+            printr("geom")
+            emit_cell(pattern)
+            emit_cell(tt_holes(&board))
+            col: mutable i64 = 0
+            while col < 12 |col, board|:
+                emit_cell(Ints::at(board.sky, col))
+                col <- col + 1
+            # An L, a bar and a square, as cell lists.
+            for shape in [0, 1, 2] |a, board, quarters, cols_out, rows_out, pattern|:
+                piece: mutable TtPiece = tt_piece_new(a)
+                if shape == 0:
+                    Ints::put(&piece.x, 0, 0)
+                    Ints::put(&piece.y, 0, 0)
+                    Ints::put(&piece.x, 1, 0)
+                    Ints::put(&piece.y, 1, 1)
+                    Ints::put(&piece.x, 2, 1)
+                    Ints::put(&piece.y, 2, 0)
+                    piece.count <- 3
+                elif shape == 1:
+                    Ints::put(&piece.x, 0, 0)
+                    Ints::put(&piece.y, 0, 0)
+                    Ints::put(&piece.x, 1, 0)
+                    Ints::put(&piece.y, 1, 1)
+                    Ints::put(&piece.x, 2, 0)
+                    Ints::put(&piece.y, 2, 2)
+                    piece.count <- 3
+                else:
+                    Ints::put(&piece.x, 0, 0)
+                    Ints::put(&piece.y, 0, 0)
+                    Ints::put(&piece.x, 1, 0)
+                    Ints::put(&piece.y, 1, 1)
+                    Ints::put(&piece.x, 2, 1)
+                    Ints::put(&piece.y, 2, 0)
+                    Ints::put(&piece.x, 3, 1)
+                    Ints::put(&piece.y, 3, 1)
+                    piece.count <- 4
+                tt_normalise(&piece)
+                found: i64 = tt_perfect_placements(a, &board, &piece, 0, &quarters, &cols_out, &rows_out)
+                emit_cell(found)
+                place: mutable i64 = 0
+                while place < found |place, found, quarters, cols_out, rows_out|:
+                    emit_cell(Ints::at_ref(&quarters, place))
+                    emit_cell(Ints::at_ref(&cols_out, place))
+                    emit_cell(Ints::at_ref(&rows_out, place))
+                    place <- place + 1
+            print("")
+
+# Carving: the seeded half. Cells are emitted, not a count.
+def sweep_carve(a: mutable Arena&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        for rung in [1, 2, 3, 4, 5, 6, 7, 8] |a|:
+            for seed in [0, 1, 7, 42, 1234] |a, rung|:
+                board: mutable TtBoard = tt_board_new(a, 14, 12)
+                # A fixed starting pile, so carve has real skyline to work on.
+                x: mutable i64 = 0
+                while x < 14 |x, board, seed|:
+                    height: i64 = (x * 5 + seed) % 4
+                    y: mutable i64 = 0
+                    while y < height |y, x, board|:
+                        tt_fill(&board, x, y, 1)
+                        y <- y + 1
+                    x <- x + 1
+                rng: mutable MT19937 = mt19937_new()
+                mt_seed_int(&rng, seed.u64())
+                g: TtGrade = tt_grade_at(rung)
+                piece: mutable TtPiece = tt_piece_new(a)
+                round: mutable i64 = 0
+                printr("carve")
+                emit_cell(rung)
+                emit_cell(seed)
+                while round < 4 |round, a, board, g, rng, piece|:
+                    tt_carve(a, &board, &g, &rng, 24, 6, &piece)
+                    emit_cell(piece.count)
+                    cell: mutable i64 = 0
+                    while cell < piece.count |cell, piece|:
+                        emit_cell(Ints::at_ref(&piece.x, cell))
+                        emit_cell(Ints::at_ref(&piece.y, cell))
+                        cell <- cell + 1
+                    round <- round + 1
+                print("")
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region arena_region(256 * 1024 * 1024)
+        arena: mutable Arena& = (&arena_region).cast[mutable Arena&]
+        sweep_grades()
+        sweep_geometry(arena)
+        sweep_carve(arena)
+        destroy arena_region
+        return 0

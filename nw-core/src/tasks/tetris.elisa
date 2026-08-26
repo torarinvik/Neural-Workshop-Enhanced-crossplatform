@@ -1,0 +1,543 @@
+# Tetris: a fine grid, and pieces cut so that a gapless drop always exists.
+#
+# Port of neural_workshop/tetris.py (GPL-2.0-or-later). Not the arcade game:
+# the board is much wider and much finer than a well, so where a piece goes is
+# a question with many answers rather than ten, and the ladder makes a rung
+# harder to PACK rather than harder to keep up with. Gravity is the player's
+# setting and no rung touches it.
+#
+# ## The promise, and how it is kept
+#
+# A piece is CUT OUT OF THE BOARD: take a window of columns, read each
+# column's skyline, fill the notch to a level top, then dent the top. Drop what
+# came out back where it came from and every column's lowest cell is exactly at
+# that column's skyline, so landing() puts them all down at once and nothing
+# empty ends up underneath. That is why one gapless placement always exists.
+#
+# The reference is careful to say that this is a proof about the piece the
+# generator MEANT to make, not about the one it made, so callers still ask
+# perfect_placements how many there are. This port keeps that split.
+#
+# ## Ties, and why they are load-bearing
+#
+# `min(cut, key=...)` returns the FIRST minimal element, so a tie goes to the
+# earliest attempt. Scanning with `<=` instead of `<` picks the last one
+# instead and quietly cuts a different piece whenever two windows sit equally
+# low -- which, on a level board, is most of the time. Same for `_bar`'s
+# `min(range(cols), key=lambda x: sky[x])`.
+#
+# ## Random-stream fidelity
+#
+#   per attempt:  randint(narrowest, min(widest, cols))   the width
+#                 randrange(cols - width + 1)             the start column
+#                 randint(lowest, highest)                ONE draw, replicated
+#                                                         across every column
+#                 randint(0, roughness) per column        only when roughness
+#
+# The level-top draw happens ONCE and is then copied width times -- `[x] * w`
+# in the reference. Drawing per column would consume width values instead of
+# one and give a top that is already ragged before the dents.
+
+const TT_GRADE_COUNT: i64 = 8
+const TT_MAX_CELLS: i64 = 64
+
+struct TtGrade:
+    least: mutable i64
+    most: mutable i64
+    narrowest: mutable i64
+    widest: mutable i64
+    step: mutable i64
+    roughness: mutable i64
+
+def tt_grade_at(rung: i64) -> TtGrade:
+    can Abort.Panic:
+        index: mutable i64 = rung - 1
+        index <- 0 if index < 0 else index
+        index <- TT_GRADE_COUNT - 1 if index > TT_GRADE_COUNT - 1 else index
+        g: mutable TtGrade = zeroed
+        if index == 0:
+            g.least <- 2
+            g.most <- 4
+            g.narrowest <- 1
+            g.widest <- 2
+        elif index == 1:
+            g.least <- 2
+            g.most <- 6
+            g.narrowest <- 1
+            g.widest <- 3
+        elif index == 2:
+            g.least <- 3
+            g.most <- 6
+            g.narrowest <- 2
+            g.widest <- 3
+            g.step <- 1
+        elif index == 3:
+            g.least <- 3
+            g.most <- 7
+            g.narrowest <- 2
+            g.widest <- 4
+            g.step <- 1
+            g.roughness <- 1
+        elif index == 4:
+            g.least <- 4
+            g.most <- 9
+            g.narrowest <- 2
+            g.widest <- 4
+            g.step <- 2
+            g.roughness <- 1
+        elif index == 5:
+            g.least <- 5
+            g.most <- 11
+            g.narrowest <- 3
+            g.widest <- 5
+            g.step <- 2
+            g.roughness <- 2
+        elif index == 6:
+            g.least <- 6
+            g.most <- 14
+            g.narrowest <- 3
+            g.widest <- 6
+            g.step <- 3
+            g.roughness <- 2
+        else:
+            g.least <- 8
+            g.most <- 18
+            g.narrowest <- 4
+            g.widest <- 7
+            g.step <- 4
+            g.roughness <- 3
+        return g
+
+# A board, row 0 at the floor. `cells` is row-major.
+struct TtBoard:
+    cols: mutable i64
+    rows: mutable i64
+    cells: mutable darray[i64]
+    sky: mutable darray[i64]
+
+def tt_board_new(a: mutable Arena&, cols: i64, rows: i64) -> TtBoard:
+    can Memory.Allocate, Abort.Panic:
+        board: mutable TtBoard = zeroed
+        board.cols <- cols
+        board.rows <- rows
+        board.cells <- Ints::zeros(a, cols * rows + 1)
+        board.sky <- Ints::zeros(a, cols + 1)
+        return board
+
+def tt_filled(board: TtBoard&, x: i64, y: i64) -> bool:
+    can Abort.Panic:
+        false return if x < 0 or x >= board.cols or y < 0 or y >= board.rows
+        return Ints::at(board.cells, y * board.cols + x) != 0
+
+def tt_fill(board: mutable TtBoard&, x: i64, y: i64, value: i64):
+    can Abort.Panic:
+        return if x < 0 or x >= board.cols or y < 0 or y >= board.rows
+        byte: i64 = value % 256
+        Ints::put(&board.cells, y * board.cols + x, byte if byte != 0 else 1)
+
+# Per column, the first row free of anything stacked -- one past the topmost
+# filled cell. Everything at or above this is empty by definition; everything
+# empty BELOW it is a hole, which is the quantity the module exists to keep
+# at zero.
+def tt_skyline(board: mutable TtBoard&):
+    can Abort.Panic:
+        clear: mutable i64 = 0
+        while clear < board.cols |clear, board|:
+            Ints::put(&board.sky, clear, 0)
+            clear <- clear + 1
+        y: mutable i64 = board.rows - 1
+        while y >= 0 |y, board|:
+            x: mutable i64 = 0
+            while x < board.cols |x, y, board|:
+                if Ints::at(board.cells, y * board.cols + x) != 0 and Ints::at(board.sky, x) == 0:
+                    Ints::put(&board.sky, x, y + 1)
+                x <- x + 1
+            y <- y - 1
+
+def tt_holes(board: mutable TtBoard&) -> i64:
+    can Abort.Panic:
+        tt_skyline(board)
+        total: mutable i64 = 0
+        x: mutable i64 = 0
+        while x < board.cols |x, board, total|:
+            y: mutable i64 = 0
+            while y < Ints::at(board.sky, x) |y, x, board, total|:
+                total <- total + 1 if Ints::at(board.cells, y * board.cols + x) == 0
+                y <- y + 1
+            x <- x + 1
+        return total
+
+# ------------------------------------------------------------
+# Pieces
+#
+# A piece is a cell list, kept SORTED ascending by (x, y) so that two pieces
+# with the same cells compare equal by a straight walk. The reference uses a
+# frozenset and compares those; sorting is the same equality without needing a
+# hash table, and it is safe because nothing here depends on iteration order --
+# `orientations` returns its list in quarter order, not set order.
+# ------------------------------------------------------------
+
+struct TtPiece:
+    x: mutable darray[i64]
+    y: mutable darray[i64]
+    count: mutable i64
+
+def tt_piece_new(a: mutable Arena&) -> TtPiece:
+    can Memory.Allocate, Abort.Panic:
+        piece: mutable TtPiece = zeroed
+        piece.x <- Ints::zeros(a, TT_MAX_CELLS + 1)
+        piece.y <- Ints::zeros(a, TT_MAX_CELLS + 1)
+        return piece
+
+# Slide the cells until their lowest row and leftmost column are 0, then sort.
+def tt_normalise(piece: mutable TtPiece&):
+    can Abort.Panic:
+        return if piece.count == 0
+        left: mutable i64 = Ints::at_ref(&piece.x, 0)
+        floor: mutable i64 = Ints::at_ref(&piece.y, 0)
+        scan: mutable i64 = 1
+        while scan < piece.count |scan, piece, left, floor|:
+            left <- Ints::at_ref(&piece.x, scan) if Ints::at_ref(&piece.x, scan) < left else left
+            floor <- Ints::at_ref(&piece.y, scan) if Ints::at_ref(&piece.y, scan) < floor else floor
+            scan <- scan + 1
+        shift: mutable i64 = 0
+        while shift < piece.count |shift, piece, left, floor|:
+            Ints::put(&piece.x, shift, Ints::at_ref(&piece.x, shift) - left)
+            Ints::put(&piece.y, shift, Ints::at_ref(&piece.y, shift) - floor)
+            shift <- shift + 1
+        # Insertion sort on the key x * 1024 + y, so a piece has one canonical
+        # spelling and two can be compared cell by cell.
+        outer: mutable i64 = 1
+        while outer < piece.count |outer, piece|:
+            key_x: i64 = Ints::at_ref(&piece.x, outer)
+            key_y: i64 = Ints::at_ref(&piece.y, outer)
+            key: i64 = key_x * 1024 + key_y
+            inner: mutable i64 = outer
+            while inner > 0 and Ints::at_ref(&piece.x, inner - 1) * 1024 + Ints::at_ref(&piece.y, inner - 1) > key |inner, piece|:
+                Ints::put(&piece.x, inner, Ints::at_ref(&piece.x, inner - 1))
+                Ints::put(&piece.y, inner, Ints::at_ref(&piece.y, inner - 1))
+                inner <- inner - 1
+            Ints::put(&piece.x, inner, key_x)
+            Ints::put(&piece.y, inner, key_y)
+            outer <- outer + 1
+
+def tt_width(piece: TtPiece&) -> i64:
+    can Abort.Panic:
+        0 return if piece.count == 0
+        widest: mutable i64 = 0
+        scan: mutable i64 = 0
+        while scan < piece.count |scan, piece, widest|:
+            widest <- Ints::at(piece.x, scan) if Ints::at(piece.x, scan) > widest else widest
+            scan <- scan + 1
+        return widest + 1
+
+def tt_height(piece: TtPiece&) -> i64:
+    can Abort.Panic:
+        0 return if piece.count == 0
+        tallest: mutable i64 = 0
+        scan: mutable i64 = 0
+        while scan < piece.count |scan, piece, tallest|:
+            tallest <- Ints::at(piece.y, scan) if Ints::at(piece.y, scan) > tallest else tallest
+            scan <- scan + 1
+        return tallest + 1
+
+def tt_same(one: TtPiece&, other: TtPiece&) -> bool:
+    can Abort.Panic:
+        false return if one.count != other.count
+        scan: mutable i64 = 0
+        while scan < one.count |scan, one, other|:
+            false return if Ints::at(one.x, scan) != Ints::at(other.x, scan)
+            false return if Ints::at(one.y, scan) != Ints::at(other.y, scan)
+            scan <- scan + 1
+        return true
+
+# `cells` turned anticlockwise by `quarter` right angles: (x, y) -> (-y, x),
+# renormalised after each turn exactly as the reference does.
+def tt_quarter_turn(source: TtPiece&, quarter: i64, out: mutable TtPiece&):
+    can Abort.Panic:
+        out.count <- source.count
+        copy: mutable i64 = 0
+        while copy < source.count |copy, source, out|:
+            Ints::put(&out.x, copy, Ints::at(source.x, copy))
+            Ints::put(&out.y, copy, Ints::at(source.y, copy))
+            copy <- copy + 1
+        turn: mutable i64 = 0
+        while turn < quarter % 4 |turn, out, quarter|:
+            spin: mutable i64 = 0
+            while spin < out.count |spin, out|:
+                held_x: i64 = Ints::at_ref(&out.x, spin)
+                held_y: i64 = Ints::at_ref(&out.y, spin)
+                Ints::put(&out.x, spin, 0 - held_y)
+                Ints::put(&out.y, spin, held_x)
+                spin <- spin + 1
+            tt_normalise(out)
+            turn <- turn + 1
+
+# The row a hard drop down column `col` comes to rest at, or -1 when the piece
+# hangs off either side. Read straight off the skyline rather than simulated:
+# every cell at or above the skyline is empty, so the first contact is
+# whichever of the piece's lowest cells reaches its own column's skyline first.
+def tt_landing(board: mutable TtBoard&, piece: TtPiece&, col: i64) -> i64:
+    can Abort.Panic:
+        width: i64 = tt_width(piece)
+        -1 return if col < 0 or col + width > board.cols
+        best: mutable i64 = 0
+        seen: mutable bool = false
+        column: mutable i64 = 0
+        while column < width |column, width, piece, board, col, best, seen|:
+            lowest: mutable i64 = board.rows + 1
+            found: mutable bool = false
+            scan: mutable i64 = 0
+            while scan < piece.count |scan, piece, column, lowest, found|:
+                if Ints::at(piece.x, scan) == column and Ints::at(piece.y, scan) < lowest:
+                    lowest <- Ints::at(piece.y, scan)
+                    found <- true
+                scan <- scan + 1
+            if found:
+                rest: i64 = Ints::at(board.sky, col + column) - lowest
+                best <- rest if not seen or rest > best else best
+                seen <- true
+            column <- column + 1
+        return best
+
+# How many empty cells the piece at (col, row) would bury. A cell counts when
+# it is empty, is not part of the piece, sits at or above its column's skyline
+# -- so it is not already buried -- and has some part of the piece above it.
+# Those are exactly the cells that become holes, because the piece is the only
+# thing being added.
+def tt_gaps_under(board: mutable TtBoard&, piece: TtPiece&, col: i64, row: i64) -> i64:
+    can Abort.Panic:
+        buried: mutable i64 = 0
+        width: i64 = tt_width(piece)
+        column: mutable i64 = 0
+        while column < width |column, width, piece, board, col, row, buried|:
+            ceiling: mutable i64 = -1
+            scan: mutable i64 = 0
+            while scan < piece.count |scan, piece, column, row, ceiling|:
+                if Ints::at(piece.x, scan) == column and row + Ints::at(piece.y, scan) > ceiling:
+                    ceiling <- row + Ints::at(piece.y, scan)
+                scan <- scan + 1
+            at_x: i64 = col + column
+            if ceiling >= 0 and at_x >= 0 and at_x < board.cols:
+                y: mutable i64 = Ints::at(board.sky, at_x)
+                while y < ceiling |y, ceiling, piece, column, row, buried, at_x|:
+                    inside: mutable bool = false
+                    check: mutable i64 = 0
+                    while check < piece.count |check, piece, column, row, y, inside|:
+                        if Ints::at(piece.x, check) == column and row + Ints::at(piece.y, check) == y:
+                            inside <- true
+                        check <- check + 1
+                    buried <- buried + 1 if not inside
+                    y <- y + 1
+            column <- column + 1
+        return buried
+
+# Every lattice drop of `piece` that buries nothing, as (quarter, col, row)
+# triples. The proof obligation of the module, discharged by ENUMERATION:
+# four orientations by every column the piece fits in, each hard-dropped and
+# then asked what it would cover.
+def tt_perfect_placements(a: mutable Arena&, board: mutable TtBoard&, piece: TtPiece&, limit: i64, out_quarter: mutable darray[i64]&, out_col: mutable darray[i64]&, out_row: mutable darray[i64]&) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        tt_skyline(board)
+        found: mutable i64 = 0
+        turned: mutable TtPiece = tt_piece_new(a)
+        earlier: mutable TtPiece = tt_piece_new(a)
+        quarter: mutable i64 = 0
+        stop: mutable bool = false
+        while quarter < 4 and not stop |quarter, piece, board, a, turned, earlier, found, limit, out_quarter, out_col, out_row, stop|:
+            tt_quarter_turn(piece, quarter, &turned)
+            # Distinct orientations only: a square has one, a domino two. A
+            # square that reported four identical drops would be advertising a
+            # choice it does not offer.
+            seen_before: mutable bool = false
+            back: mutable i64 = 0
+            while back < quarter |back, piece, earlier, turned, seen_before|:
+                tt_quarter_turn(piece, back, &earlier)
+                seen_before <- true if tt_same(&earlier, &turned)
+                back <- back + 1
+            if not seen_before:
+                width: i64 = tt_width(&turned)
+                height: i64 = tt_height(&turned)
+                col: mutable i64 = 0
+                while col <= board.cols - width and not stop |col, width, height, board, turned, found, limit, out_quarter, out_col, out_row, quarter, stop|:
+                    row: i64 = tt_landing(board, &turned, col)
+                    if row >= 0 and row + height <= board.rows:
+                        if tt_gaps_under(board, &turned, col, row) == 0:
+                            Ints::put(out_quarter, found, quarter)
+                            Ints::put(out_col, found, col)
+                            Ints::put(out_row, found, row)
+                            found <- found + 1
+                            stop <- true if limit != 0 and found >= limit
+                    col <- col + 1
+            quarter <- quarter + 1
+        return found
+
+# Raise tops until neighbouring columns actually touch. Two columns of a piece
+# are joined when their cells overlap in some row; give them independently
+# dented tops and they need not, and a piece in two halves is not a piece.
+# Raising is the repair that CANNOT FAIL: it only ever adds cells, and adding a
+# cell to a column can never separate it from anything.
+def tt_bridge(base: mutable darray[i64]&, tops: mutable darray[i64]&, width: i64):
+    can Abort.Panic:
+        index: mutable i64 = 1
+        while index < width |index, width, base, tops|:
+            left: i64 = Ints::at_ref(base, index - 1)
+            right: i64 = Ints::at_ref(base, index)
+            need: i64 = (left if left > right else right) + 1
+            if Ints::at_ref(tops, index - 1) < need:
+                Ints::put(tops, index - 1, need)
+            if Ints::at_ref(tops, index) < need:
+                Ints::put(tops, index, need)
+            index <- index + 1
+
+# The fallback: an upright bar over the shallowest column. Its lowest cell
+# rests on that column's skyline and it has no second column to leave hanging,
+# so it buries nothing wherever it goes -- and it is the ONLY shape with that
+# property on every board, which is why the fallback is this and not something
+# prettier.
+def tt_bar(board: mutable TtBoard&, g: TtGrade&, out: mutable TtPiece&):
+    can Abort.Panic:
+        tt_skyline(board)
+        # min(range(cols), key=sky): FIRST minimum, so strict <.
+        column: mutable i64 = 0
+        scan: mutable i64 = 1
+        while scan < board.cols |scan, board, column|:
+            column <- scan if Ints::at(board.sky, scan) < Ints::at(board.sky, column) else column
+            scan <- scan + 1
+        room: i64 = board.rows - 1 - Ints::at(board.sky, column)
+        height: mutable i64 = g.least if g.least < room else room
+        height <- 1 if height < 1 else height
+        out.count <- 0
+        y: mutable i64 = 0
+        while y < height |y, height, out|:
+            Ints::put(&out.x, out.count, 0)
+            Ints::put(&out.y, out.count, y)
+            out.count <- out.count + 1
+            y <- y + 1
+        tt_normalise(out)
+
+# Cut a piece out of the board: take a window of columns, fill the notch to a
+# level top, dent that top, and bridge whatever the dents separated.
+#
+# Up to `shortlist` windows are tried and the LOWEST is cut from. The reference
+# measured that against taking the first acceptable window, over 750 placements
+# of the seventh rung: mean pile height 9.3 rather than 16.6, and 49 re-cuts
+# rather than 130. Both come from the same thing -- a level board has more
+# stretches of skyline matching any given piece, so pieces keep having
+# somewhere to go and the queue keeps its promise without being re-cut.
+def tt_carve(a: mutable Arena&, board: mutable TtBoard&, g: TtGrade&, rng: mutable MT19937&, attempts: i64, shortlist: i64, out: mutable TtPiece&):
+    can Memory.Allocate, Abort.Panic:
+        tt_skyline(board)
+        ceiling: i64 = board.rows - 1
+
+        base: mutable darray[i64] = Ints::zeros(a, board.cols + 1)
+        tops: mutable darray[i64] = Ints::zeros(a, board.cols + 1)
+        best: mutable TtPiece = tt_piece_new(a)
+        candidate: mutable TtPiece = tt_piece_new(a)
+        best_low: mutable i64 = 0
+        have_best: mutable bool = false
+        kept: mutable i64 = 0
+
+        attempt: mutable i64 = 0
+        while attempt < attempts and kept < shortlist |attempt, attempts, kept, shortlist, board, g, rng, base, tops, best, candidate, best_low, have_best, ceiling|:
+            widest: i64 = g.widest if g.widest < board.cols else board.cols
+            width: i64 = py_randint(rng, g.narrowest, widest)
+            start: i64 = py_randbelow(rng, (board.cols - width + 1).u64()).i64()
+
+            low: mutable i64 = Ints::at(board.sky, start)
+            high: mutable i64 = low
+            read: mutable i64 = 0
+            while read < width |read, width, board, start, base, low, high|:
+                value: i64 = Ints::at(board.sky, start + read)
+                Ints::put(&base, read, value)
+                low <- value if value < low else low
+                high <- value if value > high else high
+                read <- read + 1
+
+            if high - low <= g.step:
+                stacked: mutable i64 = 0
+                sum_index: mutable i64 = 0
+                while sum_index < width |sum_index, width, base, stacked|:
+                    stacked <- stacked + Ints::at_ref(&base, sum_index)
+                    sum_index <- sum_index + 1
+
+                # A level top at height `top` spends width*top - sum(base)
+                # cells, monotone in top, so the cell budget is a RANGE of tops
+                # and picking one is picking a piece.
+                #
+                # The reference writes the lower bound as -((-(least+stacked))
+                # // width), which is Python's floor division standing in for a
+                # ceiling. Both operands here are non-negative, so the plain
+                # ceiling form is the same number without depending on how a
+                # language rounds negative division.
+                want_low: i64 = (g.least + stacked + width - 1) / width
+                lowest: mutable i64 = high + 1
+                lowest <- want_low if want_low > lowest else lowest
+                highest: mutable i64 = (g.most + stacked) / width
+                highest <- ceiling if highest > ceiling else highest
+
+                if lowest <= highest:
+                    # ONE draw, replicated across every column. Drawing per
+                    # column would spend `width` values instead of one and give
+                    # a top already ragged before the dents.
+                    level: i64 = py_randint(rng, lowest, highest)
+                    fill: mutable i64 = 0
+                    while fill < width |fill, width, tops, level|:
+                        Ints::put(&tops, fill, level)
+                        fill <- fill + 1
+                    if g.roughness != 0:
+                        dent: mutable i64 = 0
+                        while dent < width |dent, width, tops, base, g, rng, level|:
+                            cut: i64 = level - py_randint(rng, 0, g.roughness)
+                            need: i64 = Ints::at_ref(&base, dent) + 1
+                            Ints::put(&tops, dent, need if need > cut else cut)
+                            dent <- dent + 1
+                        tt_bridge(&base, &tops, width)
+
+                    tallest: mutable i64 = Ints::at_ref(&tops, 0)
+                    total: mutable i64 = 0
+                    check: mutable i64 = 0
+                    while check < width |check, width, tops, base, tallest, total|:
+                        top_here: i64 = Ints::at_ref(&tops, check)
+                        tallest <- top_here if top_here > tallest else tallest
+                        total <- total + top_here - Ints::at_ref(&base, check)
+                        check <- check + 1
+
+                    if tallest <= ceiling and total >= g.least and total <= g.most:
+                        candidate.count <- 0
+                        column: mutable i64 = 0
+                        while column < width |column, width, base, tops, candidate|:
+                            y: mutable i64 = Ints::at_ref(&base, column)
+                            while y < Ints::at_ref(&tops, column) |y, column, tops, candidate|:
+                                Ints::put(&candidate.x, candidate.count, column)
+                                Ints::put(&candidate.y, candidate.count, y)
+                                candidate.count <- candidate.count + 1
+                                y <- y + 1
+                            column <- column + 1
+                        tt_normalise(&candidate)
+                        # min(cut, key=first) keeps the FIRST minimum, so a tie
+                        # goes to the earliest attempt. Strict `<` here; `<=`
+                        # would take the last and cut a different piece
+                        # whenever two windows sit equally low, which on a
+                        # level board is most of the time.
+                        if not have_best or high < best_low:
+                            best_low <- high
+                            best.count <- candidate.count
+                            carry: mutable i64 = 0
+                            while carry < candidate.count |carry, candidate, best|:
+                                Ints::put(&best.x, carry, Ints::at_ref(&candidate.x, carry))
+                                Ints::put(&best.y, carry, Ints::at_ref(&candidate.y, carry))
+                                carry <- carry + 1
+                            have_best <- true
+                        kept <- kept + 1
+            attempt <- attempt + 1
+
+        if have_best:
+            out.count <- best.count
+            copy: mutable i64 = 0
+            while copy < best.count |copy, best, out|:
+                Ints::put(&out.x, copy, Ints::at_ref(&best.x, copy))
+                Ints::put(&out.y, copy, Ints::at_ref(&best.y, copy))
+                copy <- copy + 1
+        else:
+            tt_bar(board, g, out)
