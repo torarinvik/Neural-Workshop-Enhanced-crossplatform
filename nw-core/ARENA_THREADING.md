@@ -1,69 +1,66 @@
-# Why `Arena&` is threaded through nw-core signatures, and what it would take to stop
+# Region inference, and why nw-core no longer threads `Arena&`
 
-Roughly 80 functions across 15 files take `a: mutable Arena&` as their first
-parameter. stage0 warns on every one:
+Roughly 100 functions across 37 files used to take `a: mutable Arena&` as their
+first parameter. stage0 warned on every one:
 
     warning: internal runtime carrier type "Arena" is not supported in
     user-facing code; use "region scopes and inferred container regions" instead
 
-The warning is right that `Arena` is the runtime's internal carrier and does not
-belong in a user-facing signature. What the warning does NOT say -- and what an
-attempt to follow it revealed -- is that in this codebase the parameter is
-LOAD-BEARING, not decoration.
+They no longer do. A caller opens a region and the callee allocates into it:
 
-## What was tried
+    region work(64 * 1024 * 1024)
+    in work:
+        sweep_variable()
+        sweep_bt()
+    destroy work
 
-A mechanical transform: drop the parameter, drop the `in a:` block inside each
-function, drop `a` from capture lists, drop the argument at every call site, and
-replace the callers' `arena: mutable Arena& = (&work).cast[mutable Arena&]` with
-an `in work:` scope.
+## Why the first attempt failed, and what was actually wrong
 
-It worked for `board.elisa`: eight functions, zero Arena mentions left, and the
-board suite still passed all 328 cases on stage0.
+An earlier attempt at this concluded the parameter was load-bearing and reverted.
+That conclusion was wrong, and the write-up it produced (the previous version of
+this file) recorded a compiler bug as a fact about the port. Three separate
+compiler bugs were doing the blocking:
 
-It broke `stimulus`, `config`, `session` (compile) and `maze` (SIGSEGV).
+1. **`interleaved object lifetimes ... stack budget (64) exhausted`** on THREE
+   containers. The budget was never the issue: all three had landed on stack 0,
+   the shared fixed/reserved stack, because the compiler synthesizes a
+   pre-reserve for a counting loop and any reserved container goes there.
+   Crossing lifetimes on stack 0 cannot conflict -- bulk reclaim, relocating
+   backing -- so the rejection was a false positive. It also explains why
+   `reserve()`, the diagnostic's own advertised remedy, did not help: reserving
+   is what moves a container onto stack 0.
 
-## Why it broke
+2. **A silent use-after-free**, which is why the first mechanical sweep
+   SIGSEGV'd in ten suites. A container allocated in a callee, stored into a
+   struct FIELD, and returned with the struct was not recognized as escaping,
+   so the callee allocated into a per-call arena and freed it before `ret`. The
+   struct-LITERAL spelling of the same function was recognized and worked.
 
-    stimulus.elisa:81: interleaved object lifetimes in an inferred region:
-    "positions" is created while "kinds" is still live and their live ranges
-    overlap, and the region's stack budget (64) is exhausted, so they cannot
-    share a bump-stack.
+3. **Two gaps in growing a container owned by a caller**: the documented
+   `param.f[i].push(..)` shape was not actually matched, and a call site could
+   not thread a struct local's region through a field path (`&buffers.history`).
 
-`compute_bt_sequence` builds three containers whose live ranges overlap. Two of
-them (`positions`, `audio`) ESCAPE in the return value; the third (`kinds`) is
-scratch that is iterated by the same loop that fills the other two. The `in a:`
-block was giving all three one explicit region so they could share a bump-stack.
-Remove it and region inference has to place three interleaved containers on its
-own budget, which it cannot.
+All three are fixed in Elisa-core (`nw-port`), each with a regression test.
 
-`reserve()`ing the scratch container -- the diagnostic's own second suggestion --
-did NOT clear it. Tried and measured, not assumed.
+## What is left
 
-## What a real fix needs
+`test/config_sweep.elisa` still binds one `Arena&`, because
+`read_entire_file_cstr(a: mutable Arena&, path: cstr)` is a std file-IO API that
+takes the carrier explicitly. Nothing of ours threads an arena any more.
 
-Per-function design, not a sweep:
+## One shape the compiler still cannot express
 
-  * functions whose containers all escape -> the mechanical transform is correct
-    and `board.elisa` proves it;
-  * functions with escaping AND scratch containers whose ranges interleave ->
-    need the scratch hoisted into its own nested region, which means
-    restructuring the loop so the lifetimes actually nest, OR a region-inference
-    change so a reserved container really is excluded from the stack budget.
+Growth of an element of a NESTED container reached through a by-ref struct param:
 
-The second bullet is a compiler question as much as a port question, and the
-diagnostic advertising `reserve()` as a remedy that then does not work is worth
-a repro in its own right.
+    h.xs[0].push(v)        # where xs: darray[darray[i64]]
 
-## Status
+The region stamped on the param propagates to the field (`xs`) but not through
+it to the inner darray, so the push cannot name an allocation region at all.
+The flat-field form (`h.xs.push(v)` where `xs: darray[i64]`) works.
 
-REVERTED. All 13 suites pass on both stages; nothing here is half-applied. The
-warnings stay until this is done properly.
-
-A caveat on the earlier framing of this: it was first written up (in
-worktrees/elisa-core-nw/repro/pending_nw_core_patches/README.md item 7) as
-"board.elisa simply predates the right pattern and was never brought in line".
-That was wrong. display.elisa can use the inferred-region pattern because
-`display_list_new` builds containers that all escape together; the modules that
-thread `Arena&` are the ones with interleaved scratch. The difference is
-structural, not historical.
+`SessionHistory` was the one place in the port that needed this. It is now a
+flat trial-major buffer -- `flat[trial * STIMULUS_FIELD_COUNT + field]` -- which
+is exactly equivalent because every field is appended once per recorded trial,
+and is one allocation instead of STIMULUS_FIELD_COUNT + 1. The 25,725-case
+session suite is unchanged, which is the evidence that the representation swap
+preserved behaviour.

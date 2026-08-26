@@ -194,18 +194,17 @@ def session_active_cell_limit(cfg: SessionCfg&) -> i64:
 # and the curriculum cap does not apply; otherwise board.elisa's
 # active_position_ids answers, always in 2D (the reference computes
 # `dim = 3 if current_grid_3d() else 2` inside the branch where it is False).
-def session_active_position_ids(a: mutable Arena&, cfg: SessionCfg&) -> darray[i64]:
+def session_active_position_ids(cfg: SessionCfg&) -> darray[i64]:
     can Memory.Allocate, Abort.Panic:
         if cfg.grid_3d:
-            in a:
-                ids: mutable darray[i64] = []
-                total: i64 = session_3d_cell_count(cfg)
-                index: mutable i64 = 1
-                while index <= total |ids, index, total|:
-                    ids.push(index)
-                    index <- index + 1
-                return ids
-        return active_position_ids(a, session_grid_size(cfg), cfg.grid_include_center, session_active_cell_limit(cfg), 2)
+            ids: mutable darray[i64] = []
+            total: i64 = session_3d_cell_count(cfg)
+            index: mutable i64 = 1
+            while index <= total |ids, index, total|:
+                ids.push(index)
+                index <- index + 1
+            return ids
+        return active_position_ids(session_grid_size(cfg), cfg.grid_include_center, session_active_cell_limit(cfg), 2)
 
 # ---------------------------------------------------------------------------
 # state.stats.session: the per-field history streams
@@ -217,27 +216,31 @@ def session_active_position_ids(a: mutable Arena&, cfg: SessionCfg&) -> darray[i
 # reads only the stimulus streams, and 'image' is never a history key ('image'
 # as a MODALITY resolves its history to 'vis'; see current_and_history_keys).
 struct SessionHistory:
-    streams: darray[darray[i64]]
+    # One flat trial-major buffer, NOT a darray of per-field streams. Every field
+    # is appended exactly once per recorded trial (history_record_stimulus writes
+    # a whole row), so the streams grow in lockstep and
+    #
+    #     stream[field][trial] == flat[trial * STIMULUS_FIELD_COUNT + field]
+    #
+    # holds by construction. Flat because growth has to reach the caller's region:
+    # a container field of a by-ref struct param grows into the threaded region
+    # (`hist.flat.push(..)`), but an ELEMENT of a nested `darray[darray[i64]]`
+    # does not -- the region stamp does not propagate through the outer darray to
+    # the inner one, so `hist.streams[i].push(..)` cannot name an allocation
+    # region at all. This shape sidesteps that and is one allocation instead of
+    # STIMULUS_FIELD_COUNT + 1.
+    flat: mutable darray[i64]
+    trials: mutable i64
 
-def session_history_new(a: mutable Arena&) -> SessionHistory:
+def session_history_new() -> SessionHistory:
     can Memory.Allocate, Abort.Panic:
-        in a:
-            streams: mutable darray[darray[i64]] = []
-            index: mutable i64 = 0
-            while index < STIMULUS_FIELD_COUNT |streams, index|:
-                empty: mutable darray[i64] = []
-                streams.push(empty)
-                index <- index + 1
-            return SessionHistory{streams: streams}
+        flat: mutable darray[i64] = []
+        return SessionHistory{flat: flat, trials: 0}
 
-def history_stream(hist: SessionHistory&, field: StimField) -> darray[i64]:
-    can Abort.Panic:
-        return hist.streams[stimulus_field_code(field).usize()]
-
+# Every field has the same length: one entry per recorded trial.
 def history_length(hist: SessionHistory&, field: StimField) -> i64:
     can Abort.Panic:
-        stream: darray[i64] = history_stream(hist, field)
-        return stream.count.i64()
+        return hist.trials
 
 struct HistoryLookup:
     ok: bool
@@ -248,11 +251,11 @@ struct HistoryLookup:
 # false exactly where the reference would raise.
 def history_lookup(hist: SessionHistory&, field: StimField, index: i64) -> HistoryLookup:
     can Abort.Panic:
-        stream: darray[i64] = history_stream(hist, field)
-        length: i64 = stream.count.i64()
+        length: i64 = hist.trials
         wrapped: i64 = index + length if index < 0 else index
         HistoryLookup{ok: false, value: 0} return if wrapped < 0 or wrapped >= length
-        return HistoryLookup{ok: true, value: get stream[wrapped.usize()] else 0}
+        slot: i64 = wrapped * STIMULUS_FIELD_COUNT + stimulus_field_code(field)
+        return HistoryLookup{ok: true, value: get hist.flat[slot.usize()] else 0}
 
 # The stimulus half of stats.save_input(): append this trial's current_stim to
 # the history streams. It lives here rather than in a stats port because
@@ -260,15 +263,13 @@ def history_lookup(hist: SessionHistory&, field: StimField, index: i64) -> Histo
 # reference's loop is over `mode.current_stim.items()` -- which is exactly
 # STIMULUS_FIELDS order. The 'numbers' stream is current_stim['number'] (the
 # only key the reference renames), so the field code carries it unchanged.
-def history_record_stimulus(a: mutable Arena&, hist: mutable SessionHistory&, game: Mode&):
+def history_record_stimulus(hist: mutable SessionHistory&, game: Mode&):
     can Memory.Allocate, Abort.Panic:
-        in a:
-            index: mutable i64 = 0
-            while index < STIMULUS_FIELD_COUNT |a, hist, game, index|:
-                stream: mutable darray[i64] = hist.streams[index.usize()]
-                stream.push(game.current_stim[index.usize()])
-                hist.streams[index.usize()] <- stream
-                index <- index + 1
+        index: mutable i64 = 0
+        while index < STIMULUS_FIELD_COUNT |hist, game, index|:
+            hist.flat.push(game.current_stim[index.usize()])
+            index <- index + 1
+        hist.trials <- hist.trials + 1
 
 # The variable-length session buffers that hang off state.mode upstream.
 struct SessionBuffers:
@@ -436,32 +437,31 @@ struct GenerateOutcome:
 # looks values up, so sampling [0, n-1] yields exactly the indices sample()
 # would have used, and mapping them through active_ids finishes the job. The
 # random stream sees an identical sequence either way.
-def sample_random_stimuli(a: mutable Arena&, rng: mutable MT19937&, cfg: SessionCfg&, game: mutable Mode&) -> darray[i64]:
+def sample_random_stimuli(rng: mutable MT19937&, cfg: SessionCfg&, game: mutable Mode&) -> darray[i64]:
     can Memory.Allocate, Abort.Panic:
-        active: darray[i64] = session_active_position_ids(a, cfg)
+        active: darray[i64] = session_active_position_ids(cfg)
         count: i64 = active.count.i64()
         k_multi: i64 = 4 if count > 4 else count
-        in a:
-            positions: mutable darray[i64] = []
-            picks: darray[i64] = py_sample_range(a, rng, 0, count - 1, k_multi)
-            for pick in picks |positions, active|:
-                positions.push(get active[pick.usize()] else 0)
-            # zip(range(1, k+1), positions): the position is stored and a fresh
-            # vis value drawn for the SAME slot before moving on, so the draws
-            # interleave with the slots rather than coming in one block.
-            slot: mutable i64 = 1
-            while slot <= k_multi |game, positions, rng, slot, k_multi|:
-                stim_set(game, position_field(slot), get positions[(slot - 1).usize()] else 0)
-                stim_set(game, vis_field(slot), py_randint(rng, 1, 8))
-                slot <- slot + 1
-            stim_set(game, StimField.Vis, py_randint(rng, 1, 8))
-            stim_set(game, StimField.Audio, py_randint(rng, 1, 8))
-            stim_set(game, StimField.Audio2, py_randint(rng, 1, 8))
-            if cfg.grid_3d:
-                stim_set(game, StimField.Color, py_randint(rng, 1, session_3d_color_count(cfg)))
-            else:
-                stim_set(game, StimField.Color, py_randint(rng, 1, 8))
-            return positions
+        positions: mutable darray[i64] = []
+        picks: darray[i64] = py_sample_range(rng, 0, count - 1, k_multi)
+        for pick in picks |positions, active|:
+            positions.push(get active[pick.usize()] else 0)
+        # zip(range(1, k+1), positions): the position is stored and a fresh
+        # vis value drawn for the SAME slot before moving on, so the draws
+        # interleave with the slots rather than coming in one block.
+        slot: mutable i64 = 1
+        while slot <= k_multi |game, positions, rng, slot, k_multi|:
+            stim_set(game, position_field(slot), get positions[(slot - 1).usize()] else 0)
+            stim_set(game, vis_field(slot), py_randint(rng, 1, 8))
+            slot <- slot + 1
+        stim_set(game, StimField.Vis, py_randint(rng, 1, 8))
+        stim_set(game, StimField.Audio, py_randint(rng, 1, 8))
+        stim_set(game, StimField.Audio2, py_randint(rng, 1, 8))
+        if cfg.grid_3d:
+            stim_set(game, StimField.Color, py_randint(rng, 1, session_3d_color_count(cfg)))
+        else:
+            stim_set(game, StimField.Color, py_randint(rng, 1, 8))
+        return positions
 
 # ---------------------------------------------------------------------------
 # _choose_arithmetic_operands
@@ -496,69 +496,68 @@ def fraction_is_acceptable(cfg: SessionCfg&, number_nback: i64, divisor: i64) ->
 # Called on EVERY trial of EVERY mode, not just arithmetic ones -- the operand
 # draw is part of the stream regardless of whether anything shows it. Only the
 # divisor search is conditional on the mode actually being an arithmetic one.
-def choose_arithmetic_operands(a: mutable Arena&, rng: mutable MT19937&, cfg: SessionCfg&, game: mutable Mode&, modalities: darray[Modality]&, hist: SessionHistory&) -> GenerateStatus:
+def choose_arithmetic_operands(rng: mutable MT19937&, cfg: SessionCfg&, game: mutable Mode&, modalities: darray[Modality]&, hist: SessionHistory&) -> GenerateStatus:
     can Memory.Allocate, Abort.Panic:
-        in a:
-            operations: mutable darray[ArithOp] = []
-            if cfg.arithmetic_use_addition:
-                operations.push(ArithOp.Add)
-            if cfg.arithmetic_use_subtraction:
-                operations.push(ArithOp.Subtract)
-            if cfg.arithmetic_use_multiplication:
-                operations.push(ArithOp.Multiply)
-            if cfg.arithmetic_use_division:
-                operations.push(ArithOp.Divide)
-            enabled: i64 = operations.count.i64()
-            GenerateStatus.NoArithmeticOperations return if enabled == 0
-            # random.choice(seq) is seq[_randbelow(len(seq))].
-            picked: i64 = py_randbelow(rng, enabled.u64()).i64()
-            game.current_operation <- get operations[picked.usize()] else ArithOp.NoneOp
+        operations: mutable darray[ArithOp] = []
+        if cfg.arithmetic_use_addition:
+            operations.push(ArithOp.Add)
+        if cfg.arithmetic_use_subtraction:
+            operations.push(ArithOp.Subtract)
+        if cfg.arithmetic_use_multiplication:
+            operations.push(ArithOp.Multiply)
+        if cfg.arithmetic_use_division:
+            operations.push(ArithOp.Divide)
+        enabled: i64 = operations.count.i64()
+        GenerateStatus.NoArithmeticOperations return if enabled == 0
+        # random.choice(seq) is seq[_randbelow(len(seq))].
+        picked: i64 = py_randbelow(rng, enabled.u64()).i64()
+        game.current_operation <- get operations[picked.usize()] else ArithOp.NoneOp
 
-            max_number: i64 = cfg.arithmetic_max_number
-            min_number: i64 = -max_number if cfg.arithmetic_use_negatives else 0
+        max_number: i64 = cfg.arithmetic_max_number
+        min_number: i64 = -max_number if cfg.arithmetic_use_negatives else 0
 
-            divides: bool = game.current_operation == ArithOp.Divide and modalities_contain(modalities, Modality.Arithmetic)
-            if not divides:
-                stim_set(game, StimField.Number, py_randint(rng, min_number, max_number))
-                return GenerateStatus.Ok
-
-            # No history to divide into yet; any non-zero operand will do. The
-            # reference loops until it draws one, which is a real rejection
-            # loop on the stream.
-            if history_length(hist, StimField.Position1) < game.back:
-                number: mutable i64 = 0
-                spins: mutable i64 = 0
-                while number == 0 and spins < 1000 |number, spins, rng, min_number, max_number|:
-                    number <- py_randint(rng, min_number, max_number)
-                    spins <- spins + 1
-                # Upstream this loop cannot exit when min == max == 0; the port
-                # reports a status instead of hanging.
-                GenerateStatus.ZeroOperandStall return if number == 0
-                stim_set(game, StimField.Number, number)
-                return GenerateStatus.Ok
-
-            # Only offer divisors that give an acceptable result. The guard
-            # above means trial_number - back - 1 >= 0 here.
-            behind: HistoryLookup = history_lookup(hist, StimField.Number, game.trial_number - game.back - 1)
-            GenerateStatus.HistoryIndex return if not behind.ok
-            number_nback: i64 = behind.value
-            possibilities: mutable darray[i64] = []
-            candidate: mutable i64 = min_number
-            while candidate <= max_number |cfg, possibilities, candidate, max_number, number_nback|:
-                if candidate != 0:
-                    # `number_nback % x == 0` asks about divisibility, which C's
-                    # truncating % and Python's flooring % agree on exactly.
-                    if number_nback % candidate == 0:
-                        possibilities.push(candidate)
-                    else:
-                        if fraction_is_acceptable(cfg, number_nback, candidate):
-                            possibilities.push(candidate)
-                candidate <- candidate + 1
-            offered: i64 = possibilities.count.i64()
-            GenerateStatus.NoDivisors return if offered == 0
-            choice: i64 = py_randbelow(rng, offered.u64()).i64()
-            stim_set(game, StimField.Number, get possibilities[choice.usize()] else 0)
+        divides: bool = game.current_operation == ArithOp.Divide and modalities_contain(modalities, Modality.Arithmetic)
+        if not divides:
+            stim_set(game, StimField.Number, py_randint(rng, min_number, max_number))
             return GenerateStatus.Ok
+
+        # No history to divide into yet; any non-zero operand will do. The
+        # reference loops until it draws one, which is a real rejection
+        # loop on the stream.
+        if history_length(hist, StimField.Position1) < game.back:
+            number: mutable i64 = 0
+            spins: mutable i64 = 0
+            while number == 0 and spins < 1000 |number, spins, rng, min_number, max_number|:
+                number <- py_randint(rng, min_number, max_number)
+                spins <- spins + 1
+            # Upstream this loop cannot exit when min == max == 0; the port
+            # reports a status instead of hanging.
+            GenerateStatus.ZeroOperandStall return if number == 0
+            stim_set(game, StimField.Number, number)
+            return GenerateStatus.Ok
+
+        # Only offer divisors that give an acceptable result. The guard
+        # above means trial_number - back - 1 >= 0 here.
+        behind: HistoryLookup = history_lookup(hist, StimField.Number, game.trial_number - game.back - 1)
+        GenerateStatus.HistoryIndex return if not behind.ok
+        number_nback: i64 = behind.value
+        possibilities: mutable darray[i64] = []
+        candidate: mutable i64 = min_number
+        while candidate <= max_number |cfg, possibilities, candidate, max_number, number_nback|:
+            if candidate != 0:
+                # `number_nback % x == 0` asks about divisibility, which C's
+                # truncating % and Python's flooring % agree on exactly.
+                if number_nback % candidate == 0:
+                    possibilities.push(candidate)
+                else:
+                    if fraction_is_acceptable(cfg, number_nback, candidate):
+                        possibilities.push(candidate)
+            candidate <- candidate + 1
+        offered: i64 = possibilities.count.i64()
+        GenerateStatus.NoDivisors return if offered == 0
+        choice: i64 = py_randbelow(rng, offered.u64()).i64()
+        stim_set(game, StimField.Number, get possibilities[choice.usize()] else 0)
+        return GenerateStatus.Ok
 
 # ---------------------------------------------------------------------------
 # _real_back and _current_variable_back
@@ -618,33 +617,32 @@ struct InterferenceResult:
 # matters twice over: it consumes the random stream (two draws for three
 # offsets, one for two), and the loop keeps the LAST offset that works, so the
 # order decides which near miss is planted.
-def interference_back(a: mutable Arena&, rng: mutable MT19937&, game: Mode&, hist: SessionHistory&, field: StimField, real_back: i64) -> InterferenceResult:
+def interference_back(rng: mutable MT19937&, game: Mode&, hist: SessionHistory&, field: StimField, real_back: i64) -> InterferenceResult:
     can Memory.Allocate, Abort.Panic:
-        in a:
-            offsets: mutable darray[i64] = []
-            if real_back >= 3:
-                offsets.push(-1)
-            offsets.push(1)
-            offsets.push(game.back)
-            py_shuffle_i64(rng, &offsets)
+        offsets: mutable darray[i64] = []
+        if real_back >= 3:
+            offsets.push(-1)
+        offsets.push(1)
+        offsets.push(game.back)
+        py_shuffle_i64(rng, &offsets)
 
-            target: HistoryLookup = history_lookup(hist, field, game.trial_number - real_back - 1)
-            InterferenceResult{ok: false, found: false, back: 0} return if not target.ok
+        target: HistoryLookup = history_lookup(hist, field, game.trial_number - real_back - 1)
+        InterferenceResult{ok: false, found: false, back: 0} return if not target.ok
 
-            ok: mutable bool = true
-            chosen: mutable i64 = real_back
-            for offset in offsets |ok, chosen, game, hist, field, real_back, target|:
-                index: i64 = game.trial_number - (real_back + offset) - 1
-                if index >= 0:
-                    entry: HistoryLookup = history_lookup(hist, field, index)
-                    if entry.ok:
-                        if entry.value != target.value:
-                            chosen <- real_back + offset
-                    else:
-                        ok <- false
-            InterferenceResult{ok: false, found: false, back: 0} return if not ok
-            InterferenceResult{ok: true, found: false, back: 0} return if chosen == real_back
-            return InterferenceResult{ok: true, found: true, back: chosen}
+        ok: mutable bool = true
+        chosen: mutable i64 = real_back
+        for offset in offsets |ok, chosen, game, hist, field, real_back, target|:
+            index: i64 = game.trial_number - (real_back + offset) - 1
+            if index >= 0:
+                entry: HistoryLookup = history_lookup(hist, field, index)
+                if entry.ok:
+                    if entry.value != target.value:
+                        chosen <- real_back + offset
+                else:
+                    ok <- false
+        InterferenceResult{ok: false, found: false, back: 0} return if not ok
+        InterferenceResult{ok: true, found: false, back: 0} return if chosen == real_back
+        return InterferenceResult{ok: true, found: true, back: chosen}
 
 # ---------------------------------------------------------------------------
 # _resolve_position_conflict
@@ -696,11 +694,11 @@ def resolve_position_conflict(game: mutable Mode&, own_slot: i64, current: StimF
 # Two random() draws per modality, always both, in that order. r1 forces a
 # guaranteed match; r2 -- scaled by 3/2 in multi-stim modes, leaving 33% of its
 # range for the multi reversal that follows -- forces a near miss instead.
-def plant_matches(a: mutable Arena&, rng: mutable MT19937&, cfg: SessionCfg&, game: mutable Mode&, modalities: darray[Modality]&, hist: SessionHistory&, positions: mutable darray[i64]&, multi: i64, real_back: i64) -> GenerateStatus:
+def plant_matches(rng: mutable MT19937&, cfg: SessionCfg&, game: mutable Mode&, modalities: darray[Modality]&, hist: SessionHistory&, positions: mutable darray[i64]&, multi: i64, real_back: i64) -> GenerateStatus:
     can Memory.Allocate, Abort.Panic:
         count: i64 = modalities.count.i64()
         index: mutable i64 = 0
-        while index < count |a, rng, cfg, game, modalities, hist, positions, index, count, multi, real_back|:
+        while index < count |rng, cfg, game, modalities, hist, positions, index, count, multi, real_back|:
             modality: Modality = modalities[index.usize()]
             if modality != Modality.Arithmetic:
                 keys: StimKeys = current_and_history_keys(modality)
@@ -716,7 +714,7 @@ def plant_matches(a: mutable Arena&, rng: mutable MT19937&, cfg: SessionCfg&, ga
                     back <- real_back
                 else:
                     if r2 < cfg.chance_of_interference and game.back > 1:
-                        near: InterferenceResult = interference_back(a, rng, game, hist, keys.history, real_back)
+                        near: InterferenceResult = interference_back(rng, game, hist, keys.history, real_back)
                         GenerateStatus.HistoryIndex return if not near.ok
                         if near.found:
                             back <- near.back
@@ -816,7 +814,7 @@ def modalities_are_arithmetic_only(modalities: darray[Modality]&) -> bool:
 #
 # _queue_audio() and _spawn_visuals() are the two steps left out; neither draws
 # from the random stream, so the sequence below is complete.
-def generate_stimulus(a: mutable Arena&, rng: mutable MT19937&, cfg: SessionCfg&, tables: ModeTables&, game: mutable Mode&, buffers: SessionBuffers&) -> GenerateOutcome:
+def generate_stimulus(rng: mutable MT19937&, cfg: SessionCfg&, tables: ModeTables&, game: mutable Mode&, buffers: SessionBuffers&) -> GenerateOutcome:
     can Memory.Allocate, Abort.Panic:
         miss: GenerateOutcome = GenerateOutcome{status: GenerateStatus.UnknownMode, real_back: 0, variable: 0}
         entry_index: i64 = mode_index(tables, game.mode)
@@ -826,9 +824,9 @@ def generate_stimulus(a: mutable Arena&, rng: mutable MT19937&, cfg: SessionCfg&
         multi: i64 = entry.flags.multi
         crab: bool = entry.flags.crab == 1
 
-        positions: mutable darray[i64] = sample_random_stimuli(a, rng, cfg, game)
+        positions: mutable darray[i64] = sample_random_stimuli(rng, cfg, game)
 
-        arithmetic: GenerateStatus = choose_arithmetic_operands(a, rng, cfg, game, &modalities, &buffers.history)
+        arithmetic: GenerateStatus = choose_arithmetic_operands(rng, cfg, game, &modalities, &buffers.history)
         GenerateOutcome{status: arithmetic, real_back: 0, variable: 0} return if arithmetic != GenerateStatus.Ok
 
         lag: BackLookup = real_back_checked(cfg, game, crab, &buffers.variable_list)
@@ -836,7 +834,7 @@ def generate_stimulus(a: mutable Arena&, rng: mutable MT19937&, cfg: SessionCfg&
         real_back: i64 = lag.value
 
         if not modalities_are_arithmetic_only(&modalities) and game.trial_number > game.back:
-            planted: GenerateStatus = plant_matches(a, rng, cfg, game, &modalities, &buffers.history, &positions, multi, real_back)
+            planted: GenerateStatus = plant_matches(rng, cfg, game, &modalities, &buffers.history, &positions, multi, real_back)
             GenerateOutcome{status: planted, real_back: real_back, variable: 0} return if planted != GenerateStatus.Ok
             if multi > 1:
                 reversed: GenerateStatus = plant_multi_reversal(rng, cfg, game, &modalities, &buffers.history, &positions, multi, real_back)
