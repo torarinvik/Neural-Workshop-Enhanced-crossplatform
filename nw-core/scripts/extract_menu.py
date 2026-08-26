@@ -17,7 +17,7 @@ if uisupport.UI_IMPORT_ERROR is not None:
     raise SystemExit(2)
 
 from neural_workshop import geometry, state  # noqa: E402
-from neural_workshop.ui.menu import Menu  # noqa: E402
+from neural_workshop.ui.menu import BLANK_LINE, Menu  # noqa: E402
 
 
 def arg(name, default):
@@ -29,7 +29,11 @@ select = arg("--select", 0)
 black = "--black" in sys.argv
 
 state.cfg.BLACK_BACKGROUND = black
-options = ["Option %d" % i for i in range(count)]
+# --blanks scatters the spacer rows the real menus use: GameSelect has six of
+# them, and they consume a page slot without drawing anything.
+blanks = "--blanks" in sys.argv
+options = [BLANK_LINE if (blanks and i % 3 == 2) else "Option %d" % i
+           for i in range(count)]
 menu = Menu(options, title="Test Menu")
 menu.move_selection(select, relative=False)
 
@@ -55,7 +59,7 @@ out = dict(
     choicesize=menu.choicesize / SY,
     bgcolor=list(menu.bgcolor), textcolor=list(menu.textcolor),
     marker=marker, marker_color=list(menu.marker.color),
-    options=options, black_background=black,
+    options=options, black_background=black, blanks=blanks,
 )
 menu.close()
 print(json.dumps(out, indent=1))

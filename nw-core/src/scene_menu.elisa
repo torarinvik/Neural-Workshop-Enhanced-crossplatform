@@ -66,27 +66,79 @@ def menu_page_size(option_count: i64) -> i64:
             return 1
         return fitted
 
-# The first option shown, for a menu laid out fresh at `selpos` -- which is what
-# `relayout` does: reset to the top, then move the selection there in one step.
-# Reproduces move_selection's second guard; the first cannot fire from zero.
-def menu_scroll_top(selpos: i64, page_size: i64, option_count: i64) -> i64:
-    can Abort.Panic:
-        if 0 <= selpos - page_size + 1 and 0 != option_count - page_size:
-            upper: mutable i64 = selpos + 1
-            if option_count < upper:
-                upper <- option_count
-            top: i64 = upper - page_size + 1
-            if top < 0:
-                return 0
-            return top
-        return 0
-
 # `get ... else` rather than a bare index: the row walk below is bounded by the
 # same count, so an out-of-range read is a logic error, not a player input --
 # and a blank row is a far better failure than a panic mid-frame.
 def menu_option_at(options: darray[sview]&, index: i64) -> sview:
     can Abort.Panic:
         return get options[index.usize()] else ""
+
+# Where a menu laid out fresh at `requested` actually settles. `relayout` resets
+# to the top and then moves the selection there in one step, and move_selection
+# does three things in order: clamp, scroll, and -- this is the part that is easy
+# to miss -- STEP OFF a spacer row and start again.
+#
+# The skip is why this returns both numbers instead of just the scroll offset.
+# Asking for a spacer does not leave the selection on it: the original walks on
+# in the direction of travel, and the scroll guards then run again for the new
+# row. Requesting row 20 of a 24-row menu with spacers settles on row 21 AND
+# scrolls to 1, and no amount of reasoning about row 20 predicts that.
+#
+# The first and last rows are exempt from the skip even when they are spacers,
+# which is the original's own guard: there is nowhere further to walk.
+struct MenuLayout:
+    selpos: i64
+    top: i64
+
+def menu_is_spacer(text: sview) -> bool:
+    can Abort.Panic:
+        return sview_len(text) == 0.usize()
+
+def menu_layout(requested: i64, page_size: i64, options: darray[sview]&) -> MenuLayout:
+    can Abort.Panic:
+        count: i64 = options.count.i64()
+        if count <= 0:
+            return MenuLayout{selpos: 0, top: 0}
+
+        # The recursive call passes `1 if steps > 0 else -1`, and `steps` on the
+        # first call is the requested index itself.
+        direction: mutable i64 = -1
+        if requested > 0:
+            direction <- 1
+
+        sel: mutable i64 = requested
+        if sel > count - 1:
+            sel <- count - 1
+        if sel < 0:
+            sel <- 0
+
+        top: mutable i64 = 0
+        # Bounded by the row count: each pass either settles or steps one row.
+        guard: mutable i64 = 0
+        while guard <= count |guard, sel, top, count, page_size, options, direction|:
+            guard <- guard + 1
+            if top >= sel and top != 0:
+                top <- sel - 1
+                if top < 0:
+                    top <- 0
+            if top <= sel - page_size + 1 and top != count - page_size:
+                upper: mutable i64 = sel + 1
+                if count < upper:
+                    upper <- count
+                moved: i64 = upper - page_size + 1
+                top <- moved
+                if top < 0:
+                    top <- 0
+            if sel == 0 or sel == count - 1:
+                break
+            if not menu_is_spacer(menu_option_at(options, sel)):
+                break
+            sel <- sel + direction
+            if sel > count - 1:
+                sel <- count - 1
+            if sel < 0:
+                sel <- 0
+        return MenuLayout{selpos: sel, top: top}
 
 def menu_row_y(row: i64) -> f64:
     return MENU_ROWS_TOP - row.f64() * MENU_ROW_STEP
@@ -98,7 +150,8 @@ def render_menu_frame(list: mutable DisplayList&, title: sview, footnote: sview,
         ink: u32 = menu_color_text(black_background)
         count: i64 = options.count.i64()
         page_size: i64 = menu_page_size(count)
-        top: i64 = menu_scroll_top(selpos, page_size, count)
+        settled: MenuLayout = menu_layout(selpos, page_size, options)
+        top: i64 = settled.top
 
         draw_rect(list, 0.0, 0.0, REFERENCE_WIDTH, REFERENCE_HEIGHT, menu_color_background(black_background))
         draw_text(list, title, REFERENCE_WIDTH / 2.0, MENU_TITLE_Y, MENU_TITLE_SIZE, ink, ANCHOR_CENTER_CENTER)
@@ -117,14 +170,21 @@ def render_menu_frame(list: mutable DisplayList&, title: sview, footnote: sview,
         ending: mutable i64 = 0
         if top + page_size < count:
             ending <- 1
+        # A spacer row (the original's BLANK_LINE) still CONSUMES a slot -- the
+        # rows below it keep their positions -- but nothing is drawn for it. The
+        # original sets the label's text to "" and pyglet draws nothing; here the
+        # command is simply not emitted, which is the same picture and one fewer
+        # thing for four shells to no-op on.
         while row < page_size - ending and row + top < count |row, list, ink, options, top|:
-            draw_text(list, menu_option_at(options, row + top), MENU_ROW_X, menu_row_y(row), MENU_CHOICE_SIZE, ink, ANCHOR_LEFT_CENTER)
+            text: sview = menu_option_at(options, row + top)
+            if sview_len(text) > 0.usize():
+                draw_text(list, text, MENU_ROW_X, menu_row_y(row), MENU_CHOICE_SIZE, ink, ANCHOR_LEFT_CENTER)
             row <- row + 1
         if ending == 1:
             draw_text(list, "...", MENU_ROW_X, menu_row_y(row), MENU_CHOICE_SIZE, ink, ANCHOR_LEFT_CENTER)
 
         # The marker last, over the rows, at the selected row's position.
-        marker_y: f64 = menu_row_y(selpos - top)
+        marker_y: f64 = menu_row_y(settled.selpos - top)
         begin_polygon(list, 3, menu_marker_color())
         polygon_point(list, MENU_MARKER_BASE_X, marker_y + MENU_CHOICE_SIZE / 2.0)
         polygon_point(list, MENU_MARKER_TIP_X, marker_y)

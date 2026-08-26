@@ -25,24 +25,33 @@ EXTRACTOR = os.path.join(ROOT, "scripts", "extract_menu.py")
 PYTHON = os.path.join(ORIGINAL, ".venv", "bin", "python")
 
 # Must match test/menu_sweep.elisa's emission order.
+# (option count, selection, black theme, spacer rows)
 CASES = [
-    (8, 0, False),
-    (8, 7, False),
-    (30, 0, False),
-    (30, 15, False),
-    (30, 29, False),
-    (8, 3, True),
-    (1, 0, False),
+    (8, 0, False, False),
+    (8, 7, False, False),
+    (30, 0, False, False),
+    (30, 15, False, False),
+    (30, 29, False, False),
+    (8, 3, True, False),
+    (1, 0, False, False),
+    (24, 0, False, True),
+    (24, 23, False, True),
+    (24, 20, False, True),
+    (24, 2, False, True),
+    (24, 5, False, True),
+    (24, 11, False, True),
 ]
 
 TOLERANCE = 0.01
 MARKER_TOLERANCE = 0.6
 
 
-def reference(count, select, black):
+def reference(count, select, black, blanks):
     argv = [PYTHON, EXTRACTOR, "--options", str(count), "--select", str(select)]
     if black:
         argv.append("--black")
+    if blanks:
+        argv.append("--blanks")
     proc = subprocess.run(argv, cwd=ORIGINAL, capture_output=True, text=True)
     if proc.returncode != 0:
         raise SystemExit("cannot read the original's menu: %s"
@@ -132,7 +141,7 @@ def main():
     problems = []
     for hexed, case in zip(frames, CASES):
         ref = reference(*case)
-        label = "options=%d sel=%d black=%d" % case
+        label = "options=%d sel=%d black=%d blanks=%d" % case
         check_frame(decode(bytes.fromhex(hexed)), ref, label, problems)
 
     if problems:
