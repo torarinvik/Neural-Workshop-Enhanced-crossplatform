@@ -272,3 +272,56 @@ replace -- so it names a ROOM and the shell fits into it:
 `scale = min(room_w/image_w, room_h/image_h)`, drawn centred. That is
 `bootstrap._place_splash` exactly, and it is why a 2000x500 logo lands in the
 same gap as a square one.
+
+## Constructors: overload the type name
+
+A builder that returns a struct is spelled as the type, not as `foo_new`:
+
+    def MenuLayout(selpos: i64) -> MenuLayout:
+
+42 of the port's 44 builders are written that way. Two are not, and the reasons
+are worth keeping:
+
+  * **`fog_work_new` / `maze_work_new`** both build a `MazeWork` from two
+    arguments. Two overloads with the same name AND arity are ambiguous, so
+    only one of them could take the type's name and neither does.
+  * **`nar_lines_new`** is region-POLYMORPHIC. Renamed to `NarLines`, its call
+    sites stopped inferring a region -- same body, same callers, only the name
+    changed. The overload spelling and region inference interact; left alone
+    until that is understood.
+
+A struct with an **`sview` field cannot have a working constructor overload at
+all**: the compiler does not recognise it and reads `Row(...)` as positional
+construction, asking for the constructor that is defined three lines above.
+Measured across field types -- `i64`, `f64`, `bool`, `cstr` all fine, only
+`sview` breaks -- and it happens at top level with no module involved. Use the
+brace form. See `repro/nw_ctor_overload_sview_field.elisa`.
+
+## Module blocks: what actually works today
+
+`src/menu_model.elisa` is `module MenuText:` and passes on both stages, so leaf
+modules whose API is values (not growable references) are ready now.
+
+Four things block converting the rest, each with a minimal repro in
+`worktrees/elisa-core-nw/repro/`:
+
+  1. **Constants were not namespaced** -- FIXED. Two modules each declaring
+     `SIZE` collapsed onto one table row and the second silently overwrote the
+     first. A wrong answer, and qualifying the use site did not help because the
+     collision was in the table. Constants are now keyed by (owner, name).
+  2. **Struct names still are not.** Two modules cannot both declare a `Work`,
+     which is exactly what the task modules would want (SyWork, GoWork,
+     MazeWork, SokWork, RemWork). Same fix shape as constants, bigger job: six
+     registration sites, ~37 lookups, and type resolution reaches the semantic
+     phase. `nw_module_struct_name_collision.elisa`.
+  3. **Region inference does not forward through a qualified call.** A function
+     holding `mutable X&` cannot pass it to `Module::helper(x, ...)`. Every
+     renderer here does exactly that, so `Display::rect(list, ...)` is
+     unreachable from a function that received `list` as a parameter. Both
+     compilers. `nw_region_forward_through_module_call.elisa`.
+  4. **A sibling call loses to a stdlib generic on stage0.** Inside a module,
+     an unqualified `add(...)` binds to `Flags[T]::add` rather than the module's
+     own `add`. stage1 gets this RIGHT -- it prefers the enclosing module's
+     member -- so the compilers disagree. Until stage0 matches, module members
+     must avoid every name the stdlib uses generically, which is prefixing again
+     wearing a module block. `nw_stage0_module_sibling_shadowed.elisa`.
