@@ -199,35 +199,33 @@ transcription. `matching_diff.py` shows the pattern.
 code on both sides (`matching` uses `9`) rather than skipping the row — a
 skipped row is an untested row.
 
-## Module blocks: use them for NEW leaf modules, not yet for the task modules
+## Module blocks: use them
 
 Elisa has real namespaces -- `module Name:` with `::` for namespace members and
 `.` for value members. They are the right tool and the `maze_`/`nar_`/`cw_`
 prefixes scattered through src/tasks are not; prefixes are C-style scoping in a
 language that has the real thing.
 
-`src/tasks/ints.elisa` uses them (`Ints::at`, `Floats::zeros`) and passes on
-BOTH stages, so simple leaf modules are safe and new code should be written
-that way.
+This section used to say converting the six task modules was NOT safe: all six
+passed on stage0 and all six failed on stage1, one of them with a SILENT WRONG
+ANSWER. That was the constant-collision bug (two modules each declaring `SIZE`
+collapsed onto one table row), and it is fixed --
+repro/nw_stage1_module_member_wrong_answer.elisa now prints the same thing on
+both compilers. So does every other blocker that was recorded here; see
+"Module blocks: what actually works today" below for what each one turned out
+to be.
 
-Converting the six existing task modules is NOT safe yet. All six passed on
-stage0 and ALL SIX FAILED ON STAGE1, with errors like
+The mechanical transform is straightforward. Three traps, all of them paid for:
 
-    cannot call non-function value of type Grade
-
-and, in a reduced probe, a SILENT WRONG ANSWER rather than a decline. See
-worktrees/elisa-core-nw/repro/nw_stage1_module_member_wrong_answer.elisa, which
-also lists the six shapes that were tried and DO work on stage1, so a
-minimisation does not repeat them.
-
-The conversion was reverted rather than kept stage0-only. Every suite passing
-on both compilers is the property this port is actually for; a tidier namespace
-that only one compiler can build is a worse trade than a prefix.
-
-Revisit once stage1's module handling is fixed. The mechanical transform is
-straightforward -- the one trap is that substitutions must be applied in a
-SINGLE pass, because rewriting `MazeWork` to `Maze::Work` and then letting a
-`Maze` rule fire again on its own output gives `Maze::Dealt::Work`.
+  * Substitutions must be applied in a SINGLE pass. Rewriting `MazeWork` to
+    `Maze::Work` and then letting a `Maze` rule fire again on its own output
+    gives `Maze::Dealt::Work`.
+  * A qualifier must not be added to a NAME that merely spells the same word:
+    `.` before it is member access (`found.rgba.r`), `:` after it is a binding
+    (`ColorLookup{rgba: ...}`). The Display conversion's first pass qualified
+    gamemode.elisa's `rgba` field and every use of it.
+  * A column-0 comment inside a module body is a DEDENT. A sed-based conversion
+    leaves them behind and they read as ordinary comments.
 
 ## Screens: measure the original, do not read it
 
@@ -358,21 +356,36 @@ in `worktrees/elisa-core-nw/repro/`.
      `sview` LOCAL always worked, and the struct having an sview FIELD had
      nothing to do with it.
 
-  4. **A sibling call loses to a stdlib generic on stage0.** STILL OPEN. Inside
-     a module, an unqualified `add(...)` binds to `Flags[T]::add` rather than the
-     module's own `add`. stage1 gets this RIGHT -- it prefers the enclosing
-     module's member -- so the compilers disagree. Until stage0 matches, module
-     members must avoid every name the stdlib uses generically, which is
-     prefixing again wearing a module block.
-     `nw_stage0_module_sibling_shadowed.elisa`.
+  4. **A sibling call lost to a stdlib generic on stage0** -- FIXED. Inside a
+     module, an unqualified `add(...)` bound to `Flags[T]::add` rather than the
+     module's own `add`. stage1 already got this right, so the two compilers
+     disagreed about a module member calling its own sibling by its own name.
 
-  5. **Struct names are still not namespaced.** STILL OPEN. Two modules cannot
-     both declare a `Work`, which is exactly what the task modules would want
-     (SyWork, GoWork, MazeWork, SokWork, RemWork). Same fix shape as constants,
-     bigger job: the parser records struct names in a flat ownerless list
-     parallel to their member spans, so the owner has to be threaded from the
-     parser through `Ast::File` before the backend's six registration sites and
-     ~37 lookups can key on it. `nw_module_struct_name_collision.elisa`.
+     Identifier resolution reaches the global scope through the ordinary scope
+     chain, so the stdlib's `add` was found there and returned before the
+     enclosing module was ever consulted. The namespace-aware lookup already
+     existed; nothing on the call path used it.
+
+     It RENAMES the callee rather than just resolving its type. The first
+     attempt preferred the member in ident analysis alone, and the call then
+     type-checked against the module's signature while codegen still emitted the
+     stdlib symbol -- the repro compiled clean and returned 0 instead of 7. Only
+     running it showed that, which is why the guard is a runtime test.
+
+  5. **Struct names were not namespaced** -- FIXED. Two modules may now each
+     declare a `Work`, which is what the task modules want (SyWork, GoWork,
+     MazeWork, SokWork, RemWork).
+
+     Three phases each keyed structs by bare name. The parser records an owner
+     column (it has to come from there: struct member spans are keyed
+     POSITIONALLY by the struct-names index). The backend keys rows by
+     (owner, name) and mangles the LLVM type name per owner -- without that,
+     LLVMGetTypeByName2 hands the second module the first module's type, the
+     same collapse one level down. The semantic phase, which is where the
+     diagnostic actually came from, gained a parallel module column consulted by
+     the construct-site field checks.
+
+All five are closed. The task modules can now be modules.
 
 One formatting trap, since it cost real time: a comment at column 0 inside a
 module body is a dedent. The sed-based MenuText conversion left three, and they
