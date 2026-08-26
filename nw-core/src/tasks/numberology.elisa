@@ -1,0 +1,287 @@
+# Numberology: procedural number-sequence puzzles.
+#
+# Port of neural_workshop/numberology.py (GPL-2.0-or-later). Every puzzle is a
+# small seeded program, evaluated to produce both the displayed terms and the
+# answer, so generation and checking cannot drift apart. Difficulty grows the
+# number of operations, the order of the recurrence and the amount of hidden
+# state -- it is not a table of hand-authored examples.
+#
+# ## The one idiom that has to survive translation
+#
+# The reference writes `rng.randint(-scale, scale) or 1`. Python's `or` returns
+# the LEFT operand unless it is falsey, and 0 is falsey, so this means "draw a
+# number, and if it came out 0 use 1 instead". The draw happens either way.
+# Writing it as "keep drawing until non-zero" would consume a different number
+# of values from the stream and desynchronise every puzzle after it, so
+# `nonzero_or_one` below substitutes WITHOUT redrawing.
+#
+# ## Rule text
+#
+# The reference builds a human-readable rule string per family. This port emits
+# a rule ID plus the numbers that get interpolated into it rather than the
+# formatted text. The string is a pure function of those, so matching the ID
+# and the parameters is the same check without requiring two languages to agree
+# on printf formatting -- and the sweep compares the parameters, so a wrong
+# degree or period is still caught.
+
+const NUM_RULE_ADD_CONST: i64 = 1        # "Add %d each time"
+const NUM_RULE_ADD_SAME: i64 = 2         # "Add the same number each time"
+const NUM_RULE_MUL_OFFSET: i64 = 3       # "Multiply, then add the offset"
+const NUM_RULE_POLYNOMIAL: i64 = 4       # "Evaluate a degree-%d polynomial ..."
+const NUM_RULE_ALTERNATING: i64 = 5      # "Add alternating, growing steps"
+const NUM_RULE_RECURRENCE: i64 = 6       # "order-%d recurrence with degree-%d ..."
+
+const NUM_MAX_TERMS: i64 = 64
+const NUM_MAX_ORDER: i64 = 64
+
+struct SeqPuzzle:
+    terms: mutable darray[i64]
+    shown: mutable i64
+    answer: mutable i64
+    rule_id: mutable i64
+    # The numbers the rule string interpolates, in the order it uses them.
+    rule_a: mutable i64
+    rule_b: mutable i64
+    rule_c: mutable i64
+    difficulty: mutable i64
+    complexity: mutable i64
+
+# `x or 1` on an int: 0 is falsey, everything else is itself. The draw has
+# already happened; this only substitutes.
+def nonzero_or_one(value: i64) -> i64:
+    return 1 if value == 0 else value
+
+# A visible length that grows with difficulty and has no ceiling. `requested`
+# of 0 or less means "no explicit length", matching the reference's None.
+def num_sequence_length(difficulty: i64, requested: i64) -> i64:
+    can Abort.Panic:
+        if requested > 0:
+            return 4 if requested < 4 else requested
+        level: i64 = 1 if difficulty < 1 else difficulty
+        return 4 + level / 40
+
+# Horner, exactly as the reference: value = value * n + coefficient.
+def num_polynomial(coefficients: darray[i64], count: i64, n: i64) -> i64:
+    can Abort.Panic:
+        value: mutable i64 = 0
+        index: mutable i64 = 0
+        while index < count |index, count, coefficients, n, value|:
+            value <- value * n + maze_at(coefficients, index)
+            index <- index + 1
+        return value
+
+def num_puzzle_blank(a: mutable Arena&) -> SeqPuzzle:
+    can Memory.Allocate, Abort.Panic:
+        puzzle: mutable SeqPuzzle = zeroed
+        puzzle.terms <- maze_zeros(a, NUM_MAX_TERMS)
+        return puzzle
+
+# ------------------------------------------------------------
+# Families
+# ------------------------------------------------------------
+
+def num_polynomial_puzzle(a: mutable Arena&, rng: mutable MT19937&, difficulty: i64, shown: i64, degree: i64) -> SeqPuzzle:
+    can Memory.Allocate, Abort.Panic:
+        scale: mutable i64 = 1
+        power: mutable i64 = 0
+        while power < 1 + difficulty / 8 |power, scale, difficulty|:
+            scale <- scale * 10
+            power <- power + 1
+
+        coefficients: mutable darray[i64] = maze_zeros(a, degree + 2)
+        index: mutable i64 = 0
+        while index <= degree |index, coefficients, rng, scale|:
+            maze_put(&coefficients, index, nonzero_or_one(py_randint(rng, 0 - scale, scale)))
+            index <- index + 1
+
+        puzzle: mutable SeqPuzzle = num_puzzle_blank(a)
+        term: mutable i64 = 0
+        while term < shown |term, shown, puzzle, coefficients, degree|:
+            maze_put(&puzzle.terms, term, num_polynomial(coefficients, degree + 1, term))
+            term <- term + 1
+        puzzle.shown <- shown
+        puzzle.answer <- num_polynomial(coefficients, degree + 1, shown)
+        puzzle.rule_id <- NUM_RULE_POLYNOMIAL
+        puzzle.rule_a <- degree
+        puzzle.difficulty <- difficulty
+        puzzle.complexity <- degree + 1
+        return puzzle
+
+def num_alternating_puzzle(a: mutable Arena&, rng: mutable MT19937&, difficulty: i64, shown: i64) -> SeqPuzzle:
+    can Memory.Allocate, Abort.Panic:
+        start: i64 = py_randint(rng, -8, 8)
+        first: i64 = py_randint(rng, 1, 9)
+        second: i64 = py_randint(rng, 1, 9)
+
+        # values[0] = start, then one more than `shown` of them.
+        values: mutable darray[i64] = maze_zeros(a, shown + 2)
+        maze_put(&values, 0, start)
+        n: mutable i64 = 1
+        while n <= shown |n, shown, values, first, second|:
+            step: i64 = first if n % 2 == 1 else second
+            maze_put(&values, n, maze_at(values, n - 1) + step * n)
+            n <- n + 1
+
+        puzzle: mutable SeqPuzzle = num_puzzle_blank(a)
+        term: mutable i64 = 0
+        while term < shown |term, shown, puzzle, values|:
+            maze_put(&puzzle.terms, term, maze_at(values, term))
+            term <- term + 1
+        puzzle.shown <- shown
+        puzzle.answer <- maze_at(values, shown)
+        puzzle.rule_id <- NUM_RULE_ALTERNATING
+        puzzle.difficulty <- difficulty
+        puzzle.complexity <- 6
+        return puzzle
+
+def num_recurrence_puzzle(a: mutable Arena&, rng: mutable MT19937&, difficulty: i64, shown: i64, order: i64) -> SeqPuzzle:
+    can Memory.Allocate, Abort.Panic:
+        scale: i64 = 1 + difficulty / 12
+
+        # Draw order is the contract: coefficients, then initial values, then
+        # the forcing coefficients, then period, then phase.
+        coefficients: mutable darray[i64] = maze_zeros(a, order + 1)
+        index: mutable i64 = 0
+        while index < order |index, order, coefficients, rng|:
+            maze_put(&coefficients, index, nonzero_or_one(py_randint(rng, -3, 3)))
+            index <- index + 1
+
+        values: mutable darray[i64] = maze_zeros(a, shown + order + 2)
+        index <- 0
+        while index < order |index, order, values, rng, scale|:
+            maze_put(&values, index, nonzero_or_one(py_randint(rng, 0 - scale, scale)))
+            index <- index + 1
+
+        force_degree: i64 = 1 + difficulty / 18
+        force_coefficients: mutable darray[i64] = maze_zeros(a, force_degree + 2)
+        index <- 0
+        while index <= force_degree |index, force_degree, force_coefficients, rng, scale|:
+            maze_put(&force_coefficients, index, nonzero_or_one(py_randint(rng, 0 - scale, scale)))
+            index <- index + 1
+
+        period: i64 = 2 + py_randbelow(rng, (2 + difficulty / 10).u64()).i64()
+        phase: i64 = py_randbelow(rng, period.u64()).i64()
+        forcing_layers: i64 = 1 + difficulty / 16
+
+        count: mutable i64 = order
+        while count < shown + 1 |count, shown, order, values, coefficients, force_coefficients, force_degree, period, phase, forcing_layers|:
+            n: i64 = count
+            # sum(coefficient * values[-index] for index, coefficient in
+            # enumerate(coefficients, 1)): index 1 is the LAST value.
+            prior: mutable i64 = 0
+            step: mutable i64 = 1
+            while step <= order |step, order, prior, coefficients, values, count|:
+                prior <- prior + maze_at(coefficients, step - 1) * maze_at(values, count - step)
+                step <- step + 1
+
+            polynomial: i64 = num_polynomial(force_coefficients, force_degree + 1, n)
+            sign: mutable i64 = 1
+            layer: mutable i64 = 0
+            while layer < forcing_layers |layer, forcing_layers, sign, n, period, phase|:
+                layer_period: i64 = period + layer
+                if (n * (layer + 1) + phase) % layer_period == 0:
+                    sign <- 0 - sign
+                layer <- layer + 1
+
+            maze_put(&values, count, prior + sign * polynomial)
+            count <- count + 1
+
+        puzzle: mutable SeqPuzzle = num_puzzle_blank(a)
+        term: mutable i64 = 0
+        while term < shown |term, shown, puzzle, values|:
+            maze_put(&puzzle.terms, term, maze_at(values, term))
+            term <- term + 1
+        puzzle.shown <- shown
+        puzzle.answer <- maze_at(values, shown)
+        puzzle.rule_id <- NUM_RULE_RECURRENCE
+        puzzle.rule_a <- order
+        puzzle.rule_b <- force_degree
+        puzzle.rule_c <- forcing_layers
+        puzzle.difficulty <- difficulty
+        puzzle.complexity <- order + force_degree + forcing_layers + 2
+        return puzzle
+
+# ------------------------------------------------------------
+
+# A deterministic puzzle. Level 1 is a seeded, child-friendly constant step;
+# 2 and 3 teach differences and multiplicative rules; from 4 on the generator
+# composes polynomial, alternating-step and recurrence families, and the
+# recurrence order and forcing depth keep growing without a ceiling.
+def num_generate(a: mutable Arena&, difficulty_in: i64, seed: i64, length: i64) -> SeqPuzzle:
+    can Memory.Allocate, Abort.Panic:
+        difficulty: i64 = 1 if difficulty_in < 1 else difficulty_in
+        rng: mutable MT19937 = mt19937_new()
+        mt_seed_int(&rng, seed.u64())
+        shown: i64 = num_sequence_length(difficulty, length)
+
+        if difficulty == 1:
+            start_drawn: i64 = py_randint(&rng, 1, 9)
+            step: i64 = py_choice_index(&rng, 3) + 1
+            # The reference guards the old fixed 0,1,2,3 tutorial. randint(1,9)
+            # can never be 0, so this branch is unreachable -- kept because the
+            # reference keeps it and a port that "tidies" it away is a port that
+            # decided something.
+            start: i64 = 2 if start_drawn == 0 and step == 1 else start_drawn
+            puzzle: mutable SeqPuzzle = num_puzzle_blank(a)
+            term: mutable i64 = 0
+            while term < shown |term, shown, puzzle, start, step|:
+                maze_put(&puzzle.terms, term, start + step * term)
+                term <- term + 1
+            puzzle.shown <- shown
+            puzzle.answer <- start + step * shown
+            puzzle.rule_id <- NUM_RULE_ADD_CONST
+            puzzle.rule_a <- step
+            puzzle.difficulty <- difficulty
+            puzzle.complexity <- 1
+            return puzzle
+
+        if difficulty == 2:
+            step: i64 = py_randint(&rng, 2, 9)
+            start: i64 = py_randint(&rng, -9, 9)
+            puzzle: mutable SeqPuzzle = num_puzzle_blank(a)
+            term: mutable i64 = 0
+            while term < shown |term, shown, puzzle, start, step|:
+                maze_put(&puzzle.terms, term, start + step * term)
+                term <- term + 1
+            puzzle.shown <- shown
+            puzzle.answer <- start + step * shown
+            puzzle.rule_id <- NUM_RULE_ADD_SAME
+            puzzle.difficulty <- difficulty
+            puzzle.complexity <- 2
+            return puzzle
+
+        if difficulty == 3:
+            multiplier: i64 = py_randint(&rng, 2, 5)
+            offset: i64 = py_randint(&rng, 1, 8)
+            start: i64 = py_randint(&rng, 1, 8)
+            puzzle: mutable SeqPuzzle = num_puzzle_blank(a)
+            power: mutable i64 = 1
+            term: mutable i64 = 0
+            while term < shown |term, shown, puzzle, start, multiplier, offset, power|:
+                maze_put(&puzzle.terms, term, start * power + offset)
+                power <- power * multiplier
+                term <- term + 1
+            puzzle.shown <- shown
+            puzzle.answer <- start * power + offset
+            puzzle.rule_id <- NUM_RULE_MUL_OFFSET
+            puzzle.difficulty <- difficulty
+            puzzle.complexity <- 3
+            return puzzle
+
+        if difficulty <= 5:
+            return num_polynomial_puzzle(a, &rng, difficulty, shown, difficulty - 2)
+
+        if difficulty == 6:
+            return num_alternating_puzzle(a, &rng, difficulty, shown)
+
+        # Order grows with the level, but never past what the shown history can
+        # support: the next term always has a complete visible history.
+        grown: i64 = 2 + difficulty / 4
+        floor_order: i64 = 2 if shown - 1 < 2 else shown - 1
+        order: i64 = grown if grown < floor_order else floor_order
+        return num_recurrence_puzzle(a, &rng, difficulty, shown, order)
+
+# Compare an answer exactly. The reference accepts surrounding whitespace and
+# rejects anything that will not parse; `ok` false is its TypeError/ValueError.
+def num_is_correct(puzzle: SeqPuzzle&, answer: i64, ok: bool) -> bool:
+    return ok and answer == puzzle.answer
