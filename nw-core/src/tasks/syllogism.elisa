@@ -1487,6 +1487,438 @@ def sy_copy_order(out: mutable darray[i64]&, order: darray[i64], count: i64):
             Ints::put(out, index, Ints::at(order, index))
             index <- index + 1
 
+# --- all, none and at least one ---
+#
+# Decided by a fact about this fragment rather than by counting models: every
+# universal premise is a condition on ONE THING AT A TIME, so a set of premises
+# has a model exactly when every existential premise has a kind of thing no
+# universal forbids. That is one pass over the 2^n kinds, and it is exact.
+const SY_MOST_PREMISES: i64 = 8
+
+struct SyStatements:
+    form: mutable darray[i64]
+    subject: mutable darray[i64]
+    predicate: mutable darray[i64]
+    count: mutable i64
+
+def sy_statements_new(room: i64) -> SyStatements:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable SyStatements = zeroed
+        out.form <- Ints::zeros(room)
+        out.subject <- Ints::zeros(room)
+        out.predicate <- Ints::zeros(room)
+        return out
+
+def sy_statement_put(out: mutable SyStatements&, slot: i64, form: i64, subject: i64, predicate: i64):
+    can Abort.Panic:
+        Ints::put(&out.form, slot, form)
+        Ints::put(&out.subject, slot, subject)
+        Ints::put(&out.predicate, slot, predicate)
+
+# Whether a universal premise rules this kind of thing out.
+def sy_forbids(form: i64, subject: i64, predicate: i64, kind: i64) -> bool:
+    can Abort.Panic:
+        has_subject: bool = ((kind / sy_bit(subject)) % 2) == 1
+        has_predicate: bool = ((kind / sy_bit(predicate)) % 2) == 1
+        if form == SY_ALL:
+            return has_subject and not has_predicate
+        return has_subject and has_predicate
+
+# Whether this kind of thing is a witness for an existential.
+def sy_wants(form: i64, subject: i64, predicate: i64, kind: i64) -> bool:
+    can Abort.Panic:
+        has_subject: bool = ((kind / sy_bit(subject)) % 2) == 1
+        has_predicate: bool = ((kind / sy_bit(predicate)) % 2) == 1
+        if form == SY_SOME:
+            return has_subject and has_predicate
+        return has_subject and not has_predicate
+
+def sy_bit(index: i64) -> i64:
+    can Abort.Panic:
+        out: mutable i64 = 1
+        step: mutable i64 = 0
+        while step < index |step, index, out|:
+            out <- out * 2
+            step <- step + 1
+        return out
+
+# Whether `count` terms can be arranged so all of these hold. The BOOLEAN
+# reading: `every X is a Y` does not say there are any X, and the empty world
+# satisfies every universal there is.
+def sy_satisfiable(count: i64, statements: SyStatements&, extra_form: i64, extra_subject: i64, extra_predicate: i64) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        kinds: i64 = sy_bit(count)
+        allowed: mutable darray[i64] = Ints::zeros(kinds)
+        allowed_n: mutable i64 = 0
+        kind: mutable i64 = 0
+        while kind < kinds |kind, kinds, statements, extra_form, extra_subject, extra_predicate, allowed, allowed_n|:
+            forbidden: mutable bool = false
+            at: mutable i64 = 0
+            while at < statements.count and not forbidden |at, statements, kind, forbidden|:
+                form: i64 = Ints::at(statements.form, at)
+                if form == SY_ALL or form == SY_NONE:
+                    forbidden <- true if sy_forbids(form, Ints::at(statements.subject, at), Ints::at(statements.predicate, at), kind)
+                at <- at + 1
+            if not forbidden and (extra_form == SY_ALL or extra_form == SY_NONE):
+                forbidden <- sy_forbids(extra_form, extra_subject, extra_predicate, kind)
+            if not forbidden:
+                Ints::put(&allowed, allowed_n, kind)
+                allowed_n <- allowed_n + 1
+            kind <- kind + 1
+        every: mutable bool = true
+        at: mutable i64 = 0
+        while at < statements.count and every |at, statements, allowed, allowed_n, every|:
+            form: i64 = Ints::at(statements.form, at)
+            if form == SY_SOME or form == SY_SOME_NOT:
+                every <- sy_witnessed(form, Ints::at(statements.subject, at), Ints::at(statements.predicate, at), allowed, allowed_n)
+            at <- at + 1
+        if every and (extra_form == SY_SOME or extra_form == SY_SOME_NOT):
+            every <- sy_witnessed(extra_form, extra_subject, extra_predicate, allowed, allowed_n)
+        return every
+
+def sy_witnessed(form: i64, subject: i64, predicate: i64, allowed: darray[i64], allowed_n: i64) -> bool:
+    can Abort.Panic:
+        at: mutable i64 = 0
+        found: mutable bool = false
+        while at < allowed_n and not found |at, allowed_n, allowed, form, subject, predicate, found|:
+            found <- true if sy_wants(form, subject, predicate, Ints::at(allowed, at))
+            at <- at + 1
+        return found
+
+# Whether `conclusion` holds wherever the premises do: deny it and see whether
+# anything is left standing.
+def sy_entails(count: i64, premises: SyStatements&, form: i64, subject: i64, predicate: i64) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        return not sy_satisfiable(count, premises, sy_opposite_form(form), subject, predicate)
+
+# The classic no-reasoning answer, and it is a real effect: negative premise,
+# negative conclusion; particular premise, particular conclusion. It never
+# answers `nothing follows`, which is what makes it worth measuring against.
+def sy_atmosphere(premises: SyStatements&) -> i64:
+    can Abort.Panic:
+        negative: mutable bool = false
+        particular: mutable bool = false
+        at: mutable i64 = 0
+        while at < premises.count |at, premises, negative, particular|:
+            form: i64 = Ints::at(premises.form, at)
+            negative <- true if form == SY_NONE or form == SY_SOME_NOT
+            particular <- true if form == SY_SOME or form == SY_SOME_NOT
+            at <- at + 1
+        if negative:
+            return SY_SOME_NOT if particular else SY_NONE
+        return SY_SOME if particular else SY_ALL
+
+# Every way to link `count` terms in a row with one premise each: four forms
+# per link, and each link may be written either way round.
+def sy_shape_count(count: i64) -> i64:
+    can Abort.Panic:
+        links: i64 = count - 1
+        out: mutable i64 = 1
+        step: mutable i64 = 0
+        while step < links |step, links, out|:
+            out <- out * 8
+            step <- step + 1
+        return out
+
+# `itertools.product(FORMS, repeat=links)` outer, `product((0, 1), ...)` inner,
+# so the shape index splits into a forms numeral and a turns numeral.
+def sy_shape_at(count: i64, index: i64, out: mutable SyStatements&):
+    can Abort.Panic:
+        links: i64 = count - 1
+        turn_span: mutable i64 = 1
+        step: mutable i64 = 0
+        while step < links |step, links, turn_span|:
+            turn_span <- turn_span * 2
+            step <- step + 1
+        forms_index: i64 = index / turn_span
+        turns_index: i64 = index % turn_span
+        out.count <- links
+        link: mutable i64 = 0
+        while link < links |link, links, forms_index, turns_index, out|:
+            form_divisor: mutable i64 = 1
+            back: mutable i64 = 0
+            while back < links - 1 - link |back, links, link, form_divisor|:
+                form_divisor <- form_divisor * 4
+                back <- back + 1
+            form: i64 = (forms_index / form_divisor) % 4
+            turn_divisor: mutable i64 = 1
+            over: mutable i64 = 0
+            while over < links - 1 - link |over, links, link, turn_divisor|:
+                turn_divisor <- turn_divisor * 2
+                over <- over + 1
+            turn: i64 = (turns_index / turn_divisor) % 2
+            sy_statement_put(out, link, form, link + turn, link + 1 - turn)
+            link <- link + 1
+
+# The five categorical answers sort by their TEXT, which is not their index:
+# all, none, nothing follows, some, some not.
+def sy_form_rank(form: i64) -> i64:
+    can Abort.Panic:
+        if form == SY_ALL:
+            return 0
+        if form == SY_NONE:
+            return 1
+        if form == SY_NOTHING:
+            return 2
+        if form == SY_SOME:
+            return 3
+        return 4
+
+def sy_form_of_rank(rank: i64) -> i64:
+    can Abort.Panic:
+        if rank == 0:
+            return SY_ALL
+        if rank == 1:
+            return SY_NONE
+        if rank == 2:
+            return SY_NOTHING
+        if rank == 3:
+            return SY_SOME
+        return SY_SOME_NOT
+
+# What `grade` offers for a categorical question: the four forms said about the
+# two terms being asked, in the order they are ASKED about them -- which is not
+# always the order they were introduced in, because whether a conclusion
+# converts is half of what there is to get wrong here.
+def sy_categorical_option(subject: sview, other: sview, index: i64) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        if index >= 4:
+            dstr_append_cstr(&out, "nothing follows")
+            return out
+        sy_append_says(&out, index, subject, other)
+        return out
+
+# How many premises the conclusion still follows without. Counted by leaving
+# each one out and asking again rather than by guessing from where it sits in
+# the chain: a premise off the path can still be doing work.
+def sy_spare(count: i64, premises: SyStatements&, label: i64, subject: i64, other: i64) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        if label == SY_NOTHING:
+            return 0
+        without: mutable SyStatements = sy_statements_new(SY_MOST_PREMISES)
+        spare: mutable i64 = 0
+        drop: mutable i64 = 0
+        while drop < premises.count |drop, premises, without, count, label, subject, other, spare|:
+            kept: mutable i64 = 0
+            at: mutable i64 = 0
+            while at < premises.count |at, premises, drop, without, kept|:
+                if at != drop:
+                    sy_statement_put(&without, kept, Ints::at(premises.form, at), Ints::at(premises.subject, at), Ints::at(premises.predicate, at))
+                    kept <- kept + 1
+                at <- at + 1
+            without.count <- kept
+            if sy_satisfiable(count, &without, -1, 0, 0) and sy_entails(count, &without, label, subject, other):
+                spare <- spare + 1
+            drop <- drop + 1
+        return spare
+
+# Which answer this deal should have. Evenly over the five, UNLESS the
+# atmosphere reader cannot be fooled at this pair -- which is not a quirk of
+# the generator but the classical rules themselves: a valid conclusion is
+# negative exactly when a premise is, and particular exactly when a premise is.
+# Where that holds, the four forms are one answer between them and the only
+# question left is whether anything follows at all, so it is asked as the coin
+# it is.
+def sy_which(rng: mutable MT19937&, count: i64, group_of: darray[i64], shapes: i64, present: darray[i64]) -> i64:
+    can Memory.Allocate, Abort.Panic:
+        # The labels present, in sorted-by-text order.
+        sorted_labels: mutable darray[i64] = Ints::zeros(8)
+        sorted_n: mutable i64 = 0
+        rank: mutable i64 = 0
+        while rank < 5 |rank, present, sorted_labels, sorted_n|:
+            form: i64 = sy_form_of_rank(rank)
+            if Ints::at(present, form) == 1:
+                Ints::put(&sorted_labels, sorted_n, form)
+                sorted_n <- sorted_n + 1
+            rank <- rank + 1
+        forms: mutable darray[i64] = Ints::zeros(8)
+        forms_n: mutable i64 = 0
+        at: mutable i64 = 0
+        while at < sorted_n |at, sorted_n, sorted_labels, forms, forms_n|:
+            label: i64 = Ints::at(sorted_labels, at)
+            if label != SY_NOTHING:
+                Ints::put(&forms, forms_n, label)
+                forms_n <- forms_n + 1
+            at <- at + 1
+        premises: mutable SyStatements = sy_statements_new(SY_MOST_PREMISES)
+        fooled: mutable bool = false
+        walk: mutable i64 = 0
+        while walk < forms_n and not fooled |walk, forms_n, forms, group_of, shapes, count, premises, fooled|:
+            label: i64 = Ints::at(forms, walk)
+            shape: mutable i64 = 0
+            while shape < shapes and not fooled |shape, shapes, group_of, label, count, premises, fooled|:
+                if Ints::at(group_of, shape) == label:
+                    sy_shape_at(count, shape, &premises)
+                    fooled <- true if sy_atmosphere(&premises) != label
+                shape <- shape + 1
+            walk <- walk + 1
+        if fooled or forms_n == 0 or Ints::at(present, SY_NOTHING) == 0:
+            return Ints::at(sorted_labels, py_choice_index(rng, sorted_n))
+        if py_random(rng) < 0.5:
+            return SY_NOTHING
+        return Ints::at(forms, py_choice_index(rng, forms_n))
+
+# Two or three premises about kinds of thing.
+#
+# THE PAIR ASKED ABOUT IS NOT ALWAYS THE TWO ENDS, and not always the way round
+# they were introduced. Both matter: a premise off the path between them is a
+# premise whose negative or particular form the atmosphere reader counts and
+# should not, and a question asked backwards is the illicit conversion that
+# "at least one X is not a Y" invites.
+def sy_categorical_question(g: SyGrade, rng: mutable MT19937&, made_up: bool, names: mutable SyNames&, q: mutable SyQuestion&) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        count: i64 = g.items
+        sy_things(rng, count, made_up, names)
+        # `ends` -- every pair more than one step apart, in row-major order.
+        end_one: mutable darray[i64] = Ints::zeros(64)
+        end_two: mutable darray[i64] = Ints::zeros(64)
+        ends: mutable i64 = 0
+        one: mutable i64 = 0
+        while one < count |one, count, end_one, end_two, ends|:
+            two: mutable i64 = 0
+            while two < count |two, one, count, end_one, end_two, ends|:
+                gap: i64 = one - two
+                if (gap if gap > 0 else -gap) > 1:
+                    Ints::put(&end_one, ends, one)
+                    Ints::put(&end_two, ends, two)
+                    ends <- ends + 1
+                two <- two + 1
+            one <- one + 1
+        chosen_end: i64 = py_choice_index(rng, ends)
+        subject: i64 = Ints::at(end_one, chosen_end)
+        other: i64 = Ints::at(end_two, chosen_end)
+        shapes: i64 = sy_shape_count(count)
+        group_of: mutable darray[i64] = Ints::zeros(shapes)
+        present: mutable darray[i64] = Ints::zeros(8)
+        premises: mutable SyStatements = sy_statements_new(SY_MOST_PREMISES)
+        any_found: mutable bool = false
+        shape: mutable i64 = 0
+        while shape < shapes |shape, shapes, count, subject, other, premises, group_of, present, any_found|:
+            Ints::put(&group_of, shape, -1)
+            sy_shape_at(count, shape, &premises)
+            if sy_satisfiable(count, &premises, -1, 0, 0):
+                holds: mutable i64 = 0
+                first: mutable i64 = -1
+                form: mutable i64 = 0
+                while form < 4 |form, count, premises, subject, other, holds, first|:
+                    if sy_entails(count, &premises, form, subject, other):
+                        first <- form if holds == 0
+                        holds <- holds + 1
+                    form <- form + 1
+                # Premises that force a term to pick out nothing entail more
+                # than one form at once. Rare, and thrown away rather than
+                # dealt with a second right answer.
+                if holds <= 1:
+                    label: i64 = first if holds == 1 else SY_NOTHING
+                    Ints::put(&group_of, shape, label)
+                    Ints::put(&present, label, 1)
+                    any_found <- true
+            shape <- shape + 1
+        if not any_found:
+            return false
+        label: i64 = sy_which(rng, count, group_of, shapes, present)
+        agree: bool = sy_agreeable(rng, SY_CATEGORICAL, 5, label)
+        # `fitting or choices` -- fall back to the whole group when nothing in
+        # it agrees the way the deal wanted.
+        keep: mutable darray[i64] = Ints::zeros(shapes)
+        keep_n: mutable i64 = 0
+        all_n: mutable i64 = 0
+        every: mutable darray[i64] = Ints::zeros(shapes)
+        pick: mutable i64 = 0
+        while pick < shapes |pick, shapes, group_of, label, count, premises, agree, keep, keep_n, every, all_n|:
+            if Ints::at(group_of, pick) == label:
+                Ints::put(&every, all_n, pick)
+                all_n <- all_n + 1
+                sy_shape_at(count, pick, &premises)
+                if (sy_atmosphere(&premises) == label) == agree:
+                    Ints::put(&keep, keep_n, pick)
+                    keep_n <- keep_n + 1
+            pick <- pick + 1
+        taken: i64 = Ints::at(keep, py_choice_index(rng, keep_n)) if keep_n > 0 else Ints::at(every, py_choice_index(rng, all_n))
+        sy_shape_at(count, taken, &premises)
+        order: mutable darray[i64] = Ints::zeros(SY_MOST_PREMISES)
+        fill: mutable i64 = 0
+        while fill < premises.count |fill, premises, order|:
+            Ints::put(&order, fill, fill)
+            fill <- fill + 1
+        py_shuffle_i64_prefix(rng, &order, premises.count)
+        sy_question_reset(q)
+        q.found <- true
+        q.family <- SY_CATEGORICAL
+        line: mutable i64 = 0
+        while line < premises.count |line, premises, order, names, q|:
+            at: i64 = Ints::at(order, line)
+            said: mutable dstr = []
+            sy_append_says(&said, Ints::at(premises.form, at), sy_name(names, Ints::at(premises.subject, at)), sy_name(names, Ints::at(premises.predicate, at)))
+            sy_add_line(q, said)
+            line <- line + 1
+        asked: mutable dstr = []
+        dstr_append_cstr(&asked, "What follows about ")
+        dstr_append_sview(&asked, sy_name(names, subject))
+        dstr_append_cstr(&asked, " and ")
+        dstr_append_sview(&asked, sy_name(names, other))
+        dstr_append_cstr(&asked, "?")
+        sy_set_asked(q, asked)
+        option: mutable i64 = 0
+        while option < 5 |option, names, subject, other, q|:
+            sy_add_option(q, sy_categorical_option(sy_name(names, subject), sy_name(names, other), option))
+            option <- option + 1
+        q.option_count <- 5
+        q.answer <- label if label != SY_NOTHING else 4
+        q.surface <- sy_atmosphere(&premises)
+        spare: i64 = sy_spare(count, &premises, label, subject, other)
+        q.steps <- premises.count - spare
+        q.decoys <- spare
+        # The working quotes the lines as shown, then says why.
+        quote: mutable i64 = 0
+        while quote < q.line_count |quote, q|:
+            slot: i64 = q.working_count
+            Ints::put(&q.working, slot * 2, Ints::at(q.lines, quote * 2))
+            Ints::put(&q.working, slot * 2 + 1, Ints::at(q.lines, quote * 2 + 1))
+            q.working_count <- slot + 1
+            quote <- quote + 1
+        sy_categorical_working(count, &premises, names, label, subject, other, q)
+        return true
+
+# Why. For `nothing follows` that means TWO WORLDS, not a shrug.
+def sy_categorical_working(count: i64, premises: SyStatements&, names: SyNames&, label: i64, subject: i64, other: i64, q: mutable SyQuestion&):
+    can Memory.Allocate, Abort.Panic:
+        if label != SY_NOTHING:
+            first: mutable dstr = []
+            dstr_append_cstr(&first, "so ")
+            sy_append_says(&first, label, sy_name(names, subject), sy_name(names, other))
+            sy_add_working(q, first)
+            second: mutable dstr = []
+            dstr_append_cstr(&second, "and none of the other three follows")
+            sy_add_working(q, second)
+            return
+        both: mutable darray[i64] = Ints::zeros(8)
+        both_n: mutable i64 = 0
+        form: mutable i64 = 0
+        while form < 4 |form, count, premises, subject, other, both, both_n|:
+            if sy_satisfiable(count, premises, form, subject, other):
+                Ints::put(&both, both_n, form)
+                both_n <- both_n + 1
+            form <- form + 1
+        if both_n >= 2:
+            first: mutable dstr = []
+            dstr_append_cstr(&first, "the premises are all still true when ")
+            sy_append_says(&first, Ints::at(both, 0), sy_name(names, subject), sy_name(names, other))
+            dstr_append_cstr(&first, ",")
+            sy_add_working(q, first)
+            second: mutable dstr = []
+            dstr_append_cstr(&second, "and all still true when ")
+            sy_append_says(&second, Ints::at(both, 1), sy_name(names, subject), sy_name(names, other))
+            dstr_append_cstr(&second, ",")
+            sy_add_working(q, second)
+        closing: mutable dstr = []
+        dstr_append_cstr(&closing, "so nothing follows about ")
+        dstr_append_sview(&closing, sy_name(names, subject))
+        dstr_append_cstr(&closing, " and ")
+        dstr_append_sview(&closing, sy_name(names, other))
+        sy_add_working(q, closing)
+
 # --- dealing one ---
 
 struct SyWork:
@@ -1509,6 +1941,8 @@ def sy_deal_one(g: SyGrade, rng: mutable MT19937&, made_up: bool, work: mutable 
         family: i64 = g.family
         if family == SY_PARITY or family == SY_ORDER or family == SY_PLANE or family == SY_SPACE:
             return sy_chain_question(g, rng, made_up, &work.names, &work.web, &work.found, q)
+        if family == SY_CATEGORICAL:
+            return sy_categorical_question(g, rng, made_up, &work.names, q)
         return false
 
 def sy_generate(level: i64, seed: i64, made_up: bool, work: mutable SyWork&, q: mutable SyQuestion&) -> bool:
