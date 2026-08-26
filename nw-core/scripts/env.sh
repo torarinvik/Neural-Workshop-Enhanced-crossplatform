@@ -7,12 +7,14 @@
 
 NW_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)"
 
-export ELISA_CORE="$NW_ROOT/worktrees/elisa-core-nw"
-export ELISA_STAGE1_ROOT="$NW_ROOT/worktrees/elisa-compiler-nw"
+# Overridable so a scratch INTEGRATION checkout can be verified with the same
+# suites without editing this file: set either variable before sourcing.
+export ELISA_CORE="${ELISA_CORE:-$NW_ROOT/worktrees/elisa-core-nw}"
+export ELISA_STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$NW_ROOT/worktrees/elisa-compiler-nw}"
 
-export ELISACORE_BIN="$ELISA_CORE/compiler/bin/elisac-nw"
-export ELISA_STAGE1_BIN="$ELISA_STAGE1_ROOT/bin/elisac-stage1"
-export ELISA_RUNTIME_OBJ="$ELISA_STAGE1_ROOT/build/runtime/elisacore_runtime.o"
+export ELISACORE_BIN="${ELISACORE_BIN:-$ELISA_CORE/compiler/bin/elisac-nw}"
+export ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$ELISA_STAGE1_ROOT/bin/elisac-stage1}"
+export ELISA_RUNTIME_OBJ="${ELISA_RUNTIME_OBJ:-$ELISA_STAGE1_ROOT/build/runtime/elisacore_runtime.o}"
 
 # Type-check for real: stage1 emits without analysis when the gate is off.
 export ELISA_STAGE1_SEMANTIC_GATE=1
