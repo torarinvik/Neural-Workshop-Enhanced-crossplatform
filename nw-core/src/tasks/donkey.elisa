@@ -1,0 +1,341 @@
+# Donkey: a two-lane road, animals standing in it, and one press that commits.
+#
+# Port of neural_workshop/donkey.py (GPL-2.0-or-later). The car runs forward on
+# its own; the only control is a swerve that takes `swerve` ROWS to complete,
+# during which the car is in BOTH lanes and a donkey in either is a hit. From
+# the sixth rung the swerve is two rows and dodging on sight stops being a
+# policy at all -- which is the whole content of the upper ladder.
+#
+# ## `alive` as a bitmask
+#
+# The reference carries the surviving car states as a frozenset of
+# `(lane, owed)`. Those sets are only ever tested for EMPTINESS and rebuilt
+# from each other, never iterated for order, so nothing here depends on
+# CPython's set ordering -- unlike maze.elisa, which needs the real thing.
+#
+# And the state space is tiny: lane is 0 or 1, owed runs 0..crossing, and
+# crossing tops out at 3 * SUB = 12. Twenty-six states, so the whole set is a
+# bitmask in one i64 and `feasible` is a loop over set bits.
+#
+# ## The draw that is guarded
+#
+# In `generate` the dice are asked as
+#
+#     if (blocked[at] is None and at >= free_from and at + SPAN <= length
+#             and rng.random() < chance):
+#
+# Python's `and` SHORT-CIRCUITS, so `random()` is not called at all unless the
+# three cheap conditions already hold. Drawing first and testing afterwards
+# consumes a value on every sub-row instead of on a few, and lays a completely
+# different road while still looking like a road.
+
+const DK_HOLD: i64 = 0
+const DK_SWITCH: i64 = 1
+const DK_SUB: i64 = 4
+const DK_CAR: i64 = 3
+const DK_BEAST: i64 = 3
+const DK_SPAN: i64 = 5          # CAR + BEAST - 1
+const DK_RUN_IN: i64 = 3
+const DK_GAP: i64 = 4           # = SUB
+const DK_CLEAR: i64 = -1        # `None` in `blocked`
+const DK_GRADE_COUNT: i64 = 10
+
+struct DkGrade:
+    rows: mutable i64
+    # Density is a per-row rate; the dice are asked per SUB-row, so the chance
+    # is density / SUB. Held in ten-thousandths so the table is exact integers
+    # and the division to f64 happens once, the same way on both sides.
+    density_ten_thousandths: mutable i64
+    swerve: mutable i64
+
+def dk_crossing(g: DkGrade&) -> i64:
+    return g.swerve * DK_SUB
+
+def dk_grade_at(level: i64) -> DkGrade:
+    can Abort.Panic:
+        index: mutable i64 = level - 1
+        index <- 0 if index < 0 else index
+        index <- DK_GRADE_COUNT - 1 if index > DK_GRADE_COUNT - 1 else index
+        g: mutable DkGrade = zeroed
+        if index == 0:
+            g.rows <- 24
+            g.density_ten_thousandths <- 1400
+            g.swerve <- 1
+        elif index == 1:
+            g.rows <- 28
+            g.density_ten_thousandths <- 2600
+            g.swerve <- 1
+        elif index == 2:
+            g.rows <- 32
+            g.density_ten_thousandths <- 4000
+            g.swerve <- 1
+        elif index == 3:
+            g.rows <- 36
+            g.density_ten_thousandths <- 5400
+            g.swerve <- 1
+        elif index == 4:
+            g.rows <- 48
+            g.density_ten_thousandths <- 5400
+            g.swerve <- 1
+        elif index == 5:
+            g.rows <- 36
+            g.density_ten_thousandths <- 3400
+            g.swerve <- 2
+        elif index == 6:
+            g.rows <- 40
+            g.density_ten_thousandths <- 4800
+            g.swerve <- 2
+        elif index == 7:
+            g.rows <- 44
+            g.density_ten_thousandths <- 6200
+            g.swerve <- 2
+        elif index == 8:
+            g.rows <- 56
+            g.density_ten_thousandths <- 6200
+            g.swerve <- 2
+        else:
+            g.rows <- 56
+            g.density_ten_thousandths <- 5400
+            g.swerve <- 3
+        return g
+
+struct DkRoad:
+    rows: mutable i64
+    swerve: mutable i64
+    crossing: mutable i64
+    length: mutable i64
+    start: mutable i64
+    blocked: mutable darray[i64]
+    beast_at: mutable darray[i64]
+    beast_lane: mutable darray[i64]
+    beast_n: mutable i64
+
+# Where a donkey's drawn body begins, given its blocked run. The run starts a
+# car's length before the animal does, because that is where the two would
+# first overlap; the screen wants the animal.
+def dk_body_of(at: i64) -> i64:
+    return at + DK_CAR - 1
+
+# ------------------------------------------------------------
+# Surviving states, as a bitmask over (lane, owed)
+# ------------------------------------------------------------
+
+def dk_state_bit(lane: i64, owed: i64, crossing: i64) -> i64:
+    can Abort.Panic:
+        index: i64 = lane * (crossing + 1) + owed
+        bit: mutable i64 = 1
+        shift: mutable i64 = 0
+        while shift < index |shift, bit|:
+            bit <- bit * 2
+            shift <- shift + 1
+        return bit
+
+def dk_states(start: i64, crossing: i64) -> i64:
+    can Abort.Panic:
+        return dk_state_bit(start, 0, crossing)
+
+# The states that survive a sub-row blocked at `lane` (DK_CLEAR for clear
+# road), from `alive`. A pure function of the sub-row, which is what lets the
+# generator ask "may a donkey stand here?" without simulating anything.
+#
+# `owed` is sub-rows of the crossing still to run, THIS ONE INCLUDED. A settled
+# car may hold or start a swerve; a crossing car has no say.
+def dk_feasible(alive: i64, lane: i64, crossing: i64) -> i64:
+    can Abort.Panic:
+        out: mutable i64 = 0
+        was: mutable i64 = 0
+        while was < 2 |was, crossing, alive, lane, out|:
+            owed_in: mutable i64 = 0
+            while owed_in <= crossing |owed_in, crossing, was, alive, lane, out|:
+                if (alive / dk_state_bit(was, owed_in, crossing)) % 2 == 1:
+                    # A settled car has two moves; a crossing car has one.
+                    choice: mutable i64 = 0
+                    moves: i64 = 1 if owed_in != 0 else 2
+                    while choice < moves |choice, moves, owed_in, was, crossing, lane, out|:
+                        owed: mutable i64 = owed_in if owed_in != 0 else (0 if choice == 0 else crossing)
+                        # `covers` is BOTH lanes while owed, else just `was`.
+                        blocked_here: mutable bool = false
+                        if lane != DK_CLEAR:
+                            blocked_here <- true if owed != 0 else lane == was
+                        if not blocked_here:
+                            if owed != 0:
+                                owed <- owed - 1
+                                landed: i64 = (1 - was) if owed == 0 else was
+                                out <- out | dk_state_bit(landed, owed, crossing)
+                            else:
+                                out <- out | dk_state_bit(was, 0, crossing)
+                        choice <- choice + 1
+                owed_in <- owed_in + 1
+            was <- was + 1
+        return out
+
+# Would a donkey here leave the car anywhere to be?
+def dk_room_for(alive: i64, lane: i64, crossing: i64) -> bool:
+    can Abort.Panic:
+        live: mutable i64 = alive
+        step: mutable i64 = 0
+        while step < DK_SPAN and live != 0 |step, live, lane, crossing|:
+            live <- dk_feasible(live, lane, crossing)
+            step <- step + 1
+        return live != 0
+
+# ------------------------------------------------------------
+# The car
+# ------------------------------------------------------------
+
+struct DkCar:
+    lane: mutable i64
+    crossing: mutable i64
+    at: mutable i64
+    passed: mutable i64
+    hit: mutable bool
+    span: mutable i64
+
+def dk_car_new(lane: i64, swerve: i64) -> DkCar:
+    can Abort.Panic:
+        car: mutable DkCar = zeroed
+        car.lane <- lane
+        car.span <- swerve * DK_SUB
+        return car
+
+# Take the press, if there is anything for it to do. A swerve already under way
+# SWALLOWS the key -- that is the whole of what makes the road a road rather
+# than a quiz: the press commits the next `swerve` rows and no second press
+# buys them back.
+def dk_steer(car: mutable DkCar&, port: i64) -> bool:
+    can Abort.Panic:
+        false return if port != DK_SWITCH or car.crossing != 0
+        car.crossing <- car.span
+        return true
+
+# One sub-row of road arrives. Returns the donkeys got past, 0 or 1.
+#
+# The order is the order the screen draws in: the press has ALREADY been taken,
+# so the road that arrives is met by the car the press left behind. A swerve
+# started this tick is across the middle for THIS sub-row, which is why it
+# cannot be a dodge.
+def dk_beat(car: mutable DkCar&, road: DkRoad&) -> i64:
+    can Abort.Panic:
+        0 return if car.hit or car.at >= road.length
+        lane: i64 = Ints::at(road.blocked, car.at)
+        car.at <- car.at + 1
+        got: mutable i64 = 0
+        covered: bool = lane != DK_CLEAR and (car.crossing != 0 or lane == car.lane)
+        if covered:
+            car.hit <- true
+        elif lane != DK_CLEAR:
+            # Counted where the overlap would have ENDED rather than where it
+            # would have begun, so a donkey is past when it is past rather than
+            # when it comes alongside.
+            index: mutable i64 = 0
+            while index < road.beast_n |index, road, car, got|:
+                if Ints::at(road.beast_at, index) + DK_SPAN - 1 == car.at - 1:
+                    got <- 1
+                index <- index + 1
+            car.passed <- car.passed + got
+        if car.crossing != 0:
+            car.crossing <- car.crossing - 1
+            if car.crossing == 0:
+                car.lane <- 1 - car.lane
+        return got
+
+def dk_over(car: DkCar&, road: DkRoad&) -> bool:
+    return car.hit or car.at >= road.length
+
+def dk_cleared(car: DkCar&, road: DkRoad&) -> bool:
+    return not car.hit and car.at >= road.length
+
+# ------------------------------------------------------------
+# Laying a road
+# ------------------------------------------------------------
+
+# Lay one road. Deterministic in `seed`, and PASSABLE by construction: a donkey
+# goes down only where the surviving states stay non-empty for the whole SPAN
+# it would block. That is not a filter over finished roads and it is cheaper
+# than one -- refusing a donkey is always available, so the road is passable at
+# every prefix and therefore passable at the end.
+def dk_generate(a: mutable Arena&, level: i64, seed: i64) -> DkRoad:
+    can Memory.Allocate, Abort.Panic:
+        g: DkGrade = dk_grade_at(level)
+        crossing: i64 = dk_crossing(&g)
+        length: i64 = g.rows * DK_SUB
+
+        road: mutable DkRoad = zeroed
+        road.rows <- g.rows
+        road.swerve <- g.swerve
+        road.crossing <- crossing
+        road.length <- length
+        road.blocked <- Ints::zeros(a, length + 1)
+        road.beast_at <- Ints::zeros(a, length + 1)
+        road.beast_lane <- Ints::zeros(a, length + 1)
+        clear: mutable i64 = 0
+        while clear < length |clear, length, road|:
+            Ints::put(&road.blocked, clear, DK_CLEAR)
+            clear <- clear + 1
+
+        rng: mutable MT19937 = mt19937_new()
+        mt_seed_int(&rng, seed.u64())
+        road.start <- py_choice_index(&rng, 2)
+
+        alive: mutable i64 = dk_states(road.start, crossing)
+        chance: f64 = (g.density_ten_thousandths.f64() / 10000.0) / DK_SUB.f64()
+        free_from: mutable i64 = DK_RUN_IN * DK_SUB
+
+        at: mutable i64 = 0
+        while at < length |at, length, road, alive, crossing, chance, free_from, rng|:
+            # SHORT-CIRCUIT: random() is only drawn when the three cheap tests
+            # already pass. Drawing first spends a value every sub-row.
+            if Ints::at(road.blocked, at) == DK_CLEAR and at >= free_from and at + DK_SPAN <= length:
+                if py_random(&rng) < chance:
+                    wanted: i64 = py_choice_index(&rng, 2)
+                    tried: mutable i64 = 0
+                    placed: mutable bool = false
+                    while tried < 2 and not placed |tried, wanted, alive, crossing, road, at, free_from, placed|:
+                        lane: i64 = wanted if tried == 0 else 1 - wanted
+                        if dk_room_for(alive, lane, crossing):
+                            step: mutable i64 = 0
+                            while step < DK_SPAN |step, road, at, lane|:
+                                Ints::put(&road.blocked, at + step, lane)
+                                step <- step + 1
+                            Ints::put(&road.beast_at, road.beast_n, at)
+                            Ints::put(&road.beast_lane, road.beast_n, lane)
+                            road.beast_n <- road.beast_n + 1
+                            free_from <- at + DK_SPAN + DK_GAP
+                            placed <- true
+                        tried <- tried + 1
+            alive <- dk_feasible(alive, Ints::at(road.blocked, at), crossing)
+            at <- at + 1
+
+        # A road with no donkeys would be a free verdict, so if the dice never
+        # called for one, put one where it fits.
+        if road.beast_n == 0:
+            live: mutable i64 = dk_states(road.start, crossing)
+            spot: mutable i64 = 0
+            done: mutable bool = false
+            while spot < length - DK_SPAN and not done |spot, length, live, crossing, road, done|:
+                lane: mutable i64 = 0
+                while lane < 2 and not done |lane, spot, live, crossing, road, done|:
+                    if spot >= DK_RUN_IN * DK_SUB and dk_room_for(live, lane, crossing):
+                        step: mutable i64 = 0
+                        while step < DK_SPAN |step, road, spot, lane|:
+                            Ints::put(&road.blocked, spot + step, lane)
+                            step <- step + 1
+                        Ints::put(&road.beast_at, 0, spot)
+                        Ints::put(&road.beast_lane, 0, lane)
+                        road.beast_n <- 1
+                        done <- true
+                    lane <- lane + 1
+                if not done:
+                    live <- dk_feasible(live, Ints::at(road.blocked, spot), crossing)
+                spot <- spot + 1
+        return road
+
+# Is there a line through this road at all?
+def dk_survivable(road: DkRoad&) -> bool:
+    can Abort.Panic:
+        alive: mutable i64 = dk_states(road.start, road.crossing)
+        at: mutable i64 = 0
+        while at < road.length and alive != 0 |at, road, alive|:
+            alive <- dk_feasible(alive, Ints::at(road.blocked, at), road.crossing)
+            at <- at + 1
+        return alive != 0
