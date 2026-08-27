@@ -1,0 +1,130 @@
+# Monkey Ladder: a Corsi-style numbered grid. Watch the order, then click it
+# back.
+#
+# Port of the portable half of neural_workshop/ui/monkeyladder.py
+# (GPL-2.0-or-later). The task has no core module in the reference -- its rules
+# live in the UI file beside the drawing -- so what is here is the deal, the
+# cursor, the click rules and the adaptive ladder. The geometry that turns a
+# mouse position into a cell is the shell's, as it is for every other task.
+#
+# Cells are numbered ROW-MAJOR: the reference builds
+# `[(r, c) for r in range(grid) for c in range(grid)]` and samples from that
+# list, so index `i` is `(i / grid, i % grid)` and sampling indices out of
+# `range(grid * grid)` draws exactly what sampling the pairs draws.
+
+module MonkeyLadder:
+
+    # A sequence is at least two, and never longer than the grid holds.
+    const SHORTEST: i64 = 2
+
+    # What a click came to.
+    const CLICK_IGNORED: i64 = 0
+    const CLICK_RIGHT: i64 = 1
+    const CLICK_DONE: i64 = 2
+    const CLICK_WRONG: i64 = 3
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SHOW: i64 = 1
+    const PHASE_INPUT: i64 = 2
+    const PHASE_RESULT: i64 = 3
+
+    def clamp_level(level: i64, grid: i64) -> i64:
+        can Abort.Panic:
+            most: i64 = grid * grid
+            lifted: i64 = SHORTEST if level < SHORTEST else level
+            return most if lifted > most else lifted
+
+    struct Round:
+        grid: mutable i64
+        level: mutable i64
+        adaptive: mutable bool
+        phase: mutable i64
+        # The cells to click, in order, as row-major indices.
+        sequence: mutable darray[i64]
+        length: mutable i64
+        next_index: mutable i64
+        # Cells already clicked correctly, in order.
+        clicked: mutable darray[i64]
+        clicked_n: mutable i64
+        # The cell a miss landed on, -1 for none.
+        wrong: mutable i64
+        cursor_row: mutable i64
+        cursor_col: mutable i64
+
+    def new_round(grid: i64, start_level: i64, adaptive: bool) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            return Round{grid: grid, level: clamp_level(start_level, grid), adaptive: adaptive,
+                         phase: PHASE_READY, sequence: Ints::zeros(grid * grid), length: 0,
+                         next_index: 0, clicked: Ints::zeros(grid * grid), clicked_n: 0,
+                         wrong: -1, cursor_row: 0, cursor_col: 0}
+
+    # Deal a round. `random.sample` over the cell list, which is why the port
+    # samples INDICES: the population is the same size and the draw order is
+    # the same, so the two agree cell for cell.
+    def start_round(round: mutable Round&, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            cells: i64 = round.grid * round.grid
+            count: i64 = round.level if round.level < cells else cells
+            picked: darray[i64] = py_sample_range(rng, 0, cells - 1, count)
+            round.length <- 0
+            for at in 0..<count |round, picked|:
+                Ints::put(&round.sequence, at, Ints::at(picked, at))
+                round.length <- round.length + 1
+            round.next_index <- 0
+            round.clicked_n <- 0
+            round.wrong <- -1
+            round.cursor_row <- 0
+            round.cursor_col <- 0
+            round.phase <- PHASE_SHOW
+
+    # The show phase ends on the clock, which the shell owns; this is the
+    # transition it drives.
+    def begin_input(round: mutable Round&):
+        can Abort.Panic:
+            round.phase <- PHASE_INPUT if round.phase == PHASE_SHOW
+
+    # Slide the selection by one cell, STOPPING at the edges rather than
+    # wrapping.
+    def move_cursor(round: mutable Round&, d_row: i64, d_col: i64):
+        can Abort.Panic:
+            row: mutable i64 = round.cursor_row + d_row
+            col: mutable i64 = round.cursor_col + d_col
+            row <- 0 if row < 0
+            col <- 0 if col < 0
+            row <- round.grid - 1 if row > round.grid - 1
+            col <- round.grid - 1 if col > round.grid - 1
+            round.cursor_row <- row
+            round.cursor_col <- col
+
+    def cursor_cell(round: mutable Round&) -> i64:
+        can Abort.Panic:
+            return round.cursor_row * round.grid + round.cursor_col
+
+    def already_clicked(round: mutable Round&, cell: i64) -> bool:
+        can Abort.Panic:
+            for at in 0..<round.clicked_n |round, cell|:
+                true return if Ints::at_ref(&round.clicked, at) == cell
+            return false
+
+    # Handle a click. A click outside the input phase, or on a cell already
+    # clicked, does NOTHING -- not a miss. The reference returns early on both,
+    # and the difference matters: re-clicking a tile you already got right is a
+    # fat finger, not an error.
+    def click_cell(round: mutable Round&, cell: i64) -> i64:
+        can Abort.Panic:
+            CLICK_IGNORED return if round.phase != PHASE_INPUT
+            CLICK_IGNORED return if already_clicked(round, cell)
+            expected: i64 = Ints::at_ref(&round.sequence, round.next_index)
+            if cell == expected:
+                Ints::put(&round.clicked, round.clicked_n, cell)
+                round.clicked_n <- round.clicked_n + 1
+                round.next_index <- round.next_index + 1
+                if round.next_index >= round.length:
+                    round.level <- clamp_level(round.level + 1, round.grid) if round.adaptive
+                    round.phase <- PHASE_RESULT
+                    return CLICK_DONE
+                return CLICK_RIGHT
+            round.wrong <- cell
+            round.level <- clamp_level(round.level - 1, round.grid) if round.adaptive
+            round.phase <- PHASE_RESULT
+            return CLICK_WRONG
