@@ -1,0 +1,263 @@
+# The Syllogisms screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/syllogism.py -- the drawing, not the thinking.
+#
+# The most measured layout in the workshop, and the module says why: fixed
+# fractions were tried first and do not work, because a rung prints two lines
+# of premises and another prints thirteen. So each block is measured after its
+# text is set and the next one starts under it -- premises, then the question,
+# then the answers in as many columns as they need.
+#
+# Three sizes come out of counts rather than out of the window:
+#
+#   * the premises' size steps with how MANY lines there are (15 / 13 / 11)
+#   * the answers' size steps with how many COLUMNS they take (14 / 12 / 11)
+#     and is then shrunk again to whatever the step down the page allows
+#   * `spread` decides the columns: one up to five answers, three up to
+#     twelve, four beyond
+#
+# and past twelve answers the text itself changes -- `shorten` drops the word
+# "and" and abbreviates the compass words, for the eye only. The answer a
+# player picks is still the sentence the working uses.
+#
+# The numbering also stops at nine: ten or more answers are drawn bare,
+# because "10." on a four-column page costs more room than it gives back.
+#
+# NOTE: needs elisacore_math, strings, geometry, verdict, textmetrics, display
+# and scene_verdict included by the driver.
+
+module SceneSyllogism:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_ASKING: i64 = 1
+    const PHASE_JUDGED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    def color_mine() -> u32:
+        return Display::rgba(0, 114, 178, 255)
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def floor_of(height: f64) -> f64:
+        can Abort.Panic:
+            return Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 52.0).f64()).f64()
+
+    def top_of(height: f64) -> f64:
+        can Abort.Panic:
+            return Geometry::from_top_edge(height, 108.0).f64()
+
+    # How many columns that many answers want.
+    def spread(count: i64) -> i64:
+        if count <= 5:
+            return 1
+        return 3 if count <= 12 else 4
+
+    def premise_size(height: f64, lines: i64) -> f64:
+        can Abort.Panic:
+            reference: f64 = 15.0 if lines <= 6 else (13.0 if lines <= 10 else 11.0)
+            return Geometry::calc_fontsize(height, reference)
+
+    def option_size(height: f64, columns: i64) -> f64:
+        can Abort.Panic:
+            reference: f64 = 14.0 if columns == 1 else (12.0 if columns == 3 else 11.0)
+            return Geometry::calc_fontsize(height, reference)
+
+    # Whether the word `text[from_at:past]` is exactly `wanted`.
+    def word_is(text: sview, from_at: i64, past: i64, wanted: cstr) -> bool:
+        can Abort.Panic:
+            want: sview = sview(wanted, 0, -1)
+            span: i64 = sview_len(want).i64()
+            if past - from_at != span:
+                return false
+            step: mutable i64 = 0
+            while step < span |text, want, from_at, span, step|:
+                if sview_at(text, (from_at + step).usize()) != sview_at(want, step.usize()):
+                    return false
+                step <- step + 1
+            return true
+
+    # `SHORTER`, applied word by word: the compass words become letters and
+    # `above`/`below` become `up`/`down`. Anything else is drawn as it is.
+    def append_short_word(out: mutable dstr&, text: sview, from_at: i64, past: i64):
+        can Memory.Allocate, Abort.Panic:
+            if word_is(text, from_at, past, "north"):
+                out.push(78.u8())
+                return
+            if word_is(text, from_at, past, "south"):
+                out.push(83.u8())
+                return
+            if word_is(text, from_at, past, "east"):
+                out.push(69.u8())
+                return
+            if word_is(text, from_at, past, "west"):
+                out.push(87.u8())
+                return
+            if word_is(text, from_at, past, "above"):
+                dstr_append_cstr(out, "up")
+                return
+            if word_is(text, from_at, past, "below"):
+                dstr_append_cstr(out, "down")
+                return
+            at: mutable i64 = from_at
+            while at < past |out, text, past, at|:
+                out.push(sview_at(text, at.usize()))
+                at <- at + 1
+
+    # An answer as it is DRAWN, which is not always as it is meant: numbered
+    # up to nine answers, shortened past twelve.
+    def drawn_option(out: mutable dstr&, text: sview, count: i64, number: i64):
+        can Memory.Allocate, Abort.Panic:
+            if count <= 12:
+                if count <= 9:
+                    dstr_append_i64(out, number + 1)
+                    dstr_append_cstr(out, ". ")
+                dstr_append_sview(out, text)
+                return
+            # `' '.join(word for word in text.split() if word != 'and')`, so
+            # runs of spaces collapse and a dropped word takes its separator
+            # with it rather than leaving a double space behind.
+            length: i64 = sview_len(text).i64()
+            written: mutable i64 = 0
+            at: mutable i64 = 0
+            while at < length |out, text, length, at, written|:
+                if sview_at(text, at.usize()).i64() == 32:
+                    at <- at + 1
+                else:
+                    past: mutable i64 = at
+                    while past < length |text, length, past|:
+                        if sview_at(text, past.usize()).i64() == 32:
+                            break
+                        past <- past + 1
+                    if not word_is(text, at, past, "and"):
+                        if written > 0:
+                            out.push(32.u8())
+                        append_short_word(out, text, at, past)
+                        written <- written + 1
+                    at <- past
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_question: bool, premises: sview, premise_lines: i64,
+               asked: sview, hint: sview, options: darray[sview]&,
+               choice: i64, answered: i64, trial: i64, total_trials: i64,
+               message: sview, verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            wide: f64 = paint.width * 0.88
+            playing: bool = has_question and (phase == PHASE_ASKING or phase == PHASE_JUDGED)
+
+            put_text(list, paint, sview("Syllogisms", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 34.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if has_question and phase == PHASE_ASKING:
+                dstr_append_cstr(&status, "     question ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 64.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 13.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            # The hint is up while the question is being ASKED and gone once
+            # it has been answered: what a family takes for granted is help,
+            # and help on the frame the answer is given is a distraction.
+            note: sview = hint if playing and phase == PHASE_ASKING else sview("", 0, -1)
+            put_text(list, paint, note, middle,
+                     Geometry::from_top_edge(paint.height, 88.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            # `_premise_size` counts the QUESTION's lines and not the drawn
+            # block's, so it does not change when the working is shown instead.
+            lines: i64 = premise_lines if has_question else 4
+            block: sview = premises if playing else sview("", 0, -1)
+            block_size: f64 = premise_size(paint.height, lines)
+            top: f64 = top_of(paint.height)
+            put_text(list, paint, block, middle, top, block_size, paint.ink,
+                     Display::ANCHOR_CENTER_TOP, false)
+
+            question: sview = asked if playing else sview("", 0, -1)
+            asked_size: f64 = Geometry::calc_fontsize(paint.height, 16.0)
+            gap: f64 = Geometry::calc_fontsize(paint.height, 16.0)
+            asked_y: mutable f64 = top
+            if sview_len(block).i64() > 0:
+                block_tall: f64 = TextMetrics::wrapped_height(block_size, block, wide).f64()
+                asked_y <- top - block_tall - gap
+            put_text(list, paint, question, middle, asked_y, asked_size,
+                     paint.ink, Display::ANCHOR_CENTER_TOP, true)
+
+            put_text(list, paint,
+                     sview("Esc: menu   Space: start   arrows: choose   Enter: answer   O: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 24.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if not has_question:
+                return
+            under: mutable f64 = asked_y - gap
+            if sview_len(question).i64() > 0:
+                asked_tall: f64 = TextMetrics::wrapped_height(asked_size, question, wide).f64()
+                under <- under - asked_tall
+            place_options(list, paint, options, under, phase, choice, answered)
+
+    def place_options(list: mutable Display::DisplayList&, paint: Paint&,
+                      options: darray[sview]&, under: f64, phase: i64,
+                      choice: i64, answered: i64):
+        can Memory.Allocate, Abort.Panic:
+            count: i64 = options.count.i64()
+            if count == 0:
+                return
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            columns: i64 = spread(count)
+            rows: i64 = (count + columns - 1) / columns
+            bottom: f64 = floor_of(paint.height) + 10.0
+            top: f64 = under if under > bottom else bottom
+            even: f64 = (top - bottom) / rows.f64()
+            ceiling: f64 = Geometry::calc_fontsize(paint.height, 30.0)
+            step: f64 = even if even < ceiling else ceiling
+            column_wide: f64 = paint.width * 0.92 / columns.f64()
+            grown: f64 = step * 0.62
+            lifted: f64 = grown if grown > 6.0 else 6.0
+            largest: f64 = option_size(paint.height, columns)
+            size: f64 = lifted if lifted < largest else largest
+            picked: i64 = choice if phase == PHASE_ASKING else answered
+            for number in 0..<count |list, paint, options, count, columns, rows, top, step, column_wide, size, phase, picked, middle|:
+                column: i64 = number / rows
+                row: i64 = number % rows
+                # `int(...)` on the x and not on the y, which is the
+                # reference's own asymmetry and not a tidying-up here.
+                x: f64 = (middle + (column.f64() - (columns - 1).f64() / 2.0) * column_wide).i64().f64()
+                color: mutable u32 = paint.ink
+                if phase != PHASE_READY:
+                    color <- color_mine() if number == picked else paint.ink
+                shown: mutable dstr = []
+                drawn_option(&shown, get options[number.usize()] else sview("", 0, -1), count, number)
+                put_text(list, paint, bytes_view(shown),
+                         x, top - (row.f64() + 0.5) * step, size, color,
+                         Display::ANCHOR_CENTER_CENTER, false)

@@ -1,0 +1,257 @@
+# The Maze screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/maze.py -- the drawing, not the thinking.
+#
+# Three labels, a verdict and a warren. The warren is drawn in five passes and
+# the ORDER of them is the picture: walls, then the trail, then the way out,
+# then the doors, then the keys, then the walker on top of all of it.
+#
+# Two of those passes come out of SETS -- `maze.walls` and `self.walked` -- so
+# their order is CPython's hash order, and `tasks/pyset.elisa` supplies it.
+# The walls could have been settled for instead, being identical squares, but
+# the trail could not: it is drawn at 70 alpha over whatever is under it.
+#
+# The doors and the keys are tuples and are drawn in their own order, which is
+# by distance from the start. A door's COLOUR is its index into KEY_COLORS,
+# so the sixth door and the twelfth are the same orange -- that is the
+# reference's `colour % len(KEY_COLORS)` and not a shortage of colours here.
+#
+# A key is three circles: an ink rim, the colour, and a hole punched back out
+# in the background colour. On a black background that hole is black, so a
+# port that drew two circles and called the third decoration would put a solid
+# dot where a ring belongs.
+#
+# The wall squares are drawn `side + 1` across, which overlaps the neighbour by
+# a pixel and is what keeps a corridor from showing a seam. Reproduced, not
+# tidied.
+#
+# NOTE: needs elisacore_math, strings, ints, pyset, geometry, verdict, display
+# and scene_verdict included by the driver.
+
+module SceneMaze:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_WALKING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    const KEY_COLOR_COUNT: i64 = 6
+
+    def color_wall() -> u32:
+        return Display::rgba(110, 110, 110, 255)
+
+    def color_walker() -> u32:
+        return Display::rgba(204, 121, 167, 255)
+
+    def key_color(which: i64) -> u32:
+        ring: i64 = which % KEY_COLOR_COUNT
+        if ring == 0:
+            return Display::rgba(230, 159, 0, 255)
+        if ring == 1:
+            return Display::rgba(86, 180, 233, 255)
+        if ring == 2:
+            return Display::rgba(0, 158, 115, 255)
+        if ring == 3:
+            return Display::rgba(240, 228, 66, 255)
+        if ring == 4:
+            return Display::rgba(0, 114, 178, 255)
+        return Display::rgba(213, 94, 0, 255)
+
+    struct Paint:
+        ink: mutable u32
+        back: mutable u32
+        # The ink at 70 alpha, which is what the trail is drawn in.
+        trail: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     back: Display::rgba(back, back, back, 255),
+                     trail: Display::rgba(fore, fore, fore, 70),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 100.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 56.0).f64()).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.08
+            out.bottom <- bottom
+            out.width <- width * 0.84
+            out.height <- room if room > 40.0 else 40.0
+
+    struct Cell:
+        x: mutable f64
+        y: mutable f64
+        side: mutable f64
+
+    def cell_rect(out: mutable Cell&, canvas: Canvas&, wide: i64, tall: i64, cell: i64):
+        can Abort.Panic:
+            across: f64 = canvas.width / wide.f64()
+            down: f64 = canvas.height / tall.f64()
+            side: f64 = across if across < down else down
+            offset_x: f64 = canvas.left + (canvas.width - side * wide.f64()) / 2.0
+            offset_y: f64 = canvas.bottom + (canvas.height - side * tall.f64()) / 2.0
+            out.x <- offset_x + (cell % wide).f64() * side
+            out.y <- offset_y + (tall - 1 - cell / wide).f64() * side
+            out.side <- side
+
+    # `max(floor, side * fraction)` -- a rim thins with the cell down to a
+    # floor and no further.
+    def rim_of(side: f64, fraction: f64, least: f64) -> f64:
+        scaled: f64 = side * fraction
+        return scaled if scaled > least else least
+
+    def held_at(held: i64, colour: i64) -> bool:
+        return (held / (1 << colour)) % 2 == 1
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_maze: bool, wide: i64, tall: i64, walls: darray[i64]&,
+               walked: darray[i64]&, show_trail: bool, way_out: i64,
+               doors: darray[i64]&, keys: darray[i64]&, held: i64,
+               walker: i64, steps: i64, trial: i64, total_trials: i64,
+               message: sview, verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            playing: bool = phase == PHASE_WALKING or phase == PHASE_SOLVED
+
+            put_text(list, paint, sview("Maze", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if playing and has_maze:
+                dstr_append_cstr(&status, "     maze ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "   steps ")
+                dstr_append_i64(&status, steps)
+                left: mutable i64 = 0
+                for colour in 0..<keys.count.i64() |keys, held, left|:
+                    if not held_at(held, colour):
+                        left <- left + 1
+                # One key is said in words and two or more in figures, which
+                # is the reference's own line and not a rounding of it.
+                if left > 1:
+                    dstr_append_cstr(&status, "     ")
+                    dstr_append_i64(&status, left)
+                    dstr_append_cstr(&status, " keys to find")
+                elif left == 1:
+                    dstr_append_cstr(&status, "     one key to find")
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     arrows: walk     R: restart     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if not has_maze or not playing:
+                return
+
+            canvas: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&canvas, paint.width, paint.height)
+            square: mutable Cell = Cell{x: 0.0, y: 0.0, side: 0.0}
+
+            put_set(list, paint, &canvas, &square, wide, tall, walls, false)
+            if show_trail:
+                put_set(list, paint, &canvas, &square, wide, tall, walked, true)
+
+            # The way out: a frame rather than a fill, so it reads as a doorway
+            # and never as one more coloured thing to collect.
+            cell_rect(&square, &canvas, wide, tall, way_out)
+            side: f64 = square.side
+            Display::draw_bordered_rect(list, (square.x + side * 0.1) / paint.sx,
+                                        (square.y + side * 0.1) / paint.sy,
+                                        side * 0.8 / paint.sx,
+                                        side * 0.8 / paint.sy,
+                                        paint.back, paint.ink,
+                                        rim_of(side, 0.14, 2.0) / paint.sx)
+
+            for colour in 0..<doors.count.i64() |list, paint, canvas, square, wide, tall, doors, held|:
+                cell_rect(&square, &canvas, wide, tall, get doors[colour.usize()] else 0)
+                door_side: f64 = square.side
+                shade: u32 = key_color(colour)
+                if held_at(held, colour):
+                    # Opened: the frame stays so the route is still legible.
+                    Display::draw_bordered_rect(list, square.x / paint.sx,
+                                                square.y / paint.sy,
+                                                (door_side + 1.0) / paint.sx,
+                                                (door_side + 1.0) / paint.sy,
+                                                paint.back, shade,
+                                                rim_of(door_side, 0.1, 1.5) / paint.sx)
+                else:
+                    Display::draw_bordered_rect(list, square.x / paint.sx,
+                                                square.y / paint.sy,
+                                                (door_side + 1.0) / paint.sx,
+                                                (door_side + 1.0) / paint.sy,
+                                                shade, paint.ink,
+                                                rim_of(door_side, 0.07, 1.0) / paint.sx)
+
+            for colour in 0..<keys.count.i64() |list, paint, canvas, square, wide, tall, keys, held|:
+                if not held_at(held, colour):
+                    cell_rect(&square, &canvas, wide, tall, get keys[colour.usize()] else 0)
+                    key_side: f64 = square.side
+                    at_x: f64 = (square.x + key_side / 2.0) / paint.sx
+                    at_y: f64 = (square.y + key_side / 2.0) / paint.sy
+                    Display::draw_circle(list, at_x, at_y, key_side * 0.34 / paint.sx, paint.ink)
+                    Display::draw_circle(list, at_x, at_y, key_side * 0.28 / paint.sx, key_color(colour))
+                    Display::draw_circle(list, at_x, at_y, key_side * 0.12 / paint.sx, paint.back)
+
+            cell_rect(&square, &canvas, wide, tall, walker)
+            Display::draw_circle(list, (square.x + square.side / 2.0) / paint.sx,
+                                 (square.y + square.side / 2.0) / paint.sy,
+                                 square.side * 0.34 / paint.sx, color_walker())
+
+    # One pass over a SET of cells, in the order CPython would hand them out.
+    def put_set(list: mutable Display::DisplayList&, paint: Paint&,
+                canvas: Canvas&, square: mutable Cell&, wide: i64, tall: i64,
+                cells: darray[i64]&, is_trail: bool):
+        can Memory.Allocate, Abort.Panic:
+            room_for: i64 = cells.count.i64() + 8
+            held: mutable PySet::Table = PySet::new(room_for)
+            for at in 0..<cells.count.i64() |held, cells|:
+                PySet::add(&held, get cells[at.usize()] else 0)
+            order: mutable darray[i64] = Ints::zeros(room_for)
+            live: i64 = PySet::to_list(held, &order)
+            for at in 0..<live |list, paint, canvas, square, wide, tall, order, is_trail|:
+                cell_rect(square, canvas, wide, tall, Ints::at(order, at))
+                side: f64 = square.side
+                if is_trail:
+                    Display::draw_rect(list, (square.x + side * 0.38) / paint.sx,
+                                       (square.y + side * 0.38) / paint.sy,
+                                       side * 0.24 / paint.sx,
+                                       side * 0.24 / paint.sy, paint.trail)
+                else:
+                    Display::draw_rect(list, square.x / paint.sx,
+                                       square.y / paint.sy,
+                                       (side + 1.0) / paint.sx,
+                                       (side + 1.0) / paint.sy, color_wall())
