@@ -253,8 +253,10 @@ _FIELDS = {
     # square drawn as a glyph is centred on its point, and x/y alone cannot
     # tell that from a corner-anchored one. Every other rectangle in the
     # workshop leaves it at (0, 0), so the two extra cells are zeros there.
+    # ROTATION is here for Freeform Tetris, whose flying piece spins about
+    # its own middle; every other rectangle in the workshop leaves it at zero.
     "Rectangle": (("width", 0), ("height", 1), ("anchor_x", 0),
-                  ("anchor_y", 1)),
+                  ("anchor_y", 1), ("rotation", None)),
     "BorderedRectangle": (("width", 0), ("height", 1), ("border", 1)),
     # border_color is appended separately below: it is a colour, not a length.
     "Box": (("width", 0), ("height", 1), ("thickness", 1)),

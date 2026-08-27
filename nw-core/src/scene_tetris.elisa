@@ -1,0 +1,370 @@
+# The Freeform Tetris screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/tetris.py -- the drawing, not the thinking.
+#
+# FIVE GROUPS, and the order between them is the whole picture: the well and
+# its guides at 0, the settled pile at 1, the ghost of where the piece would
+# land at 2, the piece in the air at 3, and the tray of pieces still to come
+# at 4. So the frame is the chrome first, and then those five in order --
+# never the order the reference writes them in, which is frame, slot labels,
+# pile, tray, flying, ghost.
+#
+# The piece in the air is the one thing in the workshop that TURNS. Its
+# rectangles are anchored on their own middles and rotated, and the rotation
+# is the NEGATIVE of the piece's angle: pyglet turns clockwise and the game
+# counts anticlockwise. The display list carries the angle in a rectangle's
+# `ref` field, because a rect's six numbers are already spoken for.
+#
+# The status and the readout are SHRUNK to fit. A status line is a sentence
+# whose length depends on the rung's name, the numbers in it and the language
+# it was translated into, and a window is whatever size the player made it --
+# measuring is the only thing that copes with all three. Two passes, scaled by
+# the ratio rather than stepped down, because glyph widths are near enough
+# linear in the point size that one correction lands.
+#
+# NOTE: needs elisacore_math, strings, ints, geometry, verdict, textmetrics,
+# display and scene_verdict included by the driver.
+
+module SceneTetris:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_FALLING: i64 = 1
+    const PHASE_LANDED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    def color_clean_ghost() -> u32:
+        return Display::rgba(38, 166, 154, 255)
+
+    def color_ragged_ghost() -> u32:
+        return Display::rgba(240, 70, 30, 255)
+
+    # Okabe-Ito less its pale yellow -- a pile of (240, 228, 66) on the light
+    # background is barely there, and the pile is the thing being read. A
+    # piece is coloured by how many cells it has, so a glance at the tray
+    # sorts the hand by size without anybody counting.
+    def piece_color(which: i64) -> u32:
+        ring: i64 = which % 7
+        if ring == 0:
+            return Display::rgba(86, 180, 233, 255)
+        if ring == 1:
+            return Display::rgba(0, 158, 115, 255)
+        if ring == 2:
+            return Display::rgba(140, 110, 220, 255)
+        if ring == 3:
+            return Display::rgba(0, 114, 178, 255)
+        if ring == 4:
+            return Display::rgba(213, 94, 0, 255)
+        if ring == 5:
+            return Display::rgba(204, 121, 167, 255)
+        return Display::rgba(230, 159, 0, 255)
+
+    struct Cell:
+        x: i64
+        y: i64
+        # 1-based, and 0 for an empty cell.
+        tint: i64
+
+    struct Block:
+        x: f64
+        y: f64
+
+    struct Paint:
+        ink: mutable u32
+        muted: mutable u32
+        accent: mutable u32
+        # The line colour is the ink WITHOUT its alpha, because the well and
+        # its guides each set their own.
+        line: mutable i64
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     muted: Display::rgba(fore, fore, fore, 150),
+                     accent: Display::rgba(64, 96, 255, 255),
+                     line: fore,
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def lined(paint: Paint&, opacity: i64) -> u32:
+        return Display::rgba(paint.line, paint.line, paint.line, opacity)
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, wide: f64, tall: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               wide / paint.sx, tall / paint.sy, color)
+
+    # `label.font_size = wanted`, then twice over: if the line is wider than
+    # 96% of the window, scale the size by the ratio it overran by.
+    def shrunk(paint: Paint&, characters: i64, wanted: f64) -> f64:
+        can Abort.Panic:
+            room: f64 = paint.width * 0.96
+            size: mutable f64 = wanted
+            for _pass in 0..<2 |paint, characters, room, size|:
+                width: i64 = TextMetrics::text_width(size, characters)
+                if width == 0 or width.f64() <= room:
+                    break
+                shrunk_to: f64 = size * room / width.f64()
+                size <- shrunk_to if shrunk_to > 5.0 else 5.0
+            return size
+
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 92.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 52.0).f64()).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.03
+            out.bottom <- bottom
+            out.width <- width * 0.94
+            out.height <- room if room > 60.0 else 60.0
+
+    struct Field:
+        cell: mutable f64
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+        tray_bottom: mutable f64
+        tray_height: mutable f64
+        slot: mutable f64
+
+    def field_of(out: mutable Field&, width: f64, height: f64, cols: i64,
+                 rows: i64, slots: i64):
+        can Abort.Panic:
+            canvas: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&canvas, width, height)
+            share: f64 = canvas.height * 0.22
+            capped: f64 = share if share < 96.0 else 96.0
+            tray: f64 = capped if capped > 44.0 else 44.0
+            left_over: f64 = canvas.height - tray - 12.0
+            room: f64 = left_over if left_over > 30.0 else 30.0
+            across: f64 = canvas.width / cols.f64()
+            down: f64 = room / rows.f64()
+            least: f64 = across if across < down else down
+            cell: f64 = least if least > 2.0 else 2.0
+            out.cell <- cell
+            out.width <- cell * cols.f64()
+            out.height <- cell * rows.f64()
+            out.left <- canvas.left + (canvas.width - out.width) / 2.0
+            out.bottom <- canvas.bottom
+            out.tray_bottom <- canvas.bottom + out.height + 12.0
+            out.tray_height <- tray
+            out.slot <- out.width / slots.f64()
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               cols: i64, rows: i64, board: darray[i64]&,
+               queue_cells: darray[Cell]&, queue_counts: darray[i64]&,
+               fits: darray[i64]&, recut: darray[bool]&, armed: i64,
+               ghost: darray[Block]&, ghost_clean: bool,
+               flying: darray[Block]&, flying_size: i64, angle: f64,
+               status: sview, readout: sview, verdict: i64,
+               verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            slots: i64 = fits.count.i64()
+            where: mutable Field = Field{cell: 0.0, left: 0.0, bottom: 0.0, width: 0.0, height: 0.0, tray_bottom: 0.0, tray_height: 0.0, slot: 0.0}
+            field_of(&where, paint.width, paint.height, cols, rows, slots)
+
+            put_text(list, paint, sview("Freeform Tetris", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 30.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status_size: f64 = Geometry::calc_fontsize(paint.height, 13.0)
+            put_text(list, paint, status, middle,
+                     Geometry::from_top_edge(paint.height, 56.0).f64(),
+                     shrunk(paint, TextMetrics::codepoints(status), status_size),
+                     paint.ink, Display::ANCHOR_CENTER_CENTER, false)
+
+            readout_size: f64 = Geometry::calc_fontsize(paint.height, 11.0)
+            put_text(list, paint, readout, middle,
+                     Geometry::from_top_edge(paint.height, 76.0).f64(),
+                     shrunk(paint, TextMetrics::codepoints(readout), readout_size),
+                     paint.muted, Display::ANCHOR_CENTER_CENTER, false)
+
+            footnote: sview = sview("Esc: menu   Space: start, then drop   mouse: aim   hold Up/Down: spin   S: square up   click a piece or press 1-6: choose the next one   C: options", 0, -1)
+            footnote_size: f64 = Geometry::calc_fontsize(paint.height, 10.0)
+            put_text(list, paint, footnote, middle,
+                     Geometry::from_bottom_edge(paint.height, 24.0).f64(),
+                     shrunk(paint, TextMetrics::codepoints(footnote), footnote_size),
+                     paint.ink, Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 52.0, 16.0)
+
+            # Group 0: the well, its guides, its edge, and a box a slot.
+            put_rect(list, paint, where.left, where.bottom, where.width,
+                     where.height, lined(paint, 22))
+            for column in 8..<cols |list, paint, where, cols|:
+                if column % 8 == 0:
+                    Display::draw_line(list, (where.left + column.f64() * where.cell) / paint.sx,
+                                       where.bottom / paint.sy,
+                                       (where.left + column.f64() * where.cell) / paint.sx,
+                                       (where.bottom + where.height) / paint.sy,
+                                       1.0 / paint.sx, lined(paint, 34))
+            for row in 8..<rows |list, paint, where, rows|:
+                if row % 8 == 0:
+                    Display::draw_line(list, where.left / paint.sx,
+                                       (where.bottom + row.f64() * where.cell) / paint.sy,
+                                       (where.left + where.width) / paint.sx,
+                                       (where.bottom + row.f64() * where.cell) / paint.sy,
+                                       1.0 / paint.sx, lined(paint, 34))
+            Display::draw_box(list, where.left / paint.sx, where.bottom / paint.sy,
+                              where.width / paint.sx, where.height / paint.sy,
+                              lined(paint, 120), 1.5 / paint.sx)
+            for index in 0..<slots |list, paint, where, slots|:
+                left: f64 = where.left + index.f64() * where.slot
+                Display::draw_box(list, (left + 3.0) / paint.sx,
+                                  where.tray_bottom / paint.sy,
+                                  (where.slot - 6.0) / paint.sx,
+                                  where.tray_height / paint.sy,
+                                  lined(paint, 60), 1.0 / paint.sx)
+
+            # Group 1: the settled pile, walked ROW BY ROW and left to right
+            # inside a row -- which is the order the board is stored in and
+            # not the order the cells were laid down.
+            side: f64 = where.cell - 1.0
+            for cell in 0..<(cols * rows) |list, paint, where, board, side, cols, rows|:
+                tint: i64 = get board[cell.usize()] else 0
+                if tint != 0:
+                    Display::draw_rect_anchored(list,
+                                                (where.left + (cell % cols).f64() * where.cell) / paint.sx,
+                                                (where.bottom + (cell / cols).f64() * where.cell) / paint.sy,
+                                                (side if side > 1.0 else 1.0) / paint.sx,
+                                                (side if side > 1.0 else 1.0) / paint.sy,
+                                                0.0, 0.0,
+                                                with_alpha(piece_color(tint - 1), 235))
+
+            # Group 2: the ghost. `footprint` hands back a SET and the screen
+            # SORTS it before drawing -- by x and then by y -- so the order is
+            # the screen's own and not the set's.
+            #
+            # And with no piece in the air there is no ghost EITHER: the
+            # reference empties both pools in one breath, so a port that drew
+            # a landing for a piece nobody is holding is one box long.
+            flown: i64 = flying.count.i64()
+            shadow: mutable darray[Block] = []
+            for index in 0..<(ghost.count.i64() if flown > 0 else 0) |shadow, ghost|:
+                shadow.push(get ghost[index.usize()] else Block{x: 0.0, y: 0.0})
+            sort_blocks(&shadow)
+            wanted: f64 = py_round_half_even(where.cell * 0.16).f64()
+            thick: f64 = wanted if wanted > 1.0 else 1.0
+            hollow: f64 = where.cell - 1.0
+            for index in 0..<shadow.count.i64() |list, paint, where, shadow, ghost_clean, thick, hollow|:
+                one: Block = get shadow[index.usize()] else Block{x: 0.0, y: 0.0}
+                Display::draw_box(list, (where.left + one.x * where.cell) / paint.sx,
+                                  (where.bottom + one.y * where.cell) / paint.sy,
+                                  (hollow if hollow > 2.0 else 2.0) / paint.sx,
+                                  (hollow if hollow > 2.0 else 2.0) / paint.sy,
+                                  with_alpha(color_clean_ghost() if ghost_clean else color_ragged_ghost(), 235),
+                                  thick / paint.sx)
+
+            # Group 3: the piece in the air, anchored on its middles and
+            # TURNED -- the only rotation in the workshop.
+            half: f64 = where.cell / 2.0
+            flying_side: f64 = where.cell - 0.5
+            for index in 0..<flying.count.i64() |list, paint, where, flying, flying_size, angle, half, flying_side|:
+                one: Block = get flying[index.usize()] else Block{x: 0.0, y: 0.0}
+                Display::draw_rect_turned(list,
+                                          (where.left + one.x * where.cell) / paint.sx,
+                                          (where.bottom + one.y * where.cell) / paint.sy,
+                                          (flying_side if flying_side > 1.0 else 1.0) / paint.sx,
+                                          (flying_side if flying_side > 1.0 else 1.0) / paint.sy,
+                                          half / paint.sx, half / paint.sy,
+                                          0.0 - angle,
+                                          piece_color(flying_size))
+
+            # Group 4: the slot labels FIRST and then the tray. They share a
+            # group, and the labels are built before the pieces are painted,
+            # so the serial order puts them underneath.
+            # The fit count is the promise on display: how many different
+            # gapless drops that piece has on the board as it stands right
+            # now. It is never zero -- a piece stranded by the last move is
+            # cut again, and says so.
+            for index in 0..<slots |list, paint, where, fits, recut, armed, slots|:
+                left: f64 = where.left + index.f64() * where.slot
+                mark: mutable dstr = []
+                dstr_append_i64(&mark, index + 1)
+                dstr_append_cstr(&mark, ") ")
+                dstr_append_i64(&mark, get fits[index.usize()] else 0)
+                dstr_append_cstr(&mark, " fits")
+                if get recut[index.usize()] else false:
+                    dstr_append_cstr(&mark, " · re-cut")
+                put_text(list, paint, bytes_view(mark),
+                         left + where.slot / 2.0, where.tray_bottom - 8.0,
+                         Geometry::calc_fontsize(paint.height, 9.0),
+                         paint.accent if index == armed else paint.muted,
+                         Display::ANCHOR_CENTER_CENTER, false)
+
+            # Each piece is
+            # drawn to FIT ITS SLOT -- so a big piece and a small one are not
+            # the same size on screen, and neither is bigger than 1.6 cells.
+            at: mutable i64 = 0
+            for slot in 0..<slots |list, paint, where, queue_cells, queue_counts, armed, slots, at|:
+                count: i64 = get queue_counts[slot.usize()] else 0
+                span: mutable i64 = 1
+                tall: mutable i64 = 1
+                for step in 0..<count |queue_cells, at, span, tall, count|:
+                    one: Cell = get queue_cells[(at + step).usize()] else Cell{x: 0, y: 0, tint: 0}
+                    span <- span if span > one.x + 1 else one.x + 1
+                    tall <- tall if tall > one.y + 1 else one.y + 1
+                left: f64 = where.left + slot.f64() * where.slot
+                across: f64 = (where.slot - 14.0) / span.f64()
+                down: f64 = (where.tray_height - 14.0) / tall.f64()
+                roomy: f64 = across if across < down else down
+                capped: f64 = roomy if roomy < where.cell * 1.6 else where.cell * 1.6
+                size: f64 = capped if capped > 2.0 else 2.0
+                origin_x: f64 = left + (where.slot - size * span.f64()) / 2.0
+                origin_y: f64 = where.tray_bottom + (where.tray_height - size * tall.f64()) / 2.0
+                # A piece is coloured by HOW MANY CELLS it has, so a glance at
+                # the tray sorts the hand by size without anybody counting.
+                shade: u32 = with_alpha(piece_color(count), 255 if slot == armed else 185)
+                block: f64 = size - 1.0
+                for step in 0..<count |list, paint, queue_cells, at, size, origin_x, origin_y, block, shade, count|:
+                    one: Cell = get queue_cells[(at + step).usize()] else Cell{x: 0, y: 0, tint: 0}
+                    Display::draw_rect_anchored(list,
+                                                (origin_x + one.x.f64() * size) / paint.sx,
+                                                (origin_y + one.y.f64() * size) / paint.sy,
+                                                (block if block > 1.0 else 1.0) / paint.sx,
+                                                (block if block > 1.0 else 1.0) / paint.sy,
+                                                0.0, 0.0, shade)
+                at <- at + count
+
+    # `sorted(...)` over (x, y) pairs. Insertion sort: a ghost is a handful
+    # of cells and the constant factor beats anything with a stack.
+    def sort_blocks(blocks: mutable darray[Block]&):
+        can Abort.Panic:
+            count: i64 = blocks.count.i64()
+            at: mutable i64 = 1
+            while at < count |blocks, count, at|:
+                held: Block = get blocks[at.usize()] else Block{x: 0.0, y: 0.0}
+                back: mutable i64 = at - 1
+                while back >= 0 |blocks, held, back|:
+                    here: Block = get blocks[back.usize()] else Block{x: 0.0, y: 0.0}
+                    if here.x < held.x or (here.x == held.x and here.y <= held.y):
+                        break
+                    blocks[(back + 1).usize()] <- here
+                    back <- back - 1
+                blocks[(back + 1).usize()] <- held
+                at <- at + 1
+
+    def with_alpha(color: u32, opacity: i64) -> u32:
+        return (color & 4294967040.u32()) | opacity.u32()
