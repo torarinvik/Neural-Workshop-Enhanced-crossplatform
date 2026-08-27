@@ -3,28 +3,32 @@
 #
 # Port of the portable half of neural_workshop/chess.py (GPL-2.0-or-later).
 #
-# WHAT IS NOT HERE, and why. Everything chess.py knows about chess it asks
-# `python-chess` for: `mating_moves` walks `board.legal_moves`, `_transformed`
-# reflects a motif and mirrors the colours, `_add_decoy` sets a piece and asks
-# whether the position is still valid and still has exactly one mate, and
-# `validate` re-derives the whole promise from the FEN. That is a third-party
-# bitboard engine, and porting it is not porting this program -- it is also not
-# optional detail: `mates[0]` takes the FIRST of the legal moves that mate, so
-# the engine's move ORDER is part of the answer, and a re-derived generator
-# that produced the same SET would still deal a different puzzle.
+# WHERE THE ENGINE STOPS AND THIS STARTS. chess.py asks `python-chess` five
+# questions and no others: is this position legal, is the side to move in
+# check, is the game already over, how many legal moves end it in mate, and how
+# many legal moves are there at all. Everything else it does is geometry --
+# reflecting a motif, mirroring the colours, listing the empty squares,
+# refusing a pawn on a back rank -- and that is what is here.
 #
 # The engine is a dependency the shell supplies, the way the word corpus is for
-# the crossword and the media pool is for concentration. It is not in this
-# checkout, so the half that depends on it is not merely unported but
-# undifferenceable, and saying so is worth more than a transcription nobody
-# checked.
+# the crossword. It is NOT ported: `python-chess` is a bitboard move generator
+# with its own legality rules, and re-deriving it would be porting a different
+# program. What IS here is everything around it, and the boundary is drawn
+# where the reference itself draws it.
 #
-# WHAT IS HERE is `generate`'s own arithmetic, which touches no chess at all:
-# how many candidates a rung asks for, how many decoys it wants and how long it
-# will try for them, and -- the part that decides which puzzle a player
-# actually sees -- the sort, the half taken, and the draw from it. The easy
-# rungs take the SPARSEST half of what was found and the hard rungs the
-# densest, off one stable sort by how many legal moves the position allows.
+# The one thing that had to be checked before this shape was possible: whether
+# the engine's move ORDER leaks into the answer. It does not. Every call site
+# of `mating_moves` guards on `len(mates) == 1` before reading `mates[0]`, so
+# the only thing that crosses is a COUNT -- and a count is something a
+# transcript can carry. Had one of them taken the first of several, the order
+# would have been part of the answer and no amount of supplied verdict would
+# have reproduced it.
+#
+# So the questions are asked through an `Oracle`: a stream of answers, read in
+# the order the code asks for them. That is what makes this testable -- the
+# differential feeds the reference's own answers in and checks that this port
+# asks the same questions, in the same order, off the same number of draws,
+# and lands on the same position.
 
 module Chess:
 
@@ -98,3 +102,354 @@ module Chess:
             span: i64 = 1 if half < 1 else half
             first: i64 = 0 if clamp_level(level) <= 3 else found - span
             return Ints::at_ref(ids, first + py_choice_index(rng, span))
+
+    # --- the board --------------------------------------------------------
+    #
+    # Squares are numbered as python-chess numbers them: a1 is 0, h1 is 7, a8
+    # is 56, h8 is 63 -- so rank is `square / 8` and file is `square % 8`.
+
+    const EMPTY: i64 = 0
+    const PAWN: i64 = 1
+    const KNIGHT: i64 = 2
+    const BISHOP: i64 = 3
+    const ROOK: i64 = 4
+    const QUEEN: i64 = 5
+    const KING: i64 = 6
+
+    const SQUARES: i64 = 64
+
+    struct Board:
+        piece: mutable i64[64]
+        black: mutable i64[64]
+        # True when White is to move, which is what `board.turn` holds.
+        white_to_move: mutable bool
+
+    def new_board() -> Board:
+        return Board{piece: zeroed, black: zeroed, white_to_move: true}
+
+    def clear_board(out: mutable Board&):
+        for square in 0..<SQUARES |out|:
+            out.piece[square.usize()] <- EMPTY
+            out.black[square.usize()] <- 0
+
+    def copy_board(out: mutable Board&, source: Board&):
+        for square in 0..<SQUARES |out, source|:
+            out.piece[square.usize()] <- source.piece[square.usize()]
+            out.black[square.usize()] <- source.black[square.usize()]
+        out.white_to_move <- source.white_to_move
+
+    def square_rank(square: i64) -> i64:
+        return square / 8
+
+    def square_file(square: i64) -> i64:
+        return square % 8
+
+    # The seed positions, as `MOTIFS` spells them. Small legal mating motifs:
+    # these are seeds and not dealt puzzles, because generation reflects and
+    # transposes them, may swap the players, and adds independently validated
+    # decoy material.
+    const MOTIF_COUNT: i64 = 7
+
+    def motif_pieces(motif: i64) -> i64:
+        return 3 if motif == 0
+        return 9 if motif == 1
+        return 3 if motif == 2
+        return 3 if motif == 3
+        return 4 if motif == 4
+        return 4 if motif == 5
+        return 4
+
+    # Square, piece and colour of one man in a motif, packed as
+    # `square * 16 + piece * 2 + black`.
+    def motif_man(motif: i64, at: i64) -> i64:
+        if motif == 0:
+            # 7k/8/5KQ1/8/8/8/8/8 w - - 0 1
+            return 45 * 16 + 6 * 2 if at == 0
+            return 46 * 16 + 5 * 2 if at == 1
+            return 63 * 16 + 6 * 2 + 1
+        if motif == 1:
+            # 6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1
+            return 4 * 16 + 4 * 2 if at == 0
+            return 6 * 16 + 6 * 2 if at == 1
+            return 13 * 16 + 1 * 2 if at == 2
+            return 14 * 16 + 1 * 2 if at == 3
+            return 15 * 16 + 1 * 2 if at == 4
+            return 53 * 16 + 1 * 2 + 1 if at == 5
+            return 54 * 16 + 1 * 2 + 1 if at == 6
+            return 55 * 16 + 1 * 2 + 1 if at == 7
+            return 62 * 16 + 6 * 2 + 1
+        if motif == 2:
+            # 4k3/8/5K2/8/1Q6/8/8/8 w - - 0 1
+            return 25 * 16 + 5 * 2 if at == 0
+            return 45 * 16 + 6 * 2 if at == 1
+            return 60 * 16 + 6 * 2 + 1
+        if motif == 3:
+            # 6k1/8/6K1/8/8/8/8/R7 w - - 0 1
+            return 0 * 16 + 4 * 2 if at == 0
+            return 46 * 16 + 6 * 2 if at == 1
+            return 62 * 16 + 6 * 2 + 1
+        if motif == 4:
+            # 6k1/3R4/6K1/8/8/B7/8/8 w - - 0 1
+            return 16 * 16 + 3 * 2 if at == 0
+            return 46 * 16 + 6 * 2 if at == 1
+            return 51 * 16 + 4 * 2 if at == 2
+            return 62 * 16 + 6 * 2 + 1
+        if motif == 5:
+            # 7k/7B/6K1/6N1/8/8/8/8 w - - 0 1
+            return 38 * 16 + 2 * 2 if at == 0
+            return 46 * 16 + 6 * 2 if at == 1
+            return 55 * 16 + 3 * 2 if at == 2
+            return 63 * 16 + 6 * 2 + 1
+        # 8/8/8/5QK1/8/8/4N3/7k w - - 0 1
+        return 7 * 16 + 6 * 2 + 1 if at == 0
+        return 12 * 16 + 2 * 2 if at == 1
+        return 37 * 16 + 5 * 2 if at == 2
+        return 38 * 16 + 6 * 2
+
+    def set_motif(out: mutable Board&, motif: i64):
+        clear_board(out)
+        out.white_to_move <- true
+        for at in 0..<motif_pieces(motif) |out, motif|:
+            man: i64 = motif_man(motif, at)
+            square: i64 = man / 16
+            out.piece[square.usize()] <- (man % 16) / 2
+            out.black[square.usize()] <- man % 2
+
+    # The four reflections, as square permutations. Checked against
+    # `chess.flip_*` rather than reasoned out: horizontal keeps the rank and
+    # mirrors the file, vertical the other way about, the diagonal swaps rank
+    # and file, and the anti-diagonal swaps and mirrors both.
+    const FLIP_HORIZONTAL: i64 = 0
+    const FLIP_VERTICAL: i64 = 1
+    const FLIP_DIAGONAL: i64 = 2
+    const FLIP_ANTI_DIAGONAL: i64 = 3
+
+    def flipped_square(square: i64, which: i64) -> i64:
+        rank: i64 = square_rank(square)
+        file: i64 = square_file(square)
+        return rank * 8 + (7 - file) if which == FLIP_HORIZONTAL
+        return (7 - rank) * 8 + file if which == FLIP_VERTICAL
+        return file * 8 + rank if which == FLIP_DIAGONAL
+        return (7 - file) * 8 + (7 - rank)
+
+    def transform_board(out: mutable Board&, source: Board&, which: i64):
+        clear_board(out)
+        out.white_to_move <- source.white_to_move
+        for square in 0..<SQUARES |out, source, which|:
+            continue if source.piece[square.usize()] == EMPTY
+            landing: i64 = flipped_square(square, which)
+            out.piece[landing.usize()] <- source.piece[square.usize()]
+            out.black[landing.usize()] <- source.black[square.usize()]
+
+    # `mirror()`: vertically, with the colours and the side to move swapped, so
+    # the position is the same one seen from the other side of the board.
+    def mirror_board(out: mutable Board&, source: Board&):
+        transform_board(out, source, FLIP_VERTICAL)
+        out.white_to_move <- not source.white_to_move
+        for square in 0..<SQUARES |out|:
+            continue if out.piece[square.usize()] == EMPTY
+            out.black[square.usize()] <- 1 - out.black[square.usize()]
+
+    # The eight transforms a motif may be dealt through, in the order
+    # `TRANSFORMS` lists them -- `rng.choice` indexes this, so the order is
+    # part of the answer.
+    const TRANSFORM_COUNT: i64 = 8
+
+    def transform_steps(which: i64) -> i64:
+        return 0 if which == 0
+        return 2 if which >= 5
+        return 1
+
+    def transform_step(which: i64, at: i64) -> i64:
+        return FLIP_HORIZONTAL if which == 1
+        return FLIP_VERTICAL if which == 2
+        return FLIP_DIAGONAL if which == 3
+        return FLIP_ANTI_DIAGONAL if which == 4
+        if which == 5:
+            return FLIP_DIAGONAL if at == 0
+            return FLIP_HORIZONTAL
+        if which == 6:
+            return FLIP_DIAGONAL if at == 0
+            return FLIP_VERTICAL
+        return FLIP_HORIZONTAL if at == 0
+        return FLIP_VERTICAL
+
+    # The decoy material, in the order `DECOYS` lists it -- two pawns, so a
+    # pawn comes up a third of the time.
+    const DECOY_COUNT: i64 = 6
+
+    def decoy_piece(at: i64) -> i64:
+        return PAWN if at <= 1
+        return KNIGHT if at == 2
+        return BISHOP if at == 3
+        return ROOK if at == 4
+        return QUEEN
+
+    # --- the engine, as a transcript --------------------------------------
+
+    # The five questions, and the order they were asked in. An `Oracle` is the
+    # answers to them, read off in that order; the differential fills it from
+    # the reference's own engine.
+    struct Oracle:
+        answers: mutable darray[i64]
+        count: mutable i64
+        at: mutable i64
+        # Set when the stream ran out, which means this port asked a question
+        # the reference did not -- a failure, and one worth reporting rather
+        # than papering over with a default.
+        overrun: mutable bool
+
+    def new_oracle(most: i64) -> Oracle:
+        can Memory.Allocate, Abort.Panic:
+            return Oracle{answers: Ints::zeros(most), count: 0, at: 0, overrun: false}
+
+    def ask(oracle: mutable Oracle&) -> i64:
+        can Abort.Panic:
+            if oracle.at >= oracle.count:
+                oracle.overrun <- true
+                return 0
+            held: i64 = Ints::at_ref(&oracle.answers, oracle.at)
+            oracle.at <- oracle.at + 1
+            return held
+
+    # `not board.is_valid() or board.is_check() or board.is_game_over()`,
+    # which short-circuits -- so the second question is only asked when the
+    # first said yes, and the third only when the second said no. Asking all
+    # three every time would read the transcript out of step.
+    def usable(oracle: mutable Oracle&) -> bool:
+        can Abort.Panic:
+            false return if ask(oracle) == 0
+            false return if ask(oracle) != 0
+            return ask(oracle) == 0
+
+    # `len(mating_moves(board))`, with `mates[0].promotion` folded in: the
+    # count doubled, plus one where the single mating move promotes. Recorded
+    # for every call whether or not the caller reads the promotion, so that the
+    # transcript stays in step with the questions rather than with the answers.
+    def mate_state(oracle: mutable Oracle&) -> i64:
+        can Abort.Panic:
+            return ask(oracle)
+
+    def mates_once(state: i64) -> bool:
+        return state / 2 == 1
+
+    def mate_promotes(state: i64) -> bool:
+        return state % 2 == 1
+
+    # --- dealing one ------------------------------------------------------
+
+    # A motif, reflected, transposed, and half the time handed to the other
+    # player. Three draws, and no question of the engine.
+    def transformed(out: mutable Board&, work: mutable Board&, rng: mutable MT19937&):
+        can Abort.Panic:
+            set_motif(out, py_choice_index(rng, MOTIF_COUNT))
+            which: i64 = py_choice_index(rng, TRANSFORM_COUNT)
+            for at in 0..<transform_steps(which) |out, work, which|:
+                transform_board(work, out, transform_step(which, at))
+                copy_board(out, work)
+            return if py_randrange(rng, 0, 2) == 0
+            # `mirror()` swaps colours and ranks, producing a Black-to-move
+            # puzzle.
+            mirror_board(work, out)
+            copy_board(out, work)
+
+    # Try to add one piece without changing the unique mating answer.
+    def add_decoy(board: mutable Board&, work: mutable Board&, oracle: mutable Oracle&, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            false return if not mates_once(mate_state(oracle))
+            # `list(SquareSet(~board.occupied & BB_ALL))`, which is the empty
+            # squares in ascending order.
+            empty: mutable darray[i64] = Ints::zeros(SQUARES)
+            free: mutable i64 = 0
+            for square in 0..<SQUARES |board, empty, free|:
+                continue if board.piece[square.usize()] != EMPTY
+                Ints::put(&empty, free, square)
+                free <- free + 1
+            py_shuffle_i64_prefix(rng, &empty, free)
+            looked: i64 = free if free < 24 else 24
+            placed: mutable bool = false
+            for at in 0..<looked |board, work, oracle, empty, placed, rng|:
+                break if placed
+                square: i64 = Ints::at_ref(&empty, at)
+                piece: i64 = decoy_piece(py_choice_index(rng, DECOY_COUNT))
+                rank: i64 = square_rank(square)
+                # A pawn cannot stand on a back rank, and the draw for its
+                # colour is not taken when it cannot stand there at all.
+                continue if piece == PAWN and (rank == 0 or rank == 7)
+                # `color = bool(rng.randrange(2))`, and in python-chess WHITE
+                # is True -- so a one is a white man and a zero a black one,
+                # which is the other way round from how this reads.
+                black: i64 = 1 if py_randrange(rng, 0, 2) == 0 else 0
+                copy_board(work, board)
+                work.piece[square.usize()] <- piece
+                work.black[square.usize()] <- black
+                continue if not usable(oracle)
+                state: i64 = mate_state(oracle)
+                continue if not mates_once(state) or mate_promotes(state)
+                board.piece[square.usize()] <- piece
+                board.black[square.usize()] <- black
+                placed <- true
+            return placed
+
+    # One dealt candidate, or false when this position could not carry one.
+    # `alternatives` -- how many legal moves the position allows, which is what
+    # makes a mate-in-one hard to SEE -- is the engine's last word on it.
+    def candidate(board: mutable Board&, work: mutable Board&, oracle: mutable Oracle&,
+                  level: i64, alternatives: mutable i64&, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            alternatives <- 0
+            transformed(board, work, rng)
+            false return if not usable(oracle)
+            false return if not mates_once(mate_state(oracle))
+            wanted: i64 = decoys_wanted(level)
+            added: mutable i64 = 0
+            attempts: mutable i64 = 0
+            while added < wanted and attempts < decoy_attempts(level) |added, attempts, board, work, oracle, wanted, level, rng|:
+                attempts <- attempts + 1
+                added <- added + 1 if add_decoy(board, work, oracle, rng)
+            false return if not mates_once(mate_state(oracle))
+            alternatives <- ask(oracle)
+            return true
+
+    # Several candidates are sampled and the denser search tree is preferred on
+    # the higher rungs. False when sixty-four positions yielded none, which is
+    # where the reference raises.
+    def generate(board: mutable Board&, work: mutable Board&, oracle: mutable Oracle&,
+                 level: i64, alternatives: mutable i64&, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            alternatives <- 0
+            held: i64 = clamp_level(level)
+            wanted: i64 = candidates_wanted(held)
+            ids: mutable darray[i64] = Ints::zeros(MOST_CANDIDATES)
+            densities: mutable darray[i64] = Ints::zeros(MOST_CANDIDATES)
+            kept: mutable darray[i64] = Ints::zeros(MOST_CANDIDATES * SQUARES * 2 + MOST_CANDIDATES)
+            found: mutable i64 = 0
+            attempts: mutable i64 = 0
+            while found < wanted and attempts < MOST_ATTEMPTS |found, attempts, board, work, oracle, held, ids, densities, kept, rng|:
+                attempts <- attempts + 1
+                density: mutable i64 = 0
+                continue if not candidate(board, work, oracle, held, &density, rng)
+                Ints::put(&ids, found, found)
+                Ints::put(&densities, found, density)
+                # The board a candidate came out with, kept beside it: the
+                # chosen one IS the puzzle, so the position has to survive the
+                # sampling and not only its density.
+                base: i64 = found * (SQUARES * 2 + 1)
+                for square in 0..<SQUARES |kept, base, board|:
+                    Ints::put(&kept, base + square, board.piece[square.usize()])
+                    Ints::put(&kept, base + SQUARES + square, board.black[square.usize()])
+                Ints::put(&kept, base + SQUARES * 2, 1 if board.white_to_move else 0)
+                found <- found + 1
+            false return if found == 0
+            picked: i64 = select(&ids, &densities, found, held, rng)
+            false return if picked < 0
+            base: i64 = picked * (SQUARES * 2 + 1)
+            for square in 0..<SQUARES |board, kept, base|:
+                board.piece[square.usize()] <- Ints::at_ref(&kept, base + square)
+                board.black[square.usize()] <- Ints::at_ref(&kept, base + SQUARES + square)
+            board.white_to_move <- Ints::at_ref(&kept, base + SQUARES * 2) != 0
+            # `select` sorted the densities alongside the ids, so the chosen
+            # one's is read back through its id rather than off its old slot.
+            for at in 0..<found |ids, densities, picked, alternatives|:
+                alternatives <- Ints::at_ref(&densities, at) if Ints::at_ref(&ids, at) == picked
+            return true

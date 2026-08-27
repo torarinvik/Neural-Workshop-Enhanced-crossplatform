@@ -18,7 +18,14 @@ include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_
 include "../src/pyrandom.elisa"
 include "../src/pymath.elisa"
 include "../src/tasks/ints.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_fileio.elisa"
 include "../src/tasks/chess.elisa"
+
+# The engine's answers, recorded LIVE by chess_diff.py off the real
+# python-chess and written here before this binary runs. Not a golden file: it
+# is re-derived on every run, so a change in the engine shows as a mismatch
+# rather than as a stale recording that still passes.
+const ORACLE_PATH: cstr = "/tmp/nw_chess_oracle.txt"
 
 # printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
 # store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
@@ -69,9 +76,46 @@ def scripted(spec: i64, index: i64) -> i64:
     return -1 if step < spec % 4
     return 3 + (index * 13 + spec * 3) % 9
 
+# One decimal number a line, the first being how many follow.
+def load_oracle(oracle: mutable Chess::Oracle&, body: darray[u8]&) -> bool:
+    can Abort.Panic:
+        held: mutable i64 = 0
+        digits: mutable bool = false
+        first: mutable bool = true
+        wanted: mutable i64 = 0
+        oracle.count <- 0
+        oracle.at <- 0
+        oracle.overrun <- false
+        for at in 0..<body.count.i64() |oracle, body, held, digits, first, wanted|:
+            byte: i64 = (get body[at.usize()] else 0.u8()).i64()
+            if byte >= 48 and byte <= 57:
+                held <- held * 10 + byte - 48
+                digits <- true
+                continue
+            continue if not digits
+            if first:
+                wanted <- held
+                first <- false
+            else:
+                Ints::put(&oracle.answers, oracle.count, held)
+                oracle.count <- oracle.count + 1
+            held <- 0
+            digits <- false
+        if digits and not first:
+            Ints::put(&oracle.answers, oracle.count, held)
+            oracle.count <- oracle.count + 1
+        return oracle.count == wanted
+
+def emit_board(board: Chess::Board&):
+    can Console.Write, Abort.Panic:
+        for square in 0..<Chess::SQUARES |board|:
+            piece: i64 = board.piece[square.usize()]
+            emit_cell(0 if piece == Chess::EMPTY else piece * 2 + board.black[square.usize()])
+        emit_cell(1 if board.white_to_move else 0)
+
 def main() -> i64:
     can Console.Write, Memory.Allocate, Abort.Panic:
-        region w(4 * 1024 * 1024)
+        region w(16 * 1024 * 1024)
         in w:
             for level in -2..<14:
                 printr("dials")
@@ -111,5 +155,48 @@ def main() -> i64:
                         emit_cell(density)
                         emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
                         print("")
+
+            # --- the half that asks the engine -------------------------
+            arena: mutable Arena& = (&w).cast[mutable Arena&]
+            missing: darray[u8] = Bytes::zeros(0)
+            body: darray[u8] = try read_entire_file(arena, ORACLE_PATH) else missing
+            oracle: mutable Chess::Oracle = Chess::new_oracle(8192)
+            loaded: bool = load_oracle(&oracle, &body)
+            board: mutable Chess::Board = Chess::new_board()
+            work: mutable Chess::Board = Chess::new_board()
+            for level in 1..<11 |oracle, board, work, loaded|:
+                for seed in 1..<4 |oracle, board, work, level, loaded|:
+                    rng: mutable MT19937 = mt19937_new()
+                    mt_seed_int(&rng, (level * 100 + seed).u64())
+                    before: i64 = oracle.at
+                    density: mutable i64 = 0
+                    made: bool = Chess::candidate(&board, &work, &oracle, level, &density, &rng) if loaded else false
+                    printr("candidate")
+                    emit_cell(level)
+                    emit_cell(seed)
+                    emit_cell(1 if made else 0)
+                    emit_cell(density if made else 0)
+                    emit_cell(oracle.at - before)
+                    emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                    emit_board(&board)
+                    print("")
+            for level in 1..<11 |oracle, board, work, loaded|:
+                rng: mutable MT19937 = mt19937_new()
+                mt_seed_int(&rng, (9000 + level).u64())
+                before: i64 = oracle.at
+                density: mutable i64 = 0
+                made: bool = Chess::generate(&board, &work, &oracle, level, &density, &rng) if loaded else false
+                printr("generate")
+                emit_cell(level)
+                emit_cell(1 if made else 0)
+                emit_cell(density if made else 0)
+                emit_cell(oracle.at - before)
+                emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                if made:
+                    emit_board(&board)
+                else:
+                    for _cell in 0..<65:
+                        emit_cell(0)
+                print("")
         destroy w
         return 0
