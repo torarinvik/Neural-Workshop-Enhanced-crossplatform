@@ -1,0 +1,168 @@
+# The Trivia screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/trivia.py -- the drawing, not the thinking.
+#
+# Six labels and one column of options. The options are placed by MEASURING
+# the question: they start a fixed gap under wherever the wrapped question
+# ended, and the step down to the next one is whatever is left over divided
+# by how many there are. A rung asks two options and another asks eight under
+# a three-line question, so the step and the writing both shrink -- and the
+# floor they must not cross is the verdict band, because the pointed-at option
+# is blue and the right one green and either has a rim the band reader counts.
+#
+# The wrap width is `state.window.width * 0.88` and is NOT rounded, unlike
+# Verbal Reasoning's `int(... * 0.90)`. It matters: pyglet's overflow test is
+# `>=`, so a line that reaches exactly 1605 breaks at an integer width and does
+# not at 1605.12.
+#
+# NOTE: needs elisacore_math, strings, geometry, verdict, textmetrics, display
+# and scene_verdict included by the driver.
+
+module SceneTrivia:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_ASKING: i64 = 1
+    const PHASE_JUDGED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    # The option being pointed at, and the one that was right.
+    def color_mine() -> u32:
+        return Display::rgba(0, 114, 178, 255)
+
+    def color_right() -> u32:
+        return Display::rgba(0, 158, 115, 255)
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def floor_of(height: f64) -> f64:
+        can Abort.Panic:
+            return Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 52.0).f64()).f64()
+
+    # Where the question starts. Everything below flows from it.
+    def top_of(height: f64) -> f64:
+        can Abort.Panic:
+            return Geometry::from_top_edge(height, 108.0).f64()
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_round: bool, asked: sview, options: darray[sview]&,
+               choice: i64, answered: i64, answer: i64, show_answer: bool,
+               fetched: bool, missing: sview, pool: i64, trial: i64,
+               total_trials: i64, message: sview, verdict: i64,
+               verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            wide: f64 = paint.width * 0.88
+            playing: bool = has_round and (phase == PHASE_ASKING or phase == PHASE_JUDGED)
+
+            put_text(list, paint, sview("Trivia", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 34.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if has_round and phase == PHASE_ASKING:
+                dstr_append_cstr(&status, "     question ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+            elif phase == PHASE_READY or phase == PHASE_DONE:
+                dstr_append_cstr(&status, "     ")
+                dstr_append_i64(&status, pool)
+                dstr_append_cstr(&status, " questions in the pool")
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 64.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 13.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            # The pool line is NOT printed while a question is up: a
+            # distraction on the frame the trial is answered on is a
+            # distraction in the data.
+            note: sview = sview("", 0, -1) if playing or fetched else missing
+            put_text(list, paint, note, middle,
+                     Geometry::from_top_edge(paint.height, 88.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            question: sview = asked if playing else sview("", 0, -1)
+            asked_size: f64 = Geometry::calc_fontsize(paint.height, 17.0)
+            top: f64 = top_of(paint.height)
+            put_text(list, paint, question, middle, top, asked_size, paint.ink,
+                     Display::ANCHOR_CENTER_TOP, true)
+
+            put_text(list, paint,
+                     sview("Esc: menu   Space: start   arrows: choose   Enter: answer   O: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 24.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if has_round:
+                # `under` is where the question ended, less a fixed gap. An
+                # EMPTY question costs nothing -- the height is not subtracted
+                # at all rather than one line's worth being.
+                under: mutable f64 = top - Geometry::calc_fontsize(paint.height, 20.0)
+                if sview_len(question).i64() > 0:
+                    under <- under - TextMetrics::wrapped_height(asked_size, question, wide).f64()
+                place_options(list, paint, options, under, phase, choice,
+                              answered, answer, show_answer)
+
+    def place_options(list: mutable Display::DisplayList&, paint: Paint&,
+                      options: darray[sview]&, under: f64, phase: i64,
+                      choice: i64, answered: i64, answer: i64,
+                      show_answer: bool):
+        can Memory.Allocate, Abort.Panic:
+            count: i64 = options.count.i64()
+            if count == 0:
+                return
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            bottom: f64 = floor_of(paint.height) + 10.0
+            # `top = max(top, bottom)`: on a window too short for the question
+            # the options pile onto the floor rather than going below it.
+            top: f64 = under if under > bottom else bottom
+            even: f64 = (top - bottom) / count.f64()
+            ceiling: f64 = Geometry::calc_fontsize(paint.height, 34.0)
+            step: f64 = even if even < ceiling else ceiling
+            grown: f64 = step * 0.55
+            lifted: f64 = grown if grown > 6.0 else 6.0
+            largest: f64 = Geometry::calc_fontsize(paint.height, 14.0)
+            size: f64 = lifted if lifted < largest else largest
+            for number in 0..<count |list, paint, options, count, top, step, size, phase, choice, answered, answer, show_answer, middle|:
+                label: mutable dstr = []
+                dstr_append_i64(&label, number + 1)
+                dstr_append_cstr(&label, ". ")
+                dstr_append_sview(&label, get options[number.usize()] else sview("", 0, -1))
+                color: mutable u32 = paint.ink
+                if phase == PHASE_ASKING:
+                    color <- color_mine() if number == choice else paint.ink
+                elif phase != PHASE_READY:
+                    if show_answer and number == answer:
+                        color <- color_right()
+                    elif number == answered:
+                        color <- color_mine()
+                # `int(width_center())` -- already an int, and said again here
+                # because the reference says it again there.
+                put_text(list, paint, bytes_view(label), middle,
+                         top - (number.f64() + 0.5) * step, size, color,
+                         Display::ANCHOR_CENTER_CENTER, false)
