@@ -1,0 +1,339 @@
+# Differential sweep driver for src/glyphs.elisa. See glyphs_diff.py for the
+# reference side, which imports neural_workshop.glyphs and runs it as itself.
+#
+# Coverages are BUILT here, out of rectangles, rather than rasterised from a
+# typeface -- the same trick the reference's own tests use. Every function
+# under test reads a Coverage as a rectangle of bytes and none of them can tell
+# where the bytes came from, so nothing is weakened, and the suite does not
+# depend on which fonts this machine happens to have.
+#
+# Floats cross as their IEEE bits, so nothing is compared at a tolerance.
+#
+# Split into one function a family because a single frame holding six of these
+# -- a Coverage is sixteen kilobytes -- is what took the optimiser two minutes
+# on the algebra sweep before it was broken up the same way.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/glyphs.elisa"
+
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+def emit_text(text: cstr):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        printr(text)
+
+# A float as the i64 its bytes spell. The harness prints the same number the
+# same way, so a last-place difference is a difference and not a rounding.
+def emit_f64(value: f64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            holder: f64[1] = [value]
+            bits: mutable i64[1] = [0]
+            memcpy((&bits[0]).cast[mutable void&], (&holder[0]).cast[void&], 8.usize())
+            emit_cell(bits[0])
+
+# Rectangles, and some ink at 90 -- BELOW the threshold, because `bounds`,
+# `ink`, `_mass_box` and `signature` all read it and `sample` does not, and a
+# corpus of nothing but 0 and 255 would let a wrong comparison through.
+def build_cov(cov: mutable Glyphs::Coverage&, spec: i64):
+    can Abort.Panic:
+        width: i64 = 24 + spec % 9
+        height: i64 = 20 + (spec * 5) % 13
+        Glyphs::cover_reset(cov, width, height)
+        return if spec % 17 == 16
+        for box in 0..<(2 + spec % 4) |cov, spec, width, height|:
+            x0: i64 = (spec * 3 + box * 7) % (width - 4)
+            y0: i64 = (spec * 5 + box * 11) % (height - 4)
+            far_x: i64 = x0 + 2 + (spec + box) % 5
+            far_y: i64 = y0 + 2 + (spec * 2 + box) % 6
+            x1: i64 = far_x if far_x < width else width
+            y1: i64 = far_y if far_y < height else height
+            for y in y0..<y1 |cov, box, x0, x1|:
+                for x in x0..<x1 |cov, box, y|:
+                    Glyphs::cover_put(cov, x, y, 255 if (x + y + box) % 7 != 0 else 90)
+        if spec % 17 == 15:
+            for index in 0..<(width * height) |cov, width|:
+                Glyphs::cover_put(cov, index % width, index / width, 90)
+
+def emit_bounds(cov: Glyphs::Coverage&):
+    can Console.Write, Abort.Panic:
+        box: mutable Glyphs::Box = Glyphs::Box{left: 0, top: 0, right: 0, bottom: 0}
+        if Glyphs::cover_bounds(cov, &box):
+            emit_cell(box.left)
+            emit_cell(box.top)
+            emit_cell(box.right)
+            emit_cell(box.bottom)
+        else:
+            emit_cell(-1)
+            emit_cell(-1)
+            emit_cell(-1)
+            emit_cell(-1)
+
+# One ink count a row, so a mismatch says WHERE and not only THAT.
+def emit_rows(cov: Glyphs::Coverage&):
+    can Console.Write, Abort.Panic:
+        for y in 0..<cov.height |cov|:
+            count: mutable i64 = 0
+            for x in 0..<cov.width |cov, y, count|:
+                count <- count + 1 if Glyphs::cover_at(cov, x, y) >= Glyphs::INK else count
+            emit_cell(count)
+
+def emit_mat(m: Glyphs::Mat3&):
+    can Console.Write, Abort.Panic:
+        for index in 0..<9 |m|:
+            emit_f64(m.m[index.usize()])
+
+# --- the rectangle of bytes -----------------------------------------------
+def emit_cov_family():
+    can Console.Write, Abort.Panic:
+        cov: mutable Glyphs::Coverage = Glyphs::cover_blank()
+        for spec in 0..<34 |cov|:
+            build_cov(&cov, spec)
+            box: mutable Glyphs::Box = Glyphs::Box{left: 0, top: 0, right: 0, bottom: 0}
+            found: bool = Glyphs::cover_bounds(&cov, &box)
+            printr("cov")
+            emit_cell(spec)
+            emit_cell(cov.width)
+            emit_cell(cov.height)
+            emit_cell(Glyphs::cover_ink(&cov))
+            emit_cell(Glyphs::cover_weight(&cov))
+            emit_cell(1 if found else 0)
+            emit_bounds(&cov)
+            for step in 0..<9 |cov, step|:
+                x: f64 = -1.5 + step.f64() * (cov.width.f64() + 3.0) / 8.0
+                y: f64 = -1.5 + step.f64() * (cov.height.f64() + 3.0) / 8.0
+                emit_cell(Glyphs::cover_at(&cov, x.i64(), y.i64()))
+                emit_cell(Glyphs::cover_sample(&cov, x, y))
+                emit_cell(Glyphs::cover_sample(&cov, y * 0.5, x * 0.5))
+            print("")
+
+# --- the matrix ------------------------------------------------------------
+def emit_mat_family():
+    can Console.Write, Abort.Panic:
+        forward: mutable Glyphs::Mat3 = Glyphs::mat_identity()
+        back: mutable Glyphs::Mat3 = Glyphs::mat_identity()
+        product: mutable Glyphs::Mat3 = Glyphs::mat_identity()
+        landed: mutable Glyphs::Pt = Glyphs::Pt{x: 0.0, y: 0.0}
+        for spec in 0..<30 |forward, back, product, landed|:
+            sx: f64 = 0.4 + (spec % 7).f64() * 0.25
+            sy: f64 = 0.4 + (spec % 5).f64() * 0.3
+            shear: f64 = -0.5 + (spec % 11).f64() * 0.1
+            turn: f64 = (-40.0 + spec.f64() * 5.0) * Glyphs::TAU / 360.0
+            tilt_x: f64 = -0.35 + (spec % 9).f64() * 0.09
+            tilt_y: f64 = -0.35 + (spec % 13).f64() * 0.06
+            Glyphs::homography(&forward, sx, sy, shear, turn, tilt_x, tilt_y)
+            printr("mat")
+            emit_cell(spec)
+            emit_mat(&forward)
+            if Glyphs::mat_inverse(&back, &forward):
+                emit_cell(1)
+                emit_mat(&back)
+            else:
+                emit_cell(0)
+                for _slot in 0..<9:
+                    emit_cell(0)
+            Glyphs::mat_mul(&product, &forward, &forward)
+            emit_mat(&product)
+            for step in 0..<5 |forward, landed, step|:
+                u: f64 = step.f64() * 0.27
+                v: f64 = 1.0 - step.f64() * 0.19
+                Glyphs::mat_apply(&landed, &forward, u, v)
+                emit_f64(landed.x)
+                emit_f64(landed.y)
+            print("")
+
+# --- one dealt appearance --------------------------------------------------
+def emit_deal_family():
+    can Console.Write, Abort.Panic:
+        dist: mutable Glyphs::Distortion = Glyphs::distortion_blank()
+        for rung in 0..<12 |dist|:
+            for seed in [0, 1, 3, 11, 97] |rung, dist|:
+                rng: mutable MT19937 = mt19937_new()
+                mt_seed_int(&rng, (seed * 31 + rung).u64())
+                Glyphs::deal(&dist, rung, &rng)
+                grade: Glyphs::Grade = Glyphs::grade_of(rung)
+                printr("deal")
+                emit_cell(rung)
+                emit_cell(seed)
+                emit_text(Glyphs::grade_name(rung))
+                emit_cell(grade.waves)
+                emit_cell(dist.warp.waves)
+                emit_cell(dist.bar_count)
+                emit_mat(&dist.warp.inverse)
+                for slot in 0..<dist.warp.waves |dist|:
+                    wave: Glyphs::Wave& = &dist.warp.ripple[slot.usize()]
+                    emit_f64(wave.amp)
+                    emit_f64(wave.across)
+                    emit_f64(wave.down)
+                    emit_f64(wave.phase)
+                    emit_cell(wave.axis)
+                    emit_f64(Glyphs::wave_slope(wave))
+                for slot in 0..<dist.bar_count |dist|:
+                    bar: Glyphs::Bar& = &dist.bars[slot.usize()]
+                    emit_f64(bar.left)
+                    emit_f64(bar.top)
+                    emit_f64(bar.width)
+                    emit_f64(bar.height)
+                emit_f64(dist.thickness)
+                emit_f64(dist.speckle)
+                emit_f64(dist.contrast)
+                emit_f64(Glyphs::warp_slope(&dist.warp, 0))
+                emit_f64(Glyphs::warp_slope(&dist.warp, 1))
+                emit_f64(Glyphs::fold_free(&dist.warp, 8))
+                # The generator's position, which every knob above can agree
+                # on and still be wrong about.
+                emit_f64(py_random(&rng))
+                print("")
+
+# --- wear, warp, dirt, bars ------------------------------------------------
+def emit_stamp_family():
+    can Console.Write, Abort.Panic:
+        cov: mutable Glyphs::Coverage = Glyphs::cover_blank()
+        worn: mutable Glyphs::Coverage = Glyphs::cover_blank()
+        made: mutable Glyphs::Coverage = Glyphs::cover_blank()
+        scratch: mutable Glyphs::Coverage = Glyphs::cover_blank()
+        dist: mutable Glyphs::Distortion = Glyphs::distortion_blank()
+        sig: mutable Glyphs::Signature = Glyphs::signature_blank()
+        placed: mutable Glyphs::Fit = Glyphs::Fit{x: 0.0, y: 0.0, span: 0.0}
+        for spec in 0..<40 |cov, worn, made, scratch, dist, sig, placed|:
+            rung: i64 = 1 + spec % 10
+            size: i64 = 32 if spec % 4 != 0 else 24
+            build_cov(&cov, spec * 3 % 34)
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (4000 + spec).u64())
+            Glyphs::deal(&dist, rung, &rng)
+            Glyphs::thicken(&worn, &cov, dist.thickness)
+            printr("stamp")
+            emit_cell(spec)
+            emit_cell(rung)
+            emit_cell(size)
+            emit_cell(Glyphs::cover_ink(&worn))
+            emit_cell(Glyphs::cover_weight(&worn))
+            fitted: bool = Glyphs::fit_of(&placed, &worn, 0.12)
+            emit_cell(1 if fitted else 0)
+            emit_f64(placed.x if fitted else 0.0)
+            emit_f64(placed.y if fitted else 0.0)
+            emit_f64(placed.span if fitted else 0.0)
+            Glyphs::stamp(&made, &scratch, &cov, &dist, size, &rng, 0.12)
+            emit_cell(Glyphs::cover_ink(&made))
+            emit_cell(Glyphs::cover_weight(&made))
+            emit_bounds(&made)
+            emit_rows(&made)
+            Glyphs::signature(&sig, &made, Glyphs::CELLS, Glyphs::TRIM)
+            for slot in 0..<sig.span |sig|:
+                emit_f64(sig.cell[slot.usize()])
+            emit_f64(py_random(&rng))
+            print("")
+
+# --- thickening on its own, both directions --------------------------------
+def emit_thicken_family():
+    can Console.Write, Abort.Panic:
+        cov: mutable Glyphs::Coverage = Glyphs::cover_blank()
+        worn: mutable Glyphs::Coverage = Glyphs::cover_blank()
+        for spec in 0..<24 |cov, worn|:
+            build_cov(&cov, spec)
+            radius: f64 = -2.6 + spec.f64() * 0.23
+            Glyphs::thicken(&worn, &cov, radius)
+            printr("thicken")
+            emit_cell(spec)
+            emit_f64(radius)
+            emit_cell(worn.width)
+            emit_cell(worn.height)
+            emit_cell(Glyphs::cover_ink(&worn))
+            emit_cell(Glyphs::cover_weight(&worn))
+            emit_bounds(&worn)
+            emit_rows(&worn)
+            print("")
+
+# --- the measurement -------------------------------------------------------
+def emit_sig_family():
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        pool: mutable Glyphs::Templates = Glyphs::templates_blank()
+        cov: mutable Glyphs::Coverage = Glyphs::cover_blank()
+        sig: mutable Glyphs::Signature = Glyphs::signature_blank()
+        other: mutable Glyphs::Signature = Glyphs::signature_blank()
+        # LETTERS is "ACEGKMORTW": ten letters, two shapes apiece, added in
+        # that order because `recognise` keeps the FIRST of an exact tie.
+        for index in 0..<10 |pool, cov, sig|:
+            for part in 0..<2 |pool, cov, sig, index|:
+                build_cov(&cov, index * 2 + part)
+                Glyphs::signature(&sig, &cov, Glyphs::CELLS, Glyphs::TRIM)
+                Glyphs::templates_add(&pool, index, &sig)
+        for spec in 0..<34 |pool, cov, sig, other|:
+            build_cov(&cov, spec)
+            Glyphs::signature(&sig, &cov, Glyphs::CELLS, Glyphs::TRIM)
+            printr("sig")
+            emit_cell(spec)
+            total: mutable f64 = 0.0
+            for slot in 0..<sig.span |sig, total|:
+                emit_f64(sig.cell[slot.usize()])
+                total <- total + sig.cell[slot.usize()]
+            emit_f64(total)
+            box: mutable Glyphs::Box = Glyphs::Box{left: 0, top: 0, right: 0, bottom: 0}
+            if Glyphs::mass_box(&box, &cov, Glyphs::TRIM):
+                emit_cell(1)
+                emit_cell(box.left)
+                emit_cell(box.top)
+                emit_cell(box.right)
+                emit_cell(box.bottom)
+            else:
+                emit_cell(0)
+                emit_cell(-1)
+                emit_cell(-1)
+                emit_cell(-1)
+                emit_cell(-1)
+            for cells in [4, 8, 12] |cov, other|:
+                Glyphs::signature(&other, &cov, cells, Glyphs::TRIM)
+                running: mutable f64 = 0.0
+                for slot in 0..<other.span |other, running|:
+                    running <- running + other.cell[slot.usize()]
+                emit_f64(running)
+                emit_f64(Glyphs::distance(&other, &other))
+            for slot in 0..<4 |pool, sig|:
+                emit_f64(Glyphs::distance(&sig, &pool.shape[slot.usize()]))
+            emit_cell(Glyphs::recognise(&pool, &sig))
+            print("")
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(256 * 1024 * 1024)
+        in w:
+            emit_cov_family()
+            emit_mat_family()
+            emit_deal_family()
+            emit_stamp_family()
+            emit_thicken_family()
+            emit_sig_family()
+        destroy w
+        return 0

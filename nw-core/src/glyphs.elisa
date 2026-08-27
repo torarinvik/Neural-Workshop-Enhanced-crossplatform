@@ -1,0 +1,838 @@
+# Procedurally distorted letters: the rules, with no pixels drawn yet.
+#
+# Port of neural_workshop/glyphs.py. That module's own first line is "the rules,
+# with no pixels drawn yet", and it means it: a letter arrives as a rectangle of
+# coverage from whoever rasterised it, and everything that happens afterwards --
+# the warp, the wear, the dirt, the bars in front of it, and the weak recogniser
+# that scores the damage -- is arithmetic. So it belongs here and not in a shell,
+# which is the opposite of what an earlier reading of this repo said.
+#
+# What a shell still owes it: ONE function. `ui/glyphs.coverage(family, letter)`
+# asks pyglet for a glyph bitmap and flips its rows. A Coverage runs top row
+# first because that is the order the warp reads; pyglet hands back bottom row
+# first. The flip happens where the image is built, not everywhere a pixel is
+# touched, and that boundary is why nothing below has to know.
+#
+# Two draw-order traps, both of which cost a diverging sweep before they were
+# found:
+#
+#   * `_spread(rng, width)` draws NOTHING when `width <= 0.0`. The top rung of
+#     the ladder has tilt 0.00 and thickness 0.0, so a port that always draws
+#     two numbers walks the generator off by four on every clean deal.
+#   * `speckle` is `rng.random() * grade.speckle`, which draws even when the
+#     grade's speckle is zero -- and then `stamp` skips its whole per-pixel
+#     speckling pass because the PRODUCT is zero. One of those draws, one does
+#     not, and they are one line apart in the reference.
+#
+# NOTE: needs elisacore_math, pyrandom and ints included by the driver.
+
+module Glyphs:
+
+    # math.pi * 2.0. Doubling is exact in binary, so this is the same double.
+    const TAU: f64 = 6.283185307179586
+
+    # math.radians is ONE multiply by a precomputed pi/180 -- see PORTING.md.
+    const DEG_TO_RAD: f64 = 0.017453292519943295
+
+    # Alpha at or above which a pixel counts as ink.
+    const INK: i64 = 128
+
+    # Cells a side in the recogniser's grid.
+    const CELLS: i64 = 8
+
+    # The elastic waves' steepest total slope, PER AXIS.
+    const RIPPLE_SLOPE: f64 = 0.75
+
+    # Share of the ink allowed outside the box a signature is measured in.
+    const TRIM: f64 = 0.02
+
+    # A source glyph is rasterised at 72pt and a stamp is dealt at 64, so 128 a
+    # side holds either with room to spare. Fixed rather than grown because a
+    # Coverage is handed about by reference and never resized.
+    const MAX_SIDE: i64 = 128
+    const MAX_PIXELS: i64 = 16384
+
+    # grade.waves tops out at 5; the ladder cannot ask for more.
+    const MOST_WAVES: i64 = 8
+
+    # occlusion tops out at 0.40 and a bar is at least 0.06 wide, so seven bars
+    # is the most the loop can deal. Sixteen leaves the arithmetic no way to
+    # reach the end of the array.
+    const MOST_BARS: i64 = 16
+
+    # thickness tops out at 2.5, so ceil(radius) tops out at 3 and the disc at
+    # 7x7. Room for a radius of 8 in case a caller passes its own.
+    const MOST_DISC: i64 = 512
+
+    const GRADE_COUNT: i64 = 10
+
+    # -----------------------------------------------------------------------
+    # Coverage: a rectangle of alpha, top row first.
+    # -----------------------------------------------------------------------
+
+    struct Coverage:
+        width: mutable i64
+        height: mutable i64
+        alpha: mutable u8[16384]
+
+    struct Box:
+        left: mutable i64
+        top: mutable i64
+        right: mutable i64
+        bottom: mutable i64
+
+    struct Pt:
+        x: mutable f64
+        y: mutable f64
+
+    def cover_blank() -> Coverage:
+        return Coverage{width: 0, height: 0, alpha: zeroed}
+
+    def cover_reset(cov: mutable Coverage&, width: i64, height: i64):
+        can Abort.Panic:
+            cov.width <- width
+            cov.height <- height
+            span: i64 = width * height
+            for index in 0..<span |cov|:
+                cov.alpha[index.usize()] <- 0.u8()
+
+    def cover_put(cov: mutable Coverage&, x: i64, y: i64, value: i64):
+        can Abort.Panic:
+            return if x < 0 or y < 0 or x >= cov.width or y >= cov.height
+            cov.alpha[(y * cov.width + x).usize()] <- value.u8()
+
+    # Coverage at an integer pixel; 0 outside the rectangle.
+    def cover_at(cov: Coverage&, x: i64, y: i64) -> i64:
+        can Abort.Panic:
+            return 0 if x < 0 or y < 0 or x >= cov.width or y >= cov.height
+            return cov.alpha[(y * cov.width + x).usize()].i64()
+
+    # Coverage at a fractional pixel, bilinear, 0 outside.
+    #
+    # Sampling off the edge as EMPTY rather than as the edge pixel is what lets
+    # a warp move the letter partly out of frame without smearing its last row
+    # across everything beyond it.
+    def cover_sample(cov: Coverage&, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            left: i64 = floor(x).i64()
+            top: i64 = floor(y).i64()
+            fx: f64 = x - left.f64()
+            fy: f64 = y - top.f64()
+            one: f64 = cover_at(cov, left, top).f64()
+            two: f64 = cover_at(cov, left + 1, top).f64()
+            three: f64 = cover_at(cov, left, top + 1).f64()
+            four: f64 = cover_at(cov, left + 1, top + 1).f64()
+            upper: f64 = one + (two - one) * fx
+            lower: f64 = three + (four - three) * fx
+            return (upper + (lower - upper) * fy).i64()
+
+    # Pixels at or above INK.
+    def cover_ink(cov: Coverage&) -> i64:
+        can Abort.Panic:
+            span: i64 = cov.width * cov.height
+            total: mutable i64 = 0
+            for index in 0..<span |cov, total|:
+                total <- total + 1 if cov.alpha[index.usize()].i64() >= INK else total
+            return total
+
+    # Total coverage, which is ink measured without a threshold.
+    def cover_weight(cov: Coverage&) -> i64:
+        can Abort.Panic:
+            span: i64 = cov.width * cov.height
+            total: mutable i64 = 0
+            for index in 0..<span |cov, total|:
+                total <- total + cov.alpha[index.usize()].i64()
+            return total
+
+    # The ink's bounding box, half-open on the far corner. False when empty --
+    # which is a box the caller must not divide by, and the reason the
+    # reference returns None here rather than a zero-sized box.
+    def cover_bounds(cov: Coverage&, out: mutable Box&) -> bool:
+        can Abort.Panic:
+            left: mutable i64 = cov.width
+            top: mutable i64 = cov.height
+            right: mutable i64 = 0
+            bottom: mutable i64 = 0
+            for y in 0..<cov.height |cov, left, top, right, bottom|:
+                for x in 0..<cov.width |cov, y, left, top, right, bottom|:
+                    if cov.alpha[(y * cov.width + x).usize()].i64() >= INK:
+                        left <- x if x < left else left
+                        right <- x + 1 if x >= right else right
+                        top <- y if y < top else top
+                        bottom <- y + 1 if y >= bottom else bottom
+            return false if right <= left or bottom <= top
+            out.left <- left
+            out.top <- top
+            out.right <- right
+            out.bottom <- bottom
+            return true
+
+    # -----------------------------------------------------------------------
+    # A 3x3 homography, as nine numbers.
+    # -----------------------------------------------------------------------
+
+    struct Mat3:
+        m: mutable f64[9]
+
+    def mat_identity() -> Mat3:
+        return Mat3{m: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]}
+
+    def mat_copy(target: mutable Mat3&, source: Mat3&):
+        can Abort.Panic:
+            for index in 0..<9 |target, source|:
+                target.m[index.usize()] <- source.m[index.usize()]
+
+    # Matrix product, row-major. Written through a scratch so that a caller may
+    # pass the same matrix as an input and as the output.
+    def mat_mul(out: mutable Mat3&, a: Mat3&, b: Mat3&):
+        can Abort.Panic:
+            work: mutable f64[9] = zeroed
+            for row in 0..<3 |work, a, b|:
+                for col in 0..<3 |work, a, b, row|:
+                    one: f64 = a.m[(row * 3).usize()] * b.m[col.usize()]
+                    two: f64 = a.m[(row * 3 + 1).usize()] * b.m[(col + 3).usize()]
+                    three: f64 = a.m[(row * 3 + 2).usize()] * b.m[(col + 6).usize()]
+                    work[(row * 3 + col).usize()] <- one + two + three
+            for index in 0..<9 |out, work|:
+                out.m[index.usize()] <- work[index.usize()]
+
+    # Send a point through *m*, dividing by the projective row.
+    def mat_apply(out: mutable Pt&, m: Mat3&, x: f64, y: f64):
+        can Abort.Panic:
+            w: mutable f64 = m.m[6] * x + m.m[7] * y + m.m[8]
+            if fabs(w) < 1e-12:
+                w <- 1e-12 if w >= 0.0 else -1e-12
+            out.x <- (m.m[0] * x + m.m[1] * y + m.m[2]) / w
+            out.y <- (m.m[3] * x + m.m[4] * y + m.m[5]) / w
+
+    # The inverse of *m*, by cofactors. False on a singular matrix rather than
+    # something enormous: a singular warp is a bug in whatever sampled it, and
+    # a silent one shows up much later as a letter that is a single smeared row.
+    def mat_inverse(out: mutable Mat3&, m: Mat3&) -> bool:
+        can Abort.Panic:
+            a: f64 = m.m[0]
+            b: f64 = m.m[1]
+            c: f64 = m.m[2]
+            d: f64 = m.m[3]
+            e: f64 = m.m[4]
+            f: f64 = m.m[5]
+            g: f64 = m.m[6]
+            h: f64 = m.m[7]
+            i: f64 = m.m[8]
+            one: f64 = e * i - f * h
+            two: f64 = f * g - d * i
+            three: f64 = d * h - e * g
+            det: f64 = a * one + b * two + c * three
+            return false if fabs(det) < 1e-12
+            out.m[0] <- one / det
+            out.m[1] <- (c * h - b * i) / det
+            out.m[2] <- (b * f - c * e) / det
+            out.m[3] <- two / det
+            out.m[4] <- (a * i - c * g) / det
+            out.m[5] <- (c * d - a * f) / det
+            out.m[6] <- three / det
+            out.m[7] <- (b * g - a * h) / det
+            out.m[8] <- (a * e - b * d) / det
+            return true
+
+    # *m* applied about (0.5, 0.5) instead of about the origin.
+    def mat_about_centre(out: mutable Mat3&, m: Mat3&):
+        can Abort.Panic:
+            forth: Mat3 = Mat3{m: [1.0, 0.0, 0.5, 0.0, 1.0, 0.5, 0.0, 0.0, 1.0]}
+            back: Mat3 = Mat3{m: [1.0, 0.0, -0.5, 0.0, 1.0, -0.5, 0.0, 0.0, 1.0]}
+            inner: mutable Mat3 = mat_identity()
+            mat_mul(&inner, m, &back)
+            mat_mul(out, &forth, &inner)
+
+    # The affine-plus-perspective part of a warp, about the centre.
+    #
+    # *turn* is in radians and *shear* is the amount x moves per unit of y. The
+    # two tilts are the projective row: they are what makes a letter look
+    # photographed from an angle rather than scaled.
+    def homography(out: mutable Mat3&, stretch_x: f64, stretch_y: f64,
+                   shear: f64, turn: f64, tilt_x: f64, tilt_y: f64):
+        can Abort.Panic:
+            scale: Mat3 = Mat3{m: [stretch_x, 0.0, 0.0, 0.0, stretch_y, 0.0, 0.0, 0.0, 1.0]}
+            slant: Mat3 = Mat3{m: [1.0, shear, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]}
+            co: f64 = cos(turn)
+            si: f64 = sin(turn)
+            spin: Mat3 = Mat3{m: [co, -si, 0.0, si, co, 0.0, 0.0, 0.0, 1.0]}
+            lean: Mat3 = Mat3{m: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, tilt_x, tilt_y, 1.0]}
+            work: mutable Mat3 = mat_identity()
+            mat_mul(&work, &slant, &scale)
+            mat_mul(&work, &spin, &work)
+            mat_mul(&work, &lean, &work)
+            mat_about_centre(out, &work)
+
+    # -----------------------------------------------------------------------
+    # The warp.
+    # -----------------------------------------------------------------------
+
+    # One term of the elastic deformation. A sum of a few of these is a smooth,
+    # band-limited displacement field that needs no grid to interpolate, so
+    # nothing about the deformation depends on the resolution it is sampled at.
+    struct Wave:
+        amp: mutable f64
+        across: mutable f64
+        down: mutable f64
+        phase: mutable f64
+        axis: mutable i64
+
+    def wave_blank() -> Wave:
+        return Wave{amp: 0.0, across: 0.0, down: 0.0, phase: 0.0, axis: 0}
+
+    def wave_at(wave: Wave&, u: f64, v: f64) -> f64:
+        return wave.amp * sin(TAU * (wave.across * u + wave.down * v + wave.phase))
+
+    # The steepest the term can get, which is what folds a map.
+    def wave_slope(wave: Wave&) -> f64:
+        widest: f64 = fabs(wave.across) if fabs(wave.across) > fabs(wave.down) else fabs(wave.down)
+        return fabs(wave.amp) * TAU * widest
+
+    # Where each point of the drawn letter came from in the original, stored as
+    # the map from DESTINATION to SOURCE because that is the direction a
+    # resampler asks in: every output pixel wants one source point, and going
+    # the other way would leave holes.
+    struct Warp:
+        inverse: mutable Mat3
+        ripple: mutable Wave[8]
+        waves: mutable i64
+
+    def warp_blank() -> Warp:
+        return Warp{inverse: mat_identity(), ripple: zeroed, waves: 0}
+
+    def warp_of(out: mutable Warp&, forward: Mat3&) -> bool:
+        can Abort.Panic:
+            return mat_inverse(&out.inverse, forward)
+
+    # The point of the source that lands at (u, v).
+    #
+    # The ripple is applied in destination coordinates and the matrix AFTER it.
+    # That order is a choice and not a neutral one: the perspective divide does
+    # not stretch the ripple, so a rippled letter tilted away from the reader
+    # keeps its ripple's proportions. Each wave reads the coordinates the
+    # earlier waves already moved.
+    def warp_source(out: mutable Pt&, warp: Warp&, u: f64, v: f64):
+        can Abort.Panic:
+            here_u: mutable f64 = u
+            here_v: mutable f64 = v
+            for index in 0..<warp.waves |warp, here_u, here_v|:
+                shift: f64 = wave_at(&warp.ripple[index.usize()], here_u, here_v)
+                if warp.ripple[index.usize()].axis != 0:
+                    here_v <- here_v + shift
+                else:
+                    here_u <- here_u + shift
+            mat_apply(out, &warp.inverse, here_u, here_v)
+
+    # The ripple's steepest total on one axis. Per axis rather than in total
+    # because that is what RIPPLE_SLOPE bounds and what the fold depends on.
+    def warp_slope(warp: Warp&, axis: i64) -> f64:
+        can Abort.Panic:
+            total: mutable f64 = 0.0
+            for index in 0..<warp.waves |warp, axis, total|:
+                if warp.ripple[index.usize()].axis == axis:
+                    total <- total + wave_slope(&warp.ripple[index.usize()])
+            return total
+
+    # The smallest Jacobian determinant of *warp* over the unit square.
+    #
+    # A map that folds sends two different places to the same place, and a
+    # letter put through one is not a rearranged letter any more -- it has had
+    # a piece of itself pasted back over another piece. Returns the determinant
+    # rather than a yes or no, so a test can say how much room was left.
+    def fold_free(warp: Warp&, steps: i64) -> f64:
+        can Abort.Panic:
+            worst: mutable f64 = 0.0
+            seen: mutable bool = false
+            span: f64 = 1.0 / steps.f64()
+            here: mutable Pt = Pt{x: 0.0, y: 0.0}
+            right: mutable Pt = Pt{x: 0.0, y: 0.0}
+            below: mutable Pt = Pt{x: 0.0, y: 0.0}
+            for row in 0..<(steps + 1) |warp, span, worst, seen, here, right, below|:
+                for col in 0..<(steps + 1) |warp, span, row, worst, seen, here, right, below|:
+                    u: f64 = col.f64() * span
+                    v: f64 = row.f64() * span
+                    warp_source(&here, warp, u, v)
+                    warp_source(&right, warp, u + span * 0.5, v)
+                    warp_source(&below, warp, u, v + span * 0.5)
+                    dxdu: f64 = (right.x - here.x) / (span * 0.5)
+                    dydu: f64 = (right.y - here.y) / (span * 0.5)
+                    dxdv: f64 = (below.x - here.x) / (span * 0.5)
+                    dydv: f64 = (below.y - here.y) / (span * 0.5)
+                    det: f64 = dxdu * dydv - dxdv * dydu
+                    if not seen or det < worst:
+                        worst <- det
+                        seen <- true
+            return 0.0 if not seen
+            return worst
+
+    # -----------------------------------------------------------------------
+    # The rest of the appearance: ink, dirt, and what is in the way.
+    # -----------------------------------------------------------------------
+
+    # A rectangle of the stamp that something is in front of.
+    struct Bar:
+        left: mutable f64
+        top: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    # One dealt appearance: everything but which letter it is.
+    struct Distortion:
+        warp: mutable Warp
+        thickness: mutable f64
+        speckle: mutable f64
+        bars: mutable Bar[16]
+        bar_count: mutable i64
+        contrast: mutable f64
+
+    def distortion_blank() -> Distortion:
+        return Distortion{warp: warp_blank(), thickness: 0.0, speckle: 0.0,
+                          bars: zeroed, bar_count: 0, contrast: 1.0}
+
+    # One rung: the widest each knob is allowed to be dealt. The name lives in
+    # `grade_name` rather than here, because a cstr in a by-value struct buys
+    # nothing and every caller that wants it wants it on its own.
+    struct Grade:
+        stretch: mutable f64
+        shear: mutable f64
+        turn: mutable f64
+        tilt: mutable f64
+        ripple: mutable f64
+        waves: mutable i64
+        thickness: mutable f64
+        speckle: mutable f64
+        occlusion: mutable f64
+        contrast: mutable f64
+
+    def clamp_rung(rung: i64) -> i64:
+        step: mutable i64 = rung - 1
+        step <- 0 if step < 0
+        step <- GRADE_COUNT - 1 if step > GRADE_COUNT - 1
+        return step
+
+    # The rung's grade, counted from ONE and clamped to the ladder.
+    def grade_of(rung: i64) -> Grade:
+        can Abort.Panic:
+            step: i64 = clamp_rung(rung)
+            #             stretch shear  turn  tilt ripple waves thick speckle occl contrast
+            return Grade{stretch: 0.06, shear: 0.02, turn: 2.0, tilt: 0.00, ripple: 0.00, waves: 0, thickness: 0.0, speckle: 0.000, occlusion: 0.00, contrast: 1.00} if step == 0
+            return Grade{stretch: 0.12, shear: 0.06, turn: 5.0, tilt: 0.03, ripple: 0.10, waves: 1, thickness: 0.3, speckle: 0.005, occlusion: 0.00, contrast: 1.00} if step == 1
+            return Grade{stretch: 0.20, shear: 0.14, turn: 9.0, tilt: 0.07, ripple: 0.18, waves: 2, thickness: 0.5, speckle: 0.010, occlusion: 0.00, contrast: 0.95} if step == 2
+            return Grade{stretch: 0.28, shear: 0.22, turn: 13.0, tilt: 0.14, ripple: 0.26, waves: 2, thickness: 0.7, speckle: 0.020, occlusion: 0.04, contrast: 0.90} if step == 3
+            return Grade{stretch: 0.34, shear: 0.28, turn: 16.0, tilt: 0.18, ripple: 0.34, waves: 2, thickness: 1.3, speckle: 0.030, occlusion: 0.08, contrast: 0.85} if step == 4
+            return Grade{stretch: 0.40, shear: 0.34, turn: 19.0, tilt: 0.22, ripple: 0.52, waves: 3, thickness: 1.5, speckle: 0.045, occlusion: 0.12, contrast: 0.80} if step == 5
+            return Grade{stretch: 0.44, shear: 0.38, turn: 21.0, tilt: 0.25, ripple: 0.62, waves: 3, thickness: 1.7, speckle: 0.055, occlusion: 0.20, contrast: 0.75} if step == 6
+            return Grade{stretch: 0.48, shear: 0.42, turn: 23.0, tilt: 0.28, ripple: 0.72, waves: 4, thickness: 2.0, speckle: 0.080, occlusion: 0.26, contrast: 0.70} if step == 7
+            return Grade{stretch: 0.52, shear: 0.46, turn: 25.0, tilt: 0.31, ripple: 0.84, waves: 4, thickness: 2.2, speckle: 0.110, occlusion: 0.32, contrast: 0.65} if step == 8
+            return Grade{stretch: 0.56, shear: 0.50, turn: 27.0, tilt: 0.34, ripple: 1.00, waves: 5, thickness: 2.5, speckle: 0.150, occlusion: 0.40, contrast: 0.60}
+
+    def grade_name(rung: i64) -> cstr:
+        can Abort.Panic:
+            step: i64 = clamp_rung(rung)
+            return "a clean page" if step == 0
+            return "a hand that wavers" if step == 1
+            return "a slight lean" if step == 2
+            return "off the flat" if step == 3
+            return "thick and thin" if step == 4
+            return "a rippled page" if step == 5
+            return "through the blinds" if step == 6
+            return "a bad photocopy" if step == 7
+            return "a dirty window" if step == 8
+            return "most of it is gone"
+
+    # A number in [-width, width], weighted toward the edges.
+    #
+    # Uniform sampling of every knob at once puts almost every deal near the
+    # middle of the box, because the middle is where most of the box is.
+    #
+    # A zero width draws NOTHING. The top rung has tilt 0.00 and thickness 0.0,
+    # so a port that always draws two numbers walks the generator off by four
+    # on every clean deal, and the divergence surfaces in the SPECKLE.
+    def spread(rng: mutable MT19937&, width: f64) -> f64:
+        can Abort.Panic:
+            return 0.0 if width <= 0.0
+            magnitude: f64 = width * sqrt(py_random(rng))
+            return copysign(magnitude, py_random(rng) - 0.5)
+
+    # Sample one appearance from a rung. Every knob is drawn independently, so
+    # the rung is a box rather than a curve through the box: two deals from the
+    # same rung need not look alike in any particular way.
+    #
+    # False only for a singular warp, which the ladder cannot deal.
+    def deal(out: mutable Distortion&, rung: i64, rng: mutable MT19937&) -> bool:
+        can Abort.Panic:
+            grade: Grade = grade_of(rung)
+
+            # Keyword arguments, evaluated left to right by CPython, so this is
+            # the draw order and not a tidying of it.
+            stretch_x: f64 = 1.0 + spread(rng, grade.stretch)
+            stretch_y: f64 = 1.0 + spread(rng, grade.stretch)
+            shear: f64 = spread(rng, grade.shear)
+            turn: f64 = spread(rng, grade.turn) * DEG_TO_RAD
+            tilt_x: f64 = spread(rng, grade.tilt)
+            tilt_y: f64 = spread(rng, grade.tilt)
+            forward: mutable Mat3 = mat_identity()
+            homography(&forward, stretch_x, stretch_y, shear, turn, tilt_x, tilt_y)
+
+            out.warp.waves <- 0
+            budget: f64 = RIPPLE_SLOPE * grade.ripple
+            for axis in 0..<2 |out, grade, budget, rng|:
+                # Alternating, so an odd wave count leans on u. Each axis gets
+                # the whole budget: see RIPPLE_SLOPE.
+                mine: mutable i64 = 0
+                for index in 0..<grade.waves |axis, mine|:
+                    mine <- mine + 1 if index % 2 == axis else mine
+                for place in 0..<mine |out, axis, mine, budget, rng|:
+                    # The last wave on an axis gets what is LEFT rather than
+                    # its share, so the budget is spent rather than respected.
+                    spent: mutable f64 = 0.0
+                    for older in 0..<out.warp.waves |out, axis, spent|:
+                        if out.warp.ripple[older.usize()].axis == axis:
+                            spent <- spent + wave_slope(&out.warp.ripple[older.usize()])
+                    share: f64 = budget / mine.f64() if place < mine - 1 else budget - spent
+                    across: f64 = py_uniform(rng, 0.4, 1.4)
+                    down: f64 = py_uniform(rng, 0.4, 1.4)
+                    steepest: f64 = TAU * (across if across > down else down)
+                    amp: f64 = share / steepest if steepest != 0.0 else 0.0
+                    phase: f64 = py_random(rng)
+                    slot: i64 = out.warp.waves
+                    out.warp.ripple[slot.usize()] <- Wave{amp: amp, across: across, down: down, phase: phase, axis: axis}
+                    out.warp.waves <- slot + 1
+
+            # Bars, not blobs: something in front of a letter -- a railing, a
+            # window frame, the edge of the page -- is usually straight, and a
+            # straight edge is the case where a reader has to decide whether a
+            # stroke continues behind it.
+            out.bar_count <- 0
+            left_to_cover: mutable f64 = grade.occlusion
+            while left_to_cover > 0.01 |out, left_to_cover, rng|:
+                drawn: f64 = py_uniform(rng, 0.06, 0.22)
+                thick: f64 = drawn if drawn < left_to_cover else left_to_cover
+                slot: i64 = out.bar_count
+                if py_random(rng) < 0.5:
+                    over: f64 = py_random(rng) * (1.0 - thick)
+                    out.bars[slot.usize()] <- Bar{left: 0.0, top: over, width: 1.0, height: thick}
+                else:
+                    over: f64 = py_random(rng) * (1.0 - thick)
+                    out.bars[slot.usize()] <- Bar{left: over, top: 0.0, width: thick, height: 1.0}
+                out.bar_count <- slot + 1
+                left_to_cover <- left_to_cover - thick
+
+            # `Warp.of` draws nothing, and the three knobs after it draw in the
+            # order the constructor lists them.
+            ok: bool = warp_of(&out.warp, &forward)
+            out.thickness <- spread(rng, grade.thickness)
+            out.speckle <- py_random(rng) * grade.speckle
+            out.contrast <- py_uniform(rng, grade.contrast, 1.0)
+            return ok
+
+    # -----------------------------------------------------------------------
+    # Applying it.
+    # -----------------------------------------------------------------------
+
+    struct Disc:
+        dx: mutable i64[512]
+        dy: mutable i64[512]
+        count: mutable i64
+
+    # Integer offsets within *radius* of the origin, dy outer and dx inner --
+    # which is only the order they are visited in, and a max/min does not care.
+    def disc_build(out: mutable Disc&, radius: f64):
+        can Abort.Panic:
+            reach: i64 = ceil(radius).i64()
+            out.count <- 0
+            for dy in (-reach)..<(reach + 1) |out, reach, radius|:
+                for dx in (-reach)..<(reach + 1) |out, dy, radius|:
+                    if (dx * dx + dy * dy).f64() <= radius * radius + 1e-9:
+                        slot: i64 = out.count
+                        out.dx[slot.usize()] <- dx
+                        out.dy[slot.usize()] <- dy
+                        out.count <- slot + 1
+
+    # Grow the ink by *radius* pixels, or eat it if *radius* is negative.
+    #
+    # A dilation by a disc and an erosion by the same disc, which is what a
+    # heavier or lighter weight of the same typeface mostly is. Not what it
+    # ENTIRELY is -- a real bold face redraws the letter rather than fattening
+    # it -- so this knob reads as wear and exposure rather than as weight.
+    #
+    # The reference breaks out of the disc as soon as the extreme is reached.
+    # That is a speed-up and nothing else: a maximum does not depend on when
+    # you stop looking once you have found the largest value there is.
+    def thicken(out: mutable Coverage&, cov: Coverage&, radius: f64):
+        can Abort.Panic:
+            width: i64 = cov.width
+            height: i64 = cov.height
+            out.width <- width
+            out.height <- height
+            if fabs(radius) < 0.5:
+                for index in 0..<(width * height) |out, cov|:
+                    out.alpha[index.usize()] <- cov.alpha[index.usize()]
+                return
+            disc: mutable Disc = Disc{dx: zeroed, dy: zeroed, count: 0}
+            disc_build(&disc, fabs(radius))
+            grow: bool = radius > 0.0
+            for y in 0..<height |out, cov, disc, grow, width, height|:
+                for x in 0..<width |out, cov, disc, grow, width, height, y|:
+                    best: mutable i64 = 0 if grow else 255
+                    for step in 0..<disc.count |out, cov, disc, grow, width, height, x, y, best|:
+                        nx: i64 = x + disc.dx[step.usize()]
+                        ny: i64 = y + disc.dy[step.usize()]
+                        inside: bool = nx >= 0 and nx < width and ny >= 0 and ny < height
+                        # Off the edge is nothing when eating, and is not there
+                        # at all when growing.
+                        if inside or not grow:
+                            value: i64 = cov.alpha[(ny * width + nx).usize()].i64() if inside else 0
+                            if grow:
+                                best <- value if value > best else best
+                            else:
+                                best <- value if value < best else best
+                    out.alpha[(y * width + x).usize()] <- best.u8()
+
+    struct Fit:
+        x: mutable f64
+        y: mutable f64
+        span: mutable f64
+
+    # Where the unit square sits on *cov*. The letter's own ink box is centred
+    # in the square with *margin* left over, and the box is SQUARED OFF first
+    # so the letter keeps its proportions -- an I and an M therefore arrive the
+    # same height rather than the same width, which is what a reader expects
+    # and what keeps aspect ratio out of the answer.
+    def fit_of(out: mutable Fit&, cov: Coverage&, margin: f64) -> bool:
+        can Abort.Panic:
+            box: mutable Box = Box{left: 0, top: 0, right: 0, bottom: 0}
+            return false if not cover_bounds(cov, &box)
+            wide: i64 = box.right - box.left
+            tall: i64 = box.bottom - box.top
+            widest: i64 = wide if wide > tall else tall
+            floor_room: f64 = 1.0 - 2.0 * margin
+            room: f64 = floor_room if floor_room > 1e-6 else 1e-6
+            span: f64 = widest.f64() / room
+            centre_x: f64 = (box.left + box.right).f64() / 2.0
+            centre_y: f64 = (box.top + box.bottom).f64() / 2.0
+            out.x <- centre_x - span / 2.0
+            out.y <- centre_y - span / 2.0
+            out.span <- span
+            return true
+
+    # Put a letter through one dealt appearance.
+    #
+    # Order matters, and this is the order a real page would apply them: the
+    # typeface is worn or fattened first, because that happened to the
+    # printing; then the sheet is warped, because that happened to the paper;
+    # then it is dirtied and something is put in front of it, because those
+    # happened last and to the picture rather than to the letter.
+    #
+    # Thickening AFTER the warp would grow the ink by a disc in SCREEN pixels,
+    # so a letter tilted away from the reader would come back with its far end
+    # proportionally fatter -- which is not wear, it is a mistake that looks
+    # like one.
+    def stamp(out: mutable Coverage&, worn: mutable Coverage&, cov: Coverage&,
+              dist: Distortion&, size: i64, rng: mutable MT19937&, margin: f64):
+        can Abort.Panic:
+            thicken(worn, cov, dist.thickness)
+            placed: mutable Fit = Fit{x: 0.0, y: 0.0, span: 0.0}
+            fitted: bool = fit_of(&placed, worn, margin)
+            cover_reset(out, size, size)
+            # An empty letter comes back empty, and draws NOTHING on the way --
+            # the speckling pass is below this return.
+            return if not fitted
+            step: f64 = 1.0 / size.f64()
+            landed: mutable Pt = Pt{x: 0.0, y: 0.0}
+            for row in 0..<size |out, worn, dist, size, step, placed, landed|:
+                v: f64 = (row.f64() + 0.5) * step
+                for col in 0..<size |out, worn, dist, size, step, placed, landed, row, v|:
+                    warp_source(&landed, &dist.warp, (col.f64() + 0.5) * step, v)
+                    value: i64 = cover_sample(worn, placed.x + landed.x * placed.span,
+                                              placed.y + landed.y * placed.span)
+                    out.alpha[(row * size + col).usize()] <- value.u8()
+
+            if dist.speckle > 0.0:
+                for index in 0..<(size * size) |out, dist, rng|:
+                    if py_random(rng) < dist.speckle:
+                        here: i64 = out.alpha[index.usize()].i64()
+                        out.alpha[index.usize()] <- 0.u8() if here >= INK else 255.u8()
+
+            for slot in 0..<dist.bar_count |out, dist, size|:
+                bar: Bar& = &dist.bars[slot.usize()]
+                raw_x0: i64 = (bar.left * size.f64()).i64()
+                raw_x1: i64 = ceil((bar.left + bar.width) * size.f64()).i64()
+                raw_y0: i64 = (bar.top * size.f64()).i64()
+                raw_y1: i64 = ceil((bar.top + bar.height) * size.f64()).i64()
+                x0: i64 = raw_x0 if raw_x0 > 0 else 0
+                x1: i64 = raw_x1 if raw_x1 < size else size
+                y0: i64 = raw_y0 if raw_y0 > 0 else 0
+                y1: i64 = raw_y1 if raw_y1 < size else size
+                for row in y0..<y1 |out, size, x0, x1|:
+                    for col in x0..<x1 |out, size, row|:
+                        out.alpha[(row * size + col).usize()] <- 0.u8()
+
+            if dist.contrast < 1.0:
+                low: f64 = dist.contrast if dist.contrast < 1.0 else 1.0
+                scale: f64 = low if low > 0.0 else 0.0
+                for index in 0..<(size * size) |out, scale|:
+                    value: i64 = out.alpha[index.usize()].i64()
+                    if value != 0:
+                        out.alpha[index.usize()] <- (value.f64() * scale).i64().u8()
+
+    # -----------------------------------------------------------------------
+    # The measurement: does it still say what it said?
+    # -----------------------------------------------------------------------
+
+    struct Profile:
+        count: mutable i64[128]
+        span: mutable i64
+
+    struct Range:
+        low: mutable i64
+        high: mutable i64
+
+    # The run of the profile holding all but *want* of the ink at either end.
+    # A profile that never reaches *want* keeps its whole span, which is what
+    # the reference's un-taken `break` leaves behind.
+    def profile_span(out: mutable Range&, profile: Profile&, want: f64):
+        can Abort.Panic:
+            seen: mutable f64 = 0.0
+            low: mutable i64 = 0
+            done: mutable bool = false
+            for index in 0..<profile.span |profile, want, seen, low, done|:
+                if not done:
+                    seen <- seen + profile.count[index.usize()].f64()
+                    if seen > want:
+                        low <- index
+                        done <- true
+            seen <- 0.0
+            high: mutable i64 = profile.span
+            done <- false
+            for back in 0..<profile.span |profile, want, seen, high, done|:
+                index: i64 = profile.span - 1 - back
+                if not done:
+                    seen <- seen + profile.count[index.usize()].f64()
+                    if seen > want:
+                        high <- index + 1
+                        done <- true
+            out.low <- low
+            out.high <- high if high > low + 1 else low + 1
+
+    # The box holding all but *trim* of the ink at each end of each axis.
+    #
+    # Zero trim was the first thing tried and it made the measurement
+    # worthless: a single speck of noise in a corner is enough to double the
+    # box, which moves every cell boundary, so a rung's SPECKLE knob was being
+    # scored as if it had destroyed the letter when all it had done was move
+    # the ruler.
+    def mass_box(out: mutable Box&, cov: Coverage&, trim: f64) -> bool:
+        can Abort.Panic:
+            columns: mutable Profile = Profile{count: zeroed, span: cov.width}
+            rows: mutable Profile = Profile{count: zeroed, span: cov.height}
+            total: mutable i64 = 0
+            for y in 0..<cov.height |cov, columns, rows, total|:
+                for x in 0..<cov.width |cov, y, columns, rows, total|:
+                    if cov.alpha[(y * cov.width + x).usize()].i64() >= INK:
+                        columns.count[x.usize()] <- columns.count[x.usize()] + 1
+                        rows.count[y.usize()] <- rows.count[y.usize()] + 1
+                        total <- total + 1
+            return false if total == 0
+            want: f64 = total.f64() * trim
+            across: mutable Range = Range{low: 0, high: 0}
+            down: mutable Range = Range{low: 0, high: 0}
+            profile_span(&across, &columns, want)
+            profile_span(&down, &rows, want)
+            out.left <- across.low
+            out.right <- across.high
+            out.top <- down.low
+            out.bottom <- down.high
+            return true
+
+    struct Signature:
+        cell: mutable f64[256]
+        span: mutable i64
+
+    def signature_blank() -> Signature:
+        return Signature{cell: zeroed, span: 0}
+
+    # Ink per cell of a grid over the letter's OWN ink box.
+    #
+    # Measuring within the ink box rather than the frame is what makes this
+    # blind to where the letter ended up and how big it is, which is
+    # deliberate: position and scale are knobs this module turns, and a
+    # recogniser that they alone could beat would measure the knobs rather than
+    # the damage.
+    #
+    # An empty coverage gives all zeros, which every letter is equally far from
+    # -- so a stamp with nothing left in it is a WRONG ANSWER rather than a
+    # crash, and the ladder's bottom rungs need that.
+    def signature(out: mutable Signature&, cov: Coverage&, cells: i64, trim: f64):
+        can Abort.Panic:
+            out.span <- cells * cells
+            for slot in 0..<out.span |out|:
+                out.cell[slot.usize()] <- 0.0
+            box: mutable Box = Box{left: 0, top: 0, right: 0, bottom: 0}
+            return if not mass_box(&box, cov, trim)
+            wide: f64 = (box.right - box.left).f64() / cells.f64()
+            tall: f64 = (box.bottom - box.top).f64() / cells.f64()
+            for y in box.top..<box.bottom |out, cov, cells, box, wide, tall|:
+                raw_y: i64 = ((y - box.top).f64() / tall).i64()
+                cell_y: i64 = raw_y if raw_y < cells - 1 else cells - 1
+                row_base: i64 = cell_y * cells
+                for x in box.left..<box.right |out, cov, cells, box, wide, y, row_base|:
+                    if cov.alpha[(y * cov.width + x).usize()].i64() >= INK:
+                        raw_x: i64 = ((x - box.left).f64() / wide).i64()
+                        cell_x: i64 = raw_x if raw_x < cells - 1 else cells - 1
+                        slot: i64 = row_base + cell_x
+                        out.cell[slot.usize()] <- out.cell[slot.usize()] + 1.0
+            total: mutable f64 = 0.0
+            for slot in 0..<out.span |out, total|:
+                total <- total + out.cell[slot.usize()]
+            return if total <= 0.0
+            for slot in 0..<out.span |out, total|:
+                out.cell[slot.usize()] <- out.cell[slot.usize()] / total
+
+    # L1 between two signatures.
+    def distance(one: Signature&, two: Signature&) -> f64:
+        can Abort.Panic:
+            total: mutable f64 = 0.0
+            for slot in 0..<one.span |one, two, total|:
+                total <- total + fabs(one.cell[slot.usize()] - two.cell[slot.usize()])
+            return total
+
+    const MOST_TEMPLATES: i64 = 64
+
+    # The recogniser's pool: one signature per entry, each tagged with the
+    # letter it was measured from, IN THE ORDER THEY WERE ADDED. `recognise`
+    # keeps the first of an exact tie, so that order is part of the answer and
+    # not a detail -- the reference's is the dict's insertion order.
+    struct Templates:
+        letter: mutable i64[64]
+        shape: mutable Signature[64]
+        count: mutable i64
+
+    def templates_blank() -> Templates:
+        return Templates{letter: zeroed, shape: zeroed, count: 0}
+
+    def templates_add(out: mutable Templates&, letter: i64, shape: Signature&):
+        can Abort.Panic:
+            return if out.count >= MOST_TEMPLATES
+            slot: i64 = out.count
+            out.letter[slot.usize()] <- letter
+            out.shape[slot.usize()].span <- shape.span
+            for cell in 0..<shape.span |out, shape, slot|:
+                out.shape[slot.usize()].cell[cell.usize()] <- shape.cell[cell.usize()]
+            out.count <- slot + 1
+
+    # The letter whose nearest template is nearest to *sig*; -1 for an empty
+    # pool, which is the reference's empty string.
+    def recognise(pool: Templates&, sig: Signature&) -> i64:
+        can Abort.Panic:
+            best_letter: mutable i64 = -1
+            best: mutable f64 = 0.0
+            seen: mutable bool = false
+            for slot in 0..<pool.count |pool, sig, best_letter, best, seen|:
+                gap: f64 = distance(sig, &pool.shape[slot.usize()])
+                if not seen or gap < best:
+                    best <- gap
+                    best_letter <- pool.letter[slot.usize()]
+                    seen <- true
+            return best_letter
