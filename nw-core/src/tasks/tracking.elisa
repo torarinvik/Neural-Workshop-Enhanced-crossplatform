@@ -1,0 +1,130 @@
+# Moving Targets: follow the flashed balls through the motion.
+#
+# Port of the portable half of neural_workshop/ui/tracking.py
+# (GPL-2.0-or-later). Positions are in fractions of the window, which is what
+# the reference stores; the bounds and the radius come from the shell, so every
+# function here takes them rather than reading a window.
+
+extern cos(x: f64) -> f64
+extern sin(x: f64) -> f64
+
+module Tracking:
+
+    # How far apart balls spawn, in radii.
+    const SPAWN_APART: f64 = 2.4
+
+    const MOST_BALLS: i64 = 64
+
+    # 2 * math.pi, to the bit -- the reference writes `2 * math.pi` rather than
+    # `math.tau`, and the two are the same double.
+    const TWO_PI: f64 = 6.283185307179586
+
+    const PHASE_CUEING: i64 = 0
+    const PHASE_TRACKING: i64 = 1
+    const PHASE_PICKING: i64 = 2
+    const PHASE_REVEALING: i64 = 3
+
+    struct Axis:
+        position: mutable f64
+        velocity: mutable f64
+
+    # One axis of wall bounce. The overshoot is FOLDED BACK inside rather than
+    # clamped, so a fast ball does not stick to the wall it hit.
+    def bounced(position: f64, velocity: f64, low: f64, high: f64) -> Axis:
+        can Abort.Panic:
+            if position < low:
+                return Axis{position: low + (low - position), velocity: velocity if velocity >= 0.0 else 0.0 - velocity}
+            if position > high:
+                magnitude: f64 = velocity if velocity >= 0.0 else 0.0 - velocity
+                return Axis{position: high - (position - high), velocity: 0.0 - magnitude}
+            return Axis{position: position, velocity: velocity}
+
+    struct Flock:
+        count: mutable i64
+        x: mutable darray[f64]
+        y: mutable darray[f64]
+        vx: mutable darray[f64]
+        vy: mutable darray[f64]
+        target: mutable darray[i64]
+        picked: mutable darray[i64]
+
+    def new_flock() -> Flock:
+        can Memory.Allocate, Abort.Panic:
+            return Flock{count: 0, x: Floats::zeros(MOST_BALLS), y: Floats::zeros(MOST_BALLS),
+                         vx: Floats::zeros(MOST_BALLS), vy: Floats::zeros(MOST_BALLS),
+                         target: Ints::zeros(MOST_BALLS), picked: Ints::zeros(MOST_BALLS)}
+
+    # Spawn spots with clear air between them, RELAXED if crowded -- and the
+    # relaxed pass starts fresh without rewinding, so failed draws are spent.
+    #
+    # The separation test is squared on both sides, as the reference's is: no
+    # square root is taken, so nothing here depends on hypot.
+    def scatter(out: mutable Flock&, ball_count: i64, apart: f64, low_x: f64, high_x: f64, low_y: f64, high_y: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            gap: mutable f64 = apart
+            settled: mutable bool = false
+            while not settled |out, ball_count, gap, settled, low_x, high_x, low_y, high_y, rng|:
+                out.count <- 0
+                for _attempt in 0..<(ball_count * 60) |out, ball_count, gap, settled, low_x, high_x, low_y, high_y, rng|:
+                    break if settled
+                    sx: f64 = py_uniform(rng, low_x, high_x)
+                    sy: f64 = py_uniform(rng, low_y, high_y)
+                    clear: mutable bool = true
+                    for at in 0..<out.count |out, sx, sy, gap, clear|:
+                        dx: f64 = sx - Floats::at_ref(&out.x, at)
+                        dy: f64 = sy - Floats::at_ref(&out.y, at)
+                        clear <- false if dx * dx + dy * dy < gap * gap
+                    continue if not clear
+                    Floats::put(&out.x, out.count, sx)
+                    Floats::put(&out.y, out.count, sy)
+                    out.count <- out.count + 1
+                    settled <- true if out.count == ball_count
+                gap <- gap * 0.8 if not settled
+
+    # Deal a round. The draw order is the reference's and is load-bearing: the
+    # TARGETS are sampled first, then every spawn spot, then a heading per ball.
+    def deal_round(out: mutable Flock&, ball_count: i64, targets: i64, speed: f64, apart: f64, low_x: f64, high_x: f64, low_y: f64, high_y: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            chosen: darray[i64] = py_sample_range(rng, 0, ball_count - 1, targets)
+            scatter(out, ball_count, apart, low_x, high_x, low_y, high_y, rng)
+            for index in 0..<out.count |out, chosen, targets, speed, rng|:
+                heading: f64 = py_uniform(rng, 0.0, TWO_PI)
+                Floats::put(&out.vx, index, speed * cos(heading))
+                Floats::put(&out.vy, index, speed * sin(heading))
+                is_target: mutable i64 = 0
+                for at in 0..<targets |chosen, index, is_target|:
+                    is_target <- 1 if Ints::at(chosen, at) == index
+                Ints::put(&out.target, index, is_target)
+                Ints::put(&out.picked, index, 0)
+
+    # Advance the flock, bouncing off the walls.
+    #
+    # The balls PASS THROUGH each other on purpose: two identical balls crossing
+    # is exactly the moment tracking is hard, and making them bounce apart would
+    # delete the task's difficulty in the name of physics.
+    def advance(flock: mutable Flock&, dt: f64, aspect: f64, low_x: f64, high_x: f64, low_y: f64, high_y: f64):
+        can Abort.Panic:
+            for at in 0..<flock.count |flock, dt, aspect, low_x, high_x, low_y, high_y|:
+                nx: f64 = Floats::at_ref(&flock.x, at) + Floats::at_ref(&flock.vx, at) * dt * aspect
+                ny: f64 = Floats::at_ref(&flock.y, at) + Floats::at_ref(&flock.vy, at) * dt
+                across: Axis = bounced(nx, Floats::at_ref(&flock.vx, at), low_x, high_x)
+                down: Axis = bounced(ny, Floats::at_ref(&flock.vy, at), low_y, high_y)
+                Floats::put(&flock.x, at, across.position)
+                Floats::put(&flock.vx, at, across.velocity)
+                Floats::put(&flock.y, at, down.position)
+                Floats::put(&flock.vy, at, down.velocity)
+
+    def tracked_now(flock: mutable Flock&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for at in 0..<flock.count |flock, total|:
+                total <- total + 1 if Ints::at_ref(&flock.target, at) != 0
+            return total
+
+    # How many picks were right, and how many targets got away.
+    def caught(flock: mutable Flock&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for at in 0..<flock.count |flock, total|:
+                total <- total + 1 if Ints::at_ref(&flock.target, at) != 0 and Ints::at_ref(&flock.picked, at) != 0
+            return total
