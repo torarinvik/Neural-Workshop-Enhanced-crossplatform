@@ -1,0 +1,366 @@
+# Differential sweep driver for tasks/ravens.elisa. See ravens_diff.py for the
+# reference side, which imports the real package rather than lifting it.
+#
+# Six modules under test and they fail in different ways, so they are swept
+# apart: the outlines and the cut into triangles, the palettes, the figures and
+# their turn ladders, the size ladders, the layouts, the rule engine on ladders
+# of every length, and finally whole puzzles at every grade.
+#
+# The rule sections end in a probe draw. A rule that produces the right rows
+# off the wrong number of draws is a rule that puts the NEXT attribute
+# somewhere else, and a whole-puzzle row would blame the wrong thing.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/tasks/ravens.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+def emit_float(value: f64):
+    can Console.Write, Abort.Panic:
+        emit_cell(py_round_half_even(value * 1000000.0))
+
+# Bounds, area, convexity, the cut into triangles, and then the outline itself.
+def emit_outline(tag: cstr, spec: i64, x: mutable darray[f64]&, y: mutable darray[f64]&, count: i64,
+                 work_x: mutable darray[f64]&, work_y: mutable darray[f64]&,
+                 tri_x: mutable darray[f64]&, tri_y: mutable darray[f64]&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        printr(tag)
+        emit_cell(spec)
+        emit_cell(count)
+        box: Ravens::Box = Ravens::bounds(x, y, count)
+        emit_float(box.min_x)
+        emit_float(box.min_y)
+        emit_float(box.max_x)
+        emit_float(box.max_y)
+        emit_float(Ravens::signed_area(x, y, count))
+        emit_cell(1 if Ravens::is_convex(x, y, count) else 0)
+        made: i64 = Ravens::triangulate(x, y, count, work_x, work_y, tri_x, tri_y)
+        emit_cell(made)
+        for at in 0..<(made * 3) |tri_x, tri_y|:
+            emit_float(Floats::at_ref(tri_x, at))
+            emit_float(Floats::at_ref(tri_y, at))
+        for at in 0..<count |x, y|:
+            emit_float(Floats::at_ref(x, at))
+            emit_float(Floats::at_ref(y, at))
+        print("")
+
+# A concave outline, so ear clipping is exercised and not merely the fan.
+def tee(x: mutable darray[f64]&, y: mutable darray[f64]&, backwards: bool) -> i64:
+    can Abort.Panic:
+        corners: mutable darray[f64] = Floats::zeros(16)
+        Floats::put(&corners, 0, 0.0)
+        Floats::put(&corners, 1, 0.0)
+        Floats::put(&corners, 2, 6.0)
+        Floats::put(&corners, 3, 0.0)
+        Floats::put(&corners, 4, 6.0)
+        Floats::put(&corners, 5, 2.0)
+        Floats::put(&corners, 6, 4.0)
+        Floats::put(&corners, 7, 2.0)
+        Floats::put(&corners, 8, 4.0)
+        Floats::put(&corners, 9, 6.0)
+        Floats::put(&corners, 10, 2.0)
+        Floats::put(&corners, 11, 6.0)
+        Floats::put(&corners, 12, 2.0)
+        Floats::put(&corners, 13, 2.0)
+        Floats::put(&corners, 14, 0.0)
+        Floats::put(&corners, 15, 2.0)
+        for at in 0..<8 |x, y, corners, backwards|:
+            source: i64 = 7 - at if backwards else at
+            Floats::put(x, at, Floats::at_ref(&corners, source * 2))
+            Floats::put(y, at, Floats::at_ref(&corners, source * 2 + 1))
+        return 8
+
+def emit_panel(panels: mutable Ravens::Panels&, panel: i64):
+    can Console.Write, Abort.Panic:
+        held: i64 = Ints::at_ref(&panels.count, panel)
+        emit_cell(held)
+        for at in 0..<held |panels, panel|:
+            index: i64 = panel * Ravens::MOST_FIGURES + at
+            emit_cell(Ints::at_ref(&panels.shape, index))
+            emit_float(Floats::at_ref(&panels.cx, index))
+            emit_float(Floats::at_ref(&panels.cy, index))
+            emit_float(Floats::at_ref(&panels.radius, index))
+            emit_cell(Ints::at_ref(&panels.fill, index))
+            emit_cell(Ints::at_ref(&panels.angle, index))
+            emit_cell(Ints::at_ref(&panels.part, index))
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(256 * 1024 * 1024)
+        in w:
+            x: mutable darray[f64] = Floats::zeros(Ravens::MOST_CORNERS)
+            y: mutable darray[f64] = Floats::zeros(Ravens::MOST_CORNERS)
+            other_x: mutable darray[f64] = Floats::zeros(Ravens::MOST_CORNERS)
+            other_y: mutable darray[f64] = Floats::zeros(Ravens::MOST_CORNERS)
+            work_x: mutable darray[f64] = Floats::zeros(Ravens::MOST_CORNERS)
+            work_y: mutable darray[f64] = Floats::zeros(Ravens::MOST_CORNERS)
+            tri_x: mutable darray[f64] = Floats::zeros(Ravens::MOST_TRIANGLES * 3)
+            tri_y: mutable darray[f64] = Floats::zeros(Ravens::MOST_TRIANGLES * 3)
+
+            # --- the outlines ---------------------------------------------
+            for spec in 0..<6 |x, y, work_x, work_y, tri_x, tri_y|:
+                count: i64 = Ravens::ellipse_outline(1.0 + spec.f64() * 0.5, 2.0 - spec.f64() * 0.25, 4 + spec * 3, x, y)
+                emit_outline("ellipse", spec, x, y, count, work_x, work_y, tri_x, tri_y)
+            count: i64 = Ravens::ellipse_outline(3.0, 3.0, Ravens::ELLIPSE_SEGMENTS, x, y)
+            emit_outline("ellipse", 6, x, y, count, work_x, work_y, tri_x, tri_y)
+            for spec in 0..<2 |x, y, work_x, work_y, tri_x, tri_y|:
+                held: i64 = tee(x, y, spec == 1)
+                emit_outline("tee", spec, x, y, held, work_x, work_y, tri_x, tri_y)
+            for spec in 0..<6 |x, y, other_x, other_y, work_x, work_y, tri_x, tri_y|:
+                held: i64 = tee(x, y, false)
+                Ravens::transformed(x, y, held, 0.5 + spec.f64() * 0.3, spec * 37,
+                                    spec.f64() * 1.5, 0.0 - spec.f64(), other_x, other_y)
+                emit_outline("moved", spec, other_x, other_y, held, work_x, work_y, tri_x, tri_y)
+
+            # --- the palettes ---------------------------------------------
+            for which in 0..<2:
+                printr("palette")
+                emit_cell(which)
+                emit_cell(Ravens::PALETTE_FILLS)
+                for index in 0..<Ravens::PALETTE_FILLS |which|:
+                    fill: i64 = Ravens::palette_fill(which, index)
+                    emit_cell(fill)
+                    for channel in 0..<4 |fill|:
+                        emit_cell(Ravens::fill_channel(fill, channel))
+                print("")
+
+            # --- the figures ----------------------------------------------
+            turns: mutable darray[i64] = Ints::zeros(Ravens::MOST_LADDER)
+            for shape in 0..<Ravens::SHAPE_COUNT |turns|:
+                held: i64 = Ravens::turn_ladder(shape, &turns)
+                printr("turns")
+                emit_cell(shape)
+                emit_cell(Ravens::shape_sides(shape))
+                emit_float(Ravens::shape_offset(shape))
+                emit_cell(held)
+                for at in 0..<held |turns|:
+                    emit_cell(Ints::at_ref(&turns, at))
+                print("")
+            for shape in 0..<Ravens::SHAPE_COUNT |x, y, work_x, work_y, tri_x, tri_y|:
+                for spec in 0..<3 |x, y, work_x, work_y, tri_x, tri_y, shape|:
+                    angle: f64 = 0.0 if spec == 0 else (37.0 if spec == 1 else 90.0)
+                    held: i64 = Ravens::polygon(shape, 0.3 + spec.f64() * 0.05,
+                                                0.4 + spec.f64() * 0.1, 0.6 - spec.f64() * 0.15,
+                                                angle, x, y)
+                    emit_outline("polygon", shape * 3 + spec, x, y, held, work_x, work_y, tri_x, tri_y)
+
+            # --- the size ladders -----------------------------------------
+            for which in 0..<4:
+                printr("ladder")
+                emit_cell(which)
+                emit_cell(Ravens::size_ladder_count(which))
+                for at in 0..<Ravens::size_ladder_count(which) |which|:
+                    emit_float(Ravens::size_ladder_at(which, at))
+                print("")
+
+            # --- the layouts ----------------------------------------------
+            counts: mutable darray[i64] = Ints::zeros(Ravens::MOST_LADDER)
+            places: mutable darray[i64] = Ints::zeros(Ravens::MOST_SLOTS)
+            for layout in 0..<Ravens::LAYOUT_COUNT |counts, places|:
+                printr("layout")
+                emit_cell(layout)
+                emit_cell(Ravens::layout_components(layout))
+                for part in 0..<Ravens::layout_components(layout) |layout, counts, places|:
+                    slots: i64 = Ravens::component_slots(layout, part)
+                    many: i64 = Ravens::component_counts(layout, part, &counts)
+                    emit_cell(slots)
+                    emit_cell(many)
+                    emit_cell(1 if Ravens::varies_in_number(layout, part) else 0)
+                    emit_cell(Ravens::component_size_ladder(layout, part))
+                    for slot in 0..<slots |layout, part|:
+                        emit_float(Ravens::slot_centre_x(layout, part, slot))
+                        emit_float(Ravens::slot_centre_y(layout, part, slot))
+                        emit_float(Ravens::slot_radius(layout, part, slot))
+                    for at in 0..<many |counts|:
+                        emit_cell(Ints::at_ref(&counts, at))
+                    for at in 0..<many |layout, part, counts, places|:
+                        held: i64 = Ravens::component_places(layout, part, Ints::at_ref(&counts, at), &places)
+                        emit_cell(held)
+                        for step in 0..<held |places|:
+                            emit_cell(Ints::at_ref(&places, step))
+                print("")
+
+            # --- what rules a ladder offers -------------------------------
+            kinds: mutable darray[i64] = Ints::zeros(Ravens::MOST_CHOICES)
+            params: mutable darray[i64] = Ints::zeros(Ravens::MOST_CHOICES)
+            for across_at in 0..<3 |kinds, params|:
+                across: i64 = 2 + across_at
+                for length in 1..<10 |kinds, params, across|:
+                    for arith_at in 0..<2 |kinds, params, across, length|:
+                        allow_arithmetic: bool = arith_at == 1
+                        for named_at in 0..<4 |kinds, params, across, length, allow_arithmetic, arith_at|:
+                            allowed: mutable i64 = -1
+                            allowed <- Ravens::ALLOW_PROGRESSION if named_at == 1
+                            allowed <- Ravens::ALLOW_PROGRESSION | Ravens::ALLOW_DISTRIBUTE if named_at == 2
+                            allowed <- Ravens::ALLOW_PROGRESSION | Ravens::ALLOW_DISTRIBUTE | Ravens::ALLOW_ARITHMETIC if named_at == 3
+                            found: i64 = Ravens::rule_choices(&kinds, &params, length, allow_arithmetic, allowed, across, true)
+                            printr("choices")
+                            emit_cell(across)
+                            emit_cell(length)
+                            emit_cell(1 if allow_arithmetic else 0)
+                            emit_cell(allowed)
+                            emit_cell(found)
+                            for at in 0..<found |kinds, params, across|:
+                                emit_cell(Ints::at_ref(&kinds, at))
+                                emit_cell(Ints::at_ref(&params, at))
+                                emit_cell(across)
+                            print("")
+
+            # --- what a rule does to a ladder -----------------------------
+            rungs: mutable darray[i64] = Ints::zeros(Ravens::MOST_LADDER)
+            values: mutable darray[i64] = Ints::zeros(Ravens::MOST_PANELS)
+            for across_at in 0..<3 |rungs, values|:
+                across: i64 = 2 + across_at
+                for length_at in 0..<5 |rungs, values, across|:
+                    length: i64 = 3 if length_at == 0 else (4 if length_at == 1 else (5 if length_at == 2 else (7 if length_at == 3 else 9)))
+                    for seed in 1..<3 |rungs, values, across, length|:
+                        for at in 0..<length |rungs|:
+                            Ints::put(&rungs, at, at + 1)
+                        for spec in 0..<10 |rungs, values, across, length, seed|:
+                            kind: mutable i64 = Ravens::RULE_PROGRESSION
+                            param: mutable i64 = 1
+                            if spec == 1:
+                                param <- -1
+                            if spec == 2:
+                                param <- 2
+                            if spec == 3:
+                                param <- -2
+                            if spec == 4 or spec == 5:
+                                kind <- Ravens::RULE_ARITHMETIC
+                                param <- 1 if spec == 4 else -1
+                            if spec == 6 or spec == 7:
+                                kind <- Ravens::RULE_SECOND_ORDER
+                                param <- 1 if spec == 6 else -1
+                            if spec == 8:
+                                kind <- Ravens::RULE_DISTRIBUTE
+                                param <- 0
+                            if spec == 9:
+                                kind <- Ravens::RULE_CONSTANT
+                                param <- 0
+                            base: i64 = across * 1000 + length * 10 + seed
+                            rng: mutable MT19937 = mt19937_new()
+                            mt_seed_int(&rng, (base if spec < 8 else base + 7).u64())
+                            rule: Ravens::Rule = Ravens::Rule{kind: kind, param: param, across: across}
+                            Ravens::apply_rule(&rule, &rungs, length, &values, &rng)
+                            printr("rows")
+                            emit_cell(across)
+                            emit_cell(length)
+                            emit_cell(seed)
+                            emit_cell(spec)
+                            emit_cell(kind)
+                            emit_cell(param)
+                            emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                            for cell in 0..<(across * across) |values|:
+                                emit_cell(Ints::at_ref(&values, cell))
+                            print("")
+
+            # --- the one rule that is not about a ladder ------------------
+            for across_at in 0..<3 |rungs, values|:
+                across: i64 = 2 + across_at
+                for places_at in 0..<2 |rungs, values, across|:
+                    universe: i64 = 4 if places_at == 0 else 9
+                    for op in 0..<3 |rungs, values, across, universe|:
+                        for seed in 1..<4 |rungs, values, across, universe, op|:
+                            for at in 0..<universe |rungs|:
+                                Ints::put(&rungs, at, at)
+                            rng: mutable MT19937 = mt19937_new()
+                            mt_seed_int(&rng, (across * 100 + universe * 10 + seed).u64())
+                            rule: Ravens::Rule = Ravens::Rule{kind: Ravens::RULE_LOGIC, param: op, across: across}
+                            ran: bool = Ravens::apply_rule(&rule, &rungs, universe, &values, &rng)
+                            printr("logic")
+                            emit_cell(across)
+                            emit_cell(universe)
+                            emit_cell(op)
+                            emit_cell(seed)
+                            emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                            # A logic rule that could not be laid leaves rungs
+                            # where its place-sets would have been, which is
+                            # what `isinstance(held, frozenset)` reads on the
+                            # other side; encoded apart so a set of one place
+                            # and the place itself cannot be confused.
+                            for cell in 0..<(across * across) |values, ran|:
+                                held: i64 = Ints::at_ref(&values, cell)
+                                emit_cell(held if ran else 0 - held - 1)
+                            print("")
+
+            # --- the grades -----------------------------------------------
+            for level in 0..<15:
+                g: Ravens::Grade = Ravens::grade_of(level)
+                printr("grade")
+                emit_cell(level)
+                emit_cell(g.across)
+                emit_cell(g.choices)
+                emit_cell(g.active)
+                emit_cell(g.rules)
+                emit_cell(g.sizes)
+                emit_float(g.turn_chance)
+                emit_cell(1 if g.logic else 0)
+                emit_cell(Ravens::grade_layout_count(level))
+                for at in 0..<Ravens::grade_layout_count(level) |level|:
+                    emit_cell(Ravens::grade_layout(level, at))
+                print("")
+
+            # --- whole puzzles --------------------------------------------
+            puzzle: mutable Ravens::Puzzle = Ravens::new_puzzle()
+            dealt: mutable Ravens::Dealt = Ravens::new_dealt()
+            offered: mutable Ravens::Panels = Ravens::new_panels(Ravens::MOST_CHOICE_PANELS)
+            for level in 1..<13 |puzzle, dealt, offered|:
+                for seed in 1..<5 |puzzle, dealt, offered, level|:
+                    for pool in 1..<3 |puzzle, dealt, offered, level, seed|:
+                        rng: mutable MT19937 = mt19937_new()
+                        mt_seed_int(&rng, (level * 100 + seed * 10 + pool).u64())
+                        made: bool = Ravens::generate(puzzle, dealt, offered, level, pool, 80, &rng)
+                        printr("puzzle")
+                        emit_cell(level)
+                        emit_cell(seed)
+                        emit_cell(pool)
+                        emit_cell(puzzle.layout)
+                        emit_cell(puzzle.palette)
+                        emit_cell(puzzle.across)
+                        emit_cell(puzzle.answer)
+                        emit_cell(puzzle.offered.n if made else 0)
+                        emit_cell(puzzle.lines)
+                        for at in 0..<puzzle.lines |puzzle|:
+                            emit_cell(Ints::at_ref(&puzzle.line_part, at))
+                            emit_cell(Ints::at_ref(&puzzle.line_attr, at))
+                            emit_cell(Ints::at_ref(&puzzle.line_kind, at))
+                            emit_cell(Ints::at_ref(&puzzle.line_param, at))
+                        for panel in 0..<(puzzle.across * puzzle.across) |puzzle|:
+                            emit_panel(&puzzle.grid, panel)
+                        for panel in 0..<puzzle.offered.n |puzzle|:
+                            emit_panel(&puzzle.offered, panel)
+                        print("")
+        destroy w
+        return 0

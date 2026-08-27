@@ -1,0 +1,1567 @@
+# Raven's matrices: three rows that all do the same thing, and the piece missing
+# from the last one.
+#
+# Port of the portable half of the neural_workshop/ravens package
+# (GPL-2.0-or-later) -- geometry, palette, figures, layouts, rules and matrix,
+# which is all of it except the renderer. The drawing is the shell's; so is the
+# English, and `explain` here hands back which rule ran on which attribute of
+# which component rather than the sentence, because the sentence is a phrasing
+# and the rule is the fact.
+#
+# Everything works in CELL-LOCAL coordinates: the origin is the top-left of a
+# cell and y grows DOWNWARD, which is the space the original Java generator
+# drew in. Screen space is y-up, so the flip happens once, in the renderer,
+# rather than being spread through the rules where it would be easy to get
+# half-right.
+#
+# The order question, asked once for the whole package: `Logic` builds
+# frozensets of places and folds them with `|`, `&` and `^`, so they are
+# bitmasks here. Nothing ever walks one -- `_spots` takes `sorted(held)`,
+# `alternatives` walks the LADDER and flips one place at a time, and the
+# row test asks only whether the fold is empty, whether the operands are
+# distinct, and whether the fold equals one of them. All of that is order-free,
+# which is why a bitmask is faithful and not merely convenient.
+#
+# A value here is always an i64, and what it MEANS depends on the attribute:
+# a shape id, an index into a size ladder, an index into the palette, an actual
+# count, a turn in degrees, or a bitmask of places. That is what lets one rule
+# engine run over all of them, and it is what the reference does too -- its
+# ladders hold strings, floats, `Fill`s and ints, and no rule but `Arithmetic`
+# looks inside a rung.
+
+extern cos(x: f64) -> f64
+extern sin(x: f64) -> f64
+
+module Ravens:
+
+    const PI: f64 = 3.141592653589793
+
+    # `math.radians(x)` is `x * degToRad` with degToRad computed once, NOT
+    # `x * pi / 180.0`; the two groupings are not the same double, and a shape
+    # placed by one lands a rounding away from a shape placed by the other.
+    const DEG_TO_RAD: f64 = PI / 180.0
+
+    # --- geometry ---------------------------------------------------------
+
+    # Segments an ellipse is flattened into. Cells are drawn at several hundred
+    # pixels and then supersampled, so the flattening has to stay below the
+    # eye's resolution at that size: at 72 segments the chord of a full-cell
+    # circle sits under a third of a pixel from the true arc.
+    const ELLIPSE_SEGMENTS: i64 = 72
+
+    # How round a circle is drawn.
+    const CIRCLE_SEGMENTS: i64 = 64
+
+    # Most corners any outline here has, and most triangles one cuts into.
+    const MOST_CORNERS: i64 = 80
+    const MOST_TRIANGLES: i64 = MOST_CORNERS
+
+    struct Box:
+        min_x: f64
+        min_y: f64
+        max_x: f64
+        max_y: f64
+
+    # An ellipse of this size, centred on the origin.
+    def ellipse_outline(width: f64, height: f64, segments: i64, x: mutable darray[f64]&, y: mutable darray[f64]&) -> i64:
+        can Abort.Panic:
+            half_width: f64 = width / 2.0
+            half_height: f64 = height / 2.0
+            step: f64 = 2.0 * PI / segments.f64()
+            for index in 0..<segments |x, y, half_width, half_height, step|:
+                Floats::put(x, index, half_width * cos(index.f64() * step))
+                Floats::put(y, index, half_height * sin(index.f64() * step))
+            return segments
+
+    # Place an origin-centred outline into the cell.
+    #
+    # Scale first, then rotate, then translate -- the order the Java renderer
+    # composed its AffineTransform in, and not an interchangeable one: rotating
+    # before scaling would shear every shape whose width and height differ.
+    #
+    # The rotation is clockwise on screen, because y grows downward here; the
+    # sign matches what the original drew.
+    def transformed(in_x: mutable darray[f64]&, in_y: mutable darray[f64]&, count: i64,
+                    scale: f64, rotation: i64, at_x: f64, at_y: f64,
+                    out_x: mutable darray[f64]&, out_y: mutable darray[f64]&):
+        can Abort.Panic:
+            radians: f64 = rotation.f64() * DEG_TO_RAD
+            cosine: f64 = cos(radians)
+            sine: f64 = sin(radians)
+            for index in 0..<count |in_x, in_y, out_x, out_y, scale, cosine, sine, at_x, at_y|:
+                x: f64 = Floats::at_ref(in_x, index) * scale
+                y: f64 = Floats::at_ref(in_y, index) * scale
+                Floats::put(out_x, index, x * cosine - y * sine + at_x)
+                Floats::put(out_y, index, x * sine + y * cosine + at_y)
+
+    def bounds(x: mutable darray[f64]&, y: mutable darray[f64]&, count: i64) -> Box:
+        can Abort.Panic:
+            min_x: mutable f64 = Floats::at_ref(x, 0)
+            min_y: mutable f64 = Floats::at_ref(y, 0)
+            max_x: mutable f64 = min_x
+            max_y: mutable f64 = min_y
+            for index in 1..<count |x, y, min_x, min_y, max_x, max_y|:
+                here_x: f64 = Floats::at_ref(x, index)
+                here_y: f64 = Floats::at_ref(y, index)
+                min_x <- here_x if here_x < min_x
+                min_y <- here_y if here_y < min_y
+                max_x <- here_x if here_x > max_x
+                max_y <- here_y if here_y > max_y
+            return Box{min_x: min_x, min_y: min_y, max_x: max_x, max_y: max_y}
+
+    # Twice the signed area; negative when the winding is reversed.
+    def signed_area(x: mutable darray[f64]&, y: mutable darray[f64]&, count: i64) -> f64:
+        can Abort.Panic:
+            total: mutable f64 = 0.0
+            for index in 0..<count |x, y, count, total|:
+                following: i64 = (index + 1) % count
+                total <- total + Floats::at_ref(x, index) * Floats::at_ref(y, following) - Floats::at_ref(x, following) * Floats::at_ref(y, index)
+            return total
+
+    def side_of(ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64) -> f64:
+        return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+
+    # Is the point within the triangle, edges included?
+    def inside(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> bool:
+        one: f64 = side_of(ax, ay, bx, by, px, py)
+        two: f64 = side_of(bx, by, cx, cy, px, py)
+        three: f64 = side_of(cx, cy, ax, ay, px, py)
+        any_below: bool = one < 0.0 or two < 0.0 or three < 0.0
+        any_above: bool = one > 0.0 or two > 0.0 or three > 0.0
+        return not (any_below and any_above)
+
+    # Does the outline turn the same way at every corner?
+    def is_convex(x: mutable darray[f64]&, y: mutable darray[f64]&, count: i64) -> bool:
+        can Abort.Panic:
+            false return if count < 3
+            seen_positive: mutable bool = false
+            seen_negative: mutable bool = false
+            answer: mutable bool = true
+            decided: mutable bool = false
+            for index in 0..<count |x, y, count, seen_positive, seen_negative, answer, decided|:
+                continue if decided
+                back: i64 = (index + count - 1) % count
+                on: i64 = (index + 1) % count
+                cross: f64 = (Floats::at_ref(x, index) - Floats::at_ref(x, back)) * (Floats::at_ref(y, on) - Floats::at_ref(y, index)) - (Floats::at_ref(y, index) - Floats::at_ref(y, back)) * (Floats::at_ref(x, on) - Floats::at_ref(x, index))
+                seen_positive <- true if cross > 0.0
+                seen_negative <- true if cross < 0.0
+                if seen_positive and seen_negative:
+                    answer <- false
+                    decided <- true
+            return answer
+
+    # Cut an outline into triangles, written into `tri` as three corner
+    # positions a triangle. Returns how many.
+    #
+    # A convex outline is fanned from its first corner, which is exact and
+    # costs one triangle per corner. Anything else is ear clipped.
+    #
+    # The distinction is not an optimisation detail: a fan over the tee -- the
+    # one concave shape -- paints straight across the notch between the arms.
+    # Ear clipping is correct for both, but its check that nothing else lies
+    # inside a candidate ear compares every corner against every other, and a
+    # flattened ellipse has seventy-odd corners.
+    def triangulate(x: mutable darray[f64]&, y: mutable darray[f64]&, count: i64,
+                    work_x: mutable darray[f64]&, work_y: mutable darray[f64]&,
+                    tri_x: mutable darray[f64]&, tri_y: mutable darray[f64]&) -> i64:
+        can Abort.Panic:
+            0 return if count < 3
+            left: mutable i64 = count
+            # `corners.reverse()` when the winding runs the other way.
+            flip: bool = signed_area(x, y, count) < 0.0
+            for index in 0..<count |x, y, work_x, work_y, count, flip|:
+                source: i64 = count - 1 - index if flip else index
+                Floats::put(work_x, index, Floats::at_ref(x, source))
+                Floats::put(work_y, index, Floats::at_ref(y, source))
+            made: mutable i64 = 0
+            if is_convex(work_x, work_y, left):
+                for index in 1..<(left - 1) |work_x, work_y, tri_x, tri_y, made|:
+                    Floats::put(tri_x, made * 3, Floats::at_ref(work_x, 0))
+                    Floats::put(tri_y, made * 3, Floats::at_ref(work_y, 0))
+                    Floats::put(tri_x, made * 3 + 1, Floats::at_ref(work_x, index))
+                    Floats::put(tri_y, made * 3 + 1, Floats::at_ref(work_y, index))
+                    Floats::put(tri_x, made * 3 + 2, Floats::at_ref(work_x, index + 1))
+                    Floats::put(tri_y, made * 3 + 2, Floats::at_ref(work_y, index + 1))
+                    made <- made + 1
+                return made
+            guard: mutable i64 = 0
+            running: mutable bool = true
+            while running and left > 3 and guard <= left |running, left, guard, work_x, work_y, tri_x, tri_y, made|:
+                clipped: mutable bool = false
+                for index in 0..<left |clipped, left, work_x, work_y, tri_x, tri_y, made, guard|:
+                    continue if clipped
+                    back: i64 = (index + left - 1) % left
+                    on: i64 = (index + 1) % left
+                    ax: f64 = Floats::at_ref(work_x, back)
+                    ay: f64 = Floats::at_ref(work_y, back)
+                    bx: f64 = Floats::at_ref(work_x, index)
+                    by: f64 = Floats::at_ref(work_y, index)
+                    cx: f64 = Floats::at_ref(work_x, on)
+                    cy: f64 = Floats::at_ref(work_y, on)
+                    cross: f64 = (bx - ax) * (cy - by) - (by - ay) * (cx - bx)
+                    # A reflex corner is not an ear.
+                    continue if cross <= 0.0
+                    blocked: mutable bool = false
+                    for other in 0..<left |blocked, index, work_x, work_y, ax, ay, bx, by, cx, cy|:
+                        continue if other == index
+                        ox: f64 = Floats::at_ref(work_x, other)
+                        oy: f64 = Floats::at_ref(work_y, other)
+                        # `other not in (previous, current, following)` is
+                        # equality on the POINT, not on its position.
+                        continue if (ox == ax and oy == ay) or (ox == bx and oy == by) or (ox == cx and oy == cy)
+                        blocked <- true if inside(ox, oy, ax, ay, bx, by, cx, cy)
+                    # Something else is in the way.
+                    continue if blocked
+                    Floats::put(tri_x, made * 3, ax)
+                    Floats::put(tri_y, made * 3, ay)
+                    Floats::put(tri_x, made * 3 + 1, bx)
+                    Floats::put(tri_y, made * 3 + 1, by)
+                    Floats::put(tri_x, made * 3 + 2, cx)
+                    Floats::put(tri_y, made * 3 + 2, cy)
+                    made <- made + 1
+                    for step in index..<(left - 1) |work_x, work_y|:
+                        Floats::put(work_x, step, Floats::at_ref(work_x, step + 1))
+                        Floats::put(work_y, step, Floats::at_ref(work_y, step + 1))
+                    left <- left - 1
+                    guard <- 0
+                    clipped <- true
+                # No ear found; the outline is degenerate.
+                running <- false if not clipped
+                guard <- guard + 1 if clipped
+            if left == 3:
+                for corner in 0..<3 |work_x, work_y, tri_x, tri_y, made|:
+                    Floats::put(tri_x, made * 3 + corner, Floats::at_ref(work_x, corner))
+                    Floats::put(tri_y, made * 3 + corner, Floats::at_ref(work_y, corner))
+                made <- made + 1
+            return made
+
+    # --- the palette ------------------------------------------------------
+
+    # Fill ids, shared across both palettes: white is in both and is one fill,
+    # which is what `looks_like` comparing `fill.name` means.
+    const FILL_WHITE: i64 = 0
+    const FILL_GREY_LIGHT: i64 = 1
+    const FILL_GREY_MID: i64 = 2
+    const FILL_GREY_DARK: i64 = 3
+    const FILL_BLACK: i64 = 4
+    const FILL_YELLOW: i64 = 5
+    const FILL_SKY: i64 = 6
+    const FILL_VERMILION: i64 = 7
+    const FILL_BLUE: i64 = 8
+
+    const COLOUR_ALPHA: i64 = 200
+
+    const PALETTE_GREYS: i64 = 0
+    const PALETTE_COLOURS: i64 = 1
+
+    def fill_channel(fill: i64, channel: i64) -> i64:
+        red: mutable i64 = 255
+        green: mutable i64 = 255
+        blue: mutable i64 = 255
+        alpha: mutable i64 = 0
+        if fill == FILL_GREY_LIGHT:
+            red <- 191
+            green <- 191
+            blue <- 191
+            alpha <- 102
+        if fill == FILL_GREY_MID:
+            red <- 102
+            green <- 102
+            blue <- 102
+            alpha <- 128
+        if fill == FILL_GREY_DARK:
+            red <- 26
+            green <- 26
+            blue <- 26
+            alpha <- 153
+        if fill == FILL_BLACK:
+            red <- 0
+            green <- 0
+            blue <- 0
+            alpha <- 191
+        if fill == FILL_YELLOW:
+            red <- 240
+            green <- 228
+            blue <- 66
+            alpha <- COLOUR_ALPHA
+        if fill == FILL_SKY:
+            red <- 86
+            green <- 180
+            blue <- 233
+            alpha <- COLOUR_ALPHA
+        if fill == FILL_VERMILION:
+            red <- 213
+            green <- 94
+            blue <- 0
+            alpha <- COLOUR_ALPHA
+        if fill == FILL_BLUE:
+            red <- 0
+            green <- 114
+            blue <- 178
+            alpha <- COLOUR_ALPHA
+        return red if channel == 0
+        return green if channel == 1
+        return blue if channel == 2
+        return alpha
+
+    # A palette holds five fills; white opens both.
+    def palette_fill(palette: i64, index: i64) -> i64:
+        return index if palette == PALETTE_GREYS
+        return 0 if index == 0
+        return FILL_YELLOW + index - 1
+
+    const PALETTE_FILLS: i64 = 5
+
+    # --- the figures ------------------------------------------------------
+
+    const TRIANGLE: i64 = 0
+    const SQUARE: i64 = 1
+    const PENTAGON: i64 = 2
+    const HEXAGON: i64 = 3
+    const CIRCLE: i64 = 4
+    const SHAPE_COUNT: i64 = 5
+
+    # How many sides a figure has, and the angle its first vertex sits at, in
+    # degrees clockwise from straight up.
+    #
+    # The offsets are what make each figure sit the way the eye expects: a
+    # triangle on its base, a square square rather than diamond, a pentagon
+    # with its point up, a hexagon flat-topped. A regular polygon drawn without
+    # one looks tipped over, and a matrix of tipped figures looks like a
+    # mistake rather than a puzzle.
+    def shape_sides(shape: i64) -> i64:
+        return 3 if shape == TRIANGLE
+        return 4 if shape == SQUARE
+        return 5 if shape == PENTAGON
+        return 6 if shape == HEXAGON
+        return 0
+
+    def shape_offset(shape: i64) -> f64:
+        return 45.0 if shape == SQUARE
+        return 30.0 if shape == HEXAGON
+        return 0.0
+
+    # How many turns a rotation rule has to choose between. Three, because that
+    # is what distributing three values across a row needs.
+    const TURNS: i64 = 3
+
+    # Three turns of a shape that actually look different.
+    #
+    # A regular polygon comes back to itself every `360 / sides` degrees, so
+    # the turns worth offering are the ones inside that span. A fixed ladder of
+    # sixths of a turn does not know this: on a triangle it offers 0, 120 and
+    # 240, which are three names for the same triangle, and the rule is then
+    # one the puzzle claims and never shows.
+    def turn_ladder(shape: i64, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            sides: i64 = shape_sides(shape)
+            if sides == 0:
+                # A circle has no orientation at all.
+                Ints::put(out, 0, 0)
+                return 1
+            span: f64 = 360.0 / sides.f64()
+            for index in 0..<TURNS |out, span|:
+                Ints::put(out, index, py_round_half_even(index.f64() * span / TURNS.f64()))
+            return TURNS
+
+    # The outline of one figure, ready to draw.
+    def polygon(shape: i64, radius: f64, cx: f64, cy: f64, angle: f64,
+                x: mutable darray[f64]&, y: mutable darray[f64]&) -> i64:
+        can Abort.Panic:
+            sides: mutable i64 = shape_sides(shape)
+            offset: mutable f64 = shape_offset(shape)
+            if sides == 0:
+                sides <- CIRCLE_SEGMENTS
+                offset <- 0.0
+            start: f64 = (offset + angle - 90.0) * DEG_TO_RAD
+            step: f64 = 2.0 * PI / sides.f64()
+            for index in 0..<sides |x, y, radius, cx, cy, start, step|:
+                Floats::put(x, index, cx + radius * cos(start + index.f64() * step))
+                Floats::put(y, index, cy + radius * sin(start + index.f64() * step))
+            return sides
+
+    # A circle looks the same every way up, and so does any figure whose turn
+    # happens to be a whole number of its own symmetries. Angles are therefore
+    # compared modulo the symmetry rather than outright -- treating a hexagon
+    # turned by a sixth of a turn as a different figure would let two identical
+    # panels both be offered.
+    def figure_turn(shape: i64, angle: i64) -> f64:
+        sides: i64 = shape_sides(shape)
+        return 0.0 if sides == 0
+        span: f64 = 360.0 / sides.f64()
+        whole: f64 = (angle.f64() / span).i64().f64()
+        return angle.f64() - whole * span
+
+    # --- the layouts ------------------------------------------------------
+
+    const LAY_CENTRE: i64 = 0
+    const LAY_LEFT_RIGHT: i64 = 1
+    const LAY_UP_DOWN: i64 = 2
+    const LAY_INSIDE_OUTSIDE: i64 = 3
+    const LAY_GRID_FOUR: i64 = 4
+    const LAY_GRID_NINE: i64 = 5
+    const LAY_TRIPTYCH: i64 = 6
+    const LAYOUT_COUNT: i64 = 7
+
+    const MOST_SLOTS: i64 = 9
+    const MOST_COMPONENTS: i64 = 3
+
+    def layout_components(layout: i64) -> i64:
+        return 2 if layout == LAY_LEFT_RIGHT or layout == LAY_UP_DOWN or layout == LAY_INSIDE_OUTSIDE
+        return 3 if layout == LAY_TRIPTYCH
+        return 1
+
+    def lattice_across(layout: i64) -> i64:
+        return 2 if layout == LAY_GRID_FOUR
+        return 3 if layout == LAY_GRID_NINE
+        return 0
+
+    def component_slots(layout: i64, part: i64) -> i64:
+        across: i64 = lattice_across(layout)
+        return across * across if across > 0
+        return 1
+
+    # `across` by `across` evenly spaced slots filling the panel.
+    def lattice_step(layout: i64) -> f64:
+        return 1.0 / lattice_across(layout).f64()
+
+    def slot_centre_x(layout: i64, part: i64, slot: i64) -> f64:
+        across: i64 = lattice_across(layout)
+        if across > 0:
+            step: f64 = lattice_step(layout)
+            return ((slot % across).f64() + 0.5) * step
+        return 0.27 if layout == LAY_LEFT_RIGHT and part == 0
+        return 0.73 if layout == LAY_LEFT_RIGHT and part == 1
+        return 0.19 if layout == LAY_TRIPTYCH and part == 0
+        return 0.81 if layout == LAY_TRIPTYCH and part == 2
+        return 0.5
+
+    def slot_centre_y(layout: i64, part: i64, slot: i64) -> f64:
+        across: i64 = lattice_across(layout)
+        if across > 0:
+            step: f64 = lattice_step(layout)
+            return ((slot / across).f64() + 0.5) * step
+        return 0.27 if layout == LAY_UP_DOWN and part == 0
+        return 0.73 if layout == LAY_UP_DOWN and part == 1
+        return 0.5
+
+    # The inner figure's room is set so that the largest inner figure is still
+    # comfortably smaller than the smallest outer one. The two components size
+    # themselves independently -- that is the point of having two -- so nothing
+    # else stops a small outer figure and a large inner one from coming out the
+    # same size and reading as one blob.
+    def slot_radius(layout: i64, part: i64, slot: i64) -> f64:
+        across: i64 = lattice_across(layout)
+        return lattice_step(layout) / 2.0 * 0.86 if across > 0
+        return 0.42 if layout == LAY_CENTRE
+        return 0.22 if layout == LAY_LEFT_RIGHT or layout == LAY_UP_DOWN
+        return 0.15 if layout == LAY_TRIPTYCH
+        return 0.44 if part == 0
+        return 0.11
+
+    # How many of a component's slots may be filled. A component with a single
+    # slot is always full; one on a lattice can hold a varying number, which is
+    # what a rule about HOW MANY needs.
+    #
+    # A lattice of nine holding five of its places looks like a lattice with
+    # four things missing; one holding six looks like two rows of three, which
+    # is a number a person can see without counting.
+    def component_counts(layout: i64, part: i64, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            if layout == LAY_GRID_FOUR:
+                for at in 0..<4 |out|:
+                    Ints::put(out, at, at + 1)
+                return 4
+            if layout == LAY_GRID_NINE:
+                for at in 0..<3 |out|:
+                    Ints::put(out, at, 3 * (at + 1))
+                return 3
+            Ints::put(out, 0, 1)
+            return 1
+
+    def varies_in_number(layout: i64, part: i64) -> bool:
+        return lattice_across(layout) > 0
+
+    # The slots a panel holding `count` figures fills. Left to itself a count
+    # takes the first slots in reading order, which puts three figures along
+    # the top of an otherwise empty lattice -- it reads as six figures missing
+    # rather than as three present. Naming the arrangement lets each count sit
+    # squarely in the panel.
+    def component_places(layout: i64, part: i64, count: i64, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            if layout == LAY_GRID_NINE and count == 3:
+                for at in 0..<3 |out|:
+                    Ints::put(out, at, 3 + at)
+                return 3
+            if layout == LAY_GRID_NINE and count == 6:
+                for at in 0..<3 |out|:
+                    Ints::put(out, at, at)
+                    Ints::put(out, 3 + at, 6 + at)
+                return 6
+            held: i64 = count if count < component_slots(layout, part) else component_slots(layout, part)
+            for at in 0..<held |out|:
+                Ints::put(out, at, at)
+            return held
+
+    # --- the size ladders -------------------------------------------------
+    #
+    # A geometric ladder, not an evenly spaced one. What the eye judges is the
+    # RATIO between two sizes, not the difference: stepping by a fixed amount
+    # makes the small end of the ladder obvious and the large end nearly
+    # indistinguishable, which is how a rule about size ends up readable in
+    # some rows and guesswork in others. Every step here is the same multiple.
+    #
+    # `_ladder` is only ever called to build these four, and it rounds to four
+    # places, so they are written out rather than recomputed -- a
+    # correctly-rounded decimal literal is the same double either way, and the
+    # sweep checks it.
+    const LADDER_SIZES: i64 = 0
+    const LADDER_COARSE: i64 = 1
+    const LADDER_FINE: i64 = 2
+    const LADDER_LATTICE: i64 = 3
+
+    def size_ladder_count(ladder: i64) -> i64:
+        return 5 if ladder == LADDER_SIZES
+        return 7 if ladder == LADDER_FINE
+        return 3
+
+    def size_ladder_at(ladder: i64, index: i64) -> f64:
+        if ladder == LADDER_SIZES:
+            return 0.38 if index == 0
+            return 0.4778 if index == 1
+            return 0.6008 if index == 2
+            return 0.7555 if index == 3
+            return 0.95
+        if ladder == LADDER_COARSE:
+            return 0.45 if index == 0
+            return 0.6538 if index == 1
+            return 0.95
+        if ladder == LADDER_LATTICE:
+            return 0.5 if index == 0
+            return 0.6892 if index == 1
+            return 0.95
+        return 0.38 if index == 0
+        return 0.4427 if index == 1
+        return 0.5157 if index == 2
+        return 0.6008 if index == 3
+        return 0.7 if index == 4
+        return 0.8155 if index == 5
+        return 0.95
+
+    # Sizes for figures on a lattice: three steps rather than five, and so
+    # further apart, because a lattice figure is a sixth of a panel across and
+    # five steps there are five sizes nobody can rank. -1 when the component
+    # takes the grade's own ladder.
+    def component_size_ladder(layout: i64, part: i64) -> i64:
+        return LADDER_LATTICE if lattice_across(layout) > 0
+        return -1
+
+    # --- the rules --------------------------------------------------------
+
+    const RULE_CONSTANT: i64 = 0
+    const RULE_PROGRESSION: i64 = 1
+    const RULE_DISTRIBUTE: i64 = 2
+    const RULE_ARITHMETIC: i64 = 3
+    const RULE_SECOND_ORDER: i64 = 4
+    const RULE_LOGIC: i64 = 5
+
+    const OP_OR: i64 = 0
+    const OP_AND: i64 = 1
+    const OP_XOR: i64 = 2
+
+    # How many panels a row holds unless a rule is told otherwise.
+    const ACROSS: i64 = 3
+    const MOST_ACROSS: i64 = 4
+    const MOST_PANELS: i64 = MOST_ACROSS * MOST_ACROSS
+    const MOST_LADDER: i64 = 9
+
+    struct Rule:
+        kind: mutable i64
+        # The progression's step, the arithmetic's sign, the second order's
+        # delta, or the logic's operation. Unused by `constant`.
+        param: mutable i64
+        across: mutable i64
+
+    def rule_fits(kind: i64, param: i64, ladder_n: i64, across: i64, int_ladder: bool) -> bool:
+        return ladder_n >= across if kind == RULE_DISTRIBUTE
+        return ladder_n >= across if kind == RULE_PROGRESSION
+        return ladder_n >= 3 and int_ladder if kind == RULE_ARITHMETIC
+        return across >= 3 and ladder_n > (across - 1) * (across - 1) if kind == RULE_SECOND_ORDER
+        return ladder_n >= 4 if kind == RULE_LOGIC
+        return ladder_n >= 1
+
+    # Rule-name bits, for a grade's `allowed`. -1 is the reference's `None`.
+    const ALLOW_PROGRESSION: i64 = 1
+    const ALLOW_DISTRIBUTE: i64 = 2
+    const ALLOW_ARITHMETIC: i64 = 4
+    const ALLOW_SECOND_ORDER: i64 = 8
+    const ALLOW_CONSTANT: i64 = 16
+    const ALLOW_LOGIC: i64 = 32
+
+    def rule_bit(kind: i64) -> i64:
+        return ALLOW_PROGRESSION if kind == RULE_PROGRESSION
+        return ALLOW_DISTRIBUTE if kind == RULE_DISTRIBUTE
+        return ALLOW_ARITHMETIC if kind == RULE_ARITHMETIC
+        return ALLOW_SECOND_ORDER if kind == RULE_SECOND_ORDER
+        return ALLOW_LOGIC if kind == RULE_LOGIC
+        return ALLOW_CONSTANT
+
+    # Most rules `rule_choices` can offer: three copies of distribute-three,
+    # four progressions, two arithmetics and two second orders.
+    const MOST_CHOICES: i64 = 11
+
+    # Every rule that can actually be applied to this ladder, in the order the
+    # reference builds them -- `rng.choice` indexes this list, so the order is
+    # part of the answer, and so are the THREE copies of distribute-three,
+    # which is how it is weighted.
+    def rule_choices(kinds: mutable darray[i64]&, params: mutable darray[i64]&,
+                     ladder_n: i64, allow_arithmetic: bool, allowed: i64,
+                     across: i64, int_ladder: bool) -> i64:
+        can Abort.Panic:
+            found: mutable i64 = 0
+            if rule_fits(RULE_DISTRIBUTE, 0, ladder_n, across, int_ladder):
+                for _copy in 0..<3 |kinds, params, found|:
+                    Ints::put(kinds, found, RULE_DISTRIBUTE)
+                    Ints::put(params, found, 0)
+                    found <- found + 1
+            for at in 0..<4 |kinds, params, found, ladder_n, across|:
+                step: i64 = 1 if at == 0 else (-1 if at == 1 else (2 if at == 2 else -2))
+                size: i64 = step if step > 0 else 0 - step
+                continue if size * (across - 1) >= ladder_n
+                Ints::put(kinds, found, RULE_PROGRESSION)
+                Ints::put(params, found, step)
+                found <- found + 1
+            if allow_arithmetic and rule_fits(RULE_ARITHMETIC, 0, ladder_n, across, int_ladder):
+                for at in 0..<2 |kinds, params, found|:
+                    Ints::put(kinds, found, RULE_ARITHMETIC)
+                    Ints::put(params, found, 1 if at == 0 else -1)
+                    found <- found + 1
+            if rule_fits(RULE_SECOND_ORDER, 0, ladder_n, across, int_ladder):
+                for at in 0..<2 |kinds, params, found|:
+                    Ints::put(kinds, found, RULE_SECOND_ORDER)
+                    Ints::put(params, found, 1 if at == 0 else -1)
+                    found <- found + 1
+            return found if allowed < 0
+            kept: mutable i64 = 0
+            for at in 0..<found |kinds, params, kept, allowed|:
+                kind: i64 = Ints::at_ref(kinds, at)
+                continue if (allowed & rule_bit(kind)) == 0
+                Ints::put(kinds, kept, kind)
+                Ints::put(params, kept, Ints::at_ref(params, at))
+                kept <- kept + 1
+            return kept
+
+    # One rule that suits this ladder, or `constant` if none does.
+    def choose_rule(ladder_n: i64, allow_arithmetic: bool, allowed: i64,
+                    across: i64, int_ladder: bool, rng: mutable MT19937&) -> Rule:
+        can Memory.Allocate, Abort.Panic:
+            kinds: mutable darray[i64] = Ints::zeros(MOST_CHOICES)
+            params: mutable darray[i64] = Ints::zeros(MOST_CHOICES)
+            found: i64 = rule_choices(&kinds, &params, ladder_n, allow_arithmetic, allowed, across, int_ladder)
+            if found > 0:
+                pick: i64 = py_choice_index(rng, found)
+                return Rule{kind: Ints::at_ref(&kinds, pick), param: Ints::at_ref(&params, pick), across: across}
+            return Rule{kind: RULE_CONSTANT, param: 0, across: across}
+
+    # --- running a rule ---------------------------------------------------
+
+    def constant_rows(ladder: mutable darray[i64]&, ladder_n: i64, across: i64,
+                      values: mutable darray[i64]&, rng: mutable MT19937&):
+        can Abort.Panic:
+            value: i64 = Ints::at_ref(ladder, py_choice_index(rng, ladder_n))
+            for row in 0..<across |values, across, value|:
+                for column in 0..<across |values, across, row, value|:
+                    Ints::put(values, row * across + column, value)
+
+    def progression_rows(step: i64, ladder: mutable darray[i64]&, ladder_n: i64, across: i64,
+                         values: mutable darray[i64]&, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = step if step > 0 else 0 - step
+            span: i64 = size * (across - 1)
+            first: i64 = 0 if step > 0 else span
+            picks_n: i64 = ladder_n - span
+            false return if picks_n <= 0
+            picks: mutable darray[i64] = Ints::zeros(picks_n)
+            for at in 0..<picks_n |picks, first|:
+                Ints::put(&picks, at, first + at)
+            py_shuffle_i64_prefix(rng, &picks, picks_n)
+            for row in 0..<across |values, picks, picks_n, across, step, ladder|:
+                start: i64 = Ints::at_ref(&picks, row % picks_n)
+                for column in 0..<across |values, across, row, start, step, ladder|:
+                    Ints::put(values, row * across + column, Ints::at_ref(ladder, start + step * column))
+            return true
+
+    # Rotated rather than shuffled, so each column holds all of them too. A
+    # player who has found the rule can read the missing value off either the
+    # row or the column, and both agree -- which is what makes a matrix feel
+    # solvable rather than merely consistent.
+    def distribute_rows(ladder: mutable darray[i64]&, ladder_n: i64, across: i64,
+                        values: mutable darray[i64]&, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            false return if ladder_n < across
+            chosen: darray[i64] = py_sample_range(rng, 0, ladder_n - 1, across)
+            for row in 0..<across |values, across, chosen, ladder|:
+                for column in 0..<across |values, across, row, chosen, ladder|:
+                    Ints::put(values, row * across + column,
+                              Ints::at_ref(ladder, Ints::at(chosen, (column + row) % across)))
+            return true
+
+    # The last value is the first plus, or minus, all the between.
+    def arithmetic_rows(sign: i64, ladder: mutable darray[i64]&, ladder_n: i64, across: i64,
+                        values: mutable darray[i64]&, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            lowest: i64 = Ints::at_ref(ladder, 0)
+            highest: i64 = Ints::at_ref(ladder, ladder_n - 1)
+            drawn: mutable darray[i64] = Ints::zeros(MOST_ACROSS)
+            for row in 0..<across |values, drawn, across, sign, ladder, ladder_n, lowest, highest, rng|:
+                placed: mutable bool = false
+                for _try in 0..<200 |values, drawn, across, row, sign, ladder, ladder_n, lowest, highest, placed, rng|:
+                    break if placed
+                    total: mutable i64 = 0
+                    zero_between: mutable bool = false
+                    for panel in 0..<(across - 1) |drawn, ladder, ladder_n, total, zero_between, rng|:
+                        value: i64 = Ints::at_ref(ladder, py_choice_index(rng, ladder_n))
+                        Ints::put(&drawn, panel, value)
+                        if panel > 0:
+                            total <- total + value
+                            zero_between <- true if value == 0
+                    last: i64 = Ints::at_ref(&drawn, 0) + sign * total
+                    continue if last < lowest or last > highest or zero_between
+                    for panel in 0..<(across - 1) |values, drawn, across, row|:
+                        Ints::put(values, row * across + panel, Ints::at_ref(&drawn, panel))
+                    Ints::put(values, row * across + across - 1, last)
+                    placed <- true
+                false return if not placed
+            return true
+
+    # The rule itself changes between rows: each steps further. Row one holds
+    # its value, row two steps along the ladder, row three steps twice as far
+    # -- so no row's rule is the answer, and what has to be inferred is the
+    # progression OF rules.
+    #
+    # The rows start where they like. Tying them to one start would let the
+    # item be read as a plain pattern of positions; left loose, the only thread
+    # through the three rows is the accelerating step.
+    def second_order_rows(delta: i64, ladder: mutable darray[i64]&, ladder_n: i64, across: i64,
+                          values: mutable darray[i64]&, rng: mutable MT19937&) -> bool:
+        can Abort.Panic:
+            for row in 0..<across |values, across, delta, ladder, ladder_n, rng|:
+                step: i64 = delta * row
+                size: i64 = step if step >= 0 else 0 - step
+                span: i64 = size * (across - 1)
+                first: i64 = 0 if step >= 0 else span
+                starts: i64 = ladder_n - span
+                false return if starts <= 0
+                start: i64 = first + py_choice_index(rng, starts)
+                for column in 0..<across |values, across, row, start, step, ladder|:
+                    Ints::put(values, row * across + column, Ints::at_ref(ladder, start + step * column))
+            return true
+
+    def fold_places(op: i64, drawn: mutable darray[i64]&, count: i64) -> i64:
+        can Abort.Panic:
+            folded: mutable i64 = Ints::at_ref(drawn, 0)
+            for at in 1..<count |folded, drawn, op|:
+                panel: i64 = Ints::at_ref(drawn, at)
+                folded <- folded | panel if op == OP_OR
+                folded <- folded & panel if op == OP_AND
+                folded <- folded ^ panel if op == OP_XOR
+            return folded
+
+    # The last panel's filled places follow from all the others'.
+    #
+    # The one rule here that is not about a ladder. The ladder handed in is the
+    # universe of places and the values produced are sets of them. All three
+    # operations are associative, which is what lets a row longer than three
+    # fold them across every panel before the last.
+    def logic_rows(op: i64, ladder: mutable darray[i64]&, ladder_n: i64, across: i64,
+                   values: mutable darray[i64]&, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            drawn: mutable darray[i64] = Ints::zeros(MOST_ACROSS)
+            for row in 0..<across |values, drawn, across, op, ladder, ladder_n, rng|:
+                placed: mutable bool = false
+                for _try in 0..<400 |values, drawn, across, row, op, ladder, ladder_n, placed, rng|:
+                    break if placed
+                    for panel in 0..<(across - 1) |drawn, ladder, ladder_n, rng|:
+                        # Python evaluates `sample(universe, randint(...))`
+                        # left to right, so the count is drawn FIRST.
+                        wanted: i64 = py_randrange(rng, 1, ladder_n)
+                        picks: darray[i64] = py_sample_range(rng, 0, ladder_n - 1, wanted)
+                        mask: mutable i64 = 0
+                        for at in 0..<wanted |mask, picks, ladder|:
+                            mask <- mask | (1 << Ints::at_ref(ladder, Ints::at(picks, at)).u64())
+                        Ints::put(&drawn, panel, mask)
+                    last: i64 = fold_places(op, &drawn, across - 1)
+                    # The row has to SHOW the operation: identical operands
+                    # show nothing, and a result equal to one of them is
+                    # explained by "copy that one" just as well.
+                    continue if last == 0
+                    twinned: mutable bool = false
+                    for panel in 0..<(across - 1) |drawn, across, last, twinned|:
+                        twinned <- true if Ints::at_ref(&drawn, panel) == last
+                        for other in (panel + 1)..<(across - 1) |drawn, panel, twinned|:
+                            twinned <- true if Ints::at_ref(&drawn, panel) == Ints::at_ref(&drawn, other)
+                    continue if twinned
+                    for panel in 0..<(across - 1) |values, drawn, across, row|:
+                        Ints::put(values, row * across + panel, Ints::at_ref(&drawn, panel))
+                    Ints::put(values, row * across + across - 1, last)
+                    placed <- true
+                false return if not placed
+            return true
+
+    # Run a rule, falling back to `constant` if it cannot fit.
+    #
+    # A rule that cannot be laid on a ladder is a generation accident, not a
+    # puzzle worth throwing away: holding the attribute constant leaves a
+    # matrix that is still sound, only easier. The draws the failed attempt
+    # took are spent either way, which is why the fallback is a fallback and
+    # not a re-run.
+    # True when the rule itself ran; false when it could not be laid on the
+    # ladder and the constant took over. The caller needs to know, because a
+    # `logic` rule that fell back leaves plain rungs where its place-SETS would
+    # have been -- which is exactly what the reference's `isinstance(held,
+    # frozenset)` is testing further down, and getting it wrong builds a panel
+    # with no figures in it.
+    def apply_rule(rule: Rule&, ladder: mutable darray[i64]&, ladder_n: i64,
+                   values: mutable darray[i64]&, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            across: i64 = rule.across
+            ran: mutable bool = false
+            if rule.kind == RULE_CONSTANT:
+                constant_rows(ladder, ladder_n, across, values, rng)
+                return true
+            # Written out rather than guarded, because exactly ONE of these
+            # may run: every one of them draws off the generator, and a guard
+            # that evaluated its right-hand side first would spend five rules'
+            # worth of the stream to keep one.
+            if rule.kind == RULE_PROGRESSION:
+                ran <- progression_rows(rule.param, ladder, ladder_n, across, values, rng)
+            if rule.kind == RULE_DISTRIBUTE:
+                ran <- distribute_rows(ladder, ladder_n, across, values, rng)
+            if rule.kind == RULE_ARITHMETIC:
+                ran <- arithmetic_rows(rule.param, ladder, ladder_n, across, values, rng)
+            if rule.kind == RULE_SECOND_ORDER:
+                ran <- second_order_rows(rule.param, ladder, ladder_n, across, values, rng)
+            if rule.kind == RULE_LOGIC:
+                ran <- logic_rows(rule.param, ladder, ladder_n, across, values, rng)
+            true return if ran
+            constant_rows(ladder, ladder_n, across, values, rng)
+            return false
+
+    # --- the matrix -------------------------------------------------------
+
+    const ATTR_SHAPE: i64 = 0
+    const ATTR_SIZE: i64 = 1
+    const ATTR_COLOUR: i64 = 2
+    const ATTR_NUMBER: i64 = 3
+    const ATTR_ANGLE: i64 = 4
+    const MOST_ATTRS: i64 = 5
+
+    const MOST_SLOT_ATTRS: i64 = MOST_COMPONENTS * MOST_ATTRS
+    const MOST_FIGURES: i64 = MOST_COMPONENTS * MOST_SLOTS
+    const MOST_CHOICE_PANELS: i64 = 8
+
+    # Tries before a puzzle is given up on and built again from scratch.
+    const PATIENCE: i64 = 400
+
+    # Every attribute of every component, flattened: `part * MOST_ATTRS + at`.
+    # The reference keeps a list of lists of `Attribute` and looks them up by
+    # name; the names are fixed and few, so the index IS the name here except
+    # for `angle`, which is appended and therefore lands wherever the component
+    # ran out.
+    struct Dealt:
+        parts: mutable i64
+        attrs: mutable darray[i64]
+        name: mutable darray[i64]
+        # The ladder was rewritten to the universe of places, because the
+        # count became a logic rule.
+        is_places: mutable darray[i64]
+        # ...and the rule actually ran, so the VALUES are sets of places and
+        # not rungs. A logic rule that fell back to the constant sets the
+        # first and not the second.
+        masked: mutable darray[i64]
+        ladder: mutable darray[i64]
+        ladder_n: mutable darray[i64]
+        size_ladder: mutable darray[i64]
+        rule_kind: mutable darray[i64]
+        rule_param: mutable darray[i64]
+        rule_across: mutable darray[i64]
+        values: mutable darray[i64]
+
+    def new_dealt() -> Dealt:
+        can Memory.Allocate, Abort.Panic:
+            return Dealt{parts: 0, attrs: Ints::zeros(MOST_COMPONENTS),
+                         name: Ints::zeros(MOST_SLOT_ATTRS), is_places: Ints::zeros(MOST_SLOT_ATTRS),
+                         masked: Ints::zeros(MOST_SLOT_ATTRS),
+                         ladder: Ints::zeros(MOST_SLOT_ATTRS * MOST_LADDER),
+                         ladder_n: Ints::zeros(MOST_SLOT_ATTRS),
+                         size_ladder: Ints::zeros(MOST_SLOT_ATTRS),
+                         rule_kind: Ints::zeros(MOST_SLOT_ATTRS), rule_param: Ints::zeros(MOST_SLOT_ATTRS),
+                         rule_across: Ints::zeros(MOST_SLOT_ATTRS),
+                         values: Ints::zeros(MOST_SLOT_ATTRS * MOST_PANELS)}
+
+    def slot_of(part: i64, at: i64) -> i64:
+        return part * MOST_ATTRS + at
+
+    def attr_value(dealt: mutable Dealt&, slot: i64, row: i64, column: i64, across: i64) -> i64:
+        can Abort.Panic:
+            return Ints::at_ref(&dealt.values, slot * MOST_PANELS + row * across + column)
+
+    # The index of a component's attribute with this name, or -1.
+    def attr_named(dealt: mutable Dealt&, part: i64, name: i64) -> i64:
+        can Abort.Panic:
+            for at in 0..<Ints::at_ref(&dealt.attrs, part) |dealt, part, name|:
+                at return if Ints::at_ref(&dealt.name, slot_of(part, at)) == name
+            return -1
+
+    # One panel's worth of figures, flattened across every panel a grid or a
+    # rank of answers holds. Order does not matter within a panel -- they are
+    # drawn on top of one another -- so panels are compared as collections.
+    struct Panels:
+        n: mutable i64
+        count: mutable darray[i64]
+        shape: mutable darray[i64]
+        fill: mutable darray[i64]
+        angle: mutable darray[i64]
+        part: mutable darray[i64]
+        cx: mutable darray[f64]
+        cy: mutable darray[f64]
+        radius: mutable darray[f64]
+
+    def new_panels(most: i64) -> Panels:
+        can Memory.Allocate, Abort.Panic:
+            return Panels{n: 0, count: Ints::zeros(most),
+                          shape: Ints::zeros(most * MOST_FIGURES), fill: Ints::zeros(most * MOST_FIGURES),
+                          angle: Ints::zeros(most * MOST_FIGURES), part: Ints::zeros(most * MOST_FIGURES),
+                          cx: Floats::zeros(most * MOST_FIGURES), cy: Floats::zeros(most * MOST_FIGURES),
+                          radius: Floats::zeros(most * MOST_FIGURES)}
+
+    # Would these two figures be indistinguishable on the page?
+    #
+    # Both indices point into ONE `Panels`, which is why `_build_choices`
+    # copies the right answer in beside the wrong ones before comparing:
+    # `offered = [answer] + wrong` is a single list in the reference too.
+    def looks_like(panels: mutable Panels&, one: i64, two: i64) -> bool:
+        can Abort.Panic:
+            false return if Ints::at_ref(&panels.shape, one) != Ints::at_ref(&panels.shape, two)
+            false return if Ints::at_ref(&panels.fill, one) != Ints::at_ref(&panels.fill, two)
+            gap_r: f64 = Floats::at_ref(&panels.radius, one) - Floats::at_ref(&panels.radius, two)
+            gap_x: f64 = Floats::at_ref(&panels.cx, one) - Floats::at_ref(&panels.cx, two)
+            gap_y: f64 = Floats::at_ref(&panels.cy, one) - Floats::at_ref(&panels.cy, two)
+            false return if (gap_r if gap_r > 0.0 else 0.0 - gap_r) > 0.000001
+            false return if (gap_x if gap_x > 0.0 else 0.0 - gap_x) > 0.000001
+            false return if (gap_y if gap_y > 0.0 else 0.0 - gap_y) > 0.000001
+            shape: i64 = Ints::at_ref(&panels.shape, one)
+            return figure_turn(shape, Ints::at_ref(&panels.angle, one)) == figure_turn(shape, Ints::at_ref(&panels.angle, two))
+
+    # Do two panels draw the same picture?
+    def same_panel(panels: mutable Panels&, one: i64, two: i64, spent: mutable darray[i64]&) -> bool:
+        can Abort.Panic:
+            held: i64 = Ints::at_ref(&panels.count, one)
+            false return if held != Ints::at_ref(&panels.count, two)
+            for at in 0..<held |spent|:
+                Ints::put(spent, at, 0)
+            for at in 0..<held |panels, one, two, held, spent|:
+                matched: mutable bool = false
+                for candidate in 0..<held |panels, one, two, at, held, spent, matched|:
+                    continue if matched
+                    continue if Ints::at_ref(spent, candidate) != 0
+                    if looks_like(panels, one * MOST_FIGURES + at, two * MOST_FIGURES + candidate):
+                        Ints::put(spent, candidate, 1)
+                        matched <- true
+                false return if not matched
+            return true
+
+    # --- the grades -------------------------------------------------------
+
+    const GRADE_COUNT: i64 = 12
+
+    # The rules the middle grades draw from. The second-order rule -- the rule
+    # that changes between rows -- is held back for the top grades, where
+    # everything takes over.
+    const FIRST_ORDER: i64 = ALLOW_PROGRESSION | ALLOW_DISTRIBUTE | ALLOW_ARITHMETIC
+
+    struct Grade:
+        across: i64
+        choices: i64
+        active: i64
+        # Rule names the live rules may be drawn from; -1 is the reference's
+        # `None`, meaning all of them, and 0 is its empty tuple, meaning none.
+        rules: i64
+        sizes: i64
+        turn_chance: f64
+        # Whether a lattice's HOW MANY may become WHICH PLACES, governed by
+        # combining two panels into a third.
+        logic: bool
+
+    def grade_of(level: i64) -> Grade:
+        index: mutable i64 = level - 1
+        index <- 0 if index < 0
+        index <- GRADE_COUNT - 1 if index > GRADE_COUNT - 1
+        return Grade{across: 2, choices: 4, active: 0, rules: 0, sizes: LADDER_COARSE, turn_chance: 0.0, logic: false} if index == 0
+        return Grade{across: 2, choices: 4, active: 1, rules: ALLOW_PROGRESSION, sizes: LADDER_COARSE, turn_chance: 0.0, logic: false} if index == 1
+        return Grade{across: 3, choices: 4, active: 1, rules: ALLOW_PROGRESSION | ALLOW_DISTRIBUTE, sizes: LADDER_COARSE, turn_chance: 0.0, logic: false} if index == 2
+        return Grade{across: 3, choices: 8, active: 2, rules: FIRST_ORDER, sizes: LADDER_SIZES, turn_chance: 0.0, logic: false} if index == 3
+        return Grade{across: 3, choices: 8, active: 3, rules: FIRST_ORDER, sizes: LADDER_SIZES, turn_chance: 0.2, logic: false} if index == 4
+        return Grade{across: 3, choices: 8, active: 3, rules: FIRST_ORDER, sizes: LADDER_SIZES, turn_chance: 0.2, logic: false} if index == 5
+        return Grade{across: 3, choices: 8, active: 4, rules: FIRST_ORDER, sizes: LADDER_SIZES, turn_chance: 0.25, logic: false} if index == 6
+        return Grade{across: 3, choices: 8, active: 5, rules: FIRST_ORDER, sizes: LADDER_SIZES, turn_chance: 0.25, logic: true} if index == 7
+        return Grade{across: 3, choices: 8, active: 6, rules: -1, sizes: LADDER_FINE, turn_chance: 0.3, logic: true} if index == 8
+        return Grade{across: 3, choices: 8, active: 7, rules: -1, sizes: LADDER_FINE, turn_chance: 0.4, logic: true} if index == 9
+        # The four-by-four grades keep to the layouts whose ladders can
+        # actually carry four-wide rules. A lattice's three-rung sizes and
+        # counts cap it at three live rules there, which made a level-12
+        # lattice puzzle lighter than a level-8 one -- and with no lattice in
+        # the pool the logic rule has nowhere to live, so it is not claimed.
+        return Grade{across: 4, choices: 8, active: 8, rules: -1, sizes: LADDER_FINE, turn_chance: 0.5, logic: false} if index == 10
+        return Grade{across: 4, choices: 8, active: 9, rules: -1, sizes: LADDER_FINE, turn_chance: 0.6, logic: false}
+
+    def grade_layout_count(level: i64) -> i64:
+        index: mutable i64 = level - 1
+        index <- 0 if index < 0
+        index <- GRADE_COUNT - 1 if index > GRADE_COUNT - 1
+        return 2 if index == 0
+        return 1 if index == 1
+        return 3 if index == 2
+        return 3 if index == 3
+        return 3 if index == 4
+        return 3 if index == 5
+        return 3 if index == 6
+        return 4 if index == 7
+        return 3 if index == 8
+        return 3 if index == 9
+        return 2 if index == 10
+        return 1
+
+    def grade_layout(level: i64, at: i64) -> i64:
+        index: mutable i64 = level - 1
+        index <- 0 if index < 0
+        index <- GRADE_COUNT - 1 if index > GRADE_COUNT - 1
+        if index == 0:
+            return LAY_CENTRE if at == 0
+            return LAY_GRID_FOUR
+        return LAY_CENTRE if index == 1
+        # SIMPLE_LAYOUTS -- one component, which is all a one-rule puzzle needs
+        # and all an easy one should carry.
+        if index >= 2 and index <= 4:
+            return LAY_CENTRE if at == 0
+            return LAY_GRID_FOUR if at == 1
+            return LAY_GRID_NINE
+        # PAIRED_LAYOUTS -- two components, two questions asked at once.
+        if index >= 5 and index <= 7:
+            return LAY_LEFT_RIGHT if at == 0
+            return LAY_UP_DOWN if at == 1
+            return LAY_INSIDE_OUTSIDE if at == 2
+            return LAY_GRID_NINE
+        if index == 8:
+            return LAY_INSIDE_OUTSIDE if at == 0
+            return LAY_TRIPTYCH if at == 1
+            return LAY_GRID_NINE
+        if index == 9:
+            return LAY_TRIPTYCH if at == 0
+            return LAY_INSIDE_OUTSIDE if at == 1
+            return LAY_GRID_NINE
+        if index == 10:
+            return LAY_TRIPTYCH if at == 0
+            return LAY_INSIDE_OUTSIDE
+        return LAY_TRIPTYCH
+
+    # --- dealing the rules ------------------------------------------------
+
+    # The attributes of one component, in the order rules are dealt.
+    def attributes_of(dealt: mutable Dealt&, layout: i64, part: i64, grade: Grade&):
+        can Abort.Panic:
+            held: mutable i64 = 0
+            # shape
+            slot: mutable i64 = slot_of(part, 0)
+            Ints::put(&dealt.name, slot, ATTR_SHAPE)
+            Ints::put(&dealt.is_places, slot, 0)
+            Ints::put(&dealt.masked, slot, 0)
+            Ints::put(&dealt.size_ladder, slot, -1)
+            for rung in 0..<SHAPE_COUNT |dealt, slot|:
+                Ints::put(&dealt.ladder, slot * MOST_LADDER + rung, rung)
+            Ints::put(&dealt.ladder_n, slot, SHAPE_COUNT)
+            held <- held + 1
+            # size -- the component's own ladder where it has one, else the
+            # grade's.
+            slot <- slot_of(part, 1)
+            own: i64 = component_size_ladder(layout, part)
+            which: i64 = grade.sizes if own < 0 else own
+            Ints::put(&dealt.name, slot, ATTR_SIZE)
+            Ints::put(&dealt.is_places, slot, 0)
+            Ints::put(&dealt.masked, slot, 0)
+            Ints::put(&dealt.size_ladder, slot, which)
+            for rung in 0..<size_ladder_count(which) |dealt, slot|:
+                Ints::put(&dealt.ladder, slot * MOST_LADDER + rung, rung)
+            Ints::put(&dealt.ladder_n, slot, size_ladder_count(which))
+            held <- held + 1
+            # colour
+            slot <- slot_of(part, 2)
+            Ints::put(&dealt.name, slot, ATTR_COLOUR)
+            Ints::put(&dealt.is_places, slot, 0)
+            Ints::put(&dealt.masked, slot, 0)
+            Ints::put(&dealt.size_ladder, slot, -1)
+            for rung in 0..<PALETTE_FILLS |dealt, slot|:
+                Ints::put(&dealt.ladder, slot * MOST_LADDER + rung, rung)
+            Ints::put(&dealt.ladder_n, slot, PALETTE_FILLS)
+            held <- held + 1
+            if varies_in_number(layout, part):
+                slot <- slot_of(part, 3)
+                Ints::put(&dealt.name, slot, ATTR_NUMBER)
+                Ints::put(&dealt.is_places, slot, 0)
+                Ints::put(&dealt.masked, slot, 0)
+                Ints::put(&dealt.size_ladder, slot, -1)
+                counts: mutable darray[i64] = Ints::zeros(MOST_LADDER)
+                many: i64 = component_counts(layout, part, &counts)
+                for rung in 0..<many |dealt, slot, counts|:
+                    Ints::put(&dealt.ladder, slot * MOST_LADDER + rung, Ints::at_ref(&counts, rung))
+                Ints::put(&dealt.ladder_n, slot, many)
+                held <- held + 1
+            Ints::put(&dealt.attrs, part, held)
+
+    def ladder_ref(dealt: mutable Dealt&, slot: i64, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            n: i64 = Ints::at_ref(&dealt.ladder_n, slot)
+            for rung in 0..<n |dealt, slot, out|:
+                Ints::put(out, rung, Ints::at_ref(&dealt.ladder, slot * MOST_LADDER + rung))
+            return n
+
+    # Give every attribute a rule, `grade.active` of them live.
+    #
+    # Which attributes get the interesting rules is drawn rather than fixed, so
+    # two puzzles at the same grade are not the same puzzle with different
+    # figures in it. A grade asking for more live rules than the layout has
+    # attributes simply lights them all.
+    def deal_rules(dealt: mutable Dealt&, layout: i64, palette: i64, grade: Grade&, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            parts: i64 = layout_components(layout)
+            dealt.parts <- parts
+            for part in 0..<parts |dealt, layout, grade|:
+                attributes_of(dealt, layout, part, grade)
+            order: mutable darray[i64] = Ints::zeros(MOST_SLOT_ATTRS)
+            total: mutable i64 = 0
+            for part in 0..<parts |dealt, order, total|:
+                for at in 0..<Ints::at_ref(&dealt.attrs, part) |order, total, part|:
+                    Ints::put(&order, total, slot_of(part, at))
+                    total <- total + 1
+            py_shuffle_i64_prefix(rng, &order, total)
+            rungs: mutable darray[i64] = Ints::zeros(MOST_LADDER)
+            for index in 0..<total |dealt, order, layout, grade, rungs, rng|:
+                slot: i64 = Ints::at_ref(&order, index)
+                part: i64 = slot / MOST_ATTRS
+                name: i64 = Ints::at_ref(&dealt.name, slot)
+                Ints::put(&dealt.rule_across, slot, grade.across)
+                if index >= grade.active:
+                    Ints::put(&dealt.rule_kind, slot, RULE_CONSTANT)
+                    Ints::put(&dealt.rule_param, slot, 0)
+                    continue
+                turned: mutable bool = false
+                if name == ATTR_NUMBER and grade.logic and component_slots(layout, part) >= 4:
+                    turned <- py_random(rng) < 0.5
+                if turned:
+                    # The count becomes a set of places, and the rule becomes
+                    # one about combining panels. The ladder becomes the
+                    # universe of places -- which is both what the rule draws
+                    # from and what a near miss flips within.
+                    places: i64 = component_slots(layout, part)
+                    Ints::put(&dealt.is_places, slot, 1)
+                    for rung in 0..<places |dealt, slot|:
+                        Ints::put(&dealt.ladder, slot * MOST_LADDER + rung, rung)
+                    Ints::put(&dealt.ladder_n, slot, places)
+                    Ints::put(&dealt.rule_kind, slot, RULE_LOGIC)
+                    Ints::put(&dealt.rule_param, slot, py_choice_index(rng, 3))
+                    continue
+                picked: Rule = choose_rule(Ints::at_ref(&dealt.ladder_n, slot),
+                                           name == ATTR_NUMBER, grade.rules, grade.across,
+                                           name == ATTR_NUMBER, rng)
+                Ints::put(&dealt.rule_kind, slot, picked.kind)
+                Ints::put(&dealt.rule_param, slot, picked.param)
+            for part in 0..<parts |dealt, grade, rungs, rng|:
+                for at in 0..<Ints::at_ref(&dealt.attrs, part) |dealt, part, rungs, rng|:
+                    slot: i64 = slot_of(part, at)
+                    n: i64 = ladder_ref(dealt, slot, &rungs)
+                    rule: Rule = Rule{kind: Ints::at_ref(&dealt.rule_kind, slot),
+                                      param: Ints::at_ref(&dealt.rule_param, slot),
+                                      across: Ints::at_ref(&dealt.rule_across, slot)}
+                    values: mutable darray[i64] = Ints::zeros(MOST_PANELS)
+                    ran: bool = apply_rule(&rule, &rungs, n, &values, rng)
+                    Ints::put(&dealt.masked, slot, 1 if ran and Ints::at_ref(&dealt.is_places, slot) != 0 else 0)
+                    for cell in 0..<MOST_PANELS |dealt, slot, values|:
+                        Ints::put(&dealt.values, slot * MOST_PANELS + cell, Ints::at_ref(&values, cell))
+                # A turn is only offered when the figure is the same all the
+                # way across, because how far a figure must turn before it
+                # looks turned depends on how symmetrical it is, and there is
+                # one ladder per matrix. A circle's ladder has one rung -- it
+                # looks the same every way up -- so a circle is never turned
+                # without that having to be said anywhere.
+                shape_slot: i64 = slot_of(part, 0)
+                offered: mutable bool = false
+                if Ints::at_ref(&dealt.rule_kind, shape_slot) == RULE_CONSTANT:
+                    offered <- py_random(rng) < grade.turn_chance
+                continue if not offered
+                turns: mutable darray[i64] = Ints::zeros(MOST_LADDER)
+                turn_n: i64 = turn_ladder(attr_value(dealt, shape_slot, 0, 0, grade.across), &turns)
+                turning: Rule = choose_rule(turn_n, false, -1, grade.across, true, rng)
+                # On a grid no turn rule fits -- four-by-four asks more of the
+                # three-rung turn ladder than it has -- and a held tilt would
+                # be noise, not a question. Leave it out. No angle attribute at
+                # all otherwise, rather than one held at zero: a held attribute
+                # is still something a wrong answer may change, and a tilted
+                # figure among eight upright ones is a wrong answer anybody can
+                # dismiss without reading the matrix.
+                continue if turning.kind == RULE_CONSTANT
+                at: i64 = Ints::at_ref(&dealt.attrs, part)
+                slot: i64 = slot_of(part, at)
+                Ints::put(&dealt.name, slot, ATTR_ANGLE)
+                Ints::put(&dealt.is_places, slot, 0)
+                Ints::put(&dealt.masked, slot, 0)
+                Ints::put(&dealt.size_ladder, slot, -1)
+                for rung in 0..<turn_n |dealt, slot, turns|:
+                    Ints::put(&dealt.ladder, slot * MOST_LADDER + rung, Ints::at_ref(&turns, rung))
+                Ints::put(&dealt.ladder_n, slot, turn_n)
+                Ints::put(&dealt.rule_kind, slot, turning.kind)
+                Ints::put(&dealt.rule_param, slot, turning.param)
+                Ints::put(&dealt.rule_across, slot, turning.across)
+                values: mutable darray[i64] = Ints::zeros(MOST_PANELS)
+                # A turn rule is never a logic rule, so whether it ran changes
+                # nothing about how its values are read.
+                apply_rule(&turning, &turns, turn_n, &values, rng)
+                for cell in 0..<MOST_PANELS |dealt, slot, values|:
+                    Ints::put(&dealt.values, slot * MOST_PANELS + cell, Ints::at_ref(&values, cell))
+                Ints::put(&dealt.attrs, part, at + 1)
+
+    # The slots a panel fills, from a count or a set of places.
+    #
+    # A count takes its named arrangement, fixed per count rather than drawn,
+    # so that a matrix whose rule is about how many reads as figures being
+    # added rather than as figures moving about. A set of places -- the logic
+    # rule's values -- IS the arrangement, and `sorted(held)` is why a bitmask
+    # can stand in for it.
+    def spots_of(layout: i64, part: i64, held: i64, is_places: bool, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            if is_places:
+                found: mutable i64 = 0
+                for place in 0..<component_slots(layout, part) |out, found, held|:
+                    continue if (held & (1 << place.u64())) == 0
+                    Ints::put(out, found, place)
+                    found <- found + 1
+                return found
+            return component_places(layout, part, held, out)
+
+    # --- building the panels ----------------------------------------------
+
+    def put_figure(panels: mutable Panels&, panel: i64, at: i64, shape: i64, cx: f64, cy: f64,
+                   radius: f64, fill: i64, angle: i64, part: i64):
+        can Abort.Panic:
+            index: i64 = panel * MOST_FIGURES + at
+            Ints::put(&panels.shape, index, shape)
+            Ints::put(&panels.fill, index, fill)
+            Ints::put(&panels.angle, index, angle)
+            Ints::put(&panels.part, index, part)
+            Floats::put(&panels.cx, index, cx)
+            Floats::put(&panels.cy, index, cy)
+            Floats::put(&panels.radius, index, radius)
+
+    def copy_panel(out: mutable Panels&, into: i64, source: mutable Panels&, from_at: i64):
+        can Abort.Panic:
+            held: i64 = Ints::at_ref(&source.count, from_at)
+            Ints::put(&out.count, into, held)
+            for at in 0..<held |out, into, source, from_at|:
+                Ints::put(&out.shape, into * MOST_FIGURES + at, Ints::at_ref(&source.shape, from_at * MOST_FIGURES + at))
+                Ints::put(&out.fill, into * MOST_FIGURES + at, Ints::at_ref(&source.fill, from_at * MOST_FIGURES + at))
+                Ints::put(&out.angle, into * MOST_FIGURES + at, Ints::at_ref(&source.angle, from_at * MOST_FIGURES + at))
+                Ints::put(&out.part, into * MOST_FIGURES + at, Ints::at_ref(&source.part, from_at * MOST_FIGURES + at))
+                Floats::put(&out.cx, into * MOST_FIGURES + at, Floats::at_ref(&source.cx, from_at * MOST_FIGURES + at))
+                Floats::put(&out.cy, into * MOST_FIGURES + at, Floats::at_ref(&source.cy, from_at * MOST_FIGURES + at))
+                Floats::put(&out.radius, into * MOST_FIGURES + at, Floats::at_ref(&source.radius, from_at * MOST_FIGURES + at))
+
+    # One panel's figures, from whatever values the caller decided each
+    # attribute holds. `_build_panels` reads them out of the grid; a wrong
+    # answer reads them out of the last cell with some swapped -- rebuilt
+    # through the same machinery rather than edited in place, so a wrong answer
+    # is always a panel the layout could have produced.
+    def lay_panel(panels: mutable Panels&, panel: i64, dealt: mutable Dealt&, layout: i64,
+                  palette: i64, across: i64, row: i64, column: i64,
+                  swap_part: mutable darray[i64]&, swap_name: mutable darray[i64]&,
+                  swap_value: mutable darray[i64]&, swap_n: i64):
+        can Memory.Allocate, Abort.Panic:
+            spots: mutable darray[i64] = Ints::zeros(MOST_SLOTS)
+            counts: mutable darray[i64] = Ints::zeros(MOST_LADDER)
+            figures: mutable i64 = 0
+            for part in 0..<dealt.parts |panels, panel, dealt, layout, palette, across, row, column, spots, counts, figures, swap_part, swap_name, swap_value, swap_n|:
+                many: i64 = component_counts(layout, part, &counts)
+                number_at: i64 = attr_named(dealt, part, ATTR_NUMBER)
+                is_places: bool = number_at >= 0 and Ints::at_ref(&dealt.masked, slot_of(part, number_at)) != 0
+                held: mutable i64 = Ints::at_ref(&counts, 0)
+                shape: mutable i64 = 0
+                size_index: mutable i64 = 0
+                size_which: mutable i64 = LADDER_SIZES
+                fill_index: mutable i64 = 0
+                angle: mutable i64 = 0
+                for name in 0..<MOST_ATTRS |dealt, part, across, row, column, held, shape, size_index, size_which, fill_index, angle, swap_part, swap_name, swap_value, swap_n|:
+                    slot_at: i64 = attr_named(dealt, part, name)
+                    value: mutable i64 = -1
+                    found: mutable bool = false
+                    for at in 0..<swap_n |swap_part, swap_name, swap_value, part, name, value, found|:
+                        continue if Ints::at_ref(swap_part, at) != part or Ints::at_ref(swap_name, at) != name
+                        value <- Ints::at_ref(swap_value, at)
+                        found <- true
+                    if not found and slot_at >= 0:
+                        value <- attr_value(dealt, slot_of(part, slot_at), row, column, across)
+                        found <- true
+                    if slot_at >= 0 and name == ATTR_SIZE:
+                        size_which <- Ints::at_ref(&dealt.size_ladder, slot_of(part, slot_at))
+                    continue if not found
+                    held <- value if name == ATTR_NUMBER
+                    shape <- value if name == ATTR_SHAPE
+                    size_index <- value if name == ATTR_SIZE
+                    fill_index <- value if name == ATTR_COLOUR
+                    angle <- value if name == ATTR_ANGLE
+                size: f64 = size_ladder_at(size_which, size_index)
+                fill: i64 = palette_fill(palette, fill_index)
+                places: i64 = spots_of(layout, part, held, is_places, &spots)
+                for at in 0..<places |panels, panel, layout, part, spots, shape, size, fill, angle, figures|:
+                    slot: i64 = Ints::at_ref(&spots, at)
+                    put_figure(panels, panel, figures, shape,
+                               slot_centre_x(layout, part, slot), slot_centre_y(layout, part, slot),
+                               slot_radius(layout, part, slot) * size, fill, angle, part)
+                    figures <- figures + 1
+            Ints::put(&panels.count, panel, figures)
+
+    # Run every component's attributes out into the grid's panels.
+    def build_panels(panels: mutable Panels&, dealt: mutable Dealt&, layout: i64, palette: i64, across: i64):
+        can Memory.Allocate, Abort.Panic:
+            empty: mutable darray[i64] = Ints::zeros(1)
+            panels.n <- across * across
+            for row in 0..<across |panels, dealt, layout, palette, across, empty|:
+                for column in 0..<across |panels, dealt, layout, palette, across, row, empty|:
+                    lay_panel(panels, row * across + column, dealt, layout, palette, across,
+                              row, column, &empty, &empty, &empty, 0)
+
+    # --- the near misses --------------------------------------------------
+
+    # Every value a wrong answer could swap in for this one.
+    #
+    # For a ladder attribute, the other rungs. For the logic rule's place-sets,
+    # every set one flip away -- one place added or one removed -- so the wrong
+    # answer is a near miss rather than a different picture entirely.
+    def alternatives(dealt: mutable Dealt&, slot: i64, value: i64, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            n: i64 = Ints::at_ref(&dealt.ladder_n, slot)
+            found: mutable i64 = 0
+            if Ints::at_ref(&dealt.masked, slot) != 0:
+                for rung in 0..<n |dealt, slot, out, found, value|:
+                    place: i64 = Ints::at_ref(&dealt.ladder, slot * MOST_LADDER + rung)
+                    flipped: i64 = value ^ (1 << place.u64())
+                    continue if flipped == 0
+                    Ints::put(out, found, flipped)
+                    found <- found + 1
+                return found
+            for rung in 0..<n |dealt, slot, out, found, value|:
+                held: i64 = Ints::at_ref(&dealt.ladder, slot * MOST_LADDER + rung)
+                continue if held == value
+                Ints::put(out, found, held)
+                found <- found + 1
+            return found
+
+    # Which targeted attributes each wrong answer alters, as a bitmask a
+    # wrong answer's swaps are read out of.
+    #
+    # Every design here has each target altered in exactly half of the answers
+    # offered (the right answer counting as unaltered), which is the balance
+    # the module is about. Four targets is the ceiling on purpose: a wider
+    # design exists -- seven targets, each answer altering a run of four round
+    # a circle -- and it keeps every single attribute balanced, but it leaks
+    # the other way, and "pick the odd one out" found the right answer 44 per
+    # cent of the time.
+    def design_width(choices: i64, targets: i64) -> i64:
+        return 2 if choices == 4
+        return 4 if targets >= 4
+        return 3
+
+    def design_rows(choices: i64, targets: i64) -> i64:
+        return 3 if choices == 4
+        return 7
+
+    def design_mask(choices: i64, targets: i64, at: i64) -> i64:
+        if choices == 4:
+            return 1 if at == 0
+            return 2 if at == 1
+            return 3
+        if targets >= 4:
+            # All six pairs, then all four at once.
+            return 3 if at == 0
+            return 12 if at == 1
+            return 5 if at == 2
+            return 10 if at == 3
+            return 9 if at == 4
+            return 6 if at == 5
+            return 15
+        # Every combination of the three, in mask order.
+        return at + 1
+
+    struct Puzzle:
+        dealt: mutable bool
+        layout: mutable i64
+        palette: mutable i64
+        across: mutable i64
+        answer: mutable i64
+        grid: mutable Panels
+        offered: mutable Panels
+        # One line per rule that actually does something. The English is the
+        # shell's; what is here is which rule ran on which attribute of which
+        # component, which is the fact the sentence is made of.
+        lines: mutable i64
+        line_part: mutable darray[i64]
+        line_attr: mutable darray[i64]
+        line_kind: mutable darray[i64]
+        line_param: mutable darray[i64]
+
+    def new_puzzle() -> Puzzle:
+        can Memory.Allocate, Abort.Panic:
+            return Puzzle{dealt: false, layout: 0, palette: 0, across: 0, answer: 0,
+                          grid: new_panels(MOST_PANELS), offered: new_panels(MOST_CHOICE_PANELS),
+                          lines: 0, line_part: Ints::zeros(MOST_SLOT_ATTRS),
+                          line_attr: Ints::zeros(MOST_SLOT_ATTRS),
+                          line_kind: Ints::zeros(MOST_SLOT_ATTRS),
+                          line_param: Ints::zeros(MOST_SLOT_ATTRS)}
+
+    def explain(out: mutable Puzzle&, dealt: mutable Dealt&):
+        can Abort.Panic:
+            out.lines <- 0
+            for part in 0..<dealt.parts |out, dealt|:
+                for at in 0..<Ints::at_ref(&dealt.attrs, part) |out, dealt, part|:
+                    slot: i64 = slot_of(part, at)
+                    continue if Ints::at_ref(&dealt.rule_kind, slot) == RULE_CONSTANT
+                    Ints::put(&out.line_part, out.lines, part)
+                    Ints::put(&out.line_attr, out.lines, Ints::at_ref(&dealt.name, slot))
+                    Ints::put(&out.line_kind, out.lines, Ints::at_ref(&dealt.rule_kind, slot))
+                    Ints::put(&out.line_param, out.lines, Ints::at_ref(&dealt.rule_param, slot))
+                    out.lines <- out.lines + 1
+
+    # --- the answers offered ----------------------------------------------
+
+    # The answers offered, and where the right one was put. False where the
+    # attempt stalled and the caller should build another.
+    def build_choices(out: mutable Puzzle&, dealt: mutable Dealt&, offered: mutable Panels&,
+                      layout: i64, palette: i64, grade: Grade&, level: i64,
+                      rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            across: i64 = grade.across
+            answer_at: i64 = (across - 1) * across + across - 1
+            false return if Ints::at_ref(&out.grid.count, answer_at) == 0
+
+            targets: mutable darray[i64] = Ints::zeros(MOST_SLOT_ATTRS)
+            found: mutable i64 = 0
+            for part in 0..<dealt.parts |dealt, targets, found|:
+                for at in 0..<Ints::at_ref(&dealt.attrs, part) |dealt, part, targets, found|:
+                    slot: i64 = slot_of(part, at)
+                    continue if Ints::at_ref(&dealt.ladder_n, slot) <= 1
+                    Ints::put(&targets, found, slot)
+                    found <- found + 1
+            py_shuffle_i64_prefix(rng, &targets, found)
+            # Live rules first: a wrong answer that breaks a rule the matrix
+            # actually runs is a test of that rule, where one that breaks a
+            # held attribute only tests whether the player noticed the theme.
+            # `list.sort` is stable, so the shuffle survives inside each half.
+            for index in 1..<found |targets, dealt|:
+                slot: i64 = Ints::at_ref(&targets, index)
+                key: i64 = 1 if Ints::at_ref(&dealt.rule_kind, slot) == RULE_CONSTANT else 0
+                at: mutable i64 = index - 1
+                placing: mutable bool = true
+                while placing and at >= 0 |targets, dealt, at, placing, key|:
+                    held: i64 = Ints::at_ref(&targets, at)
+                    held_key: i64 = 1 if Ints::at_ref(&dealt.rule_kind, held) == RULE_CONSTANT else 0
+                    if held_key > key:
+                        Ints::put(&targets, at + 1, held)
+                        at <- at - 1
+                    else:
+                        placing <- false
+                Ints::put(&targets, at + 1, slot)
+
+            width: i64 = design_width(grade.choices, found)
+            rows: i64 = design_rows(grade.choices, found)
+            swap_part: mutable darray[i64] = Ints::zeros(MOST_SLOT_ATTRS)
+            swap_name: mutable darray[i64] = Ints::zeros(MOST_SLOT_ATTRS)
+            swap_value: mutable darray[i64] = Ints::zeros(MOST_SLOT_ATTRS)
+            options: mutable darray[i64] = Ints::zeros(MOST_LADDER)
+            picked: mutable i64 = 0
+            for index in 0..<found |out, dealt, targets, swap_part, swap_name, swap_value, options, picked, width, across, rng|:
+                break if picked == width
+                slot: i64 = Ints::at_ref(&targets, index)
+                part: i64 = slot / MOST_ATTRS
+                name: i64 = Ints::at_ref(&dealt.name, slot)
+                # A figure swap can land on a circle and erase the turn, so a
+                # shape and an angle of the same component never both serve:
+                # two combinations would collapse into one picture.
+                if name == ATTR_SHAPE or name == ATTR_ANGLE:
+                    clash: mutable bool = false
+                    for at in 0..<picked |swap_part, swap_name, part, clash|:
+                        continue if Ints::at_ref(&swap_part, at) != part
+                        held: i64 = Ints::at_ref(&swap_name, at)
+                        clash <- true if held == ATTR_SHAPE or held == ATTR_ANGLE
+                    continue if clash
+                value: i64 = attr_value(dealt, slot, across - 1, across - 1, across)
+                many: i64 = alternatives(dealt, slot, value, &options)
+                continue if many == 0
+                Ints::put(&swap_part, picked, part)
+                Ints::put(&swap_name, picked, name)
+                Ints::put(&swap_value, picked, Ints::at_ref(&options, py_choice_index(rng, many)))
+                picked <- picked + 1
+            false return if picked < width
+
+            # `offered = [answer] + wrong`, built as one rank so the pairwise
+            # test below reads them the same way.
+            offered.n <- rows + 1
+            copy_panel(offered, 0, &out.grid, answer_at)
+            live_part: mutable darray[i64] = Ints::zeros(MOST_SLOT_ATTRS)
+            live_name: mutable darray[i64] = Ints::zeros(MOST_SLOT_ATTRS)
+            live_value: mutable darray[i64] = Ints::zeros(MOST_SLOT_ATTRS)
+            for at in 0..<rows |offered, dealt, layout, palette, grade, across, rows, picked, swap_part, swap_name, swap_value, live_part, live_name, live_value|:
+                mask: i64 = design_mask(grade.choices, picked, at)
+                live: mutable i64 = 0
+                for which in 0..<picked |mask, swap_part, swap_name, swap_value, live_part, live_name, live_value, live|:
+                    continue if (mask & (1 << which.u64())) == 0
+                    Ints::put(&live_part, live, Ints::at_ref(&swap_part, which))
+                    Ints::put(&live_name, live, Ints::at_ref(&swap_name, which))
+                    Ints::put(&live_value, live, Ints::at_ref(&swap_value, which))
+                    live <- live + 1
+                lay_panel(offered, at + 1, dealt, layout, palette, across, across - 1, across - 1,
+                          &live_part, &live_name, &live_value, live)
+
+            # The design guarantees distinct combinations, not distinct
+            # pictures: two different swaps can still collide -- a size swap on
+            # a figure whose slot rounds both to the same radius, say. Rare,
+            # and a rebuild is cheaper than a proof.
+            spent: mutable darray[i64] = Ints::zeros(MOST_FIGURES)
+            for first in 0..<(rows + 1) |offered, rows, spent|:
+                for second in (first + 1)..<(rows + 1) |offered, first, spent|:
+                    false return if same_panel(offered, first, second, &spent)
+
+            where: i64 = py_randrange(rng, 0, grade.choices)
+            out.offered.n <- grade.choices
+            for at in 0..<rows |out, offered, where|:
+                copy_panel(&out.offered, at if at < where else at + 1, offered, at + 1)
+            copy_panel(&out.offered, where, offered, 0)
+            out.answer <- where
+            return true
+
+    # Build one puzzle at `level`, which runs from 1 up the grades. False when
+    # `attempts` grids all stalled.
+    def generate(out: mutable Puzzle&, dealt: mutable Dealt&, offered: mutable Panels&,
+                 level: i64, palettes: i64, attempts: i64, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            out.dealt <- false
+            palette: i64 = py_choice_index(rng, palettes)
+            grade: Grade = grade_of(level)
+            out.palette <- palette
+            out.across <- grade.across
+            for _attempt in 0..<attempts |out, dealt, offered, level, palette, grade, rng|:
+                layout: i64 = grade_layout(level, py_choice_index(rng, grade_layout_count(level)))
+                deal_rules(dealt, layout, palette, &grade, rng)
+                build_panels(&out.grid, dealt, layout, palette, grade.across)
+                continue if not build_choices(out, dealt, offered, layout, palette, &grade, level, rng)
+                out.layout <- layout
+                explain(out, dealt)
+                out.dealt <- true
+                return true
+            return false
