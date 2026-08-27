@@ -202,30 +202,43 @@ skipped row is an untested row.
 ## Module blocks: use them
 
 Elisa has real namespaces -- `module Name:` with `::` for namespace members and
-`.` for value members. They are the right tool and the `maze_`/`nar_`/`cw_`
-prefixes scattered through src/tasks are not; prefixes are C-style scoping in a
-language that has the real thing.
+`.` for value members. Every task is one now: `Sokoban::generate`,
+`Maze::Layout`, `TwoHands::HOLD`. The `maze_`/`nar_`/`cw_` prefixes are gone;
+they were C-style scoping in a language that has the real thing.
 
-This section used to say converting the six task modules was NOT safe: all six
-passed on stage0 and all six failed on stage1, one of them with a SILENT WRONG
-ANSWER. That was the constant-collision bug (two modules each declaring `SIZE`
-collapsed onto one table row), and it is fixed --
-repro/nw_stage1_module_member_wrong_answer.elisa now prints the same thing on
-both compilers. So does every other blocker that was recorded here; see
-"Module blocks: what actually works today" below for what each one turned out
-to be.
+This section used to say the conversion was NOT safe -- six suites passing on
+stage0, all six failing on stage1, one with a silent wrong answer. Every one of
+those blockers is fixed (see below), and converting the twenty files found four
+more, all the same shape: a bare name inside a module finding another module's.
 
-The mechanical transform is straightforward. Three traps, all of them paid for:
+The transform is scripted and the script refuses rather than guesses. What it
+had to learn, in the order it cost time:
 
-  * Substitutions must be applied in a SINGLE pass. Rewriting `MazeWork` to
-    `Maze::Work` and then letting a `Maze` rule fire again on its own output
-    gives `Maze::Dealt::Work`.
-  * A qualifier must not be added to a NAME that merely spells the same word:
-    `.` before it is member access (`found.rgba.r`), `:` after it is a binding
-    (`ColorLookup{rgba: ...}`). The Display conversion's first pass qualified
-    gamemode.elisa's `rgba` field and every use of it.
-  * A column-0 comment inside a module body is a DEDENT. A sed-based conversion
-    leaves them behind and they read as ordinary comments.
+  * ONE pass. Rewriting `MazeWork` to `Maze::Work` and letting a `Maze` rule
+    fire on its own output gives `Maze::Dealt::Work`.
+
+  * "Followed by `:`" is not a binding. A return type sits at the end of
+    `def f(x: i64) -> CuGrade:`. Treating that as a binding renamed every
+    struct's declaration and none of its uses, so five files stopped referring
+    to their own types. A binding is `name:` at the START of a statement, or
+    straight after `(`, `,` or `{`.
+
+  * Comments are prose. `# bisect is RIGHT, not left` became
+    `# bisect is TwoHands::RIGHT, not left`.
+
+  * A consumer that DECLARES the name is not talking about your module. donkey
+    has its own `HOLD` and twohands exports one; the tool rewrote donkey's own
+    declaration to `const TwoHands::HOLD`. The guard has to scan at any indent,
+    because a consumer that is already a module has its decls indented.
+
+  * `extern` stays OUTSIDE the module. It names a C symbol. Sweeping maze's
+    `extern rint` into `module Maze:` broke every file calling the bare `rint`.
+
+  * A stripped name can collide with a LOCAL. Rename the FUNCTION, not the
+    local: the local's scope is wider than its declaration and a line-targeted
+    rename leaves the rest behind. `Tetris::piece_width`, `Donkey::crossing_of`,
+    `Go::stone_at`, `NinaRow::flat_index` all read better than the bare word
+    anyway. Syllogism needed twelve.
 
 ## Screens: measure the original, do not read it
 
@@ -392,7 +405,31 @@ in `worktrees/elisa-core-nw/repro/`.
      diagnostic actually came from, gained a parallel module column consulted by
      the construct-site field checks.
 
-All five are closed. The task modules can now be modules.
+All five are closed, and converting the twenty task modules found four more --
+all the same shape, a bare name inside a module finding another module's:
+
+  6. **A module member's RETURN TYPE** was resolved with no owner set (stage1),
+     so a function was declared as returning another module's same-named struct.
+     Fewer fields, so the call stored too few bytes and the tail read back 0. A
+     silent wrong answer: both structs were emitted correctly and every field
+     inside the shorter one was right.
+
+  7. **Field MUTABILITY** was decided by the first row with that bare struct
+     name (stage1), so assigning a mutable field reported it immutable because
+     another module's was.
+
+  8. **Region-poly CLASSIFICATION** could not see a bare sibling call (stage0),
+     so a caller's body never got a region and the call failed with "must occur
+     where a region can be inferred" -- for a program that compiles unchanged
+     with the same two functions at top level.
+
+  9. **A sibling losing to a stdlib generic** (stage1) -- the same bug as (4),
+     one layer over, in the generic dispatch rather than the scope chain.
+
+Four modules ending up with a `Grade`, and four with a `Work`, is what made
+(6) and (7) reachable at all. The pattern to expect: anything that looks up a
+struct or a function BY BARE NAME and was written when only one could exist.
+
 
 One habit this cost enough to be worth writing down: a repro is not verified
 until it has RUN. Three of the five notes above were wrong about their own
