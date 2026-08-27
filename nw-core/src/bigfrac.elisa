@@ -7,34 +7,202 @@
 # remainder-theorem recombination runs to 10^33 on the way, and `randrange`
 # over that box draws a hundred-odd bits. None of it fits in sixty-four.
 #
-# The magnitude is decimal.elisa's `DecCoeff` -- base-10 digits, most
-# significant first -- so the add, subtract, multiply and long division under
-# this are the ones the decimal suite already checks against CPython. What is
-# added here is the SIGN, which is where the two languages part company:
-# Python's `//` floors toward minus infinity and its `%` takes the sign of the
-# DIVISOR, so `-7 // 2` is -4 and `-7 % 2` is 1. Truncating instead gives -3
-# and -1, and every congruence on the ladder would come out wrong by a modulus.
+# The magnitude is base-10 digits, most significant first, on the algorithms
+# decimal.elisa uses for its coefficient -- and NINETY-SIX of them rather than
+# that module's two hundred and fifty-six. The width is not thrift: a
+# polynomial holds sixteen of these rationals inline, an expression holds
+# several polynomials, and a builder holds several expressions, so a magnitude
+# four times too wide is a stack frame four times too wide and the optimiser
+# spends minutes on one function. Ninety-six carries the widest thing here --
+# two thirty-four digit numbers multiplied -- with room over.
+#
+# What is added over the digits is the SIGN, and that is where the two
+# languages part company: Python's `//` floors toward minus infinity and its
+# `%` takes the sign of the DIVISOR, so `-7 // 2` is -4 and `-7 % 2` is 1.
+# Truncating instead gives -3 and -1, and every congruence on the ladder would
+# come out wrong by a modulus.
+
+const BIG_DIGITS: i64 = 96
+
+# An unsigned magnitude as base-10 digits, most significant first. Invariant:
+# count >= 1, no leading zeros, and zero is exactly one 0 digit -- the same
+# invariant CPython's own decimal string carries.
+struct Mag:
+    count: mutable i64
+    d: mutable u8[96]
+
+def mag_zero() -> Mag:
+    return Mag{count: 1, d: zeroed}
+
+def mag_get(value: Mag&, index: i64) -> i64:
+    can Abort.Panic:
+        return 0 if index < 0 or index >= value.count
+        return value.d[index.usize()].i64()
+
+def mag_set(value: mutable Mag&, index: i64, digit: i64):
+    can Abort.Panic:
+        if index >= 0 and index < BIG_DIGITS:
+            value.d[index.usize()] <- digit.u8()
+
+def mag_is_zero(value: Mag&) -> bool:
+    can Abort.Panic:
+        return value.count == 1 and mag_get(value, 0) == 0
+
+def mag_copy(target: mutable Mag&, source: Mag&):
+    can Abort.Panic:
+        target.count <- source.count
+        for index in 0..<source.count |target, source|:
+            mag_set(target, index, mag_get(source, index))
+
+def mag_set_zero(target: mutable Mag&):
+    can Abort.Panic:
+        target.count <- 1
+        mag_set(target, 0, 0)
+
+def mag_trim(value: mutable Mag&):
+    can Abort.Panic:
+        lead: mutable i64 = 0
+        while lead + 1 < value.count and mag_get(value, lead) == 0 |lead, value|:
+            lead <- lead + 1
+        return if lead == 0
+        for index in 0..<(value.count - lead) |value, lead|:
+            mag_set(value, index, mag_get(value, index + lead))
+        value.count <- value.count - lead
+
+def mag_set_i64(target: mutable Mag&, value: i64):
+    can Abort.Panic:
+        if value == 0:
+            mag_set_zero(target)
+            return
+        digits: mutable i64 = 0
+        held: mutable i64 = value
+        while held > 0 |held, digits|:
+            held <- held / 10
+            digits <- digits + 1
+        target.count <- digits
+        held <- value
+        for step in 0..<digits |target, held, digits|:
+            mag_set(target, digits - 1 - step, held % 10)
+            held <- held / 10
+
+def mag_cmp(left: Mag&, right: Mag&) -> i64:
+    can Abort.Panic:
+        return -1 if left.count < right.count
+        return 1 if left.count > right.count
+        for index in 0..<left.count |left, right|:
+            a: i64 = mag_get(left, index)
+            b: i64 = mag_get(right, index)
+            -1 return if a < b
+            1 return if a > b
+        return 0
+
+def mag_append_digit(value: mutable Mag&, digit: i64) -> bool:
+    can Abort.Panic:
+        if mag_is_zero(value):
+            mag_set(value, 0, digit)
+            return true
+        false return if value.count + 1 > BIG_DIGITS
+        mag_set(value, value.count, digit)
+        value.count <- value.count + 1
+        return true
+
+def mag_add(out: mutable Mag&, left: Mag&, right: Mag&) -> bool:
+    can Abort.Panic:
+        length: i64 = left.count if left.count > right.count else right.count
+        false return if length + 1 > BIG_DIGITS
+        total_length: i64 = length + 1
+        carry: mutable i64 = 0
+        for index in 0..<length |carry, out, left, right, total_length|:
+            a: i64 = mag_get(left, left.count - 1 - index) if index < left.count else 0
+            b: i64 = mag_get(right, right.count - 1 - index) if index < right.count else 0
+            total: i64 = a + b + carry
+            mag_set(out, total_length - 1 - index, total % 10)
+            carry <- total / 10
+        mag_set(out, 0, carry)
+        out.count <- total_length
+        mag_trim(out)
+        return true
+
+# left - right, which the callers only ever ask for with left >= right.
+def mag_sub(out: mutable Mag&, left: Mag&, right: Mag&) -> bool:
+    can Abort.Panic:
+        false return if mag_cmp(left, right) < 0
+        borrow: mutable i64 = 0
+        for index in 0..<left.count |borrow, out, left, right|:
+            a: i64 = mag_get(left, left.count - 1 - index)
+            b: i64 = mag_get(right, right.count - 1 - index) if index < right.count else 0
+            difference: mutable i64 = a - b - borrow
+            if difference < 0:
+                difference <- difference + 10
+                borrow <- 1
+            else:
+                borrow <- 0
+            mag_set(out, left.count - 1 - index, difference)
+        out.count <- left.count
+        mag_trim(out)
+        return true
+
+def mag_mul(out: mutable Mag&, left: Mag&, right: Mag&) -> bool:
+    can Abort.Panic:
+        if mag_is_zero(left) or mag_is_zero(right):
+            mag_set_zero(out)
+            return true
+        total_length: i64 = left.count + right.count
+        false return if total_length > BIG_DIGITS
+        # Column sums stay far inside i64: at most 9*9*96.
+        columns: mutable i64[96] = zeroed
+        for index in 0..<left.count |columns, left, right|:
+            a: i64 = mag_get(left, left.count - 1 - index)
+            for inner in 0..<right.count |columns, right, index, a|:
+                columns[(index + inner).usize()] <- columns[(index + inner).usize()] + a * mag_get(right, right.count - 1 - inner)
+        carry: mutable i64 = 0
+        for position in 0..<total_length |carry, columns|:
+            total: i64 = columns[position.usize()] + carry
+            columns[position.usize()] <- total % 10
+            carry <- total / 10
+        out.count <- total_length
+        for write in 0..<total_length |out, columns, total_length|:
+            mag_set(out, write, columns[(total_length - 1 - write).usize()])
+        mag_trim(out)
+        return true
+
+def mag_divmod(quotient: mutable Mag&, remainder: mutable Mag&, numerator: Mag&, divisor: Mag&) -> bool:
+    can Abort.Panic:
+        false return if mag_is_zero(divisor)
+        mag_set_zero(remainder)
+        quotient.count <- numerator.count
+        for index in 0..<numerator.count |quotient, remainder, numerator, divisor|:
+            false return if not mag_append_digit(remainder, mag_get(numerator, index))
+            digit: mutable i64 = 0
+            while mag_cmp(remainder, divisor) >= 0 |digit, remainder, divisor|:
+                scratch: mutable Mag = mag_zero()
+                false return if not mag_sub(&scratch, remainder, divisor)
+                mag_copy(remainder, &scratch)
+                digit <- digit + 1
+            mag_set(quotient, index, digit)
+        mag_trim(quotient)
+        return true
 
 module Big:
 
     # Sign-and-magnitude. Zero is always positive, so there is one of it.
     struct Int:
         negative: mutable bool
-        mag: mutable DecCoeff
+        mag: mutable Mag
 
     def zero() -> Int:
-        return Int{negative: false, mag: coeff_zero()}
+        return Int{negative: false, mag: mag_zero()}
 
     def is_zero(value: Int&) -> bool:
-        return coeff_is_zero(&value.mag)
+        return mag_is_zero(&value.mag)
 
     def normalise(value: mutable Int&):
-        value.negative <- false if coeff_is_zero(&value.mag)
+        value.negative <- false if mag_is_zero(&value.mag)
 
     def set_i64(out: mutable Int&, value: i64):
         can Abort.Panic:
             out.negative <- value < 0
-            coeff_set_i64(&out.mag, value if value >= 0 else 0 - value)
+            mag_set_i64(&out.mag, value if value >= 0 else 0 - value)
             normalise(out)
 
     def from_i64(value: i64) -> Int:
@@ -46,7 +214,7 @@ module Big:
     def copy(out: mutable Int&, source: Int&):
         can Abort.Panic:
             out.negative <- source.negative
-            coeff_copy(&out.mag, &source.mag)
+            mag_copy(&out.mag, &source.mag)
 
     def negate(out: mutable Int&, source: Int&):
         can Abort.Panic:
@@ -66,7 +234,7 @@ module Big:
             return -1 if right_zero
             return -1 if left.negative and not right.negative
             return 1 if right.negative and not left.negative
-            size: i64 = coeff_cmp(&left.mag, &right.mag)
+            size: i64 = mag_cmp(&left.mag, &right.mag)
             return 0 - size if left.negative
             return size
 
@@ -78,22 +246,22 @@ module Big:
     # Magnitudes only, so the sign rules live in one place each.
     def add_mag(out: mutable Int&, left: Int&, right: Int&, flip: bool) -> bool:
         can Abort.Panic:
-            scratch: mutable DecCoeff = coeff_zero()
+            scratch: mutable Mag = mag_zero()
             same_sign: bool = left.negative == (right.negative != flip)
             if same_sign:
-                false return if coeff_add(&scratch, &left.mag, &right.mag) != DEC_OK
-                coeff_copy(&out.mag, &scratch)
+                false return if not mag_add(&scratch, &left.mag, &right.mag)
+                mag_copy(&out.mag, &scratch)
                 out.negative <- left.negative
                 normalise(out)
                 return true
-            order: i64 = coeff_cmp(&left.mag, &right.mag)
+            order: i64 = mag_cmp(&left.mag, &right.mag)
             if order >= 0:
-                false return if coeff_sub(&scratch, &left.mag, &right.mag) != DEC_OK
+                false return if not mag_sub(&scratch, &left.mag, &right.mag)
                 out.negative <- left.negative
             else:
-                false return if coeff_sub(&scratch, &right.mag, &left.mag) != DEC_OK
+                false return if not mag_sub(&scratch, &right.mag, &left.mag)
                 out.negative <- right.negative != flip
-            coeff_copy(&out.mag, &scratch)
+            mag_copy(&out.mag, &scratch)
             normalise(out)
             return true
 
@@ -105,9 +273,9 @@ module Big:
 
     def mul(out: mutable Int&, left: Int&, right: Int&) -> bool:
         can Abort.Panic:
-            scratch: mutable DecCoeff = coeff_zero()
-            false return if coeff_mul(&scratch, &left.mag, &right.mag) != DEC_OK
-            coeff_copy(&out.mag, &scratch)
+            scratch: mutable Mag = mag_zero()
+            false return if not mag_mul(&scratch, &left.mag, &right.mag)
+            mag_copy(&out.mag, &scratch)
             out.negative <- left.negative != right.negative
             normalise(out)
             return true
@@ -130,11 +298,11 @@ module Big:
     def divmod_floor(quotient: mutable Int&, remainder: mutable Int&, left: Int&, right: Int&) -> bool:
         can Abort.Panic:
             false return if is_zero(right)
-            q_mag: mutable DecCoeff = coeff_zero()
-            r_mag: mutable DecCoeff = coeff_zero()
-            false return if coeff_divmod(&q_mag, &r_mag, &left.mag, &right.mag) != DEC_OK
-            coeff_copy(&quotient.mag, &q_mag)
-            coeff_copy(&remainder.mag, &r_mag)
+            q_mag: mutable Mag = mag_zero()
+            r_mag: mutable Mag = mag_zero()
+            false return if not mag_divmod(&q_mag, &r_mag, &left.mag, &right.mag)
+            mag_copy(&quotient.mag, &q_mag)
+            mag_copy(&remainder.mag, &r_mag)
             quotient.negative <- left.negative != right.negative
             remainder.negative <- left.negative
             normalise(quotient)
@@ -142,7 +310,7 @@ module Big:
             # Truncated so far. Floor it: when the signs differed and something
             # was left over, the quotient is one lower and the remainder swings
             # across to the divisor's side.
-            return true if coeff_is_zero(&r_mag) or left.negative == right.negative
+            return true if mag_is_zero(&r_mag) or left.negative == right.negative
             one: Int = from_i64(1)
             lowered: mutable Int = zero()
             false return if not sub(&lowered, quotient, &one)
@@ -160,7 +328,7 @@ module Big:
             0 return if modulus <= 0
             held: mutable i64 = 0
             for index in 0..<value.mag.count |held, value, modulus|:
-                held <- (held * 10 + coeff_get(&value.mag, index)) % modulus
+                held <- (held * 10 + mag_get(&value.mag, index)) % modulus
             return held if not value.negative or held == 0
             return modulus - held
 
@@ -171,57 +339,57 @@ module Big:
         can Abort.Panic:
             held: mutable i64 = 0
             for index in 0..<value.mag.count |held, value|:
-                held <- held * 10 + coeff_get(&value.mag, index)
+                held <- held * 10 + mag_get(&value.mag, index)
             return 0 - held if value.negative
             return held
 
     def is_one(value: Int&) -> bool:
         can Abort.Panic:
-            return not value.negative and value.mag.count == 1 and coeff_get(&value.mag, 0) == 1
+            return not value.negative and value.mag.count == 1 and mag_get(&value.mag, 0) == 1
 
     # Euclid on the magnitudes, so the answer is never negative -- which is
     # what `math.gcd` gives and what a fraction wants to divide through by.
     def gcd(out: mutable Int&, left: Int&, right: Int&) -> bool:
         can Abort.Panic:
-            a: mutable DecCoeff = coeff_zero()
-            b: mutable DecCoeff = coeff_zero()
-            coeff_copy(&a, &left.mag)
-            coeff_copy(&b, &right.mag)
-            while not coeff_is_zero(&b) |a, b|:
-                q: mutable DecCoeff = coeff_zero()
-                r: mutable DecCoeff = coeff_zero()
-                break if coeff_divmod(&q, &r, &a, &b) != DEC_OK
-                coeff_copy(&a, &b)
-                coeff_copy(&b, &r)
-            coeff_copy(&out.mag, &a)
+            a: mutable Mag = mag_zero()
+            b: mutable Mag = mag_zero()
+            mag_copy(&a, &left.mag)
+            mag_copy(&b, &right.mag)
+            while not mag_is_zero(&b) |a, b|:
+                q: mutable Mag = mag_zero()
+                r: mutable Mag = mag_zero()
+                break if not mag_divmod(&q, &r, &a, &b)
+                mag_copy(&a, &b)
+                mag_copy(&b, &r)
+            mag_copy(&out.mag, &a)
             out.negative <- false
             return true
 
     # In place, magnitude only: what `bit_length` walks.
-    def halve(value: mutable DecCoeff&):
+    def halve(value: mutable Mag&):
         can Abort.Panic:
             carry: mutable i64 = 0
             for index in 0..<value.count |value, carry|:
-                held: i64 = carry * 10 + coeff_get(value, index)
-                coeff_set(value, index, held / 2)
+                held: i64 = carry * 10 + mag_get(value, index)
+                mag_set(value, index, held / 2)
                 carry <- held % 2
-            coeff_trim(value)
+            mag_trim(value)
 
-    def double_in_place(value: mutable DecCoeff&) -> bool:
+    def double_in_place(value: mutable Mag&) -> bool:
         can Abort.Panic:
-            scratch: mutable DecCoeff = coeff_zero()
-            false return if coeff_add(&scratch, value, value) != DEC_OK
-            coeff_copy(value, &scratch)
+            scratch: mutable Mag = mag_zero()
+            false return if not mag_add(&scratch, value, value)
+            mag_copy(value, &scratch)
             return true
 
     # `int.bit_length()`: zero for zero, and the magnitude's otherwise.
     def bit_length(value: Int&) -> i64:
         can Abort.Panic:
             0 return if is_zero(value)
-            rest: mutable DecCoeff = coeff_zero()
-            coeff_copy(&rest, &value.mag)
+            rest: mutable Mag = mag_zero()
+            mag_copy(&rest, &value.mag)
             bits: mutable i64 = 0
-            while not coeff_is_zero(&rest) |rest, bits|:
+            while not mag_is_zero(&rest) |rest, bits|:
                 halve(&rest)
                 bits <- bits + 1
             return bits
@@ -281,19 +449,19 @@ module Big:
                 Bytes::put(out, 0, 45.u8())
                 at <- 1
             for index in 0..<value.mag.count |out, value, at|:
-                Bytes::put(out, at + index, (48 + coeff_get(&value.mag, index)).u8())
+                Bytes::put(out, at + index, (48 + mag_get(&value.mag, index)).u8())
             return at + value.mag.count
 
     # A run of ASCII digits, with no sign; what the parser hands over.
     def from_digits(out: mutable Int&, text: mutable darray[u8]&, first: i64, count: i64) -> bool:
         can Abort.Panic:
             out.negative <- false
-            coeff_set_zero(&out.mag)
+            mag_set_zero(&out.mag)
             for index in 0..<count |out, text, first|:
                 digit: i64 = Bytes::at_ref(text, first + index).i64() - 48
                 false return if digit < 0 or digit > 9
-                false return if coeff_append_digit(&out.mag, digit) != DEC_OK
-            coeff_trim(&out.mag)
+                false return if not mag_append_digit(&out.mag, digit)
+            mag_trim(&out.mag)
             return true
 
 # Exact rationals, normalised the way `fractions.Fraction` normalises: the
