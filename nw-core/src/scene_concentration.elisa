@@ -1,0 +1,214 @@
+# The Concentration screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/concentration.py -- the drawing, not the thinking.
+#
+# Three labels, a verdict and a board of cards. The board's SHAPE is worked
+# out rather than configured: the column count is the square root of the card
+# count times the room's aspect, rounded, and then walked down while a whole
+# row would be left empty. `round` there is CPython's, half to EVEN, and a
+# board of the wrong shape lays every card somewhere else.
+#
+# A card is a rectangle and, once it is face up or matched, a picture inset
+# inside it or -- for a sound board -- a crotchet and a number. The four fills
+# are fixed colours and say what the card is: green for matched, near-white
+# for face up, and one of two blues for face down depending on the page.
+#
+# The board stops at the verdict band and no further, and the reason is the
+# same one Reflex has: the cards are photographs, and a photograph holds every
+# colour there is, so a board that reached into the band would be read as a
+# verdict about as often as not.
+#
+# NOTE: needs elisacore_math, pymath, strings, geometry, verdict, display and
+# scene_verdict included by the driver.
+
+module SceneConcentration:
+
+    const MEDIUM_PICTURE: i64 = 0
+    const MEDIUM_SOUND: i64 = 1
+
+    struct Card:
+        face_up: bool
+        matched: bool
+        # The card's own number, which a sound board prints.
+        index: i64
+        asset: i64
+        image_width: i64
+        image_height: i64
+
+    struct Paint:
+        ink: mutable u32
+        back_fill: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        down: u32 = Display::rgba(44, 50, 66, 255) if black_background else Display::rgba(86, 110, 168, 255)
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     back_fill: down,
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def color_matched() -> u32:
+        return Display::rgba(46, 170, 92, 255)
+
+    def color_face_up() -> u32:
+        return Display::rgba(236, 239, 245, 255)
+
+    # The crotchet and number on a sound card are drawn in a fixed near-black
+    # whatever the page, because they sit on the near-white face-up fill.
+    def color_card_ink() -> u32:
+        return Display::rgba(20, 24, 32, 255)
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def floor_of(height: f64) -> f64:
+        can Abort.Panic:
+            return Verdict::above_the_band(height, 0.0).f64()
+
+    struct Shape:
+        columns: mutable i64
+        rows: mutable i64
+
+    def grid_shape(out: mutable Shape&, width: f64, height: f64, cards: i64, pairs: i64):
+        can Abort.Panic:
+            wanted: i64 = cards if cards != 0 else pairs * 2
+            count: i64 = wanted if wanted > 2 else 2
+            room: f64 = Geometry::from_top_edge(height, 88.0).f64() - floor_of(height)
+            tall: f64 = room if room > 80.0 else 80.0
+            ratio: f64 = width * 0.9 / tall
+            aspect: f64 = ratio if ratio > 0.2 else 0.2
+            # `int(round(sqrt(count * aspect)))`, half to EVEN.
+            guess: i64 = py_round_half_even(sqrt(count.f64() * aspect))
+            columns: mutable i64 = guess if guess < count else count
+            columns <- columns if columns > 2 else 2
+            rows: mutable i64 = ceil(count.f64() / columns.f64()).i64()
+            # Walk the columns down while a whole row would be left empty.
+            while columns * rows - count >= rows and columns > 2 |columns, rows, count|:
+                columns <- columns - 1
+                rows <- ceil(count.f64() / columns.f64()).i64()
+            out.columns <- columns
+            out.rows <- rows
+
+    struct Layout:
+        left: mutable f64
+        top: mutable f64
+        side: mutable f64
+        gap: mutable f64
+        columns: mutable i64
+
+    def layout_of(out: mutable Layout&, width: f64, height: f64, cards: i64, pairs: i64):
+        can Abort.Panic:
+            shape: mutable Shape = Shape{columns: 2, rows: 1}
+            grid_shape(&shape, width, height, cards, pairs)
+            floor: f64 = floor_of(height)
+            ceiling: f64 = Geometry::from_top_edge(height, 88.0).f64()
+            span_w: f64 = width * 0.9
+            room: f64 = ceiling - floor
+            span_h: f64 = room if room > 80.0 else 80.0
+            across: f64 = span_w / shape.columns.f64()
+            down: f64 = span_h / shape.rows.f64()
+            least: f64 = across if across < down else down
+            wanted: f64 = least * 0.09
+            gap: f64 = wanted if wanted > 4.0 else 4.0
+            card_w: f64 = (span_w - gap * (shape.columns - 1).f64()) / shape.columns.f64()
+            card_h: f64 = (span_h - gap * (shape.rows - 1).f64()) / shape.rows.f64()
+            side: f64 = card_w if card_w < card_h else card_h
+            total_w: f64 = side * shape.columns.f64() + gap * (shape.columns - 1).f64()
+            total_h: f64 = side * shape.rows.f64() + gap * (shape.rows - 1).f64()
+            out.left <- (width - total_w) / 2.0
+            out.top <- floor + total_h + (span_h - total_h) / 2.0
+            out.side <- side
+            out.gap <- gap
+            out.columns <- shape.columns
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, medium: i64,
+               cards: darray[Card]&, pairs: i64, turns: i64, show_turns: bool,
+               message: sview, verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            count: i64 = cards.count.i64()
+
+            put_text(list, paint, sview("Concentration", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            found: mutable i64 = 0
+            for index in 0..<count |cards, found|:
+                one: Card = get cards[index.usize()] else Card{face_up: false, matched: false, index: 0, asset: 0, image_width: 1, image_height: 1}
+                if one.matched:
+                    found <- found + 1
+            found <- found / 2
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if show_turns and count > 0:
+                dstr_append_cstr(&status, "     ")
+                dstr_append_i64(&status, found)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, pairs)
+                dstr_append_cstr(&status, " pairs, ")
+                dstr_append_i64(&status, turns)
+                dstr_append_cstr(&status, " turns")
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: new board     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 30.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if count == 0:
+                return
+            where: mutable Layout = Layout{left: 0.0, top: 0.0, side: 0.0, gap: 0.0, columns: 2}
+            layout_of(&where, paint.width, paint.height, count, pairs)
+
+            for position in 0..<count |list, paint, cards, where, medium, count|:
+                one: Card = get cards[position.usize()] else Card{face_up: false, matched: false, index: 0, asset: 0, image_width: 1, image_height: 1}
+                column: i64 = position % where.columns
+                row: i64 = position / where.columns
+                left: f64 = where.left + column.f64() * (where.side + where.gap)
+                bottom: f64 = where.top - (row + 1).f64() * where.side - row.f64() * where.gap
+                side: f64 = where.side
+                fill: mutable u32 = paint.back_fill
+                if one.matched:
+                    fill <- color_matched()
+                elif one.face_up:
+                    fill <- color_face_up()
+                Display::draw_rect(list, left / paint.sx, bottom / paint.sy,
+                                   side / paint.sx, side / paint.sy, fill)
+                if one.face_up or one.matched:
+                    if medium == MEDIUM_SOUND:
+                        label: mutable dstr = []
+                        dstr_append_cstr(&label, "♪")
+                        dstr_append_i64(&label, one.index + 1)
+                        note: f64 = Geometry::calc_fontsize(paint.height, side * 0.20)
+                        put_text(list, paint, bytes_view(label),
+                                 left + side / 2.0, bottom + side / 2.0,
+                                 note if note > 8.0 else 8.0, color_card_ink(),
+                                 Display::ANCHOR_CENTER_CENTER, true)
+                    else:
+                        inset: f64 = side * 0.06
+                        wide: i64 = one.image_width if one.image_width > 1 else 1
+                        Display::draw_sprite(list, one.asset.u32(),
+                                             (left + inset) / paint.sx,
+                                             (bottom + inset) / paint.sy,
+                                             (side - inset * 2.0) / wide.f64() / paint.sx,
+                                             0.0, one.image_width,
+                                             one.image_height,
+                                             Display::rgba(255, 255, 255, 255))
