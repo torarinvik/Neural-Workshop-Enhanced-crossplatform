@@ -1,0 +1,245 @@
+# The Sudoku screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/sudoku.py -- the drawing, not the thinking.
+#
+# A board, a wash over everything the cursor can see, the digits, the pencilled
+# candidates, and the rules -- thin between cells, thick between boxes.
+#
+# Font sizes here come off the CELL and not off the window. `calc_fontsize`
+# scales a reference size by the window height, which is right for the chrome
+# and wrong inside a board: a cell is already measured in this window's pixels,
+# so putting it through that scales it twice and a big window spills digits out
+# of their cells. That is `fit`, and it is the reference's own reasoning.
+#
+# `peers` is SORTED in the reference -- `tuple(sorted(group))` -- so the wash
+# goes down in cell order and there is no hash order to reproduce here.
+#
+# NOTE: needs elisacore_math, strings, geometry, verdict and display included
+# by the driver.
+
+module SceneSudoku:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SOLVING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    # A sixteen needs letters, so digits past nine are A-G.
+    const GLYPHS: cstr = "123456789ABCDEFG"
+
+    const MOST_CELLS: i64 = 256
+
+    def color_here() -> u32:
+        return Display::rgba(86, 180, 233, 255)
+
+    def color_clash() -> u32:
+        return Display::rgba(213, 94, 0, 255)
+
+    def color_mine() -> u32:
+        return Display::rgba(0, 114, 178, 255)
+
+    def color_lit() -> u32:
+        return Display::rgba(86, 180, 233, 40)
+
+    def color_rule() -> u32:
+        return Display::rgba(120, 120, 120, 255)
+
+    struct Paint:
+        ink: mutable u32
+        ink_faint: mutable u32
+        paper: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     # `self.ink + (170,)` -- a pencilled mark is the ink at
+                     # two thirds, which is a different colour and not a
+                     # different shape.
+                     ink_faint: Display::rgba(fore, fore, fore, 170),
+                     paper: Display::rgba(back, back, back, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                 y: f64, width: f64, height: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               width / paint.sx, height / paint.sy, color)
+
+    def put_line(list: mutable Display::DisplayList&, paint: Paint&, x1: f64,
+                 y1: f64, x2: f64, y2: f64, thick: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_line(list, x1 / paint.sx, y1 / paint.sy,
+                               x2 / paint.sx, y2 / paint.sy,
+                               thick / paint.sy, color)
+
+    def put_bordered(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                     y: f64, width: f64, height: f64, fill: u32, edge: u32,
+                     border: f64):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_bordered_rect(list, x / paint.sx, y / paint.sy,
+                                        width / paint.sx, height / paint.sy,
+                                        fill, edge, border / paint.sy)
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    # A font size taken from the CELL rather than from the window.
+    def fit(step: f64, share: f64) -> f64:
+        raw: f64 = step * share
+        capped: f64 = raw if raw < Geometry::MAX_FONT_SIZE else Geometry::MAX_FONT_SIZE
+        return capped if capped > 5.0 else 5.0
+
+    struct Board:
+        left: mutable f64
+        bottom: mutable f64
+        side: mutable f64
+
+    def board_of(out: mutable Board&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 84.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 44.0).f64()).f64()
+            room: f64 = top - bottom
+            wide: f64 = width * 0.86
+            capped: f64 = wide if wide < room else room
+            side: f64 = capped if capped > 40.0 else 40.0
+            out.left <- (width - side) / 2.0
+            out.bottom <- bottom + (room - side) / 2.0
+            out.side <- side
+
+    # Whether two cells share a row, a column or a box -- which is what
+    # `peers(box)` lists, minus the cell itself.
+    def is_peer(box: i64, one: i64, two: i64) -> bool:
+        can Abort.Panic:
+            return false if one == two
+            size: i64 = box * box
+            return true if one / size == two / size
+            return true if one % size == two % size
+            band_one: i64 = (one / size) / box
+            band_two: i64 = (two / size) / box
+            stack_one: i64 = (one % size) / box
+            stack_two: i64 = (two % size) / box
+            return band_one == band_two and stack_one == stack_two
+
+    def glyph_of(out: mutable dstr&, value: i64):
+        can Memory.Allocate, Abort.Panic:
+            return if value < 1 or value > 16
+            out.push(sview_at(sview(GLYPHS, 0, -1), (value - 1).usize()))
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&,
+               filled: mutable darray[i64]&, givens: mutable darray[i64]&,
+               marks: mutable darray[i64]&, box: i64, phase: i64, at: i64,
+               show_clashes: bool, pencil: bool, trial: i64, total_trials: i64,
+               has_puzzle: bool, message: sview):
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = box * box
+            cells: i64 = size * size
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            put_text(list, paint, sview("Sudoku", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 34.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if has_puzzle and phase == PHASE_SOLVING:
+                blank: mutable i64 = 0
+                for cell in 0..<cells |filled, blank|:
+                    blank <- blank + 1 if Ints::at_ref(filled, cell) == 0 else blank
+                dstr_append_cstr(&status, "     puzzle ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "   ")
+                dstr_append_i64(&status, blank)
+                dstr_append_cstr(&status, " left")
+                if pencil:
+                    dstr_append_cstr(&status, "     pencil")
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 64.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 13.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     arrows: move     digits: write     N: pencil     O: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 24.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            return if not has_puzzle
+            return if phase != PHASE_SOLVING and phase != PHASE_SOLVED
+            area: mutable Board = Board{left: 0.0, bottom: 0.0, side: 0.0}
+            board_of(&area, paint.width, paint.height)
+            step: f64 = area.side / size.f64()
+
+            put_rect(list, paint, area.left, area.bottom, area.side, area.side,
+                     paint.paper)
+
+            # The wash over everything the cursor can see, then a box round it.
+            for cell in 0..<cells |list, paint, area, box, size, step, at|:
+                if is_peer(box, at, cell):
+                    x: f64 = area.left + (cell % size).f64() * step
+                    y: f64 = area.bottom + (size - 1 - cell / size).f64() * step
+                    put_rect(list, paint, x, y, step, step, color_lit())
+            raw_border: f64 = step * 0.08
+            put_bordered(list, paint,
+                         area.left + (at % size).f64() * step,
+                         area.bottom + (size - 1 - at / size).f64() * step,
+                         step, step, paint.paper, color_here(),
+                         raw_border if raw_border > 2.0 else 2.0)
+
+            for cell in 0..<cells |list, paint, area, filled, givens, marks, box, size, step, show_clashes|:
+                value: i64 = Ints::at_ref(filled, cell)
+                x: f64 = area.left + (cell % size).f64() * step
+                y: f64 = area.bottom + (size - 1 - cell / size).f64() * step
+                if value != 0:
+                    # A digit clashes when a peer already holds it.
+                    wrong: mutable bool = false
+                    if show_clashes:
+                        for other in 0..<cells |filled, box, cell, value, wrong|:
+                            if is_peer(box, cell, other) and Ints::at_ref(filled, other) == value:
+                                wrong <- true
+                    given: bool = Ints::at_ref(givens, cell) != 0
+                    shade: mutable u32 = color_mine()
+                    if given:
+                        shade <- paint.ink
+                    if wrong:
+                        shade <- color_clash()
+                    text: mutable dstr = []
+                    glyph_of(&text, value)
+                    put_text(list, paint, bytes_view(text), x + step / 2.0,
+                             y + step / 2.0, fit(step, 0.34), shade,
+                             Display::ANCHOR_CENTER_CENTER, given)
+                else:
+                    # Pencilled candidates, laid out the way the box is.
+                    held: i64 = Ints::at_ref(marks, cell)
+                    if held != 0:
+                        for slot in 0..<size |list, paint, box, size, step, x, y, held|:
+                            if (held >> slot) % 2 == 1:
+                                text: mutable dstr = []
+                                glyph_of(&text, slot + 1)
+                                put_text(list, paint, bytes_view(text),
+                                         x + step * ((slot % box).f64() + 0.5) / box.f64(),
+                                         y + step * ((box - slot / box).f64() - 0.5) / box.f64(),
+                                         fit(step, 0.13), paint.ink_faint,
+                                         Display::ANCHOR_CENTER_CENTER, false)
+
+            # Thin lines between cells, thick ones between boxes.
+            for line in 0..<(size + 1) |list, paint, area, box, step|:
+                heavy: bool = line % box == 0
+                raw: f64 = step * (0.06 if heavy else 0.02)
+                width: f64 = raw if raw > 1.0 else 1.0
+                shade: u32 = paint.ink if heavy else color_rule()
+                offset: f64 = line.f64() * step
+                put_line(list, paint, area.left, area.bottom + offset,
+                         area.left + area.side, area.bottom + offset, width, shade)
+                put_line(list, paint, area.left + offset, area.bottom,
+                         area.left + offset, area.bottom + area.side, width, shade)
