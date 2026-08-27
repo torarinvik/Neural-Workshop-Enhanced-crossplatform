@@ -1,0 +1,311 @@
+# The Crossword screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/crossword.py -- the drawing, not the thinking.
+#
+# Four labels, a verdict and a grid. The grid goes down in a fixed order and
+# the order is what makes it readable:
+#
+#   1. the page under the whole board, in the background colour
+#   2. the wash over the entry the cursor is in, the fainter wash under the
+#      pointer, and the box round the cursor itself
+#   3. the blocks, the little slot numbers and the letters, cell by cell
+#   4. the rules, LAST, so they sit over the washes and the blocks alike
+#
+# A letter's colour says where it came from: vermillion when it contradicts
+# the answer and mistakes are shown, the ink when it came WITH the puzzle, and
+# blue when the player wrote it. A given letter is also drawn bold, which is
+# the only weight difference inside the grid.
+#
+# Font sizes here come off the CELL and not off the window -- `fit(step,
+# share)` -- so a fifteen-square grid writes smaller than a five-square one at
+# the same window size.
+#
+# NOTE: needs elisacore_math, strings, ints, geometry, verdict, display and
+# scene_verdict included by the driver.
+
+module SceneCrossword:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SOLVING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    def color_rule() -> u32:
+        return Display::rgba(120, 120, 120, 255)
+
+    # The cursor's cell, its entry, and the cell under the pointer.
+    def color_here() -> u32:
+        return Display::rgba(86, 180, 233, 255)
+
+    def color_lit() -> u32:
+        return Display::rgba(86, 180, 233, 50)
+
+    def color_near() -> u32:
+        return Display::rgba(86, 180, 233, 22)
+
+    def color_wrong() -> u32:
+        return Display::rgba(213, 94, 0, 255)
+
+    def color_mine() -> u32:
+        return Display::rgba(0, 114, 178, 255)
+
+    struct Paint:
+        ink: mutable u32
+        # The ink at 190 alpha, which is what a slot number is drawn in.
+        faint: mutable u32
+        back: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     faint: Display::rgba(fore, fore, fore, 190),
+                     back: Display::rgba(back, back, back, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, width: f64, height: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               width / paint.sx, height / paint.sy, color)
+
+    # A font size taken from the CELL rather than from the window.
+    def fit(step: f64, share: f64) -> f64:
+        scaled: f64 = step * share
+        capped: f64 = scaled if scaled < Geometry::MAX_FONT_SIZE else Geometry::MAX_FONT_SIZE
+        return capped if capped > 5.0 else 5.0
+
+    struct Board:
+        left: mutable f64
+        bottom: mutable f64
+        side: mutable f64
+
+    def board_of(out: mutable Board&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 112.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 44.0).f64()).f64()
+            wide: f64 = width * 0.82
+            room: f64 = top - bottom
+            least: f64 = wide if wide < room else room
+            side: f64 = least if least > 40.0 else 40.0
+            out.left <- (width - side) / 2.0
+            out.bottom <- bottom + (top - bottom - side) / 2.0
+            out.side <- side
+
+    def cell_x(board: Board&, size: i64, cell: i64) -> f64:
+        can Abort.Panic:
+            step: f64 = board.side / size.f64()
+            return board.left + (cell % size).f64() * step
+
+    def cell_y(board: Board&, size: i64, cell: i64) -> f64:
+        can Abort.Panic:
+            step: f64 = board.side / size.f64()
+            return board.bottom + (size - 1 - cell / size).f64() * step
+
+    def step_at(values: darray[i64]&, index: i64) -> i64:
+        can Abort.Panic:
+            return get values[index.usize()] else 0
+
+    def flag_at(values: darray[bool]&, index: i64) -> bool:
+        can Abort.Panic:
+            return get values[index.usize()] else false
+
+    # The entry the cursor is in, FACING THE WAY IT FACES -- and if there is
+    # no entry that way, whichever one holds the cursor at all. Returns the
+    # slot's index, or -1.
+    def slot_here(size: i64, count: i64, slot_down: darray[bool]&,
+                  slot_first: darray[i64]&, slot_length: darray[i64]&,
+                  at: i64, down: bool) -> i64:
+        can Abort.Panic:
+            for which in 0..<count |size, count, slot_down, slot_first, slot_length, at, down|:
+                if flag_at(slot_down, which) == down and holds(size, slot_down, slot_first, slot_length, which, at):
+                    return which
+            for which in 0..<count |size, count, slot_down, slot_first, slot_length, at|:
+                if holds(size, slot_down, slot_first, slot_length, which, at):
+                    return which
+            return -1
+
+    def holds(size: i64, slot_down: darray[bool]&, slot_first: darray[i64]&,
+              slot_length: darray[i64]&, which: i64, cell: i64) -> bool:
+        can Abort.Panic:
+            stride: i64 = size if flag_at(slot_down, which) else 1
+            first: i64 = step_at(slot_first, which)
+            span: i64 = step_at(slot_length, which)
+            for step in 0..<span |stride, first, span, cell|:
+                if first + step * stride == cell:
+                    return true
+            return false
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_puzzle: bool, size: i64, solution: darray[i64]&,
+               filled: darray[i64]&, givens: darray[bool]&,
+               slot_number: darray[i64]&, slot_down: darray[bool]&,
+               slot_first: darray[i64]&, slot_length: darray[i64]&,
+               clues: darray[sview]&, at: i64, down: bool, hovered: i64,
+               show_mistakes: bool, trial: i64, total_trials: i64,
+               message: sview, verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            playing: bool = has_puzzle and (phase == PHASE_SOLVING or phase == PHASE_SOLVED)
+            count: i64 = slot_number.count.i64()
+            here: i64 = slot_here(size, count, slot_down, slot_first, slot_length, at, down) if has_puzzle else -1
+
+            put_text(list, paint, sview("Crossword", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 34.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if has_puzzle and phase == PHASE_SOLVING:
+                left: mutable i64 = 0
+                for cell in 0..<(size * size) |solution, filled, size, left|:
+                    if step_at(solution, cell) != 0 and step_at(filled, cell) == 0:
+                        left <- left + 1
+                dstr_append_cstr(&status, "     grid ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "   ")
+                dstr_append_i64(&status, left)
+                dstr_append_cstr(&status, " left")
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 64.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 13.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            clue: mutable dstr = []
+            if playing and phase == PHASE_SOLVING and here >= 0:
+                clue_line(&clue, slot_number, slot_down, slot_length, clues, here)
+            put_text(list, paint, bytes_view(clue), middle,
+                     Geometry::from_top_edge(paint.height, 92.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 15.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: menu   Space: start   click or arrows: move   letters: write   Tab: turn   O: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 24.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if not playing:
+                return
+
+            board: mutable Board = Board{left: 0.0, bottom: 0.0, side: 0.0}
+            board_of(&board, paint.width, paint.height)
+            step: f64 = board.side / size.f64()
+
+            put_rect(list, paint, board.left, board.bottom, board.side,
+                     board.side, paint.back)
+
+            # The wash over the entry the cursor is in, and a box round it.
+            if here >= 0:
+                stride: i64 = size if flag_at(slot_down, here) else 1
+                first: i64 = step_at(slot_first, here)
+                span: i64 = step_at(slot_length, here)
+                for one in 0..<span |list, paint, board, size, step, stride, first|:
+                    cell: i64 = first + one * stride
+                    put_rect(list, paint, cell_x(&board, size, cell),
+                             cell_y(&board, size, cell), step, step, color_lit())
+            if hovered >= 0 and hovered != at:
+                put_rect(list, paint, cell_x(&board, size, hovered),
+                         cell_y(&board, size, hovered), step, step, color_near())
+            rim: f64 = step * 0.08
+            Display::draw_bordered_rect(list, cell_x(&board, size, at) / paint.sx,
+                                        cell_y(&board, size, at) / paint.sy,
+                                        step / paint.sx, step / paint.sy,
+                                        paint.back, color_here(),
+                                        (rim if rim > 2.0 else 2.0) / paint.sx)
+
+            for cell in 0..<(size * size) |list, paint, board, size, step, solution, filled, givens, slot_number, slot_first, clues, show_mistakes|:
+                x: f64 = cell_x(&board, size, cell)
+                y: f64 = cell_y(&board, size, cell)
+                if step_at(solution, cell) == 0:
+                    put_rect(list, paint, x, y, step, step, paint.ink)
+                else:
+                    number: i64 = numbered(slot_number, slot_first, cell)
+                    if number > 0:
+                        label: mutable dstr = []
+                        dstr_append_i64(&label, number)
+                        put_text(list, paint, bytes_view(label), x + step * 0.08,
+                                 y + step * 0.92, fit(step, 0.16), paint.faint,
+                                 Display::ANCHOR_LEFT_TOP, false)
+                    letter: i64 = step_at(filled, cell)
+                    if letter != 0:
+                        given: bool = flag_at(givens, cell)
+                        shade: mutable u32 = color_mine()
+                        if show_mistakes and letter != step_at(solution, cell):
+                            shade <- color_wrong()
+                        elif given:
+                            shade <- paint.ink
+                        upper: mutable dstr = []
+                        upper.push(upper_of(letter))
+                        put_text(list, paint, bytes_view(upper), x + step / 2.0,
+                                 y + step * 0.44, fit(step, 0.46), shade,
+                                 Display::ANCHOR_CENTER_CENTER, given)
+
+            # The rules go over everything, one pair a line.
+            width: f64 = step * 0.03
+            thick: f64 = width if width > 1.0 else 1.0
+            for line in 0..<(size + 1) |list, paint, board, step, thick|:
+                along: f64 = line.f64() * step
+                Display::draw_line(list, board.left / paint.sx,
+                                   (board.bottom + along) / paint.sy,
+                                   (board.left + board.side) / paint.sx,
+                                   (board.bottom + along) / paint.sy,
+                                   thick / paint.sx, color_rule())
+                Display::draw_line(list, (board.left + along) / paint.sx,
+                                   board.bottom / paint.sy,
+                                   (board.left + along) / paint.sx,
+                                   (board.bottom + board.side) / paint.sy,
+                                   thick / paint.sx, color_rule())
+
+    # `str.upper()` over the ASCII letters this grid holds.
+    def upper_of(letter: i64) -> u8:
+        return (letter - 32).u8() if letter >= 97 and letter <= 122 else letter.u8()
+
+    # The slot number written in a cell, or 0 if none starts there.
+    def numbered(slot_number: darray[i64]&, slot_first: darray[i64]&, cell: i64) -> i64:
+        can Abort.Panic:
+            # `{slot.cells[0]: slot.number for slot in slots}` -- a LATER slot
+            # starting on the same cell wins, because that is what building a
+            # dict in order does.
+            found: mutable i64 = 0
+            for which in 0..<slot_number.count.i64() |slot_number, slot_first, cell, found|:
+                if step_at(slot_first, which) == cell:
+                    found <- step_at(slot_number, which)
+            return found
+
+    # '%d down (%d):  %s' or '%d across (%d):  %s', and an empty clue is
+    # replaced by a line saying so rather than left blank.
+    def clue_line(out: mutable dstr&, slot_number: darray[i64]&,
+                  slot_down: darray[bool]&, slot_length: darray[i64]&,
+                  clues: darray[sview]&, which: i64):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_i64(out, step_at(slot_number, which))
+            dstr_append_cstr(out, " down" if flag_at(slot_down, which) else " across")
+            dstr_append_cstr(out, " (")
+            dstr_append_i64(out, step_at(slot_length, which))
+            dstr_append_cstr(out, "):  ")
+            said: sview = get clues[which.usize()] else sview("", 0, -1)
+            if sview_len(said).i64() > 0:
+                dstr_append_sview(out, said)
+            else:
+                dstr_append_em_dash(out)
+                dstr_append_cstr(out, " no clue; get it from the crossings ")
+                dstr_append_em_dash(out)
