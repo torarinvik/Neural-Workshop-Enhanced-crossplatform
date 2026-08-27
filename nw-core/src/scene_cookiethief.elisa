@@ -1,0 +1,404 @@
+# The Cookie Thief screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/cookiethief.py -- the drawing, not the thinking.
+#
+# Four labels, a verdict, and a kitchen: a jar with what is left in it, the boy
+# with his hand over it, the doorway with how far it is open, and a row of pips
+# for what he has taken.
+#
+# The DOOR is the whole of the risk and every term in it is on the screen. It
+# is drawn in ONE colour at two weights and not in two colours: the solid part
+# is the gap the missing cookies left and it never closes again, and the faint
+# part on top of it is the noise a quick hand made, which dies away on a quiet
+# beat. They are the same door opened further. The second colour it used to
+# have was the golden cookie's yellow -- a thing on the counter, which must not
+# turn up in the doorway.
+#
+# The figure in the door is told apart by HEIGHT and not by colour, because on
+# the top rungs there is one beat to do it in and a colour read alone is a
+# colour read too slowly. A watching figure steps left, is drawn opaque, and
+# gains two eyes punched out in the background colour.
+#
+# The boy's arm is the whole of the animation: straight into the jar on the
+# beat the key was pressed, and a short stub at his side otherwise. There is
+# no wind-up to watch, which is what makes a press feel like a press.
+#
+# NOTE: needs elisacore_math, strings, ints, geometry, verdict, display and
+# scene_verdict included by the driver.
+
+module SceneCookieThief:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SETTING: i64 = 1
+    const PHASE_RUNNING: i64 = 2
+    const PHASE_SCORED: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    # Who is in the doorway, and when.
+    const AT_DOOR_NONE: i64 = 0
+    const AT_DOOR_COMING: i64 = 1
+    const AT_DOOR_WATCHING: i64 = 2
+
+    const WHO_MOTHER: i64 = 0
+    const WHO_SISTER: i64 = 1
+    const WHO_DOG: i64 = 2
+
+    # Where things sit across the canvas. The boy is up against the jar
+    # rather than across the kitchen from it: his hand is already over the
+    # lid and a press is a press, not a journey.
+    const JAR_AT: f64 = 0.16
+    const BOY_AT: f64 = 0.30
+    const DOOR_AT: f64 = 0.78
+
+    const FLOOR_ALPHA: i64 = 120
+    const NOISE_ALPHA: i64 = 45
+    # How far short of the limit is safe, and how long the golden one stays.
+    const SAFE: f64 = 100.0
+    const GOLD_BEATS: f64 = 6.0
+
+    def color_cookie() -> u32:
+        return Display::rgba(230, 159, 0, 255)
+
+    def color_golden() -> u32:
+        return Display::rgba(240, 228, 66, 255)
+
+    def color_door_ink(opacity: i64) -> u32:
+        return Display::rgba(213, 94, 0, opacity)
+
+    def figure_color(who: i64) -> u32:
+        if who == WHO_MOTHER:
+            return Display::rgba(204, 121, 167, 255)
+        if who == WHO_SISTER:
+            return Display::rgba(0, 114, 178, 255)
+        return Display::rgba(0, 158, 115, 255)
+
+    # The height is what tells them apart at a glance.
+    def figure_share(who: i64) -> f64:
+        if who == WHO_MOTHER:
+            return 1.00
+        if who == WHO_SISTER:
+            return 0.62
+        return 0.28
+
+    def figure_name(who: i64) -> cstr:
+        if who == WHO_MOTHER:
+            return "Mother"
+        if who == WHO_SISTER:
+            return "your sister"
+        return "the dog"
+
+    struct Paint:
+        ink: mutable u32
+        back: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     back: Display::rgba(back, back, back, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def inked(paint: Paint&, opacity: i64) -> u32:
+        channel: i64 = ((paint.ink >> 24.u32()) & 255.u32()).i64()
+        return Display::rgba(channel, channel, channel, opacity)
+
+    def with_alpha(color: u32, opacity: i64) -> u32:
+        return (color & 4294967040.u32()) | opacity.u32()
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def put_label(list: mutable Display::DisplayList&, paint: Paint&,
+                  text: sview, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            put_text(list, paint, text, x, y,
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, wide: f64, tall: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               (wide if wide > 1.0 else 1.0) / paint.sx,
+                               (tall if tall > 1.0 else 1.0) / paint.sy, color)
+
+    def put_disc(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, radius: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_circle(list, x / paint.sx, y / paint.sy,
+                                 (radius if radius > 1.0 else 1.0) / paint.sx,
+                                 color)
+
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 168.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 64.0).f64()).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.07
+            out.bottom <- bottom
+            out.width <- width * 0.86
+            out.height <- room if room > 60.0 else 60.0
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_setup: bool, room: i64, quota: i64, notice: i64,
+               opening: i64, limit: i64, jar: i64, eaten: i64, pace: i64,
+               beat: i64, grabbing: bool, reaching: i64, gold_from: i64,
+               gold_taken: bool, at_door: i64, who: i64, asked: sview,
+               trial: i64, total_trials: i64, message: sview, verdict: i64,
+               verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            playing: bool = has_setup and (phase == PHASE_SETTING or phase == PHASE_RUNNING or phase == PHASE_SCORED)
+
+            put_text(list, paint, sview("Cookie Thief", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            if has_setup:
+                dstr_append_cstr(&status, "Round ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "     ")
+                dstr_append_i64(&status, eaten)
+                dstr_append_cstr(&status, " taken     ")
+                dstr_append_sview(&status, message)
+            else:
+                dstr_append_sview(&status, message)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint, asked if has_setup else sview("", 0, -1),
+                     middle, Geometry::from_top_edge(paint.height, 94.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_TOP, false)
+
+            put_text(list, paint,
+                     sview("Esc: menu   Space: start   X: take one   Z: leave   G: golden   C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if not playing:
+                return
+
+            canvas: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&canvas, paint.width, paint.height)
+            put_jar(list, paint, &canvas, room, jar)
+            put_boy(list, paint, &canvas, grabbing, reaching, beat, gold_from,
+                    gold_taken)
+            put_door(list, paint, &canvas, notice, opening, limit, jar, pace,
+                     at_door, who)
+            put_pips(list, paint, &canvas, room, quota, eaten)
+
+    # The jar and what is left in it.
+    def put_jar(list: mutable Display::DisplayList&, paint: Paint&,
+                canvas: Canvas&, room: i64, jar: i64):
+        can Memory.Allocate, Abort.Panic:
+            held: i64 = room + 4
+            wide: f64 = canvas.width * 0.13
+            x: f64 = canvas.left + canvas.width * JAR_AT - wide / 2.0
+            tall: f64 = canvas.height * 0.52
+            base: f64 = canvas.bottom + canvas.height * 0.20
+            put_rect(list, paint, x, base, wide, tall, inked(paint, 30))
+            wanted: f64 = wide * 0.06
+            rail: f64 = wanted if wanted > 2.0 else 2.0
+            put_rect(list, paint, x, base, rail, tall, inked(paint, 70))
+            put_rect(list, paint, x + wide - rail, base, rail, tall, inked(paint, 70))
+            span: i64 = held if held > 1 else 1
+            step: f64 = tall / span.f64()
+            across: f64 = wide * 0.19
+            down: f64 = step * 0.42
+            radius: f64 = down if down < across else across
+            standing: i64 = held - jar
+            for index in 0..<(standing if standing > 0 else 0) |list, paint, x, wide, base, step, radius|:
+                row: i64 = index / 2
+                column: i64 = index % 2
+                put_disc(list, paint, x + wide * (0.3 + 0.4 * column.f64()),
+                         base + step * (row.f64() + 0.6), radius, color_cookie())
+            gone: mutable dstr = []
+            dstr_append_i64(&gone, jar)
+            dstr_append_cstr(&gone, " gone")
+            put_label(list, paint, bytes_view(gone), x + wide / 2.0,
+                      base - canvas.height * 0.07)
+
+    def put_boy(list: mutable Display::DisplayList&, paint: Paint&,
+                canvas: Canvas&, grabbing: bool, reaching: i64, beat: i64,
+                gold_from: i64, gold_taken: bool):
+        can Memory.Allocate, Abort.Panic:
+            x: f64 = canvas.left + canvas.width * BOY_AT
+            base: f64 = canvas.bottom + canvas.height * 0.22
+            body: f64 = canvas.height * 0.30
+            wide: f64 = canvas.width * 0.045
+            put_rect(list, paint, x - wide / 2.0, base, wide, body, inked(paint, 180))
+            put_disc(list, paint, x, base + body + wide * 0.55, wide * 0.55,
+                     inked(paint, 180))
+            jar_x: f64 = canvas.left + canvas.width * JAR_AT
+            wanted: f64 = canvas.height * 0.022
+            arm: f64 = wanted if wanted > 2.0 else 2.0
+            committed: bool = reaching > 0
+            if grabbing or committed:
+                # Straight into the jar, on the frame the key was pressed.
+                put_rect(list, paint, jar_x, base + body * 0.80, x - jar_x,
+                         arm, inked(paint, 220))
+            else:
+                # At his side: a short stub, so the difference between the two
+                # reads at a glance rather than needing a comparison.
+                put_rect(list, paint, x - wide * 0.9, base + body * 0.42,
+                         wide * 0.9, arm, inked(paint, 150))
+            if committed:
+                put_label(list, paint, sview("reaching", 0, -1), x,
+                          base + body + canvas.height * 0.10)
+            # `gold_on_offer`: offered, not taken, and the window still open.
+            if gold_from >= 0 and not gold_taken and beat.f64() < gold_from.f64() + GOLD_BEATS:
+                put_gold(list, paint, canvas, x, base, beat, gold_from)
+
+    # The golden one, on the counter, with the window running out.
+    def put_gold(list: mutable Display::DisplayList&, paint: Paint&,
+                 canvas: Canvas&, x: f64, base: f64, beat: i64, gold_from: i64):
+        can Memory.Allocate, Abort.Panic:
+            gone: f64 = (beat - gold_from).f64()
+            left: f64 = 1.0 - gone / GOLD_BEATS
+            share: f64 = left if left > 0.0 else 0.0
+            cx: f64 = x + canvas.width * 0.10
+            cy: f64 = base + canvas.height * 0.30
+            across: f64 = canvas.width * 0.020
+            down: f64 = canvas.height * 0.055
+            put_disc(list, paint, cx, cy, across if across < down else down,
+                     color_golden())
+            wanted: f64 = canvas.height * 0.020
+            thick: f64 = wanted if wanted > 3.0 else 3.0
+            put_rect(list, paint, cx - canvas.width * 0.03,
+                     cy - canvas.height * 0.09, canvas.width * 0.06, thick,
+                     inked(paint, 40))
+            put_rect(list, paint, cx - canvas.width * 0.03,
+                     cy - canvas.height * 0.09, canvas.width * 0.06 * share,
+                     thick, color_golden())
+
+    def put_door(list: mutable Display::DisplayList&, paint: Paint&,
+                 canvas: Canvas&, notice: i64, opening: i64, limit: i64,
+                 jar: i64, pace: i64, at_door: i64, who: i64):
+        can Memory.Allocate, Abort.Panic:
+            wide: f64 = canvas.width * 0.20
+            x: f64 = canvas.left + canvas.width * DOOR_AT - wide / 2.0
+            base: f64 = canvas.bottom + canvas.height * 0.20
+            tall: f64 = canvas.height * 0.58
+            put_rect(list, paint, x, base, wide, tall, inked(paint, 25))
+            wanted: f64 = wide * 0.05
+            rail: f64 = wanted if wanted > 2.0 else 2.0
+            put_rect(list, paint, x, base, rail, tall, inked(paint, 90))
+            put_rect(list, paint, x + wide - rail, base, rail, tall, inked(paint, 90))
+            put_rect(list, paint, x, base + tall - rail, wide, rail, inked(paint, 90))
+
+            # The opening, from the hinge on the left.
+            span: f64 = wide - 2.0 * rail
+            bound: f64 = (limit if limit > 1 else 1).f64()
+            low: f64 = (jar * notice).f64()
+            opened: f64 = low + pace.f64()
+            floor_want: f64 = low / bound
+            floor_share: f64 = floor_want if floor_want < 1.0 else 1.0
+            put_rect(list, paint, x + rail, base, span * floor_share, tall,
+                     color_door_ink(FLOOR_ALPHA))
+            if opened > low:
+                noise_want: f64 = (opened - low) / bound
+                noise: f64 = noise_want if noise_want < 1.0 else 1.0
+                put_rect(list, paint, x + rail + span * floor_share, base,
+                         span * noise, tall, color_door_ink(NOISE_ALPHA))
+
+            # The range she might be in, marked on the frame above the door.
+            wanted_gap: f64 = canvas.height * 0.02
+            zone: f64 = base + tall + (wanted_gap if wanted_gap > 3.0 else 3.0)
+            wanted_thick: f64 = canvas.height * 0.022
+            thick: f64 = wanted_thick if wanted_thick > 3.0 else 3.0
+            put_rect(list, paint, x + rail, zone, span, thick, inked(paint, 35))
+            put_rect(list, paint, x + rail + span * (SAFE / bound), zone,
+                     span * (1.0 - SAFE / bound), thick, color_door_ink(150))
+            here_want: f64 = opened / bound
+            here: f64 = here_want if here_want < 1.0 else 1.0
+            nudge: f64 = span * here
+            back: f64 = span * 0.006
+            mark: f64 = span * 0.012
+            put_rect(list, paint, x + rail + nudge - (back if back > 1.0 else 1.0),
+                     zone - thick, mark if mark > 2.0 else 2.0, thick * 3.0,
+                     inked(paint, 220))
+            # `min(999, ...)` -- a door already past a thousand says 999
+            # rather than running the line off the screen.
+            after: i64 = (opened.i64() + notice + opening)
+            said: mutable dstr = []
+            dstr_append_cstr(&said, "one more would open it to ")
+            dstr_append_i64(&said, after if after < 999 else 999)
+            dstr_append_cstr(&said, " of ")
+            dstr_append_i64(&said, limit)
+            put_label(list, paint, bytes_view(said), x + wide / 2.0,
+                      base - canvas.height * 0.07)
+            put_figure(list, paint, canvas, x, base, wide, tall, at_door, who)
+
+    def put_figure(list: mutable Display::DisplayList&, paint: Paint&,
+                   canvas: Canvas&, x: f64, base: f64, wide: f64, tall: f64,
+                   at_door: i64, who: i64):
+        can Memory.Allocate, Abort.Panic:
+            if at_door != AT_DOOR_COMING and at_door != AT_DOOR_WATCHING:
+                return
+            looking: bool = at_door == AT_DOOR_WATCHING
+            shade: u32 = with_alpha(figure_color(who), 255 if looking else 170)
+            figure: f64 = tall * 0.62 * figure_share(who)
+            body: f64 = wide * 0.30
+            cx: f64 = x + wide / 2.0 - (wide * 0.55 if looking else 0.0)
+            put_rect(list, paint, cx - body / 2.0, base, body, figure, shade)
+            put_disc(list, paint, cx, base + figure + body * 0.4, body * 0.4, shade)
+            if looking:
+                put_disc(list, paint, cx - body * 0.16, base + figure + body * 0.45,
+                         body * 0.09, paint.back)
+                put_disc(list, paint, cx + body * 0.16, base + figure + body * 0.45,
+                         body * 0.09, paint.back)
+            name: mutable dstr = []
+            dstr_append_cstr(&name, figure_name(who))
+            if looking:
+                dstr_append_cstr(&name, " is looking")
+            put_label(list, paint, bytes_view(name), x + wide / 2.0,
+                      base + tall + canvas.height * 0.10)
+
+    # What he has, against what the round asked for. The ones past the quota
+    # are drawn too, and in the golden colour, because they are worth the same
+    # point each and are the whole of the reason to still be standing there.
+    def put_pips(list: mutable Display::DisplayList&, paint: Paint&,
+                 canvas: Canvas&, room: i64, quota: i64, eaten: i64):
+        can Memory.Allocate, Abort.Panic:
+            capped: i64 = eaten if eaten < room + 6 else room + 6
+            shown: i64 = quota if quota > capped else capped
+            span: i64 = shown if shown > 1 else 1
+            across: f64 = canvas.width * 0.026
+            share: f64 = canvas.width * 0.62 / span.f64()
+            step: f64 = across if across < share else share
+            radius: f64 = step * 0.32
+            start: f64 = canvas.left + canvas.width * 0.20
+            y: f64 = canvas.bottom + canvas.height * 0.95
+            for index in 0..<shown |list, paint, start, step, radius, y, eaten, quota|:
+                got: bool = index < eaten
+                spare: bool = index >= quota
+                shade: mutable u32 = with_alpha(paint.ink, 45)
+                if got:
+                    shade <- color_golden() if spare else color_cookie()
+                put_disc(list, paint, start + step * index.f64(), y, radius, shade)
