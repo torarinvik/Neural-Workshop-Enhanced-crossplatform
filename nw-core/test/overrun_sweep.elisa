@@ -1,0 +1,232 @@
+# Differential sweep driver for tasks/overrun.elisa. See overrun_diff.py for
+# the reference side.
+#
+# The bank belongs to the shell, so both sides build the SAME synthetic pool
+# from a fixed recipe -- lengths that span the SHORTEST..LONGEST band and word
+# shapes that put the runway rule under strain at both ends.
+#
+# Two streams are pinned. The lane arithmetic, swept directly over every
+# (cleared, drift) a wave can be in. And a whole run typed out by a scripted
+# typist that misses on a fixed cadence, so wrong letters sit in the buffer,
+# get rubbed out, and sometimes are still there when the line runs out.
+#
+# The deal is the delicate part: the reference reseeds a FRESH generator per
+# wave from its own stream, so the pick is one draw from a generator that has
+# made no other.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/overrun.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+def emit_scaled(value: f64):
+    can Console.Write, Abort.Panic:
+        emit_cell(py_round_half_even(value * 1000000.0))
+
+# The synthetic bank. Sentence s holds `3 + s % 6` words; word w of it is
+# `3 + (s * 7 + w * 5) % 8` letters long, and letter L of that word is
+# `(s * 13 + w * 11 + L * 3) % 26`. Both sides build it from this recipe, so
+# the corpus is a function rather than a file.
+def build_pool(pool: mutable Overrun::Pool&, sentences: i64):
+    can Abort.Panic:
+        pool.count <- sentences
+        word_slot: mutable i64 = 0
+        letter_slot: mutable i64 = 0
+        for s in 0..<sentences |pool, word_slot, letter_slot|:
+            words: i64 = 3 + s % 6
+            Ints::put(&pool.words, s, words)
+            Ints::put(&pool.word_at, s, word_slot)
+            for wcount in 0..<words |pool, s, word_slot, letter_slot|:
+                width: i64 = 3 + (s * 7 + wcount * 5) % 8
+                Ints::put(&pool.word_length, word_slot, width)
+                Ints::put(&pool.letter_at, word_slot, letter_slot)
+                for at in 0..<width |pool, s, wcount, letter_slot, at|:
+                    Ints::put(&pool.letter, letter_slot + at, (s * 13 + wcount * 11 + at * 3) % 26)
+                letter_slot <- letter_slot + width
+                word_slot <- word_slot + 1
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(64 * 1024 * 1024)
+        in w:
+            # --- the grades ----------------------------------------------
+            for rung in -2..<17:
+                printr("grade")
+                emit_cell(rung)
+                emit_cell(Overrun::clamped_rung(rung))
+                emit_cell(Overrun::grade_of(rung))
+                emit_scaled(Overrun::grade_speed(Overrun::grade_of(rung)))
+                print("")
+
+            # --- words a minute ------------------------------------------
+            for letters in 0..<40:
+                for tenths in 0..<12:
+                    printr("wpm")
+                    emit_cell(letters)
+                    emit_cell(tenths)
+                    emit_scaled(Overrun::words_a_minute(letters.f64(), tenths.f64() * 0.85))
+                    print("")
+
+            pool: mutable Overrun::Pool = Overrun::Pool{count: 0, words: Ints::zeros(256),
+                    word_at: Ints::zeros(256), word_length: Ints::zeros(4096),
+                    letter_at: Ints::zeros(4096), letter: Ints::zeros(65536)}
+            build_pool(&pool, 64)
+
+            # --- the lane arithmetic, over every state a wave can be in ---
+            wave: mutable Overrun::Wave = Overrun::new_wave()
+            for s in 0..<64 |wave, pool|:
+                for grade in 0..<Overrun::GRADE_COUNT |wave, pool, s|:
+                    continue if (s + grade) % 5 != 0
+                    Overrun::load_wave(&wave, &pool, s, grade)
+                    printr("wave")
+                    emit_cell(s)
+                    emit_cell(grade)
+                    emit_cell(wave.word_count)
+                    emit_cell(wave.length)
+                    emit_cell(wave.letters)
+                    emit_cell(Overrun::start_cell(&wave))
+                    emit_scaled(Overrun::seconds_of(&wave))
+                    emit_scaled(Overrun::demand(&wave))
+                    for at in 0..<wave.word_count |wave|:
+                        emit_cell(Ints::at_ref(&wave.word_start, at))
+                        emit_cell(Ints::at_ref(&wave.word_length, at))
+                    print("")
+                    for cleared in 0..<(wave.word_count + 1) |wave, s, grade|:
+                        stop: Overrun::Deadline = Overrun::deadline(&wave, cleared)
+                        printr("lane")
+                        emit_cell(s)
+                        emit_cell(grade)
+                        emit_cell(cleared)
+                        emit_cell(1 if stop.finite else 0)
+                        emit_scaled(stop.seconds)
+                        for step in 0..<9 |wave, cleared, step|:
+                            drift: f64 = step.f64() * 11.0
+                            emit_scaled(Overrun::left_cell(&wave, drift))
+                            emit_scaled(Overrun::right_cell(&wave, cleared, drift))
+                            emit_cell(1 if Overrun::overrun(&wave, cleared, drift) else 0)
+                        print("")
+
+            # --- whole runs, typed ---------------------------------------
+            for cfg in 0..<6 |wave, pool|:
+                run: mutable Overrun::Run = Overrun::new_run()
+                rng: mutable MT19937 = mt19937_new()
+                mt_seed_int(&rng, (300 + cfg).u64())
+                run.start_rung <- 1 + cfg * 2
+                run.total_waves <- 4
+                run.adaptive <- (cfg % 2) == 0
+                run.coach <- (cfg % 3) != 0
+                Overrun::start_run(&run, &wave, &pool, 0.0, &rng)
+                printr("start")
+                emit_cell(cfg)
+                emit_cell(run.phase)
+                emit_cell(run.trial)
+                emit_cell(run.rung)
+                emit_cell(run.lives)
+                emit_cell(wave.word_count)
+                emit_cell(wave.length)
+                emit_cell(wave.letters)
+                print("")
+
+                dt: f64 = 1.0 / 60.0
+                now: mutable f64 = 0.0
+                tick: mutable i64 = 0
+                while run.phase != Overrun::PHASE_DONE and tick < 20000 |run, wave, pool, cfg, now, tick, dt, rng|:
+                    now <- now + dt
+                    Overrun::update(&run, &wave, &pool, dt, now, &rng)
+                    # A typist on a fixed cadence: mostly the right letter,
+                    # a wrong one every eleventh key, and a rub-out every
+                    # nineteenth -- so wrong letters sit, get taken back, and
+                    # sometimes are still there when the line runs out.
+                    if run.phase == Overrun::PHASE_TYPING and (tick % 3) == 0:
+                        if (tick % 19) == 0:
+                            Overrun::erase(&run)
+                        else:
+                            word: i64 = Overrun::target(&run, &wave)
+                            # Every seventh key is not a letter at all, which
+                            # is the one press the reference refuses BEFORE it
+                            # reaches the buffer. Otherwise a real letter: the
+                            # right one, or the next one along every eleventh.
+                            # A full buffer still gets a letter, so the "wrong
+                            # and full" refusal is exercised with a real key.
+                            key: mutable i64 = 0
+                            if (tick % 7) == 0:
+                                key <- -1
+                            else:
+                                if word >= 0 and run.typed_count < Ints::at_ref(&wave.word_length, word):
+                                    wanted: i64 = Ints::at_ref(&wave.letter, Ints::at_ref(&wave.letter_start, word) + run.typed_count)
+                                    key <- wanted if (tick % 11) != 0 else (wanted + 1) % 26
+                            Overrun::write(&run, &wave, key, now)
+                    if (tick % 20) == 0:
+                        printr("tick")
+                        emit_cell(cfg)
+                        emit_cell(tick)
+                        emit_cell(run.phase)
+                        emit_cell(run.trial)
+                        emit_cell(run.rung)
+                        emit_cell(run.lives)
+                        emit_cell(run.cleared)
+                        emit_cell(run.typed_count)
+                        emit_cell(run.landed)
+                        emit_cell(run.missed)
+                        emit_cell(run.verdict)
+                        emit_scaled(run.drift)
+                        emit_scaled(run.seconds)
+                        emit_cell(wave.word_count)
+                        emit_cell(wave.length)
+                        for at in 0..<run.typed_count |run|:
+                            emit_cell(Ints::at_ref(&run.typed, at))
+                        print("")
+                    tick <- tick + 1
+
+                tally: Overrun::Score = Overrun::score(&run)
+                printr("score")
+                emit_cell(cfg)
+                emit_cell(tick)
+                emit_cell(tally.waves)
+                emit_cell(tally.cleared)
+                emit_cell(tally.lives)
+                emit_cell(tally.best_rung)
+                emit_cell(tally.wpm)
+                emit_cell(tally.missed)
+                for at in 0..<run.result_count |run|:
+                    emit_cell(Ints::at_ref(&run.result_rung, at))
+                    emit_cell(Ints::at_ref(&run.result_done, at))
+                    emit_cell(Ints::at_ref(&run.result_words, at))
+                    emit_scaled(Floats::at_ref(&run.result_took, at))
+                print("")
+        destroy w
+        return 0

@@ -1,0 +1,616 @@
+# Out of Sight: hold on to dots that stop being visible.
+#
+# Port of the portable half of neural_workshop/ui/outofsight.py
+# (GPL-2.0-or-later). Positions are fractions of the window, as the reference
+# stores them; the bounds and the radius come from the shell.
+#
+# Two things make the picture on screen insufficient. The CROSSING aims two
+# dots at the point exactly between them, so they arrive together, overlap as
+# one, and pass through -- at that instant nothing in the frame says which came
+# from which side. The BLINDS are slabs the dots pass behind, and a slab that
+# hangs over the wall lets a dot bounce while it is hidden, so the place it
+# comes back out is not on the line it went in on.
+#
+# Nothing here is ever decided by a coin: the dots move in straight lines and
+# bounce off walls, so a tracker that keeps a position and a velocity for each
+# of them can follow every crossing and predict every emergence exactly.
+#
+# The RNG order is the delicate part, and three places are easy to get wrong:
+#
+#   * a slab is drawn upright-or-along FIRST, then its two coordinates, and a
+#     rejected candidate has already spent all three draws;
+#   * `scattered` REWINDS -- unlike lookout's flock it starts the whole layout
+#     again when it will not fit, and the spots already placed are thrown away;
+#   * a crossing schedules its NEXT gap before it looks for a free pair, so a
+#     round with nothing free still spends the draw.
+
+extern cos(x: f64) -> f64
+extern sin(x: f64) -> f64
+
+module OutOfSight:
+
+    # Dots a round may hold. The ceilings are room rather than code, and a
+    # round must leave one dot that is not yours or the question answers itself.
+    const FEWEST_DOTS: i64 = 3
+    const MOST_DOTS: i64 = 30
+    const MOST_BLINDS: i64 = 32
+
+    # How the phases pace themselves, in seconds.
+    const CUE_SECONDS: f64 = 2.0
+    const REVEAL_SECONDS: f64 = 1.8
+    const PROBE_SECONDS: f64 = 1.6
+    const VERDICT_SECONDS: f64 = 0.6
+    const SHORTEST_GAP: f64 = 1.0
+    const LONGEST_GAP: f64 = 3.0
+
+    # How long after a crossing, or after coming back out from behind a blind,
+    # a dot still counts as one whose identity was just in doubt.
+    const RISK_SECONDS: f64 = 2.5
+
+    # The most of the field the slabs may take between them. A playability
+    # floor first -- half a field with nothing visible in it is not a tracking
+    # task -- and a termination proof second: the rest of the field is always
+    # open, so looking for a spawn spot in the clear always finds one.
+    const MOST_COVERED: f64 = 0.45
+
+    const TWO_PI: f64 = 6.283185307179586
+
+    const PHASE_READY: i64 = 0
+    const PHASE_CUEING: i64 = 1
+    const PHASE_TRACKING: i64 = 2
+    const PHASE_REVEALING: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    struct Rgb:
+        r: i64
+        g: i64
+        b: i64
+
+    # The slabs, dark enough to read as solid on either background and far
+    # from every dot colour.
+    def blind_rgb(black_background: bool) -> Rgb:
+        can Abort.Panic:
+            return Rgb{r: 78, g: 82, b: 92} if black_background
+            return Rgb{r: 148, g: 152, b: 162}
+
+    # --- the field -------------------------------------------------------
+
+    struct Bounds:
+        low_x: f64
+        high_x: f64
+        low_y: f64
+        high_y: f64
+
+    def radius(window_height: f64) -> f64:
+        can Abort.Panic:
+            scaled: f64 = Geometry::scale_to_height(window_height, 19.0).f64()
+            return 7.0 if scaled < 7.0 else scaled
+
+    # low x, high x, low y, high y -- in fractions, dot CENTRE.
+    def bounds(window_width: f64, window_height: f64) -> Bounds:
+        can Abort.Panic:
+            edge_x: f64 = radius(window_height) / window_width
+            edge_y: f64 = radius(window_height) / window_height
+            return Bounds{low_x: edge_x + 0.01, high_x: 1.0 - edge_x - 0.01,
+                          low_y: edge_y + 0.11, high_y: 1.0 - edge_y - 0.15}
+
+    def aspect_of(window_width: f64, window_height: f64) -> f64:
+        can Abort.Panic:
+            return window_height / (1.0 if window_width < 1.0 else window_width)
+
+    # A slab the dots pass behind, in fractions of the window. It is drawn OVER
+    # them rather than consulted before drawing them, so a dot halfway in is
+    # halfway visible with no arithmetic -- but the ring needs to know whether
+    # a dot can be pointed at, and that is what `covers` is for.
+    struct Blinds:
+        count: mutable i64
+        left: mutable darray[f64]
+        bottom: mutable darray[f64]
+        width: mutable darray[f64]
+        height: mutable darray[f64]
+
+    def new_blinds() -> Blinds:
+        can Memory.Allocate, Abort.Panic:
+            return Blinds{count: 0, left: Floats::zeros(MOST_BLINDS), bottom: Floats::zeros(MOST_BLINDS),
+                          width: Floats::zeros(MOST_BLINDS), height: Floats::zeros(MOST_BLINDS)}
+
+    def covers(slabs: mutable Blinds&, at: i64, x: f64, y: f64) -> bool:
+        can Abort.Panic:
+            left: f64 = Floats::at_ref(&slabs.left, at)
+            bottom: f64 = Floats::at_ref(&slabs.bottom, at)
+            return left <= x and x <= left + Floats::at_ref(&slabs.width, at) and bottom <= y and y <= bottom + Floats::at_ref(&slabs.height, at)
+
+    # Is a dot centred on (x, y) out of sight? CENTRE rather than circle: a dot
+    # more than half covered is one the ring has no business pointing at, and
+    # one still showing an edge is one you can still answer about.
+    def hidden(slabs: mutable Blinds&, x: f64, y: f64) -> bool:
+        can Abort.Panic:
+            for at in 0..<slabs.count |slabs, x, y|:
+                return true if covers(slabs, at, x, y)
+            return false
+
+    def overlaps_laid(slabs: mutable Blinds&, left: f64, bottom: f64, width: f64, height: f64) -> bool:
+        can Abort.Panic:
+            for at in 0..<slabs.count |slabs, left, bottom, width, height|:
+                other_left: f64 = Floats::at_ref(&slabs.left, at)
+                other_bottom: f64 = Floats::at_ref(&slabs.bottom, at)
+                shares: bool = left < other_left + Floats::at_ref(&slabs.width, at) and other_left < left + width and bottom < other_bottom + Floats::at_ref(&slabs.height, at) and other_bottom < bottom + height
+                return true if shares
+            return false
+
+    # How much of the field a slab eats. A slab may hang past the wall, and the
+    # part that hangs over costs the flock nothing, so only the overlap is
+    # charged for.
+    def area_in(left: f64, bottom: f64, width: f64, height: f64, field: Bounds&) -> f64:
+        can Abort.Panic:
+            right: f64 = left + width
+            top: f64 = bottom + height
+            across: f64 = (right if right < field.high_x else field.high_x) - (left if left > field.low_x else field.low_x)
+            up: f64 = (top if top < field.high_y else field.high_y) - (bottom if bottom > field.low_y else field.low_y)
+            return (0.0 if across < 0.0 else across) * (0.0 if up < 0.0 else up)
+
+    # Scatter the slabs, sized in screen heights and kept apart.
+    #
+    # A slab may hang a third of itself past the wall ON PURPOSE: then a dot
+    # can bounce while it is hidden and come back out somewhere the straight
+    # line it went in on never reaches. That is the one place the task asks for
+    # a bounce to be predicted rather than seen, and it is still exactly
+    # predictable.
+    #
+    # Asking for more slabs than the field can take is not an error and not a
+    # clamp that can be worked out in advance: a slab is laid if it fits beside
+    # the ones already down and inside the share of the field the slabs are
+    # allowed between them, and dropped if it does not.
+    def lay_blinds(slabs: mutable Blinds&, blind_count: i64, blind_width: f64, window_width: f64, window_height: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            slabs.count <- 0
+            return if blind_count <= 0 or blind_width <= 0.0
+            field: Bounds = bounds(window_width, window_height)
+            room: mutable f64 = (field.high_x - field.low_x) * (field.high_y - field.low_y) * MOST_COVERED
+            aspect: f64 = aspect_of(window_width, window_height)
+            narrow: f64 = blind_width
+            along: f64 = blind_width * 2.6
+            for _slab in 0..<blind_count |slabs, field, room, aspect, narrow, along, rng|:
+                laid: mutable bool = false
+                for _attempt in 0..<200 |slabs, field, room, aspect, narrow, along, laid, rng|:
+                    break if laid
+                    upright: bool = py_random(rng) < 0.5
+                    width: f64 = (narrow if upright else along) * aspect
+                    height: f64 = along if upright else narrow
+                    left: f64 = py_uniform(rng, field.low_x - width / 3.0, field.high_x - 2.0 * width / 3.0)
+                    bottom: f64 = py_uniform(rng, field.low_y - height / 3.0, field.high_y - 2.0 * height / 3.0)
+                    taken: f64 = area_in(left, bottom, width, height, &field)
+                    continue if taken > room
+                    if not overlaps_laid(slabs, left, bottom, width, height):
+                        Floats::put(&slabs.left, slabs.count, left)
+                        Floats::put(&slabs.bottom, slabs.count, bottom)
+                        Floats::put(&slabs.width, slabs.count, width)
+                        Floats::put(&slabs.height, slabs.count, height)
+                        slabs.count <- slabs.count + 1
+                        room <- room - taken
+                        laid <- true
+
+    # --- the dots --------------------------------------------------------
+
+    struct Flock:
+        count: mutable i64
+        x: mutable darray[f64]
+        y: mutable darray[f64]
+        vx: mutable darray[f64]
+        vy: mutable darray[f64]
+        target: mutable darray[i64]
+        busy_until: mutable darray[f64]
+        risky_until: mutable darray[f64]
+        was_hidden: mutable darray[i64]
+
+    def new_flock() -> Flock:
+        can Memory.Allocate, Abort.Panic:
+            return Flock{count: 0, x: Floats::zeros(MOST_DOTS), y: Floats::zeros(MOST_DOTS),
+                         vx: Floats::zeros(MOST_DOTS), vy: Floats::zeros(MOST_DOTS),
+                         target: Ints::zeros(MOST_DOTS), busy_until: Floats::zeros(MOST_DOTS),
+                         risky_until: Floats::zeros(MOST_DOTS), was_hidden: Ints::zeros(MOST_DOTS)}
+
+    # Spawn spots in clear air, and never behind a blind. Every dot has to be
+    # seen at least once, when the cue names yours, so a spot the slabs already
+    # cover is no spot at all.
+    #
+    # This layout REWINDS: a relaxed pass starts the whole scatter again rather
+    # than keeping what it had. lookout.py's flock does the opposite, and the
+    # two are not interchangeable.
+    def scattered(out_x: mutable darray[f64]&, out_y: mutable darray[f64]&, dot_count: i64, slabs: mutable Blinds&, window_width: f64, window_height: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            field: Bounds = bounds(window_width, window_height)
+            apart: mutable f64 = 2.4 * radius(window_height) / window_height
+            settled: mutable bool = false
+            while not settled |out_x, out_y, dot_count, slabs, field, apart, settled, rng|:
+                placed: mutable i64 = 0
+                for _attempt in 0..<(dot_count * 80) |out_x, out_y, dot_count, slabs, field, apart, settled, placed, rng|:
+                    break if settled
+                    spot_x: f64 = py_uniform(rng, field.low_x, field.high_x)
+                    spot_y: f64 = py_uniform(rng, field.low_y, field.high_y)
+                    continue if hidden(slabs, spot_x, spot_y)
+                    clear: mutable bool = true
+                    for other in 0..<placed |clear, out_x, out_y, spot_x, spot_y, apart|:
+                        dx: f64 = spot_x - Floats::at_ref(out_x, other)
+                        dy: f64 = spot_y - Floats::at_ref(out_y, other)
+                        clear <- false if dx * dx + dy * dy < apart * apart
+                    if clear:
+                        Floats::put(out_x, placed, spot_x)
+                        Floats::put(out_y, placed, spot_y)
+                        placed <- placed + 1
+                        settled <- true if placed == dot_count
+                apart <- apart * 0.8 if not settled
+
+    # Aim two dots at the point between them; return the seconds.
+    #
+    # The midpoint is the only meeting place both can reach at the same pace,
+    # because it is exactly as far from one as from the other. So neither has
+    # to hurry to make the appointment, and nothing about how a dot moves --
+    # not its speed, not its heading -- says whether it is one of yours or
+    # which one it is. The outgoing velocities are each other's exact
+    # negatives, which is what makes the instant of the crossing symmetric.
+    #
+    # A velocity is screen-heights a second on BOTH axes, so the horizontal
+    # reach has to be put in those units before the two are measured against
+    # each other.
+    def rendezvous(flock: mutable Flock&, one: i64, other: i64, speed: f64, aspect: f64) -> f64:
+        can Abort.Panic:
+            one_x: f64 = Floats::at_ref(&flock.x, one)
+            one_y: f64 = Floats::at_ref(&flock.y, one)
+            mid_x: f64 = (one_x + Floats::at_ref(&flock.x, other)) / 2.0
+            mid_y: f64 = (one_y + Floats::at_ref(&flock.y, other)) / 2.0
+            reach_x: f64 = (mid_x - one_x) / aspect
+            reach_y: f64 = mid_y - one_y
+            span: f64 = py_hypot(reach_x, reach_y)
+            0.0 return if span <= 0.0 or speed <= 0.0
+            seconds: f64 = span / speed
+            one_vx: f64 = reach_x / seconds
+            one_vy: f64 = reach_y / seconds
+            Floats::put(&flock.vx, one, one_vx)
+            Floats::put(&flock.vy, one, one_vy)
+            Floats::put(&flock.vx, other, 0.0 - one_vx)
+            Floats::put(&flock.vy, other, 0.0 - one_vy)
+            return seconds
+
+    # Advance the flock, bouncing off the walls. The dots pass THROUGH each
+    # other rather than colliding: two identical dots crossing is the moment
+    # tracking is hard, and bouncing them apart would delete the difficulty in
+    # the name of physics.
+    def drift(flock: mutable Flock&, dt: f64, window_width: f64, window_height: f64):
+        can Abort.Panic:
+            field: Bounds = bounds(window_width, window_height)
+            aspect: f64 = aspect_of(window_width, window_height)
+            for at in 0..<flock.count |flock, dt, aspect, field|:
+                across: Tracking::Axis = Tracking::bounced(Floats::at_ref(&flock.x, at) + Floats::at_ref(&flock.vx, at) * dt * aspect, Floats::at_ref(&flock.vx, at), field.low_x, field.high_x)
+                down: Tracking::Axis = Tracking::bounced(Floats::at_ref(&flock.y, at) + Floats::at_ref(&flock.vy, at) * dt, Floats::at_ref(&flock.vy, at), field.low_y, field.high_y)
+                Floats::put(&flock.x, at, across.position)
+                Floats::put(&flock.vx, at, across.velocity)
+                Floats::put(&flock.y, at, down.position)
+                Floats::put(&flock.vy, at, down.velocity)
+
+    # Note the two moments a dot's identity was just in doubt: a crossing it
+    # has now made, and a return to the open from behind a slab. Both are
+    # moments the frame alone stopped saying which dot this is, so both are
+    # what the ring hunts.
+    def mark_risk(flock: mutable Flock&, slabs: mutable Blinds&, now: f64):
+        can Abort.Panic:
+            for at in 0..<flock.count |flock, slabs, now|:
+                busy: f64 = Floats::at_ref(&flock.busy_until, at)
+                if busy != 0.0 and now >= busy:
+                    Floats::put(&flock.busy_until, at, 0.0)
+                    Floats::put(&flock.risky_until, at, now + RISK_SECONDS)
+                out_of_sight: bool = hidden(slabs, Floats::at_ref(&flock.x, at), Floats::at_ref(&flock.y, at))
+                if Ints::at_ref(&flock.was_hidden, at) != 0 and not out_of_sight:
+                    Floats::put(&flock.risky_until, at, now + RISK_SECONDS)
+                Ints::put(&flock.was_hidden, at, 1 if out_of_sight else 0)
+
+    # --- a run -----------------------------------------------------------
+
+    const MOST_PROBES: i64 = 64
+    const MOST_ROUNDS: i64 = 64
+
+    struct Run:
+        dot_count: mutable i64
+        start_targets: mutable i64
+        speed: mutable f64
+        blind_count: mutable i64
+        blind_width: mutable f64
+        cross_gap: mutable f64
+        probes_per_round: mutable i64
+        total_rounds: mutable i64
+        adaptive: mutable bool
+        round_number: mutable i64
+        held: mutable i64
+        hits: mutable i64
+        wrong: mutable i64
+        late: mutable i64
+        reaction_count: mutable i64
+        reaction_times: mutable darray[f64]
+        result_count: mutable i64
+        result_held: mutable darray[i64]
+        result_asked: mutable darray[i64]
+        result_right: mutable darray[i64]
+        schedule: mutable darray[i64]
+        probes_done: mutable i64
+        round_right: mutable i64
+        # -1 means no dot is ringed; otherwise the slot in the flock.
+        probe: mutable i64
+        probe_at: mutable f64
+        probe_ends: mutable f64
+        # -1 none, 0 wrong, 1 right -- the reference's `verdict`, which is
+        # None until an answer settles the ring.
+        verdict: mutable i64
+        verdict_until: mutable f64
+        next_probe: mutable f64
+        next_cross: mutable f64
+        phase: mutable i64
+        until: mutable f64
+
+    def new_run() -> Run:
+        can Memory.Allocate, Abort.Panic:
+            return Run{dot_count: FEWEST_DOTS, start_targets: 1, speed: 0.0, blind_count: 0,
+                       blind_width: 0.0, cross_gap: 0.0, probes_per_round: 0, total_rounds: 0,
+                       adaptive: false, round_number: 0, held: 1, hits: 0, wrong: 0, late: 0,
+                       reaction_count: 0, reaction_times: Floats::zeros(MOST_PROBES * MOST_ROUNDS),
+                       result_count: 0, result_held: Ints::zeros(MOST_ROUNDS),
+                       result_asked: Ints::zeros(MOST_ROUNDS), result_right: Ints::zeros(MOST_ROUNDS),
+                       schedule: Ints::zeros(MOST_PROBES), probes_done: 0, round_right: 0,
+                       probe: -1, probe_at: 0.0, probe_ends: 0.0, verdict: -1, verdict_until: 0.0,
+                       next_probe: 0.0, next_cross: 0.0, phase: PHASE_READY, until: 0.0}
+
+    # At least one of yours, and at least one dot that is not.
+    def clamped_targets(run: mutable Run&, count: i64) -> i64:
+        can Abort.Panic:
+            ceiling: i64 = run.dot_count - 1
+            capped: i64 = ceiling if count > ceiling else count
+            return 1 if capped < 1 else capped
+
+    def reset(run: mutable Run&, slabs: mutable Blinds&, flock: mutable Flock&):
+        can Abort.Panic:
+            slabs.count <- 0
+            # `_drop_dots` clears the ring along with the dots.
+            flock.count <- 0
+            run.probe <- -1
+            run.round_number <- 0
+            run.result_count <- 0
+            run.hits <- 0
+            run.wrong <- 0
+            run.late <- 0
+            run.reaction_count <- 0
+            run.held <- clamped_targets(run, run.start_targets)
+            run.phase <- PHASE_READY
+
+    # Which questions this round asks about a dot of yours.
+    #
+    # An independent coin per question, and deliberately NOT an even half and
+    # half. A round balanced exactly would pay for counting instead of
+    # tracking: having seen three answers of "yours" in a round of six, the
+    # last three would have to be the others, and a player who kept score
+    # rather than kept hold would beat one who did the task.
+    def probe_schedule(run: mutable Run&, rng: mutable MT19937&):
+        can Abort.Panic:
+            for question in 0..<run.probes_per_round |run, rng|:
+                Ints::put(&run.schedule, question, 1 if py_random(rng) < 0.5 else 0)
+
+    def held_now(flock: mutable Flock&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for at in 0..<flock.count |flock, total|:
+                total <- total + 1 if Ints::at_ref(&flock.target, at) != 0
+            return total
+
+    def finish(run: mutable Run&):
+        can Abort.Panic:
+            run.phase <- PHASE_DONE
+            run.probe <- -1
+
+    def next_round(run: mutable Run&, slabs: mutable Blinds&, flock: mutable Flock&, spots_x: mutable darray[f64]&, spots_y: mutable darray[f64]&, window_width: f64, window_height: f64, now: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            if run.round_number >= run.total_rounds:
+                finish(run)
+                return
+            run.round_number <- run.round_number + 1
+            run.probe <- -1
+            lay_blinds(slabs, run.blind_count, run.blind_width, window_width, window_height, rng)
+            count: i64 = clamped_targets(run, run.held)
+            chosen: darray[i64] = py_sample_range(rng, 0, run.dot_count - 1, count)
+            scattered(spots_x, spots_y, run.dot_count, slabs, window_width, window_height, rng)
+            flock.count <- run.dot_count
+            for index in 0..<run.dot_count |flock, run, spots_x, spots_y, chosen, rng|:
+                heading: f64 = py_uniform(rng, 0.0, TWO_PI)
+                Floats::put(&flock.x, index, Floats::at_ref(spots_x, index))
+                Floats::put(&flock.y, index, Floats::at_ref(spots_y, index))
+                Floats::put(&flock.vx, index, run.speed * cos(heading))
+                Floats::put(&flock.vy, index, run.speed * sin(heading))
+                mine: mutable i64 = 0
+                for picked in chosen |mine, index|:
+                    mine <- 1 if picked == index
+                Ints::put(&flock.target, index, mine)
+                Floats::put(&flock.busy_until, index, 0.0)
+                Floats::put(&flock.risky_until, index, 0.0)
+                Ints::put(&flock.was_hidden, index, 0)
+            probe_schedule(run, rng)
+            run.probes_done <- 0
+            run.round_right <- 0
+            run.verdict <- -1
+            run.phase <- PHASE_CUEING
+            run.until <- now + CUE_SECONDS
+
+    def start_run(run: mutable Run&, slabs: mutable Blinds&, flock: mutable Flock&, spots_x: mutable darray[f64]&, spots_y: mutable darray[f64]&, window_width: f64, window_height: f64, now: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            reset(run, slabs, flock)
+            next_round(run, slabs, flock, spots_x, spots_y, window_width, window_height, now, rng)
+
+    # Send two dots through each other, if one is due.
+    #
+    # The pair is drawn at random from every dot not already committed to a
+    # crossing. Drawing it any other way -- always including one of yours, say
+    # -- would make the crossings themselves say which dots are yours.
+    #
+    # The next gap is scheduled BEFORE the pair is looked for, so a flock with
+    # nothing free still spends the draw.
+    def maybe_cross(run: mutable Run&, flock: mutable Flock&, window_width: f64, window_height: f64, now: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            return if run.cross_gap <= 0.0 or now < run.next_cross
+            run.next_cross <- now + py_uniform(rng, 0.6, 1.4) * run.cross_gap
+            free: mutable darray[i64] = Ints::zeros(MOST_DOTS)
+            free_count: mutable i64 = 0
+            for at in 0..<flock.count |flock, free, free_count|:
+                if Floats::at_ref(&flock.busy_until, at) == 0.0:
+                    Ints::put(&free, free_count, at)
+                    free_count <- free_count + 1
+            return if free_count < 2
+            pair: darray[i64] = py_sample_range(rng, 0, free_count - 1, 2)
+            one: i64 = Ints::at(pair, 0)
+            other: i64 = Ints::at(pair, 1)
+            one_dot: i64 = Ints::at_ref(&free, one)
+            other_dot: i64 = Ints::at_ref(&free, other)
+            meets: f64 = now + rendezvous(flock, one_dot, other_dot, run.speed, aspect_of(window_width, window_height))
+            Floats::put(&flock.busy_until, one_dot, meets)
+            Floats::put(&flock.busy_until, other_dot, meets)
+
+    # A dot to ring: one of `want`'s kind, and one you can see. Among those,
+    # one whose identity was recently in doubt, when there is one.
+    #
+    # Risk is dealt out by the crossings and the slabs, neither of which knows
+    # which dots are yours, so preferring risky dots does not leak the answer.
+    def probeable(flock: mutable Flock&, slabs: mutable Blinds&, want: i64, now: f64, rng: mutable MT19937&) -> i64:
+        can Abort.Panic:
+            open_air: mutable darray[i64] = Ints::zeros(MOST_DOTS)
+            open_count: mutable i64 = 0
+            risky: mutable darray[i64] = Ints::zeros(MOST_DOTS)
+            risky_count: mutable i64 = 0
+            for at in 0..<flock.count |flock, slabs, want, now, open_air, open_count, risky, risky_count|:
+                continue if Ints::at_ref(&flock.target, at) != want
+                continue if hidden(slabs, Floats::at_ref(&flock.x, at), Floats::at_ref(&flock.y, at))
+                Ints::put(&open_air, open_count, at)
+                open_count <- open_count + 1
+                if Floats::at_ref(&flock.risky_until, at) > now:
+                    Ints::put(&risky, risky_count, at)
+                    risky_count <- risky_count + 1
+            -1 return if open_count == 0
+            return Ints::at_ref(&risky, py_randbelow(rng, risky_count.u64()).i64()) if risky_count > 0
+            return Ints::at_ref(&open_air, py_randbelow(rng, open_count.u64()).i64())
+
+    # Ring a dot and start its clock. When every dot of the wanted kind is
+    # behind a slab there is nothing to point at, so the question simply waits
+    # -- the flock is moving, and one will be out in a moment.
+    def raise_probe(run: mutable Run&, flock: mutable Flock&, slabs: mutable Blinds&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            dot: i64 = probeable(flock, slabs, Ints::at_ref(&run.schedule, run.probes_done), now, rng)
+            return if dot < 0
+            run.probe <- dot
+            run.probe_at <- now
+            run.probe_ends <- now + PROBE_SECONDS
+
+    def settle(run: mutable Run&, right: bool, now: f64):
+        can Abort.Panic:
+            run.verdict <- 1 if right else 0
+            run.verdict_until <- now + VERDICT_SECONDS
+            run.probes_done <- run.probes_done + 1
+            run.round_right <- run.round_right + 1 if right
+
+    # A press of J (mine) or F (not mine) on the ringed dot.
+    def answer(run: mutable Run&, flock: mutable Flock&, mine: bool, now: f64):
+        can Abort.Panic:
+            return if run.phase != PHASE_TRACKING or run.probe < 0
+            return if run.verdict >= 0
+            was_mine: bool = Ints::at_ref(&flock.target, run.probe) != 0
+            right: bool = mine == was_mine
+            Floats::put(&run.reaction_times, run.reaction_count, now - run.probe_at)
+            run.reaction_count <- run.reaction_count + 1
+            if right:
+                run.hits <- run.hits + 1
+            else:
+                run.wrong <- run.wrong + 1
+            settle(run, right, now)
+
+    # The ring ran out with no answer.
+    def too_slow(run: mutable Run&, now: f64):
+        can Abort.Panic:
+            run.late <- run.late + 1
+            settle(run, false, now)
+
+    def retire_probe(run: mutable Run&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            run.probe <- -1
+            run.verdict <- -1
+            run.next_probe <- now + py_uniform(rng, SHORTEST_GAP, LONGEST_GAP)
+
+    def end_round(run: mutable Run&, flock: mutable Flock&, now: f64):
+        can Abort.Panic:
+            asked: i64 = run.probes_done
+            right: i64 = run.round_right
+            Ints::put(&run.result_held, run.result_count, held_now(flock))
+            Ints::put(&run.result_asked, run.result_count, asked)
+            Ints::put(&run.result_right, run.result_count, right)
+            run.result_count <- run.result_count + 1
+            if run.adaptive:
+                grown: i64 = run.held + 1 if right == asked else run.held - 1
+                run.held <- clamped_targets(run, grown)
+            run.phase <- PHASE_REVEALING
+            run.until <- now + REVEAL_SECONDS
+
+    def update(run: mutable Run&, slabs: mutable Blinds&, flock: mutable Flock&, spots_x: mutable darray[f64]&, spots_y: mutable darray[f64]&, dt: f64, window_width: f64, window_height: f64, now: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            step: f64 = 0.1 if dt > 0.1 else dt
+            if run.phase == PHASE_CUEING:
+                return if now < run.until
+                run.phase <- PHASE_TRACKING
+                run.next_probe <- now + py_uniform(rng, SHORTEST_GAP, LONGEST_GAP)
+                run.next_cross <- now + py_uniform(rng, 0.3, 1.0)
+                for at in 0..<flock.count |flock, slabs|:
+                    Ints::put(&flock.was_hidden, at, 1 if hidden(slabs, Floats::at_ref(&flock.x, at), Floats::at_ref(&flock.y, at)) else 0)
+            else:
+                if run.phase == PHASE_TRACKING:
+                    drift(flock, step, window_width, window_height)
+                    mark_risk(flock, slabs, now)
+                    maybe_cross(run, flock, window_width, window_height, now, rng)
+                    if run.verdict >= 0:
+                        retire_probe(run, now, rng) if now >= run.verdict_until
+                    else:
+                        if run.probe >= 0:
+                            too_slow(run, now) if now >= run.probe_ends
+                        else:
+                            if run.probes_done >= run.probes_per_round:
+                                end_round(run, flock, now)
+                            else:
+                                raise_probe(run, flock, slabs, now, rng) if now >= run.next_probe
+                else:
+                    if run.phase == PHASE_REVEALING:
+                        drift(flock, step, window_width, window_height)
+                        if now >= run.until:
+                            next_round(run, slabs, flock, spots_x, spots_y, window_width, window_height, now, rng)
+
+    struct Score:
+        rounds: i64
+        asked: i64
+        hits: i64
+        wrong: i64
+        late: i64
+        accuracy: i64
+        mean_ms: i64
+        most_held: i64
+
+    def score(run: mutable Run&) -> Score:
+        can Abort.Panic:
+            asked: i64 = run.hits + run.wrong + run.late
+            mean: mutable f64 = 0.0
+            if run.reaction_count > 0:
+                total: mutable f64 = 0.0
+                for at in 0..<run.reaction_count |run, total|:
+                    total <- total + Floats::at_ref(&run.reaction_times, at)
+                mean <- total / run.reaction_count.f64()
+            accuracy: mutable i64 = 0
+            accuracy <- py_round_half_even(100.0 * run.hits.f64() / asked.f64()) if asked != 0
+            # `max(..., default=0)` over the rounds that asked something and
+            # got every one of them right.
+            most_held: mutable i64 = 0
+            for at in 0..<run.result_count |run, most_held|:
+                ask: i64 = Ints::at_ref(&run.result_asked, at)
+                continue if ask == 0 or Ints::at_ref(&run.result_right, at) != ask
+                held: i64 = Ints::at_ref(&run.result_held, at)
+                most_held <- held if held > most_held
+            return Score{rounds: run.result_count, asked: asked, hits: run.hits,
+                         wrong: run.wrong, late: run.late, accuracy: accuracy,
+                         mean_ms: py_round_half_even(mean * 1000.0), most_held: most_held}

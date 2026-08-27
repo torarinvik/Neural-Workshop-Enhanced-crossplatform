@@ -1,0 +1,213 @@
+# Differential sweep driver for tasks/pursuit.elisa. See pursuit_diff.py for
+# the reference side.
+#
+# The quarry draws four schedules from one stream, and each habit draws its own
+# value BEFORE its next gap -- so a swerve costs three draws and a lurch two,
+# and one dial left at zero removes its draws from the stream entirely. One
+# config therefore switches surge, wobble and morph all off at once.
+#
+# `gap` divides by the CURRENT multiplier, so on an adaptive run the ladder
+# changes the draw stream from the round after it moves; two configs are
+# adaptive and two are not.
+#
+# The chaser is deterministic: one step toward the quarry per tick, which is
+# roughly what the quarry covers in a frame at its default pace, so the share
+# on target lands between the ladder's two thresholds rather than pinned.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/pymath.elisa"
+include "../src/geometry.elisa"
+include "../src/tasks/tracking.elisa"
+include "../src/tasks/lookout.elisa"
+include "../src/tasks/pursuit.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+def emit_scaled(value: f64):
+    can Console.Write, Abort.Panic:
+        emit_cell(py_round_half_even(value * 1000000.0))
+
+def window_width(which: i64) -> f64:
+    can Abort.Panic:
+        return 912.0 if which == 0
+        return 640.0 if which == 1
+        return 1366.0 if which == 2
+        return 1101.0
+
+def window_height(which: i64) -> f64:
+    can Abort.Panic:
+        return 684.0 if which == 0
+        return 480.0 if which == 1
+        return 768.0 if which == 2
+        return 617.0
+
+# One step toward the quarry, on each axis independently.
+def toward(here: f64, there: f64) -> f64:
+    can Abort.Panic:
+        return 1.0 if there > here
+        return -1.0 if there < here
+        return 0.0
+
+def emit_quarry(run: mutable Pursuit::Run&):
+    can Console.Write, Abort.Panic:
+        emit_scaled(run.quarry.x)
+        emit_scaled(run.quarry.y)
+        emit_scaled(run.quarry.heading)
+        emit_scaled(run.quarry.surge)
+        emit_scaled(run.quarry.radius)
+        emit_cell(run.quarry.form)
+        emit_cell(run.quarry.color)
+        emit_scaled(run.quarry.next_turn)
+        emit_scaled(run.quarry.next_surge)
+        emit_scaled(run.quarry.next_resize)
+        emit_scaled(run.quarry.next_morph)
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(64 * 1024 * 1024)
+        in w:
+            # --- degrees to radians, as math.radians computes it ----------
+            for degrees in 0..<181:
+                printr("radians")
+                emit_cell(degrees)
+                emit_scaled(Pursuit::radians(degrees.f64()))
+                print("")
+
+            run: mutable Pursuit::Run = Pursuit::new_run()
+
+            # --- the drawn radius and the bounds it carves ---------------
+            for size in 0..<4 |run|:
+                for size_step in 0..<9 |run, size|:
+                    run.quarry.radius <- 2.0 + size_step.f64() * 5.5
+                    width: f64 = window_width(size)
+                    height: f64 = window_height(size)
+                    edge: Pursuit::Bounds = Pursuit::bounds(&run, width, height)
+                    printr("edge")
+                    emit_cell(size)
+                    emit_cell(size_step)
+                    emit_scaled(Pursuit::drawn_radius(&run, height))
+                    emit_scaled(edge.low_x)
+                    emit_scaled(edge.high_x)
+                    emit_scaled(edge.low_y)
+                    emit_scaled(edge.high_y)
+                    print("")
+
+            # --- the cursor, nudged into and past every wall -------------
+            for size in 0..<4 |run|:
+                width: f64 = window_width(size)
+                height: f64 = window_height(size)
+                run.mouse_x <- width / 2.0
+                run.mouse_y <- height / 2.0
+                for step in 0..<60 |run, width, height, size|:
+                    dx: f64 = 1.0 if (step % 4) < 2 else -1.0
+                    dy: f64 = 1.0 if (step % 8) < 4 else -1.0
+                    Pursuit::nudge(&run, dx * 3.0, dy * 2.0, width, height)
+                    printr("nudge")
+                    emit_cell(size)
+                    emit_cell(step)
+                    emit_scaled(run.mouse_x)
+                    emit_scaled(run.mouse_y)
+                    print("")
+
+            # --- whole rounds, chased ------------------------------------
+            for cfg in 0..<5 |run|:
+                rng: mutable MT19937 = mt19937_new()
+                mt_seed_int(&rng, (900 + cfg).u64())
+                width: f64 = window_width(cfg % 4)
+                height: f64 = window_height(cfg % 4)
+                run.speed <- 0.25 + cfg.f64() * 0.08
+                # cfg 3 leaves surge, wobble and morph at zero: three habits
+                # switched off, and their draws gone from the stream.
+                run.surge_depth <- 0.0 if cfg == 3 else 0.35
+                run.turn_gap <- 0.6 + cfg.f64() * 0.15
+                run.sharpness <- Pursuit::radians(35.0 + cfg.f64() * 15.0)
+                run.base_radius <- 14.0 + cfg.f64() * 4.0
+                run.wobble <- 0.0 if cfg == 3 else 0.4
+                run.morph_gap <- 0.0 if cfg == 3 else 0.9
+                run.seconds <- 2.0
+                run.total_rounds <- 3
+                run.adaptive <- (cfg % 2) == 0
+                run.mouse_x <- width / 2.0
+                run.mouse_y <- height / 2.0
+                Pursuit::start_run(&run, 0.0, &rng)
+                printr("start")
+                emit_cell(cfg)
+                emit_cell(run.phase)
+                emit_cell(run.round_number)
+                emit_scaled(run.multiplier)
+                emit_scaled(run.until)
+                emit_quarry(&run)
+                print("")
+
+                dt: f64 = 1.0 / 60.0
+                now: mutable f64 = 0.0
+                tick: mutable i64 = 0
+                while run.phase != Pursuit::PHASE_DONE and tick < 4000 |run, cfg, width, height, now, tick, dt, rng|:
+                    now <- now + dt
+                    Pursuit::update(&run, dt, width, height, now, &rng)
+                    Pursuit::nudge(&run, toward(run.mouse_x, run.quarry.x * width), toward(run.mouse_y, run.quarry.y * height), width, height)
+                    printr("tick")
+                    emit_cell(cfg)
+                    emit_cell(tick)
+                    emit_cell(run.phase)
+                    emit_cell(run.round_number)
+                    emit_cell(run.verdict)
+                    emit_scaled(run.multiplier)
+                    emit_scaled(run.on_time)
+                    emit_scaled(run.run_time)
+                    emit_scaled(run.off_sum)
+                    emit_cell(run.off_samples)
+                    emit_scaled(run.mouse_x)
+                    emit_scaled(run.mouse_y)
+                    emit_quarry(&run)
+                    print("")
+                    tick <- tick + 1
+
+                tally: Pursuit::Score = Pursuit::score(&run)
+                printr("score")
+                emit_cell(cfg)
+                emit_cell(tick)
+                emit_cell(tally.rounds)
+                emit_cell(tally.on_percent)
+                emit_cell(tally.mean_off_px)
+                emit_cell(tally.multiplier)
+                for at in 0..<run.result_count |run|:
+                    emit_scaled(Floats::at_ref(&run.result_share, at))
+                    emit_scaled(Floats::at_ref(&run.result_drift, at))
+                    emit_scaled(Floats::at_ref(&run.result_multiplier, at))
+                print("")
+        destroy w
+        return 0

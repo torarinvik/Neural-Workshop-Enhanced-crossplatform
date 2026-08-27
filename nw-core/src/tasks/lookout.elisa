@@ -1,0 +1,477 @@
+# Lookout: press the right key the moment the cued thing is there.
+#
+# Port of the portable half of neural_workshop/ui/lookout.py
+# (GPL-2.0-or-later). Positions are fractions of the window, as the reference
+# stores them; the bounds and the radius come from the shell, so every function
+# takes them rather than reading a window.
+#
+# A colour and a form are two INDEPENDENT channels through one churn, and the
+# scoring is signal detection: a press while that channel's match is on screen
+# is a hit, timed from the moment the match appeared; a match that churns away
+# unpressed is a miss; a press with nothing matching is a false alarm.
+#
+# Three things here are easy to lose and change every number after them:
+#
+#   * `spawn_flock` does NOT rewind. When a layout will not fit it relaxes the
+#     separation and carries on from the spots it already has -- unlike the
+#     ball flock in tracking.elisa, which starts the layout fresh.
+#   * `absent_cue` shuffles all 24 glyphs and then takes the FIRST minimum, so
+#     the shuffle decides every tie -- and a tie is the common case.
+#   * `morph` redraws until the identity actually CHANGES, colour on seven
+#     draws in ten. A morph that produced the same shape would only pretend
+#     to churn.
+
+extern cos(x: f64) -> f64
+extern sin(x: f64) -> f64
+
+module Lookout:
+
+    # Shapes a run may hold. The ceiling is the same as the ball flock's: room
+    # on screen, not code.
+    const FEWEST_SHAPES: i64 = 3
+    const MOST_SHAPES: i64 = 30
+
+    const COLOR_COUNT: i64 = 6
+    const FORM_COUNT: i64 = 4
+    const CUE_COUNT: i64 = 24
+
+    # The two channels a glyph can be watched on.
+    const CHANNEL_COLOR: i64 = 0
+    const CHANNEL_FORM: i64 = 1
+
+    # Which channels the menu made live.
+    const WATCH_COLOR: i64 = 0
+    const WATCH_FORM: i64 = 1
+    const WATCH_BOTH: i64 = 2
+
+    # How long a live channel may go dry before the next morph is forced to
+    # produce its match. Vigilance needs droughts, but an unbounded one is a
+    # stuck game.
+    const DROUGHT_SECONDS: f64 = 6.0
+    const REVEAL_SECONDS: f64 = 1.4
+
+    # 2 * math.pi, to the bit -- the reference writes `2 * math.pi`.
+    const TWO_PI: f64 = 6.283185307179586
+
+    const PHASE_READY: i64 = 0
+    const PHASE_WATCHING: i64 = 1
+    const PHASE_FEEDBACK: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    struct Rgb:
+        r: i64
+        g: i64
+        b: i64
+
+    # Okabe-Ito. Six is enough variety that the cued colour is genuinely rare
+    # now and then, and few enough that every pair stays tellable apart,
+    # colour-blind included.
+    def color_rgb(which: i64) -> Rgb:
+        can Abort.Panic:
+            return Rgb{r: 230, g: 159, b: 0} if which == 0      # orange
+            return Rgb{r: 86, g: 180, b: 233} if which == 1     # sky blue
+            return Rgb{r: 0, g: 158, b: 115} if which == 2      # green
+            return Rgb{r: 240, g: 228, b: 66} if which == 3     # yellow
+            return Rgb{r: 0, g: 114, b: 178} if which == 4      # blue
+            return Rgb{r: 213, g: 94, b: 0}                     # vermilion
+
+    def channel_live(watching: i64, channel: i64) -> bool:
+        can Abort.Panic:
+            return channel == CHANNEL_COLOR if watching == WATCH_COLOR
+            return channel == CHANNEL_FORM if watching == WATCH_FORM
+            return true
+
+    # Does a shape of `color` and `form` satisfy the cue on `channel`?
+    def channel_match(color: i64, form: i64, cue_color: i64, cue_form: i64, channel: i64) -> bool:
+        can Abort.Panic:
+            return color == cue_color if channel == CHANNEL_COLOR
+            return form == cue_form
+
+    def clamped(count: i64) -> i64:
+        can Abort.Panic:
+            capped: i64 = MOST_SHAPES if count > MOST_SHAPES else count
+            return FEWEST_SHAPES if capped < FEWEST_SHAPES else capped
+
+    # --- layout ----------------------------------------------------------
+
+    struct Bounds:
+        low_x: f64
+        high_x: f64
+        low_y: f64
+        high_y: f64
+
+    def radius(window_height: f64) -> f64:
+        can Abort.Panic:
+            scaled: f64 = Geometry::scale_to_height(window_height, 17.0).f64()
+            return 7.0 if scaled < 7.0 else scaled
+
+    def bounds(window_width: f64, window_height: f64) -> Bounds:
+        can Abort.Panic:
+            edge_x: f64 = radius(window_height) / window_width
+            edge_y: f64 = radius(window_height) / window_height
+            return Bounds{low_x: edge_x + 0.01, high_x: 1.0 - edge_x - 0.01,
+                          low_y: edge_y + 0.11, high_y: 1.0 - edge_y - 0.17}
+
+    # --- the flock -------------------------------------------------------
+
+    struct Flock:
+        count: mutable i64
+        x: mutable darray[f64]
+        y: mutable darray[f64]
+        vx: mutable darray[f64]
+        vy: mutable darray[f64]
+        color: mutable darray[i64]
+        form: mutable darray[i64]
+        next_morph: mutable darray[f64]
+
+    def new_flock() -> Flock:
+        can Memory.Allocate, Abort.Panic:
+            return Flock{count: 0, x: Floats::zeros(MOST_SHAPES), y: Floats::zeros(MOST_SHAPES),
+                         vx: Floats::zeros(MOST_SHAPES), vy: Floats::zeros(MOST_SHAPES),
+                         color: Ints::zeros(MOST_SHAPES), form: Ints::zeros(MOST_SHAPES),
+                         next_morph: Floats::zeros(MOST_SHAPES)}
+
+    # One drifter, dealt into slot `at`. The draw order is the reference's own
+    # argument order: heading, pace, colour, form, and when it next morphs.
+    def fresh_drifter(flock: mutable Flock&, at: i64, x: f64, y: f64, now: f64, speed: f64, morph_gap: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            heading: f64 = py_uniform(rng, 0.0, TWO_PI)
+            pace: f64 = speed * py_uniform(rng, 0.5, 1.5)
+            Floats::put(&flock.x, at, x)
+            Floats::put(&flock.y, at, y)
+            Floats::put(&flock.vx, at, pace * cos(heading))
+            Floats::put(&flock.vy, at, pace * sin(heading))
+            Ints::put(&flock.color, at, py_randbelow(rng, COLOR_COUNT.u64()).i64())
+            Ints::put(&flock.form, at, py_randbelow(rng, FORM_COUNT.u64()).i64())
+            Floats::put(&flock.next_morph, at, now + py_uniform(rng, 0.3, morph_gap))
+
+    # Fresh drifters with clear air, varied speeds and headings.
+    #
+    # Every spot is drawn before any drifter is, because the reference lays the
+    # whole layout first and only then builds the list. And a layout that will
+    # not fit RELAXES rather than restarts: the spots already placed are kept,
+    # so the failed draws are spent and the flock is not re-dealt.
+    def spawn_flock(flock: mutable Flock&, count: i64, window_width: f64, window_height: f64, now: f64, speed: f64, morph_gap: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            edge: Bounds = bounds(window_width, window_height)
+            apart: mutable f64 = 2.4 * radius(window_height) / window_height
+            spots_x: mutable darray[f64] = Floats::zeros(MOST_SHAPES)
+            spots_y: mutable darray[f64] = Floats::zeros(MOST_SHAPES)
+            placed: mutable i64 = 0
+            while placed < count |placed, count, apart, spots_x, spots_y, edge, rng|:
+                broke: mutable bool = false
+                for _attempt in 0..<(count * 60) |placed, count, apart, spots_x, spots_y, edge, rng, broke|:
+                    break if broke
+                    spot_x: f64 = py_uniform(rng, edge.low_x, edge.high_x)
+                    spot_y: f64 = py_uniform(rng, edge.low_y, edge.high_y)
+                    clear: mutable bool = true
+                    for other in 0..<placed |clear, spots_x, spots_y, spot_x, spot_y, apart|:
+                        dx: f64 = spot_x - Floats::at_ref(&spots_x, other)
+                        dy: f64 = spot_y - Floats::at_ref(&spots_y, other)
+                        clear <- false if dx * dx + dy * dy < apart * apart
+                    if clear:
+                        Floats::put(&spots_x, placed, spot_x)
+                        Floats::put(&spots_y, placed, spot_y)
+                        placed <- placed + 1
+                        broke <- true if placed == count
+                # The `for ... else` in the reference: the relaxation happens
+                # only when the attempt budget ran out without a break.
+                apart <- apart * 0.8 if not broke
+            flock.count <- count
+            for at in 0..<count |flock, spots_x, spots_y, now, speed, morph_gap, rng|:
+                fresh_drifter(flock, at, Floats::at_ref(&spots_x, at), Floats::at_ref(&spots_y, at), now, speed, morph_gap, rng)
+
+    # --- the cue ---------------------------------------------------------
+
+    struct Cue:
+        color: i64
+        form: i64
+
+    # How many (shape, live channel) pairs this glyph would already satisfy.
+    def cue_cover(flock: mutable Flock&, watching: i64, cue_color: i64, cue_form: i64) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for shape in 0..<flock.count |flock, watching, cue_color, cue_form, total|:
+                for channel in 0..<2 |flock, watching, cue_color, cue_form, total, shape|:
+                    continue if not channel_live(watching, channel)
+                    if channel_match(Ints::at_ref(&flock.color, shape), Ints::at_ref(&flock.form, shape), cue_color, cue_form, channel):
+                        total <- total + 1
+            return total
+
+    def satisfied_anywhere(flock: mutable Flock&, watching: i64, shape: i64, cue_color: i64, cue_form: i64) -> bool:
+        can Abort.Panic:
+            for channel in 0..<2 |flock, watching, shape, cue_color, cue_form|:
+                continue if not channel_live(watching, channel)
+                return true if channel_match(Ints::at_ref(&flock.color, shape), Ints::at_ref(&flock.form, shape), cue_color, cue_form, channel)
+            return false
+
+    # A glyph no live channel is satisfied by, dealt fairly.
+    #
+    # Every episode must begin below the signal on every channel it scores: if
+    # the cued colour were already there the reaction time would start negative
+    # and the first press would be a freebie. A big flock covers every colour at
+    # once, so the dealer picks the rarest glyph and morphs its few matches away
+    # -- the cue clears its own stage rather than starting satisfied.
+    def absent_cue(flock: mutable Flock&, watching: i64, rng: mutable MT19937&) -> Cue:
+        can Memory.Allocate, Abort.Panic:
+            # Candidate k is (k / 4, k % 4): the reference builds them colour-
+            # major and then shuffles, and the shuffle decides every tie.
+            order: mutable darray[i64] = Ints::zeros(CUE_COUNT)
+            for k in 0..<CUE_COUNT |order|:
+                Ints::put(&order, k, k)
+            py_shuffle_i64(rng, &order)
+            best: mutable i64 = -1
+            best_cover: mutable i64 = 0
+            for slot in 0..<CUE_COUNT |flock, watching, order, best, best_cover|:
+                candidate: i64 = Ints::at_ref(&order, slot)
+                cover: i64 = cue_cover(flock, watching, candidate / FORM_COUNT, candidate % FORM_COUNT)
+                if best < 0 or cover < best_cover:
+                    best <- candidate
+                    best_cover <- cover
+            cue_color: i64 = best / FORM_COUNT
+            cue_form: i64 = best % FORM_COUNT
+            for shape in 0..<flock.count |flock, watching, cue_color, cue_form, rng|:
+                while satisfied_anywhere(flock, watching, shape, cue_color, cue_form) |flock, watching, shape, cue_color, cue_form, rng|:
+                    if channel_live(watching, CHANNEL_COLOR) and Ints::at_ref(&flock.color, shape) == cue_color:
+                        Ints::put(&flock.color, shape, py_randbelow(rng, COLOR_COUNT.u64()).i64())
+                    if channel_live(watching, CHANNEL_FORM) and Ints::at_ref(&flock.form, shape) == cue_form:
+                        Ints::put(&flock.form, shape, py_randbelow(rng, FORM_COUNT.u64()).i64())
+            return Cue{color: cue_color, form: cue_form}
+
+    # --- the churn -------------------------------------------------------
+
+    def drift(flock: mutable Flock&, dt: f64, aspect: f64, edge: Bounds&):
+        can Abort.Panic:
+            for at in 0..<flock.count |flock, dt, aspect, edge|:
+                across: Tracking::Axis = Tracking::bounced(Floats::at_ref(&flock.x, at) + Floats::at_ref(&flock.vx, at) * dt * aspect, Floats::at_ref(&flock.vx, at), edge.low_x, edge.high_x)
+                down: Tracking::Axis = Tracking::bounced(Floats::at_ref(&flock.y, at) + Floats::at_ref(&flock.vy, at) * dt, Floats::at_ref(&flock.vy, at), edge.low_y, edge.high_y)
+                Floats::put(&flock.x, at, across.position)
+                Floats::put(&flock.vx, at, across.velocity)
+                Floats::put(&flock.y, at, down.position)
+                Floats::put(&flock.vy, at, down.velocity)
+
+    def channel_on_screen(flock: mutable Flock&, cue_color: i64, cue_form: i64, channel: i64) -> bool:
+        can Abort.Panic:
+            for shape in 0..<flock.count |flock, cue_color, cue_form, channel|:
+                return true if channel_match(Ints::at_ref(&flock.color, shape), Ints::at_ref(&flock.form, shape), cue_color, cue_form, channel)
+            return false
+
+    # --- a run -----------------------------------------------------------
+
+    struct Run:
+        watching: mutable i64
+        speed: mutable f64
+        morph_gap: mutable f64
+        total_cues: mutable i64
+        adaptive: mutable bool
+        start_count: mutable i64
+        count: mutable i64
+        cue_number: mutable i64
+        cue_color: mutable i64
+        cue_form: mutable i64
+        cued_at: mutable f64
+        # `seen[channel]` is a timestamp or None, so it is a flag and a time.
+        seen_at: mutable darray[f64]
+        seen_set: mutable darray[i64]
+        hits: mutable i64
+        misses: mutable i64
+        false_alarms: mutable i64
+        reaction_count: mutable i64
+        reaction_times: mutable darray[f64]
+        phase: mutable i64
+        until: mutable f64
+        verdict: mutable i64
+
+    const MOST_CUES: i64 = 256
+
+    def new_run() -> Run:
+        can Memory.Allocate, Abort.Panic:
+            return Run{watching: WATCH_BOTH, speed: 0.0, morph_gap: 1.0, total_cues: 0,
+                       adaptive: false, start_count: FEWEST_SHAPES, count: FEWEST_SHAPES,
+                       cue_number: 0, cue_color: 0, cue_form: 0, cued_at: 0.0,
+                       seen_at: Floats::zeros(2), seen_set: Ints::zeros(2),
+                       hits: 0, misses: 0, false_alarms: 0, reaction_count: 0,
+                       reaction_times: Floats::zeros(MOST_CUES), phase: PHASE_READY,
+                       until: 0.0, verdict: -1}
+
+    def forget_seen(run: mutable Run&):
+        can Abort.Panic:
+            for channel in 0..<2 |run|:
+                Ints::put(&run.seen_set, channel, 0)
+                Floats::put(&run.seen_at, channel, 0.0)
+
+    def reset(run: mutable Run&):
+        can Abort.Panic:
+            run.cue_number <- 0
+            run.hits <- 0
+            run.misses <- 0
+            run.false_alarms <- 0
+            run.reaction_count <- 0
+            forget_seen(run)
+            run.count <- clamped(run.start_count)
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+
+    def dry_channel_count(run: mutable Run&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for channel in 0..<2 |run, total|:
+                continue if not channel_live(run.watching, channel)
+                total <- total + 1 if Ints::at_ref(&run.seen_set, channel) == 0
+            return total
+
+    def dry_channel_at(run: mutable Run&, which: i64) -> i64:
+        can Abort.Panic:
+            seen_so_far: mutable i64 = 0
+            for channel in 0..<2 |run, which, seen_so_far|:
+                continue if not channel_live(run.watching, channel)
+                continue if Ints::at_ref(&run.seen_set, channel) != 0
+                return channel if seen_so_far == which
+                seen_so_far <- seen_so_far + 1
+            return -1
+
+    # Change what a drifter is -- its colour, form, or both.
+    #
+    # In a drought the morph is FORCED to produce one dry channel's match, so
+    # no cue can dangle forever; otherwise the new identity just has to differ,
+    # or the churn would only pretend to churn.
+    def morph(run: mutable Run&, flock: mutable Flock&, shape: i64, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            Floats::put(&flock.next_morph, shape, now + py_uniform(rng, 0.6, 1.4) * run.morph_gap)
+            dry: i64 = dry_channel_count(run)
+            if run.phase == PHASE_WATCHING and dry > 0 and now - run.cued_at > DROUGHT_SECONDS:
+                channel: i64 = dry_channel_at(run, py_randbelow(rng, dry.u64()).i64())
+                if channel == CHANNEL_COLOR:
+                    Ints::put(&flock.color, shape, run.cue_color)
+                else:
+                    Ints::put(&flock.form, shape, run.cue_form)
+                return
+            was_color: i64 = Ints::at_ref(&flock.color, shape)
+            was_form: i64 = Ints::at_ref(&flock.form, shape)
+            changed: mutable bool = false
+            while not changed |flock, shape, was_color, was_form, changed, rng|:
+                if py_random(rng) < 0.7:
+                    Ints::put(&flock.color, shape, py_randbelow(rng, COLOR_COUNT.u64()).i64())
+                else:
+                    Ints::put(&flock.form, shape, py_randbelow(rng, FORM_COUNT.u64()).i64())
+                changed <- Ints::at_ref(&flock.color, shape) != was_color or Ints::at_ref(&flock.form, shape) != was_form
+
+    def adapt(run: mutable Run&, right: bool):
+        can Abort.Panic:
+            return if not run.adaptive
+            grown: i64 = run.count + 1 if right else run.count - 1
+            run.count <- clamped(grown)
+
+    # Close the episode and say how it went.
+    #
+    # `right` is the whole of what is paid, and only a hit earns it. A false
+    # alarm and a slip both cost, which is the point of a vigilance task: a
+    # learner that presses on every frame catches every match and is not
+    # thereby doing the task, so the two ways of being wrong cost the same.
+    def show_feedback(run: mutable Run&, flock: mutable Flock&, right: bool, window_width: f64, window_height: f64, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            run.verdict <- 1 if right else 0
+            run.phase <- PHASE_FEEDBACK
+            forget_seen(run)
+            run.until <- now + REVEAL_SECONDS
+            # The flock churns on through feedback, but grows or shrinks to the
+            # adapted count only between cues, quietly at the edge.
+            flock.count <- run.count if flock.count > run.count
+            edge: Bounds = bounds(window_width, window_height)
+            while flock.count < run.count |run, flock, edge, now, rng|:
+                spot_x: f64 = py_uniform(rng, edge.low_x, edge.high_x)
+                spot_y: f64 = py_uniform(rng, edge.low_y, edge.high_y)
+                fresh_drifter(flock, flock.count, spot_x, spot_y, now, run.speed, run.morph_gap, rng)
+                flock.count <- flock.count + 1
+
+    def finish(run: mutable Run&):
+        can Abort.Panic:
+            run.phase <- PHASE_DONE
+
+    def next_cue(run: mutable Run&, flock: mutable Flock&, now: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            if run.cue_number >= run.total_cues:
+                finish(run)
+                return
+            run.cue_number <- run.cue_number + 1
+            run.verdict <- -1
+            cue: Cue = absent_cue(flock, run.watching, rng)
+            run.cue_color <- cue.color
+            run.cue_form <- cue.form
+            run.cued_at <- now
+            forget_seen(run)
+            run.phase <- PHASE_WATCHING
+
+    def start_run(run: mutable Run&, flock: mutable Flock&, window_width: f64, window_height: f64, now: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            reset(run)
+            spawn_flock(flock, run.count, window_width, window_height, now, run.speed, run.morph_gap, rng)
+            next_cue(run, flock, now, rng)
+
+    # The match churned away unpressed.
+    def miss(run: mutable Run&, flock: mutable Flock&, window_width: f64, window_height: f64, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            run.misses <- run.misses + 1
+            adapt(run, false)
+            show_feedback(run, flock, false, window_width, window_height, now, rng)
+
+    def update(run: mutable Run&, flock: mutable Flock&, dt: f64, window_width: f64, window_height: f64, now: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            edge: Bounds = bounds(window_width, window_height)
+            aspect: f64 = window_height / (1.0 if window_width < 1.0 else window_width)
+            step: f64 = 0.1 if dt > 0.1 else dt
+            if run.phase == PHASE_WATCHING:
+                drift(flock, step, aspect, &edge)
+                for shape in 0..<flock.count |run, flock, now, rng|:
+                    if now >= Floats::at_ref(&flock.next_morph, shape):
+                        morph(run, flock, shape, now, rng)
+                # A miss RETURNS: the remaining channel is not looked at on the
+                # frame that resolved the episode.
+                for channel in 0..<2 |run, flock, window_width, window_height, now, rng|:
+                    continue if not channel_live(run.watching, channel)
+                    present: bool = channel_on_screen(flock, run.cue_color, run.cue_form, channel)
+                    if present and Ints::at_ref(&run.seen_set, channel) == 0:
+                        Ints::put(&run.seen_set, channel, 1)
+                        Floats::put(&run.seen_at, channel, now)
+                    else:
+                        if not present and Ints::at_ref(&run.seen_set, channel) != 0:
+                            miss(run, flock, window_width, window_height, now, rng)
+                            return
+            else:
+                if run.phase == PHASE_FEEDBACK:
+                    drift(flock, step, aspect, &edge)
+                    if now >= run.until:
+                        next_cue(run, flock, now, rng)
+
+    # A press on `channel`'s key. Dead keys do nothing.
+    def answer(run: mutable Run&, flock: mutable Flock&, channel: i64, window_width: f64, window_height: f64, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            return if run.phase != PHASE_WATCHING
+            return if not channel_live(run.watching, channel)
+            hit: bool = Ints::at_ref(&run.seen_set, channel) != 0
+            if hit:
+                run.hits <- run.hits + 1
+                Floats::put(&run.reaction_times, run.reaction_count, now - Floats::at_ref(&run.seen_at, channel))
+                run.reaction_count <- run.reaction_count + 1
+            else:
+                run.false_alarms <- run.false_alarms + 1
+            adapt(run, hit)
+            show_feedback(run, flock, hit, window_width, window_height, now, rng)
+
+    struct Score:
+        hits: i64
+        misses: i64
+        false_alarms: i64
+        mean_ms: i64
+        most_shapes: i64
+
+    def score(run: mutable Run&) -> Score:
+        can Abort.Panic:
+            mean: mutable f64 = 0.0
+            if run.reaction_count > 0:
+                total: mutable f64 = 0.0
+                for at in 0..<run.reaction_count |run, total|:
+                    total <- total + Floats::at_ref(&run.reaction_times, at)
+                mean <- total / run.reaction_count.f64()
+            return Score{hits: run.hits, misses: run.misses, false_alarms: run.false_alarms,
+                         mean_ms: py_round_half_even(mean * 1000.0), most_shapes: run.count}

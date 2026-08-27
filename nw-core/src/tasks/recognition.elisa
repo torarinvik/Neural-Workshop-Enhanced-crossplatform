@@ -1,0 +1,295 @@
+# Recognition: have you met this one before?
+#
+# Port of the portable half of neural_workshop/ui/recognition.py
+# (GPL-2.0-or-later). The media pool belongs to the shell, so an item is an
+# integer here rather than a path -- the pool hands them out in its own order
+# and the run only ever compares them for equality.
+#
+# The whole run is planned up front, and the plan is the delicate part:
+#
+#   * `wants_repeat` is drawn on EVERY position, before eligibility is even
+#     looked at, so a position with nothing to repeat still spends a draw.
+#   * An item is eligible to come back only once it is `min_lag` trials old
+#     AND has not been repeated already, so every "seen it" is a second
+#     showing and never a third.
+#   * The fallback when the fresh list runs dry repeats an eligible item
+#     rather than ending the run -- but only after the fresh list is spent,
+#     which is why `needed_items` budgets for a run with no repeats at all.
+
+module Recognition:
+
+    const MOST_TRIALS: i64 = 256
+
+    const CHOICE_NEW: i64 = 0
+    const CHOICE_SEEN: i64 = 1
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SHOWING: i64 = 1
+    const PHASE_HIDDEN: i64 = 2
+    const PHASE_FEEDBACK: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    # How long a right-or-wrong flash stands before the next item.
+    const FEEDBACK_SECONDS: f64 = 0.35
+
+    # --- layout ----------------------------------------------------------
+
+    struct Stage:
+        center_x: f64
+        center_y: f64
+        side: f64
+
+    struct Button:
+        left: f64
+        bottom: f64
+        width: f64
+        height: f64
+        choice: i64
+
+    # Centre and side of the square the item is presented in. The centre sits
+    # a little above the window's, to leave the answer buttons their room.
+    def stage_rect(width: f64, height: f64) -> Stage:
+        can Abort.Panic:
+            by_width: f64 = width * 0.5
+            by_height: f64 = height * 0.5
+            side: f64 = by_height if by_height < by_width else by_width
+            return Stage{center_x: Geometry::width_center(width).f64(),
+                         center_y: Geometry::height_center(height).f64() + height * 0.04,
+                         side: side}
+
+    # `seen` on the left, `new` on the right, both the same size and centred
+    # as a pair. `from_bottom_edge` scales against the framebuffer height,
+    # which is the same number as the window height on an unscaled display.
+    def button_rect(width: f64, height: f64, which: i64) -> Button:
+        can Abort.Panic:
+            by_fraction: f64 = width * 0.24
+            by_third: f64 = width / 3.2
+            button_w: f64 = by_third if by_third < by_fraction else by_fraction
+            button_h: mutable f64 = height * 0.075
+            button_h <- 40.0 if button_h < 40.0 else button_h
+            gap: f64 = width * 0.04
+            bottom: f64 = Geometry::from_bottom_edge(height, 90.0).f64()
+            left: f64 = (width - (button_w * 2.0 + gap)) / 2.0
+            return Button{left: left, bottom: bottom, width: button_w,
+                          height: button_h, choice: CHOICE_SEEN} if which == 0
+            return Button{left: left + button_w + gap, bottom: bottom,
+                          width: button_w, height: button_h, choice: CHOICE_NEW}
+
+    def button_hit(width: f64, height: f64, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            for which in 0..<2 |width, height, x, y|:
+                box: Button = button_rect(width, height, which)
+                inside: bool = box.left <= x and x <= box.left + box.width and box.bottom <= y and y <= box.bottom + box.height
+                return box.choice if inside
+            return -1
+
+    # --- the run ---------------------------------------------------------
+
+    struct Task:
+        total_trials: mutable i64
+        min_lag: mutable i64
+        repeat_percent: mutable i64
+        study_ms: mutable i64
+        feedback: mutable bool
+        sound: mutable bool
+        count: mutable i64
+        item: mutable darray[i64]
+        repeat: mutable darray[i64]
+        index: mutable i64
+        answered: mutable i64
+        choice: mutable darray[i64]
+        phase: mutable i64
+        shown_at: mutable f64
+        feedback_until: mutable f64
+        last_correct: mutable i64
+        # `shown` is the fresh presentations in the order they happened, which
+        # is the order `rng.choice` indexes into.
+        shown_when: mutable darray[i64]
+        shown_item: mutable darray[i64]
+        shown_count: mutable i64
+        repeated: mutable darray[i64]
+        eligible: mutable darray[i64]
+
+    def new_task() -> Task:
+        can Memory.Allocate, Abort.Panic:
+            return Task{total_trials: 0, min_lag: 0, repeat_percent: 0, study_ms: 0,
+                        feedback: false, sound: false, count: 0,
+                        item: Ints::zeros(MOST_TRIALS), repeat: Ints::zeros(MOST_TRIALS),
+                        index: 0, answered: 0, choice: Ints::zeros(MOST_TRIALS),
+                        phase: PHASE_READY, shown_at: 0.0, feedback_until: 0.0,
+                        last_correct: -1,
+                        shown_when: Ints::zeros(MOST_TRIALS), shown_item: Ints::zeros(MOST_TRIALS),
+                        shown_count: 0, repeated: Ints::zeros(MOST_TRIALS),
+                        eligible: Ints::zeros(MOST_TRIALS)}
+
+    # Distinct items a full run consumes, worst case.
+    #
+    # The worst case is a run with no repeats at all: whether a trial repeats
+    # is a coin flip, and no trial can repeat until `min_lag` trials have
+    # passed, so budgeting for the average share of repeats runs the fresh list
+    # dry on long runs and quietly truncates them.
+    def needed_items(total_trials: i64) -> i64:
+        can Abort.Panic:
+            return 2 if total_trials < 2 else total_trials
+
+    def reset(task: mutable Task&):
+        can Abort.Panic:
+            task.count <- 0
+            task.index <- 0
+            task.answered <- 0
+            task.phase <- PHASE_READY
+            task.last_correct <- -1
+
+    # Plan the whole stream up front. False when the library is too small.
+    def build_run(task: mutable Task&, available: i64, rng: mutable MT19937&) -> bool:
+        can Abort.Panic:
+            wanted: i64 = needed_items(task.total_trials)
+            fresh: i64 = available if available < wanted else wanted
+            task.count <- 0
+            task.shown_count <- 0
+            for at in 0..<MOST_TRIALS |task|:
+                Ints::put(&task.repeated, at, 0)
+            false return if fresh < 2
+            next_fresh: mutable i64 = 0
+            planning: mutable bool = true
+            for position in 0..<task.total_trials |task, fresh, next_fresh, planning, rng|:
+                break if not planning
+                found: mutable i64 = 0
+                for seat in 0..<task.shown_count |task, position, found|:
+                    when: i64 = Ints::at_ref(&task.shown_when, seat)
+                    what: i64 = Ints::at_ref(&task.shown_item, seat)
+                    if position - when >= task.min_lag and Ints::at_ref(&task.repeated, what) == 0:
+                        Ints::put(&task.eligible, found, what)
+                        found <- found + 1
+                # Drawn whether or not anything is eligible: the reference asks
+                # the question first and looks at the board second.
+                wants_repeat: bool = py_randbelow(rng, 100.u64()).i64() < task.repeat_percent
+                if wants_repeat and found > 0:
+                    what: i64 = Ints::at_ref(&task.eligible, py_randbelow(rng, found.u64()).i64())
+                    Ints::put(&task.repeated, what, 1)
+                    Ints::put(&task.item, task.count, what)
+                    Ints::put(&task.repeat, task.count, 1)
+                    task.count <- task.count + 1
+                else:
+                    if next_fresh < fresh:
+                        what: i64 = next_fresh
+                        next_fresh <- next_fresh + 1
+                        Ints::put(&task.shown_when, task.shown_count, position)
+                        Ints::put(&task.shown_item, task.shown_count, what)
+                        task.shown_count <- task.shown_count + 1
+                        Ints::put(&task.item, task.count, what)
+                        Ints::put(&task.repeat, task.count, 0)
+                        task.count <- task.count + 1
+                    else:
+                        if found > 0:
+                            what: i64 = Ints::at_ref(&task.eligible, py_randbelow(rng, found.u64()).i64())
+                            Ints::put(&task.repeated, what, 1)
+                            Ints::put(&task.item, task.count, what)
+                            Ints::put(&task.repeat, task.count, 1)
+                            task.count <- task.count + 1
+                        else:
+                            planning <- false
+            return task.count > 0
+
+    def has_current(task: mutable Task&) -> bool:
+        can Abort.Panic:
+            return task.index >= 0 and task.index < task.count
+
+    def current_item(task: mutable Task&) -> i64:
+        can Abort.Panic:
+            -1 return if not has_current(task)
+            return Ints::at_ref(&task.item, task.index)
+
+    def current_repeat(task: mutable Task&) -> bool:
+        can Abort.Panic:
+            false return if not has_current(task)
+            return Ints::at_ref(&task.repeat, task.index) != 0
+
+    def finish(task: mutable Task&):
+        can Abort.Panic:
+            task.phase <- PHASE_DONE
+
+    def present(task: mutable Task&, now: f64):
+        can Abort.Panic:
+            if not has_current(task):
+                finish(task)
+                return
+            task.phase <- PHASE_SHOWING
+            task.shown_at <- now
+
+    # Plan and present a run. False when the library is too small.
+    def start_run(task: mutable Task&, available: i64, now: f64, rng: mutable MT19937&) -> bool:
+        can Abort.Panic:
+            if not build_run(task, available, rng):
+                task.phase <- PHASE_READY
+                return false
+            task.index <- 0
+            task.answered <- 0
+            task.last_correct <- -1
+            present(task, now)
+            return true
+
+    # Record `choice` for the current trial and move on.
+    def answer(task: mutable Task&, choice: i64, now: f64):
+        can Abort.Panic:
+            return if not has_current(task)
+            return if task.phase != PHASE_SHOWING and task.phase != PHASE_HIDDEN
+            Ints::put(&task.choice, task.answered, choice)
+            task.answered <- task.answered + 1
+            correct: bool = (choice == CHOICE_SEEN) == current_repeat(task)
+            task.last_correct <- 1 if correct else 0
+            task.index <- task.index + 1
+            if task.feedback:
+                task.phase <- PHASE_FEEDBACK
+                task.feedback_until <- now + FEEDBACK_SECONDS
+            else:
+                present(task, now)
+
+    def update(task: mutable Task&, now: f64):
+        can Abort.Panic:
+            if task.phase == PHASE_FEEDBACK and now >= task.feedback_until:
+                present(task, now)
+            else:
+                # The item goes away but the question stands. Sound runs never
+                # hide, because there is nothing on the stage to take away.
+                waited: bool = now - task.shown_at >= task.study_ms.f64() / 1000.0
+                if task.phase == PHASE_SHOWING and task.study_ms > 0 and not task.sound and waited:
+                    task.phase <- PHASE_HIDDEN
+
+    # --- scoring ---------------------------------------------------------
+
+    struct Score:
+        hits: i64
+        misses: i64
+        false_alarms: i64
+        correct_rejections: i64
+        repeats: i64
+        answered: i64
+        accuracy: i64
+
+    # Hits, misses, false alarms and overall accuracy for the run.
+    #
+    # Answering "seen it" to everything scores 50%, so the run is reported on
+    # both halves rather than on one number: a run can be wrong in two quite
+    # different ways.
+    def score(task: mutable Task&) -> Score:
+        can Abort.Panic:
+            hits: mutable i64 = 0
+            misses: mutable i64 = 0
+            false_alarms: mutable i64 = 0
+            correct_rejections: mutable i64 = 0
+            for at in 0..<task.answered |task, hits, misses, false_alarms, correct_rejections|:
+                said_seen: bool = Ints::at_ref(&task.choice, at) == CHOICE_SEEN
+                if Ints::at_ref(&task.repeat, at) != 0:
+                    hits <- hits + 1 if said_seen
+                    misses <- misses + 1 if not said_seen
+                else:
+                    false_alarms <- false_alarms + 1 if said_seen
+                    correct_rejections <- correct_rejections + 1 if not said_seen
+            correct: i64 = hits + correct_rejections
+            accuracy: mutable i64 = 0
+            if task.answered > 0:
+                accuracy <- py_round_half_even(100.0 * correct.f64() / task.answered.f64())
+            return Score{hits: hits, misses: misses, false_alarms: false_alarms,
+                         correct_rejections: correct_rejections, repeats: hits + misses,
+                         answered: task.answered, accuracy: accuracy}

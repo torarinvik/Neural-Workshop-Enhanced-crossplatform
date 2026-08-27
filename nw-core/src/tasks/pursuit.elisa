@@ -1,0 +1,351 @@
+# Pursuit: keep the cursor on a thing that does not want it there.
+#
+# Port of the portable half of neural_workshop/ui/pursuit.py
+# (GPL-2.0-or-later). The quarry's position is a fraction of the window, as the
+# reference stores it; the cursor is in PIXELS, as the reference stores that,
+# and `distance` is where the two meet.
+#
+# The score is continuous, not hit-or-miss: every frame either has the cursor
+# on the quarry or off it, and the tally is the share of the round spent on
+# plus the average distance in pixels for the frames spent off.
+#
+# What is easy to lose here is the RNG order, because the quarry draws four
+# separate schedules from one stream:
+#
+#   * a round deals heading, form, colour, and then FOUR gaps in the fixed
+#     order next_turn, next_surge, next_resize, next_morph;
+#   * each habit draws its own value first and its next gap second, so a
+#     swerve costs three draws (angle, direction, gap) and a lurch two;
+#   * `_gap` divides by the CURRENT multiplier, so the adaptive ladder changes
+#     the stream from the round after it moves.
+#
+# The bounce is tracking.py's, imported there and here, and a fold that
+# actually changed a velocity re-derives the heading with atan2 -- so a wall
+# turns the quarry rather than just reversing a component.
+
+extern cos(x: f64) -> f64
+extern sin(x: f64) -> f64
+extern atan2(y: f64, x: f64) -> f64
+
+module Pursuit:
+
+    # The adaptive multiplier's range and step. Five percent a round is fine
+    # enough to settle on a frontier rather than oscillate over it.
+    const SLOWEST: f64 = 0.4
+    const FASTEST: f64 = 3.0
+    const STEP_UP: f64 = 1.05
+    const STEP_DOWN: f64 = 0.95
+
+    # On-target shares that move the multiplier. Between them the round was at
+    # the frontier already and the difficulty holds still.
+    const RAISE_AT: f64 = 0.7
+    const LOWER_AT: f64 = 0.4
+
+    # The cursor counts as "on" within this much of the drawn radius -- a
+    # fingertip of forgiveness, since the shapes are not all round.
+    const GRACE: f64 = 1.15
+
+    # How far one keyboard or port step moves the cursor, in window heights.
+    const CURSOR_STEP: f64 = 0.012
+
+    const REVEAL_SECONDS: f64 = 1.8
+
+    const TWO_PI: f64 = 6.283185307179586
+
+    # math.radians' own constant: Py_MATH_PI / 180.0 as a double.
+    const DEGREES_TO_RADIANS: f64 = 0.017453292519943295
+
+    const PHASE_READY: i64 = 0
+    const PHASE_CHASING: i64 = 1
+    const PHASE_FEEDBACK: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    const MOST_ROUNDS: i64 = 256
+
+    def radians(degrees: f64) -> f64:
+        can Abort.Panic:
+            return degrees * DEGREES_TO_RADIANS
+
+    # The pursued shape: motion state and its scheduled surprises.
+    struct Quarry:
+        x: mutable f64
+        y: mutable f64
+        heading: mutable f64
+        surge: mutable f64
+        radius: mutable f64
+        form: mutable i64
+        color: mutable i64
+        next_turn: mutable f64
+        next_surge: mutable f64
+        next_resize: mutable f64
+        next_morph: mutable f64
+
+    struct Bounds:
+        low_x: f64
+        high_x: f64
+        low_y: f64
+        high_y: f64
+
+    struct Run:
+        speed: mutable f64
+        surge_depth: mutable f64
+        turn_gap: mutable f64
+        sharpness: mutable f64
+        base_radius: mutable f64
+        wobble: mutable f64
+        morph_gap: mutable f64
+        seconds: mutable f64
+        total_rounds: mutable i64
+        adaptive: mutable bool
+        round_number: mutable i64
+        multiplier: mutable f64
+        on_time: mutable f64
+        run_time: mutable f64
+        off_sum: mutable f64
+        off_samples: mutable i64
+        until: mutable f64
+        phase: mutable i64
+        verdict: mutable i64
+        mouse_x: mutable f64
+        mouse_y: mutable f64
+        result_count: mutable i64
+        result_share: mutable darray[f64]
+        result_drift: mutable darray[f64]
+        result_multiplier: mutable darray[f64]
+        quarry: mutable Quarry
+
+    def new_quarry() -> Quarry:
+        can Abort.Panic:
+            return Quarry{x: 0.5, y: 0.5, heading: 0.0, surge: 1.0, radius: 0.0,
+                          form: 0, color: 0, next_turn: 0.0, next_surge: 0.0,
+                          next_resize: 0.0, next_morph: 0.0}
+
+    def new_run() -> Run:
+        can Memory.Allocate, Abort.Panic:
+            return Run{speed: 0.0, surge_depth: 0.0, turn_gap: 1.0, sharpness: 0.0,
+                       base_radius: 17.0, wobble: 0.0, morph_gap: 0.0, seconds: 10.0,
+                       total_rounds: 0, adaptive: false, round_number: 0, multiplier: 1.0,
+                       on_time: 0.0, run_time: 0.0, off_sum: 0.0, off_samples: 0,
+                       until: 0.0, phase: PHASE_READY, verdict: -1,
+                       mouse_x: 0.0, mouse_y: 0.0, result_count: 0,
+                       result_share: Floats::zeros(MOST_ROUNDS),
+                       result_drift: Floats::zeros(MOST_ROUNDS),
+                       result_multiplier: Floats::zeros(MOST_ROUNDS),
+                       quarry: new_quarry()}
+
+    # --- layout ----------------------------------------------------------
+
+    def drawn_radius(run: mutable Run&, window_height: f64) -> f64:
+        can Abort.Panic:
+            scaled: f64 = Geometry::scale_to_height(window_height, run.quarry.radius).f64()
+            return 6.0 if scaled < 6.0 else scaled
+
+    def bounds(run: mutable Run&, window_width: f64, window_height: f64) -> Bounds:
+        can Abort.Panic:
+            drawn: f64 = drawn_radius(run, window_height)
+            edge_x: f64 = drawn / (1.0 if window_width < 1.0 else window_width)
+            edge_y: f64 = drawn / (1.0 if window_height < 1.0 else window_height)
+            return Bounds{low_x: edge_x + 0.01, high_x: 1.0 - edge_x - 0.01,
+                          low_y: edge_y + 0.11, high_y: 1.0 - edge_y - 0.17}
+
+    # --- a run -----------------------------------------------------------
+
+    # The next surprise, drawn around the configured mean gap.
+    #
+    # A uniform spread around the mean rather than a metronome: a rhythm can be
+    # learned, and the whole point of the quarry is that it cannot.
+    def gap(run: mutable Run&, rng: mutable MT19937&) -> f64:
+        can Abort.Panic:
+            divisor: f64 = 0.1 if run.multiplier < 0.1 else run.multiplier
+            paced: f64 = run.turn_gap / divisor
+            pace: f64 = 0.05 if paced < 0.05 else paced
+            return py_uniform(rng, 0.3, 1.7) * pace
+
+    def reset(run: mutable Run&):
+        can Abort.Panic:
+            run.round_number <- 0
+            run.result_count <- 0
+            run.multiplier <- 1.0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+
+    def finish(run: mutable Run&):
+        can Abort.Panic:
+            run.phase <- PHASE_DONE
+
+    def next_round(run: mutable Run&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            if run.round_number >= run.total_rounds:
+                finish(run)
+                return
+            run.round_number <- run.round_number + 1
+            run.verdict <- -1
+            run.on_time <- 0.0
+            run.run_time <- 0.0
+            run.off_sum <- 0.0
+            run.off_samples <- 0
+            run.quarry.x <- 0.5
+            run.quarry.y <- 0.5
+            run.quarry.surge <- 1.0
+            run.quarry.heading <- py_uniform(rng, 0.0, TWO_PI)
+            run.quarry.radius <- run.base_radius
+            run.quarry.form <- py_randbelow(rng, Lookout::FORM_COUNT.u64()).i64()
+            run.quarry.color <- py_randbelow(rng, Lookout::COLOR_COUNT.u64()).i64()
+            # Four gaps, in this order. Each is its own draw.
+            run.quarry.next_turn <- now + gap(run, rng)
+            run.quarry.next_surge <- now + gap(run, rng)
+            run.quarry.next_resize <- now + gap(run, rng)
+            run.quarry.next_morph <- now + gap(run, rng)
+            run.phase <- PHASE_CHASING
+            run.until <- now + run.seconds
+
+    def start_run(run: mutable Run&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            reset(run)
+            next_round(run, now, rng)
+
+    # --- the quarry's habits ---------------------------------------------
+
+    # An abrupt break of direction, up to the configured angle.
+    def swerve(run: mutable Run&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            turn: f64 = py_uniform(rng, 0.35, 1.0) * run.sharpness
+            leftwards: bool = py_random(rng) < 0.5
+            run.quarry.heading <- run.quarry.heading + (turn if leftwards else 0.0 - turn)
+            run.quarry.next_turn <- now + gap(run, rng)
+
+    # A new surge factor: dawdle to sprint, around the base pace.
+    def lurch(run: mutable Run&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            drawn: f64 = py_uniform(rng, 1.0 - run.surge_depth, 1.0 + run.surge_depth)
+            run.quarry.surge <- 0.15 if drawn < 0.15 else drawn
+            run.quarry.next_surge <- now + gap(run, rng)
+
+    def swell(run: mutable Run&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            run.quarry.radius <- run.base_radius * py_uniform(rng, 1.0 - run.wobble, 1.0 + run.wobble)
+            run.quarry.next_resize <- now + gap(run, rng)
+
+    # A different shape entirely -- and it has to be DIFFERENT, or the morph
+    # would only pretend to morph.
+    def shift(run: mutable Run&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            was: i64 = run.quarry.form
+            while run.quarry.form == was |run, was, rng|:
+                run.quarry.form <- py_randbelow(rng, Lookout::FORM_COUNT.u64()).i64()
+            run.quarry.next_morph <- now + gap(run, rng)
+
+    def drift(run: mutable Run&, dt: f64, window_width: f64, window_height: f64):
+        can Abort.Panic:
+            edge: Bounds = bounds(run, window_width, window_height)
+            pace: f64 = run.speed * run.multiplier * run.quarry.surge
+            aspect: f64 = window_height / (1.0 if window_width < 1.0 else window_width)
+            vx: f64 = pace * cos(run.quarry.heading)
+            vy: f64 = pace * sin(run.quarry.heading)
+            across: Tracking::Axis = Tracking::bounced(run.quarry.x + vx * dt * aspect, vx, edge.low_x, edge.high_x)
+            down: Tracking::Axis = Tracking::bounced(run.quarry.y + vy * dt, vy, edge.low_y, edge.high_y)
+            run.quarry.x <- across.position
+            run.quarry.y <- down.position
+            # A fold that actually changed a velocity re-derives the heading, so
+            # a wall TURNS the quarry rather than reversing one component of a
+            # heading it then keeps steering by.
+            if across.velocity != vx or down.velocity != vy:
+                run.quarry.heading <- atan2(down.velocity, across.velocity)
+
+    # --- scoring ---------------------------------------------------------
+
+    # Cursor to quarry centre, in pixels.
+    def distance(run: mutable Run&, window_width: f64, window_height: f64) -> f64:
+        can Abort.Panic:
+            return py_hypot(run.mouse_x - run.quarry.x * window_width, run.mouse_y - run.quarry.y * window_height)
+
+    def on_target(run: mutable Run&, window_width: f64, window_height: f64) -> bool:
+        can Abort.Panic:
+            return distance(run, window_width, window_height) <= drawn_radius(run, window_height) * GRACE
+
+    def sample(run: mutable Run&, dt: f64, window_width: f64, window_height: f64):
+        can Abort.Panic:
+            run.run_time <- run.run_time + dt
+            if on_target(run, window_width, window_height):
+                run.on_time <- run.on_time + dt
+            else:
+                run.off_sum <- run.off_sum + distance(run, window_width, window_height)
+                run.off_samples <- run.off_samples + 1
+
+    def score_round(run: mutable Run&, now: f64):
+        can Abort.Panic:
+            share: f64 = run.on_time / run.run_time if run.run_time != 0.0 else 0.0
+            drift_px: f64 = run.off_sum / run.off_samples.f64() if run.off_samples != 0 else 0.0
+            Floats::put(&run.result_share, run.result_count, share)
+            Floats::put(&run.result_drift, run.result_count, drift_px)
+            Floats::put(&run.result_multiplier, run.result_count, run.multiplier)
+            run.result_count <- run.result_count + 1
+            # Green at the same share the ladder raises the pace at, so the bar
+            # and the difficulty move together.
+            run.verdict <- 1 if share >= RAISE_AT else 0
+            if run.adaptive:
+                if share >= RAISE_AT:
+                    raised: f64 = run.multiplier * STEP_UP
+                    run.multiplier <- FASTEST if raised > FASTEST else raised
+                else:
+                    if share < LOWER_AT:
+                        lowered: f64 = run.multiplier * STEP_DOWN
+                        run.multiplier <- SLOWEST if lowered < SLOWEST else lowered
+            run.phase <- PHASE_FEEDBACK
+            run.until <- now + REVEAL_SECONDS
+
+    def update(run: mutable Run&, dt: f64, window_width: f64, window_height: f64, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            step: f64 = 0.1 if dt > 0.1 else dt
+            if run.phase == PHASE_CHASING:
+                swerve(run, now, rng) if now >= run.quarry.next_turn
+                # Each habit is switched off by its own dial being zero, and a
+                # dial at zero does not draw.
+                lurch(run, now, rng) if run.surge_depth != 0.0 and now >= run.quarry.next_surge
+                swell(run, now, rng) if run.wobble != 0.0 and now >= run.quarry.next_resize
+                shift(run, now, rng) if run.morph_gap != 0.0 and now >= run.quarry.next_morph
+                drift(run, step, window_width, window_height)
+                sample(run, step, window_width, window_height)
+                score_round(run, now) if now >= run.until
+            else:
+                if run.phase == PHASE_FEEDBACK and now >= run.until:
+                    next_round(run, now, rng)
+
+    # Move the cursor one step, in units of the window's height.
+    #
+    # Steering by steps rather than by pointing: the chase can be played
+    # without a mouse. A step is small enough that the chase is still a chase
+    # -- at the quarry's default pace one step is roughly what it covers in a
+    # frame, so a learner that nudges once per frame keeps up in a straight
+    # line and has to anticipate the swerves.
+    def nudge(run: mutable Run&, dx: f64, dy: f64, window_width: f64, window_height: f64):
+        can Abort.Panic:
+            step: f64 = window_height * CURSOR_STEP
+            moved_x: f64 = run.mouse_x + dx * step
+            moved_y: f64 = run.mouse_y + dy * step
+            floored_x: f64 = 0.0 if moved_x < 0.0 else moved_x
+            floored_y: f64 = 0.0 if moved_y < 0.0 else moved_y
+            run.mouse_x <- window_width if floored_x > window_width else floored_x
+            run.mouse_y <- window_height if floored_y > window_height else floored_y
+
+    struct Score:
+        rounds: i64
+        on_percent: i64
+        mean_off_px: i64
+        multiplier: i64
+
+    def score(run: mutable Run&) -> Score:
+        can Abort.Panic:
+            shares: mutable f64 = 0.0
+            drifts: mutable f64 = 0.0
+            for at in 0..<run.result_count |run, shares, drifts|:
+                shares <- shares + Floats::at_ref(&run.result_share, at)
+                drifts <- drifts + Floats::at_ref(&run.result_drift, at)
+            on_percent: mutable i64 = 0
+            mean_off: mutable i64 = 0
+            if run.result_count > 0:
+                on_percent <- py_round_half_even(100.0 * shares / run.result_count.f64())
+                mean_off <- py_round_half_even(drifts / run.result_count.f64())
+            return Score{rounds: run.result_count, on_percent: on_percent,
+                         mean_off_px: mean_off,
+                         multiplier: py_round_half_even(run.multiplier * 100.0)}

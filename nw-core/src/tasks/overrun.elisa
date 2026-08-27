@@ -1,0 +1,438 @@
+# Overrun: one line of text, one margin, and a keyboard.
+#
+# Port of neural_workshop/overrun.py's arithmetic and the portable half of
+# neural_workshop/ui/overrun.py (both GPL-2.0-or-later).
+#
+# The sentence bank belongs to the shell -- it is a fetched corpus with a seed
+# fallback -- so a wave here is supplied as words, and the pool is a COUNT the
+# deal draws an index from. That is the same bargain the media pool makes in
+# concentration and recognition.
+#
+# NOT PORTED, deliberately: `letter_share` and the `pace` that reads it.
+# `letter_share` is a `statistics.mean`, which sums its terms as exact
+# rationals and rounds ONCE at the end; a naive f64 accumulation is a
+# different function and would agree only by luck. It feeds a words-a-minute
+# figure printed next to the rung and nothing the game does, so it is left out
+# rather than approximated.
+#
+# Three things carry the task and all three are easy to lose:
+#
+#   * The word being typed is always at the LEFT-hand end. Clearing one takes
+#     the front off the line and everything behind moves up, so the place to
+#     look moves only with the clock.
+#   * The runway: the right-hand end starts `length` cells from the margin, so
+#     the left-hand end starts TWICE that back from it. A shorter line starts
+#     further along and has less road, in exactly the proportion that it has
+#     less to type.
+#   * A wrong letter STAYS where it was put, and the word will not clear until
+#     it is rubbed out. Ignoring a wrong key is not what a keyboard does.
+
+module Overrun:
+
+    # The lane, in characters. The shortest and longest line a wave may be.
+    const CELLS: i64 = 88
+    const SHORTEST: i64 = 24
+    const LONGEST: i64 = 44
+
+    # The rarest word a wave may hold -- tighter than the bank's own cut,
+    # because a word you have to work out is a word you cannot type at speed.
+    const TOP_RANK: i64 = 20000
+
+    # Lives at the start of a run, and the most a run may hold. The ceiling is
+    # not decoration: past nine, a run of the usual length cannot be lost
+    # however badly the rest of it goes.
+    const START_LIVES: i64 = 3
+    const MOST_LIVES: i64 = 9
+
+    const GRADE_COUNT: i64 = 12
+
+    # How long the verdict stays up before the next wave is dealt.
+    const SETTLE_SECONDS: f64 = 0.7
+
+    const MOST_WORDS: i64 = 24
+    const MOST_LETTERS: i64 = 64
+    const MOST_WAVES: i64 = 64
+
+    const PHASE_READY: i64 = 0
+    const PHASE_TYPING: i64 = 1
+    const PHASE_SETTLED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    # Nineteen words a minute to eighty-four, in twelve steps of about a
+    # seventh each. Characters a second the line creeps right; spaces are
+    # characters here and are not typed.
+    def grade_speed(index: i64) -> f64:
+        can Abort.Panic:
+            return 1.9 if index == 0
+            return 2.2 if index == 1
+            return 2.5 if index == 2
+            return 2.9 if index == 3
+            return 3.3 if index == 4
+            return 3.8 if index == 5
+            return 4.3 if index == 6
+            return 4.9 if index == 7
+            return 5.6 if index == 8
+            return 6.4 if index == 9
+            return 7.3 if index == 10
+            return 8.4
+
+    def grade_of(rung: i64) -> i64:
+        can Abort.Panic:
+            capped: i64 = GRADE_COUNT - 1 if rung - 1 > GRADE_COUNT - 1 else rung - 1
+            return 0 if capped < 0 else capped
+
+    def clamped_rung(rung: i64) -> i64:
+        can Abort.Panic:
+            capped: i64 = GRADE_COUNT if rung > GRADE_COUNT else rung
+            return 1 if capped < 1 else capped
+
+    # --- one wave --------------------------------------------------------
+
+    # One sentence, laid out on the lane's character grid. `letter` holds every
+    # word's letters end to end (0..25), word w's starting at `letter_start[w]`.
+    struct Wave:
+        word_count: mutable i64
+        word_start: mutable darray[i64]
+        word_length: mutable darray[i64]
+        letter_start: mutable darray[i64]
+        letter: mutable darray[i64]
+        grade: mutable i64
+        length: mutable i64
+        letters: mutable i64
+
+    def new_wave() -> Wave:
+        can Memory.Allocate, Abort.Panic:
+            return Wave{word_count: 0, word_start: Ints::zeros(MOST_WORDS),
+                        word_length: Ints::zeros(MOST_WORDS),
+                        letter_start: Ints::zeros(MOST_WORDS),
+                        letter: Ints::zeros(MOST_LETTERS), grade: 0, length: 0, letters: 0}
+
+    # Where each word begins in the line, counting from its first letter. One
+    # space between words, so the offsets are what `' '.join` would have put
+    # them at. This is the whole of the layout: everything else is these
+    # offsets plus the drift.
+    def lay_out(wave: mutable Wave&, grade: i64):
+        can Abort.Panic:
+            at: mutable i64 = 0
+            letters: mutable i64 = 0
+            for index in 0..<wave.word_count |wave, at, letters|:
+                Ints::put(&wave.word_start, index, at)
+                width: i64 = Ints::at_ref(&wave.word_length, index)
+                at <- at + width + 1
+                letters <- letters + width
+            wave.grade <- grade
+            wave.letters <- letters
+            # ' '.join: every word plus one space between each pair.
+            wave.length <- letters + wave.word_count - 1 if wave.word_count > 0 else 0
+
+    def speed_of(wave: mutable Wave&) -> f64:
+        can Abort.Panic:
+            return grade_speed(wave.grade)
+
+    # The cell the line's left-hand end sits in before it moves.
+    def start_cell(wave: mutable Wave&) -> i64:
+        can Abort.Panic:
+            return CELLS - 2 * wave.length
+
+    # How long the whole wave allows, if not one letter is typed.
+    def seconds_of(wave: mutable Wave&) -> f64:
+        can Abort.Panic:
+            return wave.length.f64() / speed_of(wave)
+
+    # Letters a second that clearing this wave asks for.
+    def demand(wave: mutable Wave&) -> f64:
+        can Abort.Panic:
+            return wave.letters.f64() / seconds_of(wave)
+
+    # The usual conversion: a word is five keystrokes. Comparable with what any
+    # typing test would tell the same person -- both counts are KEYS, and here
+    # there is no space bar at all, since a word clears itself and the gap
+    # after it comes back with it.
+    def words_a_minute(letters: f64, seconds: f64) -> f64:
+        can Abort.Panic:
+            return 0.0 if seconds <= 0.0
+            return (letters / 5.0) * (60.0 / seconds)
+
+    # Where the front of the line is, after `drift` cells of it. It does not
+    # depend on how many words have gone.
+    def left_cell(wave: mutable Wave&, drift: f64) -> f64:
+        can Abort.Panic:
+            return start_cell(wave).f64() + drift
+
+    # Where the end of the line is once `cleared` words have gone.
+    def right_cell(wave: mutable Wave&, cleared: i64, drift: f64) -> f64:
+        can Abort.Panic:
+            return start_cell(wave).f64() + drift if cleared >= wave.word_count
+            return start_cell(wave).f64() + drift + (wave.length - Ints::at_ref(&wave.word_start, cleared)).f64()
+
+    # The second at which the line runs out, `cleared` words in. Every word
+    # cleared buys its own width plus the space after it, so the deadline walks
+    # forward by exactly what was typed away.
+    #
+    # The reference returns `float('inf')` for a finished wave; `finite` is
+    # that, said without a special value.
+    struct Deadline:
+        finite: bool
+        seconds: f64
+
+    def deadline(wave: mutable Wave&, cleared: i64) -> Deadline:
+        can Abort.Panic:
+            return Deadline{finite: false, seconds: 0.0} if cleared >= wave.word_count
+            return Deadline{finite: true, seconds: (wave.length + Ints::at_ref(&wave.word_start, cleared)).f64() / speed_of(wave)}
+
+    # Whether the end of the line has crossed the margin.
+    def overrun(wave: mutable Wave&, cleared: i64, drift: f64) -> bool:
+        can Abort.Panic:
+            false return if cleared >= wave.word_count
+            return right_cell(wave, cleared, drift) >= CELLS.f64()
+
+
+    # --- the bank, as the shell hands it over ----------------------------
+
+    # Every sentence the deal may draw, flattened. Sentence s owns the words
+    # `word_at[s] .. word_at[s] + words[s]`, and word w of the whole pool owns
+    # the letters `letter_at[w] .. letter_at[w] + word_length[w]`.
+    struct Pool:
+        count: mutable i64
+        words: mutable darray[i64]
+        word_at: mutable darray[i64]
+        word_length: mutable darray[i64]
+        letter_at: mutable darray[i64]
+        letter: mutable darray[i64]
+
+    # Copy sentence `index` out of the pool and lay it on the grid.
+    def load_wave(wave: mutable Wave&, pool: mutable Pool&, index: i64, grade: i64):
+        can Abort.Panic:
+            first: i64 = Ints::at_ref(&pool.word_at, index)
+            wave.word_count <- Ints::at_ref(&pool.words, index)
+            written: mutable i64 = 0
+            for slot in 0..<wave.word_count |wave, pool, first, written|:
+                width: i64 = Ints::at_ref(&pool.word_length, first + slot)
+                Ints::put(&wave.word_length, slot, width)
+                Ints::put(&wave.letter_start, slot, written)
+                source: i64 = Ints::at_ref(&pool.letter_at, first + slot)
+                for at in 0..<width |wave, pool, source, written, slot|:
+                    Ints::put(&wave.letter, written + at, Ints::at_ref(&pool.letter, source + at))
+                written <- written + width
+            lay_out(wave, grade)
+
+    # --- a run -----------------------------------------------------------
+
+    struct Run:
+        start_rung: mutable i64
+        total_waves: mutable i64
+        adaptive: mutable bool
+        coach: mutable bool
+        rung: mutable i64
+        trial: mutable i64
+        cleared: mutable i64
+        typed_count: mutable i64
+        typed: mutable darray[i64]
+        drift: mutable f64
+        lives: mutable i64
+        landed: mutable i64
+        missed: mutable i64
+        seconds: mutable f64
+        started_at: mutable f64
+        until: mutable f64
+        phase: mutable i64
+        verdict: mutable i64
+        result_count: mutable i64
+        result_rung: mutable darray[i64]
+        result_done: mutable darray[i64]
+        result_words: mutable darray[i64]
+        result_took: mutable darray[f64]
+
+    def new_run() -> Run:
+        can Memory.Allocate, Abort.Panic:
+            return Run{start_rung: 1, total_waves: 0, adaptive: false, coach: false,
+                       rung: 1, trial: 0, cleared: 0, typed_count: 0,
+                       typed: Ints::zeros(MOST_LETTERS), drift: 0.0, lives: START_LIVES,
+                       landed: 0, missed: 0, seconds: 0.0, started_at: 0.0, until: 0.0,
+                       phase: PHASE_READY, verdict: -1, result_count: 0,
+                       result_rung: Ints::zeros(MOST_WAVES), result_done: Ints::zeros(MOST_WAVES),
+                       result_words: Ints::zeros(MOST_WAVES), result_took: Floats::zeros(MOST_WAVES)}
+
+    def reset(run: mutable Run&):
+        can Abort.Panic:
+            run.trial <- 0
+            run.result_count <- 0
+            run.cleared <- 0
+            run.typed_count <- 0
+            run.drift <- 0.0
+            run.lives <- START_LIVES
+            run.landed <- 0
+            run.missed <- 0
+            run.seconds <- 0.0
+            run.rung <- clamped_rung(run.start_rung)
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+
+    # The wave index this deal picks out of a pool of `pool_size`.
+    #
+    # The reference reseeds a FRESH generator per wave from its own stream --
+    # `generate(rung, seed=self.rng.randrange(1 << 30))` -- so the pick is one
+    # draw from a generator that has made no other.
+    def deal_index(pool_size: i64, rng: mutable MT19937&) -> i64:
+        can Abort.Panic:
+            seed: i64 = py_randbelow(rng, 1073741824.u64()).i64()
+            picker: mutable MT19937 = mt19937_new()
+            mt_seed_int(&picker, seed.u64())
+            return py_randbelow(&picker, pool_size.u64()).i64()
+
+    def finish(run: mutable Run&):
+        can Abort.Panic:
+            run.phase <- PHASE_DONE
+
+    # The word at the front of the line, which is the one to type. -1 when the
+    # wave is finished.
+    def target(run: mutable Run&, wave: mutable Wave&) -> i64:
+        can Abort.Panic:
+            -1 return if run.cleared >= wave.word_count
+            return run.cleared
+
+    def paid(run: mutable Run&, landed: bool):
+        can Abort.Panic:
+            return if not run.coach
+            run.verdict <- 1 if landed else 0
+
+    # A key that changed nothing clears the label and pays zero.
+    def paid_nothing(run: mutable Run&):
+        can Abort.Panic:
+            return if not run.coach
+            run.verdict <- -1
+
+    def settle(run: mutable Run&, cleared: bool, now: f64):
+        can Abort.Panic:
+            elapsed: f64 = now - run.started_at
+            took: f64 = 0.000001 if elapsed < 0.000001 else elapsed
+            run.seconds <- run.seconds + took
+            Ints::put(&run.result_rung, run.result_count, run.rung)
+            Ints::put(&run.result_done, run.result_count, 1 if cleared else 0)
+            Ints::put(&run.result_words, run.result_count, run.cleared)
+            Floats::put(&run.result_took, run.result_count, took)
+            run.result_count <- run.result_count + 1
+            if run.adaptive:
+                run.rung <- clamped_rung(run.rung + (1 if cleared else -1))
+            run.verdict <- 1 if cleared else 0
+            run.phase <- PHASE_SETTLED
+            run.until <- now + SETTLE_SECONDS
+
+    def wave_clear(run: mutable Run&, now: f64):
+        can Abort.Panic:
+            run.lives <- MOST_LIVES if run.lives + 1 > MOST_LIVES else run.lives + 1
+            settle(run, true, now)
+
+    def spoil(run: mutable Run&, now: f64):
+        can Abort.Panic:
+            run.lives <- run.lives - 1
+            settle(run, false, now)
+
+    # Put one letter into the word at the front of the line. `key` is a letter
+    # index 0..25, or -1 for a key that is not a letter.
+    #
+    # Refused once the word's own width is full: a buffer that is wrong and
+    # full has nowhere to go but the rub-out, and letting it grow past the word
+    # would put the line's letters out of their cells.
+    def write(run: mutable Run&, wave: mutable Wave&, key: i64, now: f64):
+        can Abort.Panic:
+            return if run.phase != PHASE_TYPING or key < 0 or key > 25
+            word: i64 = target(run, wave)
+            width: i64 = 0 if word < 0 else Ints::at_ref(&wave.word_length, word)
+            if word < 0 or run.typed_count >= width:
+                paid_nothing(run)
+                return
+            wanted: i64 = Ints::at_ref(&wave.letter, Ints::at_ref(&wave.letter_start, word) + run.typed_count)
+            landed: bool = key == wanted
+            Ints::put(&run.typed, run.typed_count, key)
+            run.typed_count <- run.typed_count + 1
+            # Only the ones that landed, so the rate printed at the end of a
+            # run is a net rate rather than a count of how hard the keyboard
+            # was hit. A letter rubbed out and typed again counts twice, which
+            # is the one way this is generous and the way every typing test is.
+            if landed:
+                run.landed <- run.landed + 1
+            else:
+                run.missed <- run.missed + 1
+            whole: mutable bool = run.typed_count == width
+            for at in 0..<run.typed_count |run, wave, word, whole|:
+                whole <- false if Ints::at_ref(&run.typed, at) != Ints::at_ref(&wave.letter, Ints::at_ref(&wave.letter_start, word) + at)
+            if whole:
+                run.cleared <- run.cleared + 1
+                run.typed_count <- 0
+                if run.cleared >= wave.word_count:
+                    wave_clear(run, now)
+                    return
+            paid(run, landed)
+
+    # Take back the last letter. Pays nothing, by design: a rub-out that paid
+    # would be a rub-out worth doing on its own, and typing a wrong letter to
+    # earn the credit for rubbing it out is a loop that never ends.
+    def erase(run: mutable Run&):
+        can Abort.Panic:
+            if run.phase != PHASE_TYPING or run.typed_count == 0:
+                paid_nothing(run)
+                return
+            run.typed_count <- run.typed_count - 1
+            paid_nothing(run)
+
+    def next_trial(run: mutable Run&, wave: mutable Wave&, pool: mutable Pool&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            if run.lives <= 0 or run.trial >= run.total_waves:
+                finish(run)
+                return
+            # No sentence short enough to run this lane. With the seed text
+            # that is a real state and not a crash.
+            if pool.count <= 0:
+                run.phase <- PHASE_DONE
+                return
+            index: i64 = deal_index(pool.count, rng)
+            run.trial <- run.trial + 1
+            load_wave(wave, pool, index, grade_of(run.rung))
+            run.cleared <- 0
+            run.typed_count <- 0
+            run.drift <- 0.0
+            run.verdict <- -1
+            run.started_at <- now
+            run.phase <- PHASE_TYPING
+
+    def start_run(run: mutable Run&, wave: mutable Wave&, pool: mutable Pool&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            reset(run)
+            next_trial(run, wave, pool, now, rng)
+
+    # Move the line, and deal the next wave once this one has settled. Clamped,
+    # so a stall on a slow machine does not teleport the line past the margin
+    # without anyone having had a chance.
+    def update(run: mutable Run&, wave: mutable Wave&, pool: mutable Pool&, dt: f64, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            if run.phase == PHASE_TYPING:
+                step: f64 = 0.1 if dt > 0.1 else dt
+                run.drift <- run.drift + speed_of(wave) * step
+                if overrun(wave, run.cleared, run.drift):
+                    spoil(run, now)
+            else:
+                if run.phase == PHASE_SETTLED and now >= run.until:
+                    next_trial(run, wave, pool, now, rng)
+
+    struct Score:
+        waves: i64
+        cleared: i64
+        lives: i64
+        best_rung: i64
+        wpm: i64
+        missed: i64
+
+    def score(run: mutable Run&) -> Score:
+        can Abort.Panic:
+            cleared: mutable i64 = 0
+            best_rung: mutable i64 = 0
+            for at in 0..<run.result_count |run, cleared, best_rung|:
+                continue if Ints::at_ref(&run.result_done, at) == 0
+                cleared <- cleared + 1
+                rung: i64 = Ints::at_ref(&run.result_rung, at)
+                best_rung <- rung if rung > best_rung
+            return Score{waves: run.result_count, cleared: cleared, lives: run.lives,
+                         best_rung: best_rung,
+                         wpm: py_round_half_even(words_a_minute(run.landed.f64(), run.seconds)),
+                         missed: run.missed}
