@@ -1,0 +1,250 @@
+# The Overrun screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/overrun.py -- the drawing, not the thinking.
+#
+# A line of words slides along a track towards a margin, and the player types
+# it away. Four labels, a track, a margin, a row of life discs, and ONE LABEL
+# PER LETTER laid out on an 88-cell character grid.
+#
+# Three things about that grid are load-bearing:
+#
+#   * A space gets NO label. It is still a cell -- the arithmetic counts it,
+#     and it comes back with the word it follows -- but there is nothing to
+#     draw in one, so a port that drew one would be a command long per gap.
+#   * The line is drawn from the original offsets LESS whatever the cleared
+#     words took away, which is what makes the rest snap left by the width of
+#     the word that went rather than sliding.
+#   * A letter already typed is drawn in the TYPED character and not the
+#     wanted one, blue if they agree and vermillion if they do not. So a
+#     mistyped line still reads as what was typed.
+#
+# The letter size is MEASURED: 24 points is scaled by whatever fraction of a
+# cell an 'm' takes at 24 points, so the widest lowercase letter fits inside
+# its cell whichever of FONTLIST this machine has. A letter wider than its
+# cell would put the drawing and the arithmetic into disagreement about where
+# the end of the line is.
+#
+# The life discs are always MOST_LIVES of them and the spare ones are
+# INVISIBLE rather than absent, which a display list has no way to say -- so
+# only the held ones are emitted, and that is what the recorder sees too.
+#
+# NOTE: needs elisacore_math, strings, ints, geometry, verdict, textmetrics,
+# display and scene_verdict included by the driver.
+
+module SceneOverrun:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_TYPING: i64 = 1
+    const PHASE_SETTLED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    # The lane is 88 cells wide however wide the window is.
+    const CELLS: f64 = 88.0
+    const MOST_LIVES: i64 = 9
+
+    def color_right() -> u32:
+        return Display::rgba(0, 114, 178, 255)
+
+    def color_wrong() -> u32:
+        return Display::rgba(213, 94, 0, 255)
+
+    def color_margin() -> u32:
+        return Display::rgba(204, 121, 167, 255)
+
+    def color_track() -> u32:
+        return Display::rgba(128, 128, 128, 255)
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def floor_of(height: f64) -> f64:
+        can Abort.Panic:
+            return Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 56.0).f64()).f64()
+
+    # Left edge, margin, middle height, and the width of one cell.
+    struct Lane:
+        left: mutable f64
+        right: mutable f64
+        middle: mutable f64
+        cell: mutable f64
+
+    def lane_of(out: mutable Lane&, width: f64, height: f64):
+        can Abort.Panic:
+            left: f64 = width * 0.05
+            right: f64 = width * 0.95
+            bottom: f64 = floor_of(height)
+            top: f64 = Geometry::from_top_edge(height, 126.0).f64()
+            room: f64 = top - bottom
+            tall: f64 = room if room > 60.0 else 60.0
+            out.left <- left
+            out.right <- right
+            out.middle <- bottom + tall * 0.55
+            out.cell <- (right - left) / CELLS
+
+    # A font size whose widest lowercase letter fits inside a cell. The probe
+    # is a real measurement and not a constant, because the answer depends on
+    # whichever of FONTLIST this machine has.
+    def cell_font(cell: f64) -> f64:
+        can Abort.Panic:
+            wide: i64 = TextMetrics::advance(24.0)
+            if wide == 0:
+                return 0.0
+            return 24.0 * cell * 0.90 / wide.f64()
+
+    # `int(round(words_a_minute(letters, seconds)))`, and `round` is CPython's
+    # half-to-even. A word is five keystrokes; a wave with no time in it is
+    # nought rather than an error.
+    def words_a_minute(letters: f64, seconds: f64) -> i64:
+        can Abort.Panic:
+            if seconds <= 0.0:
+                return 0
+            return py_round_half_even(letters / 5.0 * (60.0 / seconds))
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_wave: bool, words: darray[sview]&, starts: darray[i64]&,
+               length: i64, letters: i64, seconds: f64, cleared: i64,
+               typed: sview, drift: f64, lives: i64, stocked: bool,
+               missing: sview, trial: i64, total_waves: i64, message: sview,
+               verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle_x: f64 = Geometry::width_center(paint.width).f64()
+            lane: mutable Lane = Lane{left: 0.0, right: 0.0, middle: 0.0, cell: 0.0}
+            lane_of(&lane, paint.width, paint.height)
+
+            put_text(list, paint, sview("Overrun", 0, -1), middle_x,
+                     Geometry::from_top_edge(paint.height, 34.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if has_wave and (phase == PHASE_TYPING or phase == PHASE_SETTLED):
+                dstr_append_cstr(&status, "     wave ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_waves)
+                dstr_append_cstr(&status, "   ")
+                dstr_append_i64(&status, words_a_minute(letters.f64(), seconds))
+                dstr_append_cstr(&status, " words a minute   ")
+                dstr_append_i64(&status, lives if lives > 0 else 0)
+                dstr_append_cstr(&status, " lives")
+            if phase == PHASE_READY and not stocked:
+                dstr_append_cstr(&status, "     ")
+                dstr_append_sview(&status, missing)
+            put_text(list, paint, bytes_view(status), middle_x,
+                     Geometry::from_top_edge(paint.height, 64.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 13.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            note: sview = sview("Type the line away before its end reaches the margin.", 0, -1) if phase == PHASE_READY else sview("", 0, -1)
+            put_text(list, paint, note, middle_x,
+                     Geometry::from_top_edge(paint.height, 90.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: menu   Space: start   type the line   Backspace: rub out   O: options", 0, -1),
+                     middle_x, Geometry::from_bottom_edge(paint.height, 24.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            # The track and the margin at the end of it.
+            three: f64 = lane.cell * 3.0
+            room: f64 = (lane.middle - floor_of(paint.height)) * 0.8
+            reach: f64 = three if three < room else room
+            Display::draw_line(list, lane.left / paint.sx,
+                               (lane.middle - reach) / paint.sy,
+                               lane.right / paint.sx,
+                               (lane.middle - reach) / paint.sy,
+                               2.0 / paint.sx, color_track())
+            Display::draw_line(list, lane.right / paint.sx,
+                               (lane.middle - reach) / paint.sy,
+                               lane.right / paint.sx,
+                               (lane.middle + reach) / paint.sy,
+                               5.0 / paint.sx, color_margin())
+
+            # The lives. `max(3.0, window.width * 0.006)`, one disc apiece,
+            # and only the held ones are drawn.
+            scaled: f64 = paint.width * 0.006
+            radius: f64 = scaled if scaled > 3.0 else 3.0
+            step: f64 = radius * 3.0
+            first: f64 = middle_x - step * (MOST_LIVES - 1).f64() / 2.0
+            standing: i64 = lives if lives > 0 else 0
+            disc_y: f64 = Geometry::from_top_edge(paint.height, 112.0).f64()
+            for index in 0..<MOST_LIVES |list, paint, first, step, radius, standing, disc_y|:
+                if index < standing:
+                    Display::draw_circle(list, (first + index.f64() * step) / paint.sx,
+                                         disc_y / paint.sy, radius / paint.sx,
+                                         paint.ink)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if has_wave:
+                # Even a blanked line is still one label a letter. `_place_line`
+                # sets the text to '' and does not move the label, so an idle
+                # phase leaves every letter sitting at x = 0 with nothing in
+                # it -- which is a command apiece and not an absence.
+                idle: bool = phase == PHASE_READY or phase == PHASE_DONE
+                put_line(list, paint, &lane, words, starts, length, cleared,
+                         typed, drift, idle)
+
+    def step_at(values: darray[i64]&, index: i64) -> i64:
+        can Abort.Panic:
+            return get values[index.usize()] else 0
+
+    def word_at(words: darray[sview]&, index: i64) -> sview:
+        can Abort.Panic:
+            return get words[index.usize()] else sview("", 0, -1)
+
+    def put_line(list: mutable Display::DisplayList&, paint: Paint&, lane: Lane&,
+                 words: darray[sview]&, starts: darray[i64]&, length: i64,
+                 cleared: i64, typed: sview, drift: f64, idle: bool):
+        can Memory.Allocate, Abort.Panic:
+            count: i64 = words.count.i64()
+            # What the cleared words took away with them.
+            gone: i64 = step_at(starts, cleared) if cleared < count else length
+            start_cell: f64 = CELLS - 2.0 * length.f64()
+            origin: f64 = lane.left + (start_cell + drift - gone.f64()) * lane.cell
+            size: f64 = cell_font(lane.cell)
+            wanted: sview = word_at(words, cleared) if cleared < count else sview("", 0, -1)
+            typed_len: i64 = sview_len(typed).i64()
+            for owns in 0..<count |list, paint, lane, words, starts, cleared, typed, typed_len, wanted, origin, size, idle|:
+                word: sview = word_at(words, owns)
+                at: i64 = step_at(starts, owns)
+                span: i64 = sview_len(word).i64()
+                for step in 0..<span |list, paint, lane, word, at, owns, cleared, typed, typed_len, wanted, origin, size, span, idle|:
+                    # A cleared word's letters are blanked, not removed: the
+                    # label stays where it was made, at x = 0, and its text
+                    # goes empty.
+                    letter: mutable sview = sview("", 0, -1)
+                    color: mutable u32 = paint.ink
+                    x: mutable f64 = 0.0
+                    if not idle and owns >= cleared:
+                        slot: i64 = at + step
+                        x <- origin + (slot.f64() + 0.5) * lane.cell
+                        letter <- string_view_slice(word, step, step + 1)
+                        if owns == cleared and step < typed_len:
+                            letter <- string_view_slice(typed, step, step + 1)
+                            same: bool = sview_at(typed, step.usize()) == sview_at(wanted, step.usize())
+                            color <- color_right() if same else color_wrong()
+                    put_text(list, paint, letter, x, lane.middle, size, color,
+                             Display::ANCHOR_CENTER_CENTER, false)
