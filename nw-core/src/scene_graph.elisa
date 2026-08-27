@@ -1,0 +1,220 @@
+# The daily progress chart: score history for one game mode at a time.
+#
+# Port of neural_workshop/ui/graph.py -- the chart, not the statistics. The
+# days and their two series come in already folded; how a day's sessions are
+# collapsed into one score is `stats`, which has a suite of its own.
+#
+# The whole chart is ONE drawing built in one pass, and its order is the
+# picture: the two axes, then the four fixed captions, then either the
+# "insufficient data" line or -- for a chart that has two days to draw -- the
+# x axis with its grid as the points are gathered, then the y axis with its
+# own grid, then the two series, then the legend.
+#
+# Three details are load-bearing and none is obvious:
+#
+#   * the y range is SNAPPED to quarter points, `floor(min * 4) / 4` and
+#     `ceil(max * 4) / 4`, so the axis lands on readable numbers
+#   * the x labels are THINNED by `int(20 // xinterval)` -- twenty pixels of
+#     label width divided by the spacing -- and past ten days the date's own
+#     hyphens become newlines so the parts stack instead of overlapping
+#   * a missing day is filled in as a gap entry rather than skipped, so the
+#     axis is evenly spaced in DAYS and not in sessions
+#
+# NOTE: needs elisacore_math, pymath, strings, ints, geometry and display
+# included by the driver.
+
+module SceneGraph:
+
+    def text_color(black_background: bool) -> u32:
+        return Display::rgba(240, 240, 240, 255) if black_background else Display::rgba(0, 0, 0, 255)
+
+    def color_average() -> u32:
+        return Display::rgba(0, 0, 255, 255)
+
+    def color_maximum() -> u32:
+        return Display::rgba(255, 0, 0, 255)
+
+    def axis_color(black_background: bool) -> u32:
+        return Display::rgba(96, 96, 96, 255) if black_background else Display::rgba(160, 160, 160, 255)
+
+    def minor_color(black_background: bool) -> u32:
+        return Display::rgba(64, 64, 64, 255) if black_background else Display::rgba(224, 224, 224, 255)
+
+    struct Paint:
+        ink: mutable u32
+        axis: mutable u32
+        minor: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        return Paint{ink: text_color(black_background),
+                     axis: axis_color(black_background),
+                     minor: minor_color(black_background),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def put_line(list: mutable Display::DisplayList&, paint: Paint&,
+                 x1: f64, y1: f64, x2: f64, y2: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            # The chart's lines take pyglet's DEFAULT thickness, which the
+            # reference never names -- so neither does this.
+            Display::draw_line(list, x1 / paint.sx, y1 / paint.sy,
+                               x2 / paint.sx, y2 / paint.sy, 1.0 / paint.sx,
+                               color)
+
+    struct Frame:
+        left: mutable f64
+        right: mutable f64
+        top: mutable f64
+        bottom: mutable f64
+        centre_x: mutable f64
+        centre_y: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def frame_of(out: mutable Frame&, width: f64, height: f64):
+        can Abort.Panic:
+            tall: f64 = (height * 0.625).i64().f64()
+            wide: f64 = (width * 0.625).i64().f64()
+            centre_x: f64 = Geometry::width_center(width).f64()
+            centre_y: f64 = Geometry::from_height_center(height, 20.0).f64()
+            out.width <- wide
+            out.height <- tall
+            out.centre_x <- centre_x
+            out.centre_y <- centre_y
+            out.left <- centre_x - (wide.i64() / 2).f64()
+            out.right <- centre_x + (wide.i64() / 2).f64()
+            out.top <- centre_y + (tall.i64() / 2).f64()
+            out.bottom <- centre_y - (tall.i64() / 2).f64()
+
+    # The chart's fixed furniture: the two axes and the four captions that do
+    # not depend on there being any data.
+    def put_frame(list: mutable Display::DisplayList&, paint: Paint&,
+                  frame: Frame&, keys: sview, title: sview):
+        can Memory.Allocate, Abort.Panic:
+            put_line(list, paint, frame.left, frame.top, frame.left,
+                     frame.bottom, paint.axis)
+            put_line(list, paint, frame.left, frame.bottom, frame.right,
+                     frame.bottom, paint.axis)
+            put_text(list, paint, keys,
+                     Geometry::from_left_edge(paint.width, 10.0).f64(),
+                     Geometry::from_top_edge(paint.height, 10.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 9.0), paint.ink,
+                     Display::ANCHOR_LEFT_TOP, false)
+            put_text(list, paint, title, frame.centre_x,
+                     frame.top + Geometry::scale_to_height(paint.height, 60.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 18.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+            put_text(list, paint, sview("Date", 0, -1), frame.centre_x,
+                     frame.bottom - Geometry::scale_to_height(paint.height, 80.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+            # Maximum, Average and Score, stacked up the y axis's left --
+            # and the first two are labelled in the SERIES' own colours, so
+            # the key is the line rather than a swatch beside it.
+            size: f64 = Geometry::calc_fontsize(paint.height, 12.0)
+            x: f64 = frame.left - Geometry::scale_to_width(paint.width, 60.0).f64()
+            put_text(list, paint, sview("Maximum", 0, -1), x,
+                     frame.centre_y + Geometry::scale_to_height(paint.height, 50.0).f64(),
+                     size, color_maximum(), Display::ANCHOR_RIGHT_CENTER, true)
+            put_text(list, paint, sview("Average", 0, -1), x,
+                     frame.centre_y + Geometry::scale_to_height(paint.height, 25.0).f64(),
+                     size, color_average(), Display::ANCHOR_RIGHT_CENTER, true)
+            put_text(list, paint, sview("Score", 0, -1), x, frame.centre_y,
+                     size, paint.ink, Display::ANCHOR_RIGHT_CENTER, true)
+
+    def put_insufficient(list: mutable Display::DisplayList&, paint: Paint&,
+                         frame: Frame&):
+        can Memory.Allocate, Abort.Panic:
+            put_text(list, paint,
+                     sview("Insufficient data: two days needed", 0, -1),
+                     frame.centre_x, frame.centre_y,
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.axis,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+    # `floor(min * 4) / 4` and `ceil(max * 4) / 4`.
+    def snapped_low(value: f64) -> f64:
+        can Abort.Panic:
+            return floor(value * 4.0) / 4.0
+
+    def snapped_high(value: f64) -> f64:
+        can Abort.Panic:
+            return ceil(value * 4.0) / 4.0
+
+    def point_x(frame: Frame&, index: i64, days: i64) -> f64:
+        return (frame.width / (days - 1).f64() * index.f64() + frame.left).i64().f64()
+
+    def point_y(frame: Frame&, value: f64, low: f64, high: f64) -> f64:
+        return ((value - low) / (high - low) * frame.height + frame.bottom).i64().f64()
+
+    # The x axis, drawn AS THE POINTS ARE GATHERED -- so a day's label and its
+    # two grid lines land between the series' own points in the list.
+    def put_x_axis(list: mutable Display::DisplayList&, paint: Paint&,
+                   frame: Frame&, labels: darray[sview]&, days: i64):
+        can Memory.Allocate, Abort.Panic:
+            xinterval: f64 = frame.width / (days - 1).f64()
+            skip: i64 = (20.0 / xinterval).i64()
+            for index in 0..<days |list, paint, frame, labels, days, skip|:
+                if index % (skip + 1) == 0:
+                    x: f64 = point_x(frame, index, days)
+                    put_text(list, paint,
+                             get labels[index.usize()] else sview("", 0, -1),
+                             x, frame.bottom - Geometry::scale_to_height(paint.height, 15.0).f64(),
+                             Geometry::calc_fontsize(paint.height, 8.0),
+                             paint.ink, Display::ANCHOR_CENTER_TOP, true)
+                    put_line(list, paint, x, frame.bottom, x, frame.top, paint.minor)
+                    put_line(list, paint, x,
+                             frame.bottom - Geometry::scale_to_height(paint.height, 10.0).f64(),
+                             x, frame.bottom, paint.minor)
+
+    # The y axis: a label and two lines every quarter point, walked from the
+    # low end up while it is still at or under the high one.
+    def put_y_axis(list: mutable Display::DisplayList&, paint: Paint&,
+                   frame: Frame&, low: f64, high: f64, labels: darray[sview]&):
+        can Memory.Allocate, Abort.Panic:
+            at: mutable f64 = low
+            step: mutable i64 = 0
+            while at <= high |list, paint, frame, low, high, labels, at, step|:
+                y: f64 = point_y(frame, at, low, high)
+                put_text(list, paint,
+                         get labels[step.usize()] else sview("", 0, -1),
+                         frame.left - Geometry::scale_to_width(paint.width, 30.0).f64(),
+                         y + Geometry::scale_to_width(paint.width, 1.0).f64(),
+                         Geometry::calc_fontsize(paint.height, 10.0), paint.ink,
+                         Display::ANCHOR_CENTER_CENTER, false)
+                put_line(list, paint, frame.left, y, frame.right, y, paint.minor)
+                put_line(list, paint,
+                         frame.left - Geometry::scale_to_width(paint.width, 10.0).f64(),
+                         y, frame.left, y, paint.minor)
+                at <- at + 0.25
+                step <- step + 1
+
+    # One series, as segments between consecutive points.
+    def put_series(list: mutable Display::DisplayList&, paint: Paint&,
+                   xs: darray[f64]&, ys: darray[f64]&, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            count: i64 = xs.count.i64()
+            for at in 0..<(count - 1) |list, paint, xs, ys, color, count|:
+                put_line(list, paint, get xs[at.usize()] else 0.0,
+                         get ys[at.usize()] else 0.0,
+                         get xs[(at + 1).usize()] else 0.0,
+                         get ys[(at + 1).usize()] else 0.0, color)
+
+    # The legend, at a y taken from the window's WIDTH rather than its height
+    # -- which is the reference's own line and not a slip here.
+    def put_legend(list: mutable Display::DisplayList&, paint: Paint&, text: sview):
+        can Memory.Allocate, Abort.Panic:
+            put_text(list, paint, text,
+                     Geometry::width_center(paint.width).f64(),
+                     Geometry::scale_to_width(paint.width, 20.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)

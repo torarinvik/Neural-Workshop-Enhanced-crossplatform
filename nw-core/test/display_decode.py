@@ -21,7 +21,7 @@ KIND_NAMES = {
     1: "rect", 2: "bordered_rect", 3: "box", 4: "circle", 5: "arc",
     6: "line", 7: "triangle", 8: "polygon", 9: "poly_point", 10: "sprite",
     11: "text", 12: "verdict", 13: "sound", 14: "marker",
-    15: "sprite_fit",
+    15: "sprite_fit", 16: "multiline", 17: "star",
 }
 
 ANCHOR_NAMES = ["left_bottom", "center_bottom", "right_bottom",
@@ -68,6 +68,12 @@ def _fill(cmd, kind, color, a, b, c, d, e, f, ref, ln):
     """Name the generic slots according to the command tag."""
     if kind in (1, 2, 3):                      # rect family
         cmd.update(x=a, y=b, w=c, h=d, color=color)
+        if kind == 1:
+            # A plain rectangle's last three slots: the anchor it turns and
+            # measures from, and the angle itself. The angle rides in `ref` as
+            # the BITS of an f32 rather than as a number, because `ref` is a
+            # u32 slot and a rotation is not a count.
+            cmd.update(anchor_x=e, anchor_y=f, rotation=_bits_to_f32(ref))
         if kind == 2:
             cmd.update(border=ref, border_width=e)
         if kind == 3:
@@ -85,9 +91,15 @@ def _fill(cmd, kind, color, a, b, c, d, e, f, ref, ln):
     elif kind == 9:
         cmd.update(x=a, y=b)
     elif kind == 10:
-        cmd.update(asset=ref, x=a, y=b, scale=c, rotation=e, color=color)
+        # The image's own pixel size is carried because some screens scale BY
+        # it; it is the file's fact, not the frame's, so it is not a length
+        # the shell rescales.
+        cmd.update(asset=ref, x=a, y=b, scale=c, rotation=e, color=color,
+                   image_w=int(d), image_h=int(f))
     elif kind == 11:
-        cmd.update(x=a, y=b, size=c, color=color)
+        # `d` is the weight. A shell written before it existed reads nothing
+        # there and draws at normal weight, which is what it drew anyway.
+        cmd.update(x=a, y=b, size=c, color=color, bold=bool(d))
     elif kind == 12:
         cmd.update(verdict=ref)
     elif kind == 13:
@@ -95,6 +107,19 @@ def _fill(cmd, kind, color, a, b, c, d, e, f, ref, ln):
     elif kind == 15:                           # sprite fitted into a room box
         cmd.update(asset=ref, x=a, y=b, room_w=c, room_h=d, rotation=e,
                    color=color)
+    elif kind == 16:                           # a run of joined segments
+        # Like a polygon: a header, then `points` CMD_POLY_POINT records. `x`,
+        # `y` repeat the first point, because that is where pyglet puts the
+        # run's own origin and where a recorder reads it back.
+        cmd.update(x=a, y=b, thickness=c, points=ln, color=color)
+    elif kind == 17:
+        cmd.update(x=a, y=b, outer=c, inner=d, spikes=int(e), rotation=f,
+                   color=color)
+
+
+def _bits_to_f32(bits: int) -> float:
+    """An f32 read back out of a u32 slot -- the bytes, not the value."""
+    return struct.unpack("<f", struct.pack("<I", bits & 0xFFFFFFFF))[0]
 
 
 def rgba(color: int):

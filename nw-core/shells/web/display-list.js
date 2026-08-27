@@ -14,6 +14,7 @@ export const Kind = {
     RECT: 1, BORDERED_RECT: 2, BOX: 3, CIRCLE: 4, ARC: 5, LINE: 6,
     TRIANGLE: 7, POLYGON: 8, POLY_POINT: 9, SPRITE: 10, TEXT: 11,
     VERDICT: 12, SOUND: 13, MARKER: 14, SPRITE_FIT: 15,
+    MULTILINE: 16, STAR: 17,
 };
 
 const ANCHORS = [
@@ -61,6 +62,13 @@ export function decode(bytes) {
     return commands;
 }
 
+// An f32 read back out of a u32 slot -- the bytes, not the value.
+const _bits = new DataView(new ArrayBuffer(4));
+export function rotationOf(bits) {
+    _bits.setUint32(0, bits >>> 0, true);
+    return _bits.getFloat32(0, true);
+}
+
 export function css(color) {
     const r = (color >>> 24) & 255, g = (color >>> 16) & 255;
     const b = (color >>> 8) & 255, a = color & 255;
@@ -84,10 +92,27 @@ export function render(ctx, commands, { width, height, assets = {} } = {}) {
 
     for (const cmd of commands) {
         switch (cmd.kind) {
-            case Kind.RECT:
+            case Kind.RECT: {
+                // `e`, `f` are the anchor inside the rectangle and `ref` holds
+                // the BITS of the rotation about it. Both are zero for all but
+                // two screens, so the plain path stays a single fillRect.
+                const rotation = rotationOf(cmd.ref);
                 ctx.fillStyle = css(cmd.color);
-                ctx.fillRect(cmd.a, cmd.b, cmd.c, cmd.d);
+                if (!rotation && !cmd.e && !cmd.f) {
+                    ctx.fillRect(cmd.a, cmd.b, cmd.c, cmd.d);
+                    break;
+                }
+                ctx.save();
+                ctx.translate(cmd.a, cmd.b);
+                // Same sign as the sprite branch below, so one file has one
+                // convention. See docs/display-list.md: what the core stores is
+                // pyglet's own `rotation`, and no screen yet draws a rotated
+                // sprite, so nothing has pinned the sign across shells.
+                ctx.rotate((rotation * Math.PI) / 180);
+                ctx.fillRect(-cmd.e, -cmd.f, cmd.c, cmd.d);
+                ctx.restore();
                 break;
+            }
             case Kind.BORDERED_RECT:
                 ctx.fillStyle = css(cmd.color);
                 ctx.fillRect(cmd.a, cmd.b, cmd.c, cmd.d);
@@ -132,7 +157,14 @@ export function render(ctx, commands, { width, height, assets = {} } = {}) {
                 ctx.fill();
                 break;
             case Kind.POLYGON:
-                polygon = { remaining: cmd.len, color: cmd.color, started: false };
+                polygon = { remaining: cmd.len, color: cmd.color, started: false,
+                            stroke: false };
+                break;
+            case Kind.MULTILINE:
+                // The same header-and-points shape as a polygon, drawn as an
+                // OPEN stroked run rather than a closed fill.
+                polygon = { remaining: cmd.len, color: cmd.color, started: false,
+                            stroke: true, thickness: cmd.c };
                 break;
             case Kind.POLY_POINT:
                 if (polygon) {
@@ -144,13 +176,38 @@ export function render(ctx, commands, { width, height, assets = {} } = {}) {
                         ctx.lineTo(cmd.a, cmd.b);
                     }
                     if (--polygon.remaining <= 0) {
-                        ctx.closePath();
-                        ctx.fillStyle = css(polygon.color);
-                        ctx.fill();
+                        if (polygon.stroke) {
+                            ctx.strokeStyle = css(polygon.color);
+                            ctx.lineWidth = polygon.thickness;
+                            ctx.stroke();
+                        } else {
+                            ctx.closePath();
+                            ctx.fillStyle = css(polygon.color);
+                            ctx.fill();
+                        }
                         polygon = null;
                     }
                 }
                 break;
+            case Kind.STAR: {
+                // `spikes` points alternating between the outer and the inner
+                // radius, the first one at `rotation` degrees from straight up
+                // -- pyglet's Star, whose first point is at the top.
+                const spikes = Math.max(2, Math.round(cmd.e));
+                ctx.fillStyle = css(cmd.color);
+                ctx.beginPath();
+                for (let step = 0; step < spikes * 2; step++) {
+                    const radius = step % 2 === 0 ? cmd.c : cmd.d;
+                    const turn = (cmd.f * Math.PI) / 180
+                               + (step * Math.PI) / spikes;
+                    const px = cmd.a + radius * Math.sin(turn);
+                    const py = cmd.b + radius * Math.cos(turn);
+                    if (step === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+                }
+                ctx.closePath();
+                ctx.fill();
+                break;
+            }
             case Kind.SPRITE: {
                 const image = assets[cmd.ref];
                 if (image) {
@@ -186,7 +243,9 @@ export function render(ctx, commands, { width, height, assets = {} } = {}) {
                 ctx.translate(cmd.a, cmd.b);
                 ctx.scale(1, -1);
                 ctx.fillStyle = css(cmd.color);
-                ctx.font = `${cmd.c}px system-ui, sans-serif`;
+                // `d` is the weight: every task screen's title asks for bold,
+                // and a title back at normal weight is a different frame.
+                ctx.font = `${cmd.d ? "bold " : ""}${cmd.c}px system-ui, sans-serif`;
                 ctx.textAlign = cmd.anchor ? cmd.anchor[0] : "left";
                 ctx.textBaseline = cmd.anchor
                     ? { bottom: "alphabetic", middle: "middle", top: "top" }[cmd.anchor[1]]

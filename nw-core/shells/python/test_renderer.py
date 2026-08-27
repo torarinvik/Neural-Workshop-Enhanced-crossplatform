@@ -39,21 +39,28 @@ from display_decode import canonical  # noqa: E402
 # and embedded so this test needs neither a build nor a compiler; the first
 # check below re-runs that binary when it is present and fails if it has drifted.
 FRAME_HEX = (
-    "4e4b494e01000000110000001c00000001000000ff00000000000000000000000000644400002b44000000000000000000"
-    "0000000000000003000000ff404040000099430000e44200009643000096430000004000000000000000000000000002000000"
-    "ffff80000000cb43000056430000c8420000c8420000404000000000ffffffff0000000004000000ff00c8ff0000e443000084"
-    "430000c041000000000000000000000000000000000000000005000000ff8080800000e443000084430000204200000000"
+    "4e4b494e010000001a0000002300000001000000ff00000000000000000000000000644400002b4400000000000000000000"
+    "00000000000003000000ff404040000099430000e44200009643000096430000004000000000000000000000000002000000"
+    "ffff80000000cb43000056430000c8420000c8420000404000000000ffffffff0000000004000000ff00c8ff0000e4430000"
+    "84430000c041000000000000000000000000000000000000000005000000ff8080800000e443000084430000204200000000"
     "0000000000003443000000000000000006000000ff5a5a5a000000000000c842000064440000c8420000c03f000000000000"
     "00000000000007000000ffff00ff00002041000020410000f041000020410000a0410000f041000000000000000008000000"
-    "ff0ac80a000000000000000000000000000000000000000000000000000000000300000009000000000000000000c8420000"
+    "ff0ac80a0000c8420000c84200000000000000000000000000000000000000000300000009000000000000000000c8420000"
     "c842000000000000000000000000000000000000000000000000090000000000000000000c430000c8420000000000000000"
     "0000000000000000000000000000000009000000000000000000f04200000c43000000000000000000000000000000000000"
-    "0000000000000a000000ffffffff00002f440000fa430000c03f000000000000b4420000000007000000000000000b000000"
+    "0000000000000a000000ffffffff00002f440000fa430000c03f000080420000b4420000404207000000000000000b000000"
     "ffffffff0000e4430000704200009041000000000000000000000000000000000e0000040b000000ffc8c8c80000a0410080"
-    "2244000060410000000000000000000000000e000000050000060d00000000000000cdcc4c3f000000000000000000000000"
-    "000000000000000003000000000000000c000000000000000000000000000000000000000000000000000000000000000000"
-    "0000000000000e000000000000000000000000000000000000000000000000000000000000001300000009000000506f7369"
-    "74696f6e206d617463684e203d2032747269616c2d656e64"
+    "2244000060410000000000000000000000000e000000050000060b000000ff00ffff0000e44300001b44000040410000803f"
+    "0000000000000000130000000700000701000000ff0302010000484300009643000020420000a0410000a041000020410000"
+    "00000000000001000000ff06050400007a430000a043000020420000a0410000a041000020410000f041000000000f000000"
+    "ffffffff000048440000c8430000f0420000b4420000344200000000090000000000000011000000ff0080ff0000fa430000"
+    "c8430000f041000040410000a04000009041000000000000000010000000ffffff0000007042000070420000204000000000"
+    "0000000000000000000000000300000009000000000000000000704200007042000000000000000000000000000000000000"
+    "00000000000009000000000000000000a0420000b44200000000000000000000000000000000000000000000000009000000"
+    "000000000000dc4200008c420000000000000000000000000000000000000000000000000d00000000000000cdcc4c3f0000"
+    "00000000000000000000000000000000000003000000000000000c0000000000000000000000000000000000000000000000"
+    "000000000000000000000000000000000e000000000000000000000000000000000000000000000000000000000000001a00"
+    "000009000000506f736974696f6e206d617463684e203d2032547269616c2034747269616c2d656e64"
 )
 FRAME = bytes.fromhex(FRAME_HEX)
 
@@ -136,7 +143,8 @@ def test_plan_kinds_and_events() -> None:
     frame = plan(decode(FRAME), Viewport(REFERENCE_WIDTH, REFERENCE_HEIGHT))
     kinds = [op.kind for op in frame.ops]
     expected = ["rect", "box", "bordered_rect", "circle", "arc", "line",
-                "triangle", "polygon", "sprite", "text", "text"]
+                "triangle", "polygon", "sprite", "text", "text", "text",
+                "rect", "rect", "sprite_fit", "star", "multiline"]
     check(kinds == expected, "every drawing command becomes one op",
           f"{kinds} != {expected}")
     check(frame.verdict == 0 and frame.verdict_name == "correct",
@@ -146,9 +154,23 @@ def test_plan_kinds_and_events() -> None:
     check(frame.markers == ["trial-end"], "marker carried", repr(frame.markers))
 
 
+def _by_kind(frame):
+    """First op of each kind. The frame now holds three rectangles -- plain,
+    anchored and turned -- and a dict keyed by kind would silently keep only
+    the last."""
+    out = {}
+    for op in frame.ops:
+        out.setdefault(op.kind, op.fields)
+    return out
+
+
+def _all_of(frame, kind):
+    return [op.fields for op in frame.ops if op.kind == kind]
+
+
 def test_plan_geometry() -> None:
-    ops = {op.kind: op.fields for op in
-           plan(decode(FRAME), Viewport(REFERENCE_WIDTH, REFERENCE_HEIGHT)).ops}
+    frame = plan(decode(FRAME), Viewport(REFERENCE_WIDTH, REFERENCE_HEIGHT))
+    ops = _by_kind(frame)
 
     rect = ops["rect"]
     check(rect["x"] == 0 and rect["y"] == 0 and rect["width"] == 912
@@ -187,12 +209,43 @@ def test_plan_geometry() -> None:
           and close(sprite["rotation"], -90.0),
           "sprite: rotation negated for pyglet's clockwise convention", repr(sprite))
 
+    # The three rectangles differ only in their last three slots, which is the
+    # point: a shell that ignored them would draw all three identically.
+    plain, anchored, turned = _all_of(frame, "rect")
+    check(plain["anchor_x"] == 0 and plain["anchor_y"] == 0
+          and plain["rotation"] == 0.0,
+          "rect: an ordinary rectangle carries no anchor and no angle",
+          repr(plain))
+    check(anchored["anchor_x"] == 20.0 and anchored["anchor_y"] == 10.0
+          and anchored["rotation"] == 0.0,
+          "rect: an anchored rectangle keeps its anchor", repr(anchored))
+    check(close(turned["rotation"], 30.0) and turned["anchor_x"] == 20.0,
+          "rect: the angle survives the u32 slot it rides in", repr(turned))
+
+    star = ops["star"]
+    check(close(star["outer_radius"], 30.0) and close(star["inner_radius"], 12.0)
+          and star["num_spikes"] == 5 and close(star["rotation"], 18.0),
+          "star: both radii, the spike count and the angle", repr(star))
+
+    multi = ops["multiline"]
+    check(multi["coordinates"] == [(60.0, 60.0), (80.0, 90.0), (110.0, 70.0)]
+          and close(multi["thickness"], 2.5),
+          "multiline: an open run of points with its own thickness", repr(multi))
+
+    fitted = ops["sprite_fit"]
+    check(close(fitted["room_w"], 120.0) and close(fitted["room_h"], 90.0),
+          "sprite_fit: the room, not a scale", repr(fitted))
+
 
 def test_plan_text_anchors() -> None:
     texts = [op.fields for op in
              plan(decode(FRAME), Viewport(REFERENCE_WIDTH, REFERENCE_HEIGHT)).ops
              if op.kind == "text"]
-    first, second = texts
+    first, second, third = texts
+    check(third["text"] == "Trial 4" and third["bold"] is True
+          and second["bold"] is False,
+          "the weight slot separates a bold label from a plain one",
+          repr(third))
     check(first["text"] == "Position match" and first["anchor_x"] == "center"
           and first["anchor_y"] == "center" and close(first["font_size"], 18.0),
           "centred label keeps its anchor", repr(first))
@@ -214,7 +267,7 @@ def test_plan_text_anchors() -> None:
 def test_plan_scaling() -> None:
     """Everything a command carries has to move with the viewport."""
     frame = plan(decode(FRAME), Viewport(456, 342))          # half size
-    ops = {op.kind: op.fields for op in frame.ops}
+    ops = _by_kind(frame)
     check(ops["rect"]["width"] == 456 and ops["rect"]["height"] == 342,
           "lengths halve with the viewport", repr(ops["rect"]))
     check(close(ops["line"]["thickness"], 0.75) and close(ops["box"]["thickness"], 1.0),
@@ -224,6 +277,14 @@ def test_plan_scaling() -> None:
           "radii scale, angles do not", repr(ops["arc"]))
     check(close([op.fields for op in frame.ops if op.kind == "text"][0]["font_size"], 9.0),
           "font size scales")
+    # A rectangle's anchor is a length inside it, so it halves; its angle is an
+    # angle, so it does not.
+    turned = _all_of(frame, "rect")[2]
+    check(close(turned["anchor_x"], 10.0) and close(turned["rotation"], 30.0),
+          "a rectangle's anchor scales and its angle does not", repr(turned))
+    check(close(_by_kind(frame)["star"]["outer_radius"], 15.0)
+          and close(_by_kind(frame)["multiline"]["thickness"], 1.25),
+          "a star's radii and a multiline's thickness scale too")
 
 
 def test_plan_edge_cases() -> None:
@@ -273,7 +334,7 @@ def _recording_pyglet():
         return namespace
 
     shapes = module("Rectangle", "BorderedRectangle", "Box", "Circle", "Arc",
-                    "Line", "Triangle", "Polygon")
+                    "Line", "Triangle", "Polygon", "MultiLine", "Star")
     text = module("Label")
     sprite = module("Sprite")
     batches = []
@@ -296,14 +357,23 @@ def test_pyglet_classes() -> None:
 
     built = [name for name, _args, _kwargs in log]
     expected = ["Rectangle", "Box", "BorderedRectangle", "Circle", "Arc", "Line",
-                "Triangle", "Polygon", "Sprite", "Label", "Label"]
+                "Triangle", "Polygon", "Sprite", "Label", "Label", "Label",
+                "Rectangle", "Rectangle", "Star", "MultiLine"]
+    # No second Sprite: the fitted one names asset 9 and this factory holds
+    # only 7, so it plans and then declines to build -- which is the rule for
+    # an image the shell has not loaded.
     check(built == expected, "each command builds its pyglet class",
           f"{built} != {expected}")
     check(len(renderer.drawables) == len(expected),
           "every drawable is held: a shape that is collected leaves the batch",
           f"{len(renderer.drawables)}")
 
-    by_name = {name: (args, kwargs) for name, args, kwargs in log}
+    # FIRST of each name: the frame builds three rectangles and three labels,
+    # and a last-wins dict would check the turned rectangle where the plain one
+    # is meant.
+    by_name = {}
+    for name, args, kwargs in log:
+        by_name.setdefault(name, (args, kwargs))
 
     args, kwargs = by_name["Rectangle"]
     check(args == (0.0, 0.0, 912.0, 684.0) and kwargs["color"] == (0, 0, 0, 255)
@@ -324,8 +394,11 @@ def test_pyglet_classes() -> None:
 
     labels = [(args, kwargs) for name, args, kwargs in log if name == "Label"]
     check([(k["anchor_x"], k["anchor_y"]) for _a, k in labels]
-          == [("center", "center"), ("left", "top")],
+          == [("center", "center"), ("left", "top"), ("center", "top")],
           "each Label carries its own anchor pair", repr(labels))
+    check([k["weight"] for _a, k in labels] == ["normal", "normal", "bold"],
+          "the weight reaches pyglet as a named weight, not a `bold` flag",
+          repr([k["weight"] for _a, k in labels]))
     check(labels[0][0] == ("Position match",) and close(labels[0][1]["font_size"], 18.0),
           "Label(text, font_size=...) in pyglet points", repr(labels[0]))
 
@@ -361,7 +434,7 @@ def test_bordered_rect_alpha_rule() -> None:
 # ------------------------------------------------------- decoder agreement
 
 JS_PROBE = r"""
-import { decode, Kind } from %(module)s;
+import { decode, Kind, rotationOf } from %(module)s;
 
 const KIND_NAMES = Object.fromEntries(
     Object.entries(Kind).map(([name, value]) => [value, name.toLowerCase()]));
@@ -377,6 +450,7 @@ function fields(c) {
     const k = c.kind, out = {};
     if (k === Kind.RECT || k === Kind.BORDERED_RECT || k === Kind.BOX) {
         Object.assign(out, { x: f(c.a), y: f(c.b), w: f(c.c), h: f(c.d), color: rgba(c.color) });
+        if (k === Kind.RECT) Object.assign(out, { anchor_x: f(c.e), anchor_y: f(c.f), rotation: f(rotationOf(c.ref)) });
         if (k === Kind.BORDERED_RECT) Object.assign(out, { border: rgba(c.ref), border_width: f(c.e) });
         if (k === Kind.BOX) out.thickness = f(c.e);
     } else if (k === Kind.CIRCLE) {
@@ -392,10 +466,18 @@ function fields(c) {
     } else if (k === Kind.POLY_POINT) {
         Object.assign(out, { x: f(c.a), y: f(c.b) });
     } else if (k === Kind.SPRITE) {
-        Object.assign(out, { asset: String(c.ref), x: f(c.a), y: f(c.b), scale: f(c.c), rotation: f(c.e), color: rgba(c.color) });
+        Object.assign(out, { asset: String(c.ref), x: f(c.a), y: f(c.b), scale: f(c.c), rotation: f(c.e), color: rgba(c.color),
+                             image_w: String(Math.trunc(c.d)), image_h: String(Math.trunc(c.f)) });
+    } else if (k === Kind.SPRITE_FIT) {
+        Object.assign(out, { asset: String(c.ref), x: f(c.a), y: f(c.b), room_w: f(c.c), room_h: f(c.d), rotation: f(c.e), color: rgba(c.color) });
+    } else if (k === Kind.MULTILINE) {
+        Object.assign(out, { x: f(c.a), y: f(c.b), thickness: f(c.c), points: String(c.len), color: rgba(c.color) });
+    } else if (k === Kind.STAR) {
+        Object.assign(out, { x: f(c.a), y: f(c.b), outer: f(c.c), inner: f(c.d), spikes: String(Math.trunc(c.e)), rotation: f(c.f), color: rgba(c.color) });
     } else if (k === Kind.TEXT) {
         const anchor = c.anchor[0] + "_" + (c.anchor[1] === "middle" ? "center" : c.anchor[1]);
-        Object.assign(out, { x: f(c.a), y: f(c.b), size: f(c.c), color: rgba(c.color), text: c.text, anchor });
+        Object.assign(out, { x: f(c.a), y: f(c.b), size: f(c.c), color: rgba(c.color), text: c.text, anchor,
+                             bold: c.d ? "True" : "False" });
     } else if (k === Kind.VERDICT) {
         out.verdict = String(c.ref);
     } else if (k === Kind.SOUND) {

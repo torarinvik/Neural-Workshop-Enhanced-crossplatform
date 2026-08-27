@@ -147,6 +147,7 @@ static void render_frame(SDL_Renderer *r, const nw_view *v, const nw_frame *fram
     uint32_t poly_color = 0;
     float poly_x0 = 0, poly_y0 = 0, poly_prev_x = 0, poly_prev_y = 0;
     int poly_seen = 0;
+    int poly_open = 0;   /* a MULTILINE run: stroked and open, not filled */
     char text_buffer[512];
 
     events->verdict = -1;
@@ -157,9 +158,31 @@ static void render_frame(SDL_Renderer *r, const nw_view *v, const nw_frame *fram
         const nw_cmd *cmd = &frame->commands[i];
         switch (cmd->kind) {
         case NW_RECT: {
-            set_color(r, cmd->color);
-            SDL_FRect box = rect_of(v, cmd->a, cmd->b, cmd->c, cmd->d);
-            SDL_RenderFillRect(r, &box);
+            /* `e`, `f` are the anchor inside the rectangle and `ref` carries
+             * the BITS of the angle about it. Both are zero for all but two
+             * screens, so the ordinary rectangle stays one FillRect. */
+            float turn = nw_bits_to_f32(cmd->ref);
+            if (turn == 0.0f && cmd->e == 0.0f && cmd->f == 0.0f) {
+                set_color(r, cmd->color);
+                SDL_FRect box = rect_of(v, cmd->a, cmd->b, cmd->c, cmd->d);
+                SDL_RenderFillRect(r, &box);
+                break;
+            }
+            /* Clockwise about the anchor, which is what pyglet's `rotation`
+             * means and what the recorder the core was checked against read
+             * back. Reference space is y-up, so clockwise is the NEGATIVE
+             * mathematical direction. */
+            float rad = turn * 3.14159265358979323846f / 180.0f;
+            float co = SDL_cosf(rad), si = SDL_sinf(rad);
+            float lx[4] = { -cmd->e, cmd->c - cmd->e, cmd->c - cmd->e, -cmd->e };
+            float ly[4] = { -cmd->f, -cmd->f, cmd->d - cmd->f, cmd->d - cmd->f };
+            float px[4], py[4];
+            for (int k = 0; k < 4; k++) {
+                px[k] = cmd->a + lx[k] * co + ly[k] * si;
+                py[k] = cmd->b - lx[k] * si + ly[k] * co;
+            }
+            fill_triangle(r, v, px[0], py[0], px[1], py[1], px[2], py[2], cmd->color);
+            fill_triangle(r, v, px[0], py[0], px[2], py[2], px[3], py[3], cmd->color);
             break;
         }
         case NW_BORDERED_RECT: {
@@ -194,17 +217,57 @@ static void render_frame(SDL_Renderer *r, const nw_view *v, const nw_frame *fram
             poly_remaining = (int)cmd->len;
             poly_color = cmd->color;
             poly_seen = 0;
+            poly_open = 0;
             break;
+        case NW_MULTILINE:
+            /* The same header-and-points shape as a polygon, drawn as an OPEN
+             * stroked run. Thickness is not honoured: SDL_RenderLine draws one
+             * pixel, and a wide run wants a quad per segment. Named here
+             * rather than pretended away. */
+            poly_remaining = (int)cmd->len;
+            poly_color = cmd->color;
+            poly_seen = 0;
+            poly_open = 1;
+            break;
+        case NW_STAR: {
+            /* `spikes` points alternating outer and inner radius, the first
+             * one straight up and turned by `f` degrees -- pyglet's Star. */
+            int spikes = (int)(cmd->e + 0.5f);
+            if (spikes < 2) break;
+            float base = cmd->f * 3.14159265358979323846f / 180.0f;
+            float step = 3.14159265358979323846f / (float)spikes;
+            float prev_x = 0.0f, prev_y = 0.0f;
+            for (int k = 0; k <= spikes * 2; k++) {
+                float radius = (k % 2 == 0) ? cmd->c : cmd->d;
+                float turn = base + (float)k * step;
+                float px = cmd->a + radius * SDL_sinf(turn);
+                float py = cmd->b + radius * SDL_cosf(turn);
+                if (k > 0) {
+                    fill_triangle(r, v, cmd->a, cmd->b, prev_x, prev_y, px, py,
+                                  cmd->color);
+                }
+                prev_x = px; prev_y = py;
+            }
+            break;
+        }
         case NW_POLY_POINT:
             if (poly_remaining > 0) {
-                if (poly_seen == 0) { poly_x0 = cmd->a; poly_y0 = cmd->b; }
-                else if (poly_seen >= 2) {
-                    fill_triangle(r, v, poly_x0, poly_y0, poly_prev_x, poly_prev_y,
-                                  cmd->a, cmd->b, poly_color);
+                if (poly_open) {
+                    if (poly_seen > 0) {
+                        set_color(r, poly_color);
+                        SDL_RenderLine(r, vx(v, poly_prev_x), vy(v, poly_prev_y),
+                                       vx(v, cmd->a), vy(v, cmd->b));
+                    }
+                } else {
+                    if (poly_seen == 0) { poly_x0 = cmd->a; poly_y0 = cmd->b; }
+                    else if (poly_seen >= 2) {
+                        fill_triangle(r, v, poly_x0, poly_y0, poly_prev_x, poly_prev_y,
+                                      cmd->a, cmd->b, poly_color);
+                    }
                 }
                 poly_prev_x = cmd->a; poly_prev_y = cmd->b;
                 poly_seen++;
-                if (--poly_remaining == 0) poly_seen = 0;
+                if (--poly_remaining == 0) { poly_seen = 0; poly_open = 0; }
             }
             break;
         case NW_TEXT: {

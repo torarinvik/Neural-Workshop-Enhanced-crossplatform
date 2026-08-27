@@ -62,6 +62,38 @@ sprites, 9 bordered rectangles, 8 boxes, 6 arcs, 3 triangles):
 `Rect` · `BorderedRect` · `Box` · `Circle` · `Arc` · `Line` · `Triangle` ·
 `Polygon` (points follow as `PolyPoint` records) · `Sprite` · `Text`
 
+Five later additions, each of them additive — a shell written before one of
+them either skips the tag or reads a zero where the new field is, and a zero is
+what it drew anyway:
+
+- **`SpriteFit`** — a sprite given a ROOM rather than a scale. Only the shell
+  has decoded the image, so only the shell can fit it.
+- **`MultiLine`** — the same header-and-`PolyPoint` shape as `Polygon`, drawn
+  as an open stroked run. `c` is the thickness; `a`, `b` repeat the first
+  point, because that is where pyglet puts the run's own origin.
+- **`Star`** — `c` outer radius, `d` inner, `e` spike count, `f` the angle of
+  the first point from straight up.
+- **`Rect`'s anchor and angle** — `e`, `f` are the anchor inside the rectangle
+  and `ref` carries the BITS of an f32 angle about it. Two screens use them
+  (a Lookout glyph, a Tetris piece in the air); every other rectangle leaves
+  all three at zero.
+- **`Text`'s weight** — `d` is 1 for bold. Every task screen's title asks for
+  bold, and a title back at normal weight is a different frame.
+
+`Sprite` also carries the decoded image's own pixel size in `d` and `f`. It is
+there because some screens scale BY it — Reflex sizes a target by
+`side / image.width` — so a core that did not know the width could not produce
+the scale. It is a fact about the FILE, not about the frame, so a shell must
+not rescale it with the viewport.
+
+**Rotation's sign is not yet pinned across shells.** What the core stores is
+pyglet's own `rotation`, which is clockwise, and that is what the differential
+harness compares. The pyglet shell negates a sprite's angle and the canvas
+shell does not; no screen in the workshop draws a rotated sprite, so nothing
+has ever told the two apart. A shell adding rotation should follow whatever its
+own sprite branch already does, and the day a rotated sprite appears, this is
+the paragraph that gets deleted and replaced by a test.
+
 Plus three non-drawing commands:
 
 - **`Verdict`** — the trial's outcome as data. `ref` carries the verdict code

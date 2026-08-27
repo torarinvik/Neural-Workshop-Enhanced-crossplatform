@@ -28,8 +28,16 @@ enum nw_kind {
     NW_RECT = 1, NW_BORDERED_RECT = 2, NW_BOX = 3, NW_CIRCLE = 4, NW_ARC = 5,
     NW_LINE = 6, NW_TRIANGLE = 7, NW_POLYGON = 8, NW_POLY_POINT = 9,
     NW_SPRITE = 10, NW_TEXT = 11, NW_VERDICT = 12, NW_SOUND = 13, NW_MARKER = 14,
-    NW_SPRITE_FIT = 15
+    NW_SPRITE_FIT = 15, NW_MULTILINE = 16, NW_STAR = 17
 };
+
+/* An f32 that rides in a u32 slot -- a rectangle's rotation. The bytes are the
+ * number; this is a reinterpret, not a conversion. */
+static inline float nw_bits_to_f32(uint32_t bits) {
+    float out;
+    memcpy(&out, &bits, 4);
+    return out;
+}
 
 typedef struct {
     uint8_t  kind;

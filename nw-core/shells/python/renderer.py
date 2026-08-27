@@ -171,6 +171,8 @@ def plan(commands: Sequence[Mapping[str, Any]], viewport: Viewport,
     polygon_color: Optional[int] = None
     polygon_remaining = 0
     polygon_points: List[Tuple[float, float]] = []
+    polygon_kind = "polygon"
+    polygon_thickness = 1.0
 
     for cmd in commands:
         kind = cmd["kind"]
@@ -180,6 +182,16 @@ def plan(commands: Sequence[Mapping[str, Any]], viewport: Viewport,
             ops.append(DrawOp("rect", {
                 "x": x, "y": y,
                 "width": viewport.length(cmd["w"]), "height": viewport.length(cmd["h"]),
+                # The anchor is a LENGTH inside the rectangle, so it scales
+                # with it; the angle is an angle and does not. Both are zero
+                # for all but two screens, and both are read straight rather
+                # than negated -- the recorder the ports were checked against
+                # compares `obj.rotation` as pyglet stores it. (The sprite
+                # branch below negates instead. No screen emits a rotated
+                # sprite, so nothing has ever told the two apart.)
+                "anchor_x": viewport.length(cmd.get("anchor_x", 0.0)),
+                "anchor_y": viewport.length(cmd.get("anchor_y", 0.0)),
+                "rotation": cmd.get("rotation", 0.0),
                 "color": rgba(cmd["color"]),
             }))
 
@@ -240,11 +252,13 @@ def plan(commands: Sequence[Mapping[str, Any]], viewport: Viewport,
                 "color": rgba(cmd["color"]),
             }))
 
-        elif kind == "polygon":
+        elif kind in ("polygon", "multiline"):
+            polygon_kind = kind
             polygon_color = cmd["color"]
             polygon_remaining = cmd["points"]
             polygon_points = []
-            if polygon_remaining <= 0:          # a zero-point polygon draws nothing
+            polygon_thickness = viewport.length(cmd.get("thickness", 1.0))
+            if polygon_remaining <= 0:          # a zero-point run draws nothing
                 polygon_color = None
 
         elif kind == "poly_point":
@@ -252,12 +266,24 @@ def plan(commands: Sequence[Mapping[str, Any]], viewport: Viewport,
                 polygon_points.append(viewport.point(cmd["x"], cmd["y"]))
                 polygon_remaining -= 1
                 if polygon_remaining <= 0:
-                    ops.append(DrawOp("polygon", {
-                        "coordinates": polygon_points,
-                        "color": rgba(polygon_color),
-                    }))
+                    fields = {"coordinates": polygon_points,
+                              "color": rgba(polygon_color)}
+                    if polygon_kind == "multiline":
+                        fields["thickness"] = polygon_thickness
+                    ops.append(DrawOp(polygon_kind, fields))
                     polygon_color = None
                     polygon_points = []
+
+        elif kind == "star":
+            x, y = viewport.point(cmd["x"], cmd["y"])
+            ops.append(DrawOp("star", {
+                "x": x, "y": y,
+                "outer_radius": viewport.length(cmd["outer"]),
+                "inner_radius": viewport.length(cmd["inner"]),
+                "num_spikes": cmd["spikes"],
+                "rotation": cmd["rotation"],
+                "color": rgba(cmd["color"]),
+            }))
 
         elif kind == "sprite":
             asset = cmd["asset"]
@@ -296,6 +322,7 @@ def plan(commands: Sequence[Mapping[str, Any]], viewport: Viewport,
                 "color": rgba(cmd["color"]),
                 "anchor_x": _ANCHOR_X.get(anchor_x, "left"),
                 "anchor_y": _ANCHOR_Y.get(anchor_y, "baseline"),
+                "bold": bool(cmd.get("bold", False)),
             }))
 
         elif kind == "verdict":
@@ -351,8 +378,19 @@ class PygletFactory:
 
     # -- primitives ---------------------------------------------------------
 
-    def _build_rect(self, batch, x, y, width, height, color):
-        return self.shapes.Rectangle(x, y, width, height, color=color, batch=batch)
+    def _build_rect(self, batch, x, y, width, height, color,
+                    anchor_x=0.0, anchor_y=0.0, rotation=0.0):
+        shape = self.shapes.Rectangle(x, y, width, height, color=color,
+                                      batch=batch)
+        # Set only when asked: pyglet recomputes the vertex list on each of
+        # these, and every rectangle in the workshop but two leaves them at
+        # zero.
+        if anchor_x or anchor_y:
+            shape.anchor_x = anchor_x
+            shape.anchor_y = anchor_y
+        if rotation:
+            shape.rotation = rotation
+        return shape
 
     def _build_bordered_rect(self, batch, x, y, width, height, border, color, border_color):
         # pyglet refuses a bordered rectangle whose fill and border alphas
@@ -386,6 +424,17 @@ class PygletFactory:
     def _build_polygon(self, batch, coordinates, color):
         return self.shapes.Polygon(*coordinates, color=color, batch=batch)
 
+    def _build_multiline(self, batch, coordinates, color, thickness):
+        flat = [one for point in coordinates for one in point]
+        return self.shapes.MultiLine(*flat, thickness=thickness, color=color,
+                                     batch=batch)
+
+    def _build_star(self, batch, x, y, outer_radius, inner_radius, num_spikes,
+                    rotation, color):
+        return self.shapes.Star(x, y, outer_radius, inner_radius,
+                                num_spikes=num_spikes, rotation=rotation,
+                                color=color, batch=batch)
+
     def _build_sprite(self, batch, asset, x, y, scale, rotation, color):
         image = self.assets.get(asset)
         if image is None:
@@ -412,9 +461,11 @@ class PygletFactory:
         scale = min(room_w / image.width, room_h / image.height)
         return self._build_sprite(batch, asset, x, y, scale, rotation, color)
 
-    def _build_text(self, batch, text, x, y, font_size, color, anchor_x, anchor_y):
+    def _build_text(self, batch, text, x, y, font_size, color, anchor_x, anchor_y,
+                    bold=False):
         return self.text.Label(text, x=x, y=y, font_size=font_size, color=color,
                                anchor_x=anchor_x, anchor_y=anchor_y,
+                               weight='bold' if bold else 'normal',
                                font_name=self.font_name, batch=batch)
 
 
