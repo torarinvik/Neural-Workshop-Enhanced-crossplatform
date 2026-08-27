@@ -262,9 +262,24 @@ def _label_cells(obj):
 
 
 def _sprite_cells(obj):
+    """A sprite's command cells: scale, rotation, and the image's own size.
+
+    The scale is divided down like a LENGTH and not left as pyglet has it.
+    A sprite's scale is a ratio of drawn pixels to image pixels, so a frame
+    captured at twice the reference size carries twice the scale, exactly as
+    it carries twice the width of a rectangle. Leaving it alone would put one
+    number of the command in pixel space while its position was in reference
+    space, and a shell reading the list back would draw every sprite at the
+    capture's own size.
+
+    The image's width and height are NOT divided: they are a fact about the
+    file rather than about the frame, and they are in the command because
+    Reflex scales by `side / image.width` -- a core that did not know the
+    width could not produce the scale.
+    """
     image = obj.image
     return [
-        _number(getattr(obj, "scale", 1.0)),
+        _number(getattr(obj, "scale", 1.0), 0),
         _number(getattr(obj, "rotation", 0.0)),
         str(getattr(image, "width", 0)), str(getattr(image, "height", 0)),
     ]
