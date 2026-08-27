@@ -1,0 +1,115 @@
+# Differential sweep driver for tasks/chess.elisa. See chess_diff.py for the
+# reference side.
+#
+# What is swept is the half of chess.py that does not touch chess: the level
+# dials, and the sort-take-a-half-and-draw that decides which of the sampled
+# positions a player actually sees. The candidates are scripted rather than
+# dealt, which is what lets `generate` run at all here -- `python-chess` is not
+# in this checkout, and the reference's own `_candidate` is stubbed on the
+# other side with the same script.
+#
+# The scripts deliberately include runs that deal NOTHING, because a rung that
+# samples sixty-four positions and finds no unique mate is the one path on
+# which nothing is drawn from the generator at all.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/tasks/chess.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+# A scripted run of candidates. -1 is `_candidate` returning None: a position
+# that came out illegal, in check, already over, or with no unique mate. It
+# costs an attempt and yields nothing.
+# Specs 24 to 26 are barren on purpose: one that never deals at all, so
+# `generate` raises and nothing is drawn from the generator; one that deals a
+# single candidate on the very last attempt; and one that deals three, which is
+# fewer than the top rungs ask for.
+def scripted(spec: i64, index: i64) -> i64:
+    return -1 if spec == 24
+    if spec == 25:
+        return 5 if index >= 63
+        return -1
+    if spec == 26:
+        return -1 if index < 61
+        return 7 if index < 63
+        return 4
+    step: i64 = (index * 7 + spec * 5) % 11
+    return -1 if step < spec % 4
+    return 3 + (index * 13 + spec * 3) % 9
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(4 * 1024 * 1024)
+        in w:
+            for level in -2..<14:
+                printr("dials")
+                emit_cell(level)
+                emit_cell(Chess::clamp_level(level))
+                emit_cell(Chess::candidates_wanted(level))
+                emit_cell(Chess::decoys_wanted(level))
+                emit_cell(Chess::decoy_attempts(level))
+                print("")
+
+            ids: mutable darray[i64] = Ints::zeros(Chess::MOST_CANDIDATES)
+            alternatives: mutable darray[i64] = Ints::zeros(Chess::MOST_CANDIDATES)
+            for spec in 0..<27 |ids, alternatives|:
+                for level in 1..<11 |ids, alternatives, spec|:
+                    for seed in 1..<4 |ids, alternatives, spec, level|:
+                        rng: mutable MT19937 = mt19937_new()
+                        mt_seed_int(&rng, (spec * 100 + level * 10 + seed).u64())
+                        wanted: i64 = Chess::candidates_wanted(level)
+                        found: mutable i64 = 0
+                        attempts: mutable i64 = 0
+                        while found < wanted and attempts < Chess::MOST_ATTEMPTS |found, attempts, ids, alternatives, spec, wanted|:
+                            drawn: i64 = scripted(spec, attempts)
+                            attempts <- attempts + 1
+                            continue if drawn < 0
+                            Ints::put(&ids, found, attempts - 1)
+                            Ints::put(&alternatives, found, drawn)
+                            found <- found + 1
+                        density: mutable i64 = -1
+                        chosen: i64 = Chess::select(&ids, &alternatives, found, level, &rng)
+                        for at in 0..<found |ids, alternatives, chosen, density|:
+                            density <- Ints::at_ref(&alternatives, at) if Ints::at_ref(&ids, at) == chosen
+                        printr("select")
+                        emit_cell(spec)
+                        emit_cell(level)
+                        emit_cell(seed)
+                        emit_cell(chosen)
+                        emit_cell(density)
+                        emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                        print("")
+        destroy w
+        return 0
