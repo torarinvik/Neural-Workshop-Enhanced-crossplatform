@@ -1,0 +1,305 @@
+# Differential sweep driver for tasks/graphmapping.elisa. See
+# graphmapping_diff.py for the reference side.
+#
+# Five things are under test and they fail in different ways, so they are swept
+# apart: the density dials, the graph arithmetic on hand-made graphs with no
+# randomness in them at all, the random graph and the two rewirings, the pair a
+# trial shows, and the run around it.
+#
+# Every section that touches the generator ends in a probe draw, because a port
+# that gets the same ANSWER off a different number of draws is a port that will
+# diverge on the next trial rather than on this one.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/geometry.elisa"
+include "../src/verdict.elisa"
+include "../src/tasks/graphmapping.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+def emit_float(value: f64):
+    can Console.Write, Abort.Panic:
+        emit_cell(py_round_half_even(value * 1000000.0))
+
+def emit_edges(graph: mutable GraphMapping::Graph&):
+    can Console.Write, Abort.Panic:
+        for at in 0..<graph.count |graph|:
+            emit_cell(Ints::at_ref(&graph.edges, at))
+
+# A graph with no randomness in it, for the arithmetic on its own.
+def hand_made(out: mutable GraphMapping::Graph&, size: i64, pattern: i64):
+    can Abort.Panic:
+        out.size <- size
+        out.count <- 0
+        for first in 0..<size |out, size, pattern|:
+            for second in (first + 1)..<size |out, first, pattern|:
+                continue if ((first * 3 + second * 5 + pattern * 7) % (pattern + 3)) != 0
+                Ints::put(&out.edges, out.count, GraphMapping::edge(first, second))
+                out.count <- out.count + 1
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(256 * 1024 * 1024)
+        in w:
+            bench: mutable GraphMapping::Bench = GraphMapping::new_bench()
+            probe: mutable GraphMapping::Probe = GraphMapping::new_probe()
+            base: mutable GraphMapping::Graph = GraphMapping::new_graph()
+            other: mutable GraphMapping::Graph = GraphMapping::new_graph()
+            spare: mutable GraphMapping::Graph = GraphMapping::new_graph()
+            pair: mutable GraphMapping::Pair = GraphMapping::new_pair()
+            naming: mutable darray[i64] = Ints::zeros(GraphMapping::MAX_NODES)
+            degree: mutable darray[i64] = Ints::zeros(GraphMapping::MAX_NODES)
+            near: mutable darray[i64] = Ints::zeros(GraphMapping::MAX_NODES)
+            ring_x: mutable darray[f64] = Floats::zeros(GraphMapping::MAX_NODES)
+            ring_y: mutable darray[f64] = Floats::zeros(GraphMapping::MAX_NODES)
+            second_x: mutable darray[f64] = Floats::zeros(GraphMapping::MAX_NODES)
+            second_y: mutable darray[f64] = Floats::zeros(GraphMapping::MAX_NODES)
+
+            # --- the density dials ----------------------------------------
+            for which in -1..<4:
+                printr("density")
+                emit_cell(which)
+                emit_float(GraphMapping::density_factor(which))
+                emit_cell(GraphMapping::subtle_floor(which))
+                for size in GraphMapping::MIN_NODES..<(GraphMapping::MAX_NODES + 1) |which|:
+                    emit_cell(GraphMapping::edge_count(size, which))
+                print("")
+
+            # --- the arithmetic, with no generator in it ------------------
+            for size in 4..<9 |base, other, spare, probe, naming, degree, near|:
+                for pattern in 0..<6 |base, other, spare, probe, naming, degree, near, size|:
+                    hand_made(&base, size, pattern)
+                    for node in 0..<size |naming, pattern, size|:
+                        Ints::put(naming, node, (node + pattern) % size)
+                    GraphMapping::relabel(&other, &base, naming)
+                    for node in 0..<size |naming, size|:
+                        Ints::put(naming, node, size - 1 - node)
+                    GraphMapping::relabel(&spare, &base, naming)
+                    printr("graph")
+                    emit_cell(size)
+                    emit_cell(pattern)
+                    emit_cell(base.count)
+                    emit_cell(1 if GraphMapping::connected(&base, probe) else 0)
+                    emit_cell(1 if GraphMapping::isomorphic(&base, &other, probe) else 0)
+                    emit_cell(1 if GraphMapping::isomorphic(&base, &spare, probe) else 0)
+                    hand_made(&other, size, pattern + 1)
+                    emit_cell(1 if GraphMapping::isomorphic(&base, &other, probe) else 0)
+                    GraphMapping::degrees(&base, near, degree)
+                    for node in 0..<size |degree|:
+                        emit_cell(Ints::at_ref(degree, node))
+                    emit_edges(&base)
+                    print("")
+
+            # --- the random graph and the two rewirings -------------------
+            for size in 4..<13 |bench, probe, base, other, spare|:
+                for which in 0..<3 |bench, probe, base, other, spare, size|:
+                    lines: i64 = GraphMapping::edge_count(size, which)
+                    for seed in 1..<4 |bench, probe, base, other, spare, size, which, lines|:
+                        rng: mutable MT19937 = mt19937_new()
+                        mt_seed_int(&rng, (size * 100 + which * 10 + seed).u64())
+                        GraphMapping::random_graph(&base, bench, size, lines, &rng)
+                        printr("random")
+                        emit_cell(size)
+                        emit_cell(which)
+                        emit_cell(seed)
+                        emit_cell(lines)
+                        emit_cell(base.count)
+                        emit_cell(1 if GraphMapping::connected(&base, probe) else 0)
+                        emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                        emit_edges(&base)
+                        print("")
+
+                        swapped: bool = GraphMapping::swap_partners(&other, bench, &base, &rng)
+                        moved: bool = GraphMapping::move_a_line(&spare, bench, &base, &rng)
+                        printr("rewire")
+                        emit_cell(size)
+                        emit_cell(which)
+                        emit_cell(seed)
+                        emit_cell(other.count if swapped else -1)
+                        emit_cell(spare.count if moved else -1)
+                        emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                        if swapped:
+                            emit_edges(&other)
+                        emit_cell(-1)
+                        if moved:
+                            emit_edges(&spare)
+                        print("")
+
+                        kept: bool = GraphMapping::rewired(&other, bench, probe, &base, true, &rng)
+                        free: bool = GraphMapping::rewired(&spare, bench, probe, &base, false, &rng)
+                        printr("rewired")
+                        emit_cell(size)
+                        emit_cell(which)
+                        emit_cell(seed)
+                        emit_cell(other.count if kept else -1)
+                        emit_cell(spare.count if free else -1)
+                        emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                        if kept:
+                            emit_edges(&other)
+                        emit_cell(-1)
+                        if free:
+                            emit_edges(&spare)
+                        print("")
+
+            # --- the pair a trial shows -----------------------------------
+            for size in 4..<11 |bench, probe, base, other, pair|:
+                for which in 0..<3 |bench, probe, base, other, pair, size|:
+                    lines: i64 = GraphMapping::edge_count(size, which)
+                    for subtle_at in 0..<2 |bench, probe, base, other, pair, size, which, lines|:
+                        subtle: bool = subtle_at == 1
+                        for same_at in 0..<2 |bench, probe, base, other, pair, size, which, lines, subtle, subtle_at|:
+                            same: bool = same_at == 1
+                            for seed in 1..<3 |bench, probe, base, other, pair, size, which, lines, subtle, subtle_at, same, same_at|:
+                                rng: mutable MT19937 = mt19937_new()
+                                mt_seed_int(&rng, (size * 1000 + which * 100 + (2 if subtle else 0) + (4 if same else 0) + seed * 10).u64())
+                                GraphMapping::build_pair(pair, bench, probe, &base, &other, size, lines, same, subtle, &rng)
+                                printr("pair")
+                                emit_cell(size)
+                                emit_cell(which)
+                                emit_cell(subtle_at)
+                                emit_cell(same_at)
+                                emit_cell(seed)
+                                emit_cell(1 if pair.same else 0)
+                                emit_cell(1 if pair.subtle else 0)
+                                emit_cell(pair.first.count)
+                                emit_cell(pair.second.count)
+                                emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                                emit_edges(&pair.first)
+                                emit_cell(-1)
+                                emit_edges(&pair.second)
+                                print("")
+
+            # --- the ring the nodes are laid out on -----------------------
+            for size in 4..<13 |naming, ring_x, ring_y|:
+                for seed in 1..<4 |naming, ring_x, ring_y, size|:
+                    rng: mutable MT19937 = mt19937_new()
+                    mt_seed_int(&rng, (size * 7 + seed).u64())
+                    GraphMapping::ring_positions(ring_x, ring_y, naming, size, &rng)
+                    printr("ring")
+                    emit_cell(size)
+                    emit_cell(seed)
+                    emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                    for node in 0..<size |ring_x, ring_y|:
+                        emit_float(Floats::at_ref(ring_x, node))
+                        emit_float(Floats::at_ref(ring_y, node))
+                    print("")
+
+            # --- the run ---------------------------------------------------
+            for spec in 0..<12 |bench, probe, base, other, pair, ring_x, ring_y, second_x, second_y|:
+                rng: mutable MT19937 = mt19937_new()
+                mt_seed_int(&rng, (4000 + spec).u64())
+                task: mutable GraphMapping::Task = GraphMapping::new_task()
+                task.start_nodes <- 4 + spec % 5
+                task.density <- spec % 3
+                task.total_trials <- 4 + spec % 3
+                task.subtle <- (spec % 2) == 0
+                # No exposure, one a tick crosses on its own, one that needs a
+                # skipped tick to cross, and one that never runs out -- so
+                # `hidden` is reached both ways and not reached at all.
+                exposure: mutable i64 = 0
+                exposure <- 300 if spec % 4 == 1
+                exposure <- 700 if spec % 4 == 2
+                exposure <- 1500 if spec % 4 == 3
+                task.exposure_ms <- exposure
+                task.adaptive <- (spec % 3) != 2
+                task.feedback <- (spec % 5) == 0
+                GraphMapping::read_options(task)
+                clock: mutable f64 = 0.0
+                GraphMapping::reset(task)
+                task.nodes <- GraphMapping::clamped(task, task.start_nodes)
+                GraphMapping::next_trial(task, pair, bench, probe, &base, &other,
+                                         ring_x, ring_y, second_x, second_y, clock, &rng)
+                guard: mutable i64 = 0
+                while task.phase != GraphMapping::DONE and guard < 200 |task, pair, bench, probe, base, other, ring_x, ring_y, second_x, second_y, clock, guard, spec, rng|:
+                    guard <- guard + 1
+                    clock <- clock + 0.35
+                    GraphMapping::tick(task, pair, bench, probe, &base, &other,
+                                       ring_x, ring_y, second_x, second_y, clock, &rng)
+                    # Every fifth tick is left unanswered, so a rung with an
+                    # exposure runs out of it and the question survives into
+                    # `hidden` -- which `answer` still takes.
+                    if (task.phase == GraphMapping::ASKING or task.phase == GraphMapping::HIDDEN) and guard % 5 != 0:
+                        choice: i64 = GraphMapping::SAME if (guard + spec) % 3 != 0 else GraphMapping::DIFFERENT
+                        GraphMapping::answer(task, pair, bench, probe, &base, &other,
+                                             ring_x, ring_y, second_x, second_y, choice, clock, &rng)
+                tally: GraphMapping::Score = GraphMapping::score(task)
+                printr("run")
+                emit_cell(spec)
+                emit_cell(GraphMapping::floor(task))
+                emit_cell(task.nodes)
+                emit_cell(task.trial)
+                emit_cell(task.correct)
+                emit_cell(task.settled_for)
+                emit_cell(task.phase)
+                emit_cell(tally.trials)
+                emit_cell(tally.accuracy)
+                emit_cell(tally.same_total)
+                emit_cell(tally.same_right)
+                emit_cell(tally.different_total)
+                emit_cell(tally.different_right)
+                emit_float(tally.mean_seconds)
+                emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                print("")
+
+            # --- the layout ------------------------------------------------
+            for spot in 0..<4:
+                width: f64 = 912.0 if spot == 0 else (1280.0 if spot == 1 else (640.0 if spot == 2 else 1920.0))
+                height: f64 = 684.0 if spot == 0 else (720.0 if spot == 1 else (480.0 if spot == 2 else 1080.0))
+                printr("layout")
+                emit_cell(width.i64())
+                emit_cell(height.i64())
+                emit_float(GraphMapping::canvas_left(width))
+                emit_float(GraphMapping::canvas_bottom(width, height))
+                emit_float(GraphMapping::canvas_width(width))
+                emit_float(GraphMapping::canvas_height(width, height))
+                for panel in 0..<2 |width, height|:
+                    emit_float(GraphMapping::panel_centre_x(width, height, panel))
+                    emit_float(GraphMapping::panel_centre_y(width, height))
+                    emit_float(GraphMapping::panel_side(width, height))
+                for button in 0..<2 |width, height|:
+                    gap: f64 = width * 0.04
+                    emit_float(GraphMapping::button_left(width) + button.f64() * (GraphMapping::button_width(width) + gap))
+                    emit_float(GraphMapping::button_bottom(height))
+                    emit_float(GraphMapping::button_width(width))
+                    emit_float(GraphMapping::button_height(height))
+                for panel in 0..<2 |width, height|:
+                    for point in 0..<3 |width, height, panel|:
+                        px: f64 = 0.0 if point == 0 else (0.5 if point == 1 else 1.0)
+                        py: f64 = 0.0 if point == 0 else (0.5 if point == 1 else 0.25)
+                        emit_float(GraphMapping::to_pixels_x(width, height, panel, px))
+                        emit_float(GraphMapping::to_pixels_y(width, height, py))
+                print("")
+        destroy w
+        return 0

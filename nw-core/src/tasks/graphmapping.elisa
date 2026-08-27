@@ -1,0 +1,787 @@
+# Graph Mapping: are these two networks the same one, redrawn?
+#
+# Port of the portable half of neural_workshop/ui/graphmapping.py
+# (GPL-2.0-or-later). The drawing is the shell's; what is here is the graph
+# arithmetic, the pair the trial shows, the ring the nodes are laid out on,
+# and the run around them.
+#
+# Nothing is labelled, on purpose, so the answer has to come from the
+# relations. The two ways a pair can differ ask for different work: connection
+# counts that differ can be tallied and are always decisive, and counts that
+# AGREE while the networks still do not (`subtle`) leave tallying with nothing
+# to say and the structure has to be walked.
+#
+# The count-keeping kind runs out at the bottom of the range -- at four dots,
+# and at five once there are more than six lines, every profile of connection
+# counts describes exactly one network -- so asking for it holds the size up to
+# `subtle_floor`. Above the floor a partner usually exists but not for every
+# base graph, which is why a base that cannot be rewired is REPLACED rather
+# than settled for.
+#
+# Every set in the reference is used for membership, length, or a result that
+# is sorted before it leaves -- `sorted(edges)`, `sorted(present)`, `len({...})`
+# -- so nothing here depends on Python's set iteration order. The one place it
+# is walked at all is `connected`, where reachability does not care. That is
+# what makes this module portable at all, and it was checked rather than
+# assumed.
+
+extern cos(x: f64) -> f64
+extern sin(x: f64) -> f64
+
+module GraphMapping:
+
+    # The two answers.
+    const SAME: i64 = 0
+    const DIFFERENT: i64 = 1
+
+    # Most nodes a trial will ever show, however well the player does.
+    const MAX_NODES: i64 = 16
+
+    # Fewest, so a wrong answer cannot make the task trivial.
+    const MIN_NODES: i64 = 4
+
+    # Edges are held as `low * MAX_NODES + high`, which sorts exactly the way
+    # the reference's `(low, high)` tuples do, so there are this many codes.
+    const EDGE_CODES: i64 = MAX_NODES * MAX_NODES
+
+    # Most edges any graph here can hold: every pair at the largest size.
+    const MAX_EDGES: i64 = MAX_NODES * (MAX_NODES - 1) / 2
+
+    # Density ids. Anything else is the reference's dict default, which is
+    # `1.4` lines per node and a floor of six -- `DENSITY_FACTORS.get(density,
+    # 1.4)` and `SUBTLE_FLOOR.get(density, 6)` both fall back rather than
+    # raise, and a run reaching them is a run with an unknown density name.
+    const SPARSE: i64 = 0
+    const MEDIUM: i64 = 1
+    const DENSE: i64 = 2
+
+    # Never fill in more than this share of the connections a graph could have.
+    # A nearly complete graph is both unreadable and almost always isomorphic
+    # to any other, so there is nothing to decide.
+    const MAX_FILL: f64 = 0.6
+
+    # How hard to try before settling for an easier mismatch.
+    const REWIRE_ATTEMPTS: i64 = 200
+
+    # How many fresh base graphs to try before giving up on a mismatch.
+    # Whether a mismatch of the kind asked for exists at all depends on the
+    # base graph and not only on its size: at six dots and a dense graph only
+    # four of the nine networks have a partner that keeps every count.
+    const BASE_ATTEMPTS: i64 = 20
+
+    # math.tau, to the bit.
+    const TAU: f64 = 6.283185307179586
+
+    # Phases. `hidden` is the exposure running out with the question still up.
+    const READY: i64 = 0
+    const ASKING: i64 = 1
+    const HIDDEN: i64 = 2
+    const FEEDBACK: i64 = 3
+    const DONE: i64 = 4
+
+    # Lines per node, by density.
+    def density_factor(density: i64) -> f64:
+        return 1.1 if density == SPARSE
+        return 1.8 if density == DENSE
+        return 1.4
+
+    # Fewest dots at which a mismatch can keep every count.
+    #
+    # Below this there is no second network to reach: every profile of
+    # connection counts describes exactly one network, so the count-keeping
+    # mismatch is not merely hard to find but absent.
+    def subtle_floor(density: i64) -> i64:
+        floor: i64 = 5 if density == SPARSE else 6
+        return MIN_NODES if MIN_NODES > floor else floor
+
+    # --- graphs -----------------------------------------------------------
+
+    # A simple undirected graph: `size` nodes numbered from zero, and `count`
+    # edge codes held in ascending order, so two graphs holding the same
+    # connections compare equal whatever order they were built in.
+    struct Graph:
+        size: mutable i64
+        count: mutable i64
+        edges: mutable darray[i64]
+
+    def new_graph() -> Graph:
+        can Memory.Allocate, Abort.Panic:
+            return Graph{size: 0, count: 0, edges: Ints::zeros(MAX_EDGES)}
+
+    def copy_graph(out: mutable Graph&, source: mutable Graph&):
+        can Abort.Panic:
+            out.size <- source.size
+            out.count <- source.count
+            for at in 0..<source.count |out, source|:
+                Ints::put(&out.edges, at, Ints::at_ref(&source.edges, at))
+
+    # The canonical form of the edge between two nodes.
+    def edge(first: i64, second: i64) -> i64:
+        return first * MAX_NODES + second if first < second
+        return second * MAX_NODES + first
+
+    def edge_low(code: i64) -> i64:
+        return code / MAX_NODES
+
+    def edge_high(code: i64) -> i64:
+        return code % MAX_NODES
+
+    # Each node's neighbours, as a bit per node.
+    #
+    # A bitmask rather than the reference's `List[Set[int]]` because every use
+    # it is put to here is membership, a count, or a walk whose answer does not
+    # depend on the order -- see the module note.
+    def adjacency(graph: mutable Graph&, near: mutable darray[i64]&):
+        can Abort.Panic:
+            for node in 0..<graph.size |near|:
+                Ints::put(near, node, 0)
+            for at in 0..<graph.count |graph, near|:
+                code: i64 = Ints::at_ref(&graph.edges, at)
+                first: i64 = edge_low(code)
+                second: i64 = edge_high(code)
+                Ints::put(near, first, Ints::at_ref(near, first) | (1 << second.u64()))
+                Ints::put(near, second, Ints::at_ref(near, second) | (1 << first.u64()))
+
+    def bit_count(mask: i64) -> i64:
+        left: mutable i64 = mask
+        total: mutable i64 = 0
+        while left != 0 |left, total|:
+            total <- total + (left & 1)
+            left <- left >> 1.u64()
+        return total
+
+    # How many lines meet each node, in node order.
+    def degrees(graph: mutable Graph&, near: mutable darray[i64]&, out: mutable darray[i64]&):
+        can Abort.Panic:
+            adjacency(graph, near)
+            for node in 0..<graph.size |near, out|:
+                Ints::put(out, node, bit_count(Ints::at_ref(near, node)))
+
+    # True when every node can be reached from node zero.
+    def connected(graph: mutable Graph&, probe: mutable Probe&) -> bool:
+        can Abort.Panic:
+            true return if graph.size <= 1
+            near: mutable darray[i64]& = &probe.near
+            frontier: mutable darray[i64]& = &probe.frontier
+            adjacency(graph, near)
+            seen: mutable i64 = 1
+            Ints::put(frontier, 0, 0)
+            depth: mutable i64 = 1
+            reached: mutable i64 = 1
+            while depth > 0 |depth, seen, reached, frontier, near, graph|:
+                depth <- depth - 1
+                node: i64 = Ints::at_ref(frontier, depth)
+                mask: i64 = Ints::at_ref(near, node)
+                for other in 0..<graph.size |mask, seen, depth, reached, frontier|:
+                    continue if (mask & (1 << other.u64())) == 0
+                    continue if (seen & (1 << other.u64())) != 0
+                    seen <- seen | (1 << other.u64())
+                    reached <- reached + 1
+                    Ints::put(frontier, depth, other)
+                    depth <- depth + 1
+            return reached == graph.size
+
+    # True when `first` can be relabelled into `second`.
+    #
+    # Cheap invariants first -- node count, line count, then the sorted degrees
+    # -- and only when those all agree does it search for an actual mapping.
+    # The search assigns the busiest nodes first and keeps every pair already
+    # assigned consistent, which settles the sizes this task uses long before
+    # the factorial matters.
+    # The scratch every question asked ABOUT a graph writes into: reachability
+    # and the isomorphism search. Separate from `Bench`, which is the scratch
+    # graphs are BUILT in, because one call needs both at once.
+    struct Probe:
+        near: mutable darray[i64]
+        frontier: mutable darray[i64]
+        left: mutable darray[i64]
+        right: mutable darray[i64]
+        left_degree: mutable darray[i64]
+        right_degree: mutable darray[i64]
+        sorted_left: mutable darray[i64]
+        sorted_right: mutable darray[i64]
+        order: mutable darray[i64]
+        mapping: mutable darray[i64]
+        placed: mutable darray[i64]
+        taken: mutable i64
+        size: mutable i64
+
+    def new_probe() -> Probe:
+        can Memory.Allocate, Abort.Panic:
+            return Probe{near: Ints::zeros(MAX_NODES), frontier: Ints::zeros(MAX_NODES),
+                         left: Ints::zeros(MAX_NODES), right: Ints::zeros(MAX_NODES),
+                         left_degree: Ints::zeros(MAX_NODES), right_degree: Ints::zeros(MAX_NODES),
+                         sorted_left: Ints::zeros(MAX_NODES), sorted_right: Ints::zeros(MAX_NODES),
+                         order: Ints::zeros(MAX_NODES), mapping: Ints::zeros(MAX_NODES),
+                         placed: Ints::zeros(MAX_NODES), taken: 0, size: 0}
+
+    def extend(work: mutable Probe&, index: i64) -> bool:
+        can Abort.Panic:
+            true return if index == work.size
+            node: i64 = Ints::at_ref(&work.order, index)
+            want: i64 = Ints::at_ref(&work.left_degree, node)
+            for candidate in 0..<work.size |work, node, want, index|:
+                continue if (work.taken & (1 << candidate.u64())) != 0
+                continue if Ints::at_ref(&work.right_degree, candidate) != want
+                # Every node already placed must agree about this one.
+                agrees: mutable bool = true
+                for other in 0..<work.size |work, node, candidate, agrees|:
+                    continue if Ints::at_ref(&work.placed, other) == 0
+                    image: i64 = Ints::at_ref(&work.mapping, other)
+                    near_left: bool = (Ints::at_ref(&work.left, node) & (1 << other.u64())) != 0
+                    near_right: bool = (Ints::at_ref(&work.right, candidate) & (1 << image.u64())) != 0
+                    agrees <- false if near_left != near_right
+                continue if not agrees
+                Ints::put(&work.mapping, node, candidate)
+                Ints::put(&work.placed, node, 1)
+                work.taken <- work.taken | (1 << candidate.u64())
+                true return if extend(work, index + 1)
+                Ints::put(&work.placed, node, 0)
+                work.taken <- work.taken & ~(1 << candidate.u64())
+            return false
+
+    def isomorphic(first: mutable Graph&, second: mutable Graph&, work: mutable Probe&) -> bool:
+        can Abort.Panic:
+            false return if first.size != second.size or first.count != second.count
+            degrees(first, &work.left, &work.left_degree)
+            degrees(second, &work.right, &work.right_degree)
+            for node in 0..<first.size |work|:
+                Ints::put(&work.sorted_left, node, Ints::at_ref(&work.left_degree, node))
+                Ints::put(&work.sorted_right, node, Ints::at_ref(&work.right_degree, node))
+            Ints::sort_prefix(&work.sorted_left, first.size)
+            Ints::sort_prefix(&work.sorted_right, second.size)
+            for node in 0..<first.size |work|:
+                false return if Ints::at_ref(&work.sorted_left, node) != Ints::at_ref(&work.sorted_right, node)
+            # `sorted(range(size), key=lambda node: -len(left[node]))`, which is
+            # STABLE: nodes of equal degree keep their numbering.
+            for node in 0..<first.size |work|:
+                Ints::put(&work.order, node, node)
+            for index in 1..<first.size |work|:
+                node: i64 = Ints::at_ref(&work.order, index)
+                key: i64 = 0 - Ints::at_ref(&work.left_degree, node)
+                at: mutable i64 = index - 1
+                placing: mutable bool = true
+                while placing and at >= 0 |work, at, placing, key|:
+                    held: i64 = Ints::at_ref(&work.order, at)
+                    if (0 - Ints::at_ref(&work.left_degree, held)) > key:
+                        Ints::put(&work.order, at + 1, held)
+                        at <- at - 1
+                    else:
+                        placing <- false
+                Ints::put(&work.order, at + 1, node)
+            for node in 0..<first.size |work|:
+                Ints::put(&work.placed, node, 0)
+            work.taken <- 0
+            work.size <- first.size
+            return extend(work, 0)
+
+    # `graph` with node `i` renamed to `naming[i]`.
+    def relabel(out: mutable Graph&, graph: mutable Graph&, naming: mutable darray[i64]&):
+        can Abort.Panic:
+            out.size <- graph.size
+            out.count <- graph.count
+            for at in 0..<graph.count |out, graph, naming|:
+                code: i64 = Ints::at_ref(&graph.edges, at)
+                Ints::put(&out.edges, at, edge(Ints::at_ref(naming, edge_low(code)),
+                                               Ints::at_ref(naming, edge_high(code))))
+            Ints::sort_prefix(&out.edges, out.count)
+
+    # `graph` with its nodes renamed at random.
+    def shuffled(out: mutable Graph&, graph: mutable Graph&, naming: mutable darray[i64]&, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            for node in 0..<graph.size |naming|:
+                Ints::put(naming, node, node)
+            py_shuffle_i64_prefix(rng, naming, graph.size)
+            relabel(out, graph, naming)
+
+    # How many lines a graph of `size` nodes gets at `density`. Never fewer
+    # than it takes to connect every node, and never more than `MAX_FILL` of
+    # the connections available.
+    def edge_count(size: i64, density: i64) -> i64:
+        can Abort.Panic:
+            tree: i64 = 0 if size - 1 < 0 else size - 1
+            room: i64 = size * (size - 1) / 2 - tree
+            wanted: i64 = py_round_half_even(size.f64() * density_factor(density))
+            ceiling: i64 = tree + (room.f64() * MAX_FILL).i64()
+            held: i64 = wanted if wanted < ceiling else ceiling
+            return tree if tree > held else held
+
+    # --- building a pair --------------------------------------------------
+
+    # The scratch a graph is BUILT in, so a trial allocates nothing.
+    struct Bench:
+        present: mutable darray[i64]
+        spare: mutable darray[i64]
+        naming: mutable darray[i64]
+
+    def new_bench() -> Bench:
+        can Memory.Allocate, Abort.Panic:
+            return Bench{present: Ints::zeros(EDGE_CODES), spare: Ints::zeros(MAX_EDGES),
+                         naming: Ints::zeros(MAX_NODES)}
+
+    # Collect the graph's edge codes into the `present` flag table.
+    def mark_present(bench: mutable Bench&, graph: mutable Graph&):
+        can Abort.Panic:
+            for code in 0..<EDGE_CODES |bench|:
+                Ints::put(&bench.present, code, 0)
+            for at in 0..<graph.count |bench, graph|:
+                Ints::put(&bench.present, Ints::at_ref(&graph.edges, at), 1)
+
+    # Read the `present` flags back out as a sorted edge list, which is what
+    # `tuple(sorted(present))` is.
+    def gather_present(bench: mutable Bench&, out: mutable Graph&, size: i64):
+        can Abort.Panic:
+            out.size <- size
+            out.count <- 0
+            for code in 0..<EDGE_CODES |bench, out|:
+                continue if Ints::at_ref(&bench.present, code) == 0
+                Ints::put(&out.edges, out.count, code)
+                out.count <- out.count + 1
+
+    # A connected graph with `size` nodes and `lines` lines.
+    #
+    # Built as a random spanning tree plus extra connections, so it is
+    # connected by construction -- a graph in loose pieces reads as a mistake
+    # rather than as a puzzle.
+    def random_graph(out: mutable Graph&, bench: mutable Bench&, size: i64, lines: i64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            for code in 0..<EDGE_CODES |bench|:
+                Ints::put(&bench.present, code, 0)
+            for node in 0..<size |bench|:
+                Ints::put(&bench.naming, node, node)
+            py_shuffle_i64_prefix(rng, &bench.naming, size)
+            # The tree's `size - 1` edges are all distinct: for two different
+            # `index` the higher endpoint differs, so the set comprehension
+            # never collapses one and the count is exact.
+            held: mutable i64 = 0
+            for index in 1..<size |bench, held, rng|:
+                back: i64 = py_randrange(rng, 0, index)
+                Ints::put(&bench.present, edge(Ints::at_ref(&bench.naming, index),
+                                               Ints::at_ref(&bench.naming, back)), 1)
+                held <- held + 1
+            spare_n: mutable i64 = 0
+            for first in 0..<size |bench, spare_n, size|:
+                for second in (first + 1)..<size |bench, spare_n, first|:
+                    code: i64 = edge(first, second)
+                    continue if Ints::at_ref(&bench.present, code) != 0
+                    Ints::put(&bench.spare, spare_n, code)
+                    spare_n <- spare_n + 1
+            py_shuffle_i64_prefix(rng, &bench.spare, spare_n)
+            extra: mutable i64 = lines - held
+            extra <- 0 if extra < 0
+            extra <- spare_n if extra > spare_n
+            for at in 0..<extra |bench|:
+                Ints::put(&bench.present, Ints::at_ref(&bench.spare, at), 1)
+            gather_present(bench, out, size)
+
+    # Cross two lines over, which leaves every node's count alone.
+    #
+    # Taking `a-b` and `c-d` to `a-d` and `c-b` moves connections around
+    # without changing how many meet any node, so the result can only be told
+    # from the original by its shape. False when this draw had nowhere to go.
+    def swap_partners(out: mutable Graph&, bench: mutable Bench&, graph: mutable Graph&, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            false return if graph.count < 2
+            mark_present(bench, graph)
+            picks: darray[i64] = py_sample_range(rng, 0, graph.count - 1, 2)
+            going: i64 = Ints::at(picks, 0)
+            leaving: i64 = Ints::at(picks, 1)
+            going_code: i64 = Ints::at_ref(&graph.edges, going)
+            leaving_code: i64 = Ints::at_ref(&graph.edges, leaving)
+            first: i64 = edge_low(going_code)
+            second: i64 = edge_high(going_code)
+            third: mutable i64 = edge_low(leaving_code)
+            fourth: mutable i64 = edge_high(leaving_code)
+            # Both ways of reconnecting the four ends are worth trying; only
+            # the ends are swapped, never the edges being taken out, which are
+            # removed by the canonical form they were stored under. The draw is
+            # taken whatever happens next, so the stream does not depend on it.
+            swap: bool = py_random(rng) < 0.5
+            if swap:
+                held: i64 = third
+                third <- fourth
+                fourth <- held
+            distinct: mutable i64 = 0
+            distinct <- distinct | (1 << first.u64())
+            distinct <- distinct | (1 << second.u64())
+            distinct <- distinct | (1 << third.u64())
+            distinct <- distinct | (1 << fourth.u64())
+            false return if bit_count(distinct) < 4
+            fresh_one: i64 = edge(first, fourth)
+            fresh_two: i64 = edge(third, second)
+            false return if Ints::at_ref(&bench.present, fresh_one) != 0
+            false return if Ints::at_ref(&bench.present, fresh_two) != 0
+            Ints::put(&bench.present, going_code, 0)
+            Ints::put(&bench.present, leaving_code, 0)
+            Ints::put(&bench.present, fresh_one, 1)
+            Ints::put(&bench.present, fresh_two, 1)
+            gather_present(bench, out, graph.size)
+            return true
+
+    # Move one line somewhere else, which does change the counts. The number of
+    # lines stays put, so the two panels still cannot be told apart by counting
+    # them.
+    def move_a_line(out: mutable Graph&, bench: mutable Bench&, graph: mutable Graph&, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            mark_present(bench, graph)
+            spare_n: mutable i64 = 0
+            for first in 0..<graph.size |bench, spare_n, graph|:
+                for second in (first + 1)..<graph.size |bench, spare_n, first|:
+                    code: i64 = edge(first, second)
+                    continue if Ints::at_ref(&bench.present, code) != 0
+                    Ints::put(&bench.spare, spare_n, code)
+                    spare_n <- spare_n + 1
+            false return if graph.count == 0 or spare_n == 0
+            # `rng.choice(sorted(present))` -- and the edges are already held
+            # sorted, so this is a pick straight out of them.
+            drop: i64 = Ints::at_ref(&graph.edges, py_choice_index(rng, graph.count))
+            add: i64 = Ints::at_ref(&bench.spare, py_choice_index(rng, spare_n))
+            Ints::put(&bench.present, drop, 0)
+            Ints::put(&bench.present, add, 1)
+            gather_present(bench, out, graph.size)
+            return true
+
+    # A connected graph that is NOT the same network as `graph`, or false when
+    # no such graph could be reached -- at four nodes there are few enough
+    # connected graphs that a rewiring which keeps the counts often has nowhere
+    # to go.
+    def rewired(out: mutable Graph&, bench: mutable Bench&, probe: mutable Probe&, graph: mutable Graph&, keep_degrees: bool, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            for _attempt in 0..<REWIRE_ATTEMPTS |out, bench, probe, graph, keep_degrees, rng|:
+                made: bool = swap_partners(out, bench, graph, rng) if keep_degrees else move_a_line(out, bench, graph, rng)
+                continue if not made
+                continue if not connected(out, probe)
+                true return if not isomorphic(graph, out, probe)
+            return false
+
+    # The two graphs a trial shows, and the truth about them.
+    struct Pair:
+        first: mutable Graph
+        second: mutable Graph
+        # Whether the two are the same network drawn differently.
+        same: mutable bool
+        # For a mismatch, whether it keeps every connection count -- the kind
+        # tallying cannot answer. False for a match, which has no counts to
+        # keep, and for a mismatch that had to settle.
+        subtle: mutable bool
+
+    def new_pair() -> Pair:
+        can Memory.Allocate, Abort.Panic:
+            return Pair{first: new_graph(), second: new_graph(), same: false, subtle: false}
+
+    # Two graphs to show, and the truth about them.
+    #
+    # The answer comes back rather than going in, because a mismatch is not
+    # always reachable. A mismatch that has to keep the counts is tried against
+    # FRESH base graphs before settling for one that does not, because whether
+    # a partner exists depends on the base and not only on the size. Only when
+    # no base yields one does it drop to the easier kind -- never to a match,
+    # which would quietly bend the run's balance between the two answers.
+    def build_pair(pair: mutable Pair&, bench: mutable Bench&, probe: mutable Probe&,
+                   base: mutable Graph&, other: mutable Graph&,
+                   size: i64, lines: i64, same: bool, subtle: bool, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            if same:
+                random_graph(base, bench, size, lines, rng)
+                copy_graph(&pair.first, base)
+                shuffled(&pair.second, base, &bench.naming, rng)
+                pair.same <- true
+                pair.subtle <- false
+                return
+            settled: mutable bool = false
+            # `(True, False) if subtle else (False,)`: the count-keeping kind
+            # is tried first and only then the easier one, never the other way
+            # round and never a match.
+            kinds: i64 = 2 if subtle else 1
+            for kind in 0..<kinds |pair, bench, probe, base, other, size, lines, subtle, settled, rng|:
+                break if settled
+                keep_degrees: bool = subtle and kind == 0
+                for _attempt in 0..<BASE_ATTEMPTS |pair, bench, probe, base, other, size, lines, keep_degrees, settled, rng|:
+                    break if settled
+                    random_graph(base, bench, size, lines, rng)
+                    continue if not rewired(other, bench, probe, base, keep_degrees, rng)
+                    copy_graph(&pair.first, base)
+                    shuffled(&pair.second, other, &bench.naming, rng)
+                    pair.same <- false
+                    pair.subtle <- keep_degrees
+                    settled <- true
+            return if settled
+            # No second network at all at this size and density.
+            random_graph(base, bench, size, lines, rng)
+            copy_graph(&pair.first, base)
+            shuffled(&pair.second, base, &bench.naming, rng)
+            pair.same <- true
+            pair.subtle <- false
+
+    # --- the ring ---------------------------------------------------------
+
+    # Node positions around a circle, in fractions of a panel.
+    #
+    # The nodes go round in a random order at a random turn, with the radius
+    # nudged a little, so the same network drawn twice makes two different
+    # pictures -- which is the whole difficulty.
+    def ring_positions(x: mutable darray[f64]&, y: mutable darray[f64]&, order: mutable darray[i64]&, size: i64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            for node in 0..<size |order|:
+                Ints::put(order, node, node)
+            py_shuffle_i64_prefix(rng, order, size)
+            turn: f64 = py_uniform(rng, 0.0, TAU)
+            span: i64 = 1 if size < 1 else size
+            for node in 0..<size |x, y, order, turn, span, rng|:
+                angle: f64 = turn + Ints::at_ref(order, node).f64() * TAU / span.f64()
+                reach: f64 = 0.44 * py_uniform(rng, 0.86, 1.0)
+                Floats::put(x, node, 0.5 + reach * cos(angle))
+                Floats::put(y, node, 0.5 + reach * sin(angle))
+
+    # --- the run ----------------------------------------------------------
+
+    # Most trials a run will hold results for.
+    const MOST_TRIALS: i64 = 400
+
+    # Declared arrays first, then words, then flags, which is what the layout
+    # wants; the reference's field order is a docstring's worth of grouping and
+    # not part of the answer.
+    struct Task:
+        # The block of three of each the answers are dealt from.
+        deck: mutable darray[i64]
+        # One row a trial: what it was, what was said, how long it took.
+        was_same: mutable darray[i64]
+        said_same: mutable darray[i64]
+        took: mutable darray[f64]
+        # Options, read once and again on apply.
+        start_nodes: mutable i64
+        density: mutable i64
+        total_trials: mutable i64
+        exposure_ms: mutable i64
+        # The run.
+        nodes: mutable i64
+        trial: mutable i64
+        correct: mutable i64
+        settled_for: mutable i64
+        phase: mutable i64
+        asked_at: mutable f64
+        feedback_until: mutable f64
+        deck_count: mutable i64
+        answered: mutable i64
+        subtle: mutable bool
+        adaptive: mutable bool
+        feedback: mutable bool
+        really_same: mutable bool
+
+    def new_task() -> Task:
+        can Memory.Allocate, Abort.Panic:
+            return Task{start_nodes: MIN_NODES, density: MEDIUM, total_trials: 0,
+                        subtle: false, exposure_ms: 0, adaptive: false, feedback: false,
+                        nodes: MIN_NODES, trial: 0, correct: 0, settled_for: 0,
+                        really_same: true, phase: READY, asked_at: 0.0, feedback_until: 0.0,
+                        deck: Ints::zeros(6), deck_count: 0,
+                        was_same: Ints::zeros(MOST_TRIALS), said_same: Ints::zeros(MOST_TRIALS),
+                        took: Floats::zeros(MOST_TRIALS), answered: 0}
+
+    # Fewest dots this run will go down to.
+    #
+    # Asking for mismatches that keep the counts holds the size up to where
+    # such a mismatch exists -- below that the option cannot be honoured, and
+    # quietly handing out the easier kind instead would be the option failing
+    # in silence.
+    def floor(task: mutable Task&) -> i64:
+        return subtle_floor(task.density) if task.subtle else MIN_NODES
+
+    # `nodes`, kept inside what this run can actually show.
+    def clamped(task: mutable Task&, nodes: i64) -> i64:
+        held: i64 = nodes if nodes < MAX_NODES else MAX_NODES
+        low: i64 = floor(task)
+        return low if low > held else held
+
+    def read_options(task: mutable Task&):
+        task.nodes <- clamped(task, task.start_nodes)
+
+    def reset(task: mutable Task&):
+        task.trial <- 0
+        task.correct <- 0
+        task.settled_for <- 0
+        task.answered <- 0
+        task.deck_count <- 0
+        task.phase <- READY
+
+    # Whether the next pair should match.
+    #
+    # Dealt from a shuffled block of three of each rather than from a coin, so
+    # a run cannot land six matching pairs in a row and read as broken.
+    def draw_answer(task: mutable Task&, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            if task.deck_count == 0:
+                for at in 0..<6 |task|:
+                    Ints::put(&task.deck, at, 1 if at < 3 else 0)
+                task.deck_count <- 6
+                py_shuffle_i64_prefix(rng, &task.deck, 6)
+            task.deck_count <- task.deck_count - 1
+            return Ints::at_ref(&task.deck, task.deck_count) != 0
+
+    def next_trial(task: mutable Task&, pair: mutable Pair&, bench: mutable Bench&,
+                   probe: mutable Probe&, base: mutable Graph&, other: mutable Graph&,
+                   x: mutable darray[f64]&, y: mutable darray[f64]&,
+                   second_x: mutable darray[f64]&, second_y: mutable darray[f64]&,
+                   now: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            if task.trial >= task.total_trials:
+                task.phase <- DONE
+                return
+            task.trial <- task.trial + 1
+            lines: i64 = edge_count(task.nodes, task.density)
+            want_same: bool = draw_answer(task, rng)
+            build_pair(pair, bench, probe, base, other, task.nodes, lines, want_same, task.subtle, rng)
+            if task.subtle and not pair.same and not pair.subtle:
+                task.settled_for <- task.settled_for + 1
+            ring_positions(x, y, &bench.naming, task.nodes, rng)
+            ring_positions(second_x, second_y, &bench.naming, task.nodes, rng)
+            task.really_same <- pair.same
+            task.asked_at <- now
+            task.phase <- ASKING
+
+    # Take `choice` and score it. The verdict pays what the ANSWER was worth,
+    # which is not the same thing as what the pair was.
+    def answer(task: mutable Task&, pair: mutable Pair&, bench: mutable Bench&,
+               probe: mutable Probe&, base: mutable Graph&, other: mutable Graph&,
+               x: mutable darray[f64]&, y: mutable darray[f64]&,
+               second_x: mutable darray[f64]&, second_y: mutable darray[f64]&,
+               choice: i64, now: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            return if task.phase != ASKING and task.phase != HIDDEN
+            said: bool = choice == SAME
+            right: bool = said == task.really_same
+            if task.answered < MOST_TRIALS:
+                Ints::put(&task.was_same, task.answered, 1 if task.really_same else 0)
+                Ints::put(&task.said_same, task.answered, 1 if said else 0)
+                Floats::put(&task.took, task.answered, now - task.asked_at)
+                task.answered <- task.answered + 1
+            task.correct <- task.correct + 1 if right
+            adapt(task, right)
+            if task.feedback:
+                task.phase <- FEEDBACK
+                task.feedback_until <- now + 0.9
+                return
+            next_trial(task, pair, bench, probe, base, other, x, y, second_x, second_y, now, rng)
+
+    def adapt(task: mutable Task&, right: bool):
+        return if not task.adaptive
+        task.nodes <- clamped(task, task.nodes + (1 if right else -1))
+
+    def tick(task: mutable Task&, pair: mutable Pair&, bench: mutable Bench&,
+             probe: mutable Probe&, base: mutable Graph&, other: mutable Graph&,
+             x: mutable darray[f64]&, y: mutable darray[f64]&,
+             second_x: mutable darray[f64]&, second_y: mutable darray[f64]&,
+             now: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            if task.phase == FEEDBACK and now >= task.feedback_until:
+                next_trial(task, pair, bench, probe, base, other, x, y, second_x, second_y, now, rng)
+                return
+            # Time is up; the graphs go, the question stays.
+            if task.phase == ASKING and task.exposure_ms > 0 and now - task.asked_at >= task.exposure_ms.f64() / 1000.0:
+                task.phase <- HIDDEN
+
+    struct Score:
+        trials: i64
+        correct: i64
+        accuracy: i64
+        same_total: i64
+        same_right: i64
+        different_total: i64
+        different_right: i64
+        mean_seconds: f64
+
+    # How the run went, with the two answers kept apart.
+    #
+    # Answering "different" to everything scores half, so matches and
+    # mismatches are reported separately: a run can be wrong in two quite
+    # different ways, and only one of them is a bias.
+    def score(task: mutable Task&) -> Score:
+        can Abort.Panic:
+            same_total: mutable i64 = 0
+            same_right: mutable i64 = 0
+            different_right: mutable i64 = 0
+            total_seconds: mutable f64 = 0.0
+            for at in 0..<task.answered |task, same_total, same_right, different_right, total_seconds|:
+                was: bool = Ints::at_ref(&task.was_same, at) != 0
+                said: bool = Ints::at_ref(&task.said_same, at) != 0
+                if was:
+                    same_total <- same_total + 1
+                    same_right <- same_right + 1 if said
+                else:
+                    different_right <- different_right + 1 if not said
+                total_seconds <- total_seconds + Floats::at_ref(&task.took, at)
+            accuracy: mutable i64 = 0
+            if task.answered > 0:
+                accuracy <- py_round_half_even(100.0 * task.correct.f64() / task.answered.f64())
+            mean: mutable f64 = 0.0
+            if task.answered > 0:
+                mean <- total_seconds / task.answered.f64()
+            return Score{trials: task.answered, correct: task.correct, accuracy: accuracy,
+                         same_total: same_total, same_right: same_right,
+                         different_total: task.answered - same_total,
+                         different_right: different_right, mean_seconds: mean}
+
+    # --- layout -----------------------------------------------------------
+
+    # The buttons are filled in the accent blue, which is exactly what the
+    # agent boundary's reader counts as a verdict, so they have to sit clear of
+    # the band it reads. Everything above them is laid out from where they
+    # land.
+    def button_width(width: f64) -> f64:
+        wide: f64 = width * 0.22
+        third: f64 = width / 3.2
+        return wide if wide < third else third
+
+    def button_height(height: f64) -> f64:
+        tall: f64 = height * 0.07
+        return 40.0 if 40.0 > tall else tall
+
+    def button_bottom(height: f64) -> f64:
+        can Abort.Panic:
+            return Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 84.0).f64()).f64()
+
+    def button_left(width: f64) -> f64:
+        gap: f64 = width * 0.04
+        return (width - (button_width(width) * 2.0 + gap)) / 2.0
+
+    # The rectangle both graphs are drawn in: left, bottom, width, height.
+    def canvas_bottom(width: f64, height: f64) -> f64:
+        can Abort.Panic:
+            return button_bottom(height) + button_height(height) + height * 0.03
+
+    def canvas_height(width: f64, height: f64) -> f64:
+        can Abort.Panic:
+            tall: f64 = Geometry::from_top_edge(height, 96.0).f64() - canvas_bottom(width, height)
+            return 80.0 if 80.0 > tall else tall
+
+    def canvas_width(width: f64) -> f64:
+        return width * 0.90
+
+    def canvas_left(width: f64) -> f64:
+        return (width - canvas_width(width)) / 2.0
+
+    # Centre and side of the square each graph is drawn in.
+    def panel_side(width: f64, height: f64) -> f64:
+        can Abort.Panic:
+            gap: f64 = canvas_width(width) * 0.05
+            half: f64 = (canvas_width(width) - gap) / 2.0
+            tall: f64 = canvas_height(width, height)
+            return half if half < tall else tall
+
+    def panel_centre_x(width: f64, height: f64, panel: i64) -> f64:
+        gap: f64 = canvas_width(width) * 0.05
+        half: f64 = (canvas_width(width) - gap) / 2.0
+        return canvas_left(width) + half / 2.0 if panel == 0
+        return canvas_left(width) + half + gap + half / 2.0
+
+    def panel_centre_y(width: f64, height: f64) -> f64:
+        can Abort.Panic:
+            return canvas_bottom(width, height) + canvas_height(width, height) / 2.0
+
+    def to_pixels_x(width: f64, height: f64, panel: i64, point: f64) -> f64:
+        can Abort.Panic:
+            return panel_centre_x(width, height, panel) + (point - 0.5) * panel_side(width, height)
+
+    def to_pixels_y(width: f64, height: f64, point: f64) -> f64:
+        can Abort.Panic:
+            return panel_centre_y(width, height) + (point - 0.5) * panel_side(width, height)

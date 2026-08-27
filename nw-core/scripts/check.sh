@@ -29,7 +29,7 @@ esac
 BUILD="$ROOT/build"
 mkdir -p "$BUILD"
 
-SUITES=(pyset scheduling board nback pyrandom stimulus stats matching display config gamemode decimal session maze fogworld numberology ninarow inthedark crossedwires cookiethief custody donkey tetris removals sokoban go twohands buzzwire marblemaze syllogism title menu menurow sudoku youarehere hanoi monkeyladder ncupmonte reflex salesman counting tracking concentration recognition lookout pursuit outofsight overrun mrtime jigsaw sokoban3d verbal scramble scrabble trivia crossword)
+SUITES=(pyset scheduling board nback pyrandom stimulus stats matching display config gamemode decimal session maze fogworld numberology ninarow inthedark crossedwires cookiethief custody donkey tetris removals sokoban go twohands buzzwire marblemaze syllogism title menu menurow sudoku youarehere hanoi monkeyladder ncupmonte reflex salesman counting tracking concentration recognition lookout pursuit outofsight overrun mrtime jigsaw sokoban3d verbal scramble scrabble trivia crossword graphmapping)
 
 # One suite by name, for the inner loop.
 if [[ -n "${SUITE:-}" ]]; then
