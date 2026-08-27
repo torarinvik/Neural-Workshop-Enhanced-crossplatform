@@ -1,0 +1,250 @@
+# The Matrix Reasoning screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/ravens.py -- the PLACEMENT, and not the cards.
+#
+# This is the one screen in the workshop that draws into a texture and then
+# blits it. Each card -- the matrix, and one per candidate -- is rendered
+# offscreen through a framebuffer and put on the page as a sprite, so what
+# this module lays out is where those sprites go, how big they are, which
+# candidate is outlined and in what colour, and the number in each box.
+#
+# What is NOT here is the inside of a card. Those figures are gathered into
+# one raw vertex list per card -- a `Ribbon`, thousands of triangles uploaded
+# in a single call, because a shape object per triangle cost five dropped
+# frames every time a puzzle appeared -- and a raw vertex list is not a
+# drawable the frame recorder wraps. It cannot be seen and therefore cannot
+# be checked the way every other line in this port has been, so it is left
+# for the shell that has a triangle-mesh path, and this module stops at the
+# seam rather than shipping unverified geometry.
+#
+# The two blocks are SIZED TOGETHER rather than each to its own share of the
+# room, so a candidate is drawn at exactly the size the cell it would fill is
+# drawn at. Judging whether a shape is the right size is one of the things a
+# matrix asks, and it cannot be asked if the candidates are at a different
+# scale from the grid.
+#
+# Whichever of the two blocks is SHORTER is centred against the taller. With
+# four candidates the block is shorter than the grid, and centring the grid
+# against it the other way round pushed the grid up through the title.
+#
+# A mark is drawn under three conditions and only the first that matches wins:
+# once the answer is in, the right one is ringed green and a wrong pick red;
+# before that, whatever is under the pointer is accented. The NUMBER goes
+# inside the box and not under it -- a number below a box sits just as close
+# to the box beneath, and picking by number is the whole of how the task is
+# answered.
+#
+# NOTE: needs elisacore_math, strings, geometry, display and scene_verdict
+# included by the driver.
+
+module SceneRavens:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_ASKING: i64 = 1
+    const PHASE_HIDDEN: i64 = 2
+    const PHASE_FEEDBACK: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const CHOICE_COLUMNS: i64 = 2
+
+    def color_accent() -> u32:
+        return Display::rgba(64, 96, 255, 255)
+
+    def color_right() -> u32:
+        return Display::rgba(46, 160, 67, 255)
+
+    def color_wrong() -> u32:
+        return Display::rgba(200, 64, 64, 255)
+
+    # The number in a box's corner: a fixed grey on both pages, because it
+    # sits on the card's own paper rather than on the workshop's.
+    def color_number() -> u32:
+        return Display::rgba(110, 110, 110, 255)
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64, explain: bool):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 96.0).f64()
+            # A puzzle with five rules needs several lines to say so. The room
+            # is taken OUT of the puzzle rather than written over it.
+            bottom: f64 = Geometry::from_bottom_edge(height, 112.0 if explain else 76.0).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.04
+            out.bottom <- bottom
+            out.width <- width * 0.92
+            out.height <- room if room > 40.0 else 40.0
+
+    struct Layout:
+        cell: mutable f64
+        origin: mutable f64
+        top: mutable f64
+        side: mutable f64
+        wide: mutable f64
+        gap: mutable f64
+
+    def layout_of(out: mutable Layout&, canvas: Canvas&, across: i64, choices: i64):
+        can Abort.Panic:
+            rows: i64 = (choices + CHOICE_COLUMNS - 1) / CHOICE_COLUMNS
+            gap: f64 = canvas.width * 0.04
+            by_width: f64 = (canvas.width - gap) / (across + CHOICE_COLUMNS).f64()
+            down: f64 = canvas.height / across.f64()
+            by_rows: f64 = canvas.height / rows.f64()
+            by_height: f64 = down if down < by_rows else by_rows
+            cell: f64 = by_width if by_width < by_height else by_height
+            side: f64 = cell * across.f64()
+            wide: f64 = cell * CHOICE_COLUMNS.f64()
+            used: f64 = side + gap + wide
+            out.cell <- cell
+            out.origin <- canvas.left + (canvas.width - used) / 2.0
+            out.top <- canvas.bottom + canvas.height
+            out.side <- side
+            out.wide <- wide
+            out.gap <- gap
+
+    def choice_rows(choices: i64) -> i64:
+        return (choices + CHOICE_COLUMNS - 1) / CHOICE_COLUMNS
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_puzzle: bool, across: i64, choices: i64, answer: i64,
+               picked: i64, hovered: i64, explain: bool, matrix_asset: i64,
+               matrix_pixels: i64, choice_asset: i64, choice_pixels: i64,
+               notes: sview, trial: i64, total_trials: i64, right: i64,
+               trial_level: i64, message: sview, verdict: i64,
+               verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            showing: bool = has_puzzle and (phase == PHASE_ASKING or phase == PHASE_FEEDBACK)
+
+            put_text(list, paint, sview("Matrix Reasoning", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if phase == PHASE_ASKING or phase == PHASE_HIDDEN or phase == PHASE_FEEDBACK:
+                dstr_append_cstr(&status, "     ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "   right ")
+                dstr_append_i64(&status, right)
+                dstr_append_cstr(&status, "   level ")
+                dstr_append_i64(&status, trial_level + 1)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     1-8 or click     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            # Anchored at its BOTTOM, above the key line, so a puzzle carrying
+            # five rules grows upward into the empty page rather than downward
+            # through the keys.
+            said: sview = notes if explain and has_puzzle and phase == PHASE_FEEDBACK else sview("", 0, -1)
+            put_text(list, paint, said, middle,
+                     Geometry::from_bottom_edge(paint.height, 42.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 10.0), paint.ink,
+                     Display::ANCHOR_CENTER_BOTTOM, false)
+
+            if not showing:
+                return
+
+            canvas: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&canvas, paint.width, paint.height, explain)
+            where: mutable Layout = Layout{cell: 0.0, origin: 0.0, top: 0.0, side: 0.0, wide: 0.0, gap: 0.0}
+            layout_of(&where, &canvas, across, choices)
+            rows: i64 = choice_rows(choices)
+            block: f64 = where.cell * rows.f64()
+
+            # The MATRIX card. Whichever block is shorter is centred against
+            # the taller.
+            tall: f64 = where.side if where.side > block else block
+            matrix_bottom: f64 = where.top - (tall + where.side) / 2.0
+            Display::draw_sprite(list, matrix_asset.u32(),
+                                 where.origin / paint.sx,
+                                 matrix_bottom / paint.sy,
+                                 where.side / matrix_pixels.f64() / paint.sx,
+                                 0.0, matrix_pixels, matrix_pixels,
+                                 Display::rgba(255, 255, 255, 255))
+
+            # Then each candidate, and its mark and its number after it --
+            # the marks are in a group of their own, so they all come after
+            # every card whatever order they were made in.
+            left: f64 = where.origin + where.side + canvas.width * 0.04
+            room: f64 = where.side - block
+            first_top: f64 = where.top - (room / 2.0 if room > 0.0 else 0.0)
+            for index in 0..<choices |list, paint, where, left, first_top, choice_asset, choice_pixels, choices|:
+                column: i64 = index % CHOICE_COLUMNS
+                row: i64 = index / CHOICE_COLUMNS
+                Display::draw_sprite(list, (choice_asset + index).u32(),
+                                     (left + column.f64() * where.cell) / paint.sx,
+                                     (first_top - (row + 1).f64() * where.cell) / paint.sy,
+                                     where.cell / choice_pixels.f64() / paint.sx,
+                                     0.0, choice_pixels, choice_pixels,
+                                     Display::rgba(255, 255, 255, 255))
+
+            for index in 0..<choices |list, paint, where, left, first_top, phase, answer, picked, hovered, choices|:
+                column: i64 = index % CHOICE_COLUMNS
+                row: i64 = index / CHOICE_COLUMNS
+                box_left: f64 = left + column.f64() * where.cell
+                box_bottom: f64 = first_top - (row + 1).f64() * where.cell
+                shade: mutable u32 = paint.ink
+                thickness: mutable f64 = 1.0
+                if phase == PHASE_FEEDBACK and picked >= 0:
+                    if index == answer:
+                        shade <- color_right()
+                        thickness <- 3.0
+                    elif index == picked:
+                        shade <- color_wrong()
+                        thickness <- 3.0
+                elif index == hovered:
+                    shade <- color_accent()
+                    thickness <- 2.5
+                if thickness > 1.0:
+                    Display::draw_box(list, box_left / paint.sx,
+                                      box_bottom / paint.sy,
+                                      where.cell / paint.sx,
+                                      where.cell / paint.sy, shade,
+                                      thickness / paint.sx)
+                # INSIDE the box, not under it.
+                inset: f64 = where.cell * 0.09
+                number: mutable dstr = []
+                dstr_append_i64(&number, index + 1)
+                put_text(list, paint, bytes_view(number), box_left + inset,
+                         box_bottom + where.cell - inset,
+                         Geometry::calc_fontsize(paint.height, 11.0),
+                         color_number(), Display::ANCHOR_CENTER_CENTER, false)
