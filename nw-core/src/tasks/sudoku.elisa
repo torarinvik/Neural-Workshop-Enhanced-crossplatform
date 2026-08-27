@@ -1,0 +1,970 @@
+# Sudoku: a grid dug out until exactly one solution is left, rated by the
+# cheapest technique tower that finishes it.
+#
+# Port of neural_workshop/sudoku.py (GPL-2.0-or-later). Three box sizes --
+# 2, 3, 4, meaning 4x4, 9x9 and 16x16 -- so every buffer here is sized for the
+# sixteen and carries its live length separately.
+#
+# Candidates are BITMASKS, one i64 per cell, bit `d - 1` for digit `d`. That is
+# the reference's representation too, and it is what makes the techniques
+# arithmetic rather than set juggling.
+#
+# Two things decide whether this matches CPython run for run, and both are
+# ordering rather than logic:
+#
+#   * `combinations` is lexicographic by INDEX, and every subset technique
+#     returns on the first group that eliminates anything. A different
+#     enumeration order finds a different group first and rates the puzzle
+#     differently.
+#   * `min(open_cells, key=popcount)` returns the FIRST minimum in ascending
+#     cell order, so the search branches on the same cell CPython does.
+#
+# The sets the reference iterates -- `shared` in the hidden subset, `lanes` in
+# the fish -- are struck from in full, so their order is not observable and a
+# flat membership array is the right port. Where a set's order IS observable
+# the port uses pyset.elisa; none of those are here.
+
+module Sudoku:
+
+    # The technique tower, cheapest first. A puzzle's TIER is an index into it,
+    # and the last entry is not a technique but the admission that the ones
+    # before it were not enough.
+    const TIER_NAKED_SINGLE: i64 = 0
+    const TIER_HIDDEN_SINGLE: i64 = 1
+    const TIER_LOCKED: i64 = 2
+    const TIER_NAKED_SUBSET: i64 = 3
+    const TIER_HIDDEN_SUBSET: i64 = 4
+    const TIER_FISH: i64 = 5
+    const TIER_SEARCH: i64 = 6
+    const LOGIC_COUNT: i64 = 6
+
+    const WIDEST_SUBSET: i64 = 3
+    const WIDEST_FISH: i64 = 3
+
+    # Branches one fill attempt may take before it is abandoned and restarted.
+    # Not a heuristic to tune: it is the difference between bounded and not.
+    const FILL_BUDGET: i64 = 20000
+
+    # What falling short of a rung costs against overshooting it. A rung that
+    # cannot find its band hands back something HARDER than promised.
+    const UNDERSHOOT_COST: i64 = 3
+
+    const GRADE_COUNT: i64 = 12
+
+    # Sized for the sixteen throughout.
+    const MOST_BOX: i64 = 4
+    const MOST_SIZE: i64 = 16
+    const MOST_CELLS: i64 = 256
+    const MOST_UNITS: i64 = 48
+
+    # A verdict is three-valued, because "nothing to do" and "this grid is
+    # broken" are opposite answers and telling them apart by watching the
+    # candidates for a change is both slow and a lie.
+    const VERDICT_BROKEN: i64 = -1
+    const VERDICT_NONE: i64 = 0
+    const VERDICT_MOVED: i64 = 1
+
+    # One rung: the size, and the band a deal has to land in. A BAND rather
+    # than a floor -- "at least tier two" is satisfied four times in ten by a
+    # puzzle the logic cannot finish at all.
+    struct Grade:
+        box: i64
+        floor: i64
+        ceiling: i64
+        guesses: i64
+        keep: i64
+        tries: i64
+
+    def grade_at(level_number: i64) -> Grade:
+        index: mutable i64 = level_number - 1
+        index <- 0 if index < 0
+        index <- GRADE_COUNT - 1 if index > GRADE_COUNT - 1
+        if index == 0:
+            return Grade{box: 2, floor: 0, ceiling: 0, guesses: 0, keep: 0, tries: 20}
+        if index == 1:
+            return Grade{box: 3, floor: 0, ceiling: 0, guesses: 0, keep: 45, tries: 30}
+        if index == 2:
+            return Grade{box: 3, floor: 1, ceiling: 1, guesses: 0, keep: 32, tries: 60}
+        if index == 3:
+            return Grade{box: 3, floor: 2, ceiling: 2, guesses: 0, keep: 0, tries: 120}
+        if index == 4:
+            return Grade{box: 3, floor: 3, ceiling: 3, guesses: 0, keep: 0, tries: 120}
+        if index == 5:
+            return Grade{box: 3, floor: 4, ceiling: 5, guesses: 0, keep: 0, tries: 200}
+        if index == 6:
+            return Grade{box: 3, floor: 6, ceiling: 6, guesses: 1, keep: 0, tries: 60}
+        if index == 7:
+            return Grade{box: 3, floor: 6, ceiling: 6, guesses: 8, keep: 0, tries: 150}
+        if index == 8:
+            return Grade{box: 4, floor: 0, ceiling: 1, guesses: 0, keep: 150, tries: 10}
+        if index == 9:
+            return Grade{box: 4, floor: 1, ceiling: 1, guesses: 0, keep: 120, tries: 10}
+        if index == 10:
+            return Grade{box: 4, floor: 3, ceiling: 6, guesses: 0, keep: 110, tries: 20}
+        return Grade{box: 4, floor: 6, ceiling: 6, guesses: 40, keep: 100, tries: 4}
+
+    # ------------------------------------------------------------
+    # Geometry
+    #
+    # Rows, then columns, then boxes -- that order is load-bearing: the locked
+    # candidates and fish techniques slice `units` by it. Built once per box
+    # size and threaded, which is this port's replacement for the reference's
+    # three module-level caches.
+    # ------------------------------------------------------------
+
+    struct Board:
+        box: mutable i64
+        size: mutable i64
+        cells: mutable i64
+        unit_count: mutable i64
+        peer_count: mutable i64
+        every: mutable i64
+        # unit_count * size
+        units: mutable darray[i64]
+        # cells * peer_count
+        peers: mutable darray[i64]
+        # cells
+        box_of: mutable darray[i64]
+
+    def board_of(box: i64) -> Board:
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = box * box
+            cells: i64 = size * size
+            out: mutable Board = Board{
+                box: box, size: size, cells: cells,
+                unit_count: 3 * size,
+                # row(size-1) + column(size-1) + the box's own remainder
+                peer_count: 2 * (size - 1) + (size - 1 - 2 * (box - 1)),
+                every: (1 << size) - 1,
+                units: Ints::zeros(3 * size * size),
+                peers: Ints::zeros(cells * (2 * (size - 1) + (size - 1 - 2 * (box - 1)))),
+                box_of: Ints::zeros(cells)}
+            fill_units(&out)
+            fill_peers(&out)
+            return out
+
+    def fill_units(board: mutable Board&):
+        can Abort.Panic:
+            size: i64 = board.size
+            box: i64 = board.box
+            for row in 0..<size |board, size|:
+                for col in 0..<size |board, size, row|:
+                    Ints::put(&board.units, row * size + col, row * size + col)
+            for col in 0..<size |board, size|:
+                for row in 0..<size |board, size, col|:
+                    Ints::put(&board.units, (size + col) * size + row, row * size + col)
+            for band in 0..<box |board, size, box|:
+                for tower in 0..<box |board, size, box, band|:
+                    unit: i64 = 2 * size + band * box + tower
+                    for r in 0..<box |board, size, box, band, tower, unit|:
+                        for c in 0..<box |board, size, box, band, tower, unit, r|:
+                            cell: i64 = (band * box + r) * size + tower * box + c
+                            Ints::put(&board.units, unit * size + r * box + c, cell)
+            for cell in 0..<board.cells |board, size, box|:
+                Ints::put(&board.box_of, cell, (cell / size / box) * box + (cell % size) / box)
+
+    # Every other cell sharing a unit, ASCENDING -- the reference sorts each
+    # peer set, and `candidates` walks them in that order to strike.
+    def fill_peers(board: mutable Board&):
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = board.size
+            seen: mutable darray[i64] = Ints::zeros(board.cells)
+            for cell in 0..<board.cells |board, size, seen|:
+                for other in 0..<board.cells |seen|:
+                    Ints::put(&seen, other, 0)
+                for unit in 0..<board.unit_count |board, size, seen, cell|:
+                    holds: mutable bool = false
+                    for slot in 0..<size |board, size, unit, cell, holds|:
+                        holds <- true if Ints::at_ref(&board.units, unit * size + slot) == cell
+                    continue if not holds
+                    for slot in 0..<size |board, size, unit, seen|:
+                        Ints::put(&seen, Ints::at_ref(&board.units, unit * size + slot), 1)
+                Ints::put(&seen, cell, 0)
+                found: mutable i64 = 0
+                for other in 0..<board.cells |board, seen, cell, found|:
+                    if Ints::at_ref(&seen, other) != 0 and found < board.peer_count:
+                        Ints::put(&board.peers, cell * board.peer_count + found, other)
+                        found <- found + 1
+
+    # Read through a READ-ONLY ref. Ints::at takes its darray by value and
+    # Ints::at_ref wants a mutable one, so neither fits a parameter this module
+    # genuinely does not write -- and widening the parameter to mutable to reach
+    # at_ref would say the opposite of what the function does.
+    def cell_at(values: darray[i64]&, index: i64) -> i64:
+        can Abort.Panic:
+            return get values[index.usize()] else 0
+
+
+    def box_of_cell(board: Board&, cell: i64) -> i64:
+        can Abort.Panic:
+            return cell_at(board.box_of, cell)
+
+
+    def peer_at(board: Board&, cell: i64, index: i64) -> i64:
+        can Abort.Panic:
+            return get board.peers[(cell * board.peer_count + index).usize()] else 0
+
+    def unit_cell(board: Board&, unit: i64, slot: i64) -> i64:
+        can Abort.Panic:
+            return get board.units[(unit * board.size + slot).usize()] else 0
+
+    # ------------------------------------------------------------
+    # Bit helpers
+    # ------------------------------------------------------------
+
+    def popcount(mask: i64) -> i64:
+        can Abort.Panic:
+            left: mutable i64 = mask
+            count: mutable i64 = 0
+            while left != 0 |left, count|:
+                count <- count + 1 if (left & 1) != 0
+                left <- left >> 1
+            return count
+
+    # Python's `int.bit_length`: the 1-based index of the highest set bit, so
+    # for a single-bit mask it IS the digit.
+    def bit_length(mask: i64) -> i64:
+        can Abort.Panic:
+            left: mutable i64 = mask
+            bits: mutable i64 = 0
+            while left != 0 |left, bits|:
+                bits <- bits + 1
+                left <- left >> 1
+            return bits
+
+    def single_bit(mask: i64) -> bool:
+        can Abort.Panic:
+            return mask != 0 and (mask & (mask - 1)) == 0
+
+    # The digits a mask holds, ascending, into `out`. Returns how many.
+    def bits_of(mask: i64, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            left: mutable i64 = mask
+            digit: mutable i64 = 1
+            found: mutable i64 = 0
+            while left != 0 |left, digit, found, out|:
+                if (left & 1) != 0:
+                    Ints::put(out, found, digit)
+                    found <- found + 1
+                left <- left >> 1
+                digit <- digit + 1
+            return found
+
+    # ------------------------------------------------------------
+    # Combinations
+    #
+    # `itertools.combinations(items, width)` in index order, as an odometer.
+    # The order is observable: every subset technique returns on the FIRST
+    # group that eliminates anything, so a different enumeration rates the
+    # puzzle differently.
+    # ------------------------------------------------------------
+
+    # Seed `pick` with 0, 1, ... width-1. False when `count` is too small.
+    def combo_first(count: i64, width: i64, pick: mutable darray[i64]&) -> bool:
+        can Abort.Panic:
+            return false if width > count or width <= 0
+            for slot in 0..<width |pick|:
+                Ints::put(pick, slot, slot)
+            return true
+
+    # Advance to the next combination. False when the last one is spent.
+    def combo_next(count: i64, width: i64, pick: mutable darray[i64]&) -> bool:
+        can Abort.Panic:
+            slot: mutable i64 = width - 1
+            while slot >= 0 |slot, pick, count, width|:
+                if Ints::at_ref(pick, slot) != slot + count - width:
+                    break
+                slot <- slot - 1
+            return false if slot < 0
+            Ints::put(pick, slot, Ints::at_ref(pick, slot) + 1)
+            step: mutable i64 = slot + 1
+            while step < width |step, pick|:
+                Ints::put(pick, step, Ints::at_ref(pick, step - 1) + 1)
+                step <- step + 1
+            return true
+
+    # ------------------------------------------------------------
+    # Candidates and placement
+    # ------------------------------------------------------------
+
+    # A candidate mask per cell into `cand`. False when the grid contradicts
+    # itself -- a repeated digit in a unit, or a blank with nothing left.
+    def candidates(board: Board&, grid: darray[i64]&, cand: mutable darray[i64]&) -> bool:
+        can Abort.Panic:
+            for cell in 0..<board.cells |board, cand|:
+                Ints::put(cand, cell, board.every)
+            for cell in 0..<board.cells |board, grid, cand|:
+                value: i64 = cell_at(grid, cell)
+                Ints::put(cand, cell, 1 << (value - 1)) if value != 0
+            for cell in 0..<board.cells |board, grid, cand|:
+                value: i64 = cell_at(grid, cell)
+                continue if value == 0
+                bit: i64 = 1 << (value - 1)
+                for index in 0..<board.peer_count |board, grid, cand, cell, value, bit|:
+                    other: i64 = peer_at(board, cell, index)
+                    if cell_at(grid, other) != 0:
+                        false return if cell_at(grid, other) == value
+                    else:
+                        Ints::put(cand, other, Ints::at_ref(cand, other) & ~bit)
+                        false return if Ints::at_ref(cand, other) == 0
+            return true
+
+    # Put `digit` in `cell` and strike it from the neighbours. False when that
+    # empties one.
+    def assign(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&, cell: i64, digit: i64) -> bool:
+        can Abort.Panic:
+            Ints::put(grid, cell, digit)
+            bit: i64 = 1 << (digit - 1)
+            Ints::put(cand, cell, bit)
+            for index in 0..<board.peer_count |board, grid, cand, cell, bit|:
+                other: i64 = peer_at(board, cell, index)
+                if Ints::at_ref(grid, other) == 0 and (Ints::at_ref(cand, other) & bit) != 0:
+                    Ints::put(cand, other, Ints::at_ref(cand, other) & ~bit)
+                    false return if Ints::at_ref(cand, other) == 0
+            return true
+
+    # Take `bits` out of a cell. BROKEN when that leaves it with nothing.
+    def strike(cand: mutable darray[i64]&, cell: i64, bits: i64) -> i64:
+        can Abort.Panic:
+            Ints::put(cand, cell, Ints::at_ref(cand, cell) & ~bits)
+            return VERDICT_MOVED if Ints::at_ref(cand, cell) != 0 else VERDICT_BROKEN
+
+    # ------------------------------------------------------------
+    # The techniques
+    # ------------------------------------------------------------
+
+    def naked_single(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            for cell in 0..<board.cells |board, grid, cand|:
+                continue if Ints::at_ref(grid, cell) != 0
+                mask: i64 = Ints::at_ref(cand, cell)
+                VERDICT_BROKEN return if mask == 0
+                if single_bit(mask):
+                    return VERDICT_MOVED if assign(board, grid, cand, cell, bit_length(mask)) else VERDICT_BROKEN
+            return VERDICT_NONE
+
+    def hidden_single(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            size: i64 = board.size
+            for unit in 0..<board.unit_count |board, grid, cand, size|:
+                placed: mutable i64 = 0
+                for slot in 0..<size |board, grid, unit, placed|:
+                    value: i64 = Ints::at_ref(grid, unit_cell(board, unit, slot))
+                    placed <- placed | (1 << (value - 1)) if value != 0
+                for digit in 1..<(size + 1) |board, grid, cand, size, unit, placed|:
+                    bit: i64 = 1 << (digit - 1)
+                    continue if (placed & bit) != 0
+                    homes: mutable i64 = 0
+                    home_cell: mutable i64 = -1
+                    for slot in 0..<size |board, grid, cand, unit, bit, homes, home_cell|:
+                        cell: i64 = unit_cell(board, unit, slot)
+                        if Ints::at_ref(grid, cell) == 0 and (Ints::at_ref(cand, cell) & bit) != 0:
+                            home_cell <- cell if homes == 0
+                            homes <- homes + 1
+                    VERDICT_BROKEN return if homes == 0
+                    if homes == 1:
+                        return VERDICT_MOVED if assign(board, grid, cand, home_cell, digit) else VERDICT_BROKEN
+            return VERDICT_NONE
+
+    # Whether `value` is one of the first `count` entries of `holder`.
+    def holds(holder: mutable darray[i64]&, count: i64, value: i64) -> bool:
+        can Abort.Panic:
+            for slot in 0..<count |holder, value|:
+                true return if Ints::at_ref(holder, slot) == value
+            return false
+
+    # A digit boxed into one line, or confined to one box by a line.
+    #
+    # Which row, column or box a set of cells shares is ARITHMETIC here, as in
+    # the reference -- on a sixteen, computing it is the difference between
+    # this technique costing nothing and costing more than the rest together.
+    def locked_candidates(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = board.size
+            spots: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            for digit in 1..<(size + 1) |board, grid, cand, size, spots|:
+                bit: i64 = 1 << (digit - 1)
+                # pointing: box -> line
+                for which in 0..<size |board, grid, cand, size, spots, bit|:
+                    unit: i64 = 2 * size + which
+                    found: mutable i64 = 0
+                    for slot in 0..<size |board, grid, cand, unit, bit, spots, found|:
+                        cell: i64 = unit_cell(board, unit, slot)
+                        if Ints::at_ref(grid, cell) == 0 and (Ints::at_ref(cand, cell) & bit) != 0:
+                            Ints::put(&spots, found, cell)
+                            found <- found + 1
+                    continue if found < 2
+                    first: i64 = Ints::at_ref(&spots, 0)
+                    same_row: mutable bool = true
+                    same_col: mutable bool = true
+                    for slot in 0..<found |spots, size, first, same_row, same_col|:
+                        cell: i64 = Ints::at_ref(&spots, slot)
+                        same_row <- false if cell / size != first / size
+                        same_col <- false if cell % size != first % size
+                    for pass_index in 0..<2 |board, grid, cand, size, spots, bit, found, first, same_row, same_col|:
+                        line: mutable i64 = -1
+                        line <- first / size if pass_index == 0 and same_row
+                        line <- size + first % size if pass_index == 1 and same_col
+                        continue if line < 0
+                        touched: mutable bool = false
+                        broken: mutable bool = false
+                        for slot in 0..<size |board, grid, cand, line, bit, spots, found, touched, broken|:
+                            break if broken
+                            cell: i64 = unit_cell(board, line, slot)
+                            continue if holds(&spots, found, cell)
+                            continue if Ints::at_ref(grid, cell) != 0
+                            continue if (Ints::at_ref(cand, cell) & bit) == 0
+                            broken <- true if strike(cand, cell, bit) == VERDICT_BROKEN
+                            touched <- true if not broken
+                        VERDICT_BROKEN return if broken
+                        VERDICT_MOVED return if touched
+                # claiming: line -> box
+                for unit in 0..<(2 * size) |board, grid, cand, size, spots, bit|:
+                    found: mutable i64 = 0
+                    for slot in 0..<size |board, grid, cand, unit, bit, spots, found|:
+                        cell: i64 = unit_cell(board, unit, slot)
+                        if Ints::at_ref(grid, cell) == 0 and (Ints::at_ref(cand, cell) & bit) != 0:
+                            Ints::put(&spots, found, cell)
+                            found <- found + 1
+                    continue if found < 2
+                    home: i64 = box_of_cell(board, Ints::at_ref(&spots, 0))
+                    same_box: mutable bool = true
+                    for slot in 0..<found |board, spots, home, same_box|:
+                        same_box <- false if box_of_cell(board, Ints::at_ref(&spots, slot)) != home
+                    continue if not same_box
+                    touched: mutable bool = false
+                    broken: mutable bool = false
+                    for slot in 0..<size |board, grid, cand, size, home, bit, spots, found, touched, broken|:
+                        break if broken
+                        cell: i64 = unit_cell(board, 2 * size + home, slot)
+                        continue if holds(&spots, found, cell)
+                        continue if Ints::at_ref(grid, cell) != 0
+                        continue if (Ints::at_ref(cand, cell) & bit) == 0
+                        broken <- true if strike(cand, cell, bit) == VERDICT_BROKEN
+                        touched <- true if not broken
+                    VERDICT_BROKEN return if broken
+                    VERDICT_MOVED return if touched
+            return VERDICT_NONE
+
+    # `width` cells between them holding only `width` digits own those digits.
+    def naked_subset(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = board.size
+            open_cells: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            small: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            pick: mutable darray[i64] = Ints::zeros(WIDEST_SUBSET)
+            group: mutable darray[i64] = Ints::zeros(WIDEST_SUBSET)
+            for unit in 0..<board.unit_count |board, grid, cand, size, open_cells, small, pick, group|:
+                open_count: mutable i64 = 0
+                for slot in 0..<size |board, grid, unit, open_cells, open_count|:
+                    cell: i64 = unit_cell(board, unit, slot)
+                    if Ints::at_ref(grid, cell) == 0:
+                        Ints::put(&open_cells, open_count, cell)
+                        open_count <- open_count + 1
+                for width in 2..<(WIDEST_SUBSET + 1) |board, cand, open_cells, open_count, small, pick, group|:
+                    narrow: mutable i64 = 0
+                    for slot in 0..<open_count |cand, open_cells, small, narrow, width|:
+                        cell: i64 = Ints::at_ref(&open_cells, slot)
+                        if popcount(Ints::at_ref(cand, cell)) <= width:
+                            Ints::put(&small, narrow, cell)
+                            narrow <- narrow + 1
+                    continue if not combo_first(narrow, width, &pick)
+                    walking: mutable bool = true
+                    while walking |board, cand, open_cells, open_count, small, narrow, pick, group, width, walking|:
+                        for slot in 0..<width |small, pick, group|:
+                            Ints::put(&group, slot, Ints::at_ref(&small, Ints::at_ref(&pick, slot)))
+                        shared: mutable i64 = 0
+                        for slot in 0..<width |cand, group, shared|:
+                            shared <- shared | Ints::at_ref(cand, Ints::at_ref(&group, slot))
+                        if popcount(shared) == width:
+                            touched: mutable bool = false
+                            broken: mutable bool = false
+                            for slot in 0..<open_count |cand, open_cells, group, width, shared, touched, broken|:
+                                break if broken
+                                cell: i64 = Ints::at_ref(&open_cells, slot)
+                                continue if holds(&group, width, cell)
+                                continue if (Ints::at_ref(cand, cell) & shared) == 0
+                                broken <- true if strike(cand, cell, shared) == VERDICT_BROKEN
+                                touched <- true if not broken
+                            VERDICT_BROKEN return if broken
+                            VERDICT_MOVED return if touched
+                        walking <- combo_next(narrow, width, &pick)
+            return VERDICT_NONE
+
+    # `width` digits between them living in only `width` cells own those cells.
+    def hidden_subset(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = board.size
+            open_cells: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            # homes[digit] as a flat (digit -> cells) table with a count column.
+            home_cells: mutable darray[i64] = Ints::zeros(MOST_SIZE * MOST_SIZE)
+            home_count: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            fitting: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            pick: mutable darray[i64] = Ints::zeros(WIDEST_SUBSET)
+            shared: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            for unit in 0..<board.unit_count |board, grid, cand, size, open_cells, home_cells, home_count, fitting, pick, shared|:
+                open_count: mutable i64 = 0
+                for slot in 0..<size |board, grid, unit, open_cells, open_count|:
+                    cell: i64 = unit_cell(board, unit, slot)
+                    if Ints::at_ref(grid, cell) == 0:
+                        Ints::put(&open_cells, open_count, cell)
+                        open_count <- open_count + 1
+                # A digit with no home at all is not a contradiction here -- the
+                # reference only records the digits that HAVE spots, and leaves
+                # the empty ones out of `homes` entirely.
+                for digit in 1..<(size + 1) |cand, open_cells, open_count, home_cells, home_count|:
+                    bit: i64 = 1 << (digit - 1)
+                    found: mutable i64 = 0
+                    for slot in 0..<open_count |cand, open_cells, home_cells, bit, digit, found|:
+                        cell: i64 = Ints::at_ref(&open_cells, slot)
+                        if (Ints::at_ref(cand, cell) & bit) != 0:
+                            Ints::put(&home_cells, (digit - 1) * MOST_SIZE + found, cell)
+                            found <- found + 1
+                    Ints::put(&home_count, digit - 1, found)
+                for width in 2..<(WIDEST_SUBSET + 1) |board, cand, size, home_cells, home_count, fitting, pick, shared|:
+                    narrow: mutable i64 = 0
+                    for digit in 1..<(size + 1) |home_count, fitting, narrow, width|:
+                        count: i64 = Ints::at_ref(&home_count, digit - 1)
+                        if count > 0 and count <= width:
+                            Ints::put(&fitting, narrow, digit)
+                            narrow <- narrow + 1
+                    continue if not combo_first(narrow, width, &pick)
+                    walking: mutable bool = true
+                    while walking |cand, home_cells, home_count, fitting, narrow, pick, shared, width, walking|:
+                        span: mutable i64 = 0
+                        keep: mutable i64 = 0
+                        for slot in 0..<width |home_cells, home_count, fitting, pick, shared, span, keep|:
+                            digit: i64 = Ints::at_ref(&fitting, Ints::at_ref(&pick, slot))
+                            keep <- keep | (1 << (digit - 1))
+                            for at in 0..<Ints::at_ref(&home_count, digit - 1) |home_cells, shared, span, digit|:
+                                cell: i64 = Ints::at_ref(&home_cells, (digit - 1) * MOST_SIZE + at)
+                                if not holds(&shared, span, cell):
+                                    Ints::put(&shared, span, cell)
+                                    span <- span + 1
+                        if span == width:
+                            touched: mutable bool = false
+                            broken: mutable bool = false
+                            for slot in 0..<span |cand, shared, keep, touched, broken|:
+                                break if broken
+                                cell: i64 = Ints::at_ref(&shared, slot)
+                                continue if (Ints::at_ref(cand, cell) & ~keep) == 0
+                                broken <- true if strike(cand, cell, ~keep) == VERDICT_BROKEN
+                                touched <- true if not broken
+                            VERDICT_BROKEN return if broken
+                            VERDICT_MOVED return if touched
+                        walking <- combo_next(narrow, width, &pick)
+            return VERDICT_NONE
+
+    # X-wing and its wider cousins, both ways round: `width` lines holding a
+    # digit between them in only `width` lanes own those lanes, so the digit
+    # comes out of every other cell in them.
+    #
+    # `lane` is a POSITION within a base line, which is exactly the index of a
+    # cover line -- rows and columns are transposes of each other, which is why
+    # this works without any geometry beyond the unit order.
+    def fish(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = board.size
+            spot_line: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            spot_where: mutable darray[i64] = Ints::zeros(MOST_SIZE * MOST_SIZE)
+            spot_count: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            narrow_at: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            pick: mutable darray[i64] = Ints::zeros(WIDEST_FISH)
+            lanes: mutable darray[i64] = Ints::zeros(MOST_SIZE * WIDEST_FISH)
+            mine: mutable darray[i64] = Ints::zeros(WIDEST_FISH)
+            for digit in 1..<(size + 1) |board, grid, cand, size, spot_line, spot_where, spot_count, narrow_at, pick, lanes, mine|:
+                bit: i64 = 1 << (digit - 1)
+                for way in 0..<2 |board, grid, cand, size, bit, spot_line, spot_where, spot_count, narrow_at, pick, lanes, mine|:
+                    base_at: i64 = 0 if way == 0 else size
+                    cover_at: i64 = size if way == 0 else 0
+                    spots: mutable i64 = 0
+                    for index in 0..<size |board, grid, cand, size, bit, base_at, spot_line, spot_where, spot_count, spots|:
+                        where: mutable i64 = 0
+                        for pos in 0..<size |board, grid, cand, base_at, index, bit, spot_where, spots, where|:
+                            cell: i64 = unit_cell(board, base_at + index, pos)
+                            if Ints::at_ref(grid, cell) == 0 and (Ints::at_ref(cand, cell) & bit) != 0:
+                                Ints::put(&spot_where, spots * MOST_SIZE + where, pos)
+                                where <- where + 1
+                        if where >= 2:
+                            Ints::put(&spot_line, spots, index)
+                            Ints::put(&spot_count, spots, where)
+                            spots <- spots + 1
+                    for width in 2..<(WIDEST_FISH + 1) |board, grid, cand, size, bit, cover_at, spot_line, spot_where, spot_count, spots, narrow_at, pick, lanes, mine|:
+                        narrow: mutable i64 = 0
+                        for slot in 0..<spots |spot_count, narrow_at, narrow, width|:
+                            if Ints::at_ref(&spot_count, slot) <= width:
+                                Ints::put(&narrow_at, narrow, slot)
+                                narrow <- narrow + 1
+                        continue if not combo_first(narrow, width, &pick)
+                        walking: mutable bool = true
+                        while walking |board, grid, cand, size, bit, cover_at, spot_line, spot_where, spot_count, narrow_at, narrow, pick, lanes, mine, width, walking|:
+                            span: mutable i64 = 0
+                            for slot in 0..<width |spot_where, spot_count, narrow_at, pick, spot_line, lanes, mine, span|:
+                                at: i64 = Ints::at_ref(&narrow_at, Ints::at_ref(&pick, slot))
+                                Ints::put(&mine, slot, Ints::at_ref(&spot_line, at))
+                                for one in 0..<Ints::at_ref(&spot_count, at) |spot_where, lanes, span, at|:
+                                    pos: i64 = Ints::at_ref(&spot_where, at * MOST_SIZE + one)
+                                    if not holds(&lanes, span, pos):
+                                        Ints::put(&lanes, span, pos)
+                                        span <- span + 1
+                            if span == width:
+                                touched: mutable bool = false
+                                broken: mutable bool = false
+                                for slot in 0..<span |board, grid, cand, size, bit, cover_at, lanes, mine, width, touched, broken|:
+                                    break if broken
+                                    lane: i64 = Ints::at_ref(&lanes, slot)
+                                    for pos in 0..<size |board, grid, cand, cover_at, lane, bit, mine, width, touched, broken|:
+                                        break if broken
+                                        continue if holds(&mine, width, pos)
+                                        cell: i64 = unit_cell(board, cover_at + lane, pos)
+                                        continue if Ints::at_ref(grid, cell) != 0
+                                        continue if (Ints::at_ref(cand, cell) & bit) == 0
+                                        broken <- true if strike(cand, cell, bit) == VERDICT_BROKEN
+                                        touched <- true if not broken
+                                VERDICT_BROKEN return if broken
+                                VERDICT_MOVED return if touched
+                            walking <- combo_next(narrow, width, &pick)
+            return VERDICT_NONE
+
+    # One pass of the stack, cheapest technique first.
+    def try_tier(tier: i64, board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return naked_single(board, grid, cand) if tier == TIER_NAKED_SINGLE
+            return hidden_single(board, grid, cand) if tier == TIER_HIDDEN_SINGLE
+            return locked_candidates(board, grid, cand) if tier == TIER_LOCKED
+            return naked_subset(board, grid, cand) if tier == TIER_NAKED_SUBSET
+            return hidden_subset(board, grid, cand) if tier == TIER_HIDDEN_SUBSET
+            return fish(board, grid, cand)
+
+    # ------------------------------------------------------------
+    # Solving and rating
+    # ------------------------------------------------------------
+
+    struct Solved:
+        tier: mutable i64
+        sane: mutable bool
+
+    # Run the stack to a standstill. Always the CHEAPEST technique that does
+    # anything, and back to the top after every one that does -- which is what
+    # makes the tier a floor on the puzzle rather than an artefact of the order
+    # things were tried in.
+    def logic_solve(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> Solved:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable Solved = Solved{tier: 0, sane: true}
+            running: mutable bool = true
+            while running |board, grid, cand, out, running|:
+                blank: mutable bool = false
+                for cell in 0..<board.cells |grid, blank|:
+                    blank <- true if Ints::at_ref(grid, cell) == 0
+                break if not blank
+                moved: mutable bool = false
+                for tier in 0..<LOGIC_COUNT |board, grid, cand, out, moved, running|:
+                    break if moved or not running
+                    got: i64 = try_tier(tier, board, grid, cand)
+                    if got == VERDICT_BROKEN:
+                        out.sane <- false
+                        running <- false
+                    elif got == VERDICT_MOVED:
+                        out.tier <- tier if tier > out.tier
+                        moved <- true
+                break if not moved
+            return out
+
+    # Naked and hidden singles to a fixpoint. Not a rater -- it exists because
+    # the search needs to be CHEAP, and one that only forces naked singles
+    # branches far more than it has to.
+    def propagate(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = board.size
+            moving: mutable bool = true
+            while moving |board, grid, cand, size, moving|:
+                moving <- false
+                for cell in 0..<board.cells |board, grid, cand, moving|:
+                    continue if Ints::at_ref(grid, cell) != 0
+                    mask: i64 = Ints::at_ref(cand, cell)
+                    false return if mask == 0
+                    if single_bit(mask):
+                        false return if not assign(board, grid, cand, cell, bit_length(mask))
+                        moving <- true
+                for unit in 0..<board.unit_count |board, grid, cand, size, moving|:
+                    once: mutable i64 = 0
+                    twice: mutable i64 = 0
+                    placed: mutable i64 = 0
+                    for slot in 0..<size |board, grid, cand, unit, once, twice, placed|:
+                        cell: i64 = unit_cell(board, unit, slot)
+                        value: i64 = Ints::at_ref(grid, cell)
+                        if value != 0:
+                            placed <- placed | (1 << (value - 1))
+                        else:
+                            mask: i64 = Ints::at_ref(cand, cell)
+                            twice <- twice | (once & mask)
+                            once <- once | mask
+                    false return if (board.every & ~placed & ~once) != 0
+                    alone: mutable i64 = once & ~twice
+                    while alone != 0 |board, grid, cand, size, unit, alone, moving|:
+                        bit: i64 = alone & (0 - alone)
+                        alone <- alone ^ bit
+                        for slot in 0..<size |board, grid, cand, unit, bit, moving|:
+                            cell: i64 = unit_cell(board, unit, slot)
+                            continue if Ints::at_ref(grid, cell) != 0
+                            continue if (Ints::at_ref(cand, cell) & bit) == 0
+                            false return if not assign(board, grid, cand, cell, bit_length(bit))
+                            moving <- true
+                            break
+            return true
+
+    # Shared state for the propagating depth-first search.
+    struct Search:
+        limit: mutable i64
+        guesses: mutable i64
+        found: mutable i64
+        wins: mutable darray[i64]
+
+    def copy_of(values: mutable darray[i64]&, count: i64) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[i64] = Ints::zeros(count)
+            for slot in 0..<count |values, out|:
+                Ints::put(&out, slot, Ints::at_ref(values, slot))
+            return out
+
+    # The cell to branch on: fewest candidates, and the FIRST such in ascending
+    # cell order -- `min` returns the first minimum, so the search branches on
+    # the same cell CPython does.
+    def branch_cell(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            best: mutable i64 = -1
+            best_count: mutable i64 = 0
+            for cell in 0..<board.cells |grid, cand, best, best_count|:
+                continue if Ints::at_ref(grid, cell) != 0
+                count: i64 = popcount(Ints::at_ref(cand, cell))
+                if best < 0 or count < best_count:
+                    best <- cell
+                    best_count <- count
+            return best
+
+    def search_walk(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&, state: mutable Search&):
+        can Memory.Allocate, Abort.Panic:
+            return if state.found >= state.limit
+            return if not propagate(board, grid, cand)
+            cell: i64 = branch_cell(board, grid, cand)
+            if cell < 0:
+                for slot in 0..<board.cells |board, grid, state|:
+                    Ints::put(&state.wins, state.found * board.cells + slot, Ints::at_ref(grid, slot))
+                state.found <- state.found + 1
+                return
+            choices: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            count: i64 = bits_of(Ints::at_ref(cand, cell), &choices)
+            state.guesses <- state.guesses + 1 if count > 1
+            for slot in 0..<count |board, grid, cand, state, choices, cell|:
+                return if state.found >= state.limit
+                ahead: mutable darray[i64] = copy_of(grid, board.cells)
+                spare: mutable darray[i64] = copy_of(cand, board.cells)
+                if assign(board, &ahead, &spare, cell, Ints::at_ref(&choices, slot)):
+                    search_walk(board, &ahead, &spare, state)
+
+    struct Rated:
+        tier: mutable i64
+        guesses: mutable i64
+
+    # Up to `limit` complete grids the givens allow, into `state.wins`.
+    def solutions(board: Board&, givens: mutable darray[i64]&, limit: i64, state: mutable Search&):
+        can Memory.Allocate, Abort.Panic:
+            state.limit <- limit
+            state.guesses <- 0
+            state.found <- 0
+            cand: mutable darray[i64] = Ints::zeros(board.cells)
+            return if not candidates(board, givens, &cand)
+            grid: mutable darray[i64] = copy_of(givens, board.cells)
+            search_walk(board, &grid, &cand, state)
+
+    # The deepest technique this puzzle forces, and the guesses left over.
+    # (TIER_SEARCH, n) when the stack runs dry with n branch points still to
+    # guess at; (tier, 0) when the logic finished it.
+    def rate(board: Board&, givens: mutable darray[i64]&) -> Rated:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable Rated = Rated{tier: TIER_SEARCH, guesses: 0}
+            cand: mutable darray[i64] = Ints::zeros(board.cells)
+            out return if not candidates(board, givens, &cand)
+            grid: mutable darray[i64] = copy_of(givens, board.cells)
+            solved: Solved = logic_solve(board, &grid, &cand)
+            filled: mutable bool = true
+            for cell in 0..<board.cells |grid, filled|:
+                filled <- false if Ints::at_ref(&grid, cell) == 0
+            if solved.sane and filled:
+                out.tier <- solved.tier
+                out.guesses <- 0
+                return out
+            state: mutable Search = Search{limit: 1, guesses: 0, found: 0, wins: Ints::zeros(board.cells)}
+            solutions(board, givens, 1, &state)
+            out.tier <- TIER_SEARCH
+            out.guesses <- state.guesses if state.found > 0 else 0
+            return out
+
+    # ------------------------------------------------------------
+    # Generation
+    # ------------------------------------------------------------
+
+    struct Fill:
+        spent: mutable i64
+        done: mutable bool
+        grid: mutable darray[i64]
+
+    def fill_walk(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&, rng: mutable MT19937&, state: mutable Fill&):
+        can Memory.Allocate, Abort.Panic:
+            return if state.done
+            return if state.spent > FILL_BUDGET
+            return if not propagate(board, grid, cand)
+            cell: i64 = branch_cell(board, grid, cand)
+            if cell < 0:
+                for slot in 0..<board.cells |board, grid, state|:
+                    Ints::put(&state.grid, slot, Ints::at_ref(grid, slot))
+                state.done <- true
+                return
+            choices: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            count: i64 = bits_of(Ints::at_ref(cand, cell), &choices)
+            py_shuffle_i64_prefix(rng, &choices, count)
+            for slot in 0..<count |board, grid, cand, rng, state, choices, cell|:
+                return if state.done
+                state.spent <- state.spent + 1
+                return if state.spent > FILL_BUDGET
+                ahead: mutable darray[i64] = copy_of(grid, board.cells)
+                spare: mutable darray[i64] = copy_of(cand, board.cells)
+                if assign(board, &ahead, &spare, cell, Ints::at_ref(&choices, slot)):
+                    fill_walk(board, &ahead, &spare, rng, state)
+
+    # One complete, valid grid. Randomised depth-first, propagating after every
+    # placement, and RESTARTING an attempt that goes too deep rather than
+    # backtracking out of it -- the restart is what bounds the sixteen.
+    def full_grid(board: Board&, rng: mutable MT19937&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[i64] = Ints::zeros(board.cells)
+            settled: mutable bool = false
+            while not settled |board, rng, out, settled|:
+                grid: mutable darray[i64] = Ints::zeros(board.cells)
+                cand: mutable darray[i64] = Ints::zeros(board.cells)
+                continue if not candidates(board, &grid, &cand)
+                state: mutable Fill = Fill{spent: 0, done: false, grid: Ints::zeros(board.cells)}
+                fill_walk(board, &grid, &cand, rng, &state)
+                if state.done:
+                    for slot in 0..<board.cells |state, out|:
+                        Ints::put(&out, slot, Ints::at_ref(&state.grid, slot))
+                    settled <- true
+            return out
+
+    # Whether blanking `cell` leaves the puzzle with one solution still.
+    #
+    # Asked the CHEAP way round: counting solutions and checking there is
+    # exactly one means proving a second does not exist, a whole exhausted
+    # tree. Asking instead whether any PARTICULAR other digit fits pins that
+    # cell first, and a pinned cell prunes so hard that nearly every one of
+    # these dies during propagation.
+    def still_only_one(board: Board&, givens: mutable darray[i64]&, cell: i64, held: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            cand: mutable darray[i64] = Ints::zeros(board.cells)
+            false return if not candidates(board, givens, &cand)
+            choices: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            count: i64 = bits_of(Ints::at_ref(&cand, cell), &choices)
+            for slot in 0..<count |board, givens, choices, cell, held|:
+                digit: i64 = Ints::at_ref(&choices, slot)
+                continue if digit == held
+                trial: mutable darray[i64] = copy_of(givens, board.cells)
+                Ints::put(&trial, cell, digit)
+                state: mutable Search = Search{limit: 1, guesses: 0, found: 0, wins: Ints::zeros(board.cells)}
+                solutions(board, &trial, 1, &state)
+                false return if state.found > 0
+            return true
+
+    # Blank as many cells as will still leave exactly one solution. `keep`
+    # stops early, which is the whole lever for the easy end: a puzzle dug all
+    # the way out is nearly always a hard one.
+    def dig(board: Board&, full: mutable darray[i64]&, rng: mutable MT19937&, keep: i64) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            givens: mutable darray[i64] = copy_of(full, board.cells)
+            order: mutable darray[i64] = Ints::zeros(board.cells)
+            for slot in 0..<board.cells |order|:
+                Ints::put(&order, slot, slot)
+            py_shuffle_i64(rng, &order)
+            filled: mutable i64 = board.cells
+            for slot in 0..<board.cells |board, givens, order, keep, filled|:
+                break if keep != 0 and filled <= keep
+                cell: i64 = Ints::at_ref(&order, slot)
+                held: i64 = Ints::at_ref(&givens, cell)
+                Ints::put(&givens, cell, 0)
+                if still_only_one(board, &givens, cell, held):
+                    filled <- filled - 1
+                else:
+                    Ints::put(&givens, cell, held)
+            return givens
+
+    # A dealt puzzle: what is shown, what it comes to, and what it cost.
+    struct Puzzle:
+        box: mutable i64
+        cells: mutable i64
+        tier: mutable i64
+        guesses: mutable i64
+        givens: mutable darray[i64]
+        solution: mutable darray[i64]
+
+    # How far off the rung a puzzle is; smaller is better. Distance from the
+    # BAND first, shortfall in guesses second -- a puzzle of the right depth
+    # always beats one of the wrong depth, however much either branches.
+    struct Miss:
+        adrift: mutable i64
+        short: mutable i64
+
+    def miss_of(made: Puzzle&, grade: Grade) -> Miss:
+        can Abort.Panic:
+            adrift: mutable i64 = 0
+            if made.tier < grade.floor:
+                adrift <- (grade.floor - made.tier) * UNDERSHOOT_COST
+            elif made.tier > grade.ceiling:
+                adrift <- made.tier - grade.ceiling
+            short: mutable i64 = grade.guesses - made.guesses
+            short <- 0 if short < 0
+            return Miss{adrift: adrift, short: short}
+
+    def miss_beats(one: Miss, two: Miss) -> bool:
+        can Abort.Panic:
+            true return if one.adrift < two.adrift
+            false return if one.adrift > two.adrift
+            return one.short < two.short
+
+    def deal_one(grade: Grade, rng: mutable MT19937&) -> Puzzle:
+        can Memory.Allocate, Abort.Panic:
+            board: Board = board_of(grade.box)
+            full: mutable darray[i64] = full_grid(&board, rng)
+            givens: mutable darray[i64] = dig(&board, &full, rng, grade.keep)
+            rated: Rated = rate(&board, &givens)
+            return Puzzle{box: grade.box, cells: board.cells, tier: rated.tier,
+                          guesses: rated.guesses, givens: givens, solution: full}
+
+    # A puzzle at `level_number`, inside that rung's band.
+    #
+    # Rejection sampling, because there is no way to dig TOWARDS a tier -- the
+    # tier is a property of the finished puzzle and only a solver knows it.
+    # When nothing lands, the nearest miss is handed back, and it is nearest in
+    # a DIRECTION: UNDERSHOOT_COST makes a puzzle harder than asked for beat one
+    # that is easier, so a rung's name is a floor on the work even on the deals
+    # where its band was not found.
+    def generate(level_number: i64, seed: i64, attempts: i64) -> Puzzle:
+        can Memory.Allocate, Abort.Panic:
+            grade: Grade = grade_at(level_number)
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            tries: mutable i64 = attempts if attempts > 0 else grade.tries
+            tries <- 1 if tries < 1
+            nearest: mutable Puzzle = Puzzle{box: grade.box, cells: 0, tier: 0, guesses: 0,
+                                             givens: [], solution: []}
+            closest: mutable Miss = Miss{adrift: 99, short: 99}
+            landed: mutable bool = false
+            for attempt in 0..<tries |grade, rng, nearest, closest, landed|:
+                break if landed
+                made: Puzzle = deal_one(grade, &rng)
+                adrift: Miss = miss_of(&made, grade)
+                if adrift.adrift == 0 and adrift.short == 0:
+                    nearest <- made
+                    landed <- true
+                elif miss_beats(adrift, closest):
+                    nearest <- made
+                    closest <- adrift
+            return nearest
