@@ -6,6 +6,7 @@ Run with the original's own interpreter -- it needs pyglet and a GL context:
 
     --seed N        seed every generator before the task is built (default 0)
     --start         call the task's start_run(), which is what Space does
+                    -- after its own generator and clock have been taken over
     --ticks N       drive N ticks after launching, capturing after each
     --out PATH      write the JSON here instead of stdout (a scene may hold
                     text in any language, and a pipe is not the place to find
@@ -108,14 +109,38 @@ def live():
 
 
 overlay = live()
+
+# Two things a task holds that make it irreproducible, and both have to be
+# taken over before the run starts rather than after.
+#
+#   * `self.rng = random.Random()` -- its OWN generator, seeded from system
+#     entropy. Seeding the module-level one above does nothing to it, so a
+#     round dealt here would be a different round every run. This was found by
+#     reading the constructor, not by watching a suite flap.
+#   * `self.clock = time.time`, which the task's own comment says the agent
+#     environment swaps for a virtual clock. A wall clock makes a tick mean
+#     "however long the process took", so the phase a frame is captured in
+#     would depend on the machine.
+CLOCK = [0.0]
+
+if overlay is not None:
+    if hasattr(overlay, "rng"):
+        overlay.rng = random.Random(seed)
+    if hasattr(overlay, "clock"):
+        overlay.clock = lambda: CLOCK[0]
+
 if "--start" in sys.argv and overlay is not None:
     begin = getattr(overlay, "start_run", None)
     if begin is not None:
         begin()
 
 frames = [framerec.capture()]
+label_metrics = [framerec.metrics()]
 for _each in range(ticks):
     overlay = live()
+    # A tick is a step of the virtual clock, so "one tick" means the same
+    # elapsed time on every machine and in the port.
+    CLOCK[0] += 1.0 / 60.0
     if overlay is not None:
         # Every task carries one of these two and no task carries both under
         # different meanings: `update` for the ones that animate, `step` for
@@ -125,6 +150,7 @@ for _each in range(ticks):
         if drive is not None:
             drive(1.0 / 60.0)
     frames.append(framerec.capture())
+    label_metrics.append(framerec.metrics())
 
 payload = json.dumps({
     "task": task,
@@ -133,6 +159,7 @@ payload = json.dumps({
     "reference": [width, height],
     "physical": [physical_w, physical_h],
     "frames": frames,
+    "metrics": label_metrics,
 })
 where = flag("--out")
 if where:

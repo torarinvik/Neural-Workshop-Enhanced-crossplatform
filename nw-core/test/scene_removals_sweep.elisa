@@ -1,0 +1,168 @@
+# Differential sweep driver for src/scene_removals.elisa.
+#
+# See scene_removals_diff.py for the reference side, which builds the REAL
+# pyglet screen headless and reads back what it drew.
+#
+# The frame is emitted in framerec's canonical form so the two sides are one
+# string comparison. Numbers cross as the i32 their f32 bytes spell: the
+# display list stores f32, that IS the contract, and comparing at f64 would
+# compare a precision the format does not deliver. Bits rather than a rounded
+# decimal, so that nothing is compared at a tolerance.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/strings.elisa"
+include "../src/geometry.elisa"
+include "../src/display.elisa"
+include "../src/tasks/removals.elisa"
+include "../src/scene_removals.elisa"
+
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_bar(value: i64):
+    can Console.Write, Abort.Panic:
+        printr("|")
+        print_i64(value)
+
+# An f32 as the i32 its bytes spell, which is what the harness prints.
+def emit_f32(value: f32):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            holder: f32[1] = [value]
+            bits: mutable i32[1] = [0.i32()]
+            memcpy((&bits[0]).cast[mutable void&], (&holder[0]).cast[void&], 4.usize())
+            emit_bar(bits[0].i64())
+
+def emit_color(color: u32):
+    can Console.Write, Abort.Panic:
+        printr("|")
+        print_i64(((color >> 24.u32()) & 255.u32()).i64())
+        printr(".")
+        print_i64(((color >> 16.u32()) & 255.u32()).i64())
+        printr(".")
+        print_i64(((color >> 8.u32()) & 255.u32()).i64())
+        printr(".")
+        print_i64((color & 255.u32()).i64())
+
+# The pool slice a TEXT command names, wrapped the way Python's `repr` of a
+# str wraps it. Every string this screen draws is quote-free and
+# backslash-free, so a single-quote wrap is repr exactly; a screen that draws
+# an apostrophe will need this to grow, and will say so by failing.
+def emit_text(list: mutable Display::DisplayList&, cmd: Display::DrawCmd&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        printr("|'")
+        offset: i64 = cmd.ref.i64()
+        length: i64 = (cmd.len & 16777215.u32()).i64()
+        text: mutable darray[u8] = Bytes::zeros(length + 1)
+        for index in 0..<length |text, list, offset|:
+            Bytes::put(&text, index, Bytes::at_ref(&list.pool, offset + index))
+        Bytes::put(&text, length, 0.u8())
+        trusted Unsafe.PointerCast:
+            printr((&text[0.usize()]).cast[cstr])
+        printr("'")
+
+def emit_anchor(cmd: Display::DrawCmd&):
+    can Console.Write, Abort.Panic:
+        anchor: i64 = (cmd.len >> 24.u32()).i64()
+        across: i64 = anchor % 3
+        down: i64 = anchor / 3
+        printr("|left" if across == 0 else "|center" if across == 1 else "|right")
+        printr("|bottom" if down == 0 else "|center" if down == 1 else "|top")
+
+def emit_command(list: mutable Display::DisplayList&, cmd: Display::DrawCmd&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        kind: i64 = cmd.kind.i64()
+        print_i64(kind)
+        emit_f32(cmd.a)
+        emit_f32(cmd.b)
+        emit_color(cmd.color)
+        if kind == Display::CMD_RECT.i64():
+            emit_f32(cmd.c)
+            emit_f32(cmd.d)
+        if kind == Display::CMD_CIRCLE.i64():
+            emit_f32(cmd.c)
+        if kind == Display::CMD_LINE.i64():
+            emit_f32(cmd.c)
+            emit_f32(cmd.d)
+            emit_f32(cmd.e)
+        if kind == Display::CMD_TRIANGLE.i64():
+            emit_f32(cmd.c)
+            emit_f32(cmd.d)
+            emit_f32(cmd.e)
+            emit_f32(cmd.f)
+        if kind == Display::CMD_TEXT.i64():
+            emit_text(list, cmd)
+            emit_f32(cmd.c)
+            emit_anchor(cmd)
+            printr("|bold" if cmd.d != 0.0.f32() else "|normal")
+        print("")
+
+def emit_frame(list: mutable Display::DisplayList&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        for index in 0..<list.commands.count.i64() |list|:
+            emit_command(list, &list.commands[index.usize()])
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(512 * 1024 * 1024)
+        in w:
+            work: mutable Removals::Work = Removals::Work()
+            got: mutable Removals::Round = Removals::Round()
+            best: mutable Removals::Round = Removals::Round()
+            # The window the reference is driven at: 912x684 reference units on
+            # a retina display, so 1824x1368 physical and a scale of two.
+            width: f64 = 1824.0
+            height: f64 = 1368.0
+            for spec in 0..<24 |work, got, best, width, height|:
+                rung: i64 = 1 + spec % 12
+                seed: i64 = 1000 + spec * 7
+                black: bool = spec % 6 == 5
+                ok: bool = Removals::generate(&work, rung, seed, 200, &got, &best)
+                phase: i64 = SceneRemovals::PHASE_MOVING if spec % 3 != 2 else SceneRemovals::PHASE_ASKING
+                cursor: i64 = (spec * 3) % got.move_n if got.move_n > 0 else 0
+                asking_at: i64 = spec % got.asked_n if got.asked_n > 0 else 0
+                printr("spec|")
+                print_i64(spec)
+                emit_bar(rung)
+                emit_bar(seed)
+                emit_bar(1 if ok else 0)
+                emit_bar(1 if black else 0)
+                emit_bar(phase)
+                emit_bar(cursor)
+                emit_bar(asking_at)
+                emit_bar(got.yard.vans)
+                emit_bar(got.move_n)
+                emit_bar(got.asked_n)
+                print("")
+                list: mutable Display::DisplayList = Display::DisplayList()
+                paint: SceneRemovals::Paint = SceneRemovals::paint_of(black, width, height, 2.0, 2.0)
+                SceneRemovals::render(&list, &paint, &got, phase, rung, 1 + spec % 5,
+                                      5, cursor, asking_at)
+                emit_frame(&list)
+                print("end")
+        destroy w
+        return 0

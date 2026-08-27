@@ -35,6 +35,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 from __future__ import annotations
 
 import itertools
+import struct
 import weakref
 
 import pyglet
@@ -70,6 +71,22 @@ def _wrap(module, name):
             if name in ("Polygon", "MultiLine"):
                 # Variable-length, and pyglet keeps only the flattened form.
                 keep["coordinates"] = [tuple(one) for one in args]
+            elif name == "Triangle":
+                # pyglet 2.1.16's Triangle.x2 getter returns `x + x2`: the
+                # constructor stores the second vertex absolute and the getter
+                # adds the anchor anyway. Line.x2 does NOT do this, so it is a
+                # bug in the one class and not a convention.
+                #
+                #   Triangle(10, 20, 100, 200, 300, 400).x2  ->  110.0
+                #   Line(10, 20, 100, 200).x2                ->  100.0
+                #
+                # Every arrowhead in the game is a Triangle, so a recorder that
+                # trusted the getter would have mis-measured all of them by the
+                # anchor -- and consistently, on both the reference and nothing
+                # to compare it against, which is how it would have gone
+                # unnoticed. The constructor's own numbers are kept instead,
+                # plus wherever the shape has since been moved to.
+                keep["vertices"] = [float(one) for one in args[:6]]
             _register(self, name, keep)
 
     Recorded.__name__ = original.__name__
@@ -124,9 +141,23 @@ def _group_order(group):
 _SCALE = [1.0, 1.0]
 
 
+#: When true, every number is printed as the i32 its f32 bytes spell.
+#:
+#: The display list stores coordinates as f32 -- that IS the contract, and
+#: comparing at f64 would compare a precision the format does not deliver and
+#: fail on every command. Bits rather than a rounded decimal so that nothing is
+#: compared at a tolerance: a coordinate half a float out is a layout bug, and
+#: printing it to six places is how such a bug survives a suite.
+_BITS = [False]
+
+
 def set_scale(sx, sy):
     _SCALE[0] = float(sx)
     _SCALE[1] = float(sy)
+
+
+def set_bits(on=True):
+    _BITS[0] = bool(on)
 
 
 def _number(value, axis=None):
@@ -139,6 +170,8 @@ def _number(value, axis=None):
     value = float(value)
     if axis is not None:
         value = value / _SCALE[axis]
+    if _BITS[0]:
+        return str(struct.unpack("<i", struct.pack("<f", value))[0])
     return repr(value)
 
 
@@ -158,15 +191,26 @@ def _visible(obj):
 #: Which live attributes make up each kind, beyond x/y/colour, and which axis
 #: each is measured on. None means the number is not a length: a segment count,
 #: an angle in degrees and a spike count are all scale-free.
+#: Fields the DISPLAY LIST carries. Anything pyglet knows and a command does
+#: not is absent on purpose, and each absence is a decision:
+#:
+#:   * `segments` on a circle -- pyglet picks a count from the radius; the
+#:     format names a circle and lets the shell tessellate it.
+#:   * `rotation` on a rectangle -- the format has no field for it. `e` and `f`
+#:     are free on a RECT and this is where it would go; nothing in the port
+#:     needs it yet, and comparing a field the format cannot carry would fail
+#:     every frame rather than find anything.
+#:   * a label's italic, multiline, width and align -- the core resolves a
+#:     multiline block into one command a line (see scene_title.elisa) rather
+#:     than asking a shell to reproduce another toolkit's line spacing.
 _FIELDS = {
-    "Rectangle": (("width", 0), ("height", 1), ("rotation", None)),
+    "Rectangle": (("width", 0), ("height", 1)),
     "BorderedRectangle": (("width", 0), ("height", 1), ("border", 1)),
     "Box": (("width", 0), ("height", 1), ("thickness", 1)),
-    "Circle": (("radius", 1), ("segments", None)),
-    "Arc": (("radius", 1), ("segments", None), ("angle", None),
-            ("start_angle", None), ("thickness", 1)),
+    "Circle": (("radius", 1),),
+    "Arc": (("radius", 1), ("start_angle", None), ("angle", None)),
     "Line": (("x2", 0), ("y2", 1), ("thickness", 1)),
-    "Triangle": (("x2", 0), ("y2", 1), ("x3", 0), ("y3", 1)),
+
     "Star": (("outer_radius", 1), ("inner_radius", 1),
              ("num_spikes", None), ("rotation", None)),
     "MultiLine": (("thickness", 1),),
@@ -174,20 +218,24 @@ _FIELDS = {
 
 
 def _label_cells(obj):
+    """The label's COMMAND cells.
+
+    `font_name` is deliberately absent: the reference passes a fallback list
+    and the core names an asset, so comparing them would compare two spellings
+    of "whatever this machine has". `content_width`/`content_height` are absent
+    for a stronger reason -- they are pyglet's own text measurement, which
+    docs/display-list.md puts on the shell's side of the seam. They come back
+    from `metrics()` instead, because a scene whose LAYOUT reads them is a
+    scene that cannot be ported without baking the number, and knowing which
+    ones do is worth a separate look.
+    """
     out = [
         repr(obj.text),
-        str(obj.font_name),
         _number(obj.font_size or 0.0, 1),
         str(obj.anchor_x), str(obj.anchor_y),
         # pyglet 2.1 replaced `bold` with a named weight; the reference asks
         # for bold in three places and the name is what it now stores.
         str(getattr(obj, "weight", "normal")),
-        "1" if getattr(obj, "italic", False) else "0",
-        "1" if getattr(obj, "multiline", False) else "0",
-        _number(getattr(obj, "width", None) or 0.0, 0),
-        str(obj.document.get_style("align") or "left"),
-        _number(getattr(obj, "content_width", 0.0), 0),
-        _number(getattr(obj, "content_height", 0.0), 1),
     ]
     return out
 
@@ -199,6 +247,27 @@ def _sprite_cells(obj):
         _number(getattr(obj, "rotation", 0.0)),
         str(getattr(image, "width", 0)), str(getattr(image, "height", 0)),
     ]
+
+
+def metrics():
+    """Every live label's measured size, which is NOT part of a command.
+
+    The reference reads `content_width`/`content_height` in ten places across
+    seven modules. Each is a place where a layout depends on pyglet's text
+    measurement, and each therefore has to be either baked as a constant --
+    which is what scene_title.elisa does with a multiline label's 16.5 -- or
+    left alone. This is how to find them.
+    """
+    out = []
+    for serial, kind, ref, _extra in _LIVE:
+        obj = ref()
+        if obj is None or kind != "Label":
+            continue
+        out.append("%d|%s|%s|%s" % (
+            serial, repr(obj.text),
+            _number(getattr(obj, "content_width", 0.0), 0),
+            _number(getattr(obj, "content_height", 0.0), 1)))
+    return out
 
 
 def capture(want_invisible=False):
@@ -218,6 +287,13 @@ def capture(want_invisible=False):
             cells.extend(_label_cells(obj))
         elif kind == "Sprite":
             cells.extend(_sprite_cells(obj))
+        elif kind == "Triangle":
+            base = extra["vertices"]
+            shift_x = obj.x - base[0] / 1.0
+            shift_y = obj.y - base[1] / 1.0
+            for at in range(2, 6, 2):
+                cells.append(_number(base[at] + shift_x, 0))
+                cells.append(_number(base[at + 1] + shift_y, 1))
         elif kind == "Polygon":
             for point in extra.get("coordinates", ()):
                 cells.extend(_number(one, at) for at, one in enumerate(point))

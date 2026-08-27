@@ -1,0 +1,394 @@
+# The Removals screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/removals.py -- the drawing, not the thinking. The
+# thinking is src/tasks/removals.elisa and was ported first; this is the walk
+# drawn on screen.
+#
+# The property the whole task rests on is a DRAWING property, so it is this
+# file's to keep: the vans are drawn as empty bays and never filled, and no box
+# is ever drawn with anything in it. Everything on screen comes off the move
+# alone, so two rounds whose yards differ but whose moves agree are the same
+# picture. `tests/test_removals` in the reference checks that by rendering two
+# such rounds and comparing bytes, and it is why `render` is handed the move and
+# the yard's SHAPE rather than the yard.
+#
+# Layout works in PIXELS, not in reference space, and that is deliberate. The
+# reference lays out against the live window -- which is retina-doubled here --
+# and some of its arithmetic truncates. `int(x * width)` at 1824 is not twice
+# `int(x * width)` at 912, so a port that worked in 912x684 would be a different
+# program. Every function here takes the pixel size, exactly as Geometry:: does,
+# and the division to reference space happens once, in the sweep, where the
+# extractor does it too.
+#
+# NOTE: needs elisacore_math, geometry, display and tasks/removals included by
+# the driver.
+
+module SceneRemovals:
+
+    # Okabe-Ito, used differently from In the Dark's. There a colour WAS the
+    # answer, so two that could be confused would have made an eye test of the
+    # task and the palette was cut to five. Here everything carries its number
+    # too and colour is only a second way of telling two apart, so the whole
+    # set is used, near neighbours and all, with a neutral to make eight.
+    const ITEM_COLOR_COUNT: i64 = 8
+
+    def item_color(which: i64) -> u32:
+        can Abort.Panic:
+            step: i64 = which % ITEM_COLOR_COUNT
+            return Display::rgba(230, 159, 0, 255) if step == 0
+            return Display::rgba(86, 180, 233, 255) if step == 1
+            return Display::rgba(0, 158, 115, 255) if step == 2
+            return Display::rgba(240, 228, 66, 255) if step == 3
+            return Display::rgba(0, 114, 178, 255) if step == 4
+            return Display::rgba(213, 94, 0, 255) if step == 5
+            return Display::rgba(204, 121, 167, 255) if step == 6
+            return Display::rgba(140, 140, 140, 255)
+
+    def grade_name(rung: i64) -> cstr:
+        can Abort.Panic:
+            step: mutable i64 = rung - 1
+            step <- 0 if step < 0
+            step <- Removals::GRADE_COUNT - 1 if step > Removals::GRADE_COUNT - 1
+            return "first load" if step == 0
+            return "two vans" if step == 1
+            return "stacking up" if step == 2
+            return "a box in a box" if step == 3
+            return "three deep" if step == 4
+            return "the shuffle" if step == 5
+            return "four vans" if step == 6
+            return "deep stack" if step == 7
+            return "the tangle" if step == 8
+            return "nightmare" if step == 9
+            return "inhuman" if step == 10
+            return "superhuman"
+
+    # Phases, as the reference spells them.
+    const PHASE_READY: i64 = 0
+    const PHASE_MOVING: i64 = 1
+    const PHASE_ASKING: i64 = 2
+    const PHASE_SCORED: i64 = 3
+
+
+    # Everything a draw needs that is not geometry, plus the scale.
+    #
+    # The scale is HERE and not in the sweep because of the order of two
+    # roundings. The recorder divides pyglet's f64 by the window scale and then
+    # the comparison takes it to f32; a port that stored f32 in the list and
+    # divided afterwards would round twice, in the other order. For the retina
+    # factor of exactly two those happen to agree -- halving an f32 is exact --
+    # but relying on that would make the suite pass for a reason that has
+    # nothing to do with the layout being right.
+    struct Paint:
+        ink: mutable u32
+        paper: mutable u32
+        text: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        # `bg = 0 if BLACK_BACKGROUND else 255; fg = 255 - bg`
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     paper: Display::rgba(back, back, back, 255),
+                     text: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                 y: f64, width: f64, height: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               width / paint.sx, height / paint.sy, color)
+
+    def put_circle(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                   y: f64, radius: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_circle(list, x / paint.sx, y / paint.sy,
+                                 radius / paint.sy, color)
+
+    def put_line(list: mutable Display::DisplayList&, paint: Paint&, x1: f64,
+                 y1: f64, x2: f64, y2: f64, thick: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_line(list, x1 / paint.sx, y1 / paint.sy,
+                               x2 / paint.sx, y2 / paint.sy,
+                               thick / paint.sy, color)
+
+    def put_triangle(list: mutable Display::DisplayList&, paint: Paint&,
+                     x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64,
+                     color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_triangle(list, x1 / paint.sx, y1 / paint.sy,
+                                   x2 / paint.sx, y2 / paint.sy,
+                                   x3 / paint.sx, y3 / paint.sy, color)
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    # The stage: left, bottom, width, height, in pixels.
+    struct Stage:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def stage_of(out: mutable Stage&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 105.0).f64()
+            bottom: f64 = Geometry::from_bottom_edge(height, 60.0).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.1
+            out.bottom <- bottom
+            out.width <- width * 0.8
+            out.height <- room if room > 60.0 else 60.0
+
+    # The bay one van stands in.
+    def van_rect(out: mutable Stage&, area: Stage&, van: i64, vans: i64):
+        can Abort.Panic:
+            span: f64 = area.width / vans.f64()
+            pad: f64 = span * 0.12
+            out.left <- area.left + span * van.f64() + pad
+            out.bottom <- area.bottom + area.height * 0.06
+            out.width <- span - pad * 2.0
+            out.height <- area.height * 0.17
+
+    # How big a thing or a box is drawn.
+    def glyph_size(area: Stage&) -> f64:
+        wide: f64 = area.width / 9.0
+        tall: f64 = area.height * 0.15
+        return wide if wide < tall else tall
+
+    # A hollow rectangle: ink, with the background punched out. Two commands
+    # and not a Box, because that is what the reference builds and a Box would
+    # centre its stroke on the edge rather than inside it.
+    def outline(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                y: f64, width: f64, height: f64, thick: f64):
+        can Memory.Allocate, Abort.Panic:
+            put_rect(list, paint, x, y, width, height, paint.ink)
+            inner_w: f64 = width - thick * 2.0
+            inner_h: f64 = height - thick * 2.0
+            put_rect(list, paint, x + thick, y + thick,
+                     inner_w if inner_w > 1.0 else 1.0,
+                     inner_h if inner_h > 1.0 else 1.0, paint.paper)
+
+    def font_size(height: f64, size: f64) -> f64:
+        return Geometry::calc_fontsize(height, size)
+
+    # One digit, centred. Split out because every glyph draws one and they all
+    # want the same weight and anchor.
+    def number_label(list: mutable Display::DisplayList&, paint: Paint&,
+                     value: i64, x: f64, y: f64, size: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            text: mutable dstr = []
+            dstr_append_i64(&text, value)
+            put_text(list, paint, bytes_view(text), x, y, size, color,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+    # The vans: empty bays, drawn from their number and nothing else.
+    def draw_vans(list: mutable Display::DisplayList&, paint: Paint&,
+                  area: Stage&, vans: i64):
+        can Memory.Allocate, Abort.Panic:
+            bay: mutable Stage = Stage{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            for van in 0..<vans |list, paint, area, vans, bay|:
+                van_rect(&bay, area, van, vans)
+                thick: f64 = bay.height * 0.1
+                outline(list, paint, bay.left, bay.bottom, bay.width, bay.height,
+                        thick if thick > 2.0 else 2.0)
+                number_label(list, paint, van + 1, bay.left + bay.width / 2.0,
+                             bay.bottom + bay.height / 2.0,
+                             font_size(paint.height, 15.0), paint.text)
+
+    # One thing or one box, drawn at its own middle.
+    #
+    # A thing is a filled disc in its colour, a box a hollow square. Both carry
+    # their number, because the number is what the moves are about and the
+    # colour is only there to make two of them easier to keep apart.
+    def glyph(list: mutable Display::DisplayList&, paint: Paint&,
+              yard: Removals::Yard&, node: i64, x: f64, y: f64, size: f64):
+        can Memory.Allocate, Abort.Panic:
+            if Removals::is_item(yard, node):
+                which: i64 = node - yard.vans - yard.boxes
+                put_circle(list, paint, x, y, size * 0.5, paint.ink)
+                put_circle(list, paint, x, y, size * 0.42, item_color(which))
+                number_label(list, paint, which + 1, x, y,
+                             font_size(paint.height, 14.0),
+                             Display::rgba(0, 0, 0, 255))
+            else:
+                thick: f64 = size * 0.09
+                outline(list, paint, x - size * 0.5, y - size * 0.5, size, size,
+                        thick if thick > 2.0 else 2.0)
+                number_label(list, paint, node - yard.vans + 1, x, y,
+                             font_size(paint.height, 14.0), paint.text)
+
+    # A line with an arrowhead on one end, or on both.
+    def arrow(list: mutable Display::DisplayList&, paint: Paint&, from_x: f64,
+              from_y: f64, to_x: f64, to_y: f64, thick: f64, heads: i64):
+        can Memory.Allocate, Abort.Panic:
+            put_line(list, paint, from_x, from_y, to_x, to_y, thick, paint.ink)
+            # `math.hypot(...) or 1.0` -- a zero-length arrow keeps a unit
+            # divisor rather than dividing by nothing.
+            measured: f64 = py_hypot(to_x - from_x, to_y - from_y)
+            span: f64 = measured if measured != 0.0 else 1.0
+            step_x: f64 = (to_x - from_x) / span
+            step_y: f64 = (to_y - from_y) / span
+            size: f64 = thick * 2.4
+            for head in 0..<heads |list, paint, to_x, to_y, from_x, from_y, step_x, step_y, size|:
+                tip_x: f64 = to_x if head == 0 else from_x
+                tip_y: f64 = to_y if head == 0 else from_y
+                way_x: f64 = step_x if head == 0 else -step_x
+                way_y: f64 = step_y if head == 0 else -step_y
+                back_x: f64 = tip_x - way_x * size
+                back_y: f64 = tip_y - way_y * size
+                put_triangle(list, paint, tip_x, tip_y,
+                             back_x - way_y * size * 0.6,
+                             back_y + way_x * size * 0.6,
+                             back_x + way_y * size * 0.6,
+                             back_y - way_x * size * 0.6, paint.ink)
+
+    # What this move does, over the row of bays.
+    #
+    # Drawn from the move alone. A pack is the thing, an arrow, and the holder;
+    # when the holder is a van the arrow runs on down into its bay instead,
+    # which is the only time the row is pointed at and still says nothing about
+    # what is in it.
+    def draw_move(list: mutable Display::DisplayList&, paint: Paint&,
+                  area: Stage&, yard: Removals::Yard&, kind: i64, thing: i64,
+                  other: i64):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            band: f64 = area.bottom + area.height * 0.58
+            size: f64 = glyph_size(area)
+            raw_thick: f64 = size * 0.12
+            thick: f64 = raw_thick if raw_thick > 2.0 else 2.0
+            gap: f64 = size * 1.9
+            if kind == Removals::PACK and Removals::is_van(yard, other):
+                glyph(list, paint, yard, thing, middle, band, size)
+                bay: mutable Stage = Stage{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+                van_rect(&bay, area, other, yard.vans)
+                arrow(list, paint, middle, band - size * 0.6,
+                      bay.left + bay.width / 2.0, bay.bottom + bay.height * 1.15,
+                      thick, 1)
+                return
+            glyph(list, paint, yard, thing, middle - gap, band, size)
+            glyph(list, paint, yard, other, middle + gap, band, size)
+            arrow(list, paint, middle - gap + size * 0.62, band,
+                  middle + gap - size * 0.62, band, thick,
+                  1 if kind == Removals::PACK else 2)
+
+    # The thing being asked about, over the bays it might be in.
+    def draw_question(list: mutable Display::DisplayList&, paint: Paint&,
+                      area: Stage&, yard: Removals::Yard&, asked: i64):
+        can Memory.Allocate, Abort.Panic:
+            size: f64 = glyph_size(area)
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            glyph(list, paint, yard, asked, middle,
+                  area.bottom + area.height * 0.58, size * 1.3)
+            put_text(list, paint, sview("which van?", 0, -1), middle,
+                     area.bottom + area.height * 0.40,
+                     font_size(paint.height, 15.0), paint.text,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+    # --- the chrome, and the whole frame ------------------------------------
+
+    # `'%s — %d vans, %d moves'`. The dash is an em dash, U+2014, three bytes
+    # of UTF-8 -- and it is inside a translated string, so it is the reference's
+    # bytes that matter and not a hyphen that looks close enough.
+    def append_em_dash(out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            out.push(226.u8())
+            out.push(128.u8())
+            out.push(148.u8())
+
+    def message_moving(out: mutable dstr&, rung: i64, vans: i64, moves: i64):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_cstr(out, grade_name(rung))
+            dstr_append_cstr(out, " ")
+            append_em_dash(out)
+            dstr_append_cstr(out, " ")
+            dstr_append_i64(out, vans)
+            dstr_append_cstr(out, " vans, ")
+            dstr_append_i64(out, moves)
+            dstr_append_cstr(out, " moves")
+
+    # `'     '.join(parts)` -- five spaces, which is the reference's own
+    # spelling of a gap in a status line and not a tab or a pair of them.
+    def status_text(out: mutable dstr&, message: sview, phase: i64,
+                    trial: i64, total_trials: i64, cursor: i64, moves: i64,
+                    yard: Removals::Yard&, asked: i64):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_sview(out, message)
+            if phase == PHASE_MOVING:
+                dstr_append_cstr(out, "     round ")
+                dstr_append_i64(out, trial)
+                dstr_append_cstr(out, "/")
+                dstr_append_i64(out, total_trials)
+                dstr_append_cstr(out, "   move ")
+                dstr_append_i64(out, cursor + 1)
+                dstr_append_cstr(out, "/")
+                dstr_append_i64(out, moves)
+            if phase == PHASE_ASKING:
+                dstr_append_cstr(out, "     thing ")
+                dstr_append_i64(out, asked - yard.vans - yard.boxes + 1)
+                dstr_append_cstr(out, " ")
+                append_em_dash(out)
+                dstr_append_cstr(out, " which van?")
+
+    # The chrome, in the order `_build_chrome` builds it -- which is the order
+    # the frame comes back in, because a batch with no groups draws in creation
+    # order and the chrome is built before anything is drawn into it.
+    def draw_chrome(list: mutable Display::DisplayList&, paint: Paint&,
+                    status: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            put_text(list, paint, sview("Removals", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     font_size(paint.height, 22.0), paint.text,
+                     Display::ANCHOR_CENTER_CENTER, true)
+            put_text(list, paint, status, middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     font_size(paint.height, 14.0), paint.text,
+                     Display::ANCHOR_CENTER_CENTER, false)
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     1-5: answer     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     font_size(paint.height, 12.0), paint.text,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+    # One frame. `_redraw` draws the vans and then the phase's own picture; the
+    # chrome is already there, so it comes first.
+    # `round` is taken mutably and never written. `Ints::at_ref` is the only
+    # way to read a darray behind a reference without copying it, and it asks
+    # for a mutable one; a `mutable` here is cheaper than a second reader in
+    # ints.elisa that forty-five suites would have to be re-run behind.
+    def render(list: mutable Display::DisplayList&, paint: Paint&,
+               round: mutable Removals::Round&, phase: i64, rung: i64, trial: i64,
+               total_trials: i64, cursor: i64, asking_at: i64):
+        can Memory.Allocate, Abort.Panic:
+            area: mutable Stage = Stage{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            stage_of(&area, paint.width, paint.height)
+            asked: i64 = Ints::at_ref(&round.asked, asking_at) if asking_at < round.asked_n else 0
+
+            message: mutable dstr = []
+            if phase == PHASE_MOVING:
+                message_moving(&message, rung, round.yard.vans, round.move_n)
+            if phase == PHASE_ASKING:
+                dstr_append_cstr(&message, "The doors close")
+            status: mutable dstr = []
+            status_text(&status, bytes_view(message), phase, trial, total_trials,
+                        cursor, round.move_n, &round.yard, asked)
+            draw_chrome(list, paint, bytes_view(status))
+
+            return if phase == PHASE_READY
+            draw_vans(list, paint, &area, round.yard.vans)
+            if phase == PHASE_MOVING:
+                draw_move(list, paint, &area, &round.yard,
+                          Ints::at_ref(&round.move_kind, cursor),
+                          Ints::at_ref(&round.move_thing, cursor),
+                          Ints::at_ref(&round.move_other, cursor))
+            if phase == PHASE_ASKING:
+                draw_question(list, paint, &area, &round.yard, asked)
