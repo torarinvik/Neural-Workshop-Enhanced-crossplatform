@@ -1,0 +1,215 @@
+# Differential sweep driver for src/bigfrac.elisa. See bigfrac_diff.py for the
+# reference side, which is CPython's own `int` and `fractions.Fraction`.
+#
+# The whole point of this module is the top rung of the algebra ladder: six
+# five-digit primes multiplied together, a box of about 10^28, a recombination
+# running to 10^33, and a `randrange` over the box drawing a hundred-odd bits.
+# So the sweep works at that size deliberately, and it works at the sizes where
+# the two languages disagree: Python's `//` floors toward minus infinity and
+# its `%` takes the sign of the divisor, so every combination of signs is here.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/nback.elisa"
+include "../src/decimal.elisa"
+include "../src/bigfrac.elisa"
+
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+def print_bytes(text: mutable darray[u8]&, count: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[352] = zeroed
+            for index in 0..<count |buf, text|:
+                buf[index.usize()] <- Bytes::at_ref(text, index)
+            buf[count.usize()] <- 0.u8()
+            printr((&buf[0]).cast[cstr])
+
+def emit_big(value: Big::Int&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        printr(",")
+        text: mutable darray[u8] = Bytes::zeros(352)
+        count: i64 = Big::to_text(value, &text)
+        print_bytes(&text, count)
+
+def emit_frac(value: Q::Frac&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        printr(",")
+        text: mutable darray[u8] = Bytes::zeros(352)
+        count: i64 = Q::to_text(value, &text)
+        print_bytes(&text, count)
+
+# A ladder of sizes: small, then i64-sized, then well past it.
+def sample(out: mutable Big::Int&, spec: i64) -> bool:
+    can Memory.Allocate, Abort.Panic:
+        step: mutable Big::Int = Big::zero()
+        Big::set_i64(out, 0)
+        seeds: mutable darray[i64] = Ints::zeros(6)
+        Ints::put(&seeds, 0, 0)
+        Ints::put(&seeds, 1, 1)
+        Ints::put(&seeds, 2, 7)
+        Ints::put(&seeds, 3, 1000000007)
+        Ints::put(&seeds, 4, 999999999999999989)
+        Ints::put(&seeds, 5, 4294967296)
+        magnitude: i64 = spec / 2
+        sign: i64 = spec % 2
+        if magnitude < 6:
+            Big::set_i64(out, Ints::at_ref(&seeds, magnitude))
+        else:
+            # 10^28-ish and 10^33-ish, which is where the CRT rung lives.
+            Big::set_i64(out, 99991)
+            for _each in 0..<(magnitude - 5) |out, step|:
+                false return if not Big::mul_i64(&step, out, 99989)
+                Big::copy(out, &step)
+            false return if not Big::add_i64(&step, out, magnitude * 37)
+            Big::copy(out, &step)
+        if sign == 1:
+            Big::negate(&step, out)
+            Big::copy(out, &step)
+        return true
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(64 * 1024 * 1024)
+        in w:
+            left: mutable Big::Int = Big::zero()
+            right: mutable Big::Int = Big::zero()
+            out: mutable Big::Int = Big::zero()
+            other: mutable Big::Int = Big::zero()
+
+            # --- whole numbers --------------------------------------------
+            for a in 0..<24 |left, right, out, other|:
+                for b in 0..<24 |left, right, out, other, a|:
+                    sample(&left, a)
+                    sample(&right, b)
+                    printr("int")
+                    emit_cell(a)
+                    emit_cell(b)
+                    emit_big(&left)
+                    emit_big(&right)
+                    emit_cell(Big::cmp(&left, &right))
+                    Big::add(&out, &left, &right)
+                    emit_big(&out)
+                    Big::sub(&out, &left, &right)
+                    emit_big(&out)
+                    Big::mul(&out, &left, &right)
+                    emit_big(&out)
+                    Big::gcd(&out, &left, &right)
+                    emit_big(&out)
+                    emit_cell(Big::bit_length(&left))
+                    if Big::is_zero(&right):
+                        emit_cell(-1)
+                    else:
+                        Big::divmod_floor(&out, &other, &left, &right)
+                        emit_cell(0)
+                        emit_big(&out)
+                        emit_big(&other)
+                    for modulus in 0..<4 |left|:
+                        small: i64 = 1 if modulus == 0 else (2 if modulus == 1 else (60 if modulus == 2 else 99991))
+                        emit_cell(Big::mod_i64(&left, small))
+                    print("")
+
+            # --- the generator over a big box ------------------------------
+            for spec in 0..<20 |left, out|:
+                sample(&left, spec * 2)
+                rng: mutable MT19937 = mt19937_new()
+                mt_seed_int(&rng, (5000 + spec).u64())
+                printr("draw")
+                emit_cell(spec)
+                emit_big(&left)
+                emit_cell(Big::bit_length(&left))
+                for _each in 0..<3 |out, left, rng|:
+                    Big::getrandbits(&out, Big::bit_length(&left), &rng)
+                    emit_big(&out)
+                for _each in 0..<3 |out, left, rng|:
+                    Big::randbelow(&out, &left, &rng)
+                    emit_big(&out)
+                emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                print("")
+
+            # --- exact rationals -------------------------------------------
+            one: mutable Q::Frac = Q::zero()
+            two: mutable Q::Frac = Q::zero()
+            result: mutable Q::Frac = Q::zero()
+            for a in 0..<14 |one, two, result|:
+                for b in 0..<14 |one, two, result, a|:
+                    num_one: i64 = a * 5 - 30
+                    den_one: i64 = a + 1
+                    num_two: i64 = b * 7 - 42
+                    den_two: i64 = b + 2
+                    Q::from_pair(&one, num_one, den_one)
+                    Q::from_pair(&two, num_two, den_two)
+                    printr("frac")
+                    emit_cell(num_one)
+                    emit_cell(den_one)
+                    emit_cell(num_two)
+                    emit_cell(den_two)
+                    emit_frac(&one)
+                    emit_frac(&two)
+                    Q::add(&result, &one, &two)
+                    emit_frac(&result)
+                    Q::sub(&result, &one, &two)
+                    emit_frac(&result)
+                    Q::mul(&result, &one, &two)
+                    emit_frac(&result)
+                    if Q::is_zero(&two):
+                        emit_cell(-1)
+                    else:
+                        Q::div(&result, &one, &two)
+                        emit_cell(0)
+                        emit_frac(&result)
+                    emit_cell(Q::cmp(&one, &two))
+                    emit_cell(1 if Q::equal(&one, &two) else 0)
+                    emit_cell(1 if Q::is_integer(&one) else 0)
+                    for exponent in 0..<4 |one, result|:
+                        Q::power(&result, &one, exponent)
+                        emit_frac(&result)
+                    print("")
+
+            # --- a rational over a number that does not fit ----------------
+            for spec in 0..<8 |left, one, two, result|:
+                sample(&left, 12 + spec)
+                Q::from_big(&one, &left)
+                Q::from_pair(&two, 3, 7)
+                printr("bigfrac")
+                emit_cell(spec)
+                emit_frac(&one)
+                Q::add(&result, &one, &two)
+                emit_frac(&result)
+                Q::mul(&result, &one, &two)
+                emit_frac(&result)
+                Q::div(&result, &one, &two)
+                emit_frac(&result)
+                emit_cell(1 if Q::is_integer(&one) else 0)
+                print("")
+        destroy w
+        return 0

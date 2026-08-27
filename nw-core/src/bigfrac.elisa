@@ -1,0 +1,449 @@
+# Whole numbers of any size, and exact rationals over them.
+#
+# What CPython's `int` and `fractions.Fraction` do, to the extent
+# neural_workshop/algebra.py and expressions.py need them -- which is further
+# than it looks. The top rung of the algebra ladder is six five-digit primes
+# multiplied together: the box the answer hides in is about 10^28, the
+# remainder-theorem recombination runs to 10^33 on the way, and `randrange`
+# over that box draws a hundred-odd bits. None of it fits in sixty-four.
+#
+# The magnitude is decimal.elisa's `DecCoeff` -- base-10 digits, most
+# significant first -- so the add, subtract, multiply and long division under
+# this are the ones the decimal suite already checks against CPython. What is
+# added here is the SIGN, which is where the two languages part company:
+# Python's `//` floors toward minus infinity and its `%` takes the sign of the
+# DIVISOR, so `-7 // 2` is -4 and `-7 % 2` is 1. Truncating instead gives -3
+# and -1, and every congruence on the ladder would come out wrong by a modulus.
+
+module Big:
+
+    # Sign-and-magnitude. Zero is always positive, so there is one of it.
+    struct Int:
+        negative: mutable bool
+        mag: mutable DecCoeff
+
+    def zero() -> Int:
+        return Int{negative: false, mag: coeff_zero()}
+
+    def is_zero(value: Int&) -> bool:
+        return coeff_is_zero(&value.mag)
+
+    def normalise(value: mutable Int&):
+        value.negative <- false if coeff_is_zero(&value.mag)
+
+    def set_i64(out: mutable Int&, value: i64):
+        can Abort.Panic:
+            out.negative <- value < 0
+            coeff_set_i64(&out.mag, value if value >= 0 else 0 - value)
+            normalise(out)
+
+    def from_i64(value: i64) -> Int:
+        can Abort.Panic:
+            out: mutable Int = zero()
+            set_i64(&out, value)
+            return out
+
+    def copy(out: mutable Int&, source: Int&):
+        can Abort.Panic:
+            out.negative <- source.negative
+            coeff_copy(&out.mag, &source.mag)
+
+    def negate(out: mutable Int&, source: Int&):
+        can Abort.Panic:
+            copy(out, source)
+            out.negative <- not out.negative
+            normalise(out)
+
+    # -1, 0 or 1.
+    def cmp(left: Int&, right: Int&) -> i64:
+        can Abort.Panic:
+            left_zero: bool = is_zero(left)
+            right_zero: bool = is_zero(right)
+            return 0 if left_zero and right_zero
+            return -1 if left_zero and not right.negative
+            return 1 if left_zero
+            return 1 if right_zero and not left.negative
+            return -1 if right_zero
+            return -1 if left.negative and not right.negative
+            return 1 if right.negative and not left.negative
+            size: i64 = coeff_cmp(&left.mag, &right.mag)
+            return 0 - size if left.negative
+            return size
+
+    def cmp_i64(left: Int&, right: i64) -> i64:
+        can Abort.Panic:
+            held: Int = from_i64(right)
+            return cmp(left, &held)
+
+    # Magnitudes only, so the sign rules live in one place each.
+    def add_mag(out: mutable Int&, left: Int&, right: Int&, flip: bool) -> bool:
+        can Abort.Panic:
+            scratch: mutable DecCoeff = coeff_zero()
+            same_sign: bool = left.negative == (right.negative != flip)
+            if same_sign:
+                false return if coeff_add(&scratch, &left.mag, &right.mag) != DEC_OK
+                coeff_copy(&out.mag, &scratch)
+                out.negative <- left.negative
+                normalise(out)
+                return true
+            order: i64 = coeff_cmp(&left.mag, &right.mag)
+            if order >= 0:
+                false return if coeff_sub(&scratch, &left.mag, &right.mag) != DEC_OK
+                out.negative <- left.negative
+            else:
+                false return if coeff_sub(&scratch, &right.mag, &left.mag) != DEC_OK
+                out.negative <- right.negative != flip
+            coeff_copy(&out.mag, &scratch)
+            normalise(out)
+            return true
+
+    def add(out: mutable Int&, left: Int&, right: Int&) -> bool:
+        return add_mag(out, left, right, false)
+
+    def sub(out: mutable Int&, left: Int&, right: Int&) -> bool:
+        return add_mag(out, left, right, true)
+
+    def mul(out: mutable Int&, left: Int&, right: Int&) -> bool:
+        can Abort.Panic:
+            scratch: mutable DecCoeff = coeff_zero()
+            false return if coeff_mul(&scratch, &left.mag, &right.mag) != DEC_OK
+            coeff_copy(&out.mag, &scratch)
+            out.negative <- left.negative != right.negative
+            normalise(out)
+            return true
+
+    def add_i64(out: mutable Int&, left: Int&, right: i64) -> bool:
+        can Abort.Panic:
+            held: Int = from_i64(right)
+            return add(out, left, &held)
+
+    def mul_i64(out: mutable Int&, left: Int&, right: i64) -> bool:
+        can Abort.Panic:
+            held: Int = from_i64(right)
+            return mul(out, left, &held)
+
+    # `divmod` as Python spells it: the quotient FLOORS toward minus infinity
+    # and the remainder takes the sign of the divisor, so the remainder of a
+    # negative number by a positive modulus is positive. Truncation would give
+    # the other answer and every congruence on the ladder would be out by a
+    # modulus.
+    def divmod_floor(quotient: mutable Int&, remainder: mutable Int&, left: Int&, right: Int&) -> bool:
+        can Abort.Panic:
+            false return if is_zero(right)
+            q_mag: mutable DecCoeff = coeff_zero()
+            r_mag: mutable DecCoeff = coeff_zero()
+            false return if coeff_divmod(&q_mag, &r_mag, &left.mag, &right.mag) != DEC_OK
+            coeff_copy(&quotient.mag, &q_mag)
+            coeff_copy(&remainder.mag, &r_mag)
+            quotient.negative <- left.negative != right.negative
+            remainder.negative <- left.negative
+            normalise(quotient)
+            normalise(remainder)
+            # Truncated so far. Floor it: when the signs differed and something
+            # was left over, the quotient is one lower and the remainder swings
+            # across to the divisor's side.
+            return true if coeff_is_zero(&r_mag) or left.negative == right.negative
+            one: Int = from_i64(1)
+            lowered: mutable Int = zero()
+            false return if not sub(&lowered, quotient, &one)
+            copy(quotient, &lowered)
+            shifted: mutable Int = zero()
+            false return if not add(&shifted, remainder, right)
+            copy(remainder, &shifted)
+            return true
+
+    # `value % modulus` for a positive i64 modulus, which is what every
+    # congruence here asks for. The digits are base ten, so the remainder falls
+    # out of one left-to-right pass.
+    def mod_i64(value: Int&, modulus: i64) -> i64:
+        can Abort.Panic:
+            0 return if modulus <= 0
+            held: mutable i64 = 0
+            for index in 0..<value.mag.count |held, value, modulus|:
+                held <- (held * 10 + coeff_get(&value.mag, index)) % modulus
+            return held if not value.negative or held == 0
+            return modulus - held
+
+    def is_i64(value: Int&) -> bool:
+        return value.mag.count <= 18
+
+    def to_i64(value: Int&) -> i64:
+        can Abort.Panic:
+            held: mutable i64 = 0
+            for index in 0..<value.mag.count |held, value|:
+                held <- held * 10 + coeff_get(&value.mag, index)
+            return 0 - held if value.negative
+            return held
+
+    def is_one(value: Int&) -> bool:
+        can Abort.Panic:
+            return not value.negative and value.mag.count == 1 and coeff_get(&value.mag, 0) == 1
+
+    # Euclid on the magnitudes, so the answer is never negative -- which is
+    # what `math.gcd` gives and what a fraction wants to divide through by.
+    def gcd(out: mutable Int&, left: Int&, right: Int&) -> bool:
+        can Abort.Panic:
+            a: mutable DecCoeff = coeff_zero()
+            b: mutable DecCoeff = coeff_zero()
+            coeff_copy(&a, &left.mag)
+            coeff_copy(&b, &right.mag)
+            while not coeff_is_zero(&b) |a, b|:
+                q: mutable DecCoeff = coeff_zero()
+                r: mutable DecCoeff = coeff_zero()
+                break if coeff_divmod(&q, &r, &a, &b) != DEC_OK
+                coeff_copy(&a, &b)
+                coeff_copy(&b, &r)
+            coeff_copy(&out.mag, &a)
+            out.negative <- false
+            return true
+
+    # In place, magnitude only: what `bit_length` walks.
+    def halve(value: mutable DecCoeff&):
+        can Abort.Panic:
+            carry: mutable i64 = 0
+            for index in 0..<value.count |value, carry|:
+                held: i64 = carry * 10 + coeff_get(value, index)
+                coeff_set(value, index, held / 2)
+                carry <- held % 2
+            coeff_trim(value)
+
+    def double_in_place(value: mutable DecCoeff&) -> bool:
+        can Abort.Panic:
+            scratch: mutable DecCoeff = coeff_zero()
+            false return if coeff_add(&scratch, value, value) != DEC_OK
+            coeff_copy(value, &scratch)
+            return true
+
+    # `int.bit_length()`: zero for zero, and the magnitude's otherwise.
+    def bit_length(value: Int&) -> i64:
+        can Abort.Panic:
+            0 return if is_zero(value)
+            rest: mutable DecCoeff = coeff_zero()
+            coeff_copy(&rest, &value.mag)
+            bits: mutable i64 = 0
+            while not coeff_is_zero(&rest) |rest, bits|:
+                halve(&rest)
+                bits <- bits + 1
+            return bits
+
+    # `getrandbits(k)`, which CPython assembles out of 32-bit draws.
+    #
+    # The words come off the generator LEAST significant first, and only the
+    # last one is shifted down to the width still wanted -- so the draws have
+    # to be taken in that order and the number put together afterwards, from
+    # the top.
+    const MOST_WORDS: i64 = 16
+
+    def getrandbits(out: mutable Int&, k: i64, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            set_i64(out, 0)
+            true return if k <= 0
+            if k <= 32:
+                set_i64(out, (mt_genrand_uint32(rng).u64() >> (32 - k).u64()).i64())
+                return true
+            words: i64 = (k - 1) / 32 + 1
+            false return if words > MOST_WORDS
+            held: mutable darray[i64] = Ints::zeros(MOST_WORDS)
+            left: mutable i64 = k
+            for index in 0..<words |held, left, rng|:
+                drawn: mutable u64 = mt_genrand_uint32(rng).u64()
+                drawn <- drawn >> (32 - left).u64() if left < 32
+                Ints::put(&held, index, drawn.i64())
+                left <- left - 32
+            step: mutable Int = zero()
+            for back in 0..<words |out, held, step, words|:
+                index: i64 = words - 1 - back
+                false return if not mul_i64(&step, out, 4294967296)
+                copy(out, &step)
+                false return if not add_i64(&step, out, Ints::at_ref(&held, index))
+                copy(out, &step)
+            return true
+
+    # `_randbelow_with_getrandbits`: a uniform value in [0, n) by rejection on
+    # the bit length of n. CPython uses n.bit_length() and not (n-1)'s, so for
+    # a power of two it draws one bit more than it needs and rejects half.
+    def randbelow(out: mutable Int&, n: Int&, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            set_i64(out, 0)
+            true return if is_zero(n) or n.negative
+            k: i64 = bit_length(n)
+            false return if not getrandbits(out, k, rng)
+            while cmp(out, n) >= 0 |out, k, n, rng|:
+                break if not getrandbits(out, k, rng)
+            return true
+
+    # The digits, most significant first, into a caller's buffer; the count is
+    # returned and a minus sign is written where there is one.
+    def to_text(value: Int&, out: mutable darray[u8]&) -> i64:
+        can Abort.Panic:
+            at: mutable i64 = 0
+            if value.negative:
+                Bytes::put(out, 0, 45.u8())
+                at <- 1
+            for index in 0..<value.mag.count |out, value, at|:
+                Bytes::put(out, at + index, (48 + coeff_get(&value.mag, index)).u8())
+            return at + value.mag.count
+
+    # A run of ASCII digits, with no sign; what the parser hands over.
+    def from_digits(out: mutable Int&, text: mutable darray[u8]&, first: i64, count: i64) -> bool:
+        can Abort.Panic:
+            out.negative <- false
+            coeff_set_zero(&out.mag)
+            for index in 0..<count |out, text, first|:
+                digit: i64 = Bytes::at_ref(text, first + index).i64() - 48
+                false return if digit < 0 or digit > 9
+                false return if coeff_append_digit(&out.mag, digit) != DEC_OK
+            coeff_trim(&out.mag)
+            return true
+
+# Exact rationals, normalised the way `fractions.Fraction` normalises: the
+# denominator is positive and the two share no factor, so equality is equality
+# of the pair and no comparison has to cross-multiply.
+module Q:
+
+    struct Frac:
+        num: mutable Big::Int
+        den: mutable Big::Int
+
+    def zero() -> Frac:
+        can Abort.Panic:
+            return Frac{num: Big::from_i64(0), den: Big::from_i64(1)}
+
+    def copy(out: mutable Frac&, source: Frac&):
+        can Abort.Panic:
+            Big::copy(&out.num, &source.num)
+            Big::copy(&out.den, &source.den)
+
+    def normalise(value: mutable Frac&) -> bool:
+        can Abort.Panic:
+            false return if Big::is_zero(&value.den)
+            if value.den.negative:
+                flipped: mutable Big::Int = Big::zero()
+                Big::negate(&flipped, &value.num)
+                Big::copy(&value.num, &flipped)
+                Big::negate(&flipped, &value.den)
+                Big::copy(&value.den, &flipped)
+            if Big::is_zero(&value.num):
+                Big::set_i64(&value.den, 1)
+                return true
+            common: mutable Big::Int = Big::zero()
+            false return if not Big::gcd(&common, &value.num, &value.den)
+            true return if Big::is_one(&common)
+            q: mutable Big::Int = Big::zero()
+            r: mutable Big::Int = Big::zero()
+            false return if not Big::divmod_floor(&q, &r, &value.num, &common)
+            Big::copy(&value.num, &q)
+            false return if not Big::divmod_floor(&q, &r, &value.den, &common)
+            Big::copy(&value.den, &q)
+            return true
+
+    def set_i64(out: mutable Frac&, value: i64):
+        can Abort.Panic:
+            Big::set_i64(&out.num, value)
+            Big::set_i64(&out.den, 1)
+
+    def from_i64(value: i64) -> Frac:
+        can Abort.Panic:
+            out: mutable Frac = zero()
+            set_i64(&out, value)
+            return out
+
+    def from_pair(out: mutable Frac&, num: i64, den: i64) -> bool:
+        can Abort.Panic:
+            Big::set_i64(&out.num, num)
+            Big::set_i64(&out.den, den)
+            return normalise(out)
+
+    def from_big(out: mutable Frac&, value: Big::Int&):
+        can Abort.Panic:
+            Big::copy(&out.num, value)
+            Big::set_i64(&out.den, 1)
+
+    def is_zero(value: Frac&) -> bool:
+        return Big::is_zero(&value.num)
+
+    def is_integer(value: Frac&) -> bool:
+        return Big::is_one(&value.den)
+
+    def negate(out: mutable Frac&, source: Frac&):
+        can Abort.Panic:
+            Big::negate(&out.num, &source.num)
+            Big::copy(&out.den, &source.den)
+
+    def add(out: mutable Frac&, left: Frac&, right: Frac&) -> bool:
+        can Abort.Panic:
+            one: mutable Big::Int = Big::zero()
+            two: mutable Big::Int = Big::zero()
+            false return if not Big::mul(&one, &left.num, &right.den)
+            false return if not Big::mul(&two, &right.num, &left.den)
+            top: mutable Big::Int = Big::zero()
+            false return if not Big::add(&top, &one, &two)
+            bottom: mutable Big::Int = Big::zero()
+            false return if not Big::mul(&bottom, &left.den, &right.den)
+            Big::copy(&out.num, &top)
+            Big::copy(&out.den, &bottom)
+            return normalise(out)
+
+    def sub(out: mutable Frac&, left: Frac&, right: Frac&) -> bool:
+        can Abort.Panic:
+            flipped: mutable Frac = zero()
+            negate(&flipped, right)
+            return add(out, left, &flipped)
+
+    def mul(out: mutable Frac&, left: Frac&, right: Frac&) -> bool:
+        can Abort.Panic:
+            top: mutable Big::Int = Big::zero()
+            bottom: mutable Big::Int = Big::zero()
+            false return if not Big::mul(&top, &left.num, &right.num)
+            false return if not Big::mul(&bottom, &left.den, &right.den)
+            Big::copy(&out.num, &top)
+            Big::copy(&out.den, &bottom)
+            return normalise(out)
+
+    def div(out: mutable Frac&, left: Frac&, right: Frac&) -> bool:
+        can Abort.Panic:
+            false return if is_zero(right)
+            top: mutable Big::Int = Big::zero()
+            bottom: mutable Big::Int = Big::zero()
+            false return if not Big::mul(&top, &left.num, &right.den)
+            false return if not Big::mul(&bottom, &left.den, &right.num)
+            Big::copy(&out.num, &top)
+            Big::copy(&out.den, &bottom)
+            return normalise(out)
+
+    # Both are normalised, so this is equality of the pair.
+    def equal(left: Frac&, right: Frac&) -> bool:
+        can Abort.Panic:
+            return Big::cmp(&left.num, &right.num) == 0 and Big::cmp(&left.den, &right.den) == 0
+
+    def cmp(left: Frac&, right: Frac&) -> i64:
+        can Abort.Panic:
+            one: mutable Big::Int = Big::zero()
+            two: mutable Big::Int = Big::zero()
+            0 return if not Big::mul(&one, &left.num, &right.den)
+            0 return if not Big::mul(&two, &right.num, &left.den)
+            return Big::cmp(&one, &two)
+
+    # `value ** power` for a whole non-negative power, by repeated multiplying,
+    # which is what `Fraction.__pow__` reduces to here.
+    def power(out: mutable Frac&, base: Frac&, exponent: i64) -> bool:
+        can Abort.Panic:
+            set_i64(out, 1)
+            step: mutable Frac = zero()
+            for _each in 0..<exponent |out, step, base|:
+                false return if not mul(&step, out, base)
+                copy(out, &step)
+            return true
+
+    # `str(value.numerator)` when it is whole, else `'%d/%d'`, which is what
+    # both `_number`s in the reference come down to.
+    def to_text(value: Frac&, out: mutable darray[u8]&) -> i64:
+        can Abort.Panic:
+            at: mutable i64 = Big::to_text(&value.num, out)
+            return at if is_integer(value)
+            Bytes::put(out, at, 47.u8())
+            below: mutable darray[u8] = Bytes::zeros(320)
+            span: i64 = Big::to_text(&value.den, &below)
+            for index in 0..<span |out, below, at|:
+                Bytes::put(out, at + 1 + index, Bytes::at_ref(&below, index))
+            return at + 1 + span
