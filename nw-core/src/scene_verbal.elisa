@@ -1,0 +1,210 @@
+# The Verbal Reasoning screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/verbal.py -- the drawing, not the thinking.
+#
+# The first screen whose layout MEASURES text. The answer choices are spread
+# down whatever room is left between the bottom of the wrapped question and
+# the top of the verdict band, so where they go depends on how tall the
+# question turned out once pyglet wrapped it -- and how tall it turned out
+# depends on a font size the screen picks from the question's LENGTH:
+#
+#     12 under 600 characters, 10 under 1000, 8 above that
+#
+# measured in characters and not in words, so the size can step down in the
+# middle of a sentence.
+#
+# The wrap width is `int(state.window.width * 0.90)`, and `state.window.width`
+# is PIXELS -- 1824 on a retina display, not the 912 points the window was
+# asked for. `geometry.point_size()` is where the division happens, and the
+# window itself never sees it. Measured rather than assumed, because taking it
+# for points wraps the question about half as often and every choice below it
+# then lands somewhere else.
+#
+# NOTE: needs elisacore_math, strings, geometry, verdict, textmetrics, display
+# and scene_verdict included by the driver.
+
+module SceneVerbal:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_ASKING: i64 = 1
+    const PHASE_JUDGED: i64 = 2
+    const PHASE_DONE: i64 = 3
+    const PHASE_UNAVAILABLE: i64 = 4
+
+    # MINE, the colour a picked choice is drawn in.
+    def color_mine() -> u32:
+        return Display::rgba(0, 114, 178, 255)
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def floor_of(height: f64) -> f64:
+        can Abort.Panic:
+            return Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 54.0).f64()).f64()
+
+    # `int(state.window.width * 0.90)`, the question's and the note's wrap
+    # width -- in pixels, which is what that attribute holds.
+    def prompt_wrap(paint: Paint&) -> i64:
+        can Abort.Panic:
+            return (paint.width * 0.90).i64()
+
+    # 12 under 600 characters, 10 under 1000, 8 above -- the question's own size.
+    def prompt_size(paint: Paint&, prompt: sview) -> f64:
+        can Abort.Panic:
+            length: i64 = TextMetrics::codepoints(prompt)
+            reference: f64 = 12.0 if length < 600 else (10.0 if length < 1000 else 8.0)
+            return Geometry::calc_fontsize(paint.height, reference)
+
+    # `explanation.strip()[:600]`, with an ellipsis when it was cut. The slice
+    # is CPython's, so it counts CODEPOINTS -- an explanation with an em dash
+    # in it is cut one byte earlier than a byte count would cut it, and cutting
+    # by bytes could land in the middle of one.
+    def note_text(out: mutable dstr&, explanation: sview):
+        can Memory.Allocate, Abort.Panic:
+            length: i64 = sview_len(explanation).i64()
+            first: mutable i64 = 0
+            while first < length |explanation, length, first|:
+                if is_python_space(sview_at(explanation, first.usize())):
+                    first <- first + 1
+                else:
+                    break
+            past: mutable i64 = length
+            while past > first |explanation, first, past|:
+                if is_python_space(sview_at(explanation, (past - 1).usize())):
+                    past <- past - 1
+                else:
+                    break
+
+            # Where codepoint 600 starts, or `past` if there is no such one.
+            seen: mutable i64 = 0
+            cut: mutable i64 = past
+            at: mutable i64 = first
+            while at < past |explanation, past, seen, cut, at|:
+                if not TextMetrics::is_continuation(sview_at(explanation, at.usize())):
+                    if seen == 600:
+                        cut <- at
+                        break
+                    seen <- seen + 1
+                at <- at + 1
+
+            index: mutable i64 = first
+            while index < cut |out, explanation, cut, index|:
+                out.push(sview_at(explanation, index.usize()))
+                index <- index + 1
+            if cut < past:
+                # U+2026 HORIZONTAL ELLIPSIS, one character and three bytes.
+                out.push(226.u8())
+                out.push(128.u8())
+                out.push(166.u8())
+
+    # What `str.strip()` takes off: ASCII space, tab, newline, carriage return,
+    # form feed and vertical tab.
+    def is_python_space(byte: u8) -> bool:
+        value: i64 = byte.i64()
+        if value == 32:
+            return true
+        return value >= 9 and value <= 13
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_question: bool, prompt: sview, choices: darray[sview]&,
+               choice: i64, answered: i64, trial: i64, total_trials: i64,
+               message: sview, show_explanation: bool, explanation: sview,
+               verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            wrap: i64 = prompt_wrap(paint)
+
+            put_text(list, paint, sview("Verbal Reasoning", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 32.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            # `'     '.join(parts)` -- the trial counter joins on only while a
+            # question is up and unanswered.
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if has_question and phase == PHASE_ASKING:
+                dstr_append_cstr(&status, "     question ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 62.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            asked: sview = prompt if has_question else sview("", 0, -1)
+            size: f64 = prompt_size(paint, asked)
+            prompt_y: f64 = Geometry::from_top_edge(paint.height, 90.0).f64()
+            put_text(list, paint, asked, middle, prompt_y, size, paint.ink,
+                     Display::ANCHOR_CENTER_TOP, false)
+
+            shown: mutable dstr = []
+            if has_question and phase == PHASE_JUDGED and show_explanation:
+                note_text(&shown, explanation)
+            note: sview = bytes_view(shown)
+            note_size: f64 = Geometry::calc_fontsize(paint.height, 10.0)
+            note_y: f64 = floor_of(paint.height) + 6.0
+            put_text(list, paint, note, middle, note_y, note_size, paint.ink,
+                     Display::ANCHOR_CENTER_BOTTOM, false)
+
+            put_text(list, paint,
+                     sview("Esc: menu   Space: start/next   arrows: choose   Enter: answer   O: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 24.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            # The choices, spread down the room the question left.
+            #
+            # `top` is where the question ENDED, so it is the only place in the
+            # workshop where a layout number comes out of the text measurer.
+            if has_question:
+                # Written out because a `-` cannot continue onto a new line.
+                asked_tall: f64 = TextMetrics::wrapped_height(size, asked, wrap).f64()
+                gap: f64 = Geometry::calc_fontsize(paint.height, 12.0)
+                top: f64 = prompt_y - asked_tall - gap
+                bottom: mutable f64 = floor_of(paint.height) + 8.0
+                if sview_len(note).i64() > 0:
+                    note_tall: f64 = TextMetrics::wrapped_height(note_size, note, wrap).f64()
+                    bottom <- bottom + note_tall + Geometry::calc_fontsize(paint.height, 8.0)
+                count: i64 = choices.count.i64()
+                divisor: f64 = count.f64() if count > 1 else 1.0
+                even: f64 = (top - bottom) / divisor
+                least: f64 = Geometry::calc_fontsize(paint.height, 22.0)
+                step: f64 = even if even > least else least
+                # `min(calc_fontsize(10), max(7.0, step * 0.30))`
+                grown: f64 = step * 0.30
+                lifted: f64 = grown if grown > 7.0 else 7.0
+                ceiling: f64 = Geometry::calc_fontsize(paint.height, 10.0)
+                option_size: f64 = lifted if lifted < ceiling else ceiling
+                picked: i64 = answered if phase == PHASE_JUDGED else choice
+                for number in 0..<count |list, paint, choices, count, top, step, option_size, picked, middle|:
+                    label: mutable dstr = []
+                    dstr_append_i64(&label, number + 1)
+                    dstr_append_cstr(&label, ". ")
+                    dstr_append_sview(&label, get choices[number.usize()] else sview("", 0, -1))
+                    color: u32 = color_mine() if number == picked else paint.ink
+                    put_text(list, paint, bytes_view(label), middle,
+                             top - number.f64() * step, option_size, color,
+                             Display::ANCHOR_CENTER_TOP, false)
