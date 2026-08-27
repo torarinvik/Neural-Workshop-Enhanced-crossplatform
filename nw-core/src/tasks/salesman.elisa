@@ -1,0 +1,181 @@
+# Traveling Salesman: take a tour by clicks, scored against the exact optimum.
+#
+# Port of the portable half of neural_workshop/ui/salesman.py
+# (GPL-2.0-or-later). The drawing is the shell's; what is here is the scatter,
+# the tour length, the Held-Karp optimum and the adaptive ladder.
+
+module Salesman:
+
+    # Cities a round may hold. Five is a warm-up. The ceiling is set by the
+    # EXACT solver, whose table doubles with every city: eighteen costs about a
+    # second and a half, and nineteen would double it again.
+    const FEWEST_CITIES: i64 = 5
+    const MOST_CITIES: i64 = 18
+
+    # How close to the optimum a tour has to come before an adaptive run adds a
+    # city, and how far off before one is taken away. Closeness is the OPTIMAL
+    # length over the tour's length, so one is perfect.
+    const GROW_AT: f64 = 0.97
+    const SHRINK_AT: f64 = 0.85
+
+    # How far apart cities are placed, as a share of the panel -- near enough
+    # coincident cities make length judgements about pixels, not routes.
+    const SPREAD: f64 = 0.13
+
+    # Placement attempts before the separation is relaxed. The reference
+    # restarts the whole layout with a smaller `apart` rather than insisting on
+    # room a dense count does not have, so this always returns.
+    const PLACEMENT_TRIES: i64 = 400
+
+    def clamped(count: i64) -> i64:
+        can Abort.Panic:
+            lifted: i64 = FEWEST_CITIES if count < FEWEST_CITIES else count
+            return MOST_CITIES if lifted > MOST_CITIES else lifted
+
+    struct Cities:
+        count: mutable i64
+        x: mutable darray[f64]
+        y: mutable darray[f64]
+
+    def new_cities(most: i64) -> Cities:
+        can Memory.Allocate, Abort.Panic:
+            return Cities{count: 0, x: Floats::zeros(most), y: Floats::zeros(most)}
+
+    # `count` cities in the unit square, none of them crowding. Rejection
+    # sampling against a minimum separation, RELAXED whenever a layout refuses
+    # to fit -- and the relaxed pass starts a fresh layout without rewinding the
+    # stream, so the draws that failed are spent.
+    def scatter(out: mutable Cities&, count: i64, rng: mutable MT19937&):
+        can Abort.Panic:
+            apart: mutable f64 = SPREAD
+            settled: mutable bool = false
+            while not settled |out, count, rng, apart, settled|:
+                out.count <- 0
+                for _try in 0..<PLACEMENT_TRIES |out, count, rng, apart, settled|:
+                    break if settled
+                    cx: f64 = 0.05 + 0.9 * py_random(rng)
+                    cy: f64 = 0.05 + 0.9 * py_random(rng)
+                    clear: mutable bool = true
+                    for at in 0..<out.count |out, cx, cy, apart, clear|:
+                        if py_hypot(cx - Floats::at_ref(&out.x, at), cy - Floats::at_ref(&out.y, at)) < apart:
+                            clear <- false
+                    continue if not clear
+                    Floats::put(&out.x, out.count, cx)
+                    Floats::put(&out.y, out.count, cy)
+                    out.count <- out.count + 1
+                    settled <- true if out.count == count
+                apart <- apart * 0.8 if not settled
+
+    def span_between(cities: mutable Cities&, one: i64, two: i64) -> f64:
+        can Abort.Panic:
+            return py_hypot(Floats::at_ref(&cities.x, one) - Floats::at_ref(&cities.x, two),
+                            Floats::at_ref(&cities.y, one) - Floats::at_ref(&cities.y, two))
+
+    # The length of the round trip visiting `order` and coming home.
+    def tour_length(cities: mutable Cities&, order: mutable darray[i64]&, count: i64) -> f64:
+        can Abort.Panic:
+            total: mutable f64 = 0.0
+            for here in 0..<count |cities, order, count, total|:
+                one: i64 = Ints::at_ref(order, here)
+                two: i64 = Ints::at_ref(order, (here + 1) % count)
+                total <- total + span_between(cities, one, two)
+            return total
+
+    struct Tour:
+        length: mutable f64
+        order: mutable darray[i64]
+        count: mutable i64
+
+    # The shortest round trip, EXACTLY, by Held-Karp: dynamic programming over
+    # subsets, the best way to have visited a set and be standing at one of
+    # them. Exponential and quadratic on top, which is why eighteen is the
+    # ceiling -- and what buys the honest word "optimal" for the score.
+    #
+    # The tour starts at city 0 by convention; a round trip has no start, so
+    # nothing is lost. `cost < 0` marks a subset-and-last that was never
+    # reached, which is the reference's `best.get(...) is None`.
+    def optimal_tour(cities: mutable Cities&, count: i64) -> Tour:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable Tour = Tour{length: 0.0, order: Ints::zeros(MOST_CITIES), count: count}
+            if count < 2:
+                for at in 0..<count |out|:
+                    Ints::put(&out.order, at, at)
+                return out
+            if count == 2:
+                Ints::put(&out.order, 0, 0)
+                Ints::put(&out.order, 1, 1)
+                out.length <- span_between(cities, 0, 1) * 2.0
+                return out
+            masks: i64 = 1 << count
+            cost: mutable darray[f64] = Floats::zeros(masks * count)
+            prev: mutable darray[i64] = Ints::zeros(masks * count)
+            for slot in 0..<(masks * count) |cost|:
+                Floats::put(&cost, slot, -1.0)
+            for city in 1..<count |cities, cost, prev, count|:
+                Floats::put(&cost, (1 << city) * count + city, span_between(cities, 0, city))
+                Ints::put(&prev, (1 << city) * count + city, 0)
+            for size in 2..<count |cities, cost, prev, count, masks|:
+                for mask in 0..<masks |cities, cost, prev, count, size|:
+                    continue if (mask & 1) != 0
+                    bits: mutable i64 = 0
+                    scan: mutable i64 = mask
+                    while scan != 0 |scan, bits|:
+                        bits <- bits + 1 if (scan & 1) != 0
+                        scan <- scan >> 1
+                    continue if bits != size
+                    for last in 1..<count |cities, cost, prev, count, mask|:
+                        continue if ((mask >> last) & 1) == 0
+                        without: i64 = mask ^ (1 << last)
+                        best_cost: mutable f64 = -1.0
+                        best_prev: mutable i64 = -1
+                        for previous in 1..<count |cities, cost, without, count, last, best_cost, best_prev|:
+                            continue if ((without >> previous) & 1) == 0
+                            before: f64 = Floats::at_ref(&cost, without * count + previous)
+                            continue if before < 0.0
+                            step: f64 = before + span_between(cities, previous, last)
+                            if best_cost < 0.0 or step < best_cost:
+                                best_cost <- step
+                                best_prev <- previous
+                        if best_prev >= 0:
+                            Floats::put(&cost, mask * count + last, best_cost)
+                            Ints::put(&prev, mask * count + last, best_prev)
+            everyone: i64 = masks - 2
+            end_length: mutable f64 = -1.0
+            end_last: mutable i64 = -1
+            for last in 1..<count |cities, cost, count, everyone, end_length, end_last|:
+                held: f64 = Floats::at_ref(&cost, everyone * count + last)
+                continue if held < 0.0
+                total: f64 = held + span_between(cities, last, 0)
+                if end_length < 0.0 or total < end_length:
+                    end_length <- total
+                    end_last <- last
+            out.length <- end_length
+            # Walk the chain back, then reverse everything after city 0 -- the
+            # reference's `[order[0]] + order[:0:-1]`.
+            walk: mutable darray[i64] = Ints::zeros(MOST_CITIES)
+            walked: mutable i64 = 0
+            mask: mutable i64 = everyone
+            last: mutable i64 = end_last
+            while last != 0 |cost, prev, walk, walked, mask, last, count|:
+                Ints::put(&walk, walked, last)
+                walked <- walked + 1
+                nxt: i64 = Ints::at_ref(&prev, mask * count + last)
+                mask <- mask ^ (1 << last)
+                last <- nxt
+            Ints::put(&out.order, 0, 0)
+            for at in 0..<walked |out, walk, walked|:
+                Ints::put(&out.order, at + 1, Ints::at_ref(&walk, walked - 1 - at))
+            return out
+
+    # Closeness is the OPTIMAL length over the tour's, so one is perfect and a
+    # worse tour scores lower.
+    def closeness(optimal: f64, walked: f64) -> f64:
+        can Abort.Panic:
+            return 0.0 if walked <= 0.0
+            return optimal / walked
+
+    def next_count(count: i64, close: f64) -> i64:
+        can Abort.Panic:
+            return clamped(count + 1) if close >= GROW_AT
+            return clamped(count - 1) if close < SHRINK_AT
+            return clamped(count)
