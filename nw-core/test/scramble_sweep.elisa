@@ -1,0 +1,239 @@
+# Differential sweep driver for tasks/scramble.elisa. See scramble_diff.py for
+# the reference side.
+#
+# The sentence bank and the ranked vocabulary are downloaded corpora, so both
+# sides build the same synthetic ones from a fixed recipe. The words are real
+# letter strings because the corruption is letter surgery and the candidate
+# lookup is a letter bag; what they mean is not measured anywhere.
+#
+# The corruption pipeline is one RNG stream in a fixed order -- drop, then
+# substitute, then insert, then the shuffle, then the swaps -- and every
+# retry-until-changed loop inside it can spend between one and eight draws. So
+# a sweep that only checked the OUTPUT would pass on a pipeline whose stages
+# ran in the wrong order; this one emits every corrupted word of every deal.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/scramble.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+def emit_scaled(value: f64):
+    can Console.Write, Abort.Panic:
+        emit_cell(py_round_half_even(value * 1000000.0))
+
+# The vocabulary both sides build. Word v is `3 + v % 6` letters long and its
+# letters are `(v * 7 + k * 5) % 26` -- which collides on purpose, so the bag
+# index has real buckets rather than one word apiece.
+def build_vocab(vocab: mutable Scramble::Vocab&, words: i64):
+    can Abort.Panic:
+        vocab.count <- words
+        at: mutable i64 = 0
+        for v in 0..<words |vocab, at|:
+            length: i64 = 3 + v % 6
+            Ints::put(&vocab.start, v, at)
+            Ints::put(&vocab.length, v, length)
+            # Ranks TIE deliberately: every eleventh word shares a rank with
+            # the one before it, which is what the reference's unseen words do.
+            Ints::put(&vocab.rank, v, v - v % 11)
+            for k in 0..<length |vocab, v, at|:
+                Ints::put(&vocab.letter, at + k, (v * 7 + k * 5) % 26)
+            at <- at + length
+        Scramble::index_vocab(vocab)
+
+# The sentence bank. Sentence s holds `6 + s % 8` words drawn from the
+# vocabulary, so every truth is a word a candidate lookup can find.
+def build_bank(bank: mutable Scramble::Bank&, vocab: mutable Scramble::Vocab&, sentences: i64):
+    can Abort.Panic:
+        bank.count <- sentences
+        word_slot: mutable i64 = 0
+        letter_slot: mutable i64 = 0
+        for s in 0..<sentences |bank, vocab, word_slot, letter_slot|:
+            count: i64 = 6 + s % 8
+            Ints::put(&bank.words, s, count)
+            Ints::put(&bank.word_at, s, word_slot)
+            for w in 0..<count |bank, vocab, s, word_slot, letter_slot|:
+                source: i64 = (s * 5 + w * 3) % vocab.count
+                length: i64 = Ints::at_ref(&vocab.length, source)
+                start: i64 = Ints::at_ref(&vocab.start, source)
+                Ints::put(&bank.word_length, word_slot, length)
+                Ints::put(&bank.letter_at, word_slot, letter_slot)
+                for k in 0..<length |bank, vocab, letter_slot, start|:
+                    Ints::put(&bank.letter, letter_slot + k, Ints::at_ref(&vocab.letter, start + k))
+                letter_slot <- letter_slot + length
+                word_slot <- word_slot + 1
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(128 * 1024 * 1024)
+        in w:
+            # --- the ladder -----------------------------------------------
+            for rung in -1..<16:
+                g: Scramble::Grade = Scramble::grade_of(rung)
+                printr("grade")
+                emit_cell(rung)
+                emit_cell(g.span_low)
+                emit_cell(g.span_high)
+                emit_cell(g.top_rank)
+                emit_cell(g.swap)
+                emit_cell(1 if g.interior else 0)
+                emit_cell(1 if g.whole else 0)
+                emit_cell(g.drop)
+                emit_cell(g.insert)
+                emit_cell(g.substitute)
+                emit_cell(g.spaces)
+                emit_cell(g.order)
+                emit_cell(1 if Scramble::anchored(&g) else 0)
+                emit_cell(Scramble::removals(&g))
+                emit_cell(Scramble::additions(&g))
+                print("")
+
+            # --- the keyboard's neighbours --------------------------------
+            for letter in 0..<Scramble::LETTER_COUNT:
+                printr("near")
+                emit_cell(letter)
+                first: i64 = Scramble::near_start(letter)
+                for at in first..<Scramble::near_start(letter + 1) |first|:
+                    emit_cell(Scramble::near_flat(at))
+                print("")
+
+            vocab: mutable Scramble::Vocab = Scramble::new_vocab()
+            bank: mutable Scramble::Bank = Scramble::Bank{count: 0,
+                    words: Ints::zeros(256), word_at: Ints::zeros(256),
+                    word_length: Ints::zeros(4096), letter_at: Ints::zeros(4096),
+                    letter: Ints::zeros(65536)}
+            work: mutable Scramble::Work = Scramble::new_work()
+            deal: mutable Scramble::Deal = Scramble::new_deal()
+            typed: mutable darray[i64] = Ints::zeros(1024)
+            tidy: mutable darray[i64] = Ints::zeros(1024)
+            build_vocab(&vocab, 240)
+            build_bank(&bank, &vocab, 40)
+
+            # --- feasibility, word against word ---------------------------
+            for rung in 1..<13 |vocab, work|:
+                g: Scramble::Grade = Scramble::grade_of(rung)
+                printr("feasible")
+                emit_cell(rung)
+                for token in 0..<20 |vocab, work, g|:
+                    for word in 0..<20 |vocab, work, g, token|:
+                        fits: bool = Scramble::feasible(&g, &vocab.letter, Ints::at_ref(&vocab.start, token), Ints::at_ref(&vocab.length, token), &vocab.letter, Ints::at_ref(&vocab.start, word), Ints::at_ref(&vocab.length, word), &work.scratch)
+                        emit_cell(1 if fits else 0)
+                print("")
+
+            # --- how many words a token could have been -------------------
+            for rung in 1..<13 |vocab, work|:
+                g: Scramble::Grade = Scramble::grade_of(rung)
+                printr("candidates")
+                emit_cell(rung)
+                for token in 0..<24 |vocab, work, g|:
+                    emit_cell(Scramble::candidates_count(&g, &vocab.letter, Ints::at_ref(&vocab.start, token), Ints::at_ref(&vocab.length, token), &vocab, &work.scratch, &work.odometer, &work.distinct))
+                print("")
+
+            # --- whole deals, letter by letter ----------------------------
+            for rung in 1..<13 |bank, vocab, work, deal|:
+                g: Scramble::Grade = Scramble::grade_of(rung)
+                for seed in 1..<15 |bank, vocab, work, deal, g, rung|:
+                    rng: mutable MT19937 = mt19937_new()
+                    mt_seed_int(&rng, (rung * 100 + seed).u64())
+                    Scramble::deal_one(&g, &bank, &vocab, &work, &deal, &rng)
+                    printr("deal")
+                    emit_cell(rung)
+                    emit_cell(seed)
+                    emit_cell(1 if deal.given else 0)
+                    emit_cell(deal.sentence)
+                    emit_cell(deal.words)
+                    emit_scaled(deal.ambiguity)
+                    emit_cell(deal.pinned)
+                    for slot in 0..<deal.words |deal|:
+                        emit_cell(Ints::at_ref(&deal.placing, slot))
+                    for slot in 0..<deal.words |deal|:
+                        length: i64 = Ints::at_ref(&deal.corrupted_length, slot)
+                        start: i64 = Ints::at_ref(&deal.corrupted_start, slot)
+                        emit_cell(length)
+                        for at in 0..<length |deal, start|:
+                            emit_cell(Ints::at_ref(&deal.corrupted_letter, start + at))
+                    emit_cell(deal.chunks)
+                    for slot in 0..<deal.chunks |deal|:
+                        emit_cell(Ints::at_ref(&deal.chunk_start, slot))
+                        emit_cell(Ints::at_ref(&deal.chunk_length, slot))
+                    print("")
+
+            # --- marking a typed answer -----------------------------------
+            for sentence in 0..<24 |bank, typed, tidy|:
+                count: i64 = Ints::at_ref(&bank.words, sentence)
+                first_word: i64 = Ints::at_ref(&bank.word_at, sentence)
+                for spoiled in 0..<5 |bank, typed, tidy, sentence, count, first_word|:
+                    written: mutable i64 = 0
+                    # spoiled 0 is the answer as written; 1 pads it with junk
+                    # and doubled spaces, which normalise has to eat; 2 drops
+                    # a letter; 3 adds a word; 4 changes one letter.
+                    if spoiled == 1:
+                        Ints::put(&typed, written, Scramble::OTHER)
+                        written <- written + 1
+                        Ints::put(&typed, written, Scramble::SPACE)
+                        written <- written + 1
+                    for slot in 0..<count |bank, typed, written, first_word, spoiled, count|:
+                        if slot > 0:
+                            Ints::put(&typed, written, Scramble::SPACE)
+                            written <- written + 1
+                            if spoiled == 1:
+                                Ints::put(&typed, written, Scramble::SPACE)
+                                written <- written + 1
+                        word: i64 = first_word + slot
+                        length: i64 = Ints::at_ref(&bank.word_length, word)
+                        start: i64 = Ints::at_ref(&bank.letter_at, word)
+                        keep: i64 = length - 1 if spoiled == 2 and slot == 0 else length
+                        for at in 0..<keep |bank, typed, written, start, spoiled, slot, at|:
+                            value: mutable i64 = Ints::at_ref(&bank.letter, start + at)
+                            value <- (value + 1) % 26 if spoiled == 4 and slot == 1 and at == 0
+                            Ints::put(&typed, written, value)
+                            written <- written + 1
+                    if spoiled == 3:
+                        Ints::put(&typed, written, Scramble::SPACE)
+                        written <- written + 1
+                        Ints::put(&typed, written, 0)
+                        written <- written + 1
+                    if spoiled == 1:
+                        Ints::put(&typed, written, Scramble::SPACE)
+                        written <- written + 1
+                    printr("mark")
+                    emit_cell(sentence)
+                    emit_cell(spoiled)
+                    emit_cell(1 if Scramble::correct(&bank, sentence, &typed, written, &tidy) else 0)
+                    emit_cell(Scramble::normalise(&typed, written, &tidy))
+                    print("")
+        destroy w
+        return 0

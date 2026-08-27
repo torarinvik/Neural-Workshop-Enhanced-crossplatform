@@ -1,0 +1,187 @@
+# Differential sweep driver for tasks/verbal.elisa. See verbal_diff.py for the
+# reference side.
+#
+# The corpus is a Parquet dataset, so both sides build the same synthetic bank
+# from a fixed recipe -- rows that fail every clause of the displayable guard,
+# rows that pass, and rows that fail only one clause, so a guard written with
+# the wrong comparison shows up as a different draw rather than a different
+# count.
+#
+# The draw is the delicate stream: a rejected row has already spent its
+# `randrange`, so a bank with many unusable rows in it moves every later
+# question, and `order.index(answer)` decides which choice is right.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/tasks/verbal.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+def emit_scaled(value: f64):
+    can Console.Write, Abort.Panic:
+        emit_cell(py_round_half_even(value * 1000000.0))
+
+# The recipe both sides build their bank from. Row r is English unless r % 13
+# is 0, has a digit answer unless r % 17 is 0, holds `1 + r % 6` choices --
+# which reaches both below the floor of two and above MAX_CHOICES -- and its
+# answer indexes the last choice every third row, which is exactly what the
+# shuffle exists to hide.
+def build_bank(bank: mutable Verbal::Bank&, rows: i64):
+    can Abort.Panic:
+        bank.rows <- rows
+        for r in 0..<rows |bank|:
+            count: i64 = 1 + r % 6
+            Ints::put(&bank.english, r, 0 if (r % 13) == 0 else 1)
+            Ints::put(&bank.answer_is_digit, r, 0 if (r % 17) == 0 else 1)
+            Ints::put(&bank.answer, r, count - 1 if (r % 3) == 0 else r % 7)
+            Ints::put(&bank.choices, r, count)
+            Ints::put(&bank.prompt_length, r, 1395 + (r % 4) * 4)
+            for slot in 0..<Verbal::MAX_CHOICES |bank, r|:
+                width: i64 = 0 if (r % 23) == 0 and slot == 1 else 255 + (r * 3 + slot) % 12
+                Ints::put(&bank.choice_length, r * Verbal::MAX_CHOICES + slot, width)
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(64 * 1024 * 1024)
+        in w:
+            bank: mutable Verbal::Bank = Verbal::new_bank()
+            order: mutable darray[i64] = Ints::zeros(Verbal::MAX_CHOICES)
+            build_bank(&bank, 400)
+
+            # --- the guard, row by row -----------------------------------
+            for row in 0..<400 |bank|:
+                printr("row")
+                emit_cell(row)
+                emit_cell(1 if Verbal::displayable(&bank, row) else 0)
+                emit_cell(Ints::at_ref(&bank.choices, row))
+                # -1 where the corpus's answer field is not a number at all,
+                # which is what the reference's own `int(answer)` would refuse.
+                emit_cell(Ints::at_ref(&bank.answer, row) if Ints::at_ref(&bank.answer_is_digit, row) != 0 else -1)
+                print("")
+
+            # --- the draw, and where the answer landed -------------------
+            for seed in 1..<25 |bank, order|:
+                rng: mutable MT19937 = mt19937_new()
+                mt_seed_int(&rng, (seed * 31).u64())
+                printr("draw")
+                emit_cell(seed)
+                for _pull in 0..<12 |bank, order, rng|:
+                    made: Verbal::Question = Verbal::draw(&bank, &order, &rng)
+                    emit_cell(1 if made.given else 0)
+                    emit_cell(made.row)
+                    emit_cell(made.choices)
+                    emit_cell(made.answer)
+                print("")
+
+            # A bank nothing in it can be shown: the reference raises, and the
+            # screen says so rather than dealing.
+            barren: mutable Verbal::Bank = Verbal::new_bank()
+            barren.rows <- 8
+            for row in 0..<8 |barren|:
+                Ints::put(&barren.english, row, 0)
+                Ints::put(&barren.answer_is_digit, row, 1)
+                Ints::put(&barren.answer, row, 0)
+                Ints::put(&barren.choices, row, 3)
+                Ints::put(&barren.prompt_length, row, 10)
+                for slot in 0..<Verbal::MAX_CHOICES |barren, row|:
+                    Ints::put(&barren.choice_length, row * Verbal::MAX_CHOICES + slot, 5)
+            barren_rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&barren_rng, 99.u64())
+            barren_draw: Verbal::Question = Verbal::draw(&barren, &order, &barren_rng)
+            printr("barren")
+            emit_cell(1 if barren_draw.given else 0)
+            emit_cell(barren_draw.row)
+            print("")
+
+            # --- whole runs, answered -------------------------------------
+            for cfg in 0..<10:
+                run: mutable Verbal::Run = Verbal::new_run()
+                rng: mutable MT19937 = mt19937_new()
+                mt_seed_int(&rng, (800 + cfg).u64())
+                run.total_trials <- 6
+                Verbal::start_run(&run, &bank, 0.0, &rng)
+                printr("start")
+                emit_cell(cfg)
+                emit_cell(run.phase)
+                emit_cell(run.trial)
+                emit_cell(run.question.row)
+                emit_cell(run.question.choices)
+                emit_cell(run.question.answer)
+                print("")
+
+                now: mutable f64 = 0.0
+                step: mutable i64 = 0
+                while run.phase != Verbal::PHASE_DONE and run.phase != Verbal::PHASE_UNAVAILABLE and step < 400 |run, bank, cfg, now, step, rng|:
+                    now <- now + 0.25
+                    if run.phase == Verbal::PHASE_ASKING:
+                        # Walk the cursor -- backwards too, so the wrap is
+                        # exercised in both directions -- and then submit.
+                        if (step % 4) != 3:
+                            Verbal::move(&run, 1 if (step % 3) != 2 else -2)
+                        else:
+                            if (step % 8) == 3:
+                                Verbal::choose(&run, run.question.answer, now)
+                            else:
+                                Verbal::submit(&run, now)
+                    else:
+                        if run.phase == Verbal::PHASE_JUDGED:
+                            Verbal::next_trial(&run, &bank, now, &rng)
+                    printr("step")
+                    emit_cell(cfg)
+                    emit_cell(step)
+                    emit_cell(run.phase)
+                    emit_cell(run.trial)
+                    emit_cell(run.choice)
+                    emit_cell(run.answered)
+                    emit_cell(run.verdict)
+                    emit_cell(run.question.row)
+                    emit_cell(run.question.choices)
+                    emit_cell(run.question.answer)
+                    print("")
+                    step <- step + 1
+
+                tally: Verbal::Score = Verbal::score(&run)
+                printr("score")
+                emit_cell(cfg)
+                emit_cell(step)
+                emit_cell(run.phase)
+                emit_cell(tally.asked)
+                emit_cell(tally.right)
+                emit_cell(tally.seconds)
+                for at in 0..<run.result_count |run|:
+                    emit_cell(Ints::at_ref(&run.result_right, at))
+                    emit_scaled(Floats::at_ref(&run.result_seconds, at))
+                print("")
+        destroy w
+        return 0

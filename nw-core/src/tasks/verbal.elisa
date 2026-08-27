@@ -1,0 +1,207 @@
+# Verbal Reasoning: one multiple-choice question at a time, from a corpus.
+#
+# Port of the portable half of neural_workshop/verbal.py and
+# neural_workshop/ui/verbal.py (both GPL-2.0-or-later).
+#
+# The corpus is a Parquet dataset on disk, so it belongs to the shell. What is
+# here is the SHAPE of a row and what the bank does with it: which rows are
+# displayable at all, and the shuffle that hides the corpus's own answer
+# ordering. A row is supplied as its measurements -- how many choices, which
+# one is the answer, how long the prompt and each choice are, and whether the
+# language tag and the answer field are what they have to be.
+#
+# The shuffle is the load-bearing part. The corpus may put the answer in the
+# same slot every time, so the bank redraws the order and REPORTS THE ANSWER'S
+# NEW PLACE -- `order.index(answer)`, the position the original answer landed
+# in, not the value at position `answer`. Getting that backwards passes on a
+# two-choice question half the time.
+
+module Verbal:
+
+    const MAX_CHOICES: i64 = 5
+    const MAX_PROMPT: i64 = 1400
+    const MAX_CHOICE: i64 = 260
+
+    # How many rows the bank will look at before it gives up on finding one it
+    # can show.
+    const ATTEMPTS: i64 = 256
+
+    const MOST_ROWS: i64 = 4096
+    const MOST_TRIALS: i64 = 256
+
+    const PHASE_READY: i64 = 0
+    const PHASE_ASKING: i64 = 1
+    const PHASE_JUDGED: i64 = 2
+    const PHASE_DONE: i64 = 3
+    const PHASE_UNAVAILABLE: i64 = 4
+
+    # One corpus row, as the guard measures it.
+    struct Bank:
+        rows: mutable i64
+        english: mutable darray[i64]
+        answer_is_digit: mutable darray[i64]
+        answer: mutable darray[i64]
+        choices: mutable darray[i64]
+        prompt_length: mutable darray[i64]
+        # Choice lengths, MAX_CHOICES to a row.
+        choice_length: mutable darray[i64]
+
+    def new_bank() -> Bank:
+        can Memory.Allocate, Abort.Panic:
+            return Bank{rows: 0, english: Ints::zeros(MOST_ROWS),
+                        answer_is_digit: Ints::zeros(MOST_ROWS),
+                        answer: Ints::zeros(MOST_ROWS), choices: Ints::zeros(MOST_ROWS),
+                        prompt_length: Ints::zeros(MOST_ROWS),
+                        choice_length: Ints::zeros(MOST_ROWS * MAX_CHOICES)}
+
+    # Whether a row can be shown at all.
+    #
+    # Every clause of the reference's one `or`, in its order: English, an
+    # answer that is a plain number, between two and MAX_CHOICES choices, an
+    # answer that indexes one of them, a prompt that fits, and no choice that
+    # is empty or too long.
+    def displayable(bank: mutable Bank&, row: i64) -> bool:
+        can Abort.Panic:
+            false return if Ints::at_ref(&bank.english, row) == 0
+            false return if Ints::at_ref(&bank.answer_is_digit, row) == 0
+            count: i64 = Ints::at_ref(&bank.choices, row)
+            false return if count < 2 or count > MAX_CHOICES
+            false return if Ints::at_ref(&bank.answer, row) >= count
+            false return if Ints::at_ref(&bank.prompt_length, row) > MAX_PROMPT
+            for slot in 0..<count |bank, row|:
+                width: i64 = Ints::at_ref(&bank.choice_length, row * MAX_CHOICES + slot)
+                false return if width == 0 or width > MAX_CHOICE
+            return true
+
+    struct Question:
+        # False when the bank ran out of attempts: the reference raises
+        # DatasetUnavailable, and the screen says so rather than dealing.
+        given: bool
+        row: i64
+        choices: i64
+        # Where the corpus's answer LANDED after the shuffle.
+        answer: i64
+
+    # Draw one displayable English multiple-choice question.
+    def draw(bank: mutable Bank&, order: mutable darray[i64]&, rng: mutable MT19937&) -> Question:
+        can Abort.Panic:
+            for _attempt in 0..<ATTEMPTS |bank, order, rng|:
+                row: i64 = py_randbelow(rng, bank.rows.u64()).i64()
+                continue if not displayable(bank, row)
+                count: i64 = Ints::at_ref(&bank.choices, row)
+                for slot in 0..<count |order|:
+                    Ints::put(order, slot, slot)
+                py_shuffle_i64_prefix(rng, order, count)
+                # `order.index(answer)`: where the corpus's answer went, not
+                # what landed where the corpus's answer was.
+                was: i64 = Ints::at_ref(&bank.answer, row)
+                landed: mutable i64 = 0
+                for slot in 0..<count |order, was, landed|:
+                    landed <- slot if Ints::at_ref(order, slot) == was
+                return Question{given: true, row: row, choices: count, answer: landed}
+            return Question{given: false, row: -1, choices: 0, answer: 0}
+
+    # --- a run -----------------------------------------------------------
+
+    struct Run:
+        total_trials: mutable i64
+        trial: mutable i64
+        choice: mutable i64
+        answered: mutable i64
+        question: mutable Question
+        started_at: mutable f64
+        phase: mutable i64
+        verdict: mutable i64
+        result_count: mutable i64
+        result_right: mutable darray[i64]
+        result_seconds: mutable darray[f64]
+        order: mutable darray[i64]
+
+    def new_run() -> Run:
+        can Memory.Allocate, Abort.Panic:
+            return Run{total_trials: 0, trial: 0, choice: 0, answered: -1,
+                       question: Question{given: false, row: -1, choices: 0, answer: 0},
+                       started_at: 0.0, phase: PHASE_READY, verdict: -1,
+                       result_count: 0, result_right: Ints::zeros(MOST_TRIALS),
+                       result_seconds: Floats::zeros(MOST_TRIALS),
+                       order: Ints::zeros(MAX_CHOICES)}
+
+    def reset(run: mutable Run&):
+        can Abort.Panic:
+            run.question <- Question{given: false, row: -1, choices: 0, answer: 0}
+            run.choice <- 0
+            run.answered <- -1
+            run.trial <- 0
+            run.result_count <- 0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+
+    def finish(run: mutable Run&):
+        can Abort.Panic:
+            run.question <- Question{given: false, row: -1, choices: 0, answer: 0}
+            run.phase <- PHASE_DONE
+
+    def next_trial(run: mutable Run&, bank: mutable Bank&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            if run.trial >= run.total_trials:
+                finish(run)
+                return
+            made: Question = draw(bank, &run.order, rng)
+            if not made.given:
+                run.question <- made
+                run.phase <- PHASE_UNAVAILABLE
+                return
+            run.trial <- run.trial + 1
+            run.question <- made
+            run.choice <- 0
+            run.answered <- -1
+            run.verdict <- -1
+            run.started_at <- now
+            run.phase <- PHASE_ASKING
+
+    def start_run(run: mutable Run&, bank: mutable Bank&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            reset(run)
+            next_trial(run, bank, now, rng)
+
+    # The cursor wraps, so a run can be answered from the keyboard without
+    # looking for the end of the list.
+    def move(run: mutable Run&, step: i64):
+        can Abort.Panic:
+            return if run.phase != PHASE_ASKING or not run.question.given
+            count: i64 = run.question.choices
+            moved: i64 = (run.choice + step) % count
+            run.choice <- moved + count if moved < 0 else moved
+
+    def choose(run: mutable Run&, number: i64, now: f64):
+        can Abort.Panic:
+            return if run.phase != PHASE_ASKING or not run.question.given
+            return if number < 0 or number >= run.question.choices
+            run.choice <- number
+            right: bool = run.choice == run.question.answer
+            run.answered <- run.choice
+            Ints::put(&run.result_right, run.result_count, 1 if right else 0)
+            Floats::put(&run.result_seconds, run.result_count, now - run.started_at)
+            run.result_count <- run.result_count + 1
+            run.verdict <- 1 if right else 0
+            run.phase <- PHASE_JUDGED
+
+    def submit(run: mutable Run&, now: f64):
+        can Abort.Panic:
+            return if run.phase != PHASE_ASKING
+            choose(run, run.choice, now)
+
+    struct Score:
+        asked: i64
+        right: i64
+        seconds: i64
+
+    def score(run: mutable Run&) -> Score:
+        can Abort.Panic:
+            right: mutable i64 = 0
+            total: mutable f64 = 0.0
+            for at in 0..<run.result_count |run, right, total|:
+                right <- right + 1 if Ints::at_ref(&run.result_right, at) != 0
+                total <- total + Floats::at_ref(&run.result_seconds, at)
+            # `int(sum(...))` truncates toward zero.
+            return Score{asked: run.result_count, right: right, seconds: total.i64()}
