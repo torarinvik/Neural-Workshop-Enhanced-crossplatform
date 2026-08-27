@@ -1,0 +1,244 @@
+# The Graph Mapping screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/graphmapping.py -- the drawing, not the thinking.
+#
+# Three labels, a verdict, two graphs side by side with a divider between
+# them, and two buttons.
+#
+# Two GROUPS again: the lines at order 0 and the nodes at order 1, so a node
+# sits on top of the lines it ends. And the buttons are split across the two
+# as well -- the filled rectangle goes in the LINE group and its label in the
+# NODE group -- so the whole frame comes out as
+#
+#     the chrome, which is in no group of its own,
+#     the divider, both graphs' edges, both buttons' rectangles,
+#     both graphs' nodes, both buttons' labels
+#
+# rather than in the order the reference writes it. The chrome leads because
+# a label carries pyglet's own group and that sorts ahead of a group made
+# here; everything else follows the order the two groups impose.
+#
+# The layout is built UPWARDS from the buttons. They are filled in the accent
+# blue, which is exactly what the agent boundary's reader counts as a verdict,
+# so they have to clear the band it reads -- and everything above them is laid
+# out from where they land rather than the other way round.
+#
+# A button's label is white on both backgrounds, because it sits on the accent
+# blue rather than on the page.
+#
+# NOTE: needs elisacore_math, strings, geometry, verdict, display and
+# scene_verdict included by the driver.
+
+module SceneGraphMapping:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_ASKING: i64 = 1
+    const PHASE_HIDDEN: i64 = 2
+    const PHASE_FEEDBACK: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    def color_accent() -> u32:
+        return Display::rgba(64, 96, 255, 255)
+
+    struct Point:
+        x: f64
+        y: f64
+
+    struct Edge:
+        first: i64
+        second: i64
+
+    struct Paint:
+        ink: mutable u32
+        divider: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     divider: Display::rgba(fore, fore, fore, 70),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    struct Buttons:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+        gap: mutable f64
+
+    def buttons_of(out: mutable Buttons&, width: f64, height: f64):
+        can Abort.Panic:
+            share: f64 = width * 0.22
+            third: f64 = width / 3.2
+            wide: f64 = share if share < third else third
+            tall: f64 = height * 0.07
+            out.width <- wide
+            out.height <- tall if tall > 40.0 else 40.0
+            out.gap <- width * 0.04
+            out.bottom <- Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 84.0).f64()).f64()
+            out.left <- (width - (wide * 2.0 + out.gap)) / 2.0
+
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64):
+        can Abort.Panic:
+            where: mutable Buttons = Buttons{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0, gap: 0.0}
+            buttons_of(&where, width, height)
+            wide: f64 = width * 0.90
+            bottom: f64 = where.bottom + where.height + height * 0.03
+            room: f64 = Geometry::from_top_edge(height, 96.0).f64() - bottom
+            out.left <- (width - wide) / 2.0
+            out.bottom <- bottom
+            out.width <- wide
+            out.height <- room if room > 80.0 else 80.0
+
+    struct Panel:
+        x: mutable f64
+        y: mutable f64
+        side: mutable f64
+
+    def panel_of(out: mutable Panel&, canvas: Canvas&, which: i64):
+        gap: f64 = canvas.width * 0.05
+        half: f64 = (canvas.width - gap) / 2.0
+        side: f64 = half if half < canvas.height else canvas.height
+        out.y <- canvas.bottom + canvas.height / 2.0
+        out.side <- side
+        out.x <- canvas.left + half / 2.0 if which == 0 else canvas.left + half + gap + half / 2.0
+
+    def spot_at(spots: darray[Point]&, index: i64) -> Point:
+        can Abort.Panic:
+            return get spots[index.usize()] else Point{x: 0.5, y: 0.5}
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               nodes: i64, edges_left: darray[Edge]&, edges_right: darray[Edge]&,
+               spots_left: darray[Point]&, spots_right: darray[Point]&,
+               trial: i64, total_trials: i64, right: i64, message: sview,
+               verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            showing: bool = (phase == PHASE_ASKING or phase == PHASE_FEEDBACK) and nodes > 0
+            offering: bool = phase == PHASE_ASKING or phase == PHASE_HIDDEN
+
+            canvas: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&canvas, paint.width, paint.height)
+            where: mutable Buttons = Buttons{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0, gap: 0.0}
+            buttons_of(&where, paint.width, paint.height)
+
+            put_text(list, paint, sview("Graph Mapping", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if phase == PHASE_ASKING or phase == PHASE_HIDDEN or phase == PHASE_FEEDBACK:
+                dstr_append_cstr(&status, "     ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "   right ")
+                dstr_append_i64(&status, right)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     Y / N or ← →     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 30.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            # The LINE group, in serial order: the divider, then each panel's
+            # edges, then the buttons' rectangles.
+            if showing:
+                Display::draw_line(list, (canvas.left + canvas.width / 2.0) / paint.sx,
+                                   canvas.bottom / paint.sy,
+                                   (canvas.left + canvas.width / 2.0) / paint.sx,
+                                   (canvas.bottom + canvas.height) / paint.sy,
+                                   1.0 / paint.sx, paint.divider)
+                put_edges(list, paint, &canvas, 0, edges_left, spots_left)
+                put_edges(list, paint, &canvas, 1, edges_right, spots_right)
+            if offering:
+                Display::draw_rect(list, where.left / paint.sx,
+                                   where.bottom / paint.sy,
+                                   where.width / paint.sx,
+                                   where.height / paint.sy, color_accent())
+                Display::draw_rect(list, (where.left + where.width + where.gap) / paint.sx,
+                                   where.bottom / paint.sy,
+                                   where.width / paint.sx,
+                                   where.height / paint.sy, color_accent())
+
+            # The NODE group: each panel's dots, then the buttons' labels.
+            if showing:
+                put_nodes(list, paint, &canvas, 0, nodes, spots_left)
+                put_nodes(list, paint, &canvas, 1, nodes, spots_right)
+            if offering:
+                put_button_label(list, paint, &where, where.left, sview("Same", 0, -1))
+                put_button_label(list, paint, &where,
+                                 where.left + where.width + where.gap,
+                                 sview("Different", 0, -1))
+
+    def put_edges(list: mutable Display::DisplayList&, paint: Paint&,
+                  canvas: Canvas&, which: i64, edges: darray[Edge]&,
+                  spots: darray[Point]&):
+        can Memory.Allocate, Abort.Panic:
+            panel: mutable Panel = Panel{x: 0.0, y: 0.0, side: 0.0}
+            panel_of(&panel, canvas, which)
+            wanted: f64 = panel.side * 0.005
+            thick: f64 = wanted if wanted > 1.5 else 1.5
+            for index in 0..<edges.count.i64() |list, paint, panel, edges, spots, thick|:
+                one: Edge = get edges[index.usize()] else Edge{first: 0, second: 0}
+                here: Point = spot_at(spots, one.first)
+                there: Point = spot_at(spots, one.second)
+                Display::draw_line(list,
+                                   (panel.x + (here.x - 0.5) * panel.side) / paint.sx,
+                                   (panel.y + (here.y - 0.5) * panel.side) / paint.sy,
+                                   (panel.x + (there.x - 0.5) * panel.side) / paint.sx,
+                                   (panel.y + (there.y - 0.5) * panel.side) / paint.sy,
+                                   thick / paint.sx, paint.ink)
+
+    def put_nodes(list: mutable Display::DisplayList&, paint: Paint&,
+                  canvas: Canvas&, which: i64, nodes: i64,
+                  spots: darray[Point]&):
+        can Memory.Allocate, Abort.Panic:
+            panel: mutable Panel = Panel{x: 0.0, y: 0.0, side: 0.0}
+            panel_of(&panel, canvas, which)
+            wanted: f64 = panel.side * 0.025
+            radius: f64 = wanted if wanted > 4.0 else 4.0
+            for node in 0..<nodes |list, paint, panel, spots, radius|:
+                here: Point = spot_at(spots, node)
+                Display::draw_circle(list,
+                                     (panel.x + (here.x - 0.5) * panel.side) / paint.sx,
+                                     (panel.y + (here.y - 0.5) * panel.side) / paint.sy,
+                                     radius / paint.sx, paint.ink)
+
+    def put_button_label(list: mutable Display::DisplayList&, paint: Paint&,
+                         where: Buttons&, left: f64, text: sview):
+        can Memory.Allocate, Abort.Panic:
+            # White on both backgrounds: it sits on the accent blue rather
+            # than on the page.
+            put_text(list, paint, text, left + where.width / 2.0,
+                     where.bottom + where.height / 2.0,
+                     Geometry::calc_fontsize(paint.height, 15.0),
+                     Display::rgba(255, 255, 255, 255),
+                     Display::ANCHOR_CENTER_CENTER, true)
