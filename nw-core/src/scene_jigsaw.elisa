@@ -1,0 +1,219 @@
+# The Jigsaw Puzzle screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/jigsaw.py -- the drawing, not the thinking.
+#
+# Three labels, a verdict, a board of image tiles, an optional preview of the
+# finished picture, and a box round any tile worth marking.
+#
+# The ORDER is not the order the reference writes it. It puts the tiles in a
+# group at order 0 and the marks in a group at order 1, and pyglet draws a
+# batch by group before serial -- so every tile and the preview go down first
+# and every mark afterwards, even though the reference creates a tile and its
+# mark one after the other. A port that emitted them interleaved would draw
+# the same picture and be a different display list.
+#
+# A mark is drawn under five conditions and only the FIRST that matches wins:
+# the picked tile is accented and thicker, a solved board is all green, the
+# hovered tile is accented, a tile already home is green when the option is
+# on, and otherwise nothing is drawn at all.
+#
+# The preview is the picture's largest CENTRED SQUARE and not the whole of it,
+# so a landscape photograph shows its middle rather than being squashed.
+#
+# NOTE: needs elisacore_math, strings, geometry, verdict, display and
+# scene_verdict included by the driver.
+
+module SceneJigsaw:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SOLVING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    # The gap between two tiles, in pixels and not scaled with the board.
+    const SEAM: f64 = 2.0
+
+    def color_accent() -> u32:
+        return Display::rgba(64, 96, 255, 255)
+
+    def color_right() -> u32:
+        return Display::rgba(46, 160, 67, 255)
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 96.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 56.0).f64()).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.04
+            out.bottom <- bottom
+            out.width <- width * 0.92
+            out.height <- room if room > 40.0 else 40.0
+
+    struct Board:
+        left: mutable f64
+        bottom: mutable f64
+        size: mutable f64
+
+    # With the preview on, the board leaves a quarter of the width to its
+    # right for the finished picture -- the lid of the box.
+    def board_of(out: mutable Board&, canvas: Canvas&, preview: bool):
+        can Abort.Panic:
+            room: f64 = canvas.width * (0.72 if preview else 1.0)
+            size: f64 = room if room < canvas.height else canvas.height
+            out.left <- canvas.left + (room - size) / 2.0
+            out.bottom <- canvas.bottom + (canvas.height - size) / 2.0
+            out.size <- size
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               side: i64, order: darray[i64]&, tile_pixels: i64,
+               preview: bool, has_image: bool, image_width: i64,
+               image_height: i64, tile_asset: darray[i64]&,
+               preview_asset: i64, picked: i64, hovered: i64,
+               mark_placed: bool, puzzle: i64, total_puzzles: i64,
+               swaps: i64, par: i64, small_library: sview, message: sview,
+               verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            playing: bool = (phase == PHASE_SOLVING or phase == PHASE_SOLVED) and order.count.i64() > 0
+
+            put_text(list, paint, sview("Jigsaw Puzzle", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if phase == PHASE_SOLVING or phase == PHASE_SOLVED:
+                dstr_append_cstr(&status, "     puzzle ")
+                dstr_append_i64(&status, puzzle)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, total_puzzles)
+                dstr_append_cstr(&status, "   swaps ")
+                dstr_append_i64(&status, swaps)
+                dstr_append_cstr(&status, "   minimum ")
+                dstr_append_i64(&status, par)
+                dstr_append_cstr(&status, "   tiles ")
+                dstr_append_i64(&status, side)
+                dstr_append_cstr(&status, "x")
+                dstr_append_i64(&status, side)
+                if sview_len(small_library).i64() > 0:
+                    dstr_append_cstr(&status, "     ")
+                    dstr_append_sview(&status, small_library)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     click two tiles to swap     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if not playing:
+                return
+
+            canvas: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&canvas, paint.width, paint.height)
+            board: mutable Board = Board{left: 0.0, bottom: 0.0, size: 0.0}
+            board_of(&board, &canvas, preview)
+            span: f64 = (board.size - SEAM * (side - 1).f64()) / side.f64()
+            places: i64 = side * side
+
+            # The tiles first, then the preview, and only then the marks --
+            # which is what the two groups make pyglet do.
+            for position in 0..<places |list, paint, board, order, tile_asset, side, span, tile_pixels, places|:
+                Display::draw_sprite(list, tile_at(tile_asset, step_at(order, position)).u32(),
+                                     tile_x(&board, side, span, position) / paint.sx,
+                                     tile_y(&board, side, span, position) / paint.sy,
+                                     span / tile_pixels.f64() / paint.sx, 0.0,
+                                     tile_pixels, tile_pixels,
+                                     Display::rgba(255, 255, 255, 255))
+
+            if preview and has_image:
+                # `min(image.width, image.height)` -- the largest square the
+                # picture holds, taken from its middle.
+                square: i64 = image_width if image_width < image_height else image_height
+                size: f64 = preview_size(&canvas)
+                Display::draw_sprite(list, preview_asset.u32(),
+                                     (canvas.left + canvas.width - size) / paint.sx,
+                                     (canvas.bottom + canvas.height - size) / paint.sy,
+                                     size / square.f64() / paint.sx, 0.0,
+                                     square, square,
+                                     Display::rgba(255, 255, 255, 255))
+
+            for position in 0..<places |list, paint, board, order, side, span, picked, hovered, mark_placed, phase, places|:
+                shade: mutable u32 = 0.u32()
+                thickness: mutable f64 = 2.0
+                drawn: mutable bool = false
+                if position == picked:
+                    shade <- color_accent()
+                    thickness <- 3.0
+                    drawn <- true
+                elif phase == PHASE_SOLVED:
+                    shade <- color_right()
+                    drawn <- true
+                elif position == hovered:
+                    shade <- color_accent()
+                    drawn <- true
+                elif mark_placed and step_at(order, position) == position:
+                    shade <- color_right()
+                    drawn <- true
+                if drawn:
+                    Display::draw_box(list, tile_x(&board, side, span, position) / paint.sx,
+                                      tile_y(&board, side, span, position) / paint.sy,
+                                      span / paint.sx, span / paint.sy, shade,
+                                      thickness / paint.sx)
+
+    def preview_size(canvas: Canvas&) -> f64:
+        across: f64 = canvas.width * 0.24
+        down: f64 = canvas.height * 0.5
+        return across if across < down else down
+
+    def step_at(values: darray[i64]&, index: i64) -> i64:
+        can Abort.Panic:
+            return get values[index.usize()] else 0
+
+    def tile_at(values: darray[i64]&, index: i64) -> i64:
+        can Abort.Panic:
+            return get values[index.usize()] else 0
+
+    def tile_x(board: Board&, side: i64, span: f64, position: i64) -> f64:
+        column: i64 = position % side
+        return board.left + column.f64() * (span + SEAM)
+
+    # `top - span`, where `top` counts DOWN from the board's top edge.
+    def tile_y(board: Board&, side: i64, span: f64, position: i64) -> f64:
+        row: i64 = position / side
+        top: f64 = board.bottom + board.size - row.f64() * (span + SEAM)
+        return top - span
