@@ -1,0 +1,354 @@
+# The Scrabble screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/scrabble.py -- the drawing, not the thinking.
+#
+# Three labels, a verdict, a board and a rack. The rack is drawn BELOW the
+# board, so the board's own clearance is not the task's -- both are measured
+# off one floor, and a premium square is painted vermilion, which is a colour
+# the verdict reader counts.
+#
+# The board's passes go: the page, then per cell a premium wash and a letter,
+# then the pointer's wash, then the rules, then the cursor's box. Two things
+# about that order matter. The pointer's wash goes down AFTER the letters, so
+# it tints them; and the cursor's box is drawn last of all with a fully
+# TRANSPARENT fill, so it is a frame and not a lid.
+#
+# A premium is only painted when the square is empty AND nothing has been laid
+# on it this turn, so laying a tile takes the wash away with it.
+#
+# A letter already on the board is bold and drawn in the ink; one laid this
+# turn is not bold and drawn in blue. That is the only way to tell them apart
+# and it is the whole of the play.
+#
+# The rack and the Play button are centred TOGETHER. Centring the rack alone
+# and hanging the button off its right end put the whole row off centre by
+# half a button, which looks like a layout bug because it is one.
+#
+# NOTE: needs elisacore_math, strings, ints, geometry, verdict, display and
+# scene_verdict included by the driver.
+
+module SceneScrabble:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_PLAYING: i64 = 1
+    const PHASE_SCORED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    # Premium squares, in the order the model numbers them. Kept PALE: a board
+    # is mostly premiums and a saturated one would be unreadable under the
+    # tiles.
+    const PREMIUM_NONE: i64 = 0
+    const PREMIUM_DL: i64 = 1
+    const PREMIUM_TL: i64 = 2
+    const PREMIUM_DW: i64 = 3
+    const PREMIUM_TW: i64 = 4
+
+    def premium_color(which: i64) -> u32:
+        if which == PREMIUM_DL:
+            return Display::rgba(170, 205, 230, 255)
+        if which == PREMIUM_TL:
+            return Display::rgba(110, 160, 205, 255)
+        if which == PREMIUM_DW:
+            return Display::rgba(240, 190, 170, 255)
+        return Display::rgba(225, 140, 110, 255)
+
+    def color_rule() -> u32:
+        return Display::rgba(120, 120, 120, 255)
+
+    def color_here() -> u32:
+        return Display::rgba(86, 180, 233, 255)
+
+    def color_mine() -> u32:
+        return Display::rgba(0, 114, 178, 255)
+
+    def color_near() -> u32:
+        return Display::rgba(86, 180, 233, 40)
+
+    # What a tile is worth, which the rack prints under the letter.
+    def letter_value(letter: i64) -> i64:
+        if letter == 97 or letter == 101 or letter == 105 or letter == 108 or letter == 110 or letter == 111 or letter == 114 or letter == 115 or letter == 116 or letter == 117:
+            return 1
+        if letter == 100 or letter == 103:
+            return 2
+        if letter == 98 or letter == 99 or letter == 109 or letter == 112:
+            return 3
+        if letter == 102 or letter == 104 or letter == 118 or letter == 119 or letter == 121:
+            return 4
+        if letter == 107:
+            return 5
+        if letter == 106 or letter == 120:
+            return 8
+        return 10
+
+    struct Paint:
+        ink: mutable u32
+        faint: mutable u32
+        dim: mutable u32
+        back: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     faint: Display::rgba(fore, fore, fore, 190),
+                     dim: Display::rgba(fore, fore, fore, 110),
+                     back: Display::rgba(back, back, back, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, wide: f64, tall: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               wide / paint.sx, tall / paint.sy, color)
+
+    # A font size taken from the SQUARE rather than from the window.
+    def fit(step: f64, share: f64) -> f64:
+        scaled: f64 = step * share
+        capped: f64 = scaled if scaled < Geometry::MAX_FONT_SIZE else Geometry::MAX_FONT_SIZE
+        return capped if capped > 4.0 else 4.0
+
+    def floor_of(height: f64) -> f64:
+        can Abort.Panic:
+            return Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 44.0).f64()).f64()
+
+    # How tall a rack tile is, which is also how tall its strip is.
+    def rack_step(height: f64) -> f64:
+        can Abort.Panic:
+            room: f64 = (Geometry::from_top_edge(height, 84.0).f64() - floor_of(height)) * 0.13
+            capped: f64 = room if room < 56.0 else 56.0
+            return capped if capped > 14.0 else 14.0
+
+    struct Board:
+        left: mutable f64
+        bottom: mutable f64
+        side: mutable f64
+
+    def board_of(out: mutable Board&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 84.0).f64()
+            bottom: f64 = floor_of(height) + rack_step(height) * 1.6
+            wide: f64 = width * 0.8
+            room: f64 = top - bottom
+            least: f64 = wide if wide < room else room
+            side: f64 = least if least > 40.0 else 40.0
+            out.left <- (width - side) / 2.0
+            out.bottom <- bottom + (top - bottom - side) / 2.0
+            out.side <- side
+
+    def step_at(values: darray[i64]&, index: i64) -> i64:
+        can Abort.Panic:
+            return get values[index.usize()] else 0
+
+    def upper_of(letter: i64) -> u8:
+        return (letter - 32).u8() if letter >= 97 and letter <= 122 else letter.u8()
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_deal: bool, size: i64, premiums: darray[i64]&,
+               letters: darray[i64]&, laid: darray[i64]&, rack: darray[i64]&,
+               spent: darray[bool]&, show_premiums: bool, at: i64,
+               hovered: i64, hovered_tile: i64, hovered_play: bool,
+               down: bool, trial: i64, total_trials: i64, message: sview,
+               verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            playing: bool = has_deal and (phase == PHASE_PLAYING or phase == PHASE_SCORED)
+
+            put_text(list, paint, sview("Scrabble", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 34.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if has_deal and phase == PHASE_PLAYING:
+                dstr_append_cstr(&status, "     board ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "   ")
+                dstr_append_cstr(&status, "down" if down else "across")
+                dstr_append_cstr(&status, "   in hand: ")
+                # `self.rack_left().upper() or _('none')` -- an empty rack
+                # says so in words rather than trailing off.
+                standing: mutable i64 = 0
+                for slot in 0..<rack.count.i64() |status, rack, spent, standing|:
+                    if not (get spent[slot.usize()] else false):
+                        status.push(upper_of(step_at(rack, slot)))
+                        standing <- standing + 1
+                if standing == 0:
+                    dstr_append_cstr(&status, "none")
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 64.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 13.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: menu   Space: start   click or arrows: move   click a tile to lay   Tab: turn   Enter: play", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 24.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if not playing:
+                return
+            board: mutable Board = Board{left: 0.0, bottom: 0.0, side: 0.0}
+            board_of(&board, paint.width, paint.height)
+            put_board(list, paint, &board, size, premiums, letters, laid,
+                      show_premiums, at, hovered)
+            put_rack(list, paint, rack, spent, laid, hovered_tile, hovered_play)
+
+    def put_board(list: mutable Display::DisplayList&, paint: Paint&,
+                  board: Board&, size: i64, premiums: darray[i64]&,
+                  letters: darray[i64]&, laid: darray[i64]&,
+                  show_premiums: bool, at: i64, hovered: i64):
+        can Memory.Allocate, Abort.Panic:
+            step: f64 = board.side / size.f64()
+            put_rect(list, paint, board.left, board.bottom, board.side,
+                     board.side, paint.back)
+            for cell in 0..<(size * size) |list, paint, board, size, step, premiums, letters, laid, show_premiums|:
+                x: f64 = board.left + (cell % size).f64() * step
+                y: f64 = board.bottom + (size - 1 - cell / size).f64() * step
+                premium: i64 = step_at(premiums, cell)
+                mine: i64 = step_at(laid, cell)
+                # A premium is painted only where the square is EMPTY and
+                # nothing has been laid on it this turn.
+                if premium != PREMIUM_NONE and show_premiums and step_at(letters, cell) == 0 and mine == 0:
+                    put_rect(list, paint, x, y, step, step, premium_color(premium))
+                # `mine.get(cell) or board.letters[cell]` -- what was laid
+                # this turn wins over what was already there.
+                letter: i64 = mine if mine != 0 else step_at(letters, cell)
+                if letter != 0:
+                    shown: mutable dstr = []
+                    shown.push(upper_of(letter))
+                    put_text(list, paint, bytes_view(shown), x + step / 2.0,
+                             y + step * 0.46, fit(step, 0.46),
+                             color_mine() if mine != 0 else paint.ink,
+                             Display::ANCHOR_CENTER_CENTER, mine == 0)
+            # The pointer's wash goes down AFTER the letters, so it tints them.
+            if hovered >= 0 and hovered != at:
+                put_rect(list, paint,
+                         board.left + (hovered % size).f64() * step,
+                         board.bottom + (size - 1 - hovered / size).f64() * step,
+                         step, step, color_near())
+            width: f64 = step * 0.03
+            thick: f64 = width if width > 1.0 else 1.0
+            for line in 0..<(size + 1) |list, paint, board, step, thick|:
+                along: f64 = line.f64() * step
+                Display::draw_line(list, board.left / paint.sx,
+                                   (board.bottom + along) / paint.sy,
+                                   (board.left + board.side) / paint.sx,
+                                   (board.bottom + along) / paint.sy,
+                                   thick / paint.sx, color_rule())
+                Display::draw_line(list, (board.left + along) / paint.sx,
+                                   board.bottom / paint.sy,
+                                   (board.left + along) / paint.sx,
+                                   (board.bottom + board.side) / paint.sy,
+                                   thick / paint.sx, color_rule())
+            # The cursor last of all, and with a fully TRANSPARENT fill.
+            #
+            # And therefore INVISIBLE, which is not what the code reads as.
+            # pyglet completes a three-tuple `border_color` with the FILL's
+            # alpha, so `color=(0, 0, 0, 0)` with `border_color=HERE` gives a
+            # border of (86, 180, 233, 0) and the cursor is not on the screen
+            # at all. Go's cursor has the same shape and the same fate. It is
+            # reproduced rather than corrected: the border carries the fill's
+            # alpha here too, and the command then draws nothing and is
+            # dropped. Crossword's cursor survives only because its fill is
+            # the background colour at full alpha.
+            rim: f64 = step * 0.1
+            Display::draw_bordered_rect(list,
+                                        (board.left + (at % size).f64() * step) / paint.sx,
+                                        (board.bottom + (size - 1 - at / size).f64() * step) / paint.sy,
+                                        step / paint.sx, step / paint.sy,
+                                        Display::rgba(0, 0, 0, 0),
+                                        Display::rgba(86, 180, 233, 0),
+                                        (rim if rim > 2.0 else 2.0) / paint.sx)
+
+    # Rack width, the gap after it, and the Play button's width.
+    def strip_width(height: f64, tiles: i64) -> f64:
+        can Abort.Panic:
+            step: f64 = rack_step(height)
+            return step * (tiles if tiles > 0 else 1).f64()
+
+    def rack_left(width: f64, height: f64, tiles: i64) -> f64:
+        can Abort.Panic:
+            step: f64 = rack_step(height)
+            return (width - (strip_width(height, tiles) + step * 0.5 + step * 2.6)) / 2.0
+
+    def put_rack(list: mutable Display::DisplayList&, paint: Paint&,
+                 rack: darray[i64]&, spent: darray[bool]&, laid: darray[i64]&,
+                 hovered_tile: i64, hovered_play: bool):
+        can Memory.Allocate, Abort.Panic:
+            tiles: i64 = rack.count.i64()
+            step: f64 = rack_step(paint.height)
+            board: mutable Board = Board{left: 0.0, bottom: 0.0, side: 0.0}
+            board_of(&board, paint.width, paint.height)
+            top: f64 = board.bottom - step * 0.3
+            left: f64 = rack_left(paint.width, paint.height, tiles)
+            for position in 0..<tiles |list, paint, rack, spent, step, top, left, hovered_tile|:
+                if not (get spent[position.usize()] else false):
+                    x: f64 = left + position.f64() * step
+                    Display::draw_bordered_rect(list, x / paint.sx,
+                                                (top - step) / paint.sy,
+                                                step * 0.9 / paint.sx,
+                                                step / paint.sy, paint.back,
+                                                color_here() if position == hovered_tile else color_rule(),
+                                                1.0 / paint.sx)
+                    letter: i64 = step_at(rack, position)
+                    shown: mutable dstr = []
+                    shown.push(upper_of(letter))
+                    put_text(list, paint, bytes_view(shown), x + step * 0.45,
+                             top - step * 0.52, fit(step, 0.42), paint.ink,
+                             Display::ANCHOR_CENTER_CENTER, false)
+                    worth: mutable dstr = []
+                    dstr_append_i64(&worth, position + 1)
+                    dstr_append_cstr(&worth, "·")
+                    dstr_append_i64(&worth, letter_value(letter))
+                    put_text(list, paint, bytes_view(worth), x + step * 0.45,
+                             top - step * 0.9, fit(step, 0.2), paint.faint,
+                             Display::ANCHOR_CENTER_CENTER, false)
+            put_play(list, paint, &board, tiles, laid, hovered_play)
+
+    # The one action the keyboard has that a square does not. In the rack
+    # STRIP rather than under it: the strip's floor is already the lowest this
+    # task may draw, and a button below it would be a shape in the band whose
+    # colour nobody is checking.
+    def put_play(list: mutable Display::DisplayList&, paint: Paint&,
+                 board: Board&, tiles: i64, laid: darray[i64]&,
+                 hovered_play: bool):
+        can Memory.Allocate, Abort.Panic:
+            step: f64 = rack_step(paint.height)
+            top: f64 = board.bottom - step * 0.3
+            wide: f64 = step * 2.6
+            wanted: f64 = rack_left(paint.width, paint.height, tiles) + strip_width(paint.height, tiles) + step * 0.5
+            # Never off the right edge, however narrow the window is.
+            edge: f64 = paint.width - wide - step * 0.2
+            left: f64 = wanted if wanted < edge else edge
+            live: mutable bool = false
+            for cell in 0..<laid.count.i64() |laid, live|:
+                if step_at(laid, cell) != 0:
+                    live <- true
+            Display::draw_bordered_rect(list, left / paint.sx,
+                                        (top - step) / paint.sy,
+                                        wide / paint.sx, step / paint.sy,
+                                        paint.back,
+                                        color_here() if hovered_play and live else color_rule(),
+                                        1.0 / paint.sx)
+            put_text(list, paint, sview("Play", 0, -1), left + wide / 2.0,
+                     top - step + step / 2.0, fit(step, 0.32),
+                     paint.ink if live else paint.dim,
+                     Display::ANCHOR_CENTER_CENTER, false)
