@@ -1,0 +1,210 @@
+# The Sokoban screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/sokoban.py -- the drawing, not the thinking.
+#
+# Three labels, a verdict and a room. The room is drawn cell by cell in index
+# order, and then the BOXES are drawn -- and those come out of a frozenset, so
+# the order they go down in is CPython's hash order and not the order they
+# were put in.
+#
+# That order is reproduced rather than settled for, and the difference from
+# Go's rings is that it has to be: Go's rings are identical circles on distinct
+# points, where nothing about the order can reach a pixel. A box that is home
+# is drawn green and a box that is not is drawn blue, so an ordering that put
+# the two colours in a different sequence would be a different display list
+# even though it is the same picture. `tasks/pyset.elisa` is already a model of
+# setobject.c, so the honest thing is cheaper than the excuse.
+#
+# The player is REDDISH PURPLE and not the vermillion it reads as. Vermillion
+# is (213, 94, 0) -- red over 180, green and blue under 140 -- which is
+# exactly the agent boundary's pattern for a NEGATIVE verdict, and the board
+# reaches into the band the boundary reads. A pusher standing low on the room
+# was being paid as a lost trial.
+#
+# NOTE: needs elisacore_math, strings, ints, pyset, geometry, verdict, display
+# and scene_verdict included by the driver.
+
+module SceneSokoban:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_PUSHING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_LOST: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    def color_wall() -> u32:
+        return Display::rgba(110, 110, 110, 255)
+
+    def color_goal() -> u32:
+        return Display::rgba(230, 159, 0, 255)
+
+    def color_box() -> u32:
+        return Display::rgba(86, 180, 233, 255)
+
+    def color_box_home() -> u32:
+        return Display::rgba(0, 158, 115, 255)
+
+    def color_player() -> u32:
+        return Display::rgba(204, 121, 167, 255)
+
+    def color_trap() -> u32:
+        return Display::rgba(150, 150, 150, 255)
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    # Left, bottom, width and height of the room's box on screen.
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 100.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 56.0).f64()).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.08
+            out.bottom <- bottom
+            out.width <- width * 0.84
+            out.height <- room if room > 40.0 else 40.0
+
+    # Left, bottom and side of one cell's square.
+    struct Cell:
+        x: mutable f64
+        y: mutable f64
+        side: mutable f64
+
+    def cell_rect(out: mutable Cell&, canvas: Canvas&, wide: i64, tall: i64, cell: i64):
+        can Abort.Panic:
+            across: f64 = canvas.width / wide.f64()
+            down: f64 = canvas.height / tall.f64()
+            side: f64 = across if across < down else down
+            offset_x: f64 = canvas.left + (canvas.width - side * wide.f64()) / 2.0
+            offset_y: f64 = canvas.bottom + (canvas.height - side * tall.f64()) / 2.0
+            out.x <- offset_x + (cell % wide).f64() * side
+            out.y <- offset_y + (tall - 1 - cell / wide).f64() * side
+            out.side <- side
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_level: bool, wide: i64, tall: i64, walls: darray[bool]&,
+               goals: darray[bool]&, traps: darray[bool]&,
+               boxes: darray[i64]&, player: i64, show_traps: bool,
+               pushes: i64, trial: i64, total_trials: i64, message: sview,
+               verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            playing: bool = has_level and (phase == PHASE_PUSHING or phase == PHASE_SOLVED or phase == PHASE_LOST)
+
+            put_text(list, paint, sview("Sokoban", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            # The counter joins on by PHASE alone: a level that is gone still
+            # says which puzzle it was and how many pushes it took.
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if phase == PHASE_PUSHING or phase == PHASE_SOLVED or phase == PHASE_LOST:
+                dstr_append_cstr(&status, "     puzzle ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "   pushes ")
+                dstr_append_i64(&status, pushes)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     arrows: push     U: undo     R: restart     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if not playing:
+                return
+
+            # The boxes, in the order a frozenset hands them out.
+            # `new` sizes the backing store and nothing else -- the live
+            # table still starts at MINSIZE, so this is a bound and not a
+            # presize. `order` has to be sized up front too: `Ints::put` drops
+            # an out-of-range index silently rather than growing.
+            room_for: i64 = boxes.count.i64() + 8
+            held: mutable PySet::Table = PySet::new(room_for)
+            for at in 0..<boxes.count.i64() |held, boxes|:
+                PySet::add(&held, get boxes[at.usize()] else 0)
+            order: mutable darray[i64] = Ints::zeros(room_for)
+            live: i64 = PySet::to_list(held, &order)
+
+            canvas: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&canvas, paint.width, paint.height)
+            square: mutable Cell = Cell{x: 0.0, y: 0.0, side: 0.0}
+
+            for cell in 0..<(wide * tall) |list, paint, canvas, square, wide, tall, walls, goals, traps, held, show_traps|:
+                cell_rect(&square, &canvas, wide, tall, cell)
+                side: f64 = square.side
+                pad: f64 = side * 0.04
+                if get walls[cell.usize()] else false:
+                    Display::draw_rect(list, (square.x + pad) / paint.sx,
+                                       (square.y + pad) / paint.sy,
+                                       (side - 2.0 * pad) / paint.sx,
+                                       (side - 2.0 * pad) / paint.sy,
+                                       color_wall())
+                elif (get goals[cell.usize()] else false) and not PySet::contains(&held, cell):
+                    Display::draw_circle(list, (square.x + side / 2.0) / paint.sx,
+                                         (square.y + side / 2.0) / paint.sy,
+                                         side * 0.13 / paint.sx, color_goal())
+                elif show_traps and (get traps[cell.usize()] else false):
+                    # The landmines, marked on request: a box pushed onto one
+                    # of these can never reach a goal again.
+                    Display::draw_line(list, (square.x + side * 0.36) / paint.sx,
+                                       (square.y + side * 0.36) / paint.sy,
+                                       (square.x + side * 0.64) / paint.sx,
+                                       (square.y + side * 0.64) / paint.sy,
+                                       2.0 / paint.sx, color_trap())
+                    Display::draw_line(list, (square.x + side * 0.36) / paint.sx,
+                                       (square.y + side * 0.64) / paint.sy,
+                                       (square.x + side * 0.64) / paint.sx,
+                                       (square.y + side * 0.36) / paint.sy,
+                                       2.0 / paint.sx, color_trap())
+
+            for at in 0..<live |list, paint, canvas, square, wide, tall, order, goals, live|:
+                box: i64 = Ints::at(order, at)
+                cell_rect(&square, &canvas, wide, tall, box)
+                side: f64 = square.side
+                pad: f64 = side * 0.16
+                home: bool = get goals[box.usize()] else false
+                Display::draw_rect(list, (square.x + pad) / paint.sx,
+                                   (square.y + pad) / paint.sy,
+                                   (side - 2.0 * pad) / paint.sx,
+                                   (side - 2.0 * pad) / paint.sy,
+                                   color_box_home() if home else color_box())
+
+            cell_rect(&square, &canvas, wide, tall, player)
+            Display::draw_circle(list, (square.x + square.side / 2.0) / paint.sx,
+                                 (square.y + square.side / 2.0) / paint.sy,
+                                 square.side * 0.3 / paint.sx, color_player())
