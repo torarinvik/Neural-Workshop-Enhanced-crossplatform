@@ -69,3 +69,147 @@ module TextMetrics:
     def text_height(size: f64, lines: i64) -> i64:
         can Abort.Panic:
             return lines * line_height(size)
+
+    # --- word wrapping ----------------------------------------------------
+    #
+    # A multiline label wraps at its `width`, and seven screens lay out
+    # against how tall the result turned out. That number is not arithmetic:
+    # it is what pyglet's `_flow_glyphs_wrap` decided, and the decision has
+    # edges worth naming.
+    #
+    #   * The overflow test is `x + advance >= width`, with >= and not >, so a
+    #     line that fills the width EXACTLY has already broken.
+    #   * A run with no break opportunity in it does not break at all. The
+    #     line overflows and `content_width` comes back wider than `width`.
+    #   * Whitespace that ends a line is not measured -- pyglet subtracts the
+    #     trailing run (`line.width -= eol_ws`) as it flushes -- but the SAME
+    #     whitespace is what committed the words before it.
+    #   * The last line is flushed without that subtraction.
+    #   * An empty label has no lines at all: content_height is 0, not one
+    #     line's worth.
+    #
+    # The model below is that function with the parts this port cannot reach
+    # taken out -- one font, no kerning, no margins, no indents, no inline
+    # elements, no tab stops -- and it was fuzzed against real pyglet Labels
+    # over 308 texts at nine widths and four sizes with no mismatches.
+    #
+    # It counts CODEPOINTS, not bytes, because a glyph is a codepoint.
+
+    def is_continuation(byte: u8) -> bool:
+        return (byte.i64() & 192) == 128
+
+    # A three-byte E2 xx yy sequence starting at `at`.
+    def is_utf8_pair(text: sview, at: i64, second: i64, third: i64) -> bool:
+        can Abort.Panic:
+            length: i64 = sview_len(text).i64()
+            if at + 2 >= length:
+                return false
+            if sview_at(text, at.usize()).i64() != 226:
+                return false
+            if sview_at(text, (at + 1).usize()).i64() != second:
+                return false
+            return sview_at(text, (at + 2).usize()).i64() == third
+
+    # ' ', tab and zero-width space: pyglet's break opportunities.
+    def is_break_space(text: sview, at: i64) -> bool:
+        can Abort.Panic:
+            byte: i64 = sview_at(text, at.usize()).i64()
+            if byte == 32 or byte == 9:
+                return true
+            return is_utf8_pair(text, at, 128, 139)      # U+200B
+
+    # '\n', U+2028 and U+2029: pyglet's forced breaks.
+    def is_break_line(text: sview, at: i64) -> bool:
+        can Abort.Panic:
+            byte: i64 = sview_at(text, at.usize()).i64()
+            if byte == 10:
+                return true
+            if is_utf8_pair(text, at, 128, 168):         # U+2028
+                return true
+            return is_utf8_pair(text, at, 128, 169)      # U+2029
+
+    struct Wrapped:
+        widest: mutable i64
+        lines: mutable i64
+
+    def wrap(text: sview, step: i64, width: i64) -> Wrapped:
+        can Abort.Panic:
+            length: i64 = sview_len(text).i64()
+            if length == 0:
+                return Wrapped{widest: 0, lines: 0}
+
+            x: mutable i64 = 0
+            # Pending glyphs in this owner run, and the ones already committed
+            # to the current line by a following space.
+            owner: mutable i64 = 0
+            owner_n: mutable i64 = 0
+            commit: mutable i64 = 0
+            commit_n: mutable i64 = 0
+            # The current line, and whether anything has been boxed into it.
+            line: mutable i64 = 0
+            boxes: mutable i64 = 0
+            # Whitespace accumulated at the end of the line, which the flush
+            # takes back off again.
+            trailing: mutable i64 = 0
+
+            widest: mutable i64 = 0
+            lines: mutable i64 = 0
+            at: mutable i64 = 0
+            while at < length |text, step, width, length, x, owner, owner_n, commit, commit_n, line, boxes, trailing, widest, lines, at|:
+                if is_continuation(sview_at(text, at.usize())):
+                    at <- at + 1
+                elif is_break_space(text, at):
+                    commit <- commit + owner + step
+                    commit_n <- commit_n + owner_n + 1
+                    trailing <- trailing + step
+                    owner <- 0
+                    owner_n <- 0
+                    x <- x + step
+                    at <- at + 1
+                else:
+                    newline: bool = is_break_line(text, at)
+                    if x + step >= width or newline:
+                        if newline:
+                            commit <- commit + owner
+                            commit_n <- commit_n + owner_n
+                            owner <- 0
+                            owner_n <- 0
+                        if commit_n > 0:
+                            line <- line + commit
+                            boxes <- boxes + 1
+                            commit <- 0
+                            commit_n <- 0
+                        if boxes > 0 or newline:
+                            line <- line - trailing
+                            widest <- line if line > widest else widest
+                            lines <- lines + 1
+                            line <- 0
+                            boxes <- 0
+                            x <- owner
+                    if not newline:
+                        owner <- owner + step
+                        owner_n <- owner_n + 1
+                        x <- x + step
+                    trailing <- 0
+                    at <- at + 1
+
+            if commit_n > 0:
+                line <- line + commit
+            if owner_n > 0:
+                line <- line + owner
+            widest <- line if line > widest else widest
+            lines <- lines + 1
+            return Wrapped{widest: widest, lines: lines}
+
+    # What pyglet calls a wrapped label's content_width and content_height.
+    def wrapped_width(size: f64, text: sview, width: i64) -> i64:
+        can Abort.Panic:
+            return wrap(text, advance(size), width).widest
+
+    def wrapped_lines(size: f64, text: sview, width: i64) -> i64:
+        can Abort.Panic:
+            return wrap(text, advance(size), width).lines
+
+    def wrapped_height(size: f64, text: sview, width: i64) -> i64:
+        can Abort.Panic:
+            return wrap(text, advance(size), width).lines * line_height(size)

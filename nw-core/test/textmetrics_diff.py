@@ -29,6 +29,20 @@ from neural_workshop.constants import FONTLIST                     # noqa: E402
 CHARACTERS = (1, 2, 7, 10, 64)
 LINES = (1, 2, 3, 5, 8)
 
+#: Mirrored, in order, by `text_of` in textmetrics_sweep.elisa. Chosen to sit
+#: on pyglet's wrapping decisions -- a width narrower than one glyph, a word
+#: with no break in it, a line that fills the width exactly, trailing and
+#: doubled spaces, forced newlines including an empty line -- rather than to
+#: look like prose.
+TEXTS = ("", " ", "\n", "a", "a b", "aaaa", "the quick brown fox",
+         "supercalifragilisticexpialidocious", "aa bbbbbbbbbb cc", "aaa bbb",
+         "  a  b  ", "a\n\nb", "\na",
+         "one two three four five six seven eight",
+         "brown-fox don't x. (y) 1,000 end.",
+         "ggggggggggggg hi the quick a bb ccc dddd eeeee")
+SIZES = (80, 100, 120, 220)
+COLUMNS = (1, 2, 3, 4, 5, 8, 13, 40, 97)
+
 
 def reference():
     out = []
@@ -50,6 +64,24 @@ def reference():
                                       width=4000)
             row.append(label.content_height)
         out.append(",".join(str(cell) for cell in row))
+
+    for which, text in enumerate(TEXTS):
+        for tenths in SIZES:
+            size = tenths / 10.0
+            advance = pyglet.text.Label('M', font_size=size,
+                                        font_name=FONTLIST).content_width
+            for cols in COLUMNS:
+                label = pyglet.text.Label(text, font_size=size,
+                                          font_name=FONTLIST, multiline=True,
+                                          width=cols * advance)
+                tall = pyglet.text.Label('M\nM', font_size=size,
+                                         font_name=FONTLIST, multiline=True,
+                                         width=4000).content_height // 2
+                lines = label.content_height // tall
+                out.append(",".join(str(cell) for cell in
+                                    ["w", which, tenths, cols,
+                                     label.content_width, lines,
+                                     label.content_height]))
     return out
 
 
@@ -71,7 +103,7 @@ def main():
             print("  elisa:  %s" % a)
             print("  pyglet: %s" % b)
             return 1
-    print("PASS: %d sizes identical" % len(want))
+    print("PASS: %d measurements identical" % len(want))
     return 0
 
 
