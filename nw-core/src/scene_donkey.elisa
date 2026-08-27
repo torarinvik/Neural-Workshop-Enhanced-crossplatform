@@ -1,0 +1,316 @@
+# The Donkey screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/donkey.py -- the drawing, not the thinking.
+#
+# Four labels, a verdict, a road, some donkeys, a car and a progress bar. The
+# order matters and is stated in the reference: the road, the donkeys, the
+# car, and THEN every donkey the car is inside AGAIN, over the bonnet -- so a
+# hit reads as a donkey on top of a car rather than a donkey that vanished.
+#
+# Everything on the road is placed against the car's tail at offset zero, in
+# SUB-ROWS, and drawn at its own length. The frame a round ends on is the
+# frame the two boxes meet, which is only true because both are drawn at
+# exactly the length the collision uses.
+#
+# The donkey is vermillion, `(213, 94, 0)`, which is a NEGATIVE VERDICT
+# outright rather than merely a blend that passes for one -- so the stage
+# stops above the band, and a donkey drawn down there would pay the road a -1
+# for standing in it.
+#
+# `_rect` floors both sides at one pixel, so a shape too small to see is still
+# a command.
+#
+# NOTE: needs elisacore_math, strings, ints, geometry, verdict, display and
+# scene_verdict included by the driver.
+
+module SceneDonkey:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SETTING: i64 = 1
+    const PHASE_RUNNING: i64 = 2
+    const PHASE_SCORED: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    # Sub-rows a drawn row holds, and how many rows are drawn ahead.
+    const SUB: f64 = 4.0
+    const SIGHT: i64 = 10
+    # The car and the donkey, in sub-rows.
+    const CAR_LONG: f64 = 3.0
+    const BEAST: f64 = 3.0
+
+    const ROAD_ALPHA: i64 = 24
+    const MARK_ALPHA: i64 = 90
+
+    def color_car() -> u32:
+        return Display::rgba(0, 114, 178, 255)
+
+    def color_donkey() -> u32:
+        return Display::rgba(213, 94, 0, 255)
+
+    def color_passed() -> u32:
+        return Display::rgba(0, 158, 115, 255)
+
+    struct Beast:
+        # First blocked sub-row, which is a car's length before the animal.
+        at: i64
+        lane: i64
+
+    struct Paint:
+        ink: mutable u32
+        back: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     back: Display::rgba(back, back, back, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    # The ink at some other opacity, which is how the road is drawn.
+    def inked(paint: Paint&, opacity: i64) -> u32:
+        channel: i64 = ((paint.ink >> 24.u32()) & 255.u32()).i64()
+        return Display::rgba(channel, channel, channel, opacity)
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    # `max(1.0, wide)` and `max(1.0, tall)`: a shape too small to see is
+    # still a command, and still one pixel across.
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, wide: f64, tall: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               (wide if wide > 1.0 else 1.0) / paint.sx,
+                               (tall if tall > 1.0 else 1.0) / paint.sy, color)
+
+    struct Stage:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def stage_of(out: mutable Stage&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 140.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 60.0).f64()).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.10
+            out.bottom <- bottom
+            out.width <- width * 0.80
+            out.height <- room if room > 60.0 else 60.0
+
+    struct Road:
+        left: mutable f64
+        bottom: mutable f64
+        wide: mutable f64
+        tall: mutable f64
+
+    def road_of(out: mutable Road&, stage: Stage&):
+        across: f64 = stage.width * 0.34
+        down: f64 = stage.height * 0.62
+        wide: f64 = across if across < down else down
+        out.left <- stage.left + (stage.width - wide) / 2.0
+        out.bottom <- stage.bottom
+        out.wide <- wide
+        out.tall <- stage.height
+
+    def row_height(road: Road&) -> f64:
+        return road.tall / (SIGHT + 2).f64()
+
+    def row_y(road: Road&, offset: f64) -> f64:
+        return road.bottom + row_height(road) * (offset + 1.0)
+
+    def rows_of(steps: f64) -> f64:
+        return steps / SUB
+
+    def lane_x(road: Road&, lane: f64) -> f64:
+        return road.left + road.wide * (0.25 + 0.5 * lane)
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_road: bool, beasts: darray[Beast]&, blocked: i64,
+               road_rows: i64, donkeys: i64, car_at: i64, car_lane: i64,
+               car_crossing: i64, car_span: i64, car_passed: i64,
+               asked: sview, trial: i64, total_trials: i64, message: sview,
+               verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            driving: bool = has_road and (phase == PHASE_SETTING or phase == PHASE_RUNNING or phase == PHASE_SCORED)
+
+            put_text(list, paint, sview("Donkey", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            # With no road under the car the status is the bare message; with
+            # one it is the road counter and the message together, in that
+            # order and joined by five spaces.
+            status: mutable dstr = []
+            if has_road:
+                dstr_append_cstr(&status, "Road ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "     ")
+                dstr_append_sview(&status, message)
+            else:
+                dstr_append_sview(&status, message)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint, asked if has_road else sview("", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 94.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_TOP, false)
+
+            put_text(list, paint,
+                     sview("Esc: menu   Space: start, then swerve   C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if not driving:
+                return
+
+            stage: mutable Stage = Stage{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            stage_of(&stage, paint.width, paint.height)
+            road: mutable Road = Road{left: 0.0, bottom: 0.0, wide: 0.0, tall: 0.0}
+            road_of(&road, &stage)
+
+            put_road(list, paint, &road, car_at)
+            put_donkeys(list, paint, &road, beasts, car_at, false)
+            put_car(list, paint, &road, car_lane, car_crossing, car_span)
+            put_donkeys(list, paint, &road, beasts, car_at, true)
+            put_left(list, paint, &stage, car_at, blocked, road_rows,
+                     donkeys, car_passed)
+
+    def put_road(list: mutable Display::DisplayList&, paint: Paint&,
+                 road: Road&, car_at: i64):
+        can Memory.Allocate, Abort.Panic:
+            put_rect(list, paint, road.left, road.bottom, road.wide, road.tall,
+                     inked(paint, ROAD_ALPHA))
+            edge: f64 = road.wide * 0.03
+            verge: f64 = edge if edge > 2.0 else 2.0
+            put_rect(list, paint, road.left, road.bottom, verge, road.tall,
+                     inked(paint, MARK_ALPHA))
+            put_rect(list, paint, road.left + road.wide - verge, road.bottom,
+                     verge, road.tall, inked(paint, MARK_ALPHA))
+            # Dashes every other row of the ROAD, not of the screen, so they
+            # slide down with everything else instead of blinking in place.
+            step: f64 = row_height(road)
+            wanted: f64 = road.wide * 0.02
+            thick: f64 = wanted if wanted > 2.0 else 2.0
+            first: i64 = car_at / SUB.i64() - 1
+            for row in first..<(first + SIGHT + 3) |list, paint, road, car_at, step, thick|:
+                if row >= 0 and row % 2 == 0:
+                    y: f64 = row_y(road, rows_of((row * SUB.i64() - car_at).f64()))
+                    if y >= road.bottom and y + step * 0.5 <= road.bottom + road.tall:
+                        put_rect(list, paint, road.left + road.wide / 2.0 - thick / 2.0,
+                                 y, thick, step * 0.5, inked(paint, MARK_ALPHA))
+
+    # Every donkey near the window, or -- when `overlapping` -- only the one
+    # the car is inside.
+    def put_donkeys(list: mutable Display::DisplayList&, paint: Paint&,
+                    road: Road&, beasts: darray[Beast]&, car_at: i64,
+                    overlapping: bool):
+        can Memory.Allocate, Abort.Panic:
+            for index in 0..<beasts.count.i64() |list, paint, road, beasts, car_at, overlapping|:
+                one: Beast = get beasts[index.usize()] else Beast{at: 0, lane: 0}
+                # `body_of(at)` is `at + CAR - 1`: the blocked run starts a
+                # car's length before the animal does, and the screen wants
+                # the animal.
+                body: i64 = one.at + CAR_LONG.i64() - 1
+                offset: f64 = rows_of((body - car_at).f64())
+                if offset >= -1.0 and offset <= SIGHT.f64():
+                    if not overlapping or (offset > -rows_of(BEAST) and offset < rows_of(CAR_LONG)):
+                        put_donkey(list, paint, road, offset, one.lane.f64())
+
+    # A body, a head and two ears. It is not much of a donkey.
+    def put_donkey(list: mutable Display::DisplayList&, paint: Paint&,
+                   road: Road&, offset: f64, lane: f64):
+        can Memory.Allocate, Abort.Panic:
+            step: f64 = row_height(road)
+            x: f64 = lane_x(road, lane)
+            tall: f64 = step * rows_of(BEAST)
+            y: f64 = row_y(road, offset) + tall / 2.0
+            across: f64 = road.wide * 0.30
+            body: f64 = across if across < tall else tall
+            shade: u32 = color_donkey()
+            put_rect(list, paint, x - body / 2.0, y - body * 0.32, body, body * 0.62, shade)
+            head: f64 = body * 0.34
+            put_rect(list, paint, x + body * 0.34, y + body * 0.10, head, head, shade)
+            put_rect(list, paint, x + body * 0.40, y + body * 0.34, head * 0.22, head * 0.55, shade)
+            put_rect(list, paint, x + body * 0.66, y + body * 0.34, head * 0.22, head * 0.55, shade)
+            put_rect(list, paint, x - body * 0.34, y - body * 0.62, body * 0.12, body * 0.34, shade)
+            put_rect(list, paint, x + body * 0.20, y - body * 0.62, body * 0.12, body * 0.34, shade)
+
+    def put_car(list: mutable Display::DisplayList&, paint: Paint&, road: Road&,
+                car_lane: i64, car_crossing: i64, car_span: i64):
+        can Memory.Allocate, Abort.Panic:
+            # `share` is 0 in the lane it left and 1 in the new one, so a
+            # swerve under way is drawn part of the way across: the car
+            # covers both lanes for as long as the crossing lasts.
+            share: mutable f64 = 0.0
+            if car_crossing != 0:
+                share <- (car_span - car_crossing + 1).f64() / (car_span + 1).f64()
+            lane: f64 = car_lane.f64() + (1 - 2 * car_lane).f64() * share
+            step: f64 = row_height(road)
+            x: f64 = lane_x(road, lane)
+            tall: f64 = step * rows_of(CAR_LONG)
+            y: f64 = row_y(road, 0.0) + tall / 2.0
+            across: f64 = road.wide * 0.28
+            body: f64 = across if across < tall else tall
+            put_rect(list, paint, x - body / 2.0, y - body * 0.42, body, body * 0.84, color_car())
+            # A roof, so which way it is pointing is never in question.
+            put_rect(list, paint, x - body * 0.30, y - body * 0.10, body * 0.60,
+                     body * 0.34, paint.back)
+            put_rect(list, paint, x - body * 0.54 - body * 0.10, y - body * 0.34,
+                     body * 0.20, body * 0.26, inked(paint, 200))
+            put_rect(list, paint, x + body * 0.54 - body * 0.10, y - body * 0.34,
+                     body * 0.20, body * 0.26, inked(paint, 200))
+
+    # How much road is behind, and how many donkeys are in it.
+    def put_left(list: mutable Display::DisplayList&, paint: Paint&,
+                 stage: Stage&, car_at: i64, blocked: i64, road_rows: i64,
+                 donkeys: i64, car_passed: i64):
+        can Memory.Allocate, Abort.Panic:
+            span: f64 = stage.width * 0.16
+            wanted: f64 = stage.height * 0.020
+            thick: f64 = wanted if wanted > 3.0 else 3.0
+            y: f64 = stage.bottom + stage.height * 0.5
+            length: i64 = blocked if blocked > 1 else 1
+            walked: f64 = car_at.f64() / length.f64()
+            share: f64 = walked if walked < 1.0 else 1.0
+            put_rect(list, paint, stage.left, y, span, thick, inked(paint, 40))
+            put_rect(list, paint, stage.left, y, span * share, thick, color_passed())
+            done: mutable dstr = []
+            dstr_append_i64(&done, car_at / SUB.i64())
+            dstr_append_cstr(&done, " of ")
+            dstr_append_i64(&done, road_rows)
+            dstr_append_cstr(&done, " rows")
+            put_text(list, paint, bytes_view(done), stage.left + span / 2.0,
+                     y + stage.height * 0.06,
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+            past: mutable dstr = []
+            dstr_append_i64(&past, car_passed)
+            dstr_append_cstr(&past, " of ")
+            dstr_append_i64(&past, donkeys)
+            dstr_append_cstr(&past, " donkeys")
+            put_text(list, paint, bytes_view(past), stage.left + span / 2.0,
+                     y - stage.height * 0.06,
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
