@@ -1,0 +1,570 @@
+# Trivia: one question, and the wrong answers that make it a question.
+#
+# Port of the portable half of neural_workshop/trivia.py (GPL-2.0-or-later).
+# The corpus is downloaded (with a seed pool written into the module for a
+# player who has fetched nothing), so a bank here is supplied as rows of TEXT
+# -- real bytes, because everything this module does is look at the shape of
+# the writing rather than at what it says.
+#
+# Two things do the work.
+#
+# `normalise` is TriviaQA's own comparison form: no case, no punctuation, no
+# articles. Two answers that come out the same here are the same answer, and
+# one of them must not be offered as the other's wrong option.
+#
+# `kind_of` is what an answer LOOKS like and never what it is about: year,
+# number, name (two or more capitalised words), phrase (two or more that are
+# not), or word. It exists so a screen of options does not give its answer
+# away by being the only date on it. It is deliberately shallow -- the moment
+# it started trying to be a taxonomy it would start being wrong about the
+# questions that are interesting.
+#
+# Matching wrong answers to the right one's shape is a PREFERENCE, not a
+# promise: a pool with three years in it cannot offer seven wrong ones of the
+# same shape, and the honest fallback is a wrong answer of another shape rather
+# than a question with fewer options than the rung says.
+
+module Trivia:
+
+    const KIND_YEAR: i64 = 0
+    const KIND_NUMBER: i64 = 1
+    const KIND_NAME: i64 = 2
+    const KIND_PHRASE: i64 = 3
+    const KIND_WORD: i64 = 4
+    const KIND_COUNT: i64 = 5
+
+    const GRADE_COUNT: i64 = 7
+
+    # A question shorter than this is not a trivia question, and one longer
+    # than this does not fit on a screen above eight options.
+    const QUESTION_SHORTEST: i64 = 16
+    const QUESTION_LONGEST: i64 = 180
+
+    # An answer longer than this is a sentence rather than an option.
+    const ANSWER_LONGEST: i64 = 40
+
+    # Aliases kept per answer. The dataset carries up to a few hundred and all
+    # that is wanted is enough to catch another row offering the same thing
+    # under another name.
+    const ALIASES: i64 = 12
+
+    const MOST_OPTIONS: i64 = 8
+    const MOST_TEXT: i64 = 262144
+    const MOST_ROWS: i64 = 512
+    const MOST_ALIASES: i64 = 8192
+
+    # One rung: how many options, and whether the wrong ones must be the same
+    # shape as the right one.
+    #
+    # Two dials, one of which only starts turning once the other has run out of
+    # room: past four options a fifth wrong answer drawn at random is a fifth
+    # free elimination rather than a harder question.
+    struct Grade:
+        options: i64
+        matched: bool
+
+    def grade_at(rung: i64) -> Grade:
+        can Abort.Panic:
+            capped: i64 = GRADE_COUNT if rung > GRADE_COUNT else rung
+            index: i64 = (1 if capped < 1 else capped) - 1
+            return Grade{options: 2, matched: false} if index == 0
+            return Grade{options: 3, matched: false} if index == 1
+            return Grade{options: 4, matched: false} if index == 2
+            return Grade{options: 4, matched: true} if index == 3
+            return Grade{options: 5, matched: true} if index == 4
+            return Grade{options: 6, matched: true} if index == 5
+            return Grade{options: 8, matched: true}
+
+    # --- looking at the writing -------------------------------------------
+
+    def is_digit(byte: i64) -> bool:
+        can Abort.Panic:
+            return byte >= 48 and byte <= 57
+
+    def is_lower(byte: i64) -> bool:
+        can Abort.Panic:
+            return byte >= 97 and byte <= 122
+
+    def is_upper(byte: i64) -> bool:
+        can Abort.Panic:
+            return byte >= 65 and byte <= 90
+
+    def lowered(byte: i64) -> i64:
+        can Abort.Panic:
+            return byte + 32 if is_upper(byte)
+            return byte
+
+    # Whitespace as `str.split()` understands it.
+    def is_space(byte: i64) -> bool:
+        can Abort.Panic:
+            return byte == 32 or (byte >= 9 and byte <= 13)
+
+    # `' '.join(text.split())`: runs of whitespace become one space and the
+    # ends are trimmed.
+    def collapse(text: mutable darray[i64]&, start: i64, length: i64, out: mutable darray[i64]&, at: i64) -> i64:
+        can Abort.Panic:
+            written: mutable i64 = 0
+            gap: mutable bool = false
+            for slot in 0..<length |text, out, start, at, written, gap|:
+                byte: i64 = Ints::at_ref(text, start + slot)
+                if is_space(byte):
+                    gap <- true
+                else:
+                    if gap and written > 0:
+                        Ints::put(out, at + written, 32)
+                        written <- written + 1
+                    gap <- false
+                    Ints::put(out, at + written, byte)
+                    written <- written + 1
+            return written
+
+    # TriviaQA's own comparison form. `[^a-z0-9 ]+` becomes a space, then a
+    # standalone `a`, `an` or `the` goes -- word boundaries in a string that
+    # already holds only `[a-z0-9 ]` are exactly the token edges -- and then
+    # the whitespace collapses.
+    def normalise(text: mutable darray[i64]&, start: i64, length: i64, out: mutable darray[i64]&, at: i64, scratch: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            for slot in 0..<length |text, scratch, start|:
+                byte: i64 = lowered(Ints::at_ref(text, start + slot))
+                keep: bool = is_lower(byte) or is_digit(byte) or byte == 32
+                Ints::put(scratch, slot, byte if keep else 32)
+            # Drop whole tokens of a / an / the.
+            written: mutable i64 = 0
+            token: mutable i64 = 0
+            slot: mutable i64 = 0
+            while slot <= length |scratch, length, written, token, slot|:
+                byte: i64 = 32 if slot == length else Ints::at_ref(scratch, slot)
+                if byte == 32:
+                    if token > 0:
+                        article: mutable bool = false
+                        first: i64 = slot - token
+                        if token == 1:
+                            article <- Ints::at_ref(scratch, first) == 97
+                        if token == 2:
+                            article <- Ints::at_ref(scratch, first) == 97 and Ints::at_ref(scratch, first + 1) == 110
+                        if token == 3:
+                            article <- Ints::at_ref(scratch, first) == 116 and Ints::at_ref(scratch, first + 1) == 104 and Ints::at_ref(scratch, first + 2) == 101
+                        if article:
+                            for back in 0..<token |scratch, first|:
+                                Ints::put(scratch, first + back, 32)
+                    token <- 0
+                else:
+                    token <- token + 1
+                slot <- slot + 1
+            _ = written
+            return collapse(scratch, 0, length, out, at)
+
+    def text_equal(left: mutable darray[i64]&, left_start: i64, left_length: i64, right: mutable darray[i64]&, right_start: i64, right_length: i64) -> bool:
+        can Abort.Panic:
+            false return if left_length != right_length
+            for at in 0..<left_length |left, right, left_start, right_start|:
+                false return if Ints::at_ref(left, left_start + at) != Ints::at_ref(right, right_start + at)
+            return true
+
+    # `needle in haystack`: plain substring containment, as Python's `in` is.
+    def text_within(needle: mutable darray[i64]&, needle_start: i64, needle_length: i64, hay: mutable darray[i64]&, hay_start: i64, hay_length: i64) -> bool:
+        can Abort.Panic:
+            true return if needle_length == 0
+            false return if needle_length > hay_length
+            for offset in 0..<(hay_length - needle_length + 1) |needle, hay, needle_start, needle_length, hay_start|:
+                true return if text_equal(needle, needle_start, needle_length, hay, hay_start + offset, needle_length)
+            return false
+
+    # Words that sit uncapitalised inside a name without making it a phrase.
+    def is_particle(word: mutable darray[i64]&, start: i64, length: i64) -> bool:
+        can Abort.Panic:
+            # `word.strip('.').lower()`, then a look-up in PARTICLES.
+            first: mutable i64 = start
+            last: mutable i64 = start + length
+            while first < last and Ints::at_ref(word, first) == 46 |word, first, last|:
+                first <- first + 1
+            while last > first and Ints::at_ref(word, last - 1) == 46 |word, first, last|:
+                last <- last - 1
+            span: i64 = last - first
+            false return if span == 0 or span > 6
+            a: i64 = lowered(Ints::at_ref(word, first))
+            b: i64 = lowered(Ints::at_ref(word, first + 1)) if span > 1 else 0
+            c: i64 = lowered(Ints::at_ref(word, first + 2)) if span > 2 else 0
+            d: i64 = lowered(Ints::at_ref(word, first + 3)) if span > 3 else 0
+            e: i64 = lowered(Ints::at_ref(word, first + 4)) if span > 4 else 0
+            f: i64 = lowered(Ints::at_ref(word, first + 5)) if span > 5 else 0
+            if span == 1:
+                return a == 121                                          # y
+            if span == 2:
+                return (a == 100 and b == 97) or (a == 100 and b == 101) or (a == 100 and b == 105) or (a == 100 and b == 117) or (a == 108 and b == 97) or (a == 108 and b == 101) or (a == 115 and b == 116) or (a == 109 and b == 99) or (a == 97 and b == 108)
+            if span == 3:
+                return (a == 100 and b == 101 and c == 108) or (a == 100 and b == 101 and c == 114) or (a == 118 and b == 97 and c == 110) or (a == 118 and b == 111 and c == 110) or (a == 98 and b == 105 and c == 110) or (a == 105 and b == 98 and c == 110) or (a == 97 and b == 110 and c == 100)
+            if span == 5:
+                return a == 100 and b == 101 and c == 108 and d == 108 and e == 97
+            _ = f
+            return false
+
+    struct Number:
+        matched: bool
+        year: bool
+
+    # `^[0-9][0-9,. ]*(?:s|st|nd|rd|th|%)?$` and, when that matches,
+    # `^([0-9]{3,4})(?:s|$)` with the year between 1000 and 2100.
+    #
+    # No backtracking is needed: the greedy run's class holds none of the
+    # suffix letters, so where it stops is where it has to stop.
+    def number_shape(text: mutable darray[i64]&, start: i64, length: i64) -> Number:
+        can Abort.Panic:
+            none: Number = Number{matched: false, year: false}
+            none return if length == 0 or not is_digit(Ints::at_ref(text, start))
+            at: mutable i64 = 1
+            while at < length |text, start, length, at|:
+                byte: i64 = Ints::at_ref(text, start + at)
+                break if not (is_digit(byte) or byte == 44 or byte == 46 or byte == 32)
+                at <- at + 1
+            rest: i64 = length - at
+            tail_ok: mutable bool = rest == 0
+            if rest == 1:
+                byte: i64 = Ints::at_ref(text, start + at)
+                tail_ok <- byte == 115 or byte == 37                      # s or %
+            if rest == 2:
+                one: i64 = Ints::at_ref(text, start + at)
+                two: i64 = Ints::at_ref(text, start + at + 1)
+                tail_ok <- (one == 115 and two == 116) or (one == 110 and two == 100) or (one == 114 and two == 100) or (one == 116 and two == 104)
+            none return if not tail_ok
+            # The year clause, greedy at four digits and then three.
+            for digits in 0..<2 |text, start, length|:
+                span: i64 = 4 - digits
+                continue if length < span
+                all_digits: mutable bool = true
+                for slot in 0..<span |text, start, all_digits|:
+                    all_digits <- false if not is_digit(Ints::at_ref(text, start + slot))
+                continue if not all_digits
+                closed: bool = length == span or Ints::at_ref(text, start + span) == 115
+                continue if not closed
+                value: mutable i64 = 0
+                for slot in 0..<span |text, start, value|:
+                    value <- value * 10 + (Ints::at_ref(text, start + slot) - 48)
+                return Number{matched: true, year: true} if value >= 1000 and value <= 2100
+                return Number{matched: true, year: false}
+            return Number{matched: true, year: false}
+
+    # What an answer LOOKS like. A leading article is not part of the shape, so
+    # `the femur` is a word and `the Dead Sea` is a name.
+    def kind_of(text: mutable darray[i64]&, start: i64, length: i64) -> i64:
+        can Abort.Panic:
+            # `answer.strip()`.
+            first: mutable i64 = start
+            last: mutable i64 = start + length
+            while first < last and is_space(Ints::at_ref(text, first)) |text, first, last|:
+                first <- first + 1
+            while last > first and is_space(Ints::at_ref(text, last - 1)) |text, first, last|:
+                last <- last - 1
+            span: i64 = last - first
+            shape: Number = number_shape(text, first, span)
+            if shape.matched:
+                return KIND_YEAR if shape.year
+                return KIND_NUMBER
+            # `body.split()`, then a leading article dropped.
+            words: mutable i64 = 0
+            word_start: mutable darray[i64] = Ints::zeros(64)
+            word_length: mutable darray[i64] = Ints::zeros(64)
+            at: mutable i64 = first
+            while at < last |text, at, last, words, word_start, word_length|:
+                if is_space(Ints::at_ref(text, at)):
+                    at <- at + 1
+                else:
+                    from_at: i64 = at
+                    while at < last and not is_space(Ints::at_ref(text, at)) |text, at, last|:
+                        at <- at + 1
+                    if words < 64:
+                        Ints::put(&word_start, words, from_at)
+                        Ints::put(&word_length, words, at - from_at)
+                        words <- words + 1
+            dropped: mutable i64 = 0
+            if words > 0:
+                width: i64 = Ints::at_ref(&word_length, 0)
+                where: i64 = Ints::at_ref(&word_start, 0)
+                a: i64 = lowered(Ints::at_ref(text, where))
+                article: mutable bool = width == 1 and a == 97
+                article <- true if width == 2 and a == 97 and lowered(Ints::at_ref(text, where + 1)) == 110
+                article <- true if width == 3 and a == 116 and lowered(Ints::at_ref(text, where + 1)) == 104 and lowered(Ints::at_ref(text, where + 2)) == 101
+                dropped <- 1 if article
+            kept: i64 = words - dropped
+            return KIND_WORD if kept <= 1
+            for slot in dropped..<words |text, word_start, word_length|:
+                where: i64 = Ints::at_ref(&word_start, slot)
+                width: i64 = Ints::at_ref(&word_length, slot)
+                capital: bool = width > 0 and is_upper(Ints::at_ref(text, where))
+                return KIND_PHRASE if not capital and not is_particle(text, where, width)
+            return KIND_NAME
+
+    # --- the pool ----------------------------------------------------------
+
+    # A pool of questions, indexed the one way the deal asks for them.
+    #
+    # `text` holds the asked and answer strings as they are printed; `plain`
+    # holds their normalised forms, the aliases' included. Aliases are a SET in
+    # the reference, so duplicates are dropped as they go in.
+    struct Bank:
+        rows: mutable i64
+        asked_at: mutable darray[i64]
+        asked_n: mutable darray[i64]
+        answer_at: mutable darray[i64]
+        answer_n: mutable darray[i64]
+        kind: mutable darray[i64]
+        plain_at: mutable darray[i64]
+        plain_n: mutable darray[i64]
+        asked_plain_at: mutable darray[i64]
+        asked_plain_n: mutable darray[i64]
+        alias_first: mutable darray[i64]
+        alias_count: mutable darray[i64]
+        alias_at: mutable darray[i64]
+        alias_n: mutable darray[i64]
+        aliases: mutable i64
+        text: mutable darray[i64]
+        text_used: mutable i64
+        plain: mutable darray[i64]
+        plain_used: mutable i64
+        # by_kind, in the order the rows arrived.
+        kind_first: mutable darray[i64]
+        kind_count: mutable darray[i64]
+        kind_row: mutable darray[i64]
+
+    def new_bank() -> Bank:
+        can Memory.Allocate, Abort.Panic:
+            return Bank{rows: 0, asked_at: Ints::zeros(MOST_ROWS), asked_n: Ints::zeros(MOST_ROWS),
+                        answer_at: Ints::zeros(MOST_ROWS), answer_n: Ints::zeros(MOST_ROWS),
+                        kind: Ints::zeros(MOST_ROWS), plain_at: Ints::zeros(MOST_ROWS),
+                        plain_n: Ints::zeros(MOST_ROWS), asked_plain_at: Ints::zeros(MOST_ROWS),
+                        asked_plain_n: Ints::zeros(MOST_ROWS),
+                        alias_first: Ints::zeros(MOST_ROWS), alias_count: Ints::zeros(MOST_ROWS),
+                        alias_at: Ints::zeros(MOST_ALIASES), alias_n: Ints::zeros(MOST_ALIASES),
+                        aliases: 0, text: Ints::zeros(MOST_TEXT), text_used: 0,
+                        plain: Ints::zeros(MOST_TEXT), plain_used: 0,
+                        kind_first: Ints::zeros(KIND_COUNT), kind_count: Ints::zeros(KIND_COUNT),
+                        kind_row: Ints::zeros(MOST_ROWS)}
+
+    # `yes`, `no`, `true`, `false`, `none`, `unknown`: answers that are not
+    # answers when they are on a list with three others.
+    def is_yesno(plain: mutable darray[i64]&, start: i64, length: i64) -> bool:
+        can Abort.Panic:
+            false return if length < 2 or length > 7
+            a: i64 = Ints::at_ref(plain, start)
+            if length == 2:
+                return a == 110 and Ints::at_ref(plain, start + 1) == 111       # no
+            if length == 3:
+                return a == 121 and Ints::at_ref(plain, start + 1) == 101 and Ints::at_ref(plain, start + 2) == 115   # yes
+            if length == 4:
+                b: i64 = Ints::at_ref(plain, start + 1)
+                c: i64 = Ints::at_ref(plain, start + 2)
+                d: i64 = Ints::at_ref(plain, start + 3)
+                return (a == 116 and b == 114 and c == 117 and d == 101) or (a == 110 and b == 111 and c == 110 and d == 101)
+            if length == 5:
+                return a == 102 and Ints::at_ref(plain, start + 1) == 97 and Ints::at_ref(plain, start + 2) == 108 and Ints::at_ref(plain, start + 3) == 115 and Ints::at_ref(plain, start + 4) == 101
+            if length == 7:
+                return a == 117 and Ints::at_ref(plain, start + 1) == 110 and Ints::at_ref(plain, start + 2) == 107 and Ints::at_ref(plain, start + 3) == 110 and Ints::at_ref(plain, start + 4) == 111 and Ints::at_ref(plain, start + 5) == 119 and Ints::at_ref(plain, start + 6) == 110
+            return false
+
+    # One dataset row as a question, or nothing if it cannot be.
+    #
+    # Refused rather than repaired, and the refusal worth naming is the last
+    # one: a row that prints its own answer inside the question. "Which
+    # country's capital is Oslo?" answered by "Norway" is fine, but "In which
+    # year of the 1960s did the Beatles first play America?" answered by "1964"
+    # is a reading exercise.
+    def question_from(bank: mutable Bank&, raw: mutable darray[i64]&, asked_start: i64, asked_length: i64, answer_start: i64, answer_length: i64, alias_start: mutable darray[i64]&, alias_length: mutable darray[i64]&, alias_given: i64, scratch: mutable darray[i64]&) -> bool:
+        can Abort.Panic:
+            asked_at: i64 = bank.text_used
+            asked_n: i64 = collapse(raw, asked_start, asked_length, &bank.text, asked_at)
+            answer_at: i64 = asked_at + asked_n
+            answer_n: i64 = collapse(raw, answer_start, answer_length, &bank.text, answer_at)
+            false return if asked_n == 0 or answer_n == 0
+            false return if asked_n < QUESTION_SHORTEST or asked_n > QUESTION_LONGEST
+            false return if answer_n > ANSWER_LONGEST
+            plain_at: i64 = bank.plain_used
+            plain_n: i64 = normalise(&bank.text, answer_at, answer_n, &bank.plain, plain_at, scratch)
+            false return if is_yesno(&bank.plain, plain_at, plain_n)
+            false return if plain_n == 0
+            asked_plain_at: i64 = plain_at + plain_n
+            asked_plain_n: i64 = normalise(&bank.text, asked_at, asked_n, &bank.plain, asked_plain_at, scratch)
+            false return if text_within(&bank.plain, plain_at, plain_n, &bank.plain, asked_plain_at, asked_plain_n)
+            # The answer's own normalised form leads the alias set, and only
+            # the first ALIASES of the row's own are taken.
+            first_alias: i64 = bank.aliases
+            written: mutable i64 = asked_plain_at + asked_plain_n
+            kept: mutable i64 = 0
+            Ints::put(&bank.alias_at, first_alias, plain_at)
+            Ints::put(&bank.alias_n, first_alias, plain_n)
+            kept <- 1
+            taken: i64 = ALIASES if alias_given > ALIASES else alias_given
+            for slot in 0..<taken |bank, raw, alias_start, alias_length, scratch, first_alias, written, kept, plain_at, plain_n|:
+                length: i64 = normalise(raw, Ints::at_ref(alias_start, slot), Ints::at_ref(alias_length, slot), &bank.plain, written, scratch)
+                continue if length == 0
+                twin: mutable bool = false
+                for earlier in 0..<kept |bank, first_alias, written, length, twin|:
+                    twin <- true if text_equal(&bank.plain, Ints::at_ref(&bank.alias_at, first_alias + earlier), Ints::at_ref(&bank.alias_n, first_alias + earlier), &bank.plain, written, length)
+                continue if twin
+                Ints::put(&bank.alias_at, first_alias + kept, written)
+                Ints::put(&bank.alias_n, first_alias + kept, length)
+                kept <- kept + 1
+                written <- written + length
+            row: i64 = bank.rows
+            Ints::put(&bank.asked_at, row, asked_at)
+            Ints::put(&bank.asked_n, row, asked_n)
+            Ints::put(&bank.answer_at, row, answer_at)
+            Ints::put(&bank.answer_n, row, answer_n)
+            Ints::put(&bank.kind, row, kind_of(&bank.text, answer_at, answer_n))
+            Ints::put(&bank.plain_at, row, plain_at)
+            Ints::put(&bank.plain_n, row, plain_n)
+            Ints::put(&bank.asked_plain_at, row, asked_plain_at)
+            Ints::put(&bank.asked_plain_n, row, asked_plain_n)
+            Ints::put(&bank.alias_first, row, first_alias)
+            Ints::put(&bank.alias_count, row, kept)
+            bank.aliases <- first_alias + kept
+            bank.text_used <- answer_at + answer_n
+            bank.plain_used <- written
+            bank.rows <- row + 1
+            return true
+
+    def index_kinds(bank: mutable Bank&):
+        can Abort.Panic:
+            written: mutable i64 = 0
+            for kind in 0..<KIND_COUNT |bank, written|:
+                Ints::put(&bank.kind_first, kind, written)
+                count: mutable i64 = 0
+                for row in 0..<bank.rows |bank, kind, written, count|:
+                    if Ints::at_ref(&bank.kind, row) == kind:
+                        Ints::put(&bank.kind_row, written + count, row)
+                        count <- count + 1
+                Ints::put(&bank.kind_count, kind, count)
+                written <- written + count
+
+    # The most matched options the THINNEST shape can fill. `min(..., default=0)`
+    # over the shapes the pool actually holds -- a shape with nothing in it is
+    # not a shape the pool has.
+    def narrowest(bank: mutable Bank&) -> i64:
+        can Abort.Panic:
+            smallest: mutable i64 = -1
+            for kind in 0..<KIND_COUNT |bank, smallest|:
+                count: i64 = Ints::at_ref(&bank.kind_count, kind)
+                continue if count == 0
+                smallest <- count if smallest < 0 or count < smallest
+            return 0 if smallest < 0 else smallest
+
+    def aliases_meet(bank: mutable Bank&, left: i64, right: i64) -> bool:
+        can Abort.Panic:
+            left_n: i64 = Ints::at_ref(&bank.alias_count, left)
+            right_n: i64 = Ints::at_ref(&bank.alias_count, right)
+            for one in 0..<left_n |bank, left, right, right_n|:
+                left_at: i64 = Ints::at_ref(&bank.alias_first, left) + one
+                for two in 0..<right_n |bank, right, left_at|:
+                    right_at: i64 = Ints::at_ref(&bank.alias_first, right) + two
+                    true return if text_equal(&bank.plain, Ints::at_ref(&bank.alias_at, left_at), Ints::at_ref(&bank.alias_n, left_at), &bank.plain, Ints::at_ref(&bank.alias_at, right_at), Ints::at_ref(&bank.alias_n, right_at))
+            return false
+
+    # Scratch for one deal, sized once.
+    struct Work:
+        order: mutable darray[i64]
+        taken_at: mutable darray[i64]
+        taken_n: mutable darray[i64]
+        taken: mutable i64
+        found: mutable darray[i64]
+        options: mutable darray[i64]
+        scratch: mutable darray[i64]
+
+    def new_work() -> Work:
+        can Memory.Allocate, Abort.Panic:
+            return Work{order: Ints::zeros(MOST_ROWS), taken_at: Ints::zeros(MOST_ALIASES),
+                        taken_n: Ints::zeros(MOST_ALIASES), taken: 0,
+                        found: Ints::zeros(MOST_OPTIONS), options: Ints::zeros(MOST_OPTIONS),
+                        scratch: Ints::zeros(4096)}
+
+    def already_taken(bank: mutable Bank&, work: mutable Work&, at: i64, length: i64) -> bool:
+        can Abort.Panic:
+            for slot in 0..<work.taken |bank, work, at, length|:
+                true return if text_equal(&bank.plain, Ints::at_ref(&work.taken_at, slot), Ints::at_ref(&work.taken_n, slot), &bank.plain, at, length)
+            return false
+
+    def take(bank: mutable Bank&, work: mutable Work&, at: i64, length: i64):
+        can Abort.Panic:
+            return if already_taken(bank, work, at, length)
+            Ints::put(&work.taken_at, work.taken, at)
+            Ints::put(&work.taken_n, work.taken, length)
+            work.taken <- work.taken + 1
+
+    # One pass of `draw`: shuffle a source list and walk it, keeping the wrong
+    # answers that are genuinely wrong.
+    def draw_from(bank: mutable Bank&, work: mutable Work&, question: i64, count: i64, source: mutable darray[i64]&, source_n: i64, rng: mutable MT19937&, found: mutable i64&):
+        can Abort.Panic:
+            for slot in 0..<source_n |work, source|:
+                Ints::put(&work.order, slot, Ints::at_ref(source, slot))
+            py_shuffle_i64_prefix(rng, &work.order, source_n)
+            for slot in 0..<source_n |bank, work, question, count, found|:
+                return if found >= count
+                other: i64 = Ints::at_ref(&work.order, slot)
+                at: i64 = Ints::at_ref(&bank.plain_at, other)
+                length: i64 = Ints::at_ref(&bank.plain_n, other)
+                continue if length == 0
+                continue if already_taken(bank, work, at, length)
+                # Either direction: the candidate may be an alias of this
+                # answer, or this answer an alias of the candidate.
+                continue if aliases_meet(bank, question, other)
+                continue if text_within(&bank.plain, at, length, &bank.plain, Ints::at_ref(&bank.asked_plain_at, question), Ints::at_ref(&bank.asked_plain_n, question))
+                take(bank, work, at, length)
+                alias_n: i64 = Ints::at_ref(&bank.alias_count, other)
+                for one in 0..<alias_n |bank, work, other|:
+                    alias: i64 = Ints::at_ref(&bank.alias_first, other) + one
+                    take(bank, work, Ints::at_ref(&bank.alias_at, alias), Ints::at_ref(&bank.alias_n, alias))
+                Ints::put(&work.found, found, other)
+                found <- found + 1
+
+    # `count` wrong answers, drawn from the pool. Matching is a PREFERENCE and
+    # not a promise, so the matched pass runs first and the whole pool follows.
+    def distractors(bank: mutable Bank&, work: mutable Work&, question: i64, count: i64, matched: bool, rng: mutable MT19937&) -> i64:
+        can Abort.Panic:
+            work.taken <- 0
+            own: i64 = Ints::at_ref(&bank.alias_count, question)
+            for one in 0..<own |bank, work, question|:
+                alias: i64 = Ints::at_ref(&bank.alias_first, question) + one
+                take(bank, work, Ints::at_ref(&bank.alias_at, alias), Ints::at_ref(&bank.alias_n, alias))
+            found: mutable i64 = 0
+            if matched:
+                kind: i64 = Ints::at_ref(&bank.kind, question)
+                first: i64 = Ints::at_ref(&bank.kind_first, kind)
+                alike_n: i64 = Ints::at_ref(&bank.kind_count, kind)
+                alike: mutable darray[i64] = Ints::zeros(MOST_ROWS)
+                for slot in 0..<alike_n |bank, alike, first|:
+                    Ints::put(&alike, slot, Ints::at_ref(&bank.kind_row, first + slot))
+                draw_from(bank, work, question, count, &alike, alike_n, rng, &found)
+            every: mutable darray[i64] = Ints::zeros(MOST_ROWS)
+            for row in 0..<bank.rows |every|:
+                Ints::put(&every, row, row)
+            draw_from(bank, work, question, count, &every, bank.rows, rng, &found)
+            return found
+
+    struct Round:
+        given: bool
+        question: i64
+        options: i64
+        answer: i64
+        rung: i64
+
+    # One question at a rung, or nothing when the pool cannot fill it.
+    #
+    # Nothing means the pool holds nothing to ask. A pool too thin for the
+    # rung's WIDTH is not that: it is dealt narrower, because a question with
+    # five options instead of six is still a question.
+    def generate(bank: mutable Bank&, work: mutable Work&, rung: i64, rng: mutable MT19937&) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            none: Round = Round{given: false, question: -1, options: 0, answer: 0, rung: 0}
+            none return if bank.rows == 0
+            grade: Grade = grade_at(rung)
+            question: i64 = py_randbelow(rng, bank.rows.u64()).i64()
+            wrong: i64 = distractors(bank, work, question, grade.options - 1, grade.matched, rng)
+            none return if wrong == 0
+            Ints::put(&work.options, 0, question)
+            for slot in 0..<wrong |work|:
+                Ints::put(&work.options, slot + 1, Ints::at_ref(&work.found, slot))
+            py_shuffle_i64_prefix(rng, &work.options, wrong + 1)
+            answer: mutable i64 = 0
+            for slot in 0..<(wrong + 1) |work, question, answer|:
+                answer <- slot if Ints::at_ref(&work.options, slot) == question
+            capped: i64 = GRADE_COUNT if rung > GRADE_COUNT else rung
+            return Round{given: true, question: question, options: wrong + 1,
+                         answer: answer, rung: 1 if capped < 1 else capped}

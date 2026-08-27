@@ -1,0 +1,242 @@
+# Differential sweep driver for tasks/scrabble.elisa. See scrabble_diff.py for
+# the reference side.
+#
+# The word list is a downloaded corpus, so both sides build the same small
+# lexicon from a fixed recipe -- short words with deliberate overlaps, so the
+# cross-checks refuse things and the prefix pruning has real dead branches.
+#
+# What is swept: the premium layout at every board size, the run reader, the
+# scorer (including the three rules people get wrong -- a spent premium, a word
+# premium that multiplies the perpendicular word too, and BINGO only on a full
+# rack), legality, anchors, cross-checks, the exhaustive play list IN ORDER,
+# and the best play's tie-break, which is decided by the walk's own order.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/tasks/scrabble.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+# a, e, i, n, o, r, s, t -- the eight that make the most short words, so a rack
+# drawn from the real bag can often play and the cross-checks have to refuse
+# things rather than allowing everything.
+def alphabet(pick: i64) -> i64:
+    can Abort.Panic:
+        return 0 if pick == 0
+        return 4 if pick == 1
+        return 8 if pick == 2
+        return 13 if pick == 3
+        return 14 if pick == 4
+        return 17 if pick == 5
+        return 18 if pick == 6
+        return 19
+
+# The lexicon both sides build. Word w is `2 + w % 4` letters long over that
+# alphabet, so words share prefixes and cross-check each other.
+def build_lexicon(lex: mutable Scrabble::Lexicon&, words: i64):
+    can Abort.Panic:
+        lex.count <- words
+        at: mutable i64 = 0
+        for w in 0..<words |lex, at|:
+            length: i64 = 2 + w % 4
+            Ints::put(&lex.start, w, at)
+            Ints::put(&lex.length, w, length)
+            Ints::put(&lex.rank, w, w)
+            for k in 0..<length |lex, w, at|:
+                # a, e, n, r, t -- the five that make the most short words.
+                pick: i64 = (w / 8 + k * 3 + w % 8) % 8
+                Ints::put(&lex.letter, at + k, alphabet(pick))
+            at <- at + length
+        Scrabble::index_lexicon(lex)
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(256 * 1024 * 1024)
+        in w:
+            # --- the ladder -----------------------------------------------
+            for rung in -1..<14:
+                g: Scrabble::Grade = Scrabble::grade_of(rung)
+                printr("grade")
+                emit_cell(rung)
+                emit_cell(g.size)
+                emit_cell(g.top_rank)
+                emit_cell(g.seeded)
+                emit_cell((g.share * 1000000.0).i64())
+                emit_cell(g.rack)
+                print("")
+
+            # --- the letter values and the bag ----------------------------
+            printr("values")
+            for letter in 0..<Scrabble::LETTER_COUNT:
+                emit_cell(Scrabble::letter_value(letter))
+            print("")
+            printr("bag")
+            for letter in 0..<Scrabble::LETTER_COUNT:
+                emit_cell(Scrabble::bag_count(letter))
+            print("")
+
+            board: mutable Scrabble::Board = Scrabble::new_board()
+            work: mutable Scrabble::Work = Scrabble::new_work()
+            lex: mutable Scrabble::Lexicon = Scrabble::new_lexicon()
+            found: mutable Scrabble::Plays = Scrabble::new_plays()
+            rack: mutable darray[i64] = Ints::zeros(Scrabble::RACK)
+            build_lexicon(&lex, 120)
+
+            # --- the premium layout at every size -------------------------
+            for size in 7..<16 |board|:
+                Scrabble::blank_board(&board, size)
+                printr("premiums")
+                emit_cell(size)
+                for cell in 0..<(size * size) |board|:
+                    emit_cell(Ints::at_ref(&board.premium, cell))
+                print("")
+
+            # --- the bag, drawn ------------------------------------------
+            for seed in 1..<20 |work, rack|:
+                rng: mutable MT19937 = mt19937_new()
+                mt_seed_int(&rng, (seed * 17).u64())
+                printr("draw")
+                emit_cell(seed)
+                for _pull in 0..<3 |work, rack, rng|:
+                    taken: i64 = Scrabble::draw(&work, &rng, Scrabble::RACK, &rack)
+                    emit_cell(taken)
+                    for at in 0..<taken |rack|:
+                        emit_cell(Ints::at_ref(&rack, at))
+                print("")
+
+            # --- a board written on, then read, scored and solved ---------
+            for spec in 0..<18 |board, work, lex, found, rack|:
+                size: i64 = 7 + (spec % 3) * 2
+                Scrabble::blank_board(&board, size)
+                # Lay one word across the middle, from the lexicon, so every
+                # later play has something to hook onto.
+                seed_word: i64 = (spec * 7) % lex.count
+                length: i64 = Ints::at_ref(&lex.length, seed_word)
+                start: i64 = Ints::at_ref(&lex.start, seed_word)
+                middle: i64 = size / 2
+                at: i64 = middle * size + (size - length) / 2
+                for k in 0..<length |board, lex, at, start|:
+                    Ints::put(&board.letters, at + k, Ints::at_ref(&lex.letter, start + k))
+                # Odd specs get a second word down a column through the first,
+                # so the board is crossed and the cross-checks bite.
+                if (spec % 2) == 1:
+                    down_word: i64 = (spec * 11 + 3) % lex.count
+                    down_length: i64 = Ints::at_ref(&lex.length, down_word)
+                    down_start: i64 = Ints::at_ref(&lex.start, down_word)
+                    column: i64 = at % size
+                    top: i64 = middle - down_length / 2
+                    if top >= 0 and top + down_length <= size:
+                        for k in 0..<down_length |board, lex, size, column, top, down_start|:
+                            Ints::put(&board.letters, (top + k) * size + column, Ints::at_ref(&lex.letter, down_start + k))
+                printr("board")
+                emit_cell(spec)
+                emit_cell(size)
+                emit_cell(Scrabble::board_filled(&board))
+                for cell in 0..<(size * size) |board|:
+                    emit_cell(Ints::at_ref(&board.letters, cell))
+                print("")
+
+                spots: i64 = Scrabble::anchors(&board, &work)
+                printr("anchors")
+                emit_cell(spec)
+                emit_cell(spots)
+                for slot in 0..<spots |work|:
+                    emit_cell(Ints::at_ref(&work.spots, slot))
+                print("")
+
+                for down_at in 0..<2 |board, work, lex, spec, spots|:
+                    down: bool = down_at == 1
+                    printr("cross")
+                    emit_cell(spec)
+                    emit_cell(down_at)
+                    for slot in 0..<spots |board, work, lex, down|:
+                        cell: i64 = Ints::at_ref(&work.spots, slot)
+                        Scrabble::cross_check(&board, &work, cell, down, &lex)
+                        emit_cell(cell)
+                        for letter in 0..<Scrabble::LETTER_COUNT |work, cell|:
+                            emit_cell(Ints::at_ref(&work.allowed, cell * Scrabble::LETTER_COUNT + letter))
+                    print("")
+
+                # A rack drawn from the bag, then every play from it.
+                # A rack over the lexicon's own alphabet, so the exhaustive
+                # search has real work: a rack drawn from the whole bag is
+                # mostly letters no word here uses.
+                taken: i64 = 4 + spec % 4
+                for at in 0..<taken |rack, spec|:
+                    Ints::put(&rack, at, alphabet((spec * 3 + at * 2) % 8))
+                Ints::sort_prefix(&rack, taken)
+                Scrabble::find_plays(&board, &work, &lex, &rack, taken, &found)
+                printr("plays")
+                emit_cell(spec)
+                emit_cell(taken)
+                for at in 0..<taken |rack|:
+                    emit_cell(Ints::at_ref(&rack, at))
+                emit_cell(found.count)
+                emit_cell(1 if found.full else 0)
+                print("")
+                for slot in 0..<found.count |found, spec|:
+                    printr("play")
+                    emit_cell(spec)
+                    emit_cell(slot)
+                    emit_cell(Ints::at_ref(&found.down, slot))
+                    emit_cell(Ints::at_ref(&found.score, slot))
+                    laid: i64 = Ints::at_ref(&found.laid_n, slot)
+                    emit_cell(laid)
+                    for at in 0..<laid |found, slot|:
+                        emit_cell(Ints::at_ref(&found.laid_cell, slot * Scrabble::RACK + at))
+                        emit_cell(Ints::at_ref(&found.laid_letter, slot * Scrabble::RACK + at))
+                    word_at: i64 = Ints::at_ref(&found.word_at, slot)
+                    word_n: i64 = Ints::at_ref(&found.word_length, slot)
+                    emit_cell(word_n)
+                    for at in 0..<word_n |found, word_at|:
+                        emit_cell(Ints::at_ref(&found.word_letter, word_at + at))
+                    made: i64 = Ints::at_ref(&found.made, slot)
+                    made_at: i64 = Ints::at_ref(&found.made_at, slot)
+                    emit_cell(made)
+                    for one in 0..<made |found, slot, made_at|:
+                        made_start: i64 = Ints::at_ref(&found.made_start, slot * Scrabble::MOST_MADE + one)
+                        made_length: i64 = Ints::at_ref(&found.made_length, slot * Scrabble::MOST_MADE + one)
+                        emit_cell(made_length)
+                        for at in 0..<made_length |found, made_at, made_start|:
+                            emit_cell(Ints::at_ref(&found.made_letter, made_at + made_start + at))
+                    print("")
+                printr("best")
+                emit_cell(spec)
+                best: i64 = Scrabble::best_play(&found)
+                emit_cell(best)
+                if best >= 0:
+                    emit_cell(Ints::at_ref(&found.score, best))
+                    emit_cell(Ints::at_ref(&found.down, best))
+                print("")
+        destroy w
+        return 0

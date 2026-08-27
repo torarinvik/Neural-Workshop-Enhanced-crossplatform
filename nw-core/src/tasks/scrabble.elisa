@@ -1,0 +1,791 @@
+# Scrabble: the highest-scoring play on a board that is already busy.
+#
+# Port of the portable half of neural_workshop/scrabble.py
+# (GPL-2.0-or-later). The word list is a downloaded, rank-ordered corpus, so it
+# is supplied: a lexicon here is words with ranks, indexed the two ways the
+# solver asks for them -- is this a word, and is this the opening of one.
+#
+# The play generator is EXHAUSTIVE, and slow on purpose rather than by
+# accident: what a rung reports is the player's score as a share of the best,
+# and a best that was only nearly the best would flatter everybody by an
+# unknown amount.
+#
+# Four rules carry the scoring and three of them are the ones people get wrong:
+#
+#   * the premium under a tile ALREADY on the board is spent and does not pay
+#     again -- only freshly laid tiles collect;
+#   * a word premium multiplies EVERY word it falls in, the perpendicular one
+#     included, which is why a triple word under a crossing is worth so much;
+#   * the main word is scored once even though the play's own direction and the
+#     cross direction can both produce it;
+#   * a full rack pays BINGO on top, and only a FULL one.
+#
+# The premium layout is GENERATED rather than copied from the fifteen by
+# fifteen, because the boards here run from seven to fifteen and the real
+# layout does not scale by cutting bits off it.
+
+module Scrabble:
+
+    const LETTER_COUNT: i64 = 26
+    const EMPTY: i64 = -1
+
+    const PLAIN: i64 = 0
+    const DOUBLE_LETTER: i64 = 1
+    const TRIPLE_LETTER: i64 = 2
+    const DOUBLE_WORD: i64 = 3
+    const TRIPLE_WORD: i64 = 4
+
+    # What the board pays for using every tile in the rack.
+    const BINGO: i64 = 50
+
+    # A full rack. Seven at every rung, because the rack is not the dial.
+    const RACK: i64 = 7
+
+    const MOST_SIZE: i64 = 15
+    const MOST_CELLS: i64 = 225
+    const GRADE_COUNT: i64 = 10
+
+    # The English letter values, which are the game's and not ours.
+    def letter_value(letter: i64) -> i64:
+        can Abort.Panic:
+            return 1 if letter == 0        # a
+            return 3 if letter == 1        # b
+            return 3 if letter == 2        # c
+            return 2 if letter == 3        # d
+            return 1 if letter == 4        # e
+            return 4 if letter == 5        # f
+            return 2 if letter == 6        # g
+            return 4 if letter == 7        # h
+            return 1 if letter == 8        # i
+            return 8 if letter == 9        # j
+            return 5 if letter == 10       # k
+            return 1 if letter == 11       # l
+            return 3 if letter == 12       # m
+            return 1 if letter == 13       # n
+            return 1 if letter == 14       # o
+            return 3 if letter == 15       # p
+            return 10 if letter == 16      # q
+            return 1 if letter == 17       # r
+            return 1 if letter == 18       # s
+            return 1 if letter == 19       # t
+            return 1 if letter == 20       # u
+            return 4 if letter == 21       # v
+            return 4 if letter == 22       # w
+            return 8 if letter == 23       # x
+            return 4 if letter == 24       # y
+            return 10                      # z
+
+    # How many of each letter the bag holds, blanks left out. Kept because a
+    # rack drawn uniformly over the alphabet is a rack of consonants and is not
+    # the game.
+    def bag_count(letter: i64) -> i64:
+        can Abort.Panic:
+            return 9 if letter == 0
+            return 2 if letter == 1
+            return 2 if letter == 2
+            return 4 if letter == 3
+            return 12 if letter == 4
+            return 2 if letter == 5
+            return 3 if letter == 6
+            return 2 if letter == 7
+            return 9 if letter == 8
+            return 1 if letter == 9
+            return 1 if letter == 10
+            return 4 if letter == 11
+            return 2 if letter == 12
+            return 6 if letter == 13
+            return 8 if letter == 14
+            return 2 if letter == 15
+            return 1 if letter == 16
+            return 6 if letter == 17
+            return 4 if letter == 18
+            return 6 if letter == 19
+            return 4 if letter == 20
+            return 2 if letter == 21
+            return 2 if letter == 22
+            return 1 if letter == 23
+            return 2 if letter == 24
+            return 1
+
+    # --- the ladder ------------------------------------------------------
+
+    struct Grade:
+        size: i64
+        top_rank: i64
+        seeded: i64
+        share: f64
+        rack: i64
+
+    def grade_at(index: i64) -> Grade:
+        can Abort.Panic:
+            return Grade{size: 7, top_rank: 3000, seeded: 1, share: 0.50, rack: 4} if index == 0
+            return Grade{size: 7, top_rank: 3000, seeded: 1, share: 0.60, rack: 5} if index == 1
+            return Grade{size: 9, top_rank: 3000, seeded: 2, share: 0.70, rack: 7} if index == 2
+            return Grade{size: 11, top_rank: 10000, seeded: 2, share: 0.75, rack: 7} if index == 3
+            return Grade{size: 11, top_rank: 10000, seeded: 3, share: 0.80, rack: 7} if index == 4
+            return Grade{size: 13, top_rank: 30000, seeded: 3, share: 0.85, rack: 7} if index == 5
+            return Grade{size: 13, top_rank: 30000, seeded: 4, share: 0.88, rack: 7} if index == 6
+            return Grade{size: 15, top_rank: 80000, seeded: 4, share: 0.92, rack: 7} if index == 7
+            return Grade{size: 15, top_rank: 1073741824, seeded: 4, share: 0.96, rack: 7} if index == 8
+            return Grade{size: 15, top_rank: 1073741824, seeded: 5, share: 1.00, rack: 7}
+
+    def grade_of(rung: i64) -> Grade:
+        can Abort.Panic:
+            capped: i64 = GRADE_COUNT - 1 if rung - 1 > GRADE_COUNT - 1 else rung - 1
+            return grade_at(0 if capped < 0 else capped)
+
+    # --- the board -------------------------------------------------------
+
+    struct Board:
+        size: mutable i64
+        letters: mutable darray[i64]
+        premium: mutable darray[i64]
+
+    def new_board() -> Board:
+        can Memory.Allocate, Abort.Panic:
+            return Board{size: 0, letters: Ints::zeros(MOST_CELLS), premium: Ints::zeros(MOST_CELLS)}
+
+    # Premium squares laid out by SYMMETRY: the triple words at the corners and
+    # the edge midpoints, the double words on the diagonals inward from them,
+    # and the letter premiums on a ring between. Every square keeps the
+    # eightfold symmetry the real board has, so no corner of a rung's board is
+    # worth more than another.
+    def lay_premiums(board: mutable Board&, size: i64):
+        can Abort.Panic:
+            middle: i64 = size / 2
+            for row in 0..<size |board, size, middle|:
+                for col in 0..<size |board, size, middle, row|:
+                    near_row: i64 = row if row < size - 1 - row else size - 1 - row
+                    near_col: i64 = col if col < size - 1 - col else size - 1 - col
+                    cell: i64 = row * size + col
+                    gap: i64 = near_row - near_col
+                    span: i64 = gap if gap >= 0 else 0 - gap
+                    nearest: i64 = near_row if near_row < near_col else near_col
+                    if (near_row == 0 and near_col == 0) or (near_row == 0 and col == middle) or (near_col == 0 and row == middle):
+                        Ints::put(&board.premium, cell, TRIPLE_WORD)
+                    else:
+                        if near_row == near_col and near_row >= 1 and near_row <= middle - 1:
+                            Ints::put(&board.premium, cell, DOUBLE_WORD)
+                        else:
+                            if span == 2 and nearest <= 1:
+                                Ints::put(&board.premium, cell, TRIPLE_LETTER)
+                            else:
+                                if ((near_row + near_col) % 4) == 1 and near_row != 0 and near_col != 0:
+                                    Ints::put(&board.premium, cell, DOUBLE_LETTER)
+                                else:
+                                    Ints::put(&board.premium, cell, PLAIN)
+            Ints::put(&board.premium, middle * size + middle, DOUBLE_WORD)
+
+    def blank_board(board: mutable Board&, size: i64):
+        can Abort.Panic:
+            board.size <- size
+            for cell in 0..<(size * size) |board|:
+                Ints::put(&board.letters, cell, EMPTY)
+            lay_premiums(board, size)
+
+    def board_filled(board: mutable Board&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for cell in 0..<(board.size * board.size) |board, total|:
+                total <- total + 1 if Ints::at_ref(&board.letters, cell) != EMPTY
+            return total
+
+    # --- the word list ---------------------------------------------------
+
+    const LEX_SLOTS: i64 = 32768
+    const LEX_MASK: i64 = 32767
+    const MOST_LEX_WORDS: i64 = 8192
+    const MOST_LEX_LETTERS: i64 = 65536
+
+    # Words with ranks, indexed the two ways the solver asks for them: is this
+    # a word, and is this the opening of one. `entries` is the reference's own
+    # rank order, which is a STABLE sort, so words of equal rank keep the order
+    # they were handed over in.
+    struct Lexicon:
+        count: mutable i64
+        start: mutable darray[i64]
+        length: mutable darray[i64]
+        letter: mutable darray[i64]
+        rank: mutable darray[i64]
+        word_head: mutable darray[i64]
+        word_next: mutable darray[i64]
+        # Every prefix of every word, as its own chained set.
+        prefix_head: mutable darray[i64]
+        prefix_next: mutable darray[i64]
+        prefix_word: mutable darray[i64]
+        prefix_length: mutable darray[i64]
+        prefixes: mutable i64
+
+    def new_lexicon() -> Lexicon:
+        can Memory.Allocate, Abort.Panic:
+            return Lexicon{count: 0, start: Ints::zeros(MOST_LEX_WORDS),
+                           length: Ints::zeros(MOST_LEX_WORDS),
+                           letter: Ints::zeros(MOST_LEX_LETTERS),
+                           rank: Ints::zeros(MOST_LEX_WORDS),
+                           word_head: Ints::zeros(LEX_SLOTS), word_next: Ints::zeros(MOST_LEX_WORDS),
+                           prefix_head: Ints::zeros(LEX_SLOTS),
+                           prefix_next: Ints::zeros(MOST_LEX_LETTERS),
+                           prefix_word: Ints::zeros(MOST_LEX_LETTERS),
+                           prefix_length: Ints::zeros(MOST_LEX_LETTERS), prefixes: 0}
+
+    def letters_hash(letters: mutable darray[i64]&, start: i64, length: i64) -> i64:
+        can Abort.Panic:
+            mixed: mutable u64 = 14695981039346656037.u64()
+            for at in 0..<length |letters, start, mixed|:
+                mixed <- (mixed ^ (Ints::at_ref(letters, start + at) + 1).u64()) * 1099511628211.u64()
+            mixed <- (mixed ^ (length + 97).u64()) * 1099511628211.u64()
+            return (mixed >> 9.u64()).i64() & LEX_MASK
+
+    def letters_equal(left: mutable darray[i64]&, left_start: i64, left_length: i64, right: mutable darray[i64]&, right_start: i64, right_length: i64) -> bool:
+        can Abort.Panic:
+            false return if left_length != right_length
+            for at in 0..<left_length |left, right, left_start, right_start|:
+                false return if Ints::at_ref(left, left_start + at) != Ints::at_ref(right, right_start + at)
+            return true
+
+    def index_lexicon(lex: mutable Lexicon&):
+        can Abort.Panic:
+            for slot in 0..<LEX_SLOTS |lex|:
+                Ints::put(&lex.word_head, slot, 0)
+                Ints::put(&lex.prefix_head, slot, 0)
+            lex.prefixes <- 0
+            for word in 0..<lex.count |lex|:
+                start: i64 = Ints::at_ref(&lex.start, word)
+                length: i64 = Ints::at_ref(&lex.length, word)
+                slot: i64 = letters_hash(&lex.letter, start, length)
+                Ints::put(&lex.word_next, word, Ints::at_ref(&lex.word_head, slot))
+                Ints::put(&lex.word_head, slot, word + 1)
+                # `for cut in range(1, len(word))`: the whole word is not one
+                # of its own openings.
+                for cut in 1..<length |lex, start, word|:
+                    where: i64 = letters_hash(&lex.letter, start, cut)
+                    Ints::put(&lex.prefix_word, lex.prefixes, word)
+                    Ints::put(&lex.prefix_length, lex.prefixes, cut)
+                    Ints::put(&lex.prefix_next, lex.prefixes, Ints::at_ref(&lex.prefix_head, where))
+                    Ints::put(&lex.prefix_head, where, lex.prefixes + 1)
+                    lex.prefixes <- lex.prefixes + 1
+
+    def valid(lex: mutable Lexicon&, letters: mutable darray[i64]&, start: i64, length: i64) -> bool:
+        can Abort.Panic:
+            false return if length == 0
+            probe: mutable i64 = Ints::at_ref(&lex.word_head, letters_hash(letters, start, length)) - 1
+            while probe >= 0 |lex, letters, start, length, probe|:
+                true return if letters_equal(&lex.letter, Ints::at_ref(&lex.start, probe), Ints::at_ref(&lex.length, probe), letters, start, length)
+                probe <- Ints::at_ref(&lex.word_next, probe) - 1
+            return false
+
+    def is_prefix(lex: mutable Lexicon&, letters: mutable darray[i64]&, start: i64, length: i64) -> bool:
+        can Abort.Panic:
+            false return if length == 0
+            probe: mutable i64 = Ints::at_ref(&lex.prefix_head, letters_hash(letters, start, length)) - 1
+            while probe >= 0 |lex, letters, start, length, probe|:
+                word: i64 = Ints::at_ref(&lex.prefix_word, probe)
+                true return if letters_equal(&lex.letter, Ints::at_ref(&lex.start, word), Ints::at_ref(&lex.prefix_length, probe), letters, start, length)
+                probe <- Ints::at_ref(&lex.prefix_next, probe) - 1
+            return false
+
+    # --- reading words off the board -------------------------------------
+
+    # Scratch for one position, sized once. `overlay` is `dict(laid)`: the
+    # newly laid tiles, EMPTY where nothing was laid.
+    struct Work:
+        overlay: mutable darray[i64]
+        run_cells: mutable darray[i64]
+        run_word: mutable darray[i64]
+        cross_word: mutable darray[i64]
+        laid_cell: mutable darray[i64]
+        laid_letter: mutable darray[i64]
+        rack_left: mutable darray[i64]
+        so_far: mutable darray[i64]
+        allowed: mutable darray[i64]
+        spots: mutable darray[i64]
+        bag: mutable darray[i64]
+
+    def new_work() -> Work:
+        can Memory.Allocate, Abort.Panic:
+            return Work{overlay: Ints::zeros(MOST_CELLS), run_cells: Ints::zeros(MOST_SIZE),
+                        run_word: Ints::zeros(MOST_SIZE), cross_word: Ints::zeros(MOST_SIZE),
+                        laid_cell: Ints::zeros(RACK), laid_letter: Ints::zeros(RACK),
+                        rack_left: Ints::zeros(LETTER_COUNT), so_far: Ints::zeros(MOST_SIZE * 2),
+                        allowed: Ints::zeros(MOST_CELLS * LETTER_COUNT),
+                        spots: Ints::zeros(MOST_CELLS), bag: Ints::zeros(128)}
+
+    def held_at(board: mutable Board&, overlay: mutable darray[i64]&, at: i64) -> i64:
+        can Abort.Panic:
+            laid: i64 = Ints::at_ref(overlay, at)
+            return laid if laid != EMPTY else Ints::at_ref(&board.letters, at)
+
+    # `inside`: a DOWN run needs only the board's bounds, because a step of
+    # `size` keeps the column by itself; an ACROSS run has to stay on its row.
+    def run_inside(board: mutable Board&, at: i64, down: bool, row: i64) -> bool:
+        can Abort.Panic:
+            false return if at < 0 or at >= board.size * board.size
+            return true if down
+            return at / board.size == row
+
+    # The whole word through `cell` in one direction, and its cells.
+    def run_of(board: mutable Board&, work: mutable Work&, cell: i64, down: bool) -> i64:
+        can Abort.Panic:
+            size: i64 = board.size
+            step: i64 = size if down else 1
+            row: i64 = cell / size
+            start: mutable i64 = cell
+            walking: mutable bool = true
+            while walking |board, work, start, step, down, row, walking|:
+                back: i64 = start - step
+                if run_inside(board, back, down, row) and held_at(board, &work.overlay, back) != EMPTY:
+                    start <- back
+                else:
+                    walking <- false
+            found: mutable i64 = 0
+            at: mutable i64 = start
+            reading: mutable bool = true
+            while reading |board, work, at, step, down, row, found, reading|:
+                if run_inside(board, at, down, row) and held_at(board, &work.overlay, at) != EMPTY:
+                    Ints::put(&work.run_cells, found, at)
+                    Ints::put(&work.run_word, found, held_at(board, &work.overlay, at))
+                    found <- found + 1
+                    at <- at + step
+                else:
+                    reading <- false
+            return found
+
+    struct Scored:
+        score: i64
+        words: i64
+
+    # What a play scores on a board, and every word it makes.
+    def score_play(board: mutable Board&, work: mutable Work&, laid: i64, down: bool, out_word_start: mutable darray[i64]&, out_word_length: mutable darray[i64]&, out_word_letter: mutable darray[i64]&) -> Scored:
+        can Abort.Panic:
+            for cell in 0..<(board.size * board.size) |work|:
+                Ints::put(&work.overlay, cell, EMPTY)
+            for slot in 0..<laid |work|:
+                Ints::put(&work.overlay, Ints::at_ref(&work.laid_cell, slot), Ints::at_ref(&work.laid_letter, slot))
+            # The main word, kept so the cross pass can decline to score it a
+            # second time.
+            main_length: i64 = run_of(board, work, Ints::at_ref(&work.laid_cell, 0), down)
+            main: mutable darray[i64] = Ints::zeros(MOST_SIZE)
+            for at in 0..<main_length |work, main|:
+                Ints::put(&main, at, Ints::at_ref(&work.run_word, at))
+            total: mutable i64 = 0
+            words: mutable i64 = 0
+            written: mutable i64 = 0
+            for pass_at in 0..<2 |board, work, laid, down, main, main_length, total, words, written, out_word_start, out_word_length, out_word_letter|:
+                direction: bool = down if pass_at == 0 else not down
+                seeds: i64 = 1 if pass_at == 0 else laid
+                for seed_at in 0..<seeds |board, work, laid, down, direction, main, main_length, total, words, written, out_word_start, out_word_length, out_word_letter|:
+                    seed: i64 = Ints::at_ref(&work.laid_cell, 0) if pass_at == 0 else Ints::at_ref(&work.laid_cell, seed_at)
+                    length: i64 = run_of(board, work, seed, direction)
+                    continue if length < 2
+                    if direction != down and laid == length:
+                        same: mutable bool = length == main_length
+                        for at in 0..<length |work, main, same|:
+                            same <- false if Ints::at_ref(&work.run_word, at) != Ints::at_ref(&main, at)
+                        continue if same
+                    value: mutable i64 = 0
+                    multiplier: mutable i64 = 1
+                    for at in 0..<length |board, work, value, multiplier|:
+                        one: i64 = Ints::at_ref(&work.run_cells, at)
+                        pay: mutable i64 = letter_value(Ints::at_ref(&work.run_word, at))
+                        if Ints::at_ref(&work.overlay, one) != EMPTY:
+                            premium: i64 = Ints::at_ref(&board.premium, one)
+                            pay <- pay * 2 if premium == DOUBLE_LETTER
+                            pay <- pay * 3 if premium == TRIPLE_LETTER
+                            multiplier <- multiplier * 2 if premium == DOUBLE_WORD
+                            multiplier <- multiplier * 3 if premium == TRIPLE_WORD
+                        value <- value + pay
+                    total <- total + value * multiplier
+                    Ints::put(out_word_start, words, written)
+                    Ints::put(out_word_length, words, length)
+                    for at in 0..<length |work, out_word_letter, written|:
+                        Ints::put(out_word_letter, written + at, Ints::at_ref(&work.run_word, at))
+                    written <- written + length
+                    words <- words + 1
+            # Only a FULL rack pays.
+            total <- total + BINGO if laid == RACK
+            return Scored{score: total, words: words}
+
+    # Whether a play is one this board and this pool allow.
+    def legal(board: mutable Board&, work: mutable Work&, laid: i64, down: bool, lex: mutable Lexicon&) -> bool:
+        can Abort.Panic:
+            false return if laid == 0
+            size: i64 = board.size
+            for slot in 0..<laid |board, work|:
+                false return if Ints::at_ref(&board.letters, Ints::at_ref(&work.laid_cell, slot)) != EMPTY
+            # One line, and one only.
+            first_line: i64 = Ints::at_ref(&work.laid_cell, 0) % size if down else Ints::at_ref(&work.laid_cell, 0) / size
+            for slot in 0..<laid |board, work, size, down, first_line|:
+                cell: i64 = Ints::at_ref(&work.laid_cell, slot)
+                line: i64 = cell % size if down else cell / size
+                false return if line != first_line
+            for cell in 0..<(size * size) |work|:
+                Ints::put(&work.overlay, cell, EMPTY)
+            for slot in 0..<laid |work|:
+                Ints::put(&work.overlay, Ints::at_ref(&work.laid_cell, slot), Ints::at_ref(&work.laid_letter, slot))
+            length: i64 = run_of(board, work, Ints::at_ref(&work.laid_cell, 0), down)
+            # A gap the play did not fill.
+            for slot in 0..<laid |work, length|:
+                cell: i64 = Ints::at_ref(&work.laid_cell, slot)
+                inside: mutable bool = false
+                for at in 0..<length |work, cell, inside|:
+                    inside <- true if Ints::at_ref(&work.run_cells, at) == cell
+                false return if not inside
+            false return if length < 2
+            false return if not valid(lex, &work.run_word, 0, length)
+            # Floating free of everything on the board.
+            if board_filled(board) != 0:
+                touching: mutable bool = false
+                for at in 0..<length |board, work, touching|:
+                    touching <- true if Ints::at_ref(&board.letters, Ints::at_ref(&work.run_cells, at)) != EMPTY
+                false return if not touching
+            for slot in 0..<laid |board, work, down, lex|:
+                across: i64 = run_of(board, work, Ints::at_ref(&work.laid_cell, slot), not down)
+                if across > 1:
+                    for at in 0..<across |work|:
+                        Ints::put(&work.cross_word, at, Ints::at_ref(&work.run_word, at))
+                    false return if not valid(lex, &work.cross_word, 0, across)
+            # The main run is rebuilt so a caller reading `run_word` after a
+            # true answer sees the main word, not the last cross word.
+            _ = run_of(board, work, Ints::at_ref(&work.laid_cell, 0), down)
+            return true
+
+    # Empty squares touching something, or the centre on a bare board.
+    def anchors(board: mutable Board&, work: mutable Work&) -> i64:
+        can Abort.Panic:
+            size: i64 = board.size
+            if board_filled(board) == 0:
+                Ints::put(&work.spots, 0, size / 2 * size + size / 2)
+                return 1
+            found: mutable i64 = 0
+            for cell in 0..<(size * size) |board, work, size, found|:
+                continue if Ints::at_ref(&board.letters, cell) != EMPTY
+                row: i64 = cell / size
+                col: i64 = cell % size
+                touching: mutable bool = false
+                for way in 0..<4 |board, size, row, col, touching|:
+                    dr: i64 = 0 if way < 2 else (1 if way == 2 else -1)
+                    dc: i64 = (1 if way == 0 else -1) if way < 2 else 0
+                    r: i64 = row + dr
+                    c: i64 = col + dc
+                    continue if r < 0 or r >= size or c < 0 or c >= size
+                    touching <- true if Ints::at_ref(&board.letters, r * size + c) != EMPTY
+                if touching:
+                    Ints::put(&work.spots, found, cell)
+                    found <- found + 1
+            return found
+
+    # Letters that make a legal perpendicular word at a cell. Written into
+    # `work.allowed[cell * 26 ..]`: 1 allowed, 0 not.
+    #
+    # `down` here is the direction of the PLAY and the walk goes ACROSS it, so
+    # the bounds test is the opposite way round from `run_of`'s: an across play
+    # reads a vertical cross word, whose column a step of `size` keeps by
+    # itself, and a down play reads a horizontal one, which has to stay on its
+    # row.
+    def cross_check(board: mutable Board&, work: mutable Work&, cell: i64, down: bool, lex: mutable Lexicon&):
+        can Abort.Panic:
+            size: i64 = board.size
+            step: i64 = 1 if down else size
+            row: i64 = cell / size
+            before: mutable i64 = 0
+            at: mutable i64 = cell - step
+            walking: mutable bool = true
+            while walking |board, work, at, step, down, size, row, before, walking|:
+                inside: bool = at >= 0 and at < size * size and (not down or at / size == row)
+                if inside and Ints::at_ref(&board.letters, at) != EMPTY:
+                    before <- before + 1
+                    at <- at - step
+                else:
+                    walking <- false
+            # Read forwards from the start so the letters come out in order.
+            for slot in 0..<before |board, work, cell, step, before|:
+                Ints::put(&work.cross_word, slot, Ints::at_ref(&board.letters, cell - (before - slot) * step))
+            after: mutable i64 = 0
+            at <- cell + step
+            walking <- true
+            while walking |board, work, at, step, down, size, row, before, after, walking|:
+                inside: bool = at >= 0 and at < size * size and (not down or at / size == row)
+                if inside and Ints::at_ref(&board.letters, at) != EMPTY:
+                    Ints::put(&work.cross_word, before + 1 + after, Ints::at_ref(&board.letters, at))
+                    after <- after + 1
+                    at <- at + step
+                else:
+                    walking <- false
+            base: i64 = cell * LETTER_COUNT
+            if before == 0 and after == 0:
+                # Nothing either side: every letter is allowed.
+                for letter in 0..<LETTER_COUNT |work, base|:
+                    Ints::put(&work.allowed, base + letter, 1)
+                return
+            for letter in 0..<LETTER_COUNT |board, work, lex, base, before, after|:
+                Ints::put(&work.cross_word, before, letter)
+                Ints::put(&work.allowed, base + letter, 1 if valid(lex, &work.cross_word, 0, before + 1 + after) else 0)
+
+    # --- the exact best play ---------------------------------------------
+
+    const MOST_PLAYS: i64 = 4096
+    const MOST_MADE: i64 = 8
+
+    # Every legal play found, in the order the walk found them -- which is what
+    # `best_play`'s `max` breaks its ties on.
+    #
+    # The laid tiles are stored in LAYING order, which is already ascending by
+    # cell: the walk only ever steps forwards. That is why the reference's
+    # `tuple(sorted(laid))` key needs no sort here.
+    struct Plays:
+        count: mutable i64
+        full: mutable bool
+        down: mutable darray[i64]
+        score: mutable darray[i64]
+        laid_n: mutable darray[i64]
+        laid_cell: mutable darray[i64]
+        laid_letter: mutable darray[i64]
+        word_at: mutable darray[i64]
+        word_length: mutable darray[i64]
+        word_letter: mutable darray[i64]
+        made: mutable darray[i64]
+        made_at: mutable darray[i64]
+        made_start: mutable darray[i64]
+        made_length: mutable darray[i64]
+        made_letter: mutable darray[i64]
+        made_letters: mutable i64
+        word_letters: mutable i64
+        head: mutable darray[i64]
+        next: mutable darray[i64]
+
+    def new_plays() -> Plays:
+        can Memory.Allocate, Abort.Panic:
+            return Plays{count: 0, full: false, down: Ints::zeros(MOST_PLAYS),
+                         score: Ints::zeros(MOST_PLAYS), laid_n: Ints::zeros(MOST_PLAYS),
+                         laid_cell: Ints::zeros(MOST_PLAYS * RACK),
+                         laid_letter: Ints::zeros(MOST_PLAYS * RACK),
+                         word_at: Ints::zeros(MOST_PLAYS), word_length: Ints::zeros(MOST_PLAYS),
+                         word_letter: Ints::zeros(MOST_PLAYS * MOST_SIZE * 2),
+                         made: Ints::zeros(MOST_PLAYS), made_at: Ints::zeros(MOST_PLAYS),
+                         made_start: Ints::zeros(MOST_PLAYS * MOST_MADE),
+                         made_length: Ints::zeros(MOST_PLAYS * MOST_MADE),
+                         made_letter: Ints::zeros(MOST_PLAYS * MOST_MADE * MOST_SIZE),
+                         made_letters: 0, word_letters: 0,
+                         head: Ints::zeros(LEX_SLOTS), next: Ints::zeros(MOST_PLAYS)}
+
+    def plays_reset(out: mutable Plays&):
+        can Abort.Panic:
+            out.count <- 0
+            out.full <- false
+            out.made_letters <- 0
+            out.word_letters <- 0
+            for slot in 0..<LEX_SLOTS |out|:
+                Ints::put(&out.head, slot, 0)
+
+    def play_key(work: mutable Work&, laid: i64, down: bool) -> i64:
+        can Abort.Panic:
+            mixed: mutable u64 = 14695981039346656037.u64()
+            mixed <- (mixed ^ (1.u64() if down else 0.u64())) * 1099511628211.u64()
+            for slot in 0..<laid |work, mixed|:
+                mixed <- (mixed ^ Ints::at_ref(&work.laid_cell, slot).u64()) * 1099511628211.u64()
+                mixed <- (mixed ^ Ints::at_ref(&work.laid_letter, slot).u64()) * 1099511628211.u64()
+            return (mixed >> 7.u64()).i64() & LEX_MASK
+
+    # A play already found. Two starts can reach the same tiles, and the same
+    # tiles laid the same way are the same play however it was arrived at.
+    def already_seen(out: mutable Plays&, work: mutable Work&, laid: i64, down: bool) -> bool:
+        can Abort.Panic:
+            probe: mutable i64 = Ints::at_ref(&out.head, play_key(work, laid, down)) - 1
+            while probe >= 0 |out, work, laid, down, probe|:
+                same: mutable bool = Ints::at_ref(&out.laid_n, probe) == laid and (Ints::at_ref(&out.down, probe) != 0) == down
+                for slot in 0..<laid |out, work, probe, same|:
+                    same <- false if Ints::at_ref(&out.laid_cell, probe * RACK + slot) != Ints::at_ref(&work.laid_cell, slot)
+                    same <- false if Ints::at_ref(&out.laid_letter, probe * RACK + slot) != Ints::at_ref(&work.laid_letter, slot)
+                true return if same
+                probe <- Ints::at_ref(&out.next, probe) - 1
+            return false
+
+    def keep_play(out: mutable Plays&, board: mutable Board&, work: mutable Work&, laid: i64, down: bool, so_far: i64):
+        can Memory.Allocate, Abort.Panic:
+            if out.count >= MOST_PLAYS:
+                out.full <- true
+                return
+            slot: i64 = out.count
+            made_start: mutable darray[i64] = Ints::zeros(MOST_MADE)
+            made_length: mutable darray[i64] = Ints::zeros(MOST_MADE)
+            made_letter: mutable darray[i64] = Ints::zeros(MOST_MADE * MOST_SIZE)
+            scored: Scored = score_play(board, work, laid, down, &made_start, &made_length, &made_letter)
+            Ints::put(&out.down, slot, 1 if down else 0)
+            Ints::put(&out.score, slot, scored.score)
+            Ints::put(&out.laid_n, slot, laid)
+            for at in 0..<laid |out, work, slot|:
+                Ints::put(&out.laid_cell, slot * RACK + at, Ints::at_ref(&work.laid_cell, at))
+                Ints::put(&out.laid_letter, slot * RACK + at, Ints::at_ref(&work.laid_letter, at))
+            Ints::put(&out.word_at, slot, out.word_letters)
+            Ints::put(&out.word_length, slot, so_far)
+            for at in 0..<so_far |out, work|:
+                Ints::put(&out.word_letter, out.word_letters + at, Ints::at_ref(&work.so_far, at))
+            out.word_letters <- out.word_letters + so_far
+            Ints::put(&out.made, slot, scored.words)
+            Ints::put(&out.made_at, slot, out.made_letters)
+            written: mutable i64 = 0
+            for one in 0..<scored.words |out, made_start, made_length, made_letter, slot, written|:
+                length: i64 = Ints::at_ref(&made_length, one)
+                Ints::put(&out.made_start, slot * MOST_MADE + one, written)
+                Ints::put(&out.made_length, slot * MOST_MADE + one, length)
+                for at in 0..<length |out, made_start, made_letter, one, written|:
+                    Ints::put(&out.made_letter, out.made_letters + written + at, Ints::at_ref(&made_letter, Ints::at_ref(&made_start, one) + at))
+                written <- written + length
+            out.made_letters <- out.made_letters + written
+            where: i64 = play_key(work, laid, down)
+            Ints::put(&out.next, slot, Ints::at_ref(&out.head, where))
+            Ints::put(&out.head, where, slot + 1)
+            out.count <- out.count + 1
+
+    def line_of(board: mutable Board&, cell: i64, down: bool) -> i64:
+        can Abort.Panic:
+            return cell % board.size if down else cell / board.size
+
+    def walk_inside(board: mutable Board&, at: i64, down: bool, line: i64) -> bool:
+        can Abort.Panic:
+            return at >= 0 and at < board.size * board.size and line_of(board, at, down) == line
+
+    # Lay tiles from `start` rightwards, pruning on the prefix set.
+    def walk_go(board: mutable Board&, work: mutable Work&, lex: mutable Lexicon&, out: mutable Plays&, at: i64, step: i64, down: bool, line: i64, laid: i64, so_far: i64):
+        can Memory.Allocate, Abort.Panic:
+            if laid != 0 and so_far != 0 and valid(lex, &work.so_far, 0, so_far):
+                if not walk_inside(board, at, down, line) or Ints::at_ref(&board.letters, at) == EMPTY:
+                    if not already_seen(out, work, laid, down) and legal(board, work, laid, down, lex):
+                        keep_play(out, board, work, laid, down, so_far)
+            return if not walk_inside(board, at, down, line)
+            if so_far != 0:
+                return if not is_prefix(lex, &work.so_far, 0, so_far) and not valid(lex, &work.so_far, 0, so_far)
+            if Ints::at_ref(&board.letters, at) != EMPTY:
+                Ints::put(&work.so_far, so_far, Ints::at_ref(&board.letters, at))
+                walk_go(board, work, lex, out, at + step, step, down, line, laid, so_far + 1)
+                return
+            spare: mutable i64 = 0
+            for letter in 0..<LETTER_COUNT |work, spare|:
+                spare <- spare + Ints::at_ref(&work.rack_left, letter)
+            return if spare == 0
+            # `checks.get(at)` is None off an anchor: every cell starts at 1
+            # for the direction being walked, and only an anchor's own
+            # cross-check writes zeros, so an off-anchor cell is unrestricted.
+            for letter in 0..<LETTER_COUNT |board, work, lex, out, at, step, down, line, laid, so_far|:
+                continue if Ints::at_ref(&work.rack_left, letter) == 0
+                continue if Ints::at_ref(&work.allowed, at * LETTER_COUNT + letter) == 0
+                Ints::put(&work.rack_left, letter, Ints::at_ref(&work.rack_left, letter) - 1)
+                Ints::put(&work.laid_cell, laid, at)
+                Ints::put(&work.laid_letter, laid, letter)
+                Ints::put(&work.so_far, so_far, letter)
+                walk_go(board, work, lex, out, at + step, step, down, line, laid + 1, so_far + 1)
+                Ints::put(&work.rack_left, letter, Ints::at_ref(&work.rack_left, letter) + 1)
+
+    # Grow a play through an anchor, left first and then right.
+    def extend_from(board: mutable Board&, work: mutable Work&, lex: mutable Lexicon&, out: mutable Plays&, anchor: i64, down: bool, rack: i64, spots: i64):
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = board.size
+            step: i64 = size if down else 1
+            line: i64 = line_of(board, anchor, down)
+            # How far left the play may start: back to the previous letter, or
+            # as far as the rack could reach. An anchor stops the walk-back,
+            # because a start beyond it belongs to that anchor's own extend.
+            room: mutable i64 = 0
+            at: mutable i64 = anchor - step
+            walking: mutable bool = true
+            while walking |board, work, at, step, down, line, room, walking, spots|:
+                if walk_inside(board, at, down, line) and Ints::at_ref(&board.letters, at) == EMPTY:
+                    is_spot: mutable bool = false
+                    for slot in 0..<spots |work, at, is_spot|:
+                        is_spot <- true if Ints::at_ref(&work.spots, slot) == at
+                    if is_spot:
+                        walking <- false
+                    else:
+                        room <- room + 1
+                        at <- at - step
+                else:
+                    walking <- false
+            before: mutable i64 = 0
+            at <- anchor - step
+            walking <- true
+            while walking |board, at, step, down, line, before, walking|:
+                if walk_inside(board, at, down, line) and Ints::at_ref(&board.letters, at) != EMPTY:
+                    before <- before + 1
+                    at <- at - step
+                else:
+                    walking <- false
+            for slot in 0..<before |board, work, anchor, step, before|:
+                Ints::put(&work.so_far, slot, Ints::at_ref(&board.letters, anchor - (before - slot) * step))
+            room <- 0 if before != 0
+            reach: i64 = rack if rack < room else room
+            for back in 0..<(reach + 1) |board, work, lex, out, anchor, step, down, line, before, rack|:
+                start: i64 = anchor - back * step
+                break if not walk_inside(board, start, down, line)
+                walk_go(board, work, lex, out, start, step, down, line, 0, before)
+
+    # Every legal play from a rack. Exhaustive, which is the point.
+    def find_plays(board: mutable Board&, work: mutable Work&, lex: mutable Lexicon&, rack: mutable darray[i64]&, rack_n: i64, out: mutable Plays&):
+        can Memory.Allocate, Abort.Panic:
+            plays_reset(out)
+            size: i64 = board.size
+            spots: i64 = anchors(board, work)
+            for pass_at in 0..<2 |board, work, lex, out, rack, rack_n, size, spots|:
+                down: bool = pass_at == 1
+                # -1 everywhere means "no cross-check here", which is what a
+                # missing key in the reference's dict means.
+                for cell in 0..<(size * size) |work, size|:
+                    for letter in 0..<LETTER_COUNT |work, cell|:
+                        Ints::put(&work.allowed, cell * LETTER_COUNT + letter, 1)
+                for slot in 0..<spots |board, work, lex, down|:
+                    cross_check(board, work, Ints::at_ref(&work.spots, slot), down, lex)
+                for slot in 0..<spots |board, work, lex, out, rack, rack_n, down, spots|:
+                    for letter in 0..<LETTER_COUNT |work|:
+                        Ints::put(&work.rack_left, letter, 0)
+                    for at in 0..<rack_n |work, rack|:
+                        held: i64 = Ints::at_ref(rack, at)
+                        Ints::put(&work.rack_left, held, Ints::at_ref(&work.rack_left, held) + 1)
+                    extend_from(board, work, lex, out, Ints::at_ref(&work.spots, slot), down, rack_n, spots)
+
+    # The highest-scoring legal play, or -1 if there is none. Ties break on the
+    # main word, and `max` keeps the FIRST of equals -- so the walk's own order
+    # is part of the answer.
+    def best_play(out: mutable Plays&) -> i64:
+        can Abort.Panic:
+            -1 return if out.count == 0
+            best: mutable i64 = 0
+            for slot in 1..<out.count |out, best|:
+                score: i64 = Ints::at_ref(&out.score, slot)
+                held: i64 = Ints::at_ref(&out.score, best)
+                if score > held:
+                    best <- slot
+                else:
+                    continue if score < held
+                    # Same score: the greater main word wins, compared as
+                    # Python compares strings.
+                    mine_at: i64 = Ints::at_ref(&out.word_at, slot)
+                    mine_n: i64 = Ints::at_ref(&out.word_length, slot)
+                    held_at: i64 = Ints::at_ref(&out.word_at, best)
+                    held_n: i64 = Ints::at_ref(&out.word_length, best)
+                    shorter: i64 = mine_n if mine_n < held_n else held_n
+                    decided: mutable i64 = 0
+                    for at in 0..<shorter |out, mine_at, held_at, decided|:
+                        continue if decided != 0
+                        mine: i64 = Ints::at_ref(&out.word_letter, mine_at + at)
+                        theirs: i64 = Ints::at_ref(&out.word_letter, held_at + at)
+                        decided <- 1 if mine > theirs
+                        decided <- -1 if mine < theirs
+                    if decided == 0:
+                        decided <- 1 if mine_n > held_n
+                    best <- slot if decided == 1
+            return best
+
+    # `count` tiles from the bag, in its own distribution -- a rack drawn
+    # uniformly over the alphabet is a rack of consonants and is not the game.
+    def draw(work: mutable Work&, rng: mutable MT19937&, count: i64, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            tiles: mutable i64 = 0
+            for letter in 0..<LETTER_COUNT |work, tiles|:
+                for _copy in 0..<bag_count(letter) |work, letter, tiles|:
+                    Ints::put(&work.bag, tiles, letter)
+                    tiles <- tiles + 1
+            py_shuffle_i64_prefix(rng, &work.bag, tiles)
+            taken: i64 = count if count < tiles else tiles
+            for at in 0..<taken |work, out|:
+                Ints::put(out, at, Ints::at_ref(&work.bag, at))
+            Ints::sort_prefix(out, taken)
+            return taken

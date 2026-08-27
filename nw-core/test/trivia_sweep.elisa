@@ -1,0 +1,206 @@
+# Differential sweep driver for tasks/trivia.elisa. See trivia_diff.py for the
+# reference side.
+#
+# The corpus is downloaded, so both sides build the same rows from a fixed
+# recipe -- real BYTES, because everything this module does is look at the
+# shape of the writing. The recipe deliberately produces rows that fail every
+# clause of `question_from`'s guard as well as rows that pass, and answers of
+# all five shapes including the ones on the year/number boundary.
+#
+# The deal's stream is the delicate part: a rejected candidate has already been
+# passed over inside a SHUFFLED list, and the matched pass runs before the
+# whole-pool pass, so a shape the pool is thin in changes every later draw.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/tasks/trivia.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+# Write one byte string into a buffer, returning its length. The alphabet is
+# chosen so the shape tests have something to bite on: capitals, lower case,
+# digits, commas, full stops, percent signs and spaces.
+def write_word(out: mutable darray[i64]&, at: i64, kind: i64, salt: i64) -> i64:
+    can Abort.Panic:
+        written: mutable i64 = 0
+        if kind == 0:
+            # A capitalised word: `Xabc`.
+            Ints::put(out, at, 65 + salt % 26)
+            written <- 1
+            for k in 0..<(2 + salt % 4) |out, at, salt, written|:
+                Ints::put(out, at + written, 97 + (salt * 3 + k * 5) % 26)
+                written <- written + 1
+        else:
+            if kind == 1:
+                # A lower-case word.
+                for k in 0..<(3 + salt % 4) |out, at, salt, written|:
+                    Ints::put(out, at + written, 97 + (salt * 7 + k * 3) % 26)
+                    written <- written + 1
+            else:
+                if kind == 2:
+                    # A number, sometimes with a suffix that makes it a year.
+                    value: i64 = 900 + salt * 37 % 1400
+                    Ints::put(out, at, 48 + value / 1000)
+                    Ints::put(out, at + 1, 48 + (value / 100) % 10)
+                    Ints::put(out, at + 2, 48 + (value / 10) % 10)
+                    Ints::put(out, at + 3, 48 + value % 10)
+                    written <- 4
+                    if (salt % 5) == 0:
+                        Ints::put(out, at + 4, 115)          # a trailing `s`
+                        written <- 5
+                    if (salt % 7) == 0:
+                        Ints::put(out, at + 4, 37)           # a percent sign
+                        written <- 5
+                else:
+                    if kind == 3:
+                        # A particle, uncapitalised inside a name.
+                        Ints::put(out, at, 118)              # v
+                        Ints::put(out, at + 1, 97)           # a
+                        Ints::put(out, at + 2, 110)          # n
+                        written <- 3
+                    else:
+                        # An article.
+                        Ints::put(out, at, 116)
+                        Ints::put(out, at + 1, 104)
+                        Ints::put(out, at + 2, 101)
+                        written <- 3
+        return written
+
+def write_text(out: mutable darray[i64]&, at: i64, words: i64, recipe: i64) -> i64:
+    can Abort.Panic:
+        written: mutable i64 = 0
+        for w in 0..<words |out, at, recipe, written|:
+            if w > 0:
+                Ints::put(out, at + written, 32)
+                written <- written + 1
+                # Every fifth gap is doubled, which `split()` has to eat.
+                if ((recipe + w) % 5) == 0:
+                    Ints::put(out, at + written, 32)
+                    written <- written + 1
+            kind: i64 = (recipe / 3 + w) % 5
+            written <- written + write_word(out, at + written, kind, recipe * 3 + w)
+            # Every seventh word takes a comma, which normalise strips.
+            if ((recipe + w) % 7) == 0:
+                Ints::put(out, at + written, 44)
+                written <- written + 1
+        return written
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(64 * 1024 * 1024)
+        in w:
+            raw: mutable darray[i64] = Ints::zeros(65536)
+            plain: mutable darray[i64] = Ints::zeros(65536)
+            scratch: mutable darray[i64] = Ints::zeros(4096)
+            alias_start: mutable darray[i64] = Ints::zeros(64)
+            alias_length: mutable darray[i64] = Ints::zeros(64)
+
+            # --- the ladder -----------------------------------------------
+            for rung in -1..<11:
+                g: Trivia::Grade = Trivia::grade_at(rung)
+                printr("grade")
+                emit_cell(rung)
+                emit_cell(g.options)
+                emit_cell(1 if g.matched else 0)
+                print("")
+
+            # --- normalising, and what a shape looks like ------------------
+            for recipe in 0..<120 |raw, plain, scratch|:
+                words: i64 = 1 + recipe % 6
+                length: i64 = write_text(&raw, 0, words, recipe)
+                tidy: i64 = Trivia::normalise(&raw, 0, length, &plain, 0, &scratch)
+                printr("shape")
+                emit_cell(recipe)
+                emit_cell(length)
+                for at in 0..<length |raw|:
+                    emit_cell(Ints::at_ref(&raw, at))
+                emit_cell(tidy)
+                for at in 0..<tidy |plain|:
+                    emit_cell(Ints::at_ref(&plain, at))
+                emit_cell(Trivia::kind_of(&raw, 0, length))
+                print("")
+
+            # --- the pool -------------------------------------------------
+            bank: mutable Trivia::Bank = Trivia::new_bank()
+            work: mutable Trivia::Work = Trivia::new_work()
+            for row in 0..<160 |bank, raw, alias_start, alias_length, scratch|:
+                asked_words: i64 = 3 + row % 9
+                asked_at: i64 = 0
+                asked_n: i64 = write_text(&raw, asked_at, asked_words, row * 5 + 1)
+                answer_at: i64 = asked_at + asked_n + 1
+                answer_n: i64 = write_text(&raw, answer_at, 1 + row % 3, row * 7 + 2)
+                aliases: i64 = row % 4
+                at: mutable i64 = answer_at + answer_n + 1
+                for one in 0..<aliases |raw, alias_start, alias_length, at, row|:
+                    Ints::put(&alias_start, one, at)
+                    length: i64 = write_text(&raw, at, 1 + one, row * 11 + one)
+                    Ints::put(&alias_length, one, length)
+                    at <- at + length + 1
+                kept: bool = Trivia::question_from(&bank, &raw, asked_at, asked_n, answer_at, answer_n, &alias_start, &alias_length, aliases, &scratch)
+                printr("row")
+                emit_cell(row)
+                emit_cell(1 if kept else 0)
+                emit_cell(bank.rows)
+                if kept:
+                    emit_cell(Ints::at_ref(&bank.kind, bank.rows - 1))
+                    emit_cell(Ints::at_ref(&bank.alias_count, bank.rows - 1))
+                    emit_cell(Ints::at_ref(&bank.answer_n, bank.rows - 1))
+                    emit_cell(Ints::at_ref(&bank.plain_n, bank.rows - 1))
+                print("")
+            Trivia::index_kinds(&bank)
+            printr("pool")
+            emit_cell(bank.rows)
+            emit_cell(Trivia::narrowest(&bank))
+            for kind in 0..<Trivia::KIND_COUNT |bank|:
+                emit_cell(Ints::at_ref(&bank.kind_count, kind))
+            print("")
+
+            # --- whole rounds ----------------------------------------------
+            for rung in 1..<8 |bank, work|:
+                for seed in 1..<13 |bank, work, rung|:
+                    rng: mutable MT19937 = mt19937_new()
+                    mt_seed_int(&rng, (rung * 1000 + seed).u64())
+                    made: Trivia::Round = Trivia::generate(&bank, &work, rung, &rng)
+                    printr("round")
+                    emit_cell(rung)
+                    emit_cell(seed)
+                    emit_cell(1 if made.given else 0)
+                    emit_cell(made.question)
+                    emit_cell(made.options)
+                    emit_cell(made.answer)
+                    emit_cell(made.rung)
+                    for slot in 0..<made.options |work|:
+                        emit_cell(Ints::at_ref(&work.options, slot))
+                    print("")
+        destroy w
+        return 0
