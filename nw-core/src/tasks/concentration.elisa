@@ -1,0 +1,334 @@
+# Concentration: turn cards over two at a time and find the pairs.
+#
+# Port of the portable half of neural_workshop/ui/concentration.py
+# (GPL-2.0-or-later). The board is a deal, a grid and a state machine. The
+# media pool and the window belong to the shell, so the deal takes a pair
+# count rather than paths and every geometry function takes its own bounds.
+#
+# Two things here are load-bearing and easy to lose:
+#
+#   * `seen` is a set of card IDENTITIES per pair, not a count. It answers two
+#     different questions -- has THIS card been up before, and is a whole pair
+#     already showing somewhere -- and a counter answers neither.
+#   * The mismatch timer is not state. The reference hides on
+#     `len(self.flipped) == 2 and now >= self.hide_at`, and two cards up with
+#     no match IS that condition, so the board carries the clock nowhere.
+
+extern sqrt(x: f64) -> f64
+extern ceil(x: f64) -> f64
+
+module Concentration:
+
+    const MOST_PAIRS: i64 = 64
+    const MOST_CARDS: i64 = 128
+
+    const PHASE_READY: i64 = 0
+    const PHASE_PEEK: i64 = 1
+    const PHASE_PLAYING: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    # `_coach_verdict`'s three states: a pair matched, a lapse paid, and the
+    # cleared label that half a turn or an honest miss leaves behind.
+    const VERDICT_NONE: i64 = -1
+    const VERDICT_LAPSE: i64 = 0
+    const VERDICT_PAIR: i64 = 1
+
+    def slot(values: darray[i64]&, index: i64) -> i64:
+        can Abort.Panic:
+            return get values[index.usize()] else 0
+
+    # --- the grid --------------------------------------------------------
+
+    struct Layout:
+        columns: i64
+        rows: i64
+        side: f64
+        gap: f64
+        left: f64
+        top: f64
+
+    struct Rect:
+        left: f64
+        bottom: f64
+        width: f64
+        height: f64
+
+    # The room the board has: down to the top of the band the agent boundary
+    # reads, and no further -- but never less than the floor the reference
+    # keeps so a short window still lays a grid.
+    def board_room(floor: f64, ceiling: f64) -> f64:
+        can Abort.Panic:
+            span: f64 = ceiling - floor
+            return 80.0 if span < 80.0 else span
+
+    # Columns and rows that fit the cards into the window. Before the deal the
+    # reference sizes the grid for the pairs it is about to lay, which is what
+    # `len(self.cards) or self.pairs * 2` says: an empty board falls through to
+    # the pairs, a laid one counts what it holds.
+    def grid_shape(card_count: i64, pairs: i64, window_width: f64, floor: f64, ceiling: f64) -> Layout:
+        can Abort.Panic:
+            count: mutable i64 = card_count if card_count != 0 else pairs * 2
+            count <- 2 if count < 2 else count
+            room: f64 = board_room(floor, ceiling)
+            aspect: mutable f64 = (window_width * 0.9) / room
+            aspect <- 0.2 if aspect < 0.2 else aspect
+            root: i64 = py_round_half_even(sqrt(count.f64() * aspect))
+            columns: mutable i64 = root if root < count else count
+            columns <- 2 if columns < 2 else columns
+            rows: mutable i64 = ceil(count.f64() / columns.f64()).i64()
+            # Drop a column while doing so leaves the last row no emptier: a
+            # grid with a whole blank row in it is wider than it needs to be.
+            while columns * rows - count >= rows and columns > 2 |columns, rows, count|:
+                columns <- columns - 1
+                rows <- ceil(count.f64() / columns.f64()).i64()
+            return Layout{columns: columns, rows: rows, side: 0.0, gap: 0.0, left: 0.0, top: 0.0}
+
+    # Place every card in the grid for the current window. Cards are square --
+    # the shorter of the two fits -- and the block is centred both ways.
+    def layout_board(card_count: i64, pairs: i64, window_width: f64, floor: f64, ceiling: f64) -> Layout:
+        can Abort.Panic:
+            shape: Layout = grid_shape(card_count, pairs, window_width, floor, ceiling)
+            columns: f64 = shape.columns.f64()
+            rows: f64 = shape.rows.f64()
+            span_w: f64 = window_width * 0.9
+            span_h: f64 = board_room(floor, ceiling)
+            by_column: f64 = span_w / columns
+            by_row: f64 = span_h / rows
+            tight: f64 = by_column if by_column < by_row else by_row
+            gap: mutable f64 = tight * 0.09
+            gap <- 4.0 if gap < 4.0 else gap
+            card_w: f64 = (span_w - gap * (columns - 1.0)) / columns
+            card_h: f64 = (span_h - gap * (rows - 1.0)) / rows
+            side: f64 = card_w if card_w < card_h else card_h
+            total_w: f64 = side * columns + gap * (columns - 1.0)
+            total_h: f64 = side * rows + gap * (rows - 1.0)
+            left: f64 = (window_width - total_w) / 2.0
+            top: f64 = floor + total_h + (span_h - total_h) / 2.0
+            return Layout{columns: shape.columns, rows: shape.rows, side: side,
+                          gap: gap, left: left, top: top}
+
+    def card_rect(plan: Layout&, position: i64) -> Rect:
+        can Abort.Panic:
+            column: f64 = (position % plan.columns).f64()
+            row: f64 = (position / plan.columns).f64()
+            return Rect{left: plan.left + column * (plan.side + plan.gap),
+                        bottom: plan.top - (row + 1.0) * plan.side - row * plan.gap,
+                        width: plan.side, height: plan.side}
+
+    def rect_contains(box: Rect&, x: f64, y: f64) -> bool:
+        can Abort.Panic:
+            return box.left <= x and x <= box.left + box.width and box.bottom <= y and y <= box.bottom + box.height
+
+    # The first card under the point, in deal order. -1 for none.
+    def card_at(plan: Layout&, card_count: i64, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            for position in 0..<card_count |plan, x, y|:
+                box: Rect = card_rect(plan, position)
+                return position if rect_contains(&box, x, y)
+            return -1
+
+    # --- the board -------------------------------------------------------
+
+    struct Board:
+        pairs: mutable i64
+        count: mutable i64
+        index: mutable darray[i64]
+        face_up: mutable darray[i64]
+        matched: mutable darray[i64]
+        flipped: mutable darray[i64]
+        flipped_count: mutable i64
+        turns: mutable i64
+        lapses: mutable i64
+        phase: mutable i64
+        owed: mutable bool
+        coach: mutable bool
+        verdict: mutable i64
+        # `seen[pair]` is a set of at most two card slots, so it is two columns
+        # with -1 for absent rather than a container.
+        seen_a: mutable darray[i64]
+        seen_b: mutable darray[i64]
+
+    def new_board() -> Board:
+        can Memory.Allocate, Abort.Panic:
+            return Board{pairs: 0, count: 0, index: Ints::zeros(MOST_CARDS),
+                         face_up: Ints::zeros(MOST_CARDS), matched: Ints::zeros(MOST_CARDS),
+                         flipped: Ints::zeros(2), flipped_count: 0, turns: 0, lapses: 0,
+                         phase: PHASE_READY, owed: false, coach: false, verdict: VERDICT_NONE,
+                         seen_a: Ints::zeros(MOST_PAIRS), seen_b: Ints::zeros(MOST_PAIRS)}
+
+    def forget_all(board: mutable Board&):
+        can Abort.Panic:
+            for pair in 0..<MOST_PAIRS |board|:
+                Ints::put(&board.seen_a, pair, -1)
+                Ints::put(&board.seen_b, pair, -1)
+
+    def reset(board: mutable Board&):
+        can Abort.Panic:
+            board.count <- 0
+            board.flipped_count <- 0
+            board.turns <- 0
+            board.lapses <- 0
+            forget_all(board)
+            board.phase <- PHASE_READY
+            board.verdict <- VERDICT_NONE
+            board.owed <- false
+
+    def seen_has(board: mutable Board&, pair: i64, card: i64) -> bool:
+        can Abort.Panic:
+            return Ints::at_ref(&board.seen_a, pair) == card or Ints::at_ref(&board.seen_b, pair) == card
+
+    def seen_add(board: mutable Board&, pair: i64, card: i64):
+        can Abort.Panic:
+            return if seen_has(board, pair, card)
+            if Ints::at_ref(&board.seen_a, pair) < 0:
+                Ints::put(&board.seen_a, pair, card)
+            else:
+                Ints::put(&board.seen_b, pair, card)
+
+    def seen_both(board: mutable Board&, pair: i64) -> bool:
+        can Abort.Panic:
+            return Ints::at_ref(&board.seen_a, pair) >= 0 and Ints::at_ref(&board.seen_b, pair) >= 0
+
+    def pair_matched(board: mutable Board&, pair: i64) -> bool:
+        can Abort.Panic:
+            for card in 0..<board.count |board, pair|:
+                return true if Ints::at_ref(&board.index, card) == pair and Ints::at_ref(&board.matched, card) != 0
+            return false
+
+    # Is a whole unmatched pair already turned over somewhere?
+    #
+    # The one thing this board can be scored on. Whether a turn matched is
+    # mostly luck early and mostly memory later, and the two are not worth
+    # telling apart by counting turns. What a player who forgot nothing would
+    # never do is leave a pair on the table when both of its cards have been
+    # turned over once, or turn a card over again hoping for a match it has
+    # already been shown is not there.
+    def known_pair(board: mutable Board&) -> bool:
+        can Abort.Panic:
+            for pair in 0..<board.pairs |board|:
+                return true if seen_both(board, pair) and not pair_matched(board, pair)
+            return false
+
+    # Paint what the turn just completed did to the board. With coach off
+    # nothing is painted AT ALL -- the reference returns before it clears, so a
+    # label left over from a coached run would survive the switch.
+    def coach_verdict(board: mutable Board&, good: i64):
+        can Abort.Panic:
+            return if not board.coach
+            board.verdict <- good
+
+    # Draw fresh items and lay a new board. `sound` is the medium that cannot
+    # be peeked at: a clip has to be played, so showing it first shows nothing.
+    def deal(board: mutable Board&, pairs: i64, peek_ms: i64, sound: bool, rng: mutable MT19937&):
+        can Abort.Panic:
+            board.pairs <- pairs
+            board.count <- pairs * 2
+            # Each item is dealt twice, adjacent, and then the whole board is
+            # shuffled -- one shuffle over 2n cards, not a deal of pairs.
+            for at in 0..<board.count |board|:
+                Ints::put(&board.index, at, at / 2)
+            py_shuffle_i64_prefix(rng, &board.index, board.count)
+            for at in 0..<board.count |board|:
+                Ints::put(&board.face_up, at, 0)
+                Ints::put(&board.matched, at, 0)
+            board.flipped_count <- 0
+            board.turns <- 0
+            board.lapses <- 0
+            forget_all(board)
+            board.verdict <- VERDICT_NONE
+            board.owed <- false
+            if peek_ms > 0 and not sound:
+                for at in 0..<board.count |board|:
+                    Ints::put(&board.face_up, at, 1)
+                board.phase <- PHASE_PEEK
+            else:
+                board.phase <- PHASE_PLAYING
+
+    # The peek running out: everything back down, and the board is live.
+    def peek_over(board: mutable Board&):
+        can Abort.Panic:
+            return if board.phase != PHASE_PEEK
+            for at in 0..<board.count |board|:
+                Ints::put(&board.face_up, at, 0)
+            board.phase <- PHASE_PLAYING
+
+    # Turn an unmatched pair back down.
+    def resolve(board: mutable Board&):
+        can Abort.Panic:
+            for at in 0..<board.flipped_count |board|:
+                card: i64 = Ints::at_ref(&board.flipped, at)
+                Ints::put(&board.face_up, card, 0) if Ints::at_ref(&board.matched, card) == 0
+            board.flipped_count <- 0
+
+    def check_finished(board: mutable Board&):
+        can Abort.Panic:
+            for at in 0..<board.count |board|:
+                return if Ints::at_ref(&board.matched, at) == 0
+            board.phase <- PHASE_DONE
+
+    # Two cards up and no match: the mismatch is waiting on the hide timer.
+    def hiding(board: mutable Board&) -> bool:
+        can Abort.Panic:
+            return board.flipped_count == 2
+
+    def cleared(board: mutable Board&) -> bool:
+        can Abort.Panic:
+            return board.phase == PHASE_DONE
+
+    # Turn `card` over. The move a click makes; used by tests too.
+    def flip(board: mutable Board&, card: i64):
+        can Abort.Panic:
+            return if board.phase != PHASE_PLAYING
+            return if card < 0 or card >= board.count
+            return if Ints::at_ref(&board.face_up, card) != 0 or Ints::at_ref(&board.matched, card) != 0
+            # A third flip resolves the pair still showing before it lands, so
+            # a fast player never has to wait out the hide timer.
+            if board.flipped_count >= 2:
+                resolve(board)
+            pair: i64 = Ints::at_ref(&board.index, card)
+            seen_before: bool = seen_has(board, pair, card)
+            Ints::put(&board.face_up, card, 1)
+            Ints::put(&board.flipped, board.flipped_count, card)
+            board.flipped_count <- board.flipped_count + 1
+            seen_add(board, pair, card)
+            if board.flipped_count == 1:
+                coach_verdict(board, VERDICT_NONE)   # half a turn decides nothing
+                # Counted WITH this card, so it covers both of the cases a
+                # player who forgot nothing would act on: a pair it can already
+                # see the whole of somewhere else, and the partner of the card
+                # it has just turned over.
+                board.owed <- known_pair(board)
+            else:
+                board.turns <- board.turns + 1
+                first: i64 = Ints::at_ref(&board.flipped, 0)
+                second: i64 = Ints::at_ref(&board.flipped, 1)
+                if Ints::at_ref(&board.index, first) == Ints::at_ref(&board.index, second):
+                    Ints::put(&board.matched, first, 1)
+                    Ints::put(&board.matched, second, 1)
+                    board.flipped_count <- 0
+                    check_finished(board)
+                    board.owed <- false
+                    if board.phase == PHASE_PLAYING:
+                        coach_verdict(board, VERDICT_PAIR)
+                else:
+                    lapsed: bool = board.owed or seen_before
+                    if lapsed:
+                        board.lapses <- board.lapses + 1
+                    coach_verdict(board, VERDICT_LAPSE if lapsed else VERDICT_NONE)
+
+    # --- drawing ---------------------------------------------------------
+
+    struct Fill:
+        r: i64
+        g: i64
+        b: i64
+        alpha: i64
+
+    # A matched card stays green, a face-up one goes pale, and the back takes
+    # whichever of the two backs reads against the configured background.
+    def card_fill(face_up: bool, matched: bool, black_background: bool) -> Fill:
+        can Abort.Panic:
+            return Fill{r: 46, g: 170, b: 92, alpha: 255} if matched
+            return Fill{r: 236, g: 239, b: 245, alpha: 255} if face_up
+            return Fill{r: 44, g: 50, b: 66, alpha: 255} if black_background
+            return Fill{r: 86, g: 110, b: 168, alpha: 255}
