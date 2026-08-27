@@ -1,0 +1,210 @@
+# The N-in-a-row screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/ninarow.py -- the drawing, not the thinking.
+#
+# A square board with a pale slab under it, its grid, two colours of pellet,
+# and a marker on one cell: the player's choice while the question stands, or
+# the right answer once it has been judged and the level gives it away.
+#
+# The marker is FOUR LINES and not a Box. That is not a stylistic difference:
+# a Box centres its stroke on the rectangle's edge and these four sit wholly
+# inside the cell, inset by a margin, so a Box would cover pellets in the
+# neighbouring cells at small board sizes -- and the board goes to 128 squares.
+#
+# Cell numbering runs from the TOP LEFT: `row, col = divmod(cell, size)` and the
+# row is drawn at `bottom + (size - row - 1) * step`. The board's own y axis is
+# the other way up from the display list's.
+#
+# NOTE: needs elisacore_math, strings, geometry, verdict, display and
+# tasks/ninarow included by the driver.
+
+module SceneNinaRow:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_ASKING: i64 = 1
+    const PHASE_JUDGED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    def color_player() -> u32:
+        return Display::rgba(0, 114, 178, 255)
+
+    def color_opponent() -> u32:
+        return Display::rgba(213, 94, 0, 255)
+
+    def color_grid() -> u32:
+        return Display::rgba(128, 128, 128, 255)
+
+    def color_select() -> u32:
+        return Display::rgba(232, 178, 0, 255)
+
+    def color_answer() -> u32:
+        return Display::rgba(0, 158, 115, 255)
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                 y: f64, width: f64, height: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               width / paint.sx, height / paint.sy, color)
+
+    def put_line(list: mutable Display::DisplayList&, paint: Paint&, x1: f64,
+                 y1: f64, x2: f64, y2: f64, thick: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_line(list, x1 / paint.sx, y1 / paint.sy,
+                               x2 / paint.sx, y2 / paint.sy,
+                               thick / paint.sy, color)
+
+    def put_circle(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                   y: f64, radius: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_circle(list, x / paint.sx, y / paint.sy,
+                                 radius / paint.sy, color)
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    struct Board:
+        left: mutable f64
+        bottom: mutable f64
+        side: mutable f64
+
+    def board_box(out: mutable Board&, width: f64, height: f64):
+        can Abort.Panic:
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 56.0).f64()).f64() + 8.0
+            top: f64 = Geometry::from_top_edge(height, 132.0).f64()
+            room: f64 = top - bottom
+            tall: f64 = room if room > 80.0 else 80.0
+            wide: f64 = width * 0.82
+            side: f64 = wide if wide < tall else tall
+            out.left <- Geometry::width_center(width).f64() - side / 2.0
+            out.bottom <- bottom
+            out.side <- side
+
+    # The four lines that ring one cell, inset by `margin`. Written out in the
+    # reference's own order -- bottom, right, top, left -- because the order is
+    # the frame's order.
+    def mark_cell(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                  y: f64, step: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            raw: f64 = step * 0.08
+            margin: f64 = raw if raw > 2.0 else 2.0
+            put_line(list, paint, x + margin, y + margin,
+                     x + step - margin, y + margin, 2.0, color)
+            put_line(list, paint, x + step - margin, y + margin,
+                     x + step - margin, y + step - margin, 2.0, color)
+            put_line(list, paint, x + step - margin, y + step - margin,
+                     x + margin, y + step - margin, 2.0, color)
+            put_line(list, paint, x + margin, y + step - margin,
+                     x + margin, y + margin, 2.0, color)
+
+    # `cells` is separate from `puzzle` on purpose: NinaRow::generate writes the
+    # board into the buffer its CALLER supplies and leaves `puzzle.cells` alone,
+    # so a scene that read `puzzle.cells` would draw an empty board and every
+    # other command would still line up. The existing ninarow sweep reads the
+    # same buffer the same way.
+    def render(list: mutable Display::DisplayList&, paint: Paint&,
+               puzzle: mutable NinaRow::Puzzle&, cells: mutable darray[i64]&,
+               has_puzzle: bool, phase: i64,
+               trial: i64, total_trials: i64, choice: i64, show_answer: bool,
+               message: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            put_text(list, paint, sview("N-in-a-row", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 34.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if phase == PHASE_ASKING:
+                dstr_append_cstr(&status, "     question ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 64.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 13.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            note: mutable dstr = []
+            if has_puzzle:
+                dstr_append_i64(&note, puzzle.size)
+                dstr_append_cstr(&note, " x ")
+                dstr_append_i64(&note, puzzle.size)
+                dstr_append_cstr(&note, " board   ")
+                dstr_append_i64(&note, puzzle.pellets)
+                dstr_append_cstr(&note, " pellets   ")
+                dstr_append_i64(&note, puzzle.length)
+                dstr_append_cstr(&note, " in a row")
+            else:
+                dstr_append_cstr(&note, "The board grows from 5 to 128 squares; the line grows from 3 to 100.")
+            put_text(list, paint, bytes_view(note), middle,
+                     Geometry::from_top_edge(paint.height, 88.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: menu   Space: start   arrows/click: choose   Enter: answer   O: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 24.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            return if not has_puzzle
+            area: mutable Board = Board{left: 0.0, bottom: 0.0, side: 0.0}
+            board_box(&area, paint.width, paint.height)
+            size: i64 = puzzle.size
+            step: f64 = area.side / size.f64()
+
+            put_rect(list, paint, area.left, area.bottom, area.side, area.side,
+                     Display::rgba(236, 236, 236, 255))
+            for row in 0..<(size + 1) |list, paint, area, step|:
+                y: f64 = area.bottom + row.f64() * step
+                put_line(list, paint, area.left, y, area.left + area.side, y,
+                         1.0, color_grid())
+            for col in 0..<(size + 1) |list, paint, area, step|:
+                x: f64 = area.left + col.f64() * step
+                put_line(list, paint, x, area.bottom, x, area.bottom + area.side,
+                         1.0, color_grid())
+
+            raw_radius: f64 = step * 0.32
+            radius: f64 = raw_radius if raw_radius > 2.0 else 2.0
+            for cell in 0..<(size * size) |list, paint, area, cells, size, step, radius|:
+                value: i64 = Ints::at_ref(cells, cell)
+                if value != NinaRow::EMPTY:
+                    row: i64 = cell / size
+                    col: i64 = cell % size
+                    x: f64 = area.left + col.f64() * step
+                    y: f64 = area.bottom + (size - row - 1).f64() * step
+                    color: u32 = color_player() if value == NinaRow::PLAYER else color_opponent()
+                    put_circle(list, paint, x + step / 2.0, y + step / 2.0,
+                               radius, color)
+
+            marked: mutable i64 = -1
+            marked_color: mutable u32 = color_select()
+            if phase == PHASE_ASKING:
+                marked <- choice
+            if phase == PHASE_JUDGED and show_answer:
+                marked <- puzzle.answer
+                marked_color <- color_answer()
+            return if marked < 0
+            row: i64 = marked / size
+            col: i64 = marked % size
+            mark_cell(list, paint, area.left + col.f64() * step,
+                      area.bottom + (size - row - 1).f64() * step, step,
+                      marked_color)
