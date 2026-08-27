@@ -1,0 +1,300 @@
+# Jigsaw Puzzle: put a scrambled photograph back together.
+#
+# Port of the portable half of neural_workshop/ui/jigsaw.py
+# (GPL-2.0-or-later). The photograph library belongs to the shell, so a puzzle
+# here is a permutation and a grid; what the tiles show is not what the task
+# decides anything on.
+#
+# The score is not just finishing. Any scramble can be solved in a KNOWABLE
+# minimum number of swaps -- one less than the length of each cycle of the
+# shuffle, summed -- and the run reports how close to that minimum each
+# solution came. Swapping tiles about at random finishes eventually; seeing
+# where each tile goes before touching it finishes at the minimum, and the gap
+# between the two is what is measured.
+#
+# Two details carry it:
+#
+#   * `scramble` REDRAWS the identity away rather than patching it away.
+#     Swapping a pair into an almost-sorted shuffle would bias small grids
+#     toward one-swap puzzles.
+#   * the minimum is EXACT -- n minus the number of cycles in the permutation,
+#     not a bound on it -- which is why green can mean "the fewest swaps this
+#     scramble could be undone in" rather than "close enough".
+
+module Jigsaw:
+
+    const SMALLEST_SIDE: i64 = 2
+    const LARGEST_SIDE: i64 = 10
+
+    # The gap ruled between tiles, in pixels. Wide enough that tile edges never
+    # fuse into a finished-looking picture before it is finished.
+    const SEAM: f64 = 2.0
+
+    # How efficient a solution has to be before an adaptive run grows the grid,
+    # and how far below that it falls before the grid shrinks. Efficiency is
+    # the minimum number of swaps over the number used, so one is perfect.
+    const GROW_AT: f64 = 0.7
+    const SHRINK_AT: f64 = 0.45
+
+    const FEEDBACK_SECONDS: f64 = 1.6
+
+    const MOST_TILES: i64 = 100
+    const MOST_PUZZLES: i64 = 64
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SOLVING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    def clamped(side: i64) -> i64:
+        can Abort.Panic:
+            capped: i64 = LARGEST_SIDE if side > LARGEST_SIDE else side
+            return SMALLEST_SIDE if capped < SMALLEST_SIDE else capped
+
+    def is_solved(order: mutable darray[i64]&, count: i64) -> bool:
+        can Abort.Panic:
+            for position in 0..<count |order, position|:
+                false return if Ints::at_ref(order, position) != position
+            return true
+
+    # A shuffle of the grid's tiles, never the solved one. `order[position]` is
+    # the tile shown at `position`.
+    def scramble(order: mutable darray[i64]&, side: i64, rng: mutable MT19937&):
+        can Abort.Panic:
+            count: i64 = side * side
+            for position in 0..<count |order|:
+                Ints::put(order, position, position)
+            # The identity always passes the test, so the shuffle runs at least
+            # once -- and again for as long as it lands back on the identity.
+            while is_solved(order, count) |order, count, rng|:
+                py_shuffle_i64_prefix(rng, order, count)
+
+    # The fewest swaps that sort `order`. Each cycle of length n needs n - 1
+    # swaps, so the total is the size of the grid minus the number of cycles.
+    # This is the par a solution is measured against.
+    def minimum_swaps(order: mutable darray[i64]&, count: i64, seen: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            for at in 0..<count |seen|:
+                Ints::put(seen, at, 0)
+            cycles: mutable i64 = 0
+            for start in 0..<count |order, seen, cycles|:
+                continue if Ints::at_ref(seen, start) != 0
+                cycles <- cycles + 1
+                position: mutable i64 = start
+                while Ints::at_ref(seen, position) == 0 |order, seen, position|:
+                    Ints::put(seen, position, 1)
+                    position <- Ints::at_ref(order, position)
+            return count - cycles
+
+    # --- layout ----------------------------------------------------------
+
+    struct Canvas:
+        left: f64
+        bottom: f64
+        width: f64
+        height: f64
+
+    struct Square:
+        left: f64
+        bottom: f64
+        size: f64
+
+    struct Rect:
+        left: f64
+        bottom: f64
+        width: f64
+        height: f64
+
+    # Left, bottom, width, height of the room the board may use.
+    def canvas(window_width: f64, window_height: f64) -> Canvas:
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(window_height, 96.0).f64()
+            bottom: f64 = Verdict::above_the_band(window_height, Geometry::from_bottom_edge(window_height, 56.0).f64()).f64()
+            span: f64 = top - bottom
+            return Canvas{left: window_width * 0.04, bottom: bottom,
+                          width: window_width * 0.92,
+                          height: 40.0 if span < 40.0 else span}
+
+    # Left, bottom and size of the puzzle square. With the preview on, the
+    # board leaves a quarter of the width to its right for the finished
+    # picture -- the lid of the box.
+    def board_rect(window_width: f64, window_height: f64, preview: bool) -> Square:
+        can Abort.Panic:
+            view: Canvas = canvas(window_width, window_height)
+            room: f64 = view.width * (0.72 if preview else 1.0)
+            size: f64 = view.height if view.height < room else room
+            return Square{left: view.left + (room - size) / 2.0,
+                          bottom: view.bottom + (view.height - size) / 2.0, size: size}
+
+    def preview_rect(window_width: f64, window_height: f64) -> Square:
+        can Abort.Panic:
+            view: Canvas = canvas(window_width, window_height)
+            by_width: f64 = view.width * 0.24
+            by_height: f64 = view.height * 0.5
+            size: f64 = by_height if by_height < by_width else by_width
+            return Square{left: view.left + view.width - size,
+                          bottom: view.bottom + view.height - size, size: size}
+
+    # Tiles are laid TOP-DOWN: position 0 is the top-left corner, so a row is
+    # measured down from the board's top edge rather than up from its bottom.
+    def tile_rect(window_width: f64, window_height: f64, preview: bool, side: i64, position: i64) -> Rect:
+        can Abort.Panic:
+            board: Square = board_rect(window_width, window_height, preview)
+            span: f64 = (board.size - SEAM * (side - 1).f64()) / side.f64()
+            row: f64 = (position / side).f64()
+            column: f64 = (position % side).f64()
+            left: f64 = board.left + column * (span + SEAM)
+            top: f64 = board.bottom + board.size - row * (span + SEAM)
+            return Rect{left: left, bottom: top - span, width: span, height: span}
+
+    def tile_at(window_width: f64, window_height: f64, preview: bool, side: i64, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            for position in 0..<(side * side) |window_width, window_height, preview, side, x, y|:
+                box: Rect = tile_rect(window_width, window_height, preview, side, position)
+                inside: bool = box.left <= x and x <= box.left + box.width and box.bottom <= y and y <= box.bottom + box.height
+                return position if inside
+            return -1
+
+    # --- a run -----------------------------------------------------------
+
+    struct Run:
+        start_side: mutable i64
+        total_puzzles: mutable i64
+        adaptive: mutable bool
+        preview: mutable bool
+        side: mutable i64
+        trial_side: mutable i64
+        puzzle: mutable i64
+        order: mutable darray[i64]
+        seen: mutable darray[i64]
+        par: mutable i64
+        swaps: mutable i64
+        picked: mutable i64
+        started_at: mutable f64
+        feedback_until: mutable f64
+        phase: mutable i64
+        verdict: mutable i64
+        result_count: mutable i64
+        result_side: mutable darray[i64]
+        result_efficiency: mutable darray[f64]
+        result_took: mutable darray[f64]
+
+    def new_run() -> Run:
+        can Memory.Allocate, Abort.Panic:
+            return Run{start_side: SMALLEST_SIDE, total_puzzles: 0, adaptive: false,
+                       preview: false, side: SMALLEST_SIDE, trial_side: SMALLEST_SIDE,
+                       puzzle: 0, order: Ints::zeros(MOST_TILES), seen: Ints::zeros(MOST_TILES),
+                       par: 0, swaps: 0, picked: -1, started_at: 0.0, feedback_until: 0.0,
+                       phase: PHASE_READY, verdict: -1, result_count: 0,
+                       result_side: Ints::zeros(MOST_PUZZLES),
+                       result_efficiency: Floats::zeros(MOST_PUZZLES),
+                       result_took: Floats::zeros(MOST_PUZZLES)}
+
+    def reset(run: mutable Run&):
+        can Abort.Panic:
+            run.puzzle <- 0
+            run.result_count <- 0
+            run.picked <- -1
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+
+    def finish(run: mutable Run&):
+        can Abort.Panic:
+            run.phase <- PHASE_DONE
+
+    def next_puzzle(run: mutable Run&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            if run.puzzle >= run.total_puzzles:
+                finish(run)
+                return
+            run.puzzle <- run.puzzle + 1
+            run.trial_side <- run.side
+            scramble(&run.order, run.trial_side, rng)
+            run.par <- minimum_swaps(&run.order, run.trial_side * run.trial_side, &run.seen)
+            run.swaps <- 0
+            run.picked <- -1
+            run.verdict <- -1
+            run.started_at <- now
+            run.phase <- PHASE_SOLVING
+
+    def start_run(run: mutable Run&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            reset(run)
+            run.side <- clamped(run.start_side)
+            next_puzzle(run, now, rng)
+
+    def solved(run: mutable Run&, now: f64):
+        can Abort.Panic:
+            took: f64 = now - run.started_at
+            divisor: i64 = run.swaps if run.swaps > run.par else run.par
+            efficiency: f64 = run.par.f64() / divisor.f64()
+            Ints::put(&run.result_side, run.result_count, run.trial_side)
+            Floats::put(&run.result_efficiency, run.result_count, efficiency)
+            Floats::put(&run.result_took, run.result_count, took)
+            run.result_count <- run.result_count + 1
+            if run.adaptive:
+                if efficiency >= GROW_AT:
+                    run.side <- clamped(run.side + 1)
+                else:
+                    if efficiency < SHRINK_AT:
+                        run.side <- clamped(run.side - 1)
+            run.phase <- PHASE_SOLVED
+            run.feedback_until <- now + FEEDBACK_SECONDS
+            # Green means the fewest swaps this scramble could be undone in,
+            # which is exact.
+            run.verdict <- 1 if run.swaps <= run.par else 0
+
+    # First click marks a tile; the second swaps the two.
+    #
+    # A position off the end of the board is refused. A click cannot produce
+    # one, but a caller driving the task directly can, and a swap against an
+    # index nothing is at would corrupt the permutation rather than fail.
+    def pick(run: mutable Run&, position: i64, now: f64):
+        can Abort.Panic:
+            count: i64 = run.trial_side * run.trial_side
+            return if run.phase != PHASE_SOLVING or position < 0 or position >= count
+            if run.picked < 0:
+                run.picked <- position
+            else:
+                if run.picked == position:
+                    run.picked <- -1
+                else:
+                    held: i64 = Ints::at_ref(&run.order, run.picked)
+                    Ints::put(&run.order, run.picked, Ints::at_ref(&run.order, position))
+                    Ints::put(&run.order, position, held)
+                    run.swaps <- run.swaps + 1
+                    run.picked <- -1
+                    if is_solved(&run.order, count):
+                        solved(run, now)
+
+    def update(run: mutable Run&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            if run.phase == PHASE_SOLVED and now >= run.feedback_until:
+                next_puzzle(run, now, rng)
+
+    struct Score:
+        puzzles: i64
+        efficiency: i64
+        mean_seconds: f64
+        best_side: i64
+
+    # How the run went, on both of its axes. Efficiency is reported beside the
+    # time because they trade against each other: swapping fast and loose
+    # finishes sooner and scores lower.
+    def score(run: mutable Run&) -> Score:
+        can Abort.Panic:
+            total_efficiency: mutable f64 = 0.0
+            total_seconds: mutable f64 = 0.0
+            best_side: mutable i64 = 0
+            for at in 0..<run.result_count |run, total_efficiency, total_seconds, best_side|:
+                total_efficiency <- total_efficiency + Floats::at_ref(&run.result_efficiency, at)
+                total_seconds <- total_seconds + Floats::at_ref(&run.result_took, at)
+                side: i64 = Ints::at_ref(&run.result_side, at)
+                best_side <- side if side > best_side
+            efficiency: mutable i64 = 0
+            mean_seconds: mutable f64 = 0.0
+            if run.result_count > 0:
+                efficiency <- py_round_half_even(100.0 * total_efficiency / run.result_count.f64())
+                mean_seconds <- total_seconds / run.result_count.f64()
+            return Score{puzzles: run.result_count, efficiency: efficiency,
+                         mean_seconds: mean_seconds, best_side: best_side}
