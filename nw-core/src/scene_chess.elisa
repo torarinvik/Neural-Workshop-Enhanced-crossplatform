@@ -1,0 +1,177 @@
+# The Winning Move screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/chess.py -- the drawing, not the thinking.
+#
+# A board seen from the side to move, the pieces on it as Unicode glyphs, and
+# -- once a piece is picked up -- the squares it may go to.
+#
+# Two things carried across that a reading would not invent.
+#
+# A white piece is drawn TWICE: a dark glyph offset by (+1.5, -1.5) and then
+# the bright one on top. The reference says why -- pyglet has no stroke support
+# for these glyphs, so the underlay is the outline, and without it a white king
+# on a cream square is a white king on a white square.
+#
+# The squares are `cell + 1` wide and `cell + 1` tall, not `cell`. A board of
+# eight squares laid out at a fractional cell size leaves hairlines between
+# them at some window sizes; the extra pixel closes them. It also means the
+# squares OVERLAP, so their order is load-bearing and `settle_positions` must
+# not be used on this scene.
+#
+# `targets` comes in from the caller. The reference asks python-chess for the
+# legal moves from the selected square; the port takes the answer, exactly as
+# tasks/chess.elisa takes the engine's verdicts. Move generation is the
+# dependency this project decided to keep rather than reimplement.
+#
+# NOTE: needs elisacore_math, strings, geometry, verdict and display included
+# by the driver.
+
+module SceneChess:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SOLVING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_MISSED: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    def color_light() -> u32:
+        return Display::rgba(238, 238, 210, 255)
+
+    def color_dark() -> u32:
+        return Display::rgba(118, 150, 86, 255)
+
+    def color_select() -> u32:
+        return Display::rgba(246, 194, 62, 255)
+
+    def color_target() -> u32:
+        return Display::rgba(120, 188, 210, 255)
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                 y: f64, width: f64, height: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               width / paint.sx, height / paint.sy, color)
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    struct Board:
+        left: mutable f64
+        bottom: mutable f64
+        side: mutable f64
+
+    def board_rect(out: mutable Board&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 92.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 42.0).f64()).f64()
+            room: f64 = top - bottom
+            wide: f64 = width * 0.78
+            capped: f64 = wide if wide < room else room
+            side: f64 = capped if capped > 80.0 else 80.0
+            out.left <- (width - side) / 2.0
+            out.bottom <- bottom + (room - side) / 2.0
+            out.side <- side
+
+    # The square drawn at (file, rank) of the VIEW. White sees a1 bottom-left;
+    # Black sees the board turned round, which is `square(7 - file, 7 - rank)`.
+    def square_for_display(view_white: bool, file: i64, rank: i64) -> i64:
+        return rank * 8 + file if view_white else (7 - rank) * 8 + (7 - file)
+
+    # `♔♕♖♗♘♙` and `♚♛♜♝♞♟`, as UTF-8. Each is three bytes: U+2654..U+2659 for
+    # White and U+265A..U+265F for Black.
+    #
+    # The code points run KING QUEEN ROOK BISHOP KNIGHT PAWN and python-chess
+    # numbers its pieces the other way round -- PAWN is 1 and KING is 6, which
+    # is what tasks/chess.elisa carries -- so the index is subtracted, not
+    # added. Getting that backwards draws a legal-looking board of the wrong
+    # pieces, which is the kind of wrong a screenshot does not show.
+    def append_glyph(out: mutable dstr&, piece: i64, white: bool):
+        can Memory.Allocate, Abort.Panic:
+            return if piece < Chess::PAWN or piece > Chess::KING
+            point: i64 = 9817 - (piece - Chess::PAWN) + (0 if white else 6)
+            out.push(226.u8())
+            out.push((128 + (point % 4096) / 64).u8())
+            out.push((128 + point % 64).u8())
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&,
+               piece: mutable darray[i64]&, white: mutable darray[i64]&,
+               targets: mutable darray[i64]&, view_white: bool, phase: i64,
+               selected: i64, trial: i64, total_trials: i64, message: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            put_text(list, paint, sview("Winning Move", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 34.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            playing: bool = phase == PHASE_SOLVING or phase == PHASE_SOLVED or phase == PHASE_MISSED
+            if playing:
+                dstr_append_cstr(&status, "     puzzle ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 65.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 13.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     click: move     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 24.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            return if not playing
+            area: mutable Board = Board{left: 0.0, bottom: 0.0, side: 0.0}
+            board_rect(&area, paint.width, paint.height)
+            cell: f64 = area.side / 8.0
+
+            for rank in 0..<8 |list, paint, area, cell, piece, white, targets, view_white, phase, selected|:
+                for file in 0..<8 |list, paint, area, cell, piece, white, targets, view_white, phase, selected, rank|:
+                    square: i64 = square_for_display(view_white, file, rank)
+                    shade: mutable u32 = color_dark() if (file + rank) % 2 == 0 else color_light()
+                    # Targets only light up while a piece is in hand, so an
+                    # answered puzzle shows a plain board.
+                    if phase == PHASE_SOLVING and selected >= 0 and Ints::at_ref(targets, square) != 0:
+                        shade <- color_target()
+                    if square == selected:
+                        shade <- color_select()
+                    put_rect(list, paint, area.left + file.f64() * cell,
+                             area.bottom + rank.f64() * cell,
+                             cell + 1.0, cell + 1.0, shade)
+                    kind: i64 = Ints::at_ref(piece, square)
+                    if kind != 0:
+                        is_white: bool = Ints::at_ref(white, square) != 0
+                        px: f64 = area.left + (file.f64() + 0.5) * cell
+                        py: f64 = area.bottom + (rank.f64() + 0.5) * cell
+                        raw: i64 = (cell * 0.72).i64()
+                        size: f64 = (raw if raw > 18 else 18).f64()
+                        text: mutable dstr = []
+                        append_glyph(&text, kind, is_white)
+                        if is_white:
+                            put_text(list, paint, bytes_view(text), px + 1.5,
+                                     py - 1.5, size,
+                                     Display::rgba(38, 38, 38, 255),
+                                     Display::ANCHOR_CENTER_CENTER, false)
+                        ink: u32 = Display::rgba(250, 250, 244, 255) if is_white else Display::rgba(28, 28, 28, 255)
+                        put_text(list, paint, bytes_view(text), px, py, size,
+                                 ink, Display::ANCHOR_CENTER_CENTER, false)
