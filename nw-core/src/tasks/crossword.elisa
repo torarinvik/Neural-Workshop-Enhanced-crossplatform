@@ -1,0 +1,711 @@
+# Crossword: a grid that has to be a crossword before it can be a puzzle.
+#
+# Port of the portable half of neural_workshop/crossword.py
+# (GPL-2.0-or-later). The word list is a downloaded, rank-ordered corpus with
+# clues attached, so it is supplied -- already narrowed to the rung's rank band
+# and entry lengths, which is what `deal_one` asks the pool for before it
+# fills. `generate` is not here: it is `grade_of`, a seeded generator and
+# `deal_one`, and all three are.
+#
+# Ranks in the corpus start at ONE. `Lexicon.narrowed` takes `lo = 1` and
+# drops anything below it, so a pool ranked from zero silently loses its first
+# word the moment a deal narrows -- which is a fill that is right in isolation
+# and wrong inside a deal, and cost an afternoon.
+#
+# The blocks are AIMED rather than scattered, and the module says why at
+# length: scattering a fixed share of them and keeping whatever stayed well
+# formed put nearly all of them on the edges, because a block in the middle of
+# an empty grid leaves a run of one somewhere far more often than one in a
+# corner does. So a nine by nine came out as a word square with the corners
+# nibbled, which is not an ordinary crossword and cannot be filled. Instead:
+# find the longest run, split it, repeat -- and the block count is whatever
+# that took rather than a number chosen in advance.
+#
+# The fill goes across in reading order, so a down entry always holds a
+# contiguous run from its own top and can be tested against the pool's prefix
+# set the instant a row closes. A branch that has made a column impossible dies
+# at that row rather than at the bottom of the grid, which is the difference
+# between a six-by-six square taking a second and taking all afternoon.
+#
+# The prefix sets are kept PER LENGTH, and that is most of the pruning rather
+# than a refinement: pooled across lengths, `ab` counts as a live opening for a
+# five-letter slot because `abc` exists, and a fill following that advice walks
+# to the bottom of every column before finding out.
+
+module Crossword:
+
+    const MIN_ENTRY: i64 = 3
+
+    # Longest entry the generator will attempt. Past this the pool thins out
+    # faster than the crossing constrains it and a fill turns into a search for
+    # the one word of that length that fits.
+    const MAX_ENTRY: i64 = 11
+
+    # Grids to try before giving up on a rung. The budget is SPLIT between them
+    # rather than pooled, because a grid that cannot be filled will happily eat
+    # a whole rung's budget proving it, and the answer is nearly always in the
+    # next grid rather than deeper in this one.
+    const RESTARTS: i64 = 12
+
+    const GRADE_COUNT: i64 = 10
+    const MOST_CELLS: i64 = 169
+    const MOST_RUNS: i64 = 96
+    const MOST_SLOTS: i64 = 192
+    const BLANK: i64 = -1
+    const OPEN: i64 = -2
+
+    struct Grade:
+        size: i64
+        longest_entry: i64
+        top_rank: i64
+        given: f64
+        withheld: f64
+        tries: i64
+
+    def grade_at(index: i64) -> Grade:
+        can Abort.Panic:
+            return Grade{size: 4, longest_entry: 4, top_rank: 3000, given: 0.50, withheld: 0.00, tries: 60000} if index == 0
+            return Grade{size: 6, longest_entry: 4, top_rank: 10000, given: 0.30, withheld: 0.00, tries: 120000} if index == 1
+            return Grade{size: 7, longest_entry: 5, top_rank: 10000, given: 0.15, withheld: 0.00, tries: 400000} if index == 2
+            return Grade{size: 9, longest_entry: 6, top_rank: 30000, given: 0.08, withheld: 0.00, tries: 6000000} if index == 3
+            return Grade{size: 9, longest_entry: 6, top_rank: 30000, given: 0.00, withheld: 0.00, tries: 6000000} if index == 4
+            return Grade{size: 9, longest_entry: 6, top_rank: 1073741824, given: 0.00, withheld: 0.00, tries: 6000000} if index == 5
+            return Grade{size: 9, longest_entry: 6, top_rank: 1073741824, given: 0.00, withheld: 0.25, tries: 6000000} if index == 6
+            return Grade{size: 5, longest_entry: 5, top_rank: 30000, given: 0.00, withheld: 0.00, tries: 4000000} if index == 7
+            return Grade{size: 5, longest_entry: 5, top_rank: 1073741824, given: 0.00, withheld: 0.40, tries: 4000000} if index == 8
+            return Grade{size: 9, longest_entry: 6, top_rank: 1073741824, given: 0.00, withheld: 0.50, tries: 6000000}
+
+    def grade_of(rung: i64) -> Grade:
+        can Abort.Panic:
+            capped: i64 = GRADE_COUNT - 1 if rung - 1 > GRADE_COUNT - 1 else rung - 1
+            return grade_at(0 if capped < 0 else capped)
+
+    # --- the shape -------------------------------------------------------
+
+    # Every maximal unblocked run in one direction, in reading order.
+    # `run_at[r] .. run_at[r] + run_n[r]` indexes `run_cell`.
+    struct Runs:
+        count: mutable i64
+        at: mutable darray[i64]
+        n: mutable darray[i64]
+        cell: mutable darray[i64]
+        used: mutable i64
+
+    def new_runs() -> Runs:
+        can Memory.Allocate, Abort.Panic:
+            return Runs{count: 0, at: Ints::zeros(MOST_RUNS), n: Ints::zeros(MOST_RUNS),
+                        cell: Ints::zeros(MOST_CELLS * 2), used: 0}
+
+    def find_runs(size: i64, blocks: mutable darray[i64]&, down: bool, out: mutable Runs&):
+        can Abort.Panic:
+            out.count <- 0
+            out.used <- 0
+            for line in 0..<size |size, blocks, down, out|:
+                held: mutable i64 = 0
+                start: mutable i64 = 0
+                for step in 0..<size |size, blocks, down, out, line, held, start|:
+                    cell: i64 = (step * size + line) if down else (line * size + step)
+                    if Ints::at_ref(blocks, cell) != 0:
+                        if held > 0:
+                            Ints::put(&out.at, out.count, start)
+                            Ints::put(&out.n, out.count, held)
+                            out.count <- out.count + 1
+                        held <- 0
+                    else:
+                        start <- out.used if held == 0 else start
+                        Ints::put(&out.cell, out.used, cell)
+                        out.used <- out.used + 1
+                        held <- held + 1
+                if held > 0:
+                    Ints::put(&out.at, out.count, start)
+                    Ints::put(&out.n, out.count, held)
+                    out.count <- out.count + 1
+
+    # Whether every run in both directions is long enough to be an entry.
+    #
+    # ONLY the floor, deliberately. This once checked a ceiling too, and that
+    # quietly stopped `shape` from working on anything wider than the ceiling:
+    # an empty thirteen by thirteen is already over it, every single block
+    # leaves it still over it, and so every step of the growth was rolled back
+    # and the grid came out empty.
+    def well_formed(size: i64, blocks: mutable darray[i64]&, scratch: mutable Runs&) -> bool:
+        can Abort.Panic:
+            for pass_at in 0..<2 |size, blocks, scratch|:
+                find_runs(size, blocks, pass_at == 1, scratch)
+                for run in 0..<scratch.count |scratch|:
+                    false return if Ints::at_ref(&scratch.n, run) < MIN_ENTRY
+            return true
+
+    # Whether the unblocked cells are one piece.
+    def connected(size: i64, blocks: mutable darray[i64]&, seen: mutable darray[i64]&, frontier: mutable darray[i64]&) -> bool:
+        can Abort.Panic:
+            cells: i64 = size * size
+            open_n: mutable i64 = 0
+            first: mutable i64 = -1
+            for cell in 0..<cells |blocks, seen, open_n, first|:
+                Ints::put(seen, cell, 0)
+                if Ints::at_ref(blocks, cell) == 0:
+                    open_n <- open_n + 1
+                    first <- cell if first < 0
+            false return if open_n == 0
+            Ints::put(seen, first, 1)
+            Ints::put(frontier, 0, first)
+            held: mutable i64 = 1
+            found: mutable i64 = 1
+            while held > 0 |size, blocks, seen, frontier, held, found|:
+                held <- held - 1
+                cell: i64 = Ints::at_ref(frontier, held)
+                row: i64 = cell / size
+                col: i64 = cell % size
+                for way in 0..<4 |size, blocks, seen, frontier, held, found, row, col|:
+                    dr: i64 = 0 if way < 2 else (1 if way == 2 else -1)
+                    dc: i64 = (1 if way == 0 else -1) if way < 2 else 0
+                    r: i64 = row + dr
+                    c: i64 = col + dc
+                    continue if r < 0 or r >= size or c < 0 or c >= size
+                    near: i64 = r * size + c
+                    continue if Ints::at_ref(blocks, near) != 0 or Ints::at_ref(seen, near) != 0
+                    Ints::put(seen, near, 1)
+                    Ints::put(frontier, held, near)
+                    held <- held + 1
+                    found <- found + 1
+            return found == open_n
+
+    # The longest run either way, which is what a block count is for.
+    def longest(size: i64, blocks: mutable darray[i64]&, scratch: mutable Runs&) -> i64:
+        can Abort.Panic:
+            best: mutable i64 = 0
+            for pass_at in 0..<2 |size, blocks, scratch, best|:
+                find_runs(size, blocks, pass_at == 1, scratch)
+                for run in 0..<scratch.count |scratch, best|:
+                    length: i64 = Ints::at_ref(&scratch.n, run)
+                    best <- length if length > best
+            return best
+
+    # Where a block may go in a run, leaving legal pieces: either end, which
+    # shortens the run by one, or far enough inside to leave an entry on both
+    # sides. The middle of a five is neither -- it would leave a two.
+    #
+    # Leaving the ends out of this was why nothing above rung one dealt at all:
+    # a run of five has no interior split, so a five-by-five could never be
+    # broken up and came out as a word square wearing a crossword's rung.
+    def split_points(length: i64, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            written: mutable i64 = 0
+            if length - 1 >= MIN_ENTRY:
+                Ints::put(out, 0, 0)
+                Ints::put(out, 1, length - 1)
+                written <- 2
+            for at in MIN_ENTRY..<(length - MIN_ENTRY) |out, written|:
+                # `dict.fromkeys` dedupes and keeps the order it first saw.
+                twin: mutable bool = false
+                for earlier in 0..<written |out, at, twin|:
+                    twin <- true if Ints::at_ref(out, earlier) == at
+                continue if twin
+                Ints::put(out, written, at)
+                written <- written + 1
+            return written
+
+    struct Shaper:
+        blocks: mutable darray[i64]
+        best: mutable darray[i64]
+        seen: mutable darray[i64]
+        frontier: mutable darray[i64]
+        cuts: mutable darray[i64]
+        worst: mutable darray[i64]
+        runs: mutable Runs
+        across: mutable Runs
+        down: mutable Runs
+
+    def new_shaper() -> Shaper:
+        can Memory.Allocate, Abort.Panic:
+            return Shaper{blocks: Ints::zeros(MOST_CELLS), best: Ints::zeros(MOST_CELLS),
+                          seen: Ints::zeros(MOST_CELLS), frontier: Ints::zeros(MOST_CELLS),
+                          cuts: Ints::zeros(MOST_CELLS), worst: Ints::zeros(MOST_CELLS),
+                          runs: new_runs(), across: new_runs(), down: new_runs()}
+
+    # The longest run either way, copied out: `max(..., key=len)` keeps the
+    # FIRST of equals, and across runs are generated before down ones.
+    def worst_run(size: i64, blocks: mutable darray[i64]&, shaper: mutable Shaper&) -> i64:
+        can Abort.Panic:
+            best: mutable i64 = 0
+            for pass_at in 0..<2 |size, blocks, shaper, best|:
+                find_runs(size, blocks, pass_at == 1, &shaper.runs)
+                for run in 0..<shaper.runs.count |shaper, best|:
+                    length: i64 = Ints::at_ref(&shaper.runs.n, run)
+                    continue if length <= best
+                    best <- length
+                    at: i64 = Ints::at_ref(&shaper.runs.at, run)
+                    for slot in 0..<length |shaper, at|:
+                        Ints::put(&shaper.worst, slot, Ints::at_ref(&shaper.runs.cell, at + slot))
+            return best
+
+    # A block pattern with 180-degree symmetry and no run past `longest_entry`.
+    def shape(size: i64, longest_entry: i64, shaper: mutable Shaper&, out: mutable darray[i64]&, rng: mutable MT19937&, attempts: i64):
+        can Abort.Panic:
+            for cell in 0..<(size * size) |out|:
+                Ints::put(out, cell, 0)
+            return if longest_entry >= size
+            settled: mutable bool = false
+            for _try in 0..<attempts |size, longest_entry, shaper, out, settled, rng|:
+                break if settled
+                break if longest(size, out, &shaper.runs) <= longest_entry
+                span: i64 = worst_run(size, out, shaper)
+                break if span <= longest_entry
+                cuts: i64 = split_points(span, &shaper.cuts)
+                break if cuts == 0
+                py_shuffle_i64_prefix(rng, &shaper.cuts, cuts)
+                placed: mutable bool = false
+                for slot in 0..<cuts |size, shaper, out, placed|:
+                    break if placed
+                    cell: i64 = Ints::at_ref(&shaper.worst, Ints::at_ref(&shaper.cuts, slot))
+                    twin: i64 = size * size - 1 - cell
+                    continue if Ints::at_ref(out, cell) != 0 or Ints::at_ref(out, twin) != 0
+                    Ints::put(out, cell, 1)
+                    Ints::put(out, twin, 1)
+                    if well_formed(size, out, &shaper.runs) and connected(size, out, &shaper.seen, &shaper.frontier):
+                        placed <- true
+                    else:
+                        Ints::put(out, cell, 0)
+                        Ints::put(out, twin, 0)
+                # The reference's `for ... else: break`: no cut worked, so the
+                # growth is over.
+                settled <- true if not placed
+
+    # A block pattern that really does come down to `longest_entry`.
+    #
+    # `shape` aims and does not always land -- at eleven by eleven it reaches
+    # an entry of six about two times in five. Those are legal grids and much
+    # harder to fill, and a deal that accepted them spent its whole budget on
+    # the hard ones. Reshaping is free, so it is done until the shape is the
+    # one that was asked for.
+    def a_shape(size: i64, longest_entry: i64, shaper: mutable Shaper&, out: mutable darray[i64]&, rng: mutable MT19937&, attempts: i64):
+        can Abort.Panic:
+            cells: i64 = size * size
+            for cell in 0..<cells |shaper|:
+                Ints::put(&shaper.best, cell, 0)
+            # `not best` is Python's truthiness on a frozenset: empty is false.
+            have_best: mutable bool = false
+            settled: mutable bool = false
+            for _try in 0..<attempts |size, longest_entry, shaper, out, rng, cells, have_best, settled|:
+                break if settled
+                shape(size, longest_entry, shaper, out, rng, 600)
+                reach: i64 = longest(size, out, &shaper.runs)
+                if reach <= longest_entry:
+                    settled <- true
+                else:
+                    blocked: mutable i64 = 0
+                    for cell in 0..<cells |out, blocked|:
+                        blocked <- blocked + 1 if Ints::at_ref(out, cell) != 0
+                    if not have_best or reach < longest(size, &shaper.best, &shaper.runs):
+                        for cell in 0..<cells |shaper, out|:
+                            Ints::put(&shaper.best, cell, Ints::at_ref(out, cell))
+                        have_best <- blocked != 0
+            if not settled:
+                for cell in 0..<cells |shaper, out|:
+                    Ints::put(out, cell, Ints::at_ref(&shaper.best, cell))
+
+    # Cell to printed number, for the cells an entry starts at. 0 elsewhere.
+    def number(size: i64, blocks: mutable darray[i64]&, out: mutable darray[i64]&):
+        can Abort.Panic:
+            count: mutable i64 = 0
+            for cell in 0..<(size * size) |size, blocks, out, count|:
+                Ints::put(out, cell, 0)
+                continue if Ints::at_ref(blocks, cell) != 0
+                row: i64 = cell / size
+                col: i64 = cell % size
+                starts_across: bool = col == 0 or Ints::at_ref(blocks, cell - 1) != 0
+                starts_down: bool = row == 0 or Ints::at_ref(blocks, cell - size) != 0
+                if starts_across or starts_down:
+                    count <- count + 1
+                    Ints::put(out, cell, count)
+
+    # --- the word list ---------------------------------------------------
+
+    const LEX_SLOTS: i64 = 32768
+    const LEX_MASK: i64 = 32767
+    const MOST_LEX_WORDS: i64 = 8192
+    const MOST_LEX_LETTERS: i64 = 65536
+
+    # Words with ranks and clues, in the reference's own rank order -- a STABLE
+    # sort, so words of equal rank keep the order they were handed over in, and
+    # that order is what `fitting` walks and what a fill therefore tries first.
+    struct Lexicon:
+        count: mutable i64
+        start: mutable darray[i64]
+        length: mutable darray[i64]
+        letter: mutable darray[i64]
+        rank: mutable darray[i64]
+        clue: mutable darray[i64]
+        word_head: mutable darray[i64]
+        word_next: mutable darray[i64]
+        # by_length, in entry order.
+        length_first: mutable darray[i64]
+        length_count: mutable darray[i64]
+        length_word: mutable darray[i64]
+        # Prefixes, kept PER LENGTH -- pooled across lengths they would let a
+        # dead column live to the bottom of the grid.
+        prefix_head: mutable darray[i64]
+        prefix_next: mutable darray[i64]
+        prefix_word: mutable darray[i64]
+        prefix_cut: mutable darray[i64]
+        prefixes: mutable i64
+
+    def new_lexicon() -> Lexicon:
+        can Memory.Allocate, Abort.Panic:
+            return Lexicon{count: 0, start: Ints::zeros(MOST_LEX_WORDS),
+                           length: Ints::zeros(MOST_LEX_WORDS),
+                           letter: Ints::zeros(MOST_LEX_LETTERS),
+                           rank: Ints::zeros(MOST_LEX_WORDS), clue: Ints::zeros(MOST_LEX_WORDS),
+                           word_head: Ints::zeros(LEX_SLOTS), word_next: Ints::zeros(MOST_LEX_WORDS),
+                           length_first: Ints::zeros(MAX_ENTRY + 2),
+                           length_count: Ints::zeros(MAX_ENTRY + 2),
+                           length_word: Ints::zeros(MOST_LEX_WORDS),
+                           prefix_head: Ints::zeros(LEX_SLOTS),
+                           prefix_next: Ints::zeros(MOST_LEX_LETTERS),
+                           prefix_word: Ints::zeros(MOST_LEX_LETTERS),
+                           prefix_cut: Ints::zeros(MOST_LEX_LETTERS), prefixes: 0}
+
+    def word_hash(letters: mutable darray[i64]&, start: i64, length: i64, salt: i64) -> i64:
+        can Abort.Panic:
+            mixed: mutable u64 = 14695981039346656037.u64()
+            for at in 0..<length |letters, start, mixed|:
+                mixed <- (mixed ^ (Ints::at_ref(letters, start + at) + 1).u64()) * 1099511628211.u64()
+            mixed <- (mixed ^ (length + 97).u64()) * 1099511628211.u64()
+            mixed <- (mixed ^ (salt + 13).u64()) * 1099511628211.u64()
+            return (mixed >> 9.u64()).i64() & LEX_MASK
+
+    def word_equal(left: mutable darray[i64]&, left_start: i64, right: mutable darray[i64]&, right_start: i64, length: i64) -> bool:
+        can Abort.Panic:
+            for at in 0..<length |left, right, left_start, right_start|:
+                false return if Ints::at_ref(left, left_start + at) != Ints::at_ref(right, right_start + at)
+            return true
+
+    def index_lexicon(lex: mutable Lexicon&):
+        can Abort.Panic:
+            for slot in 0..<LEX_SLOTS |lex|:
+                Ints::put(&lex.word_head, slot, 0)
+                Ints::put(&lex.prefix_head, slot, 0)
+            lex.prefixes <- 0
+            written: mutable i64 = 0
+            for length in 0..<(MAX_ENTRY + 2) |lex, written|:
+                Ints::put(&lex.length_first, length, written)
+                count: mutable i64 = 0
+                for word in 0..<lex.count |lex, length, written, count|:
+                    if Ints::at_ref(&lex.length, word) == length:
+                        Ints::put(&lex.length_word, written + count, word)
+                        count <- count + 1
+                Ints::put(&lex.length_count, length, count)
+                written <- written + count
+            for word in 0..<lex.count |lex|:
+                start: i64 = Ints::at_ref(&lex.start, word)
+                length: i64 = Ints::at_ref(&lex.length, word)
+                slot: i64 = word_hash(&lex.letter, start, length, 0)
+                Ints::put(&lex.word_next, word, Ints::at_ref(&lex.word_head, slot))
+                Ints::put(&lex.word_head, slot, word + 1)
+                # Keyed by the WORD's length as well as the prefix, which is
+                # what `prefixes(length)` means.
+                for cut in 1..<length |lex, start, length, word|:
+                    where: i64 = word_hash(&lex.letter, start, cut, length)
+                    Ints::put(&lex.prefix_word, lex.prefixes, word)
+                    Ints::put(&lex.prefix_cut, lex.prefixes, cut)
+                    Ints::put(&lex.prefix_next, lex.prefixes, Ints::at_ref(&lex.prefix_head, where))
+                    Ints::put(&lex.prefix_head, where, lex.prefixes + 1)
+                    lex.prefixes <- lex.prefixes + 1
+
+    def valid(lex: mutable Lexicon&, letters: mutable darray[i64]&, start: i64, length: i64) -> bool:
+        can Abort.Panic:
+            false return if length == 0
+            probe: mutable i64 = Ints::at_ref(&lex.word_head, word_hash(letters, start, length, 0)) - 1
+            while probe >= 0 |lex, letters, start, length, probe|:
+                if Ints::at_ref(&lex.length, probe) == length and word_equal(&lex.letter, Ints::at_ref(&lex.start, probe), letters, start, length):
+                    return true
+                probe <- Ints::at_ref(&lex.word_next, probe) - 1
+            return false
+
+    # The word entry for a spelling, or -1. The reference's `at` map keeps the
+    # LAST entry of a repeated spelling, which is the first one chained here.
+    def word_of(lex: mutable Lexicon&, letters: mutable darray[i64]&, start: i64, length: i64) -> i64:
+        can Abort.Panic:
+            -1 return if length == 0
+            probe: mutable i64 = Ints::at_ref(&lex.word_head, word_hash(letters, start, length, 0)) - 1
+            while probe >= 0 |lex, letters, start, length, probe|:
+                if Ints::at_ref(&lex.length, probe) == length and word_equal(&lex.letter, Ints::at_ref(&lex.start, probe), letters, start, length):
+                    return probe
+                probe <- Ints::at_ref(&lex.word_next, probe) - 1
+            return -1
+
+    def is_prefix(lex: mutable Lexicon&, letters: mutable darray[i64]&, start: i64, cut: i64, whole: i64) -> bool:
+        can Abort.Panic:
+            false return if cut == 0
+            probe: mutable i64 = Ints::at_ref(&lex.prefix_head, word_hash(letters, start, cut, whole)) - 1
+            while probe >= 0 |lex, letters, start, cut, whole, probe|:
+                word: i64 = Ints::at_ref(&lex.prefix_word, probe)
+                if Ints::at_ref(&lex.prefix_cut, probe) == cut and Ints::at_ref(&lex.length, word) == whole:
+                    return true if word_equal(&lex.letter, Ints::at_ref(&lex.start, word), letters, start, cut)
+                probe <- Ints::at_ref(&lex.prefix_next, probe) - 1
+            return false
+
+    # --- the fill ---------------------------------------------------------
+
+    struct Filler:
+        grid: mutable darray[i64]
+        pattern: mutable darray[i64]
+        options: mutable darray[i64]
+        down_of: mutable darray[i64]
+        column: mutable darray[i64]
+        across: mutable Runs
+        down: mutable Runs
+        left: mutable i64
+        spent: mutable i64
+
+    def new_filler() -> Filler:
+        can Memory.Allocate, Abort.Panic:
+            return Filler{grid: Ints::zeros(MOST_CELLS), pattern: Ints::zeros(MOST_CELLS * MOST_RUNS),
+                          options: Ints::zeros(MOST_LEX_WORDS * 4), down_of: Ints::zeros(MOST_CELLS),
+                          column: Ints::zeros(MOST_CELLS), across: new_runs(), down: new_runs(),
+                          left: 0, spent: 0}
+
+    # Candidate words left to try, shared by every branch of the fill.
+    def take_one(filler: mutable Filler&) -> bool:
+        can Abort.Panic:
+            filler.spent <- filler.spent + 1
+            filler.left <- filler.left - 1
+            return filler.left > 0
+
+    # Whether every down run the row just touched can still become a word.
+    def columns_alive(filler: mutable Filler&, lex: mutable Lexicon&, at: i64, span: i64) -> bool:
+        can Abort.Panic:
+            seen_runs: mutable i64 = 0
+            for slot in 0..<span |filler, lex, at, seen_runs|:
+                cell: i64 = Ints::at_ref(&filler.across.cell, at + slot)
+                run: i64 = Ints::at_ref(&filler.down_of, cell)
+                twin: mutable bool = false
+                for earlier in 0..<slot |filler, at, run, twin|:
+                    twin <- true if Ints::at_ref(&filler.down_of, Ints::at_ref(&filler.across.cell, at + earlier)) == run
+                continue if twin
+                seen_runs <- seen_runs + 1
+                run_at: i64 = Ints::at_ref(&filler.down.at, run)
+                run_n: i64 = Ints::at_ref(&filler.down.n, run)
+                so_far: mutable i64 = 0
+                for step in 0..<run_n |filler, run_at, so_far|:
+                    letter: i64 = Ints::at_ref(&filler.grid, Ints::at_ref(&filler.down.cell, run_at + step))
+                    break if letter == OPEN
+                    Ints::put(&filler.column, so_far, letter)
+                    so_far <- so_far + 1
+                continue if so_far == 0
+                if so_far == run_n:
+                    false return if not valid(lex, &filler.column, 0, so_far)
+                else:
+                    false return if not is_prefix(lex, &filler.column, 0, so_far, run_n)
+            return true
+
+    # Lay one across entry and recurse. Across entries are filled in READING
+    # ORDER, which is what lets a down entry be tested from its own top.
+    def place_across(filler: mutable Filler&, lex: mutable Lexicon&, index: i64, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            true return if index >= filler.across.count
+            run_at: i64 = Ints::at_ref(&filler.across.at, index)
+            run_n: i64 = Ints::at_ref(&filler.across.n, index)
+            base: i64 = index * MOST_CELLS
+            for slot in 0..<run_n |filler, run_at, base|:
+                Ints::put(&filler.pattern, base + slot, Ints::at_ref(&filler.grid, Ints::at_ref(&filler.across.cell, run_at + slot)))
+            # `fitting(pattern)`: the pool's own order, filtered.
+            found: mutable darray[i64] = Ints::zeros(MOST_LEX_WORDS)
+            fits: mutable i64 = 0
+            first: i64 = Ints::at_ref(&lex.length_first, run_n) if run_n <= MAX_ENTRY + 1 else 0
+            pool: i64 = Ints::at_ref(&lex.length_count, run_n) if run_n <= MAX_ENTRY + 1 else 0
+            for slot in 0..<pool |filler, lex, found, fits, first, base, run_n|:
+                word: i64 = Ints::at_ref(&lex.length_word, first + slot)
+                start: i64 = Ints::at_ref(&lex.start, word)
+                matches: mutable bool = true
+                for at in 0..<run_n |filler, lex, base, start, matches|:
+                    want: i64 = Ints::at_ref(&filler.pattern, base + at)
+                    continue if want == OPEN
+                    matches <- false if Ints::at_ref(&lex.letter, start + at) != want
+                if matches:
+                    Ints::put(&found, fits, word)
+                    fits <- fits + 1
+            py_shuffle_i64_prefix(rng, &found, fits)
+            for slot in 0..<fits |filler, lex, found, index, run_at, run_n, base, rng|:
+                false return if not take_one(filler)
+                word: i64 = Ints::at_ref(&found, slot)
+                start: i64 = Ints::at_ref(&lex.start, word)
+                for at in 0..<run_n |filler, lex, run_at, start|:
+                    Ints::put(&filler.grid, Ints::at_ref(&filler.across.cell, run_at + at), Ints::at_ref(&lex.letter, start + at))
+                if columns_alive(filler, lex, run_at, run_n):
+                    true return if place_across(filler, lex, index + 1, rng)
+                for at in 0..<run_n |filler, run_at, base|:
+                    Ints::put(&filler.grid, Ints::at_ref(&filler.across.cell, run_at + at), Ints::at_ref(&filler.pattern, base + at))
+            return false
+
+    # Letters for every unblocked cell, or false when none was found.
+    def fill(filler: mutable Filler&, lex: mutable Lexicon&, size: i64, blocks: mutable darray[i64]&, tries: i64, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            filler.left <- tries
+            filler.spent <- 0
+            find_runs(size, blocks, false, &filler.across)
+            find_runs(size, blocks, true, &filler.down)
+            for run in 0..<filler.down.count |filler|:
+                at: i64 = Ints::at_ref(&filler.down.at, run)
+                span: i64 = Ints::at_ref(&filler.down.n, run)
+                for slot in 0..<span |filler, run, at|:
+                    Ints::put(&filler.down_of, Ints::at_ref(&filler.down.cell, at + slot), run)
+            for cell in 0..<(size * size) |filler, blocks|:
+                Ints::put(&filler.grid, cell, BLANK if Ints::at_ref(blocks, cell) != 0 else OPEN)
+            return place_across(filler, lex, 0, rng)
+
+    # --- dealing ----------------------------------------------------------
+
+    # A dealt crossword: the shape, the answer, and what is on show.
+    struct Puzzle:
+        #: False where the reference returns `None`: the budget ran out and no
+        #: grid was dealt. Every other field is then blank rather than left
+        #: over from the last deal, because the caller reuses this object.
+        dealt: mutable bool
+        size: mutable i64
+        blocks: mutable darray[i64]
+        solution: mutable darray[i64]
+        givens: mutable darray[i64]
+        slots: mutable i64
+        slot_number: mutable darray[i64]
+        slot_down: mutable darray[i64]
+        slot_at: mutable darray[i64]
+        slot_n: mutable darray[i64]
+        slot_cell: mutable darray[i64]
+        slot_clue: mutable darray[i64]
+        slot_cells: mutable i64
+        # What it cost to find this grid, in candidate words tried. Junior to
+        # everything else and reported because a rung that is expensive to deal
+        # is worth knowing about before the screen freezes.
+        tried: mutable i64
+
+    def new_puzzle() -> Puzzle:
+        can Memory.Allocate, Abort.Panic:
+            return Puzzle{dealt: false, size: 0, blocks: Ints::zeros(MOST_CELLS),
+                          solution: Ints::zeros(MOST_CELLS), givens: Ints::zeros(MOST_CELLS),
+                          slots: 0, slot_number: Ints::zeros(MOST_SLOTS),
+                          slot_down: Ints::zeros(MOST_SLOTS), slot_at: Ints::zeros(MOST_SLOTS),
+                          slot_n: Ints::zeros(MOST_SLOTS), slot_cell: Ints::zeros(MOST_CELLS * 2),
+                          slot_clue: Ints::zeros(MOST_SLOTS), slot_cells: 0, tried: 0}
+
+    def blanks(out: mutable Puzzle&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for cell in 0..<(out.size * out.size) |out, total|:
+                continue if Ints::at_ref(&out.solution, cell) == BLANK
+                total <- total + 1 if Ints::at_ref(&out.givens, cell) == 0
+            return total
+
+    def unclued(out: mutable Puzzle&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for slot in 0..<out.slots |out, total|:
+                total <- total + 1 if Ints::at_ref(&out.slot_clue, slot) < 0
+            return total
+
+    # Number the grid, attach clues, and give some of it away.
+    def dress(out: mutable Puzzle&, grade: Grade&, filler: mutable Filler&, lex: mutable Lexicon&, shaper: mutable Shaper&, numbers: mutable darray[i64]&, word: mutable darray[i64]&, tried: i64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = grade.size
+            out.size <- size
+            out.tried <- tried
+            number(size, &out.blocks, numbers)
+            out.slots <- 0
+            out.slot_cells <- 0
+            for pass_at in 0..<2 |out, size, filler, lex, shaper, numbers, word|:
+                down: bool = pass_at == 1
+                find_runs(size, &out.blocks, down, &shaper.runs)
+                for run in 0..<shaper.runs.count |out, size, lex, shaper, numbers, word, down|:
+                    at: i64 = Ints::at_ref(&shaper.runs.at, run)
+                    length: i64 = Ints::at_ref(&shaper.runs.n, run)
+                    for slot in 0..<length |out, shaper, word, at|:
+                        Ints::put(word, slot, Ints::at_ref(&out.solution, Ints::at_ref(&shaper.runs.cell, at + slot)))
+                    entry: i64 = word_of(lex, word, 0, length)
+                    Ints::put(&out.slot_number, out.slots, Ints::at_ref(numbers, Ints::at_ref(&shaper.runs.cell, at)))
+                    Ints::put(&out.slot_down, out.slots, 1 if down else 0)
+                    Ints::put(&out.slot_at, out.slots, out.slot_cells)
+                    Ints::put(&out.slot_n, out.slots, length)
+                    Ints::put(&out.slot_clue, out.slots, -1 if entry < 0 else Ints::at_ref(&lex.clue, entry))
+                    for slot in 0..<length |out, shaper, at|:
+                        Ints::put(&out.slot_cell, out.slot_cells + slot, Ints::at_ref(&shaper.runs.cell, at + slot))
+                    out.slot_cells <- out.slot_cells + length
+                    out.slots <- out.slots + 1
+            # Stable insertion sort by (number, down), which is what Python's
+            # `sort(key=...)` is.
+            for index in 1..<out.slots |out|:
+                number_key: i64 = Ints::at_ref(&out.slot_number, index)
+                down_key: i64 = Ints::at_ref(&out.slot_down, index)
+                at_key: i64 = Ints::at_ref(&out.slot_at, index)
+                n_key: i64 = Ints::at_ref(&out.slot_n, index)
+                clue_key: i64 = Ints::at_ref(&out.slot_clue, index)
+                at: mutable i64 = index - 1
+                placing: mutable bool = true
+                while placing and at >= 0 |out, at, placing, number_key, down_key|:
+                    held_number: i64 = Ints::at_ref(&out.slot_number, at)
+                    held_down: i64 = Ints::at_ref(&out.slot_down, at)
+                    after: bool = held_number > number_key or (held_number == number_key and held_down > down_key)
+                    if after:
+                        Ints::put(&out.slot_number, at + 1, held_number)
+                        Ints::put(&out.slot_down, at + 1, held_down)
+                        Ints::put(&out.slot_at, at + 1, Ints::at_ref(&out.slot_at, at))
+                        Ints::put(&out.slot_n, at + 1, Ints::at_ref(&out.slot_n, at))
+                        Ints::put(&out.slot_clue, at + 1, Ints::at_ref(&out.slot_clue, at))
+                        at <- at - 1
+                    else:
+                        placing <- false
+                Ints::put(&out.slot_number, at + 1, number_key)
+                Ints::put(&out.slot_down, at + 1, down_key)
+                Ints::put(&out.slot_at, at + 1, at_key)
+                Ints::put(&out.slot_n, at + 1, n_key)
+                Ints::put(&out.slot_clue, at + 1, clue_key)
+            hush: i64 = py_round_half_even(out.slots.f64() * grade.withheld)
+            if hush != 0:
+                quiet: darray[i64] = py_sample_range(rng, 0, out.slots - 1, hush)
+                for slot in 0..<hush |out, quiet|:
+                    Ints::put(&out.slot_clue, Ints::at(quiet, slot), -1)
+            open_n: mutable i64 = 0
+            open_cells: mutable darray[i64] = Ints::zeros(MOST_CELLS)
+            for cell in 0..<(size * size) |out, open_cells, open_n|:
+                Ints::put(&out.givens, cell, 0)
+                if Ints::at_ref(&out.blocks, cell) == 0:
+                    Ints::put(&open_cells, open_n, cell)
+                    open_n <- open_n + 1
+            handed: i64 = py_round_half_even(open_n.f64() * grade.given)
+            if handed != 0:
+                chosen: darray[i64] = py_sample_range(rng, 0, open_n - 1, handed)
+                for slot in 0..<handed |out, open_cells, chosen|:
+                    Ints::put(&out.givens, Ints::at_ref(&open_cells, Ints::at(chosen, slot)), 1)
+            out.dealt <- true
+
+    # One puzzle at a grade, or nothing if the budget ran out.
+    def deal_one(out: mutable Puzzle&, grade: Grade&, filler: mutable Filler&, lex: mutable Lexicon&, shaper: mutable Shaper&, numbers: mutable darray[i64]&, word: mutable darray[i64]&, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            out.dealt <- false
+            out.size <- 0
+            out.tried <- 0
+            out.slots <- 0
+            size: i64 = grade.size
+            widest: i64 = MAX_ENTRY if MAX_ENTRY < size else size
+            ceiling: i64 = grade.longest_entry if grade.longest_entry < widest else widest
+            tried: mutable i64 = 0
+            settled: mutable bool = false
+            for _restart in 0..<RESTARTS |out, grade, filler, lex, shaper, numbers, word, size, ceiling, tried, settled, rng|:
+                break if settled
+                slice: i64 = grade.tries / RESTARTS
+                budget: i64 = 1 if slice < 1 else slice
+                a_shape(size, ceiling, shaper, &out.blocks, rng, 40)
+                continue if not well_formed(size, &out.blocks, &shaper.runs)
+                # The grid would not come down to the entry length this rung
+                # asked for. A legal crossword, but a harder one than the rung
+                # promised and one the narrowed pool may hold no words long
+                # enough for, so it is dropped rather than filled. Free:
+                # nothing was spent on it.
+                continue if longest(size, &out.blocks, &shaper.runs) > ceiling
+                got: bool = fill(filler, lex, size, &out.blocks, budget, rng)
+                tried <- tried + filler.spent
+                continue if not got
+                for cell in 0..<(size * size) |out, filler|:
+                    Ints::put(&out.solution, cell, Ints::at_ref(&filler.grid, cell))
+                dress(out, grade, filler, lex, shaper, numbers, word, tried + filler.spent, rng)
+                settled <- true

@@ -1,0 +1,254 @@
+# Differential sweep driver for tasks/crossword.elisa. See crossword_diff.py
+# for the reference side.
+#
+# The word list is a downloaded corpus with clues attached, so both sides build
+# the same one from a fixed recipe. The grids are small, because what is under
+# test is the arithmetic and not the size: a four by four and a five by five
+# reach every branch of the shaper, and the five by five is the one the module
+# says was coming out as a word square before `split_points` learned about the
+# ends of a run.
+#
+# The shaper is where the RNG lives -- `shuffle(cuts)` per growth step, and
+# `a_shape` reshaping until the grid really does come down to the entry length
+# the rung asked for -- and the fill spends a shuffled candidate list per row
+# out of a budget shared by every branch. So the sweep emits the block pattern,
+# the filled grid, the numbering, every slot, and what the deal cost.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/crossword.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+# The lexicon both sides build: every word of length 3, 4 and 5 over a
+# four-letter alphabet, which is 64 + 256 + 1024 words. Small enough to run and
+# dense enough that a grid can actually be filled.
+def build_lexicon(lex: mutable Crossword::Lexicon&):
+    can Abort.Panic:
+        alphabet: mutable darray[i64] = Ints::zeros(4)
+        Ints::put(&alphabet, 0, 0)     # a
+        Ints::put(&alphabet, 1, 4)     # e
+        Ints::put(&alphabet, 2, 13)    # n
+        Ints::put(&alphabet, 3, 19)    # t
+        at: mutable i64 = 0
+        count: mutable i64 = 0
+        for length in 3..<6 |lex, alphabet, at, count|:
+            span: mutable i64 = 1
+            for _k in 0..<length |span|:
+                span <- span * 4
+            for index in 0..<span |lex, alphabet, at, count, length|:
+                # Ranked from one, as the real corpus is: `Lexicon.narrowed`
+                # takes `lo = 1` and drops anything below it, so a pool ranked
+                # from zero loses its first word the moment a deal narrows.
+                rank: i64 = count + 1
+                Ints::put(&lex.start, count, at)
+                Ints::put(&lex.length, count, length)
+                Ints::put(&lex.rank, count, rank)
+                # Every third word has no clue in the pool at all, which is a
+                # different thing from a rung withholding one.
+                Ints::put(&lex.clue, count, -1 if (rank % 3) == 0 else rank)
+                left: mutable i64 = index
+                for k in 0..<length |lex, alphabet, at, left|:
+                    Ints::put(&lex.letter, at + length - 1 - k, Ints::at_ref(&alphabet, left % 4))
+                    left <- left / 4
+                at <- at + length
+                count <- count + 1
+        lex.count <- count
+        Crossword::index_lexicon(lex)
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(256 * 1024 * 1024)
+        in w:
+            # --- the ladder -----------------------------------------------
+            for rung in -1..<13:
+                g: Crossword::Grade = Crossword::grade_of(rung)
+                printr("grade")
+                emit_cell(rung)
+                emit_cell(g.size)
+                emit_cell(g.longest_entry)
+                emit_cell(g.top_rank)
+                emit_cell((g.given * 1000000.0).i64())
+                emit_cell((g.withheld * 1000000.0).i64())
+                emit_cell(g.tries)
+                print("")
+
+            # --- where a block may go -------------------------------------
+            cuts: mutable darray[i64] = Ints::zeros(Crossword::MOST_CELLS)
+            for length in 0..<16 |cuts|:
+                printr("splits")
+                emit_cell(length)
+                found: i64 = Crossword::split_points(length, &cuts)
+                emit_cell(found)
+                for at in 0..<found |cuts|:
+                    emit_cell(Ints::at_ref(&cuts, at))
+                print("")
+
+            shaper: mutable Crossword::Shaper = Crossword::new_shaper()
+            blocks: mutable darray[i64] = Ints::zeros(Crossword::MOST_CELLS)
+            numbers: mutable darray[i64] = Ints::zeros(Crossword::MOST_CELLS)
+            word: mutable darray[i64] = Ints::zeros(Crossword::MOST_CELLS)
+            lex: mutable Crossword::Lexicon = Crossword::new_lexicon()
+            filler: mutable Crossword::Filler = Crossword::new_filler()
+            puzzle: mutable Crossword::Puzzle = Crossword::new_puzzle()
+            build_lexicon(&lex)
+
+            # --- the shaper -----------------------------------------------
+            for size in 4..<8 |shaper, blocks|:
+                for entry in 3..<7 |shaper, blocks, size|:
+                    for seed in 1..<5 |shaper, blocks, size, entry|:
+                        rng: mutable MT19937 = mt19937_new()
+                        mt_seed_int(&rng, (size * 1000 + entry * 100 + seed).u64())
+                        Crossword::shape(size, entry, &shaper, &blocks, &rng, 600)
+                        printr("shape")
+                        emit_cell(size)
+                        emit_cell(entry)
+                        emit_cell(seed)
+                        emit_cell(Crossword::longest(size, &blocks, &shaper.runs))
+                        emit_cell(1 if Crossword::well_formed(size, &blocks, &shaper.runs) else 0)
+                        emit_cell(1 if Crossword::connected(size, &blocks, &shaper.seen, &shaper.frontier) else 0)
+                        for cell in 0..<(size * size) |blocks|:
+                            emit_cell(Ints::at_ref(&blocks, cell))
+                        print("")
+                        Crossword::a_shape(size, entry, &shaper, &blocks, &rng, 40)
+                        printr("ashape")
+                        emit_cell(size)
+                        emit_cell(entry)
+                        emit_cell(seed)
+                        emit_cell(Crossword::longest(size, &blocks, &shaper.runs))
+                        for cell in 0..<(size * size) |blocks|:
+                            emit_cell(Ints::at_ref(&blocks, cell))
+                        Crossword::number(size, &blocks, &numbers)
+                        for cell in 0..<(size * size) |numbers|:
+                            emit_cell(Ints::at_ref(&numbers, cell))
+                        # A probe draw: the same pattern reached after a
+                        # different number of draws is a different generator,
+                        # and everything downstream of it moves.
+                        emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                        print("")
+
+            # --- the fill, on a grid the shaper did not choose ------------
+            #
+            # Isolated from the shaper on purpose: a fill and a reshape both
+            # spend from the same generator, and a suite that only checked
+            # whole deals could not say which of the two had moved.
+            for pattern in 0..<24 |shaper, lex, filler, numbers|:
+                size: i64 = 5 + pattern % 2
+                for cell in 0..<(size * size) |numbers, size, pattern|:
+                    row: i64 = cell / size
+                    col: i64 = cell % size
+                    blocked: bool = ((row * 7 + col * 5 + pattern * 3) % 11) == 0
+                    Ints::put(&numbers, cell, 1 if blocked else 0)
+                ok_shape: bool = Crossword::well_formed(size, &numbers, &shaper.runs) and Crossword::connected(size, &numbers, &shaper.seen, &shaper.frontier)
+                rng: mutable MT19937 = mt19937_new()
+                mt_seed_int(&rng, (5000 + pattern).u64())
+                got: mutable bool = false
+                if ok_shape:
+                    got <- Crossword::fill(&filler, &lex, size, &numbers, 900, &rng)
+                printr("fill")
+                emit_cell(pattern)
+                emit_cell(size)
+                emit_cell(1 if ok_shape else 0)
+                emit_cell(1 if got else 0)
+                emit_cell(filler.spent if ok_shape else 0)
+                emit_cell(py_randbelow(&rng, 1000000.u64()).i64())
+                for cell in 0..<(size * size) |numbers|:
+                    emit_cell(Ints::at_ref(&numbers, cell))
+                if got:
+                    for cell in 0..<(size * size) |filler|:
+                        emit_cell(Ints::at_ref(&filler.grid, cell))
+                print("")
+
+            # --- whole deals ----------------------------------------------
+            # Rungs one to four: three that this pool can actually fill and
+            # one -- nine by nine, entries up to six -- that it cannot, because
+            # the pool stops at five letters. The rung that deals nothing is
+            # the one that walks all twelve restarts and spends the whole
+            # budget proving it, which is the path the shorter rungs never take.
+            # Two regimes. The first twenty-four have a budget that buys a
+            # grid on the first restart -- rungs one to three deal, and rung
+            # four cannot, because it wants entries of six and the pool stops
+            # at five, so it walks all twelve restarts and comes back empty.
+            #
+            # The last twelve are budget-starved on purpose, alternating a
+            # seven by seven that eventually deals with a six by six that
+            # never does. The seven is the only spec that spends a restart's
+            # whole budget failing and then deals out of a later grid, which
+            # is the one path on which `tried` accumulates across restarts.
+            for spec in 0..<36 |shaper, lex, filler, puzzle, numbers, word|:
+                tight: bool = spec >= 24
+                step: i64 = spec - 24 if tight else spec
+                rng: mutable MT19937 = mt19937_new()
+                mt_seed_int(&rng, ((7000 + step) if tight else (3000 + step)).u64())
+                rungs_at: mutable i64 = 1 + step % 4
+                if tight:
+                    rungs_at <- 3 if step % 2 == 0 else 2
+                rung: Crossword::Grade = Crossword::grade_of(rungs_at)
+                spare: i64 = 96 if step % 2 == 0 else 60
+                # The rungs' own sizes but a budget this suite can afford; the
+                # budget is a dial, and what is under test is what it buys.
+                grade: Crossword::Grade = Crossword::Grade{size: rung.size,
+                        longest_entry: rung.longest_entry, top_rank: rung.top_rank,
+                        given: rung.given, withheld: rung.withheld,
+                        tries: spare if tight else 2400}
+                Crossword::deal_one(&puzzle, &grade, &filler, &lex, &shaper, &numbers, &word, &rng)
+                probe: i64 = py_randbelow(&rng, 1000000.u64()).i64()
+                printr("deal")
+                emit_cell(spec)
+                emit_cell(probe)
+                emit_cell(1 if puzzle.dealt else 0)
+                emit_cell(puzzle.size)
+                emit_cell(puzzle.tried)
+                if puzzle.dealt:
+                    emit_cell(Crossword::blanks(&puzzle))
+                    emit_cell(Crossword::unclued(&puzzle))
+                    for cell in 0..<(puzzle.size * puzzle.size) |puzzle|:
+                        emit_cell(Ints::at_ref(&puzzle.blocks, cell))
+                        emit_cell(Ints::at_ref(&puzzle.solution, cell))
+                        emit_cell(Ints::at_ref(&puzzle.givens, cell))
+                    emit_cell(puzzle.slots)
+                    for slot in 0..<puzzle.slots |puzzle|:
+                        emit_cell(Ints::at_ref(&puzzle.slot_number, slot))
+                        emit_cell(Ints::at_ref(&puzzle.slot_down, slot))
+                        emit_cell(Ints::at_ref(&puzzle.slot_n, slot))
+                        emit_cell(Ints::at_ref(&puzzle.slot_clue, slot))
+                        at: i64 = Ints::at_ref(&puzzle.slot_at, slot)
+                        span: i64 = Ints::at_ref(&puzzle.slot_n, slot)
+                        for step in 0..<span |puzzle, at|:
+                            emit_cell(Ints::at_ref(&puzzle.slot_cell, at + step))
+                print("")
+        destroy w
+        return 0
