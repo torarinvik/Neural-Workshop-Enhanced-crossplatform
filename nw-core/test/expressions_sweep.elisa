@@ -1,0 +1,269 @@
+# Differential sweep driver for tasks/expressions.elisa. See
+# expressions_diff.py for the reference side.
+#
+# The corpus is read from a file the harness writes, so both sides read the
+# same strings and there is one place they are written down. Terms come out in
+# RENDER order and again in `str(mono)` order rather than in the order the
+# polynomial happens to hold them: the reference says term order is not part of
+# the value, and emitting the internal order would be testing a coincidence.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_fileio.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/nback.elisa"
+include "../src/decimal.elisa"
+include "../src/bigfrac.elisa"
+include "../src/tasks/expressions.elisa"
+
+const CORPUS_PATH: cstr = "/tmp/nw_expressions_corpus.txt"
+const MOST_LINES: i64 = 128
+const MOST_LINE: i64 = 512
+
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+def print_bytes(text: mutable darray[u8]&, first: i64, count: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[544] = zeroed
+            for index in 0..<count |buf, text, first|:
+                buf[index.usize()] <- Bytes::at_ref(text, first + index)
+            buf[count.usize()] <- 0.u8()
+            printr((&buf[0]).cast[cstr])
+
+def emit_text(text: mutable darray[u8]&, count: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_bytes(text, 0, count)
+
+def emit_dash():
+    can Console.Write, Abort.Panic:
+        printr(",-")
+
+def emit_frac(value: Q::Frac&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        text: mutable darray[u8] = Bytes::zeros(352)
+        count: i64 = Q::to_text(value, &text)
+        emit_text(&text, count)
+
+# One expression a line, which is what the harness writes.
+struct Corpus:
+    count: mutable i64
+    start: mutable darray[i64]
+    span: mutable darray[i64]
+    body: mutable darray[u8]
+    length: mutable i64
+
+def load_corpus(out: mutable Corpus&, body: darray[u8]&) -> bool:
+    can Abort.Panic:
+        out.count <- 0
+        out.length <- body.count.i64()
+        false return if out.length > MOST_LINES * MOST_LINE
+        for index in 0..<out.length |out, body|:
+            Bytes::put(&out.body, index, get body[index.usize()] else 0.u8())
+        first: mutable i64 = 0
+        for index in 0..<out.length |out, first|:
+            continue if Bytes::at_ref(&out.body, index).i64() != 10
+            false return if out.count >= MOST_LINES
+            Ints::put(&out.start, out.count, first)
+            Ints::put(&out.span, out.count, index - first)
+            out.count <- out.count + 1
+            first <- index + 1
+        return true
+
+def take_line(corpus: mutable Corpus&, spec: i64, out: mutable darray[u8]&) -> i64:
+    can Abort.Panic:
+        first: i64 = Ints::at_ref(&corpus.start, spec)
+        span: i64 = Ints::at_ref(&corpus.span, spec)
+        for index in 0..<span |out, corpus, first|:
+            Bytes::put(out, index, Bytes::at_ref(&corpus.body, first + index))
+        return span
+
+# The terms in one order or the other, four powers and a coefficient each.
+def emit_terms(value: Expressions::Poly&, by_repr: bool):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        order: mutable darray[i64] = Ints::zeros(Expressions::MOST_TERMS)
+        if not by_repr:
+            Expressions::sorted_terms(value, &order)
+        else:
+            # `sorted(answer.terms, key=lambda mono: str(mono))`, which is the
+            # repr of the tuple of pairs compared as a string. An odd key, but
+            # it is the key the near-miss search uses.
+            for term in 0..<value.count |order|:
+                Ints::put(&order, term, term)
+            left: mutable darray[u8] = Bytes::zeros(64)
+            right: mutable darray[u8] = Bytes::zeros(64)
+            for index in 1..<value.count |order, value, left, right|:
+                held: i64 = Ints::at_ref(&order, index)
+                at: mutable i64 = index - 1
+                placing: mutable bool = true
+                while placing and at >= 0 |order, value, left, right, at, placing, held|:
+                    one: i64 = Expressions::mono_repr(value, Ints::at_ref(&order, at), &left)
+                    two: i64 = Expressions::mono_repr(value, held, &right)
+                    after: mutable bool = false
+                    decided: mutable bool = false
+                    limit: i64 = one if one < two else two
+                    for step in 0..<limit |left, right, after, decided|:
+                        continue if decided
+                        a: i64 = Bytes::at_ref(&left, step).i64()
+                        b: i64 = Bytes::at_ref(&right, step).i64()
+                        continue if a == b
+                        after <- a > b
+                        decided <- true
+                    after <- one > two if not decided
+                    if after:
+                        Ints::put(&order, at + 1, Ints::at_ref(&order, at))
+                        at <- at - 1
+                    else:
+                        placing <- false
+                Ints::put(&order, at + 1, held)
+        for index in 0..<value.count |value, order|:
+            term: i64 = Ints::at_ref(&order, index)
+            for name in 0..<Expressions::NAME_COUNT |value, term|:
+                emit_cell(Expressions::power_at(value, term, name))
+            emit_frac(&value.coefficient[term.usize()])
+
+def emit_poly(value: Expressions::Poly&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        emit_cell(value.count)
+        text: mutable darray[u8] = Bytes::zeros(544)
+        emit_text(&text, Expressions::render(value, &text))
+        held: mutable Q::Frac = Q::zero()
+        if Expressions::constant_value(&held, value):
+            emit_cell(1)
+            emit_frac(&held)
+        else:
+            emit_cell(0)
+            emit_dash()
+        degree: mutable i64 = 0
+        for term in 0..<value.count |value, degree|:
+            held_degree: i64 = Expressions::total_degree(value, term)
+            degree <- held_degree if held_degree > degree
+        emit_cell(degree)
+        for name in 0..<Expressions::NAME_COUNT |value|:
+            highest: mutable i64 = 0
+            for term in 0..<value.count |value, name, highest|:
+                held_power: i64 = Expressions::power_at(value, term, name)
+                highest <- held_power if held_power > highest
+            emit_cell(highest)
+        emit_terms(value, false)
+        printr(",|")
+        emit_terms(value, true)
+
+def emit_render(value: Expressions::Poly&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        text: mutable darray[u8] = Bytes::zeros(544)
+        emit_text(&text, Expressions::render(value, &text))
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(192 * 1024 * 1024)
+        in w:
+            arena: mutable Arena& = (&w).cast[mutable Arena&]
+            missing: darray[u8] = Bytes::zeros(0)
+            body: darray[u8] = try read_entire_file(arena, CORPUS_PATH) else missing
+            corpus: mutable Corpus = Corpus{count: 0, start: Ints::zeros(MOST_LINES),
+                                            span: Ints::zeros(MOST_LINES),
+                                            body: Bytes::zeros(MOST_LINES * MOST_LINE),
+                                            length: 0}
+            loaded: bool = load_corpus(&corpus, &body)
+            reader: mutable Expressions::Reader = Expressions::new_reader()
+            line: mutable darray[u8] = Bytes::zeros(MOST_LINE)
+            at: mutable Expressions::Assign = Expressions::new_assign()
+            half: mutable Q::Frac = Q::zero()
+            Q::from_pair(&half, 1, 2)
+            Expressions::assign(&at, Expressions::NAME_X, &half)
+            three: Q::Frac = Q::from_i64(-3)
+            Expressions::assign(&at, Expressions::NAME_Y, &three)
+            two: Q::Frac = Q::from_i64(2)
+            Expressions::assign(&at, Expressions::NAME_Z, &two)
+            one: Q::Frac = Q::from_i64(1)
+            Expressions::assign(&at, Expressions::NAME_N, &one)
+
+            parsed: mutable Expressions::Poly = Expressions::zero()
+            for spec in 0..<corpus.count |corpus, reader, line, at, parsed, loaded|:
+                span: i64 = take_line(&corpus, spec, &line)
+                ok: bool = Expressions::parse(&parsed, &line, span, &reader) if loaded else false
+                printr("parse")
+                emit_cell(spec)
+                emit_cell(1 if ok else 0)
+                if ok:
+                    emit_poly(&parsed)
+                    value: mutable Q::Frac = Q::zero()
+                    if Expressions::evaluate(&value, &parsed, &at):
+                        emit_frac(&value)
+                    else:
+                        emit_dash()
+                print("")
+
+            left: mutable Expressions::Poly = Expressions::zero()
+            right: mutable Expressions::Poly = Expressions::zero()
+            made: mutable Expressions::Poly = Expressions::zero()
+            for one_at in 0..<corpus.count |corpus, reader, line, left, right, made, loaded|:
+                for two_at in 0..<corpus.count |corpus, reader, line, left, right, made, loaded, one_at|:
+                    continue if (one_at * 7 + two_at * 3) % 11 != 0
+                    span_one: i64 = take_line(&corpus, one_at, &line)
+                    ok_one: bool = Expressions::parse(&left, &line, span_one, &reader) if loaded else false
+                    span_two: i64 = take_line(&corpus, two_at, &line)
+                    ok_two: bool = Expressions::parse(&right, &line, span_two, &reader) if loaded else false
+                    printr("arith")
+                    emit_cell(one_at)
+                    emit_cell(two_at)
+                    emit_cell(1 if ok_one else 0)
+                    emit_cell(1 if ok_two else 0)
+                    if not ok_one or not ok_two:
+                        print("")
+                        continue
+                    emit_cell(1 if Expressions::equal(&left, &right) else 0)
+                    if Expressions::add(&made, &left, &right):
+                        emit_render(&made)
+                    else:
+                        emit_dash()
+                    if Expressions::sub(&made, &left, &right):
+                        emit_render(&made)
+                    else:
+                        emit_dash()
+                    if Expressions::mul(&made, &left, &right):
+                        emit_render(&made)
+                    else:
+                        emit_dash()
+                    if Expressions::div(&made, &left, &right):
+                        emit_render(&made)
+                    else:
+                        emit_dash()
+                    for exponent in 0..<4 |left, made|:
+                        if Expressions::power(&made, &left, exponent):
+                            emit_render(&made)
+                        else:
+                            emit_dash()
+                    print("")
+        destroy w
+        return 0
