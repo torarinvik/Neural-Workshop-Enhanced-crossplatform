@@ -33,14 +33,14 @@ SOURCE = open(SWEEP).read()
 def returns(name):
     body = SOURCE.split("def %s(which: i64) -> cstr:" % name)[1]
     body = body.split("\n\n")[0]
-    return [one.encode().decode("unicode_escape")
+    return [scenediff.unescape(one)
             for one in re.findall(r'return "((?:[^"\\]|\\.)*)"', body)]
 
 
 BLOCKS = returns("block_of")
 ANSWERS = returns("answer_of")
-HINT = re.search(r'const HINT: cstr = "((?:[^"\\]|\\.)*)"',
-                 SOURCE).group(1).encode().decode("unicode_escape")
+HINT = scenediff.unescape(re.search(r'const HINT: cstr = "((?:[^"\\]|\\.)*)"',
+                                    SOURCE).group(1))
 
 
 class Grade:

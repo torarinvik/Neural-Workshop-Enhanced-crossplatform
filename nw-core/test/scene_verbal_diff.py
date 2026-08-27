@@ -37,7 +37,7 @@ def literals():
     def returns(name):
         body = source.split("def %s(which: i64) -> cstr:" % name)[1]
         body = body.split("\n\n")[0]
-        return [one.encode().decode("unicode_escape")
+        return [scenediff.unescape(one)
                 for one in re.findall(r'return "((?:[^"\\]|\\.)*)"', body)]
 
     return returns("prompt_of"), returns("choice_of"), returns("explanation_of")

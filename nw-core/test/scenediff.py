@@ -67,6 +67,31 @@ def reexec():
         raise SystemExit(2)
 
 
+def unescape(literal):
+    """An Elisa string literal's own text, from the sweep's source.
+
+    NOT `bytes.decode("unicode_escape")`, which is the obvious thing and is
+    wrong: it decodes the source's UTF-8 as latin-1, so `4x4`'s multiplication
+    sign comes back as two characters, the second of them a C1 control. That
+    reached pyglet as text and crashed the process several frames later.
+
+    Only the four escapes a sweep actually writes are unescaped; every other
+    byte is left as the UTF-8 it already is.
+    """
+    out = []
+    at = 0
+    while at < len(literal):
+        here = literal[at]
+        if here == "\\" and at + 1 < len(literal):
+            nxt = literal[at + 1]
+            out.append({"n": "\n", "t": "\t", "r": "\r"}.get(nxt, nxt))
+            at += 2
+            continue
+        out.append(here)
+        at += 1
+    return "".join(out)
+
+
 def parse(binary):
     """The sweep's output: a `spec|` line, its frame, and `end`.
 

@@ -1,0 +1,175 @@
+# The Fog of War screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/fogofwar.py -- the drawing, not the walking.
+#
+# One decision governs the whole file and is the reason the screen looks as
+# bare as it does:
+#
+#     THE FRAME IS A PURE FUNCTION OF WHERE THE WALKER IS AND WHAT HAS BEEN
+#     REVEALED. NOTHING ELSE REACHES IT.
+#
+# No step counter, no coverage read-out, no clock, no bump flash, nothing that
+# blinks. That is not minimalism for its own sake. An agent trained on a
+# prediction-based intrinsic reward finds the cheapest way to make the screen
+# surprising, and if walking into a wall produced ANY visible event at all,
+# walking into a wall would be cheaper than travelling -- measured elsewhere
+# at corr(payment, bumping) +0.79 against corr(payment, coverage) -0.59. So a
+# bump changes nothing here: not a pixel, not a label, not a colour.
+#
+# The status line says only which world it is, and that can change only
+# BETWEEN worlds. Anything that changed on a move would be a thing to chase
+# instead of ground to cover.
+#
+# The dark is real. The fog is ONE rectangle over the whole world and the
+# revealed cells are painted on top of it, so a cell nobody has seen cannot
+# leave a trace even by accident -- and two worlds that differ only somewhere
+# far off draw the same bytes until somebody walks over there.
+#
+# The revealed cells go down in CELL ORDER: `sorted(self.revealed)`, not the
+# set's own. What is counted off these frames is counted by exact byte match,
+# so the order is part of the picture.
+#
+# NOTE: needs elisacore_math, strings, ints, geometry, display and
+# scene_verdict included by the driver.
+
+module SceneFogOfWar:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_EXPLORING: i64 = 1
+    const PHASE_FINISHED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    # The dark, PAINTED rather than left as background, so the picture inside
+    # the world is the same whichever way round the black-background setting
+    # is turned.
+    def color_fog() -> u32:
+        return Display::rgba(0, 0, 0, 255)
+
+    # Floor and wall once seen: both well clear of the fog and of each other,
+    # and both flat fills -- a gradient here would be a bug.
+    def color_floor() -> u32:
+        return Display::rgba(176, 176, 176, 255)
+
+    def color_wall() -> u32:
+        return Display::rgba(64, 64, 64, 255)
+
+    def color_walker() -> u32:
+        return Display::rgba(204, 121, 167, 255)
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, wide: f64, tall: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               wide / paint.sx, tall / paint.sy, color)
+
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 100.0).f64()
+            bottom: f64 = Geometry::from_bottom_edge(height, 56.0).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.06
+            out.bottom <- bottom
+            out.width <- width * 0.88
+            out.height <- room if room > 40.0 else 40.0
+
+    def side_of(canvas: Canvas&, wide: i64, tall: i64) -> f64:
+        across: f64 = canvas.width / wide.f64()
+        down: f64 = canvas.height / tall.f64()
+        return across if across < down else down
+
+    def cell_x(canvas: Canvas&, wide: i64, tall: i64, cell: i64) -> f64:
+        can Abort.Panic:
+            side: f64 = side_of(canvas, wide, tall)
+            offset: f64 = canvas.left + (canvas.width - side * wide.f64()) / 2.0
+            return offset + (cell % wide).f64() * side
+
+    def cell_y(canvas: Canvas&, wide: i64, tall: i64, cell: i64) -> f64:
+        can Abort.Panic:
+            side: f64 = side_of(canvas, wide, tall)
+            offset: f64 = canvas.bottom + (canvas.height - side * tall.f64()) / 2.0
+            return offset + (tall - 1 - cell / wide).f64() * side
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_world: bool, wide: i64, tall: i64, walls: darray[bool]&,
+               revealed: darray[bool]&, at: i64, trial: i64,
+               total_trials: i64, message: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+
+            put_text(list, paint, sview("Fog of War", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            # While exploring the line is REPLACED rather than joined to: the
+            # message is not shown at all, so nothing a move could change can
+            # reach the screen.
+            status: mutable dstr = []
+            if has_world and phase == PHASE_EXPLORING:
+                dstr_append_cstr(&status, "World ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, total_trials)
+            else:
+                dstr_append_sview(&status, message)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     arrows: walk     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if not has_world or (phase != PHASE_EXPLORING and phase != PHASE_FINISHED):
+                return
+
+            canvas: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&canvas, paint.width, paint.height)
+            side: f64 = side_of(&canvas, wide, tall)
+
+            # The fog, in ONE rectangle. Its corner is cell 0's, which is the
+            # world's TOP-left, so it is dropped by the world's height less a
+            # row to reach the bottom.
+            put_rect(list, paint, cell_x(&canvas, wide, tall, 0),
+                     cell_y(&canvas, wide, tall, 0) - side * (tall - 1).f64(),
+                     side * wide.f64(), side * tall.f64(), color_fog())
+
+            for cell in 0..<(wide * tall) |list, paint, canvas, wide, tall, walls, revealed, side|:
+                if get revealed[cell.usize()] else false:
+                    put_rect(list, paint, cell_x(&canvas, wide, tall, cell),
+                             cell_y(&canvas, wide, tall, cell),
+                             side + 1.0, side + 1.0,
+                             color_wall() if (get walls[cell.usize()] else false) else color_floor())
+
+            put_rect(list, paint, cell_x(&canvas, wide, tall, at) + side * 0.22,
+                     cell_y(&canvas, wide, tall, at) + side * 0.22,
+                     side * 0.56, side * 0.56, color_walker())
