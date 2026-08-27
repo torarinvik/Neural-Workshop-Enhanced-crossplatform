@@ -1,0 +1,196 @@
+# The Count screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/counting.py -- the drawing, not the thinking.
+#
+# Four labels, a verdict, and a tangle of OUTLINES. The tangle is held in
+# fractions of the drawing area rather than in pixels, so a resize redraws the
+# same puzzle at the new size instead of a different one, and this scene is
+# where those fractions become pixels.
+#
+# Four shape kinds and each is a different pyglet class:
+#
+#   lines       Line, two points
+#   circles     Arc closed on itself -- an outline, not a disc
+#   triangles   MultiLine of three points, closed
+#   rectangles  Box, which is a Rectangle's outline
+#
+# A circle's radius is a fraction of `min(width, height)` and NOT of either
+# one, so an ellipse never happens on a wide window; the other kinds are
+# scaled on each axis separately and DO stretch with it.
+#
+# NOTE: needs elisacore_math, strings, geometry, display and scene_verdict
+# included by the driver.
+
+module SceneCounting:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SHOWING: i64 = 1
+    const PHASE_HIDDEN: i64 = 2
+    const PHASE_FEEDBACK: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const KIND_LINE: i64 = 0
+    const KIND_CIRCLE: i64 = 1
+    const KIND_TRIANGLE: i64 = 2
+    const KIND_RECTANGLE: i64 = 3
+
+    # One shape, in fractions of the drawing area. Three points is as many as
+    # any kind needs; a line and a rectangle use the first two.
+    struct Shape:
+        kind: i64
+        x1: f64
+        y1: f64
+        x2: f64
+        y2: f64
+        x3: f64
+        y3: f64
+        radius: f64
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64):
+        can Abort.Panic:
+            room_wide: f64 = width * 0.78
+            room_tall: f64 = height * 0.56
+            out.left <- (width - room_wide) / 2.0
+            out.bottom <- Geometry::from_bottom_edge(height, 150.0).f64()
+            out.width <- room_wide
+            out.height <- room_tall
+
+    def to_x(canvas: Canvas&, fraction: f64) -> f64:
+        return canvas.left + fraction * canvas.width
+
+    def to_y(canvas: Canvas&, fraction: f64) -> f64:
+        return canvas.bottom + fraction * canvas.height
+
+    # `max(1.0, scale_to_height(1.4))` -- one pixel is the thinnest a line can
+    # be drawn, so a short window stops thinning rather than disappearing.
+    def thickness_of(height: f64) -> f64:
+        can Abort.Panic:
+            scaled: f64 = Geometry::scale_to_height(height, 1.4).f64()
+            return scaled if scaled > 1.0 else 1.0
+
+    def put_shape(list: mutable Display::DisplayList&, paint: Paint&,
+                  canvas: Canvas&, shape: Shape&, thickness: f64):
+        can Memory.Allocate, Abort.Panic:
+            ink: u32 = paint.ink
+            edge: f64 = thickness / paint.sx
+            if shape.kind == KIND_CIRCLE:
+                # A fraction of the SHORTER side, so it stays a circle.
+                across: f64 = canvas.width
+                down: f64 = canvas.height
+                least: f64 = across if across < down else down
+                radius: f64 = shape.radius * least
+                Display::draw_arc(list, to_x(canvas, shape.x1) / paint.sx,
+                                  to_y(canvas, shape.y1) / paint.sy,
+                                  radius / paint.sx, 0.0, 360.0, ink)
+                return
+            if shape.kind == KIND_TRIANGLE:
+                Display::begin_multiline(list, 3, to_x(canvas, shape.x1) / paint.sx,
+                                         to_y(canvas, shape.y1) / paint.sy,
+                                         edge, ink)
+                Display::polygon_point(list, to_x(canvas, shape.x1) / paint.sx,
+                                       to_y(canvas, shape.y1) / paint.sy)
+                Display::polygon_point(list, to_x(canvas, shape.x2) / paint.sx,
+                                       to_y(canvas, shape.y2) / paint.sy)
+                Display::polygon_point(list, to_x(canvas, shape.x3) / paint.sx,
+                                       to_y(canvas, shape.y3) / paint.sy)
+                return
+            if shape.kind == KIND_RECTANGLE:
+                left: f64 = to_x(canvas, shape.x1)
+                bottom: f64 = to_y(canvas, shape.y1)
+                right: f64 = to_x(canvas, shape.x2)
+                top: f64 = to_y(canvas, shape.y2)
+                Display::draw_box(list, left / paint.sx, bottom / paint.sy,
+                                  (right - left) / paint.sx,
+                                  (top - bottom) / paint.sy, ink, edge)
+                return
+            Display::draw_line(list, to_x(canvas, shape.x1) / paint.sx,
+                               to_y(canvas, shape.y1) / paint.sy,
+                               to_x(canvas, shape.x2) / paint.sx,
+                               to_y(canvas, shape.y2) / paint.sy, edge, ink)
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               shapes: darray[Shape]&, typed: sview, trial: i64,
+               total_trials: i64, right: i64, message: sview, verdict: i64,
+               verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+
+            put_text(list, paint, sview("Count", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if phase == PHASE_SHOWING or phase == PHASE_HIDDEN or phase == PHASE_FEEDBACK:
+                dstr_append_cstr(&status, "     ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "   right ")
+                dstr_append_i64(&status, right)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            # `self.answer_text or '_'` -- an empty answer still shows a caret,
+            # so the line never disappears mid-trial.
+            answer: mutable dstr = []
+            if phase == PHASE_SHOWING or phase == PHASE_HIDDEN:
+                if sview_len(typed).i64() > 0:
+                    dstr_append_sview(&answer, typed)
+                else:
+                    answer.push(95.u8())
+            put_text(list, paint, bytes_view(answer), middle,
+                     Geometry::from_bottom_edge(paint.height, 86.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 26.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     digits then Enter     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 30.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            # The tangle is up while the shapes are SHOWING and again during
+            # FEEDBACK -- but not while they are HIDDEN, which is the phase the
+            # answer is typed in.
+            if phase != PHASE_SHOWING and phase != PHASE_FEEDBACK:
+                return
+            canvas: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&canvas, paint.width, paint.height)
+            thickness: f64 = thickness_of(paint.height)
+            for index in 0..<shapes.count.i64() |list, paint, canvas, shapes, thickness|:
+                shape: Shape = get shapes[index.usize()] else Shape{kind: 0, x1: 0.0, y1: 0.0, x2: 0.0, y2: 0.0, x3: 0.0, y3: 0.0, radius: 0.0}
+                put_shape(list, paint, &canvas, &shape, thickness)
