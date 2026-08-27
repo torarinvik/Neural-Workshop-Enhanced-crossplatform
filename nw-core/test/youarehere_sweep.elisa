@@ -1,0 +1,146 @@
+# Differential sweep driver for tasks/youarehere.elisa. See youarehere_diff.py
+# for the reference side.
+#
+# The maze itself comes from the 2D ladder, already covered by maze_sweep, so
+# what this checks is everything the 3D task adds: the starting facing, the
+# breadth-first par over pose AND keys, the route it unwinds, the wall-hugging
+# walk, the slipping walk's draw order, and the view -- rays and motes both.
+#
+# The view is FLOAT output, so every number is emitted as a scaled integer: the
+# harness compares exact bits on the integers and the scaling is what keeps a
+# last-ulp difference from being reported as a whole wrong ray.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/tasks/pyset.elisa"
+include "../src/tasks/maze.elisa"
+include "../src/tasks/youarehere.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+
+# Floats are compared as scaled integers so a printed decimal never has to
+# agree between two languages. 1e6 keeps six places, which is far past what
+# any of these quantities is meaningful to.
+def emit_scaled(value: f64):
+    can Console.Write, Abort.Panic:
+        emit_cell(py_round_half_even(value * 1000000.0))
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(512 * 1024 * 1024)
+        in w:
+            work: mutable Maze::Work = Maze::work_new(18, 6)
+            for level in 1..<16:
+                for seed in 1..<4:
+                    maze: mutable Maze::Layout = Maze::generate(&work, level, seed, 1)
+                    continue if not maze.ok
+                    sw: mutable YouAreHere::Sweep = YouAreHere::sweep_new(&work)
+                    facing: i64 = YouAreHere::facing_at(&work, &maze)
+                    steps: i64 = YouAreHere::par(&work, &maze, &sw)
+                    printr("par")
+                    emit_cell(level)
+                    emit_cell(seed)
+                    emit_cell(maze.width)
+                    emit_cell(facing)
+                    emit_cell(steps)
+                    emit_cell(sw.route_n)
+                    for at in 0..<sw.route_n |sw|:
+                        emit_cell(Ints::at_ref(&sw.route, at))
+                    print("")
+
+                    printr("hug")
+                    emit_cell(level)
+                    emit_cell(seed)
+                    emit_cell(YouAreHere::walk_hugging(&work, &maze, 20000))
+                    print("")
+
+                    # The slipping walk, at three slip rates. The RNG is
+                    # reseeded per rate so a divergence in one does not shift
+                    # the draw order of the next.
+                    #
+                    # Low rungs only, and a short cap. This walk re-plans a FULL
+                    # breadth-first sweep after every single step, so the
+                    # reference spends twenty-five seconds on one level-fifteen
+                    # walk -- the whole rest of this suite costs about one. The
+                    # cap is part of the answer, not a speed dial, so both sides
+                    # carry the same one; what it bounds is how far a walk gets,
+                    # and the re-planning and the draw order are exercised in
+                    # the first few steps either way.
+                    for rate in 0..<3 |work, maze, sw, level, seed|:
+                        break if level > 7
+                        slip: f64 = 0.02 if rate == 0 else (0.1 if rate == 1 else 0.25)
+                        rng: mutable MT19937 = mt19937_new()
+                        mt_seed_int(&rng, (seed * 1000 + rate).u64())
+                        printr("slip")
+                        emit_cell(level)
+                        emit_cell(seed)
+                        emit_cell(rate)
+                        emit_cell(YouAreHere::walk_slipping(&work, &maze, slip, &rng, 1500, &sw))
+                        print("")
+
+                    # The view from the start, and from one step along it.
+                    distance: mutable darray[f64] = Floats::zeros(YouAreHere::COLUMNS)
+                    cell_of: mutable darray[i64] = Ints::zeros(YouAreHere::COLUMNS)
+                    side_of: mutable darray[i64] = Ints::zeros(YouAreHere::COLUMNS)
+                    marks: mutable YouAreHere::Motes = YouAreHere::motes_new()
+                    for turn in 0..<4 |work, maze, level, seed, facing, distance, cell_of, side_of, marks|:
+                        pose: YouAreHere::Pose = YouAreHere::Pose{cell: maze.start, facing: (facing + turn) % 4}
+                        YouAreHere::look(&work, &maze, pose, YouAreHere::COLUMNS, 1.5707963267948966, &distance, &cell_of, &side_of)
+                        printr("see")
+                        emit_cell(level)
+                        emit_cell(seed)
+                        emit_cell(turn)
+                        for column in 0..<YouAreHere::COLUMNS |distance, cell_of, side_of|:
+                            emit_scaled(Floats::at_ref(&distance, column))
+                            emit_cell(Ints::at_ref(&cell_of, column))
+                            emit_cell(Ints::at_ref(&side_of, column))
+                        print("")
+
+                        held: i64 = Maze::picked_up(&maze, maze.start, 0)
+                        YouAreHere::motes(&work, &maze, pose, held, 1.5707963267948966, &marks)
+                        printr("mote")
+                        emit_cell(level)
+                        emit_cell(seed)
+                        emit_cell(turn)
+                        emit_cell(marks.count)
+                        for at in 0..<marks.count |marks|:
+                            emit_cell(Ints::at_ref(&marks.what, at))
+                            emit_cell(Ints::at_ref(&marks.which, at))
+                            emit_cell(Ints::at_ref(&marks.cell, at))
+                            emit_scaled(Floats::at_ref(&marks.across, at))
+                            emit_scaled(Floats::at_ref(&marks.distance, at))
+                        print("")
+        destroy w
+        return 0

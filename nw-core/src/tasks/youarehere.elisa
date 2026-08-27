@@ -1,0 +1,484 @@
+# 3D Maze: the same maze the 2D task deals, walked from inside it.
+#
+# Port of neural_workshop/youarehere.py (GPL-2.0-or-later). Deliberately not a
+# ladder of its own -- level nine here IS level nine there, so what the view
+# costs can be read straight off the two pars.
+#
+# The reference carries the maze's wall set on its `Maze` namedtuple. This port
+# does not: nw-core's `Maze::Layout` is the summary and the grid lives in
+# `Maze::Work` as `open_flag`, so every function here takes the pair, which is
+# what `Maze::search` and `Maze::greedy_walk` already do.
+
+extern tan(x: f64) -> f64
+
+module YouAreHere:
+
+    # North, east, south and west, CLOCKWISE, on a grid whose y grows downwards
+    # -- which is how maze.elisa numbers its cells and how the map is drawn.
+    def facing_dx(facing: i64) -> i64:
+        can Abort.Panic:
+            return 0 if facing == 0
+            return 1 if facing == 1
+            return 0 if facing == 2
+            return -1
+
+    def facing_dy(facing: i64) -> i64:
+        can Abort.Panic:
+            return -1 if facing == 0
+            return 0 if facing == 1
+            return 1 if facing == 2
+            return 0
+
+    # The four things a player can do, each costing exactly one step. The order
+    # is the reference's MOVES tuple; `sweep` pushes them in a DIFFERENT order
+    # (left, right, ahead, back) and that order is what fixes the route.
+    const AHEAD: i64 = 0
+    const BACK: i64 = 1
+    const LEFT: i64 = 2
+    const RIGHT: i64 = 3
+
+    # Rays across the viewport, blocky on purpose. A right angle of view, so a
+    # corridor opening off the cell you stand in reaches the very edge.
+    const COLUMNS: i64 = 180
+    # Far enough to mean "nothing there" without being infinite.
+    const FAR: f64 = 10000.0
+
+    struct Pose:
+        cell: mutable i64
+        facing: mutable i64
+
+    def is_wall(work: mutable Maze::Work&, cell: i64) -> bool:
+        can Abort.Panic:
+            true return if cell < 0 or cell >= work.cells
+            return Ints::at(work.open_flag, cell) != 1
+
+    # The cell one step that way, or -1 when a wall is in the way.
+    #
+    # Knows nothing about doors: a locked door is a cell you cannot ENTER yet,
+    # not a cell that is not there, and the two want telling apart -- you can
+    # see through a doorway and you cannot see through a wall.
+    def ahead_of(work: mutable Maze::Work&, maze: mutable Maze::Layout&, cell: i64, facing: i64) -> i64:
+        can Abort.Panic:
+            x: i64 = cell % maze.width
+            y: i64 = cell / maze.width
+            nx: i64 = x + facing_dx(facing)
+            ny: i64 = y + facing_dy(facing)
+            -1 return if nx < 0 or nx >= maze.width or ny < 0 or ny >= maze.height
+            step: i64 = ny * maze.width + nx
+            return -1 if is_wall(work, step) else step
+
+    # Which way a player starts out looking: the first open direction clockwise
+    # from north, so a maze always opens onto a corridor rather than a wall.
+    def facing_at(work: mutable Maze::Work&, maze: mutable Maze::Layout&) -> i64:
+        can Abort.Panic:
+            for facing in 0..<4 |work, maze|:
+                facing return if ahead_of(work, maze, maze.start, facing) >= 0
+            return 0
+
+    # The colour barring `cell`, or -1 when it may be walked into.
+    def locked(maze: mutable Maze::Layout&, cell: i64, held: i64) -> i64:
+        can Abort.Panic:
+            for colour in 0..<maze.door_count |maze, cell, held|:
+                if maze.doors[colour.usize()] == cell and ((held >> colour) & 1) == 0:
+                    return colour
+            return -1
+
+    def costs(doing: i64, moved: bool) -> i64:
+        can Abort.Panic:
+            return 1 if moved or doing == LEFT or doing == RIGHT else 0
+
+    # What one move comes to: the new pose, the keys held, and whether the
+    # player actually went anywhere.
+    struct Step:
+        cell: mutable i64
+        facing: mutable i64
+        held: mutable i64
+        moved: mutable bool
+
+    # , not :  is the ownership-transfer keyword, so a
+    # function of that name parses as the keyword and every call reads as a
+    # function VALUE rather than a call.
+    def after(work: mutable Maze::Work&, maze: mutable Maze::Layout&, pose: Pose, held: i64, doing: i64) -> Step:
+        can Abort.Panic:
+            if doing == LEFT:
+                return Step{cell: pose.cell, facing: (pose.facing + 3) % 4, held: held, moved: false}
+            if doing == RIGHT:
+                return Step{cell: pose.cell, facing: (pose.facing + 1) % 4, held: held, moved: false}
+            facing: i64 = pose.facing if doing == AHEAD else (pose.facing + 2) % 4
+            step: i64 = ahead_of(work, maze, pose.cell, facing)
+            if step < 0 or locked(maze, step, held) >= 0:
+                return Step{cell: pose.cell, facing: pose.facing, held: held, moved: false}
+            return Step{cell: step, facing: pose.facing, held: Maze::picked_up(maze, step, held), moved: true}
+
+    # ------------------------------------------------------------
+    # What a perfect walk costs
+    #
+    # Breadth-first over pose AND keys. Every edge costs one, so plain
+    # breadth-first is already the shortest path and there is nothing to weigh.
+    # A state is packed into one integer -- (cell * 4 + facing) * 64 + keys --
+    # exactly as the reference packs it, because the alternative is several
+    # hundred thousand tuples and this loop is the one thing here that takes
+    # long enough to notice.
+    # ------------------------------------------------------------
+
+    struct Sweep:
+        steps: mutable i64
+        # The moves of one shortest way out, in order.
+        route: mutable darray[i64]
+        route_n: mutable i64
+        # came[state] is the previous state PLUS ONE, so 0 means unvisited.
+        came: mutable darray[i64]
+        came_move: mutable darray[i64]
+        queue: mutable darray[i64]
+        nextup: mutable darray[i64]
+        # steps[cell * 4 + facing], and the door/key bits per cell.
+        landing: mutable darray[i64]
+        shut: mutable darray[i64]
+        opens: mutable darray[i64]
+
+    def sweep_new(work: mutable Maze::Work&) -> Sweep:
+        can Memory.Allocate, Abort.Panic:
+            states: i64 = work.cells * 4 * 64
+            return Sweep{steps: -1, route: Ints::zeros(work.cells * 8), route_n: 0,
+                         came: Ints::zeros(states), came_move: Ints::zeros(states),
+                         queue: Ints::zeros(states), nextup: Ints::zeros(states),
+                         landing: Ints::zeros(work.cells * 4),
+                         shut: Ints::zeros(work.cells), opens: Ints::zeros(work.cells)}
+
+    # The maze flattened into what the sweep's inner loop wants: where a step
+    # from each cell and facing lands, which bits each door wants, and which
+    # bits each cell hands over. All three are read a great many times and none
+    # of them change.
+    def tables(work: mutable Maze::Work&, maze: mutable Maze::Layout&, out: mutable Sweep&):
+        can Abort.Panic:
+            for cell in 0..<work.cells |work, maze, out|:
+                for facing in 0..<4 |work, maze, out, cell|:
+                    Ints::put(&out.landing, cell * 4 + facing, -1)
+                Ints::put(&out.shut, cell, 0)
+                Ints::put(&out.opens, cell, 0)
+            for cell in 0..<work.cells |work, maze, out|:
+                continue if is_wall(work, cell)
+                for facing in 0..<4 |work, maze, out, cell|:
+                    Ints::put(&out.landing, cell * 4 + facing, ahead_of(work, maze, cell, facing))
+            for colour in 0..<maze.door_count |maze, out|:
+                door: i64 = maze.doors[colour.usize()]
+                Ints::put(&out.shut, door, Ints::at_ref(&out.shut, door) | (1 << colour))
+                key: i64 = maze.keys[colour.usize()]
+                Ints::put(&out.opens, key, Ints::at_ref(&out.opens, key) | (1 << colour))
+
+    def unwind(state_in: i64, out: mutable Sweep&):
+        can Abort.Panic:
+            walked: mutable darray[i64] = Ints::zeros(out.route.count.i64())
+            count: mutable i64 = 0
+            state: mutable i64 = state_in
+            while Ints::at_ref(&out.came, state) != 0 |state, out, walked, count|:
+                Ints::put(&walked, count, Ints::at_ref(&out.came_move, state))
+                count <- count + 1
+                state <- Ints::at_ref(&out.came, state) - 1
+            out.route_n <- count
+            out.steps <- count
+            for slot in 0..<count |out, walked, count|:
+                Ints::put(&out.route, slot, Ints::at_ref(&walked, count - 1 - slot))
+
+    # Breadth-first, back to front once it lands. `move` remains the definition
+    # of what a move does; this is the same rules written out flat.
+    def sweep(work: mutable Maze::Work&, maze: mutable Maze::Layout&, from_cell: i64, from_facing: i64, held: i64, out: mutable Sweep&):
+        can Memory.Allocate, Abort.Panic:
+            tables(work, maze, out)
+            out.steps <- -1
+            out.route_n <- 0
+            for slot in 0..<(work.cells * 4 * 64) |out|:
+                Ints::put(&out.came, slot, 0)
+            first: i64 = (from_cell * 4 + from_facing) * 64 + held
+            # `came` doubles as the seen set, so the first state is marked with
+            # a self-reference the unwind stops on rather than with 0.
+            Ints::put(&out.came, first, 0)
+            seen: mutable darray[i64] = Ints::zeros(work.cells * 4 * 64)
+            Ints::put(&seen, first, 1)
+            Ints::put(&out.queue, 0, first)
+            queue_n: mutable i64 = 1
+            landed: mutable bool = false
+            while queue_n > 0 and not landed |work, maze, out, seen, queue_n, landed|:
+                next_n: mutable i64 = 0
+                for at in 0..<queue_n |work, maze, out, seen, next_n, landed|:
+                    break if landed
+                    state: i64 = Ints::at_ref(&out.queue, at)
+                    carried: i64 = state & 63
+                    spun: i64 = state >> 6
+                    cell: i64 = spun >> 2
+                    facing: i64 = spun & 3
+                    if cell == maze.way_out:
+                        unwind(state, out)
+                        landed <- true
+                    else:
+                        for turn in 0..<2 |out, seen, next_n, state, cell, facing, carried|:
+                            turned: i64 = (facing + 3) % 4 if turn == 0 else (facing + 1) % 4
+                            doing: i64 = LEFT if turn == 0 else RIGHT
+                            below: i64 = ((cell * 4 + turned) << 6) | carried
+                            continue if Ints::at_ref(&seen, below) != 0
+                            Ints::put(&seen, below, 1)
+                            Ints::put(&out.came, below, state + 1)
+                            Ints::put(&out.came_move, below, doing)
+                            Ints::put(&out.nextup, next_n, below)
+                            next_n <- next_n + 1
+                        for way in 0..<2 |out, seen, next_n, state, cell, facing, carried|:
+                            heading: i64 = facing if way == 0 else (facing + 2) % 4
+                            doing: i64 = AHEAD if way == 0 else BACK
+                            step: i64 = Ints::at_ref(&out.landing, cell * 4 + heading)
+                            continue if step < 0
+                            barred: i64 = Ints::at_ref(&out.shut, step)
+                            continue if barred != 0 and (carried & barred) == 0
+                            below: i64 = ((step * 4 + facing) << 6) | (carried | Ints::at_ref(&out.opens, step))
+                            continue if Ints::at_ref(&seen, below) != 0
+                            Ints::put(&seen, below, 1)
+                            Ints::put(&out.came, below, state + 1)
+                            Ints::put(&out.came_move, below, doing)
+                            Ints::put(&out.nextup, next_n, below)
+                            next_n <- next_n + 1
+                break if landed
+                for slot in 0..<next_n |out|:
+                    Ints::put(&out.queue, slot, Ints::at_ref(&out.nextup, slot))
+                queue_n <- next_n
+
+    # The fewest steps out, turns counted, keys and all. An exact minimum.
+    def par(work: mutable Maze::Work&, maze: mutable Maze::Layout&, out: mutable Sweep&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            held: i64 = Maze::picked_up(maze, maze.start, 0)
+            sweep(work, maze, maze.start, facing_at(work, maze), held, out)
+            return out.steps
+
+    # ------------------------------------------------------------
+    # Players
+    # ------------------------------------------------------------
+
+    # One hand on the wall, and no glance at the map at all. The fallback of a
+    # player that has lost its place, and the reason the ladder braids loops
+    # into every rung above the first: a hand on the wall gets you out of any
+    # maze WITHOUT loops, and can walk a maze with them round for ever.
+    def walk_hugging(work: mutable Maze::Work&, maze: mutable Maze::Layout&, cap: i64) -> i64:
+        can Abort.Panic:
+            pose: mutable Pose = Pose{cell: maze.start, facing: facing_at(work, maze)}
+            held: mutable i64 = Maze::picked_up(maze, maze.start, 0)
+            steps: mutable i64 = 0
+            while steps < cap |work, maze, pose, held, steps|:
+                steps return if pose.cell == maze.way_out
+                spun: Step = after(work, maze, pose, held, RIGHT)
+                pose <- Pose{cell: spun.cell, facing: spun.facing}
+                held <- spun.held
+                steps <- steps + 1
+                for _try in 0..<4 |work, maze, pose, held, steps|:
+                    went: Step = after(work, maze, pose, held, AHEAD)
+                    steps <- steps + costs(AHEAD, went.moved)
+                    if went.moved:
+                        pose <- Pose{cell: went.cell, facing: went.facing}
+                        held <- went.held
+                        break
+                    turned: Step = after(work, maze, pose, held, LEFT)
+                    pose <- Pose{cell: turned.cell, facing: turned.facing}
+                    held <- turned.held
+                    steps <- steps + 1
+            return -1
+
+    # Plan perfectly from where you THINK you are, and slip sometimes.
+    #
+    # The foil the whole task is built to punish. It reads the map, solves the
+    # maze exactly, and carries out the answer -- but once in a while it does
+    # not notice that it moved, and its belief quietly parts company with where
+    # it is. It does not try to recover, deliberately: what is measured is the
+    # cost of ONE dropped update.
+    def walk_slipping(work: mutable Maze::Work&, maze: mutable Maze::Layout&, slip: f64, rng: mutable MT19937&, cap: i64, out: mutable Sweep&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            pose: mutable Pose = Pose{cell: maze.start, facing: facing_at(work, maze)}
+            held: mutable i64 = Maze::picked_up(maze, maze.start, 0)
+            thinks: mutable Pose = Pose{cell: pose.cell, facing: pose.facing}
+            believes: mutable i64 = held
+            steps: mutable i64 = 0
+            while steps < cap |work, maze, rng, out, pose, held, thinks, believes, steps, slip|:
+                steps return if pose.cell == maze.way_out
+                sweep(work, maze, thinks.cell, thinks.facing, believes, out)
+                -1 return if out.route_n == 0
+                doing: i64 = Ints::at_ref(&out.route, 0)
+                went: Step = after(work, maze, pose, held, doing)
+                pose <- Pose{cell: went.cell, facing: went.facing}
+                held <- went.held
+                steps <- steps + costs(doing, went.moved)
+                if py_random(rng) >= slip:
+                    believed: Step = after(work, maze, thinks, believes, doing)
+                    thinks <- Pose{cell: believed.cell, facing: believed.facing}
+                    believes <- believed.held
+            return -1
+
+    # ------------------------------------------------------------
+    # What can be seen
+    # ------------------------------------------------------------
+
+    # One ray, by the usual grid march: distance, cell, side.
+    #
+    # `dir_x`/`dir_y` are deliberately NOT a unit vector -- they are the way the
+    # player is looking plus a sideways lean, so the distance this marches off
+    # is already measured square on to the screen and needs no second
+    # correction. Normalising first and dividing back gets the sign of the
+    # correction wrong if you are not careful.
+    struct Sight:
+        distance: mutable f64
+        cell: mutable i64
+        side: mutable i64
+
+    def float_abs(value: f64) -> f64:
+        can Abort.Panic:
+            return value if value >= 0.0 else 0.0 - value
+
+    def cast(work: mutable Maze::Work&, maze: mutable Maze::Layout&, from_x: f64, from_y: f64, dir_x: f64, dir_y: f64) -> Sight:
+        can Abort.Panic:
+            map_x: mutable i64 = from_x.i64()
+            map_y: mutable i64 = from_y.i64()
+            step_x: i64 = 1 if dir_x >= 0.0 else -1
+            step_y: i64 = 1 if dir_y >= 0.0 else -1
+            delta_x: f64 = float_abs(1.0 / dir_x) if dir_x != 0.0 else FAR
+            delta_y: f64 = float_abs(1.0 / dir_y) if dir_y != 0.0 else FAR
+            next_x: mutable f64 = ((map_x + 1).f64() - from_x) * delta_x if dir_x >= 0.0 else (from_x - map_x.f64()) * delta_x
+            next_y: mutable f64 = ((map_y + 1).f64() - from_y) * delta_y if dir_y >= 0.0 else (from_y - map_y.f64()) * delta_y
+            side: mutable i64 = 0
+            walked: mutable f64 = 0.0
+            for _march in 0..<(maze.width + maze.height + 2) |work, maze, map_x, map_y, next_x, next_y, side, walked, delta_x, delta_y, step_x, step_y|:
+                if next_x < next_y:
+                    map_x <- map_x + step_x
+                    side <- 0
+                    walked <- next_x
+                    next_x <- next_x + delta_x
+                else:
+                    map_y <- map_y + step_y
+                    side <- 1
+                    walked <- next_y
+                    next_y <- next_y + delta_y
+                if map_x < 0 or map_x >= maze.width or map_y < 0 or map_y >= maze.height:
+                    return Sight{distance: FAR, cell: -1, side: side}
+                cell: i64 = map_y * maze.width + map_x
+                if is_wall(work, cell):
+                    return Sight{distance: walked if walked > 0.000001 else 0.000001, cell: cell, side: side}
+            return Sight{distance: FAR, cell: -1, side: side}
+
+    # The view from `pose`, one ray to a column, left edge first. The angle is
+    # taken across the SCREEN PLANE rather than swept evenly, so a flat wall
+    # renders flat instead of curved.
+    def look(work: mutable Maze::Work&, maze: mutable Maze::Layout&, pose: Pose, columns: i64, fov: f64, out_distance: mutable darray[f64]&, out_cell: mutable darray[i64]&, out_side: mutable darray[i64]&):
+        can Abort.Panic:
+            from_x: f64 = (pose.cell % maze.width).f64() + 0.5
+            from_y: f64 = (pose.cell / maze.width).f64() + 0.5
+            face_x: f64 = facing_dx(pose.facing).f64()
+            face_y: f64 = facing_dy(pose.facing).f64()
+            edge: f64 = tan(fov / 2.0)
+            for column in 0..<columns |work, maze, out_distance, out_cell, out_side, from_x, from_y, face_x, face_y, edge, columns|:
+                offset: f64 = edge * (2.0 * ((column.f64()) + 0.5) / columns.f64() - 1.0)
+                seen: Sight = cast(work, maze, from_x, from_y, face_x - face_y * offset, face_y + face_x * offset)
+                Floats::put(out_distance, column, seen.distance)
+                Ints::put(out_cell, column, seen.cell)
+                Ints::put(out_side, column, seen.side)
+
+    # True when nothing walled stands between two cells. Only ever asked about
+    # cells sharing a row or a column, because those are the only ones a mark
+    # can be seen down: a corridor is one cell wide and anything off the
+    # straight is behind a corner.
+    def clear_between(work: mutable Maze::Work&, maze: mutable Maze::Layout&, here: i64, there: i64) -> bool:
+        can Abort.Panic:
+            hx: i64 = here % maze.width
+            hy: i64 = here / maze.width
+            tx: i64 = there % maze.width
+            ty: i64 = there / maze.width
+            false return if hx != tx and hy != ty
+            step_x: mutable i64 = 0
+            step_y: mutable i64 = 0
+            if hx == tx:
+                step_y <- 1 if ty > hy else -1
+            else:
+                step_x <- 1 if tx > hx else -1
+            x: mutable i64 = hx
+            y: mutable i64 = hy
+            while x != tx or y != ty |work, maze, x, y, tx, ty, step_x, step_y|:
+                x <- x + step_x
+                y <- y + step_y
+                false return if is_wall(work, y * maze.width + x)
+            return true
+
+    # Something standing in a cell, seen from where you are. Keys and the way
+    # out are drawn as marks HANGING IN THE CORRIDOR rather than as anything on
+    # the floor, because a floor mark disappears the moment it is more than a
+    # few cells off and these have to be recognisable from down a passage.
+    const MOTE_KEY: i64 = 0
+    const MOTE_WAY_OUT: i64 = 1
+
+    struct Motes:
+        count: mutable i64
+        what: mutable darray[i64]
+        which: mutable darray[i64]
+        cell: mutable darray[i64]
+        across: mutable darray[f64]
+        distance: mutable darray[f64]
+
+    def motes_new() -> Motes:
+        can Memory.Allocate, Abort.Panic:
+            return Motes{count: 0, what: Ints::zeros(8), which: Ints::zeros(8),
+                         cell: Ints::zeros(8), across: Floats::zeros(8), distance: Floats::zeros(8)}
+
+    # The keys still lying about and the way out, as seen from `pose`, FARTHEST
+    # FIRST. The reference sorts by `-distance` with Python's stable sort, so
+    # equal distances keep the order they were found in -- keys in colour order,
+    # then the way out. An unstable sort would reorder ties and the screen would
+    # draw two marks in the wrong depth order.
+    def motes(work: mutable Maze::Work&, maze: mutable Maze::Layout&, pose: Pose, held: i64, fov: f64, out: mutable Motes&):
+        can Abort.Panic:
+            out.count <- 0
+            from_x: f64 = (pose.cell % maze.width).f64() + 0.5
+            from_y: f64 = (pose.cell / maze.width).f64() + 0.5
+            face_x: f64 = facing_dx(pose.facing).f64()
+            face_y: f64 = facing_dy(pose.facing).f64()
+            edge: f64 = tan(fov / 2.0)
+            for slot in 0..<(maze.door_count + 1) |work, maze, out, pose, held, from_x, from_y, face_x, face_y, edge|:
+                what: i64 = MOTE_KEY if slot < maze.door_count else MOTE_WAY_OUT
+                which: i64 = slot if slot < maze.door_count else -1
+                cell: i64 = maze.keys[slot.usize()] if slot < maze.door_count else maze.way_out
+                if what == MOTE_KEY:
+                    continue if ((held >> slot) & 1) != 0
+                at_x: f64 = (cell % maze.width).f64() + 0.5 - from_x
+                at_y: f64 = (cell / maze.width).f64() + 0.5 - from_y
+                depth: f64 = at_x * face_x + at_y * face_y
+                continue if depth <= 0.05
+                sideways: f64 = at_x * (0.0 - face_y) + at_y * face_x
+                across: f64 = (sideways / depth / edge + 1.0) / 2.0
+                continue if across < -0.2 or across > 1.2
+                continue if not clear_between(work, maze, pose.cell, cell)
+                Ints::put(&out.what, out.count, what)
+                Ints::put(&out.which, out.count, which)
+                Ints::put(&out.cell, out.count, cell)
+                Floats::put(&out.across, out.count, across)
+                Floats::put(&out.distance, out.count, depth)
+                out.count <- out.count + 1
+            sort_motes(out)
+
+    # Insertion sort, farthest first, and STABLE -- which is what Python's
+    # `sort(key=lambda m: -m.distance)` is.
+    def sort_motes(out: mutable Motes&):
+        can Abort.Panic:
+            for index in 1..<out.count |out|:
+                at: mutable i64 = index - 1
+                what: i64 = Ints::at_ref(&out.what, index)
+                which: i64 = Ints::at_ref(&out.which, index)
+                cell: i64 = Ints::at_ref(&out.cell, index)
+                across: f64 = Floats::at_ref(&out.across, index)
+                distance: f64 = Floats::at_ref(&out.distance, index)
+                placing: mutable bool = true
+                while placing and at >= 0 |out, at, placing, distance|:
+                    if Floats::at_ref(&out.distance, at) < distance:
+                        Ints::put(&out.what, at + 1, Ints::at_ref(&out.what, at))
+                        Ints::put(&out.which, at + 1, Ints::at_ref(&out.which, at))
+                        Ints::put(&out.cell, at + 1, Ints::at_ref(&out.cell, at))
+                        Floats::put(&out.across, at + 1, Floats::at_ref(&out.across, at))
+                        Floats::put(&out.distance, at + 1, Floats::at_ref(&out.distance, at))
+                        at <- at - 1
+                    else:
+                        placing <- false
+                Ints::put(&out.what, at + 1, what)
+                Ints::put(&out.which, at + 1, which)
+                Ints::put(&out.cell, at + 1, cell)
+                Floats::put(&out.across, at + 1, across)
+                Floats::put(&out.distance, at + 1, distance)
