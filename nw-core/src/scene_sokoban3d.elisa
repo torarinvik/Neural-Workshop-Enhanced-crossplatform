@@ -1,0 +1,334 @@
+# The 3D Sokoban screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/sokoban3d.py -- the drawing, not the thinking.
+#
+# The same three batches the 3D Maze has, in the same order -- the plan, the
+# corridor, the chrome -- and the same corridor built the same way. What
+# differs is what the rays hit and what the plan is honest about.
+#
+# The PLAN shows the walls and the goals, which do not move, and the boxes and
+# the player where they stood when the door shut. Both of those stop being
+# true on the first push, and that is the task rather than a bug in it.
+#
+# A wall face is grey and a BOX face keeps the box's own colour -- green if it
+# is already home and blue if it is not -- fading towards the far-wall grey
+# rather than towards the background, because a box you cannot make out at
+# eight cells is a thing you will walk into.
+#
+# The stage stops above the verdict band and the reason is written down in the
+# reference: a box is Okabe-Ito sky blue, which is not a verdict colour, but
+# against the dark room's near-black ceiling its anti-aliased edge runs
+# through (69, 140, 180) -- and that IS the reader's pattern for a positive
+# verdict, exactly.
+#
+# The status line is WRAPPED rather than trimmed, because it carries the
+# rung's name, the par, and whether the par is a minimum at all, and on a
+# narrow window one line of that ran off both edges at once.
+#
+# NOTE: needs elisacore_math, pymath, strings, ints, geometry, verdict,
+# display and scene_verdict included by the driver.
+
+module SceneSokoban3D:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_PUSHING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_LOST: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const VIEW_SHARE: f64 = 0.63
+    const MAP_SHARE: f64 = 0.33
+    const NEAR: f64 = 3.0
+    const EDGE_ON: f64 = 0.68
+    const FAR: f64 = 10000.0
+
+    def color_wall() -> u32:
+        return Display::rgba(110, 110, 110, 255)
+
+    def color_goal() -> u32:
+        return Display::rgba(230, 159, 0, 255)
+
+    def color_box() -> u32:
+        return Display::rgba(86, 180, 233, 255)
+
+    def color_box_home() -> u32:
+        return Display::rgba(0, 158, 115, 255)
+
+    def color_player() -> u32:
+        return Display::rgba(204, 121, 167, 255)
+
+    def color_trap() -> u32:
+        return Display::rgba(150, 150, 150, 255)
+
+    def room_channel(black_background: bool, which: i64) -> i64:
+        if black_background:
+            if which == 0:
+                return 18
+            if which == 1:
+                return 46
+            if which == 2:
+                return 200
+            return 88
+        if which == 0:
+            return 238
+        if which == 1:
+            return 212
+        if which == 2:
+            return 80
+        return 170
+
+    struct Sight:
+        distance: f64
+        cell: i64
+        side: i64
+
+    struct Mark:
+        across: f64
+        distance: f64
+
+    struct Paint:
+        ink: mutable u32
+        back: mutable u32
+        black: mutable bool
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     back: Display::rgba(back, back, back, 255),
+                     black: black_background,
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, wide: f64, tall: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               wide / paint.sx, tall / paint.sy, color)
+
+    def put_disc(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, radius: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_circle(list, x / paint.sx, y / paint.sy,
+                                 radius / paint.sx, color)
+
+    struct Stage:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def stage_of(out: mutable Stage&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 96.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 66.0).f64()).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.03
+            out.bottom <- bottom
+            out.width <- width * 0.94
+            out.height <- room if room > 60.0 else 60.0
+
+    def mix(front: i64, back: i64, lit: f64) -> i64:
+        can Abort.Panic:
+            return py_round_half_even(back.f64() + (front - back).f64() * lit)
+
+    def lit_of(distance: f64, side: i64) -> f64:
+        reach: f64 = distance if distance > 0.0 else 0.0
+        return NEAR / (NEAR + reach) * (EDGE_ON if side != 0 else 1.0)
+
+    def step_at(values: darray[i64]&, index: i64) -> i64:
+        can Abort.Panic:
+            return get values[index.usize()] else 0
+
+    def flag_at(values: darray[bool]&, index: i64) -> bool:
+        can Abort.Panic:
+            return get values[index.usize()] else false
+
+    struct Cell:
+        x: mutable f64
+        y: mutable f64
+        side: mutable f64
+
+    def cell_rect(out: mutable Cell&, stage: Stage&, wide: i64, tall: i64, cell: i64):
+        can Abort.Panic:
+            left: f64 = stage.left + stage.width * (1.0 - MAP_SHARE)
+            width: f64 = stage.width * MAP_SHARE
+            across: f64 = width / wide.f64()
+            down: f64 = stage.height / tall.f64()
+            side: f64 = across if across < down else down
+            offset_x: f64 = left + (width - side * wide.f64()) / 2.0
+            offset_y: f64 = stage.bottom + (stage.height - side * tall.f64()) / 2.0
+            out.x <- offset_x + (cell % wide).f64() * side
+            out.y <- offset_y + (tall - 1 - cell / wide).f64() * side
+            out.side <- side
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_level: bool, wide: i64, tall: i64, walls: darray[bool]&,
+               goals: darray[bool]&, traps: darray[bool]&,
+               plan_boxes: darray[i64]&, plan_player: i64,
+               live_boxes: darray[bool]&, show_traps: bool, show_marks: bool,
+               sights: darray[Sight]&, marks: darray[Mark]&, steps: i64,
+               pushes: i64, trial: i64, total_trials: i64, message: sview,
+               verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            walking: bool = has_level and (phase == PHASE_PUSHING or phase == PHASE_SOLVED or phase == PHASE_LOST)
+            stage: mutable Stage = Stage{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            stage_of(&stage, paint.width, paint.height)
+
+            if has_level:
+                put_plan(list, paint, &stage, wide, tall, walls, goals, traps,
+                         plan_boxes, plan_player, show_traps)
+
+            if walking:
+                put_room(list, paint, &stage, sights, live_boxes, goals)
+                if show_marks:
+                    put_marks(list, paint, &stage, marks, sights)
+
+            put_text(list, paint, sview("3D Sokoban", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if has_level and phase == PHASE_PUSHING:
+                # The par is already in the message, so it is not said twice:
+                # what belongs here is what the run has spent.
+                dstr_append_cstr(&status, "     warehouse ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "   steps ")
+                dstr_append_i64(&status, steps)
+                dstr_append_cstr(&status, "   pushes ")
+                dstr_append_i64(&status, pushes)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 62.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_TOP, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu   Space: start   Arrows: walk, turn and push   U: undo   R: restart   C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+    def put_plan(list: mutable Display::DisplayList&, paint: Paint&,
+                 stage: Stage&, wide: i64, tall: i64, walls: darray[bool]&,
+                 goals: darray[bool]&, traps: darray[bool]&,
+                 plan_boxes: darray[i64]&, plan_player: i64, show_traps: bool):
+        can Memory.Allocate, Abort.Panic:
+            square: mutable Cell = Cell{x: 0.0, y: 0.0, side: 0.0}
+            for cell in 0..<(wide * tall) |list, paint, stage, wide, tall, walls, goals, traps, show_traps, square|:
+                cell_rect(&square, stage, wide, tall, cell)
+                side: f64 = square.side
+                if flag_at(walls, cell):
+                    put_rect(list, paint, square.x, square.y, side + 0.5,
+                             side + 0.5, color_wall())
+                elif flag_at(goals, cell):
+                    put_disc(list, paint, square.x + side / 2.0,
+                             square.y + side / 2.0, side * 0.16, color_goal())
+                elif show_traps and flag_at(traps, cell):
+                    # From inside a corridor a pocket is not something you can
+                    # look at, so the training wheels are worth rather more
+                    # here than on the flat screen.
+                    Display::draw_line(list, (square.x + side * 0.34) / paint.sx,
+                                       (square.y + side * 0.34) / paint.sy,
+                                       (square.x + side * 0.66) / paint.sx,
+                                       (square.y + side * 0.66) / paint.sy,
+                                       1.0 / paint.sx, color_trap())
+                    Display::draw_line(list, (square.x + side * 0.34) / paint.sx,
+                                       (square.y + side * 0.66) / paint.sy,
+                                       (square.x + side * 0.66) / paint.sx,
+                                       (square.y + side * 0.34) / paint.sy,
+                                       1.0 / paint.sx, color_trap())
+            # `sorted(level.boxes)`: the plan's boxes go down in CELL order and
+            # not in the frozenset's, which is the one place in the workshop a
+            # set is sorted before it is drawn.
+            for index in 0..<plan_boxes.count.i64() |list, paint, stage, wide, tall, plan_boxes, square|:
+                cell_rect(&square, stage, wide, tall, step_at(plan_boxes, index))
+                pad: f64 = square.side * 0.18
+                put_rect(list, paint, square.x + pad, square.y + pad,
+                         square.side - 2.0 * pad, square.side - 2.0 * pad,
+                         color_box())
+            cell_rect(&square, stage, wide, tall, plan_player)
+            put_disc(list, paint, square.x + square.side / 2.0,
+                     square.y + square.side / 2.0, square.side * 0.3,
+                     color_player())
+
+    def put_room(list: mutable Display::DisplayList&, paint: Paint&,
+                 stage: Stage&, sights: darray[Sight]&,
+                 live_boxes: darray[bool]&, goals: darray[bool]&):
+        can Memory.Allocate, Abort.Panic:
+            width: f64 = stage.width * VIEW_SHARE
+            middle: f64 = stage.bottom + stage.height / 2.0
+            ceiling: i64 = room_channel(paint.black, 0)
+            floor: i64 = room_channel(paint.black, 1)
+            put_rect(list, paint, stage.left, middle, width, stage.height / 2.0,
+                     Display::rgba(ceiling, ceiling, ceiling, 255))
+            put_rect(list, paint, stage.left, stage.bottom, width,
+                     stage.height / 2.0,
+                     Display::rgba(floor, floor, floor, 255))
+            columns: i64 = sights.count.i64()
+            step: f64 = width / columns.f64()
+            for column in 0..<columns |list, paint, stage, sights, live_boxes, goals, width, middle, step|:
+                seen: Sight = get sights[column.usize()] else Sight{distance: FAR, cell: -1, side: 0}
+                if seen.distance < FAR:
+                    reach: f64 = seen.distance if seen.distance > 0.15 else 0.15
+                    wanted: f64 = stage.height / reach
+                    tall: f64 = wanted if wanted < stage.height else stage.height
+                    put_rect(list, paint, stage.left + column.f64() * step,
+                             middle - tall / 2.0, step + 0.5, tall,
+                             face_color(paint, &seen, live_boxes, goals))
+
+    def face_color(paint: Paint&, seen: Sight&, live_boxes: darray[bool]&,
+                   goals: darray[bool]&) -> u32:
+        can Abort.Panic:
+            far: i64 = room_channel(paint.black, 3)
+            near_r: mutable i64 = room_channel(paint.black, 2)
+            near_g: mutable i64 = near_r
+            near_b: mutable i64 = near_r
+            if seen.cell >= 0 and flag_at(live_boxes, seen.cell):
+                shade: u32 = color_box_home() if flag_at(goals, seen.cell) else color_box()
+                near_r <- ((shade >> 24.u32()) & 255.u32()).i64()
+                near_g <- ((shade >> 16.u32()) & 255.u32()).i64()
+                near_b <- ((shade >> 8.u32()) & 255.u32()).i64()
+            lit: f64 = lit_of(seen.distance, seen.side)
+            return Display::rgba(mix(near_r, far, lit), mix(near_g, far, lit),
+                                 mix(near_b, far, lit), 255)
+
+    # Goals still wanting a box, hidden behind whatever is in front of them.
+    def put_marks(list: mutable Display::DisplayList&, paint: Paint&,
+                  stage: Stage&, marks: darray[Mark]&, sights: darray[Sight]&):
+        can Memory.Allocate, Abort.Panic:
+            width: f64 = stage.width * VIEW_SHARE
+            middle: f64 = stage.bottom + stage.height / 2.0
+            columns: i64 = sights.count.i64()
+            for index in 0..<marks.count.i64() |list, paint, stage, marks, sights, width, middle, columns|:
+                one: Mark = get marks[index.usize()] else Mark{across: 0.0, distance: 0.0}
+                column: i64 = (one.across * columns.f64()).i64()
+                if column >= 0 and column < columns:
+                    ahead: Sight = get sights[column.usize()] else Sight{distance: 0.0, cell: -1, side: 0}
+                    if ahead.distance > one.distance:
+                        reach: f64 = one.distance if one.distance > 0.5 else 0.5
+                        wanted: f64 = stage.height / reach * 0.30
+                        half: f64 = stage.height * 0.5
+                        size: f64 = wanted if wanted < half else half
+                        at_x: f64 = stage.left + one.across * width
+                        put_disc(list, paint, at_x, middle, size * 0.50, color_goal())
+                        put_disc(list, paint, at_x, middle, size * 0.34, paint.back)
