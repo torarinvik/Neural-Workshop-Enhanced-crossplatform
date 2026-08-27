@@ -1,0 +1,370 @@
+# The 3D Maze screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/youarehere.py -- the drawing, not the thinking.
+#
+# THREE BATCHES, drawn in a fixed order that nothing but `on_draw` knows:
+# the map, then the corridor, then the chrome. So the display list is in that
+# order too, and the chrome -- which is CREATED first -- comes out last.
+#
+# The corridor is a ceiling, a floor and one strip per ray. A strip beyond
+# FAR is not drawn at all; the rest are as tall as `height / distance`, capped
+# at the view's own height, and coloured by two things at once: how near the
+# wall is, and whether it is seen edge-on. A door keeps its own colour all the
+# way to the back and fades only towards the FAR-WALL grey rather than towards
+# the background, because a doorway you cannot make out at ten cells is a
+# landmark that only works once you no longer need it.
+#
+# The map shows the maze, where it began, where it lets out, and every door
+# and key in its colour. Everything about where the player IS is deliberately
+# absent: no marker, no facing, no trail, no dimming of what has been walked.
+# It is the same picture on the first step and the last.
+#
+# Both halves stop above the verdict band together. The corridor is painted in
+# greys, which are never a verdict; the MAP is not, and three of its key
+# colours pass through the reader's pattern on their way to the background.
+# Whether that landed in the band turned on the shape of the window rather
+# than on the deal, which is why nothing ever caught it.
+#
+# NOTE: needs elisacore_math, pymath, strings, ints, pyset, geometry, verdict,
+# display and scene_verdict included by the driver.
+
+module SceneYouAreHere:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_WALKING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    const VIEW_SHARE: f64 = 0.63
+    const MAP_SHARE: f64 = 0.33
+    # How near a wall has to be to be drawn at full strength, in cells, and
+    # how much of full strength one seen edge-on gets.
+    const NEAR: f64 = 3.0
+    const EDGE_ON: f64 = 0.68
+    const FAR: f64 = 10000.0
+
+    const MOTE_KEY: i64 = 0
+    const MOTE_WAY_OUT: i64 = 1
+
+    const KEY_COLOR_COUNT: i64 = 6
+
+    def color_wall() -> u32:
+        return Display::rgba(110, 110, 110, 255)
+
+    def color_walker() -> u32:
+        return Display::rgba(204, 121, 167, 255)
+
+    def key_color(which: i64) -> u32:
+        ring: i64 = which % KEY_COLOR_COUNT
+        if ring == 0:
+            return Display::rgba(230, 159, 0, 255)
+        if ring == 1:
+            return Display::rgba(86, 180, 233, 255)
+        if ring == 2:
+            return Display::rgba(0, 158, 115, 255)
+        if ring == 3:
+            return Display::rgba(240, 228, 66, 255)
+        if ring == 4:
+            return Display::rgba(0, 114, 178, 255)
+        return Display::rgba(213, 94, 0, 255)
+
+    # The four greys the corridor is made of: ceiling, floor, a wall up close,
+    # and a wall as far off as it ever gets. Set out flat rather than derived
+    # by fading everything towards the background -- which is what this did
+    # first and what did not work: at any distance worth having the wall, the
+    # floor and the ceiling all arrived at the same pale grey.
+    def room_channel(black_background: bool, which: i64) -> i64:
+        if black_background:
+            if which == 0:
+                return 18
+            if which == 1:
+                return 46
+            if which == 2:
+                return 200
+            return 88
+        if which == 0:
+            return 238
+        if which == 1:
+            return 212
+        if which == 2:
+            return 80
+        return 170
+
+    struct Sight:
+        distance: f64
+        cell: i64
+        side: i64
+
+    struct Mote:
+        what: i64
+        which: i64
+        across: f64
+        distance: f64
+
+    struct Paint:
+        ink: mutable u32
+        back: mutable u32
+        black: mutable bool
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     back: Display::rgba(back, back, back, 255),
+                     black: black_background,
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, wide: f64, tall: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               wide / paint.sx, tall / paint.sy, color)
+
+    def put_disc(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, radius: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_circle(list, x / paint.sx, y / paint.sy,
+                                 radius / paint.sx, color)
+
+    struct Stage:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def stage_of(out: mutable Stage&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 96.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 66.0).f64()).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.03
+            out.bottom <- bottom
+            out.width <- width * 0.94
+            out.height <- room if room > 60.0 else 60.0
+
+    # `int(round(back + (front - back) * lit))` a channel, half to EVEN.
+    def mix(front: i64, back: i64, lit: f64) -> i64:
+        can Abort.Panic:
+            return py_round_half_even(back.f64() + (front - back).f64() * lit)
+
+    def lit_of(distance: f64, side: i64) -> f64:
+        reach: f64 = distance if distance > 0.0 else 0.0
+        strength: f64 = NEAR / (NEAR + reach)
+        capped: f64 = strength if strength < 1.0 else strength
+        return capped * (EDGE_ON if side != 0 else 1.0)
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_maze: bool, wide: i64, tall: i64, walls: darray[i64]&,
+               doors: darray[i64]&, keys: darray[i64]&, start: i64,
+               way_out: i64, held: i64, sights: darray[Sight]&,
+               motes: darray[Mote]&, show_marks: bool, steps: i64, par: i64,
+               trial: i64, total_trials: i64, message: sview, verdict: i64,
+               verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            walking: bool = has_maze and (phase == PHASE_WALKING or phase == PHASE_SOLVED)
+            stage: mutable Stage = Stage{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            stage_of(&stage, paint.width, paint.height)
+
+            # The MAP batch first, because `on_draw` submits it first.
+            if has_maze:
+                put_map(list, paint, &stage, wide, tall, walls, doors, keys,
+                        start, way_out)
+
+            # Then the VIEW batch: the corridor, the marks in it, and the keys
+            # in your pocket.
+            if walking:
+                put_room(list, paint, &stage, sights, doors)
+                if show_marks:
+                    put_motes(list, paint, &stage, motes, sights)
+                put_held(list, paint, &stage, keys.count.i64(), held)
+
+            # And the chrome last, though it was made first.
+            put_text(list, paint, sview("3D Maze", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if has_maze and phase == PHASE_WALKING:
+                dstr_append_cstr(&status, "     maze ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "   ")
+                dstr_append_i64(&status, steps)
+                dstr_append_cstr(&status, " steps   ")
+                dstr_append_i64(&status, par)
+                dstr_append_cstr(&status, " at best")
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu   Space: start   Arrows: walk and turn   R: restart   C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+    def step_at(values: darray[i64]&, index: i64) -> i64:
+        can Abort.Panic:
+            return get values[index.usize()] else 0
+
+    struct Cell:
+        x: mutable f64
+        y: mutable f64
+        side: mutable f64
+
+    def cell_rect(out: mutable Cell&, stage: Stage&, wide: i64, tall: i64, cell: i64):
+        can Abort.Panic:
+            left: f64 = stage.left + stage.width * (1.0 - MAP_SHARE)
+            width: f64 = stage.width * MAP_SHARE
+            across: f64 = width / wide.f64()
+            down: f64 = stage.height / tall.f64()
+            side: f64 = across if across < down else down
+            offset_x: f64 = left + (width - side * wide.f64()) / 2.0
+            offset_y: f64 = stage.bottom + (stage.height - side * tall.f64()) / 2.0
+            out.x <- offset_x + (cell % wide).f64() * side
+            out.y <- offset_y + (tall - 1 - cell / wide).f64() * side
+            out.side <- side
+
+    def put_map(list: mutable Display::DisplayList&, paint: Paint&,
+                stage: Stage&, wide: i64, tall: i64, walls: darray[i64]&,
+                doors: darray[i64]&, keys: darray[i64]&, start: i64,
+                way_out: i64):
+        can Memory.Allocate, Abort.Panic:
+            square: mutable Cell = Cell{x: 0.0, y: 0.0, side: 0.0}
+            # The walls come out of a frozenset, so pyset supplies the order.
+            room_for: i64 = walls.count.i64() + 8
+            held: mutable PySet::Table = PySet::new(room_for)
+            for at in 0..<walls.count.i64() |held, walls|:
+                PySet::add(&held, step_at(walls, at))
+            order: mutable darray[i64] = Ints::zeros(room_for)
+            live: i64 = PySet::to_list(held, &order)
+            for at in 0..<live |list, paint, stage, wide, tall, order, square|:
+                cell_rect(&square, stage, wide, tall, Ints::at(order, at))
+                put_rect(list, paint, square.x, square.y, square.side + 0.5,
+                         square.side + 0.5, color_wall())
+            for colour in 0..<doors.count.i64() |list, paint, stage, wide, tall, doors, square|:
+                cell_rect(&square, stage, wide, tall, step_at(doors, colour))
+                put_rect(list, paint, square.x, square.y, square.side,
+                         square.side, key_color(colour))
+            for colour in 0..<keys.count.i64() |list, paint, stage, wide, tall, keys, square|:
+                cell_rect(&square, stage, wide, tall, step_at(keys, colour))
+                side: f64 = square.side
+                put_disc(list, paint, square.x + side / 2.0, square.y + side / 2.0,
+                         side * 0.42, paint.ink)
+                put_disc(list, paint, square.x + side / 2.0, square.y + side / 2.0,
+                         side * 0.32, key_color(colour))
+            # Where the maze began: a filled square in the walker's colour.
+            cell_rect(&square, stage, wide, tall, start)
+            put_rect(list, paint, square.x + square.side * 0.18,
+                     square.y + square.side * 0.18, square.side * 0.64,
+                     square.side * 0.64, color_walker())
+            # The way out: a RING, so it never reads as somebody standing there.
+            cell_rect(&square, stage, wide, tall, way_out)
+            put_disc(list, paint, square.x + square.side / 2.0,
+                     square.y + square.side / 2.0, square.side * 0.48, paint.ink)
+            put_disc(list, paint, square.x + square.side / 2.0,
+                     square.y + square.side / 2.0, square.side * 0.30, paint.back)
+
+    def put_room(list: mutable Display::DisplayList&, paint: Paint&,
+                 stage: Stage&, sights: darray[Sight]&, doors: darray[i64]&):
+        can Memory.Allocate, Abort.Panic:
+            width: f64 = stage.width * VIEW_SHARE
+            middle: f64 = stage.bottom + stage.height / 2.0
+            ceiling: i64 = room_channel(paint.black, 0)
+            floor: i64 = room_channel(paint.black, 1)
+            put_rect(list, paint, stage.left, middle, width, stage.height / 2.0,
+                     Display::rgba(ceiling, ceiling, ceiling, 255))
+            put_rect(list, paint, stage.left, stage.bottom, width,
+                     stage.height / 2.0,
+                     Display::rgba(floor, floor, floor, 255))
+            columns: i64 = sights.count.i64()
+            step: f64 = width / columns.f64()
+            for column in 0..<columns |list, paint, stage, sights, doors, width, middle, step, columns|:
+                seen: Sight = get sights[column.usize()] else Sight{distance: FAR, cell: -1, side: 0}
+                # A strip beyond FAR is not drawn at all.
+                if seen.distance < FAR:
+                    reach: f64 = seen.distance if seen.distance > 0.15 else 0.15
+                    wanted: f64 = stage.height / reach
+                    tall: f64 = wanted if wanted < stage.height else stage.height
+                    put_rect(list, paint, stage.left + column.f64() * step,
+                             middle - tall / 2.0, step + 0.5, tall,
+                             wall_color(paint, &seen, doors))
+
+    # Grey for a wall, and the door's own colour for a doorway.
+    def wall_color(paint: Paint&, seen: Sight&, doors: darray[i64]&) -> u32:
+        can Abort.Panic:
+            far: i64 = room_channel(paint.black, 3)
+            near_r: mutable i64 = room_channel(paint.black, 2)
+            near_g: mutable i64 = near_r
+            near_b: mutable i64 = near_r
+            for colour in 0..<doors.count.i64() |doors, seen, near_r, near_g, near_b|:
+                if step_at(doors, colour) == seen.cell:
+                    shade: u32 = key_color(colour)
+                    near_r <- ((shade >> 24.u32()) & 255.u32()).i64()
+                    near_g <- ((shade >> 16.u32()) & 255.u32()).i64()
+                    near_b <- ((shade >> 8.u32()) & 255.u32()).i64()
+                    break
+            lit: f64 = lit_of(seen.distance, seen.side)
+            return Display::rgba(mix(near_r, far, lit), mix(near_g, far, lit),
+                                 mix(near_b, far, lit), 255)
+
+    # Keys and the way out, hidden behind whatever is in front of them.
+    def put_motes(list: mutable Display::DisplayList&, paint: Paint&,
+                  stage: Stage&, motes: darray[Mote]&, sights: darray[Sight]&):
+        can Memory.Allocate, Abort.Panic:
+            width: f64 = stage.width * VIEW_SHARE
+            middle: f64 = stage.bottom + stage.height / 2.0
+            columns: i64 = sights.count.i64()
+            for index in 0..<motes.count.i64() |list, paint, stage, motes, sights, width, middle, columns|:
+                one: Mote = get motes[index.usize()] else Mote{what: 0, which: 0, across: 0.0, distance: 0.0}
+                column: i64 = (one.across * columns.f64()).i64()
+                if column >= 0 and column < columns:
+                    ahead: Sight = get sights[column.usize()] else Sight{distance: 0.0, cell: -1, side: 0}
+                    if ahead.distance > one.distance:
+                        reach: f64 = one.distance if one.distance > 0.5 else 0.5
+                        wanted: f64 = stage.height / reach * 0.34
+                        half: f64 = stage.height * 0.5
+                        size: f64 = wanted if wanted < half else half
+                        at_x: f64 = stage.left + one.across * width
+                        put_disc(list, paint, at_x, middle, size * 0.55, paint.ink)
+                        inner: u32 = paint.back if one.what == MOTE_WAY_OUT else key_color(one.which)
+                        put_disc(list, paint, at_x, middle, size * 0.42, inner)
+
+    # The keys in your pocket. Drawn INSIDE the view rather than on the margin
+    # below it: these pips are key colours too, and hanging them under the
+    # stage put them inside the band on any window that was wide enough.
+    def put_held(list: mutable Display::DisplayList&, paint: Paint&,
+                 stage: Stage&, keys: i64, held: i64):
+        can Memory.Allocate, Abort.Panic:
+            if keys == 0:
+                return
+            width: f64 = stage.width * VIEW_SHARE
+            wanted: f64 = width / 44.0
+            pip: f64 = wanted if wanted > 5.0 else 5.0
+            for colour in 0..<keys |list, paint, stage, pip, held|:
+                at_x: f64 = stage.left + pip * 2.2 * colour.f64() + pip
+                spot: f64 = stage.bottom + pip * 1.4
+                put_disc(list, paint, at_x, spot, pip * 0.62, paint.ink)
+                carried: bool = (held / (1 << colour)) % 2 == 1
+                put_disc(list, paint, at_x, spot, pip * 0.46,
+                         key_color(colour) if carried else paint.back)

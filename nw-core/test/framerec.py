@@ -117,6 +117,36 @@ def uninstall():
 def forget():
     """Drop every recorded widget without unpatching."""
     _LIVE.clear()
+    _BATCHES.clear()
+
+
+#: Batches in the order `on_draw` submits them, set by `set_batches`. A screen
+#: that keeps more than one batch draws them in a fixed order that pyglet knows
+#: nothing about -- the 3D Maze submits its map, then its corridor, then its
+#: chrome -- so the recorder cannot work it out and is told. Empty means one
+#: batch and no ordering to apply, which is every other screen.
+_BATCHES = []
+
+
+def set_batches(batches):
+    """Name the batches in the order the screen draws them."""
+    _BATCHES[:] = list(batches)
+
+
+def _batch_order(obj):
+    """Which batch this widget is in, as an index into `_BATCHES`.
+
+    A widget in no named batch sorts FIRST rather than last, because with no
+    batches named at all every widget lands here and the order is the serial
+    order the recorder has always used.
+    """
+    if not _BATCHES:
+        return -1
+    batch = getattr(obj, "batch", None)
+    for index, known in enumerate(_BATCHES):
+        if batch is known:
+            return index
+    return -1
 
 
 def _group_order(group):
@@ -345,8 +375,9 @@ def capture(want_invisible=False):
                 for point in extra.get("coordinates", ()):
                     cells.extend(_number(one, at)
                                  for at, one in enumerate(point))
-        rows.append((_group_order(getattr(obj, "group", None)), serial,
+        rows.append((_batch_order(obj),
+                     _group_order(getattr(obj, "group", None)), serial,
                      "|".join(cells)))
     _LIVE[:] = keep
-    rows.sort(key=lambda row: (row[0], row[1]))
-    return [row[2] for row in rows]
+    rows.sort(key=lambda row: (row[0], row[1], row[2]))
+    return [row[3] for row in rows]
