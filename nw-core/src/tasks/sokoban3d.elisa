@@ -1,0 +1,584 @@
+# 3D Sokoban: the same warehouse, from inside it, with a plan of it that was
+# true when you walked in and has been out of date since your first push.
+#
+# Port of neural_workshop/sokoban3d.py (GPL-2.0-or-later), on top of the ports
+# of the flat game (sokoban.elisa) and the 3D maze (youarehere.elisa) it is
+# built from -- the ladder is the flat game's own, so level six here is the
+# room level six is there.
+#
+# What is held in the head is not a position but a POSITION AND A WORLD,
+# updated by arithmetic you do yourself, once per action, without ever being
+# shown the answer. The plan on the wall is drawn once and never touched again.
+#
+# Two things carry the arithmetic:
+#
+#   * a box is a WALL THAT MOVES. The ray caster asks a world only how wide,
+#     how tall, and which cells are solid, so the eye here is the flat level's
+#     rock and its boxes in one set -- which is exactly the reading from inside
+#     a corridor.
+#   * the par is a step count, not a push count. A turn costs one, a walk costs
+#     one, and a bump costs nothing; walking BACKWARDS pushes just as well as
+#     walking forwards, so the search offers both and the par is a par of what
+#     the keys can really do.
+#
+# NOT PORTED, and the reason is worth stating precisely:
+#
+#   `_unwind`/`route` and the two foils (`push_forgetful`, `push_slipping`)
+#   that replay a route. Everything they need is here EXCEPT the tie-break.
+#   `_pushes_from` iterates `for box in boxes` over a Python FROZENSET, and the
+#   iteration order of a frozenset built by `(boxes - {box}) | {beyond}` is the
+#   slot order of a table whose layout depends on which of set_difference's two
+#   branches ran, on whether set_merge could copy a table wholesale, and on
+#   where the dummies fell. That order decides the `tick` a state is pushed
+#   with, and `tick` breaks ties in the heap, and the tie-break decides WHICH
+#   of several equally cheap routes comes back.
+#
+#   The par does not depend on it, and that is not a hope: Dijkstra's distance
+#   labels are order-independent, states settle in nondecreasing cost, and so
+#   the cost of the (budget+1)-th settled state -- which is what the bounded
+#   search reports when it runs out -- is the (budget+1)-th smallest distance
+#   whatever order the ties were broken in. So `par`, `certified` and the
+#   bound are exact here, and the boxes are iterated in ascending cell order.
+
+module Sokoban3D:
+
+    # How many states the step-minimum search settles before it gives up and
+    # reports its frontier instead. Far smaller than the flat game's push
+    # budget on purpose: every state settled here runs a little breadth-first
+    # sweep of its own to price the walking.
+    const STEP_BUDGET: i64 = 20000
+
+    const MOST_CELLS: i64 = 256
+    const BIG: i64 = 1073741824
+
+    # --- the eye ---------------------------------------------------------
+
+    # An adapter so youarehere.elisa's ray caster can look at a warehouse. It
+    # asks a world for three things -- how wide, how tall, and which cells are
+    # solid -- and has no opinion about what solid is made of.
+    struct Eye:
+        work: mutable Maze::Work
+        maze: mutable Maze::Layout
+
+    def new_eye() -> Eye:
+        can Memory.Allocate, Abort.Panic:
+            return Eye{work: Maze::work_new(8, 1), maze: Maze::blank()}
+
+    # The room as the eye finds it: rock and boxes, undistinguished.
+    def blocking(eye: mutable Eye&, level: mutable Sokoban::Level&, boxes_in: mutable darray[i64]&):
+        can Abort.Panic:
+            eye.work.width <- level.width
+            eye.work.height <- level.height
+            eye.work.cells <- level.cells
+            eye.maze.width <- level.width
+            eye.maze.height <- level.height
+            for cell in 0..<level.cells |eye, level, boxes_in|:
+                solid: bool = Ints::at_ref(&level.walls_in, cell) == 1 or Ints::at_ref(boxes_in, cell) == 1
+                Ints::put(&eye.work.open_flag, cell, 0 if solid else 1)
+
+    # --- standing in a warehouse -----------------------------------------
+
+    # The cell one step that way, or -1 when rock is in the way.
+    #
+    # Knows nothing about boxes -- a box is something you may be able to move,
+    # not something that is not there, and the two want telling apart.
+    def step_to(level: mutable Sokoban::Level&, cell: i64, facing: i64) -> i64:
+        can Abort.Panic:
+            x: i64 = cell % level.width
+            y: i64 = cell / level.width
+            nx: i64 = x + YouAreHere::facing_dx(facing)
+            ny: i64 = y + YouAreHere::facing_dy(facing)
+            -1 return if nx < 0 or nx >= level.width or ny < 0 or ny >= level.height
+            step: i64 = ny * level.width + nx
+            -1 return if Ints::at_ref(&level.walls_in, step) == 1
+            return step
+
+    # Which way a player starts out looking: the first direction clockwise from
+    # north with floor in it, so a room always opens onto somewhere rather than
+    # onto rock. Read off the WALLS and not off the boxes, so the same seed
+    # always faces the same way however the generator's walk left the load.
+    def facing_at(level: mutable Sokoban::Level&) -> i64:
+        can Abort.Panic:
+            for facing in 0..<4 |level|:
+                return facing if step_to(level, level.player, facing) >= 0
+            return 0
+
+    struct Step:
+        cell: i64
+        facing: i64
+        moved: bool
+        pushed: bool
+        # The box that moved and where it went, -1 when none did.
+        from_cell: i64
+        to_cell: i64
+
+    # Do one thing. Turning always works. Going forwards or backwards works
+    # when there is floor there; when a box is standing in it the box goes too,
+    # if the square beyond it is empty floor, and nothing at all happens if it
+    # is not.
+    #
+    # Walking BACKWARDS pushes just as well as walking forwards, which is not a
+    # flourish: a player who has just pushed a box is facing it, and reversing
+    # into the box behind them is often the cheapest next push there is.
+    def after(level: mutable Sokoban::Level&, boxes_in: mutable darray[i64]&, cell: i64, facing: i64, doing: i64) -> Step:
+        can Abort.Panic:
+            return Step{cell: cell, facing: (facing + 3) % 4, moved: false, pushed: false, from_cell: -1, to_cell: -1} if doing == YouAreHere::LEFT
+            return Step{cell: cell, facing: (facing + 1) % 4, moved: false, pushed: false, from_cell: -1, to_cell: -1} if doing == YouAreHere::RIGHT
+            way: i64 = facing if doing == YouAreHere::AHEAD else (facing + 2) % 4
+            step: i64 = step_to(level, cell, way)
+            stayed: Step = Step{cell: cell, facing: facing, moved: false, pushed: false, from_cell: -1, to_cell: -1}
+            stayed return if step < 0
+            if Ints::at_ref(boxes_in, step) == 1:
+                beyond: i64 = step_to(level, step, way)
+                stayed return if beyond < 0 or Ints::at_ref(boxes_in, beyond) == 1
+                return Step{cell: step, facing: facing, moved: true, pushed: true, from_cell: step, to_cell: beyond}
+            return Step{cell: step, facing: facing, moved: true, pushed: false, from_cell: -1, to_cell: -1}
+
+    # What one action is charged: one step, unless it was a bump.
+    #
+    # A turn always costs, which is the whole reason the par here is not the
+    # flat game's push count. Walking into rock, or shoving a box that will not
+    # go, costs nothing: what is in front of you is plainly visible from where
+    # you stand, so charging for the attempt would be charging for a typo.
+    def costs(doing: i64, moved: bool) -> i64:
+        can Abort.Panic:
+            return 1 if moved or doing == YouAreHere::LEFT or doing == YouAreHere::RIGHT
+            return 0
+
+    # Every box home.
+    def solved(level: mutable Sokoban::Level&, boxes_in: mutable darray[i64]&) -> bool:
+        can Abort.Panic:
+            for cell in 0..<level.cells |level, boxes_in|:
+                false return if Ints::at_ref(boxes_in, cell) == 1 and Ints::at_ref(&level.goals_in, cell) == 0
+            return true
+
+    # Which cells a player or a box may stand on.
+    def floor_of(level: mutable Sokoban::Level&, out: mutable darray[i64]&):
+        can Abort.Panic:
+            for cell in 0..<level.cells |level, out|:
+                x: i64 = cell % level.width
+                y: i64 = cell / level.width
+                inside: bool = x > 0 and x < level.width - 1 and y > 0 and y < level.height - 1
+                open_cell: bool = inside and Ints::at_ref(&level.walls_in, cell) == 0
+                Ints::put(out, cell, 1 if open_cell else 0)
+
+    # Provably lost, by the flat game's own test: a box standing where no push
+    # could ever bring it to a goal, or a box frozen off-goal. Both tests are
+    # sufficient but not exhaustive -- Sokoban hides deadlocks no cheap test
+    # catches -- so false means "not provably lost", never "still winnable".
+    def stuck(work: mutable Sokoban::Work&, level: mutable Sokoban::Level&, boxes_in: mutable darray[i64]&) -> bool:
+        can Abort.Panic:
+            work.width <- level.width
+            work.height <- level.height
+            work.cells <- level.cells
+            Sokoban::floor_flags(work, &level.walls_in)
+            Sokoban::live_cells(work, &level.goals_in)
+            Sokoban::mark_dead(work)
+            for cell in 0..<level.cells |level, work, boxes_in|:
+                continue if Ints::at_ref(boxes_in, cell) == 0
+                true return if Ints::at(work.alive_in, cell) == 0
+            for cell in 0..<level.cells |level, work, boxes_in|:
+                continue if Ints::at_ref(boxes_in, cell) == 0
+                continue if Ints::at_ref(&level.goals_in, cell) == 1
+                # A fresh `assumed` generation per box: the reference passes an
+                # empty frozenset at every top-level call.
+                work.assumed_gen <- work.assumed_gen + 1
+                true return if Sokoban::is_stuck(work, boxes_in, cell)
+            return false
+
+    # --- what a perfect run costs ----------------------------------------
+
+    # The cheapest walk from a pose to every (cell, facing), indexed
+    # `cell * 4 + facing`, -1 where there is no way at all. Turning and walking
+    # each cost one and a bump costs nothing, so plain breadth-first is already
+    # the shortest walk and there is nothing to weigh. Boxes are OBSTACLES
+    # here rather than things to push: this is the walking BETWEEN pushes, and
+    # a push is priced separately by the edge it opens.
+    def walk_cost(level: mutable Sokoban::Level&, boxes_in: mutable darray[i64]&, floor_ok: mutable darray[i64]&, cell: i64, facing: i64, reach: mutable darray[i64]&, queue: mutable darray[i64]&):
+        can Abort.Panic:
+            states: i64 = level.cells * 4
+            for at in 0..<states |reach|:
+                Ints::put(reach, at, -1)
+            first: i64 = cell * 4 + facing
+            Ints::put(reach, first, 0)
+            Ints::put(queue, 0, first)
+            queue_head: mutable i64 = 0
+            queue_end: mutable i64 = 1
+            while queue_head < queue_end |level, boxes_in, floor_ok, reach, queue, queue_head, queue_end|:
+                state: i64 = Ints::at_ref(queue, queue_head)
+                queue_head <- queue_head + 1
+                at_cell: i64 = state / 4
+                at_facing: i64 = state % 4
+                spent: i64 = Ints::at_ref(reach, state) + 1
+                for turn in 0..<2 |reach, queue, queue_end, at_cell, at_facing, spent|:
+                    turned: i64 = (at_facing + 3) % 4 if turn == 0 else (at_facing + 1) % 4
+                    below: i64 = at_cell * 4 + turned
+                    if Ints::at_ref(reach, below) < 0:
+                        Ints::put(reach, below, spent)
+                        Ints::put(queue, queue_end, below)
+                        queue_end <- queue_end + 1
+                for direction in 0..<2 |level, boxes_in, floor_ok, reach, queue, queue_end, at_cell, at_facing, spent|:
+                    way: i64 = at_facing if direction == 0 else (at_facing + 2) % 4
+                    step: i64 = step_to(level, at_cell, way)
+                    continue if step < 0 or Ints::at_ref(boxes_in, step) == 1 or Ints::at_ref(floor_ok, step) == 0
+                    below: i64 = step * 4 + at_facing
+                    if Ints::at_ref(reach, below) < 0:
+                        Ints::put(reach, below, spent)
+                        Ints::put(queue, queue_end, below)
+                        queue_end <- queue_end + 1
+
+    # --- the step-minimum search -----------------------------------------
+
+    const STATE_WORDS: i64 = 4
+    const NODE_CAP: i64 = 150000
+    const HEAP_CAP: i64 = 300000
+    const HASH_SLOTS: i64 = 1048576
+    const HASH_MASK: i64 = 1048575
+
+    struct Search:
+        count: mutable i64
+        full: mutable bool
+        words: mutable darray[i64]
+        anchor: mutable darray[i64]
+        best: mutable darray[i64]
+        head: mutable darray[i64]
+        next: mutable darray[i64]
+        heap_count: mutable i64
+        heap_cost: mutable darray[i64]
+        heap_tick: mutable darray[i64]
+        heap_node: mutable darray[i64]
+        # Scratch, sized once.
+        mask: mutable darray[i64]
+        moved: mutable darray[i64]
+        boxes_flags: mutable darray[i64]
+        moved_flags: mutable darray[i64]
+        floor_ok: mutable darray[i64]
+        reach: mutable darray[i64]
+        queue: mutable darray[i64]
+        box_list: mutable darray[i64]
+
+    def new_search() -> Search:
+        can Memory.Allocate, Abort.Panic:
+            return Search{count: 0, full: false,
+                          words: Ints::zeros(NODE_CAP * STATE_WORDS),
+                          anchor: Ints::zeros(NODE_CAP), best: Ints::zeros(NODE_CAP),
+                          head: Ints::zeros(HASH_SLOTS), next: Ints::zeros(NODE_CAP),
+                          heap_count: 0, heap_cost: Ints::zeros(HEAP_CAP),
+                          heap_tick: Ints::zeros(HEAP_CAP), heap_node: Ints::zeros(HEAP_CAP),
+                          mask: Ints::zeros(STATE_WORDS), moved: Ints::zeros(STATE_WORDS),
+                          boxes_flags: Ints::zeros(MOST_CELLS), moved_flags: Ints::zeros(MOST_CELLS),
+                          floor_ok: Ints::zeros(MOST_CELLS),
+                          reach: Ints::zeros(MOST_CELLS * 4), queue: Ints::zeros(MOST_CELLS * 4),
+                          box_list: Ints::zeros(MOST_CELLS)}
+
+    def mask_clear(words: mutable darray[i64]&, base: i64):
+        can Abort.Panic:
+            for at in 0..<STATE_WORDS |words, base|:
+                Ints::put(words, base + at, 0)
+
+    def mask_set_bit(words: mutable darray[i64]&, base: i64, cell: i64):
+        can Abort.Panic:
+            word: i64 = base + cell / 64
+            Ints::put(words, word, Ints::at_ref(words, word) | (1 << (cell % 64).u64()))
+
+    def mask_clear_bit(words: mutable darray[i64]&, base: i64, cell: i64):
+        can Abort.Panic:
+            word: i64 = base + cell / 64
+            Ints::put(words, word, Ints::at_ref(words, word) & ~(1 << (cell % 64).u64()))
+
+    def mask_has(words: mutable darray[i64]&, base: i64, cell: i64) -> bool:
+        can Abort.Panic:
+            return (Ints::at_ref(words, base + cell / 64) & (1 << (cell % 64).u64())) != 0
+
+    def state_hash(words: mutable darray[i64]&, base: i64, anchor: i64) -> i64:
+        can Abort.Panic:
+            mixed: mutable u64 = 14695981039346656037.u64()
+            for at in 0..<STATE_WORDS |words, base, mixed|:
+                mixed <- (mixed ^ Ints::at_ref(words, base + at).u64()) * 1099511628211.u64()
+            mixed <- (mixed ^ anchor.u64()) * 1099511628211.u64()
+            return (mixed >> 13.u64()).i64() & HASH_MASK
+
+    # The node for (box mask, anchor), created on first sight. -1 when the
+    # table is full, which the caller turns into a refusal rather than a wrong
+    # answer.
+    def node_of(search: mutable Search&, words: mutable darray[i64]&, base: i64, anchor: i64) -> i64:
+        can Abort.Panic:
+            slot: i64 = state_hash(words, base, anchor)
+            probe: mutable i64 = Ints::at_ref(&search.head, slot) - 1
+            while probe >= 0 |search, words, base, anchor, probe|:
+                same: mutable bool = Ints::at_ref(&search.anchor, probe) == anchor
+                for at in 0..<STATE_WORDS |search, words, base, probe, same|:
+                    same <- false if Ints::at_ref(&search.words, probe * STATE_WORDS + at) != Ints::at_ref(words, base + at)
+                probe return if same
+                probe <- Ints::at_ref(&search.next, probe) - 1
+            -1 return if search.count >= NODE_CAP
+            fresh: i64 = search.count
+            search.count <- search.count + 1
+            for at in 0..<STATE_WORDS |search, words, base, fresh|:
+                Ints::put(&search.words, fresh * STATE_WORDS + at, Ints::at_ref(words, base + at))
+            Ints::put(&search.anchor, fresh, anchor)
+            Ints::put(&search.best, fresh, BIG)
+            Ints::put(&search.next, fresh, Ints::at_ref(&search.head, slot))
+            Ints::put(&search.head, slot, fresh + 1)
+            return fresh
+
+    def heap_push(search: mutable Search&, cost: i64, tick: i64, node: i64):
+        can Abort.Panic:
+            return if search.heap_count >= HEAP_CAP
+            at: mutable i64 = search.heap_count
+            search.heap_count <- search.heap_count + 1
+            Ints::put(&search.heap_cost, at, cost)
+            Ints::put(&search.heap_tick, at, tick)
+            Ints::put(&search.heap_node, at, node)
+            climbing: mutable bool = true
+            while climbing and at > 0 |search, at, climbing|:
+                parent: i64 = (at - 1) / 2
+                parent_cost: i64 = Ints::at_ref(&search.heap_cost, parent)
+                parent_tick: i64 = Ints::at_ref(&search.heap_tick, parent)
+                mine_cost: i64 = Ints::at_ref(&search.heap_cost, at)
+                mine_tick: i64 = Ints::at_ref(&search.heap_tick, at)
+                above: bool = parent_cost < mine_cost or (parent_cost == mine_cost and parent_tick < mine_tick)
+                if above:
+                    climbing <- false
+                else:
+                    held_cost: i64 = parent_cost
+                    held_tick: i64 = parent_tick
+                    held_node: i64 = Ints::at_ref(&search.heap_node, parent)
+                    Ints::put(&search.heap_cost, parent, mine_cost)
+                    Ints::put(&search.heap_tick, parent, mine_tick)
+                    Ints::put(&search.heap_node, parent, Ints::at_ref(&search.heap_node, at))
+                    Ints::put(&search.heap_cost, at, held_cost)
+                    Ints::put(&search.heap_tick, at, held_tick)
+                    Ints::put(&search.heap_node, at, held_node)
+                    at <- parent
+
+    # The heap's key is (cost, tick) and ticks are unique, so the order is
+    # TOTAL: any correct binary heap pops the same sequence heapq does.
+    def heap_pop(search: mutable Search&) -> i64:
+        can Abort.Panic:
+            -1 return if search.heap_count == 0
+            top: i64 = Ints::at_ref(&search.heap_node, 0)
+            search.heap_count <- search.heap_count - 1
+            last: i64 = search.heap_count
+            Ints::put(&search.heap_cost, 0, Ints::at_ref(&search.heap_cost, last))
+            Ints::put(&search.heap_tick, 0, Ints::at_ref(&search.heap_tick, last))
+            Ints::put(&search.heap_node, 0, Ints::at_ref(&search.heap_node, last))
+            at: mutable i64 = 0
+            sinking: mutable bool = true
+            while sinking |search, at, sinking, last|:
+                left: i64 = at * 2 + 1
+                right: i64 = left + 1
+                small: mutable i64 = at
+                if left < last:
+                    if Ints::at_ref(&search.heap_cost, left) < Ints::at_ref(&search.heap_cost, small) or (Ints::at_ref(&search.heap_cost, left) == Ints::at_ref(&search.heap_cost, small) and Ints::at_ref(&search.heap_tick, left) < Ints::at_ref(&search.heap_tick, small)):
+                        small <- left
+                if right < last:
+                    if Ints::at_ref(&search.heap_cost, right) < Ints::at_ref(&search.heap_cost, small) or (Ints::at_ref(&search.heap_cost, right) == Ints::at_ref(&search.heap_cost, small) and Ints::at_ref(&search.heap_tick, right) < Ints::at_ref(&search.heap_tick, small)):
+                        small <- right
+                if small == at:
+                    sinking <- false
+                else:
+                    held_cost: i64 = Ints::at_ref(&search.heap_cost, at)
+                    held_tick: i64 = Ints::at_ref(&search.heap_tick, at)
+                    held_node: i64 = Ints::at_ref(&search.heap_node, at)
+                    Ints::put(&search.heap_cost, at, Ints::at_ref(&search.heap_cost, small))
+                    Ints::put(&search.heap_tick, at, Ints::at_ref(&search.heap_tick, small))
+                    Ints::put(&search.heap_node, at, Ints::at_ref(&search.heap_node, small))
+                    Ints::put(&search.heap_cost, small, held_cost)
+                    Ints::put(&search.heap_tick, small, held_tick)
+                    Ints::put(&search.heap_node, small, held_node)
+                    at <- small
+            return top
+
+    def heap_top_cost(search: mutable Search&) -> i64:
+        can Abort.Panic:
+            return Ints::at_ref(&search.heap_cost, 0)
+
+    struct Solution:
+        found: bool
+        steps: i64
+        bound: i64
+        # True when the node table filled: a refusal, never a wrong answer.
+        table_full: bool
+
+    # (exact minimum steps or none, proven lower bound).
+    #
+    # Dijkstra over (boxes, cell, facing), contracted so that one edge is "walk
+    # to somewhere you can push from, and push". The walk is priced by
+    # `walk_cost` and the push costs one on top, so the total is exactly what a
+    # player at the keyboard would spend.
+    #
+    # The lower bound costs nothing extra. States SETTLE in order of cost, so
+    # when the budget dies every run still out there costs at least what the
+    # frontier is holding -- and the flat game's certified push count is a
+    # second lower bound for free, since every push is a step. The larger of
+    # the two is reported and neither is a guess.
+    #
+    # A position is only known to be minimal when it comes OFF the heap, not
+    # when it is generated: edges here cost anything from one step to a walk
+    # across the room, so the first solved position the search generates is
+    # routinely not the cheapest one.
+    def solve_bounded(search: mutable Search&, work: mutable Sokoban::Work&, level: mutable Sokoban::Level&, budget: i64, boxes_in: mutable darray[i64]&, from_cell: i64, from_facing: i64) -> Solution:
+        can Abort.Panic:
+            pushes_at_least: i64 = level.minimum if level.minimum >= 0 else level.at_least
+            return Solution{found: true, steps: 0, bound: 0, table_full: false} if solved(level, boxes_in)
+            work.width <- level.width
+            work.height <- level.height
+            work.cells <- level.cells
+            Sokoban::floor_flags(work, &level.walls_in)
+            Sokoban::live_cells(work, &level.goals_in)
+            floor_of(level, &search.floor_ok)
+            for cell in 0..<level.cells |level, work, boxes_in|:
+                continue if Ints::at_ref(boxes_in, cell) == 0
+                # Already lost; nothing to certify.
+                return Solution{found: false, steps: 0, bound: 0, table_full: false} if Ints::at(work.alive_in, cell) == 0
+
+            search.count <- 0
+            search.full <- false
+            search.heap_count <- 0
+            for slot in 0..<HASH_SLOTS |search|:
+                Ints::put(&search.head, slot, 0)
+            mask_clear(&search.mask, 0)
+            for cell in 0..<level.cells |search, level, boxes_in|:
+                mask_set_bit(&search.mask, 0, cell) if Ints::at_ref(boxes_in, cell) == 1
+            start: i64 = node_of(search, &search.mask, 0, from_cell * 4 + from_facing)
+            Ints::put(&search.best, start, 0)
+            heap_push(search, 0, 0, start)
+            tick: mutable i64 = 0
+            settled: mutable i64 = 0
+            answer: mutable Solution = Solution{found: false, steps: 0, bound: pushes_at_least, table_full: false}
+            running: mutable bool = true
+            while running and search.heap_count > 0 |search, work, level, budget, running, answer, tick, settled|:
+                spent: i64 = heap_top_cost(search)
+                state: i64 = heap_pop(search)
+                # A cheaper way there already went.
+                continue if spent > Ints::at_ref(&search.best, state)
+                for cell in 0..<level.cells |search, level, state|:
+                    Ints::put(&search.boxes_flags, cell, 1 if mask_has(&search.words, state * STATE_WORDS, cell) else 0)
+                if solved(level, &search.boxes_flags):
+                    answer <- Solution{found: true, steps: spent, bound: spent, table_full: false}
+                    running <- false
+                else:
+                    settled <- settled + 1
+                    if settled > budget:
+                        larger: i64 = spent if spent > answer.bound else answer.bound
+                        answer <- Solution{found: false, steps: 0, bound: larger, table_full: false}
+                        running <- false
+                    else:
+                        anchor: i64 = Ints::at_ref(&search.anchor, state)
+                        walk_cost(level, &search.boxes_flags, &search.floor_ok, anchor / 4, anchor % 4, &search.reach, &search.queue)
+                        box_count: mutable i64 = 0
+                        for cell in 0..<level.cells |search, level, box_count|:
+                            if Ints::at_ref(&search.boxes_flags, cell) == 1:
+                                Ints::put(&search.box_list, box_count, cell)
+                                box_count <- box_count + 1
+                        for slot in 0..<box_count |search, work, level, spent, state, tick, running, answer|:
+                            box: i64 = Ints::at_ref(&search.box_list, slot)
+                            for facing in 0..<4 |search, work, level, spent, state, tick, running, answer, box|:
+                                stride: i64 = YouAreHere::facing_dy(facing) * level.width + YouAreHere::facing_dx(facing)
+                                behind: i64 = box - stride
+                                beyond: i64 = box + stride
+                                continue if behind < 0 or behind >= level.cells or beyond < 0 or beyond >= level.cells
+                                continue if Ints::at_ref(&search.floor_ok, behind) == 0 or Ints::at_ref(&search.boxes_flags, behind) == 1
+                                continue if Ints::at_ref(&search.floor_ok, beyond) == 0 or Ints::at_ref(&search.boxes_flags, beyond) == 1
+                                continue if Ints::at(work.alive_in, beyond) == 0
+                                for at in 0..<STATE_WORDS |search, state|:
+                                    Ints::put(&search.moved, at, Ints::at_ref(&search.words, state * STATE_WORDS + at))
+                                mask_clear_bit(&search.moved, 0, box)
+                                mask_set_bit(&search.moved, 0, beyond)
+                                for standing_at in 0..<2 |search, spent, tick, running, answer, box, behind, facing|:
+                                    standing: i64 = facing if standing_at == 0 else (facing + 2) % 4
+                                    walked: i64 = Ints::at_ref(&search.reach, behind * 4 + standing)
+                                    continue if walked < 0
+                                    total: i64 = spent + walked + 1
+                                    below: i64 = node_of(search, &search.moved, 0, box * 4 + standing)
+                                    if below < 0:
+                                        search.full <- true
+                                        answer <- Solution{found: false, steps: 0, bound: 0, table_full: true}
+                                        running <- false
+                                    else:
+                                        if total < Ints::at_ref(&search.best, below):
+                                            Ints::put(&search.best, below, total)
+                                            tick <- tick + 1
+                                            heap_push(search, total, tick, below)
+            return answer
+
+    # What a run is judged against: the exact step minimum, or the proven lower
+    # bound where the search could not afford one.
+    def par(search: mutable Search&, work: mutable Sokoban::Work&, level: mutable Sokoban::Level&, budget: i64) -> i64:
+        can Abort.Panic:
+            found: Solution = solve_bounded(search, work, level, budget, &level.boxes_in, level.player, facing_at(level))
+            return found.bound if not found.found else found.steps
+
+    # Whether the par is a minimum rather than a proven lower bound.
+    def certified(search: mutable Search&, work: mutable Sokoban::Work&, level: mutable Sokoban::Level&, budget: i64) -> bool:
+        can Abort.Panic:
+            return solve_bounded(search, work, level, budget, &level.boxes_in, level.player, facing_at(level)).found
+
+    # --- what can be seen -------------------------------------------------
+
+    struct Marks:
+        count: mutable i64
+        cell: mutable darray[i64]
+        across: mutable darray[f64]
+        distance: mutable darray[f64]
+
+    def new_marks() -> Marks:
+        can Memory.Allocate, Abort.Panic:
+            return Marks{count: 0, cell: Ints::zeros(MOST_CELLS),
+                         across: Floats::zeros(MOST_CELLS), distance: Floats::zeros(MOST_CELLS)}
+
+    # Insertion sort, farthest first, and STABLE -- which is what Python's
+    # `sort(key=lambda mote: -mote.distance)` is.
+    def sort_marks(out: mutable Marks&):
+        can Abort.Panic:
+            for index in 1..<out.count |out|:
+                at: mutable i64 = index - 1
+                cell: i64 = Ints::at_ref(&out.cell, index)
+                across: f64 = Floats::at_ref(&out.across, index)
+                distance: f64 = Floats::at_ref(&out.distance, index)
+                placing: mutable bool = true
+                while placing and at >= 0 |out, at, placing, distance|:
+                    if Floats::at_ref(&out.distance, at) < distance:
+                        Ints::put(&out.cell, at + 1, Ints::at_ref(&out.cell, at))
+                        Floats::put(&out.across, at + 1, Floats::at_ref(&out.across, at))
+                        Floats::put(&out.distance, at + 1, Floats::at_ref(&out.distance, at))
+                        at <- at - 1
+                    else:
+                        placing <- false
+                Ints::put(&out.cell, at + 1, cell)
+                Floats::put(&out.across, at + 1, across)
+                Floats::put(&out.distance, at + 1, distance)
+
+    # The goals still wanting a box, as seen from a pose.
+    #
+    # The plan already says where every goal is, so catching sight of one is
+    # what lets a player who has been counting corridors check its answer.
+    # BOXES ARE NOT MARKS: they are solid, they are in the view already, and a
+    # box drawn as a hovering ring as well as a block would say twice over what
+    # the eye can see once.
+    def marks(eye: mutable Eye&, level: mutable Sokoban::Level&, boxes_in: mutable darray[i64]&, cell: i64, facing: i64, fov: f64, out: mutable Marks&):
+        can Abort.Panic:
+            blocking(eye, level, boxes_in)
+            out.count <- 0
+            from_x: f64 = (cell % level.width).f64() + 0.5
+            from_y: f64 = (cell / level.width).f64() + 0.5
+            face_x: f64 = YouAreHere::facing_dx(facing).f64()
+            face_y: f64 = YouAreHere::facing_dy(facing).f64()
+            edge: f64 = tan(fov / 2.0)
+            # `sorted(level.goals - boxes)`: ascending cell order.
+            for goal in 0..<level.cells |eye, level, boxes_in, out, from_x, from_y, face_x, face_y, edge, cell|:
+                continue if Ints::at_ref(&level.goals_in, goal) == 0 or Ints::at_ref(boxes_in, goal) == 1
+                at_x: f64 = (goal % level.width).f64() + 0.5 - from_x
+                at_y: f64 = (goal / level.width).f64() + 0.5 - from_y
+                depth: f64 = at_x * face_x + at_y * face_y
+                continue if depth <= 0.05
+                sideways: f64 = at_x * (0.0 - face_y) + at_y * face_x
+                across: f64 = (sideways / depth / edge + 1.0) / 2.0
+                continue if across < -0.2 or across > 1.2
+                continue if not YouAreHere::clear_between(&eye.work, &eye.maze, cell, goal)
+                Ints::put(&out.cell, out.count, goal)
+                Floats::put(&out.across, out.count, across)
+                Floats::put(&out.distance, out.count, depth)
+                out.count <- out.count + 1
+            sort_marks(out)

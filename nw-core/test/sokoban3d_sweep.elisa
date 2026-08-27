@@ -1,0 +1,235 @@
+# Differential sweep driver for tasks/sokoban3d.elisa. See sokoban3d_diff.py
+# for the reference side.
+#
+# The warehouses are BUILT rather than generated. The flat game's generator
+# needs its own solver on every attempt, which is minutes per rung in pure
+# Python; what is under test here is the first-person arithmetic on top of a
+# level, so both sides raise the same rooms from the same recipe and the
+# generator is left to sokoban's own suite.
+#
+# What is swept: the step, the push (forwards AND backwards -- reversing into a
+# box pushes it), what each key costs, the frozen-position test, the walking
+# between pushes, the step minimum and its bound, and what the eye finds --
+# rays that stop on a box exactly as they stop on rock.
+#
+# The route and the two foils are not swept, because they are not ported: see
+# the module comment for why the tie-break they depend on is a frozenset's slot
+# order and why the par is not.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_rng.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/pyrandom.elisa"
+include "../src/pymath.elisa"
+include "../src/tasks/ints.elisa"
+include "../src/tasks/pyset.elisa"
+include "../src/tasks/maze.elisa"
+include "../src/tasks/youarehere.elisa"
+include "../src/tasks/sokoban.elisa"
+include "../src/tasks/sokoban3d.elisa"
+
+# printr(i64) and int_to_string_scratch both trip a stage1 backend decline of
+# store_* generics (repro/nw_print_int_generic_stage1.elisa), so format by hand.
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr(",")
+        print_i64(value)
+
+def emit_scaled(value: f64):
+    can Console.Write, Abort.Panic:
+        emit_cell(py_round_half_even(value * 1000000.0))
+
+# The recipe both sides raise their warehouses from. A wall border, interior
+# rock on a fixed lattice, the player on the first interior floor cell, the
+# goals on the last few and the boxes on every other one from the second.
+def build_level(level: mutable Sokoban::Level&, spec: i64) -> bool:
+    can Abort.Panic:
+        width: i64 = 7 + spec % 3
+        height: i64 = 6 + (spec / 4) % 3
+        cells: i64 = width * height
+        level.width <- width
+        level.height <- height
+        level.cells <- cells
+        level.minimum <- -1
+        level.at_least <- 2
+        level.bound <- 20
+        level.traps_n <- 0
+        for cell in 0..<cells |level, width, height, spec|:
+            x: i64 = cell % width
+            y: i64 = cell / width
+            border: bool = x == 0 or y == 0 or x == width - 1 or y == height - 1
+            rock: bool = border or ((x * 3 + y * 5 + spec) % 11) == 0
+            Ints::put(&level.walls_in, cell, 1 if rock else 0)
+            Ints::put(&level.goals_in, cell, 0)
+            Ints::put(&level.boxes_in, cell, 0)
+        floor_list: mutable darray[i64] = Ints::zeros(Sokoban::MOST_CELLS)
+        floor_n: mutable i64 = 0
+        for cell in 0..<cells |level, floor_list, floor_n|:
+            if Ints::at_ref(&level.walls_in, cell) == 0:
+                Ints::put(&floor_list, floor_n, cell)
+                floor_n <- floor_n + 1
+        boxes: i64 = 2 + spec % 2
+        false return if floor_n < 2 * boxes + 2
+        level.player <- Ints::at_ref(&floor_list, 0)
+        for k in 0..<boxes |level, floor_list, floor_n|:
+            Ints::put(&level.goals_in, Ints::at_ref(&floor_list, floor_n - 1 - k), 1)
+            Ints::put(&level.boxes_in, Ints::at_ref(&floor_list, 1 + 2 * k), 1)
+        level.ok <- true
+        return true
+
+def emit_grid(level: mutable Sokoban::Level&, grid: mutable darray[i64]&):
+    can Console.Write, Abort.Panic:
+        for cell in 0..<level.cells |grid|:
+            emit_cell(Ints::at_ref(grid, cell))
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region w(512 * 1024 * 1024)
+        in w:
+            level: mutable Sokoban::Level = Sokoban::Level()
+            work: mutable Sokoban::Work = Sokoban::Work()
+            search: mutable Sokoban3D::Search = Sokoban3D::new_search()
+            eye: mutable Sokoban3D::Eye = Sokoban3D::new_eye()
+            marks: mutable Sokoban3D::Marks = Sokoban3D::new_marks()
+            floor_ok: mutable darray[i64] = Ints::zeros(Sokoban::MOST_CELLS)
+            boxes: mutable darray[i64] = Ints::zeros(Sokoban::MOST_CELLS)
+            reach: mutable darray[i64] = Ints::zeros(Sokoban::MOST_CELLS * 4)
+            queue: mutable darray[i64] = Ints::zeros(Sokoban::MOST_CELLS * 4)
+            rays: mutable darray[f64] = Floats::zeros(64)
+            ray_cell: mutable darray[i64] = Ints::zeros(64)
+            ray_side: mutable darray[i64] = Ints::zeros(64)
+
+            for spec in 0..<24 |level, work, search, eye, marks, floor_ok, boxes, reach, queue, rays, ray_cell, ray_side|:
+                laid: bool = build_level(&level, spec)
+                printr("level")
+                emit_cell(spec)
+                emit_cell(1 if laid else 0)
+                if not laid:
+                    print("")
+                    continue
+                emit_cell(level.width)
+                emit_cell(level.height)
+                emit_cell(level.player)
+                emit_grid(&level, &level.walls_in)
+                emit_grid(&level, &level.goals_in)
+                emit_grid(&level, &level.boxes_in)
+                print("")
+
+                Sokoban3D::floor_of(&level, &floor_ok)
+                printr("floor")
+                emit_cell(spec)
+                emit_cell(Sokoban3D::facing_at(&level))
+                emit_grid(&level, &floor_ok)
+                print("")
+
+                printr("steps")
+                emit_cell(spec)
+                for cell in 0..<level.cells |level|:
+                    for facing in 0..<4 |level, cell|:
+                        emit_cell(Sokoban3D::step_to(&level, cell, facing))
+                print("")
+
+                # A scripted walk: turn, walk, reverse, and shove. Reversing
+                # into a box pushes it, which is the branch a port most often
+                # loses.
+                for cell in 0..<level.cells |level, boxes|:
+                    Ints::put(&boxes, cell, Ints::at_ref(&level.boxes_in, cell))
+                at_cell: mutable i64 = level.player
+                at_facing: mutable i64 = Sokoban3D::facing_at(&level)
+                spent: mutable i64 = 0
+                for press in 0..<80 |level, boxes, at_cell, at_facing, spent, spec|:
+                    doing: i64 = (press * 7 + spec * 3) % 4
+                    moved: Sokoban3D::Step = Sokoban3D::after(&level, &boxes, at_cell, at_facing, doing)
+                    if moved.pushed:
+                        Ints::put(&boxes, moved.from_cell, 0)
+                        Ints::put(&boxes, moved.to_cell, 1)
+                    at_cell <- moved.cell
+                    at_facing <- moved.facing
+                    spent <- spent + Sokoban3D::costs(doing, moved.moved)
+                    printr("walk")
+                    emit_cell(spec)
+                    emit_cell(press)
+                    emit_cell(doing)
+                    emit_cell(at_cell)
+                    emit_cell(at_facing)
+                    emit_cell(1 if moved.moved else 0)
+                    emit_cell(1 if moved.pushed else 0)
+                    emit_cell(spent)
+                    emit_cell(1 if Sokoban3D::solved(&level, &boxes) else 0)
+                    emit_cell(1 if Sokoban3D::stuck(&work, &level, &boxes) else 0)
+                    emit_grid(&level, &boxes)
+                    print("")
+
+                # The walking between pushes, from the start pose and from the
+                # one the scripted walk left the body in.
+                for which in 0..<2 |level, boxes, floor_ok, reach, queue, at_cell, at_facing, spec|:
+                    from_cell: i64 = level.player if which == 0 else at_cell
+                    from_facing: i64 = Sokoban3D::facing_at(&level) if which == 0 else at_facing
+                    Sokoban3D::walk_cost(&level, &level.boxes_in, &floor_ok, from_cell, from_facing, &reach, &queue)
+                    printr("reach")
+                    emit_cell(spec)
+                    emit_cell(which)
+                    for at in 0..<(level.cells * 4) |reach|:
+                        emit_cell(Ints::at_ref(&reach, at))
+                    print("")
+
+                # The step minimum, and the bound when the budget bites.
+                for budget in [40, 4000] |level, work, search, spec|:
+                    answer: Sokoban3D::Solution = Sokoban3D::solve_bounded(&search, &work, &level, budget, &level.boxes_in, level.player, Sokoban3D::facing_at(&level))
+                    printr("par")
+                    emit_cell(spec)
+                    emit_cell(budget)
+                    emit_cell(1 if answer.found else 0)
+                    emit_cell(answer.steps)
+                    emit_cell(answer.bound)
+                    emit_cell(1 if answer.table_full else 0)
+                    print("")
+
+                # What the eye finds. A box stops a ray exactly as rock does.
+                Sokoban3D::blocking(&eye, &level, &level.boxes_in)
+                for facing in 0..<4 |level, eye, marks, rays, ray_cell, ray_side, spec|:
+                    pose: YouAreHere::Pose = YouAreHere::Pose{cell: level.player, facing: facing}
+                    YouAreHere::look(&eye.work, &eye.maze, pose, 24, 1.5707963267948966, &rays, &ray_cell, &ray_side)
+                    printr("view")
+                    emit_cell(spec)
+                    emit_cell(facing)
+                    for column in 0..<24 |rays, ray_cell, ray_side|:
+                        emit_scaled(Floats::at_ref(&rays, column))
+                        emit_cell(Ints::at_ref(&ray_cell, column))
+                        emit_cell(Ints::at_ref(&ray_side, column))
+                    print("")
+                    Sokoban3D::marks(&eye, &level, &level.boxes_in, level.player, facing, 1.5707963267948966, &marks)
+                    printr("marks")
+                    emit_cell(spec)
+                    emit_cell(facing)
+                    emit_cell(marks.count)
+                    for at in 0..<marks.count |marks|:
+                        emit_cell(Ints::at_ref(&marks.cell, at))
+                        emit_scaled(Floats::at_ref(&marks.across, at))
+                        emit_scaled(Floats::at_ref(&marks.distance, at))
+                    print("")
+        destroy w
+        return 0
