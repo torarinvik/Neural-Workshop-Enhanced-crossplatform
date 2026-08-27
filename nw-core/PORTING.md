@@ -258,6 +258,74 @@ opt -passes='default<O2>' -o /tmp/x.bc /tmp/x.ll     # the optimiser
 llc -O2 -filetype=obj -time-passes -o /dev/null /tmp/x.bc   # and codegen
 ```
 
+## Porting a scene
+
+A task's *logic* was ported against CPython. Its *screen* is ported against the
+real pyglet one, running headless, and the comparison is command by command.
+
+```bash
+# explore: any of the forty-four tasks, in reference space, as JSON
+<original>/.venv/bin/python scripts/extract_scene.py removals \
+    --recorder test --start --ticks 3 --out /tmp/f.json
+```
+
+Three files a scene:
+
+- `src/scene_<name>.elisa` — `render(list, paint, …)`, state in, commands out.
+- `test/scene_<name>_sweep.elisa` — includes `scene_emit.elisa`, prints a
+  `names|` header, then a `spec|` line, its frame, and `end`, per case.
+- `test/scene_<name>_diff.py` — one `build(spec)` returning
+  `(screen, screen._build_chrome)`; `scenediff.main` does the rest.
+
+**Lay out in PIXELS and divide once, in `put_*`.** The reference lays out
+against the live window, which is retina-doubled here, and some of its
+arithmetic truncates: `int(x * width)` at 1824 is not twice `int(x * width)` at
+912. The recorder divides pyglet's f64 by the measured scale and *then* the
+comparison takes it to f32, so a port that stored f32 and divided afterwards
+would round twice, in the other order. For a factor of exactly two those agree
+— which is worse, not better, because the suite would be passing for a reason
+that has nothing to do with the layout being right.
+
+**Numbers cross as f32 bits.** f32 is what a `DrawCmd` stores; comparing at f64
+compares a precision the format does not deliver, and comparing a rounded
+decimal lets a coordinate half a float out through.
+
+**Set state, do not play into it.** A scene is a function from state to frame.
+Driving forty moves to reach move forty tests the driving.
+
+**Give `render` only what the screen may see.** Crossed Wires is the clearest
+case: the wiring lives behind the Bench and never reaches the screen, so the
+scene takes two spots, two counters and a budget. That is what makes a scene a
+pure function rather than a view onto a task object.
+
+### What the reference does that a careful reading misses
+
+Each of these cost a diverging suite, and each is in the recorder now:
+
+- **`Triangle.x2` returns `x + x2`** in pyglet 2.1.16. `Line.x2` does not, so
+  it is a bug in the one class. Every arrowhead in the game is a Triangle.
+- **A bordered rectangle's border alpha comes from its FILL.** Give it
+  `color=(…, 0)` and a three-component `border_color` and the border is
+  transparent too. Go's cursor ring is invisible in the original because of
+  this. Reproduce it; do not correct it here.
+- **A three-component colour is opaque.** Requiring four to call a shape
+  visible drops commands that are drawn.
+- **A transparent fill is not an absent shape** — the border may still draw.
+- **`content_width` / `content_height` are pyglet's text measurement**, which
+  is the shell's side of the seam. `framerec.metrics()` lists them so you can
+  find the ten places across seven modules where a layout reads one; bake the
+  number, as `scene_title.elisa` does with a multiline block's 16.5.
+
+### When the order genuinely does not matter
+
+Some scenes draw a set of identical marks and get the set out of a `frozenset`,
+so the reference's order is CPython's hash order. `scenediff.settle_positions`
+sorts runs of commands that differ only in *where* they are — which is
+unobservable **unless they overlap**. It is opt-in for that reason. The port
+has the machinery to reproduce `setobject.c`'s probe schedule
+(`tasks/pyset.elisa`); spending it to decide which of several identical circles
+goes down first is precision nothing can observe.
+
 ## Adding a suite
 
 1. `nw-core/src/<name>.elisa` — the port. No I/O, no globals; state arrives as
