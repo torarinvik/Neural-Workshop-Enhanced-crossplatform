@@ -219,7 +219,12 @@ def _visible(obj):
 #:     multiline block into one command a line (see scene_title.elisa) rather
 #:     than asking a shell to reproduce another toolkit's line spacing.
 _FIELDS = {
-    "Rectangle": (("width", 0), ("height", 1)),
+    # A rectangle's ANCHOR is recorded because Lookout's squares set it: a
+    # square drawn as a glyph is centred on its point, and x/y alone cannot
+    # tell that from a corner-anchored one. Every other rectangle in the
+    # workshop leaves it at (0, 0), so the two extra cells are zeros there.
+    "Rectangle": (("width", 0), ("height", 1), ("anchor_x", 0),
+                  ("anchor_y", 1)),
     "BorderedRectangle": (("width", 0), ("height", 1), ("border", 1)),
     # border_color is appended separately below: it is a colour, not a length.
     "Box": (("width", 0), ("height", 1), ("thickness", 1)),

@@ -1,0 +1,137 @@
+# The Lookout screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/lookout.py -- the drawing, not the thinking.
+#
+# Three labels, a verdict, a drifting flock of glyphs, and ONE more glyph
+# beside the status line saying what to watch for. The order they go down in
+# is not the order `_build_chrome` writes them, and that is the trap:
+#
+#     _sync_cue_glyph()      <- makes the cue glyph
+#     _sync_shapes()         <- makes the flock
+#     _update_status()       <- sets the status text and calls
+#                               _sync_cue_glyph AGAIN, which DELETES the cue
+#                               glyph and makes a new one
+#
+# so the cue glyph that survives is the second one, and it is younger than
+# every shape in the flock. It is drawn last.
+#
+# It has to be made twice, because where it goes depends on how wide the
+# status line turned out -- `width_center() + status.content_width / 2 + 34` --
+# and the first pass runs before the text is set. So the cue sits beside a
+# line whose width is measured, which is textmetrics again.
+#
+# The footnote is built from the LIVE CHANNELS: watching colour alone says
+# only the J key, watching form alone says only the F key, and watching both
+# says both with five spaces between them.
+#
+# NOTE: needs elisacore_math, strings, ints, geometry, textmetrics, display,
+# scene_verdict and scene_glyphrow included by the driver.
+
+module SceneLookout:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_WATCHING: i64 = 1
+    const PHASE_FEEDBACK: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    # Which channels the menu made live.
+    const WATCH_COLOR: i64 = 0
+    const WATCH_FORM: i64 = 1
+    const WATCH_BOTH: i64 = 2
+
+    struct Drifter:
+        x: f64
+        y: f64
+        color: i64
+        form: i64
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    # `max(7.0, float(scale_to_height(17)))`.
+    def radius_of(height: f64) -> f64:
+        can Abort.Panic:
+            scaled: f64 = Geometry::scale_to_height(height, 17.0).f64()
+            return scaled if scaled > 7.0 else 7.0
+
+    def keys_line(out: mutable dstr&, watching: i64):
+        can Memory.Allocate, Abort.Panic:
+            said: mutable i64 = 0
+            if watching == WATCH_FORM or watching == WATCH_BOTH:
+                dstr_append_cstr(out, "F: that shape is on screen")
+                said <- said + 1
+            if watching == WATCH_COLOR or watching == WATCH_BOTH:
+                if said > 0:
+                    dstr_append_cstr(out, "     ")
+                dstr_append_cstr(out, "J: that colour is on screen")
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               watching: i64, shapes: darray[Drifter]&, cue_color: i64,
+               cue_form: i64, cue_number: i64, total_cues: i64,
+               message: sview, verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+
+            put_text(list, paint, sview("Lookout", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if phase == PHASE_WATCHING or phase == PHASE_FEEDBACK:
+                dstr_append_cstr(&status, "     cue ")
+                dstr_append_i64(&status, cue_number)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_cues)
+            status_size: f64 = Geometry::calc_fontsize(paint.height, 14.0)
+            status_y: f64 = Geometry::from_top_edge(paint.height, 70.0).f64()
+            put_text(list, paint, bytes_view(status), middle, status_y,
+                     status_size, paint.ink, Display::ANCHOR_CENTER_CENTER, false)
+
+            footnote: mutable dstr = []
+            dstr_append_cstr(&footnote, "Esc: task menu     Space: start     ")
+            keys_line(&footnote, watching)
+            dstr_append_cstr(&footnote, "     C: options")
+            put_text(list, paint, bytes_view(footnote), middle,
+                     Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            radius: f64 = radius_of(paint.height)
+            for index in 0..<shapes.count.i64() |list, paint, shapes, radius|:
+                one: Drifter = get shapes[index.usize()] else Drifter{x: 0.0, y: 0.0, color: 0, form: 0}
+                SceneGlyphRow::put(list, one.form, one.x * paint.width,
+                                   one.y * paint.height, radius,
+                                   SceneGlyphRow::glyph_color(one.color),
+                                   paint.sx, paint.sy)
+
+            # Last, and only while there is a cue to show. Its x is measured
+            # off the status line it sits beside.
+            if phase == PHASE_WATCHING or phase == PHASE_FEEDBACK:
+                wide: i64 = TextMetrics::text_width(status_size, TextMetrics::codepoints(bytes_view(status)))
+                SceneGlyphRow::put(list, cue_form, middle + wide.f64() / 2.0 + 34.0,
+                                   status_y, radius,
+                                   SceneGlyphRow::glyph_color(cue_color),
+                                   paint.sx, paint.sy)
