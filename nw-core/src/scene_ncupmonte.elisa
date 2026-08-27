@@ -1,0 +1,149 @@
+# The N-Cup Monte screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/ncupmonte.py -- the drawing, not the thinking.
+#
+# A row of cups, each a body and a brim, with the ball under one of them while
+# the round lets it show. The cups are drawn IN VISUAL ORDER and coloured BY
+# IDENTITY: `order[visual]` is which cup is standing in which slot, so a shuffle
+# moves the numbers about without moving the slots.
+#
+# `xs` -- where each slot is -- is a screen fact and comes in from the caller,
+# because during a shuffle the cups are between slots and the animation owns
+# those numbers. At rest they are exactly `slot_positions`, and the sweep uses
+# both so a mid-swap frame is covered as well as a settled one.
+#
+# NOTE: needs elisacore_math, strings, geometry and display included by the
+# driver.
+
+module SceneNCupMonte:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_HIDE: i64 = 1
+    const PHASE_SHUFFLE: i64 = 2
+    const PHASE_GUESS: i64 = 3
+    const PHASE_REVEAL: i64 = 4
+    const PHASE_RESULT: i64 = 5
+
+    const MOST_CUPS: i64 = 24
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                 y: f64, width: f64, height: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               width / paint.sx, height / paint.sy, color)
+
+    def put_circle(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                   y: f64, radius: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_circle(list, x / paint.sx, y / paint.sy,
+                                 radius / paint.sy, color)
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    # Where each slot's centre sits. `span` is capped at 120 a cup so a small
+    # round does not stretch across the whole window.
+    def slot_positions(out: mutable darray[f64]&, width: f64, count: i64):
+        can Abort.Panic:
+            room: f64 = width * 0.78
+            wide: f64 = 120.0 * count.f64()
+            span: f64 = room if room < wide else wide
+            start: f64 = (width - span) / 2.0
+            divisor: i64 = count if count > 1 else 1
+            step: f64 = span / divisor.f64()
+            for index in 0..<count |out, start, step|:
+                Floats::put(out, index, start + (index.f64() + 0.5) * step)
+
+    struct CupSize:
+        width: mutable f64
+        height: mutable f64
+
+    def cup_size(out: mutable CupSize&, width: f64, cups: i64):
+        can Abort.Panic:
+            raw: f64 = width / (cups + 2).f64()
+            capped: f64 = raw if raw < 96.0 else 96.0
+            wide: f64 = capped if capped > 48.0 else 48.0
+            out.width <- wide
+            out.height <- wide * 1.15
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&,
+               order: mutable darray[i64]&, xs: mutable darray[f64]&,
+               cups: i64, phase: i64, ball: i64, guess: i64,
+               show_numbers: bool, message: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            put_text(list, paint, sview("N-Cup Monte", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            # `'Cups %d — %s'`
+            status: mutable dstr = []
+            dstr_append_cstr(&status, "Cups ")
+            dstr_append_i64(&status, cups)
+            dstr_append_cstr(&status, " ")
+            dstr_append_em_dash(&status)
+            dstr_append_cstr(&status, " ")
+            dstr_append_sview(&status, message)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: next round     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 30.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            size: mutable CupSize = CupSize{width: 0.0, height: 0.0}
+            cup_size(&size, paint.width, cups)
+            base_y: f64 = paint.height * 0.38
+            show_ball: bool = phase == PHASE_READY or phase == PHASE_REVEAL or phase == PHASE_RESULT
+
+            # The cups first, then their numbers -- the reference keeps two
+            # lists and builds the labels into the second, but they go into ONE
+            # batch in creation order, so a label lands right after its own cup.
+            for visual in 0..<cups |list, paint, order, xs, cups, phase, ball, guess, show_numbers, size, base_y, show_ball|:
+                cup_id: i64 = Ints::at_ref(order, visual)
+                cx: f64 = Floats::at_ref(xs, visual)
+                chosen: bool = phase == PHASE_RESULT and cup_id == guess
+                correct: bool = phase == PHASE_RESULT and cup_id == ball
+                fill: mutable u32 = Display::rgba(196, 92, 48, 255)
+                if chosen:
+                    fill <- Display::rgba(220, 64, 64, 255)
+                if correct:
+                    fill <- Display::rgba(46, 170, 92, 255)
+                put_rect(list, paint, cx - size.width / 2.0, base_y, size.width,
+                         size.height, fill)
+                put_rect(list, paint, cx - size.width / 2.0 - 4.0,
+                         base_y + size.height - 10.0, size.width + 8.0, 12.0,
+                         Display::rgba(220, 120, 64, 255))
+                if show_ball and cup_id == ball:
+                    put_circle(list, paint, cx, base_y + 16.0, 11.0,
+                               Display::rgba(240, 220, 70, 255))
+                if show_numbers:
+                    text: mutable dstr = []
+                    dstr_append_i64(&text, cup_id + 1)
+                    put_text(list, paint, bytes_view(text), cx,
+                             base_y + size.height / 2.0,
+                             Geometry::calc_fontsize(paint.height, 14.0),
+                             Display::rgba(255, 255, 255, 255),
+                             Display::ANCHOR_CENTER_CENTER, true)
