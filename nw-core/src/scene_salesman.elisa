@@ -1,0 +1,185 @@
+# The Traveling Salesman screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/salesman.py -- the drawing, not the thinking.
+#
+# Three labels, a verdict, and a map: the best tour underneath in green, the
+# player's route over it in blue, and the cities on top. pyglet is told that
+# with two groups, order 0 for the lines and order 1 for the cities, but the
+# lines are also CREATED first, so the display list needs no notion of a group
+# to come out in the same order.
+#
+# The closing edge is drawn only once the tour is finished, and only when there
+# is more than one city in the route -- a single city closed on itself is a
+# zero-length line, which pyglet draws as nothing and a port that emits it
+# would draw as one command too many.
+#
+# Unlike Sokoban this canvas does NOT stop above the verdict band: `_canvas`
+# takes `from_bottom_edge(56)` straight, with no `above_the_band`. The cities
+# are drawn in the foreground colour and the route in a blue that is not a
+# verdict blue, so nothing here lands in the reader's pattern.
+#
+# NOTE: needs elisacore_math, strings, ints, geometry, display and
+# scene_verdict included by the driver.
+
+module SceneSalesman:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_TOURING: i64 = 1
+    const PHASE_TOURED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    def color_route() -> u32:
+        return Display::rgba(64, 96, 255, 255)
+
+    def color_best() -> u32:
+        return Display::rgba(46, 160, 67, 255)
+
+    struct Point:
+        x: f64
+        y: f64
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 100.0).f64()
+            bottom: f64 = Geometry::from_bottom_edge(height, 56.0).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.06
+            out.bottom <- bottom
+            out.width <- width * 0.88
+            out.height <- room if room > 40.0 else 40.0
+
+    def place_x(canvas: Canvas&, city: Point&) -> f64:
+        return canvas.left + city.x * canvas.width
+
+    def place_y(canvas: Canvas&, city: Point&) -> f64:
+        return canvas.bottom + city.y * canvas.height
+
+    # `darray&` cannot be handed to Ints::at, which takes the array by value,
+    # so the two lookups this scene needs are spelled out here.
+    def step_at(steps: darray[i64]&, index: i64) -> i64:
+        can Abort.Panic:
+            return get steps[index.usize()] else 0
+
+    def city_at(cities: darray[Point]&, index: i64) -> Point:
+        can Abort.Panic:
+            return get cities[index.usize()] else Point{x: 0.0, y: 0.0}
+
+    def put_line(list: mutable Display::DisplayList&, paint: Paint&,
+                 canvas: Canvas&, cities: darray[Point]&, one: i64, two: i64,
+                 color: u32, thickness: f64):
+        can Memory.Allocate, Abort.Panic:
+            here: Point = city_at(cities, one)
+            there: Point = city_at(cities, two)
+            Display::draw_line(list, place_x(canvas, &here) / paint.sx,
+                               place_y(canvas, &here) / paint.sy,
+                               place_x(canvas, &there) / paint.sx,
+                               place_y(canvas, &there) / paint.sy,
+                               thickness / paint.sx, color)
+
+    def visited(route: darray[i64]&, city: i64, steps: i64) -> bool:
+        can Abort.Panic:
+            at: mutable i64 = 0
+            while at < steps |route, city, steps, at|:
+                if step_at(route, at) == city:
+                    return true
+                at <- at + 1
+            return false
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               cities: darray[Point]&, route: darray[i64]&, steps: i64,
+               best_order: darray[i64]&, best_steps: i64, show_best: bool,
+               round: i64, total_rounds: i64, trial_cities: i64,
+               message: sview, verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            touring: bool = phase == PHASE_TOURING or phase == PHASE_TOURED
+
+            put_text(list, paint, sview("Traveling Salesman", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if touring:
+                dstr_append_cstr(&status, "     route ")
+                dstr_append_i64(&status, round)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, total_rounds)
+                dstr_append_cstr(&status, "   visited ")
+                dstr_append_i64(&status, steps)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, trial_cities)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     click cities in order, the last again to undo     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            count: i64 = cities.count.i64()
+            if not touring or count == 0:
+                return
+
+            canvas: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&canvas, paint.width, paint.height)
+
+            if phase == PHASE_TOURED and show_best:
+                for here in 0..<best_steps |list, paint, canvas, cities, best_order, best_steps|:
+                    put_line(list, paint, &canvas, cities,
+                             step_at(best_order, here),
+                             step_at(best_order, (here + 1) % best_steps),
+                             color_best(), 5.0)
+
+            for here in 0..<(steps - 1) |list, paint, canvas, cities, route, steps|:
+                put_line(list, paint, &canvas, cities, step_at(route, here),
+                         step_at(route, here + 1), color_route(), 3.0)
+
+            if phase == PHASE_TOURED and steps > 1:
+                put_line(list, paint, &canvas, cities, step_at(route, steps - 1),
+                         step_at(route, 0), color_route(), 3.0)
+
+            # `route[0] if route else -1` -- the city the tour started from is
+            # drawn bigger, and an empty route starts from no city at all.
+            first: i64 = step_at(route, 0) if steps > 0 else -1
+            for city in 0..<count |list, paint, canvas, cities, route, steps, first, count|:
+                here: Point = city_at(cities, city)
+                radius: f64 = 9.0 if city == first else 7.0
+                Display::draw_circle(list, place_x(&canvas, &here) / paint.sx,
+                                     place_y(&canvas, &here) / paint.sy,
+                                     radius / paint.sx,
+                                     color_route() if visited(route, city, steps) else paint.ink)

@@ -95,6 +95,11 @@ def parse(binary):
     if len(specs) != len(frames):
         raise SystemExit("sweep printed %d specs and %d frames"
                          % (len(specs), len(frames)))
+    if not specs:
+        # A sweep that printed nothing used to come back as "PASS: 0 frames",
+        # which is what a suite says when its binary is stale or was never
+        # built. Nothing checked is not the same as nothing wrong.
+        raise SystemExit("sweep printed no specs at all")
     return specs, frames
 
 
