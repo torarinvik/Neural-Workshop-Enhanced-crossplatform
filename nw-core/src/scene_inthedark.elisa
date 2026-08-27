@@ -1,0 +1,325 @@
+# The In the Dark screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/inthedark.py -- the drawing, not the thinking.
+#
+# A row of lamp SOCKETS, and over them a diagram of whatever the current room
+# does to them. The sockets are drawn from the lamp COUNT alone, never from the
+# lamps, which is the whole point of the task: the picture cannot leak what
+# colour anything is.
+#
+# Three room kinds and three diagrams:
+#
+#   PAINT  a filled blob over the socket, with an arrow down into it
+#   TURN   a broken ring with the loose end swept round, and two arrows
+#   SWAP   an arrow between two sockets with a head on BOTH ends
+#   COPY   the same arrow with one head, which is the only difference
+#
+# The ring is drawn with `angle=math.radians(300)` and
+# `start_angle=math.radians(-60)`, and pyglet 2.1's Arc takes DEGREES. So the
+# reference asks for a 5.24-degree arc starting at -1.05 degrees and gets a
+# stub rather than the ring the comment describes. That is reproduced here and
+# not corrected: the numbers are what the screen draws.
+#
+# NOTE: needs elisacore_math, pymath, strings, geometry, display and
+# scene_verdict included by the driver.
+
+module SceneInTheDark:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_WALKING: i64 = 1
+    const PHASE_ASKING: i64 = 2
+    const PHASE_SCORED: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const KIND_PAINT: i64 = 0
+    const KIND_TURN: i64 = 1
+    const KIND_SWAP: i64 = 2
+    const KIND_COPY: i64 = 3
+
+    const LAMP_COLOR_COUNT: i64 = 5
+
+    # Okabe-Ito, five of them. Vermilion is left out because it sits too near
+    # the orange and the plain blue because it sits too near the sky blue: a
+    # task about remembering a colour must not become one about telling two
+    # of them apart.
+    def lamp_color(which: i64) -> u32:
+        ring: i64 = which % LAMP_COLOR_COUNT
+        if ring == 0:
+            return Display::rgba(230, 159, 0, 255)
+        if ring == 1:
+            return Display::rgba(86, 180, 233, 255)
+        if ring == 2:
+            return Display::rgba(0, 158, 115, 255)
+        if ring == 3:
+            return Display::rgba(240, 228, 66, 255)
+        return Display::rgba(204, 121, 167, 255)
+
+    struct Paint:
+        ink: mutable u32
+        back: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     back: Display::rgba(back, back, back, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def put_circle(list: mutable Display::DisplayList&, paint: Paint&,
+                   x: f64, y: f64, radius: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_circle(list, x / paint.sx, y / paint.sy,
+                                 radius / paint.sx, color)
+
+    struct Stage:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def stage_of(out: mutable Stage&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 105.0).f64()
+            bottom: f64 = Geometry::from_bottom_edge(height, 60.0).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.1
+            out.bottom <- bottom
+            out.width <- width * 0.8
+            out.height <- room if room > 60.0 else 60.0
+
+    struct Socket:
+        x: mutable f64
+        y: mutable f64
+        radius: mutable f64
+
+    def socket_of(out: mutable Socket&, stage: Stage&, lamps: i64, lamp: i64):
+        can Abort.Panic:
+            across: f64 = stage.width / lamps.f64() * 0.22
+            down: f64 = stage.height * 0.11
+            out.radius <- across if across < down else down
+            out.x <- stage.left + stage.width * (lamp.f64() + 0.5) / lamps.f64()
+            out.y <- stage.bottom + stage.height * 0.22
+
+    # A line with an arrowhead on one end, or on both. `heads` is 1 or 2 and
+    # the SECOND head is at the line's start, which is what tells a swap from
+    # a copy.
+    def put_arrow(list: mutable Display::DisplayList&, paint: Paint&,
+                  from_x: f64, from_y: f64, to_x: f64, to_y: f64,
+                  shade: u32, thick: f64, heads: i64):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_line(list, from_x / paint.sx, from_y / paint.sy,
+                               to_x / paint.sx, to_y / paint.sy,
+                               thick / paint.sx, shade)
+            # `math.hypot(...) or 1.0` -- a zero-length arrow points along x.
+            reach: f64 = py_hypot(to_x - from_x, to_y - from_y)
+            span: f64 = reach if reach != 0.0 else 1.0
+            step_x: f64 = (to_x - from_x) / span
+            step_y: f64 = (to_y - from_y) / span
+            size: f64 = thick * 2.4
+            put_head(list, paint, to_x, to_y, step_x, step_y, size, shade)
+            if heads > 1:
+                put_head(list, paint, from_x, from_y, -step_x, -step_y, size, shade)
+
+    def put_head(list: mutable Display::DisplayList&, paint: Paint&,
+                 tip_x: f64, tip_y: f64, way_x: f64, way_y: f64,
+                 size: f64, shade: u32):
+        can Memory.Allocate, Abort.Panic:
+            back_x: f64 = tip_x - way_x * size
+            back_y: f64 = tip_y - way_y * size
+            Display::draw_triangle(list, tip_x / paint.sx, tip_y / paint.sy,
+                                   (back_x - way_y * size * 0.6) / paint.sx,
+                                   (back_y + way_x * size * 0.6) / paint.sy,
+                                   (back_x + way_y * size * 0.6) / paint.sx,
+                                   (back_y - way_x * size * 0.6) / paint.sy,
+                                   shade)
+
+    # A pip under one socket, to point at the lamp being asked.
+    def put_mark(list: mutable Display::DisplayList&, paint: Paint&,
+                 stage: Stage&, lamps: i64, lamp: i64, shade: u32, lift: f64):
+        can Memory.Allocate, Abort.Panic:
+            where: mutable Socket = Socket{x: 0.0, y: 0.0, radius: 0.0}
+            socket_of(&where, stage, lamps, lamp)
+            put_circle(list, paint, where.x, where.y - where.radius * lift,
+                       where.radius * 0.26, shade)
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_round: bool, lamps: i64, colours: i64, kind: i64,
+               room_lamp: i64, room_other: i64, cursor: i64, rooms: i64,
+               asked: darray[i64]&, answers: darray[i64]&,
+               given: darray[i64]&, asking_at: i64, trial: i64,
+               total_trials: i64, message: sview, verdict: i64,
+               verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            playing: bool = has_round and (phase == PHASE_WALKING or phase == PHASE_ASKING or phase == PHASE_SCORED)
+
+            put_text(list, paint, sview("In the Dark", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if has_round and phase == PHASE_WALKING:
+                dstr_append_cstr(&status, "     round ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "   room ")
+                dstr_append_i64(&status, cursor + 1)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, rooms)
+            elif has_round and phase == PHASE_ASKING:
+                dstr_append_cstr(&status, "     lamp ")
+                dstr_append_i64(&status, step_at(asked, asking_at) + 1)
+                dstr_append_cstr(&status, " ")
+                dstr_append_em_dash(&status)
+                dstr_append_cstr(&status, " which colour?")
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     1-5: answer     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if not playing:
+                return
+
+            stage: mutable Stage = Stage{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            stage_of(&stage, paint.width, paint.height)
+            put_sockets(list, paint, &stage, lamps)
+            if phase == PHASE_WALKING:
+                put_room(list, paint, &stage, lamps, kind, room_lamp, room_other)
+            elif phase == PHASE_ASKING:
+                put_mark(list, paint, &stage, lamps, step_at(asked, asking_at), paint.ink, 1.9)
+                put_legend(list, paint, &stage, colours,
+                           stage.bottom + stage.height * 0.72)
+            else:
+                put_verdicts(list, paint, &stage, lamps, asked, answers, given)
+
+    def step_at(values: darray[i64]&, index: i64) -> i64:
+        can Abort.Panic:
+            return get values[index.usize()] else 0
+
+    def put_sockets(list: mutable Display::DisplayList&, paint: Paint&,
+                    stage: Stage&, lamps: i64):
+        can Memory.Allocate, Abort.Panic:
+            where: mutable Socket = Socket{x: 0.0, y: 0.0, radius: 0.0}
+            for lamp in 0..<lamps |list, paint, stage, lamps, where|:
+                socket_of(&where, stage, lamps, lamp)
+                put_circle(list, paint, where.x, where.y, where.radius, paint.ink)
+                put_circle(list, paint, where.x, where.y, where.radius * 0.82, paint.back)
+                label: mutable dstr = []
+                dstr_append_i64(&label, lamp + 1)
+                put_text(list, paint, bytes_view(label), where.x,
+                         where.y - where.radius * 2.0,
+                         Geometry::calc_fontsize(paint.height, 13.0), paint.ink,
+                         Display::ANCHOR_CENTER_CENTER, true)
+
+    def put_room(list: mutable Display::DisplayList&, paint: Paint&,
+                 stage: Stage&, lamps: i64, kind: i64, room_lamp: i64,
+                 room_other: i64):
+        can Memory.Allocate, Abort.Panic:
+            where: mutable Socket = Socket{x: 0.0, y: 0.0, radius: 0.0}
+            socket_of(&where, stage, lamps, room_lamp)
+            x: f64 = where.x
+            y: f64 = where.y
+            radius: f64 = where.radius
+            band: f64 = stage.bottom + stage.height * 0.62
+            scaled: f64 = radius * 0.16
+            thick: f64 = scaled if scaled > 2.0 else 2.0
+
+            if kind == KIND_PAINT:
+                shade: u32 = lamp_color(room_other)
+                put_circle(list, paint, x, band + radius * 1.2, radius * 0.95, paint.ink)
+                put_circle(list, paint, x, band + radius * 1.2, radius * 0.8, shade)
+                put_arrow(list, paint, x, band, x, y + radius * 1.25, paint.ink, thick, 1)
+                return
+            if kind == KIND_TURN:
+                # `angle` and `start_angle` are handed to pyglet as RADIANS
+                # into a degrees API. Reproduced; see the module note.
+                Display::draw_arc(list, x / paint.sx, (band + radius * 1.2) / paint.sy,
+                                  radius / paint.sx, degrees_to_radians(-60.0), degrees_to_radians(300.0),
+                                  paint.ink)
+                put_arrow(list, paint, x + radius * 0.75, band + radius * 1.75,
+                          x + radius * 1.15, band + radius * 1.2, paint.ink, thick, 1)
+                put_arrow(list, paint, x, band, x, y + radius * 1.25, paint.ink, thick, 1)
+                return
+
+            other: mutable Socket = Socket{x: 0.0, y: 0.0, radius: 0.0}
+            socket_of(&other, stage, lamps, room_other)
+            top: f64 = band + radius * 1.1
+            put_arrow(list, paint, other.x, top, x, top, paint.ink, thick,
+                      2 if kind == KIND_SWAP else 1)
+            Display::draw_line(list, x / paint.sx, top / paint.sy,
+                               x / paint.sx, (y + radius * 1.25) / paint.sy,
+                               thick * 0.7 / paint.sx, paint.ink)
+            Display::draw_line(list, other.x / paint.sx, top / paint.sy,
+                               other.x / paint.sx, (y + radius * 1.25) / paint.sy,
+                               thick * 0.7 / paint.sx, paint.ink)
+
+    # The colours and the keys that name them.
+    def put_legend(list: mutable Display::DisplayList&, paint: Paint&,
+                   stage: Stage&, colours: i64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            span: i64 = colours if colours > 1 else 1
+            scaled: f64 = stage.width / span.f64() * 0.08
+            radius: f64 = scaled if scaled < 16.0 else 16.0
+            for colour in 0..<colours |list, paint, stage, colours, radius, y|:
+                x: f64 = stage.left + stage.width * (colour.f64() + 0.5) / colours.f64()
+                put_circle(list, paint, x, y, radius * 1.16, paint.ink)
+                put_circle(list, paint, x, y, radius, lamp_color(colour))
+                label: mutable dstr = []
+                dstr_append_i64(&label, colour + 1)
+                put_text(list, paint, bytes_view(label), x, y - radius * 2.2,
+                         Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                         Display::ANCHOR_CENTER_CENTER, true)
+
+    # What was said and what was so, one row under the other.
+    def put_verdicts(list: mutable Display::DisplayList&, paint: Paint&,
+                     stage: Stage&, lamps: i64, asked: darray[i64]&,
+                     answers: darray[i64]&, given: darray[i64]&):
+        can Memory.Allocate, Abort.Panic:
+            where: mutable Socket = Socket{x: 0.0, y: 0.0, radius: 0.0}
+            for spot in 0..<asked.count.i64() |list, paint, stage, lamps, asked, answers, given, where|:
+                lamp: i64 = step_at(asked, spot)
+                socket_of(&where, stage, lamps, lamp)
+                # `given` runs short while a round is still being answered.
+                mine: i64 = step_at(given, spot) if spot < given.count.i64() else -1
+                truth: i64 = step_at(answers, spot)
+                # A row is SKIPPED when there is no colour for it, and the
+                # row number still advances -- so an unanswered lamp leaves
+                # the truth on the lower row rather than moving it up.
+                put_pip(list, paint, where.x, stage.bottom + stage.height * 0.78,
+                        where.radius, mine)
+                put_pip(list, paint, where.x, stage.bottom + stage.height * 0.65,
+                        where.radius, truth)
+                put_mark(list, paint, stage, lamps, lamp,
+                         paint.ink if mine == truth else paint.back, 1.9)
+
+    def put_pip(list: mutable Display::DisplayList&, paint: Paint&,
+                x: f64, y: f64, radius: f64, colour: i64):
+        can Memory.Allocate, Abort.Panic:
+            if colour < 0:
+                return
+            put_circle(list, paint, x, y, radius * 0.5, paint.ink)
+            put_circle(list, paint, x, y, radius * 0.4, lamp_color(colour))
