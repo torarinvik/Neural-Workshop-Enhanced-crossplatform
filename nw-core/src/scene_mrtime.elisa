@@ -1,0 +1,313 @@
+# The Mr. Time screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/mrtime.py -- the drawing, not the thinking.
+#
+# Six labels, a verdict, and ONE OUTLINE. The outline is a marker for an
+# instant rather than a thing to remember, so which shape it is carries
+# nothing -- it varies only so that a trial is not the same picture twice.
+# Six kinds, and five of them are one closed run of points around a turn:
+#
+#   triangle   three corners
+#   square     four
+#   pentagon   five
+#   star       ten, every other one pulled in to 0.45
+#   cross      twelve, written out as offsets and then turned
+#
+# and the sixth, the circle, is an Arc closed on itself instead.
+#
+# The middle of the page says NOTHING except in the two phases where it has
+# something to say that is not a clock. Watching, waiting, settled and between
+# runs all leave the question, the prompt and the answer blank -- because
+# anything they could say would be a clock, and the task is to keep one in
+# your head.
+#
+# NOTE: needs elisacore_math, pymath, strings, geometry, verdict, display and
+# scene_verdict included by the driver.
+
+module SceneMrTime:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SHOWING: i64 = 1
+    const PHASE_COUNTING: i64 = 2
+    const PHASE_WATCHING: i64 = 3
+    const PHASE_ASKING: i64 = 4
+    const PHASE_SETTLED: i64 = 5
+    const PHASE_DONE: i64 = 6
+
+    const TAU: f64 = 6.283185307179586
+
+    const KIND_CIRCLE: i64 = 0
+    const KIND_TRIANGLE: i64 = 1
+    const KIND_SQUARE: i64 = 2
+    const KIND_PENTAGON: i64 = 3
+    const KIND_STAR: i64 = 4
+    const KIND_CROSS: i64 = 5
+
+    # The precision ladder: what the error is written in, and how much of a
+    # second one of them is.
+    def rung_unit(rung: i64) -> cstr:
+        ring: i64 = clamped(rung)
+        if ring == 1:
+            return "seconds"
+        if ring == 2:
+            return "deciseconds"
+        if ring == 3:
+            return "centiseconds"
+        if ring == 4:
+            return "milliseconds"
+        if ring == 5:
+            return "microseconds"
+        return "nanoseconds"
+
+    def rung_short(rung: i64) -> cstr:
+        ring: i64 = clamped(rung)
+        if ring == 1:
+            return "s"
+        if ring == 2:
+            return "ds"
+        if ring == 3:
+            return "cs"
+        if ring == 4:
+            return "ms"
+        if ring == 5:
+            return "µs"
+        return "ns"
+
+    def rung_per_second(rung: i64) -> f64:
+        ring: i64 = clamped(rung)
+        if ring == 1:
+            return 1.0
+        if ring == 2:
+            return 10.0
+        if ring == 3:
+            return 100.0
+        if ring == 4:
+            return 1000.0
+        if ring == 5:
+            return 1000000.0
+        return 1000000000.0
+
+    def clamped(rung: i64) -> i64:
+        low: i64 = rung if rung > 1 else 1
+        return low if low < 6 else 6
+
+    struct Paint:
+        ink: mutable u32
+        muted: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     muted: Display::rgba(fore, fore, fore, 170),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    # The floor is `above_the_band`, and the margin is folded in BEFORE that
+    # call rather than after -- because a shape is placed by its centre and
+    # drawn outwards.
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64):
+        can Abort.Panic:
+            wide: f64 = width * 0.78
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 176.0).f64()).f64()
+            top: f64 = Geometry::from_top_edge(height, 104.0).f64()
+            least: f64 = Geometry::scale_to_height(height, 80.0).f64()
+            room: f64 = top - bottom
+            out.left <- (width - wide) / 2.0
+            out.bottom <- bottom
+            out.width <- wide
+            out.height <- room if room > least else least
+
+    def thickness_of(height: f64) -> f64:
+        can Abort.Panic:
+            scaled: f64 = Geometry::scale_to_height(height, 2.2).f64()
+            return scaled if scaled > 1.5 else 1.5
+
+    # `'%.2f %s'` under ten and `'{:,} {}'` at ten or over, which is the only
+    # thing that makes a nanosecond figure readable at all.
+    def quantity(out: mutable dstr&, seconds: f64, rung: i64):
+        can Memory.Allocate, Abort.Panic:
+            reach: f64 = seconds if seconds >= 0.0 else 0.0 - seconds
+            value: f64 = reach * rung_per_second(rung)
+            if value < 10.0:
+                dstr_append_fixed(out, value, 2)
+            else:
+                append_grouped(out, py_round_half_even(value))
+            out.push(32.u8())
+            dstr_append_cstr(out, rung_short(rung))
+
+    # `'{:,}'.format(value)` -- a comma every three digits from the right.
+    def append_grouped(out: mutable dstr&, value: i64):
+        can Memory.Allocate, Abort.Panic:
+            digits: mutable dstr = []
+            dstr_append_i64(&digits, value)
+            span: i64 = digits.count.i64()
+            for index in 0..<span |out, digits, span|:
+                if index > 0 and (span - index) % 3 == 0:
+                    out.push(44.u8())
+                out.push(Bytes::at_ref(&digits, index))
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_mark: bool, kind: i64, mark_x: f64, mark_y: f64,
+               radius: f64, turn: f64, rung: i64, target: f64,
+               typed: sview, trial: i64, total_trials: i64, right: i64,
+               message: sview, verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+
+            put_text(list, paint, sview("Mr. Time", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            dstr_append_sview(&status, message)
+            if phase != PHASE_READY and phase != PHASE_DONE:
+                dstr_append_cstr(&status, "     ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "   right ")
+                dstr_append_i64(&status, right)
+                dstr_append_cstr(&status, "   to the nearest ")
+                dstr_append_cstr(&status, rung_unit(rung))
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            question: mutable dstr = []
+            prompt: mutable dstr = []
+            answer: mutable dstr = []
+            if phase == PHASE_COUNTING:
+                dstr_append_cstr(&question, "Click the shape ")
+                quantity(&question, target, rung)
+                dstr_append_cstr(&question, " from now")
+                dstr_append_cstr(&prompt, "Space or a click on the shape is the moment")
+            elif phase == PHASE_ASKING:
+                dstr_append_cstr(&question, "How long ago did the shape appear?")
+                dstr_append_cstr(&prompt, "Answer in seconds, right to the nearest ")
+                dstr_append_cstr(&prompt, rung_unit(rung))
+                # `(self.answer_text or '_') + ' s'` -- an empty field still
+                # shows a caret, and the unit is always seconds here whatever
+                # the rung says the error is measured in.
+                if sview_len(typed).i64() > 0:
+                    dstr_append_sview(&answer, typed)
+                else:
+                    answer.push(95.u8())
+                dstr_append_cstr(&answer, " s")
+
+            put_text(list, paint, bytes_view(question), middle,
+                     Geometry::from_bottom_edge(paint.height, 148.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 20.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+            put_text(list, paint, bytes_view(prompt), middle,
+                     Geometry::from_bottom_edge(paint.height, 120.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.muted,
+                     Display::ANCHOR_CENTER_CENTER, false)
+            put_text(list, paint, bytes_view(answer), middle,
+                     Geometry::from_bottom_edge(paint.height, 88.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 26.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     digits . then Enter     Space or click: act     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 30.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            # The shape is on screen while it is SHOWING and while the player
+            # is counting towards it, and at no other moment.
+            if has_mark and (phase == PHASE_SHOWING or phase == PHASE_COUNTING):
+                put_mark(list, paint, kind, mark_x, mark_y, radius, turn)
+
+    def put_mark(list: mutable Display::DisplayList&, paint: Paint&, kind: i64,
+                 mark_x: f64, mark_y: f64, radius: f64, turn: f64):
+        can Memory.Allocate, Abort.Panic:
+            canvas: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&canvas, paint.width, paint.height)
+            centre_x: f64 = canvas.left + mark_x * canvas.width
+            centre_y: f64 = canvas.bottom + mark_y * canvas.height
+            least: f64 = canvas.width if canvas.width < canvas.height else canvas.height
+            reach: f64 = radius * least
+            thick: f64 = thickness_of(paint.height)
+            if kind == KIND_CIRCLE:
+                Display::draw_arc(list, centre_x / paint.sx, centre_y / paint.sy,
+                                  reach / paint.sx, 0.0, 360.0, paint.ink)
+                return
+            corners: i64 = 3 if kind == KIND_TRIANGLE else (4 if kind == KIND_SQUARE else (5 if kind == KIND_PENTAGON else (10 if kind == KIND_STAR else 12)))
+            Display::begin_multiline(list, corners,
+                                     point_x(kind, centre_x, reach, turn, 0) / paint.sx,
+                                     point_y(kind, centre_y, reach, turn, 0) / paint.sy,
+                                     thick / paint.sx, paint.ink)
+            for index in 0..<corners |list, paint, kind, centre_x, centre_y, reach, turn|:
+                Display::polygon_point(list,
+                                       point_x(kind, centre_x, reach, turn, index) / paint.sx,
+                                       point_y(kind, centre_y, reach, turn, index) / paint.sy)
+
+    # `around(index, scale, sides)`, and for the cross the twelve offsets
+    # turned into an angle and a reach first.
+    def corner_angle(kind: i64, turn: f64, index: i64) -> f64:
+        can Abort.Panic:
+            if kind == KIND_CROSS:
+                return turn + atan2(cross_up(index), cross_across(index))
+            sides: f64 = 3.0 if kind == KIND_TRIANGLE else (4.0 if kind == KIND_SQUARE else (5.0 if kind == KIND_PENTAGON else 10.0))
+            return turn + index.f64() * TAU / sides
+
+    def corner_reach(kind: i64, reach: f64, index: i64) -> f64:
+        can Abort.Panic:
+            if kind == KIND_CROSS:
+                return reach * py_hypot(cross_across(index), cross_up(index))
+            if kind == KIND_STAR:
+                return reach * (1.0 if index % 2 == 0 else 0.45)
+            return reach
+
+    def point_x(kind: i64, centre_x: f64, reach: f64, turn: f64, index: i64) -> f64:
+        can Abort.Panic:
+            return centre_x + corner_reach(kind, reach, index) * cos(corner_angle(kind, turn, index))
+
+    def point_y(kind: i64, centre_y: f64, reach: f64, turn: f64, index: i64) -> f64:
+        can Abort.Panic:
+            return centre_y + corner_reach(kind, reach, index) * sin(corner_angle(kind, turn, index))
+
+    # A cross, drawn as its own twelve-cornered outline: an arm of one and a
+    # waist of 0.34.
+    def cross_across(index: i64) -> f64:
+        ring: i64 = index % 12
+        if ring == 0 or ring == 7 or ring == 8 or ring == 11:
+            return 0.34
+        if ring == 1 or ring == 2 or ring == 5 or ring == 6:
+            return -0.34
+        if ring == 3 or ring == 4:
+            return -1.0
+        return 1.0
+
+    def cross_up(index: i64) -> f64:
+        ring: i64 = index % 12
+        if ring == 0 or ring == 1:
+            return 1.0
+        if ring == 2 or ring == 3 or ring == 10 or ring == 11:
+            return 0.34
+        if ring == 4 or ring == 5 or ring == 8 or ring == 9:
+            return -0.34
+        return -1.0
