@@ -1,0 +1,170 @@
+# The Tower of Hanoi screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/hanoi.py -- the drawing, not the thinking.
+#
+# Three posts, a base under each, and the disks stacked on them. The one piece
+# of state the picture carries beyond the board is `picked`: the peg a disk has
+# been lifted off, which is drawn as a box round the whole column and a
+# fourteen-pixel lift on that column's TOP disk only.
+#
+# The posts are drawn at alpha 90 -- `woodcolor = (fg, fg, fg, 90)` -- so the
+# scenery reads as scenery. That alpha is on the colour and not on the shape,
+# which is why it survives into the display list's packed RGBA and needs no
+# opacity field.
+#
+# Layout is in PIXELS; see scene_removals.elisa for why the divide to reference
+# space belongs in `put_*` and not in the sweep.
+#
+# NOTE: needs elisacore_math, strings, geometry, display and tasks/hanoi
+# included by the driver.
+
+module SceneHanoi:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SOLVING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    const DISK_COLOR_COUNT: i64 = 8
+
+    def disk_color(disk: i64) -> u32:
+        can Abort.Panic:
+            step: i64 = (disk - 1) % DISK_COLOR_COUNT
+            return Display::rgba(230, 159, 0, 255) if step == 0
+            return Display::rgba(86, 180, 233, 255) if step == 1
+            return Display::rgba(0, 158, 115, 255) if step == 2
+            return Display::rgba(240, 228, 66, 255) if step == 3
+            return Display::rgba(0, 114, 178, 255) if step == 4
+            return Display::rgba(213, 94, 0, 255) if step == 5
+            return Display::rgba(204, 121, 167, 255) if step == 6
+            return Display::rgba(153, 153, 153, 255)
+
+    struct Paint:
+        ink: mutable u32
+        wood: mutable u32
+        accent: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     wood: Display::rgba(fore, fore, fore, 90),
+                     accent: Display::rgba(64, 96, 255, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                 y: f64, width: f64, height: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               width / paint.sx, height / paint.sy, color)
+
+    def put_box(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                y: f64, width: f64, height: f64, thick: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_box(list, x / paint.sx, y / paint.sy,
+                              width / paint.sx, height / paint.sy, color,
+                              thick / paint.sy)
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 110.0).f64()
+            bottom: f64 = Geometry::from_bottom_edge(height, 64.0).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.06
+            out.bottom <- bottom
+            out.width <- width * 0.88
+            out.height <- room if room > 40.0 else 40.0
+
+    # `'     '.join(parts)` again -- five spaces, the same gap Removals uses.
+    def status_text(out: mutable dstr&, message: sview, phase: i64, round: i64,
+                    total_rounds: i64, moves: i64, par: i64, disks: i64):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_sview(out, message)
+            return if phase != PHASE_SOLVING and phase != PHASE_SOLVED
+            dstr_append_cstr(out, "     tower ")
+            dstr_append_i64(out, round)
+            dstr_append_cstr(out, " of ")
+            dstr_append_i64(out, total_rounds)
+            dstr_append_cstr(out, "   moves ")
+            dstr_append_i64(out, moves)
+            dstr_append_cstr(out, "   minimum ")
+            dstr_append_i64(out, par)
+            dstr_append_cstr(out, "   ")
+            dstr_append_i64(out, disks)
+            dstr_append_cstr(out, " disks")
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&,
+               board: mutable Hanoi::Board&, phase: i64, picked: i64,
+               round: i64, total_rounds: i64, moves: i64, par: i64,
+               trial_disks: i64, message: sview):
+        can Memory.Allocate, Abort.Panic:
+            area: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&area, paint.width, paint.height)
+
+            # The board is drawn BEFORE the labels here, unlike Removals: the
+            # chrome is built in `_build_chrome` and the disks in `_redraw`, but
+            # `_redraw` is called from inside `_build_chrome` -- so the labels
+            # already exist and the disks come after them.
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            put_text(list, paint, sview("Tower of Hanoi", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+            status: mutable dstr = []
+            status_text(&status, message, phase, round, total_rounds, moves,
+                        par, trial_disks)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     click or 1-3: pegs     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            return if phase != PHASE_SOLVING and phase != PHASE_SOLVED
+            span: f64 = area.width / 3.0
+            reach: f64 = (trial_disks + 2).f64() * area.height * 0.11
+            cap: f64 = area.height * 0.8
+            post_height: f64 = cap if cap < reach else reach
+            disk_height: f64 = post_height / (trial_disks.f64() + 1.5)
+            widest: f64 = span * 0.9
+
+            for peg in 0..<3 |list, paint, board, area, span, post_height, disk_height, widest, picked, trial_disks|:
+                rect_left: f64 = area.left + peg.f64() * span
+                centre: f64 = rect_left + span / 2.0
+                put_rect(list, paint, centre - 2.0, area.bottom, 4.0,
+                         post_height, paint.wood)
+                put_rect(list, paint, rect_left + span * 0.05, area.bottom - 6.0,
+                         span * 0.9, 6.0, paint.wood)
+                if peg == picked:
+                    put_box(list, paint, rect_left + 2.0, area.bottom - 10.0,
+                            span - 4.0, post_height + 14.0, 2.5, paint.accent)
+                pile: i64 = Ints::at_ref(&board.height, peg)
+                for stacked in 0..<pile |list, paint, board, area, peg, centre, disk_height, widest, picked, trial_disks, pile|:
+                    disk: i64 = Ints::at_ref(&board.disk, peg * Hanoi::LARGEST_TOWER + stacked)
+                    share: f64 = disk.f64() / trial_disks.f64()
+                    disk_width: f64 = widest * (0.25 + 0.75 * share)
+                    lifted: bool = peg == picked and stacked == pile - 1
+                    put_rect(list, paint, centre - disk_width / 2.0,
+                             area.bottom + stacked.f64() * (disk_height + 2.0)
+                             + (14.0 if lifted else 0.0),
+                             disk_width, disk_height, disk_color(disk))

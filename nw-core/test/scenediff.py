@@ -98,7 +98,39 @@ def parse(binary):
     return specs, frames
 
 
-def main(build, width=912, height=684):
+def settle_positions(frame):
+    """Sort each run of commands that differ only in WHERE they are.
+
+    Some scenes draw a set of identical marks -- Go rings its target group with
+    one circle a point -- and the reference gets that set out of a frozenset,
+    so the order it draws them in is CPython's hash order. Reproducing that
+    would mean reproducing setobject.c's probe schedule to decide which of
+    several IDENTICAL circles goes down first.
+
+    The rule applied instead is narrow and can be stated: adjacent commands
+    that agree on everything except their first two numbers are the same mark
+    in different places, and the order of those is unobservable UNLESS THEY
+    OVERLAP. Equal-radius circles on distinct board points do not. A scene
+    where they could overlap must not opt in to this, which is why it is
+    opt-in and not the default.
+    """
+    out = []
+    run = []
+    shape = None
+    for line in frame:
+        cells = line.split("|")
+        here = tuple(cells[:1] + cells[3:])
+        if here == shape:
+            run.append(line)
+            continue
+        out.extend(sorted(run))
+        run = [line]
+        shape = here
+    out.extend(sorted(run))
+    return out
+
+
+def main(build, width=912, height=684, settle=None):
     reexec()
 
     import framerec
@@ -124,6 +156,8 @@ def main(build, width=912, height=684):
             screen.close()
         except Exception:                                  # noqa: BLE001
             pass
+        if settle is not None:
+            ours, theirs = settle(ours), settle(theirs)
         if ours == theirs:
             continue
         bad += 1

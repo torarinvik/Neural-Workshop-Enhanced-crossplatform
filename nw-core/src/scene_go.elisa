@@ -1,0 +1,216 @@
+# The Find the Winning Move screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/go.py -- the drawing, not the thinking.
+#
+# A goban: a wooden slab, the grid lines on it, the stones, and -- while the
+# problem is being solved -- a ring round the target group, a dot on the winning
+# move if the level gives it away, and a cursor.
+#
+# Two things here are easy to get wrong.
+#
+# The board's y axis is FLIPPED. `problem.board` is rows from the top, the
+# display list's origin is bottom-left, so a stone at row `y` is drawn at
+# `bottom + (size - 1 - y) * step`. Every one of the four things drawn on the
+# grid does that conversion, and each one does it separately in the reference.
+#
+# The cursor is a bordered rectangle whose FILL is fully transparent --
+# `color=(219, 174, 92, 0)` -- and whose border is given as a three-component
+# colour, `(50, 120, 220)`. pyglet completes a short border colour with THE
+# FILL'S ALPHA, not with 255:
+#
+#     BorderedRectangle(color=(219,174,92,0), border_color=(50,120,220))
+#         .border_color  ->  (50, 120, 220, 0)
+#
+# so the ring is transparent too and the original draws no cursor at all. That
+# is a bug in the reference and it is reproduced here rather than corrected,
+# because this file's job is to say what the reference draws. It is worth
+# fixing -- in the reference -- and the fix is one component.
+#
+# NOTE: needs elisacore_math, strings, geometry, display, verdict and tasks/go
+# included by the driver.
+
+module SceneGo:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SOLVING: i64 = 1
+    const PHASE_JUDGED: i64 = 2
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                 y: f64, width: f64, height: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               width / paint.sx, height / paint.sy, color)
+
+    def put_line(list: mutable Display::DisplayList&, paint: Paint&, x1: f64,
+                 y1: f64, x2: f64, y2: f64, thick: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_line(list, x1 / paint.sx, y1 / paint.sy,
+                               x2 / paint.sx, y2 / paint.sy,
+                               thick / paint.sy, color)
+
+    def put_circle(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                   y: f64, radius: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_circle(list, x / paint.sx, y / paint.sy,
+                                 radius / paint.sy, color)
+
+    def put_bordered(list: mutable Display::DisplayList&, paint: Paint&, x: f64,
+                     y: f64, width: f64, height: f64, fill: u32, edge: u32,
+                     border: f64):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_bordered_rect(list, x / paint.sx, y / paint.sy,
+                                        width / paint.sx, height / paint.sy,
+                                        fill, edge, border / paint.sy)
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    struct Goban:
+        left: mutable f64
+        bottom: mutable f64
+        step: mutable f64
+
+    # The grid's own box, centred in whatever room is left between the title
+    # and the verdict band. `above_the_band` is the one call a task's layout
+    # needs -- a board laid into the band is a scalar read off the scenery.
+    def board_of(out: mutable Goban&, width: f64, height: f64, size: i64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 90.0).f64()
+            floor: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 44.0).f64()).f64()
+            room: f64 = width * 0.82
+            span: f64 = top - floor
+            outer: f64 = room if room < span else span
+            step: f64 = outer / size.f64()
+            grid_side: f64 = step * (size - 1).f64()
+            out.left <- Geometry::width_center(width).f64() - grid_side / 2.0
+            out.bottom <- floor + (outer - grid_side) / 2.0
+            out.step <- step
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&,
+               problem: mutable Go::Problem&, has_problem: bool, phase: i64,
+               difficulty: i64, trial: i64, total_trials: i64,
+               cursor_x: i64, cursor_y: i64, message: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            put_text(list, paint, sview("Find the Winning Move", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 34.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            if has_problem and phase == PHASE_SOLVING:
+                # `'Level %d/10 — Black to play: %s — problem %d/%d'`
+                dstr_append_cstr(&status, "Level ")
+                dstr_append_i64(&status, difficulty)
+                dstr_append_cstr(&status, "/10 ")
+                dstr_append_em_dash(&status)
+                dstr_append_cstr(&status, " Black to play: ")
+                if problem.show_target:
+                    dstr_append_cstr(&status, "capture the blue-ringed White group")
+                else:
+                    dstr_append_cstr(&status, "capture the largest White group")
+                dstr_append_cstr(&status, " ")
+                dstr_append_em_dash(&status)
+                dstr_append_cstr(&status, " problem ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, "/")
+                dstr_append_i64(&status, total_trials)
+            else:
+                if has_problem:
+                    dstr_append_sview(&status, message)
+                else:
+                    # No problem yet: `'%s — difficulty %d/10'`, and the board
+                    # is not drawn at all.
+                    dstr_append_sview(&status, message)
+                    dstr_append_cstr(&status, " ")
+                    dstr_append_em_dash(&status)
+                    dstr_append_cstr(&status, " difficulty ")
+                    dstr_append_i64(&status, difficulty)
+                    dstr_append_cstr(&status, "/10")
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 64.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 13.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: menu   1-0: level   Space: start/next   click, or arrows + Enter   C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 24.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            return if not has_problem
+            size: i64 = problem.size
+            board: mutable Goban = Goban{left: 0.0, bottom: 0.0, step: 0.0}
+            board_of(&board, paint.width, paint.height, size)
+            step: f64 = board.step
+            board_side: f64 = step * (size - 1).f64()
+
+            put_rect(list, paint, board.left - step * 0.5,
+                     board.bottom - step * 0.5, board_side + step,
+                     board_side + step, Display::rgba(219, 174, 92, 255))
+            for index in 0..<size |list, paint, board, board_side, step|:
+                put_line(list, paint, board.left, board.bottom + index.f64() * step,
+                         board.left + board_side, board.bottom + index.f64() * step,
+                         1.0, Display::rgba(35, 35, 35, 255))
+                put_line(list, paint, board.left + index.f64() * step, board.bottom,
+                         board.left + index.f64() * step, board.bottom + board_side,
+                         1.0, Display::rgba(35, 35, 35, 255))
+
+            if problem.show_target and phase == PHASE_SOLVING:
+                # `problem.target` is a per-cell MASK here, not a list of
+                # points: the reference keeps a frozenset and the port keeps
+                # the membership, because a set of points is exactly what a
+                # mask is and the port has no set. The reference draws them in
+                # the frozenset's own hash order; these are one colour and one
+                # radius on distinct points, so which goes down first cannot
+                # change a pixel. See scenediff.settle_positions.
+                for cell in 0..<(size * size) |list, paint, board, problem, size, step|:
+                    if Ints::at_ref(&problem.target, cell) == 1:
+                        put_circle(list, paint,
+                                   board.left + (cell % size).f64() * step,
+                                   board.bottom + (size - 1 - cell / size).f64() * step,
+                                   step * 0.49, Display::rgba(50, 120, 220, 255))
+
+            if problem.show_move and phase == PHASE_SOLVING:
+                x: i64 = problem.winning % size
+                y: i64 = problem.winning / size
+                put_circle(list, paint, board.left + x.f64() * step,
+                           board.bottom + (size - 1 - y).f64() * step,
+                           step * 0.13, Display::rgba(50, 120, 220, 255))
+
+            for y in 0..<size |list, paint, board, problem, size, step|:
+                for x in 0..<size |list, paint, board, problem, size, step, y|:
+                    stone: i64 = Go::stone_at(&problem.board, size, x, y)
+                    if stone != 0:
+                        color: u32 = Display::rgba(25, 25, 28, 255) if stone == 1 else Display::rgba(238, 238, 238, 255)
+                        put_circle(list, paint, board.left + x.f64() * step,
+                                   board.bottom + (size - 1 - y).f64() * step,
+                                   step * 0.43, color)
+
+            if phase == PHASE_SOLVING:
+                raw_border: f64 = step * 0.05
+                put_bordered(list, paint,
+                             board.left + cursor_x.f64() * step - step * 0.13,
+                             board.bottom + (size - 1 - cursor_y).f64() * step - step * 0.13,
+                             step * 0.26, step * 0.26,
+                             Display::rgba(219, 174, 92, 0),
+                             # The fill's alpha, per the note at the top.
+                             Display::rgba(50, 120, 220, 0),
+                             raw_border if raw_border > 1.0 else 1.0)

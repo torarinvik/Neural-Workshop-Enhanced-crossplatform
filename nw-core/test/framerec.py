@@ -183,9 +183,24 @@ def _color(obj):
 
 
 def _visible(obj):
+    """Whether the shape puts anything on screen.
+
+    Transparent is not the same as absent, and a BorderedRectangle is where
+    that bites: Go draws its cursor as a rect with a fully transparent FILL and
+    an opaque border. Reading opacity alone would drop that command, and the
+    port -- which emits it, correctly -- would have looked wrong.
+    """
     if not getattr(obj, "visible", True):
         return False
-    return int(getattr(obj, "opacity", 255)) > 0
+    if int(getattr(obj, "opacity", 255)) > 0:
+        return True
+    border = getattr(obj, "border_color", None)
+    if not border:
+        return False
+    # A three-tuple border is opaque -- Go passes `border_color=(50, 120, 220)`
+    # with no alpha at all, and requiring four components here dropped its
+    # cursor from every frame.
+    return len(border) < 4 or border[3] > 0
 
 
 #: Which live attributes make up each kind, beyond x/y/colour, and which axis
@@ -206,6 +221,7 @@ def _visible(obj):
 _FIELDS = {
     "Rectangle": (("width", 0), ("height", 1)),
     "BorderedRectangle": (("width", 0), ("height", 1), ("border", 1)),
+    # border_color is appended separately below: it is a colour, not a length.
     "Box": (("width", 0), ("height", 1), ("thickness", 1)),
     "Circle": (("radius", 1),),
     "Arc": (("radius", 1), ("start_angle", None), ("angle", None)),
@@ -300,6 +316,11 @@ def capture(want_invisible=False):
         else:
             for field, axis in _FIELDS.get(kind, ()):
                 cells.append(_number(getattr(obj, field, 0) or 0, axis))
+            if kind == "BorderedRectangle":
+                edge = tuple(obj.border_color)
+                if len(edge) == 3:
+                    edge = edge + (255,)
+                cells.append("%d.%d.%d.%d" % edge)
             if kind == "MultiLine":
                 for point in extra.get("coordinates", ()):
                     cells.extend(_number(one, at)
