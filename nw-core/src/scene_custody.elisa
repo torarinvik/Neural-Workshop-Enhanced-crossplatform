@@ -1,0 +1,365 @@
+# The Chain of Custody screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/custody.py -- the drawing, not the thinking.
+#
+# Four labels, a verdict, and a carousel: a belt drawn as two runs joined at
+# the ends, machines standing on it, a delivery bay under it, boxes riding it,
+# a claw reaching in from outside, and a budget bar under everything.
+#
+# The SLOT NUMBERING is the layout's whole trick. The first `width` slots run
+# left to right along the top and the rest run right to LEFT along the bottom,
+# so slot and slot+1 are always neighbours on screen as well as on the belt.
+# A port that laid the second row left to right would draw a belt nothing
+# travels round.
+#
+# Three details are stated in the reference and are easy to lose:
+#
+#   * a held box lifts towards the OUTSIDE of the loop -- up on the top run
+#     and down on the bottom one -- so it reads as held rather than as one
+#     sitting next to the arm
+#   * heat is a RIM and not a tint, because the coat is the thing a player is
+#     following and it must not be muddied by state
+#   * the claw reaches in from outside whichever run it is on, and is kept
+#     under a slot's height because it used to draw its crossbar straight
+#     through the line of text saying what the round wanted
+#
+# NOTE: needs elisacore_math, strings, ints, geometry, verdict, display and
+# scene_verdict included by the driver.
+
+module SceneCustody:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_MARKING: i64 = 1
+    const PHASE_RUNNING: i64 = 2
+    const PHASE_SCORED: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const KIND_CHARGER: i64 = 0
+    const KIND_COOLER: i64 = 1
+    const KIND_PAINTER: i64 = 2
+
+    # Where the two runs sit in the canvas, as shares of its height, and how
+    # big a slot's box is. Named because the belt, the boxes, the machines,
+    # the claw and the bay all have to agree about them.
+    const TOP_ROW: f64 = 0.76
+    const BOTTOM_ROW: f64 = 0.34
+    const SLOT_SHARE: f64 = 0.72
+    const ROW_SHARE: f64 = 0.22
+
+    def coat_color(which: i64) -> u32:
+        ring: i64 = which % 4
+        if ring == 0:
+            return Display::rgba(0, 114, 178, 255)      # blue
+        if ring == 1:
+            return Display::rgba(240, 228, 66, 255)     # yellow
+        if ring == 2:
+            return Display::rgba(0, 158, 115, 255)      # green
+        return Display::rgba(204, 121, 167, 255)        # reddish purple
+
+    # A machine is furniture and must never read as a box, so these are
+    # deliberately not the coat colours.
+    def machine_color(kind: i64) -> u32:
+        if kind == KIND_CHARGER:
+            return Display::rgba(230, 159, 0, 255)      # orange
+        if kind == KIND_COOLER:
+            return Display::rgba(86, 180, 233, 255)     # sky blue
+        return Display::rgba(150, 150, 150, 255)        # grey
+
+    def machine_word(kind: i64) -> cstr:
+        if kind == KIND_CHARGER:
+            return "charge"
+        if kind == KIND_COOLER:
+            return "cool"
+        return "paint"
+
+    struct Machine:
+        slot: i64
+        kind: i64
+
+    struct Box:
+        slot: i64
+        held: bool
+        delivered: bool
+        look: i64
+        charge: i64
+        heat: i64
+        # Whether this box is the one the round is about.
+        is_core: bool
+
+    struct Paint:
+        ink: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def inked(paint: Paint&, opacity: i64) -> u32:
+        channel: i64 = ((paint.ink >> 24.u32()) & 255.u32()).i64()
+        return Display::rgba(channel, channel, channel, opacity)
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, wide: f64, tall: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               (wide if wide > 1.0 else 1.0) / paint.sx,
+                               (tall if tall > 1.0 else 1.0) / paint.sy, color)
+
+    struct Canvas:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def canvas_of(out: mutable Canvas&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 130.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 76.0).f64()).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.07
+            out.bottom <- bottom
+            out.width <- width * 0.86
+            out.height <- room if room > 60.0 else 60.0
+
+    struct Slot:
+        x: mutable f64
+        y: mutable f64
+        side: mutable f64
+
+    def slot_rect(out: mutable Slot&, canvas: Canvas&, span: i64, slot: i64):
+        can Abort.Panic:
+            step: f64 = canvas.width / span.f64()
+            across: f64 = step * SLOT_SHARE
+            down: f64 = canvas.height * ROW_SHARE
+            row: i64 = slot / span
+            along: mutable i64 = slot % span
+            # The bottom run goes right to LEFT, so slot and slot+1 are
+            # neighbours on screen as well as on the belt.
+            if row != 0:
+                along <- span - 1 - along
+            out.x <- canvas.left + (along.f64() + 0.5) * step
+            out.y <- canvas.bottom + canvas.height * (BOTTOM_ROW if row != 0 else TOP_ROW)
+            out.side <- across if across < down else down
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               has_layout: bool, span: i64, slots: i64, bay: i64,
+               machines: darray[Machine]&, boxes: darray[Box]&, claw: i64,
+               need_charge: i64, max_heat: i64, budget: i64, spent: i64,
+               asked: sview, trial: i64, total_trials: i64, message: sview,
+               verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+            running: bool = has_layout and (phase == PHASE_MARKING or phase == PHASE_RUNNING or phase == PHASE_SCORED)
+
+            put_text(list, paint, sview("Chain of Custody", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            if has_layout:
+                dstr_append_cstr(&status, "Round ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "     ")
+                left: i64 = budget - spent
+                dstr_append_i64(&status, left if left > 0 else 0)
+                dstr_append_cstr(&status, " actions left     ")
+                dstr_append_sview(&status, message)
+            else:
+                dstr_append_sview(&status, message)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint, asked if has_layout else sview("", 0, -1),
+                     middle, Geometry::from_top_edge(paint.height, 98.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint,
+                     sview("Esc: task menu     Space: start     arrows: move the claw     Z: pick up / put down     C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if not running:
+                return
+
+            canvas: mutable Canvas = Canvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            canvas_of(&canvas, paint.width, paint.height)
+
+            put_belt(list, paint, &canvas)
+            put_machines(list, paint, &canvas, span, machines)
+            put_bay(list, paint, &canvas, span, bay)
+            for index in 0..<boxes.count.i64() |list, paint, canvas, span, boxes, need_charge, max_heat, phase|:
+                one: Box = get boxes[index.usize()] else Box{slot: 0, held: false, delivered: false, look: 0, charge: 0, heat: 0, is_core: false}
+                if not one.delivered:
+                    put_box(list, paint, &canvas, span, &one, need_charge,
+                            max_heat, phase)
+            put_claw(list, paint, &canvas, span, claw)
+            put_budget(list, paint, &canvas, budget, spent)
+
+    # The two runs of the loop, and the ends that join them.
+    def put_belt(list: mutable Display::DisplayList&, paint: Paint&, canvas: Canvas&):
+        can Memory.Allocate, Abort.Panic:
+            wanted: f64 = canvas.height * 0.012
+            rail: f64 = wanted if wanted > 2.0 else 2.0
+            shade: u32 = inked(paint, 70)
+            put_rect(list, paint, canvas.left,
+                     canvas.bottom + canvas.height * BOTTOM_ROW - rail / 2.0,
+                     canvas.width, rail, shade)
+            put_rect(list, paint, canvas.left,
+                     canvas.bottom + canvas.height * TOP_ROW - rail / 2.0,
+                     canvas.width, rail, shade)
+            put_rect(list, paint, canvas.left,
+                     canvas.bottom + canvas.height * BOTTOM_ROW, rail,
+                     canvas.height * (TOP_ROW - BOTTOM_ROW), shade)
+            put_rect(list, paint, canvas.left + canvas.width - rail,
+                     canvas.bottom + canvas.height * BOTTOM_ROW, rail,
+                     canvas.height * (TOP_ROW - BOTTOM_ROW), shade)
+
+    def put_machines(list: mutable Display::DisplayList&, paint: Paint&,
+                     canvas: Canvas&, span: i64, machines: darray[Machine]&):
+        can Memory.Allocate, Abort.Panic:
+            where: mutable Slot = Slot{x: 0.0, y: 0.0, side: 0.0}
+            for index in 0..<machines.count.i64() |list, paint, canvas, span, machines, where|:
+                one: Machine = get machines[index.usize()] else Machine{slot: 0, kind: 0}
+                slot_rect(&where, canvas, span, one.slot)
+                side: f64 = where.side
+                shade: u32 = machine_color(one.kind)
+                put_rect(list, paint, where.x - side * 0.62, where.y - side * 0.72,
+                         side * 1.24, side * 1.44, with_alpha(shade, 60))
+                wanted: f64 = side * 0.07
+                edge: f64 = wanted if wanted > 2.0 else 2.0
+                put_rect(list, paint, where.x - side * 0.62, where.y - side * 0.72,
+                         side * 1.24, edge, shade)
+                put_rect(list, paint, where.x - side * 0.62,
+                         where.y + side * 0.72 - edge, side * 1.24, edge, shade)
+                put_text(list, paint, sview(machine_word(one.kind), 0, -1),
+                         where.x, where.y + side * 0.95,
+                         Geometry::calc_fontsize(paint.height, 9.0), paint.ink,
+                         Display::ANCHOR_CENTER_CENTER, false)
+
+    # The chute under the bottom row. Nothing else is ever there.
+    def put_bay(list: mutable Display::DisplayList&, paint: Paint&,
+                canvas: Canvas&, span: i64, bay: i64):
+        can Memory.Allocate, Abort.Panic:
+            where: mutable Slot = Slot{x: 0.0, y: 0.0, side: 0.0}
+            slot_rect(&where, canvas, span, bay)
+            side: f64 = where.side
+            below: f64 = where.y - side * 1.15
+            put_rect(list, paint, where.x - side * 0.7, below, side * 1.4,
+                     side * 0.8, inked(paint, 45))
+            # UNDER the chute rather than in it: the claw reaches down into
+            # the bay to deliver, and its crossbar was landing on the word.
+            put_text(list, paint, sview("bay", 0, -1), where.x,
+                     below - side * 0.22,
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+    def put_box(list: mutable Display::DisplayList&, paint: Paint&,
+                canvas: Canvas&, span: i64, box: Box&, need_charge: i64,
+                max_heat: i64, phase: i64):
+        can Memory.Allocate, Abort.Panic:
+            where: mutable Slot = Slot{x: 0.0, y: 0.0, side: 0.0}
+            slot_rect(&where, canvas, span, box.slot)
+            side: f64 = where.side
+            x: f64 = where.x
+            y: mutable f64 = where.y
+            if box.held:
+                # Lifted towards the OUTSIDE of the loop: up on the top run
+                # and down on the bottom one, the same side the claw reaches
+                # in from.
+                y <- y + side * 0.55 * (1.0 if box.slot < span else -1.0)
+            put_rect(list, paint, x - side * 0.4, y - side * 0.4,
+                     side * 0.8, side * 0.8, coat_color(box.look))
+            if need_charge != 0:
+                put_charge(list, paint, box, x, y, side, need_charge)
+            if max_heat < 100 and box.heat != 0:
+                # Heat as a RIM rather than a tint, so it never changes what
+                # coat the box reads as.
+                wanted: f64 = side * 0.09
+                hot: f64 = wanted if wanted > 2.0 else 2.0
+                share: f64 = box.heat.f64() / 100.0
+                capped: f64 = share if share < 1.0 else 1.0
+                put_rect(list, paint, x - side * 0.4, y + side * 0.4 - hot,
+                         side * 0.8, hot,
+                         Display::rgba(213, 94, 0, (60.0 + 195.0 * capped).i64()))
+            if phase == PHASE_MARKING and box.is_core:
+                # The one moment the Core is told apart from the rest.
+                wanted: f64 = side * 0.09
+                Display::draw_arc(list, x / paint.sx, y / paint.sy,
+                                  side * 0.72 / paint.sx, 0.0, 360.0, paint.ink)
+
+    def put_charge(list: mutable Display::DisplayList&, paint: Paint&,
+                   box: Box&, x: f64, y: f64, side: f64, need_charge: i64):
+        can Memory.Allocate, Abort.Panic:
+            wide: f64 = side * 0.8
+            wanted: f64 = side * 0.12
+            tall: f64 = wanted if wanted > 2.0 else 2.0
+            base: f64 = y - side * 0.62
+            put_rect(list, paint, x - wide / 2.0, base, wide, tall, inked(paint, 50))
+            share: f64 = box.charge.f64() / 100.0
+            capped: f64 = share if share < 1.0 else 1.0
+            # `if share:` -- a flat zero draws nothing at all.
+            if capped != 0.0:
+                enough: bool = box.charge >= need_charge
+                put_rect(list, paint, x - wide / 2.0, base, wide * capped, tall,
+                         Display::rgba(0, 158, 115, 255) if enough else Display::rgba(150, 150, 150, 255))
+
+    def put_claw(list: mutable Display::DisplayList&, paint: Paint&,
+                 canvas: Canvas&, span: i64, claw: i64):
+        can Memory.Allocate, Abort.Panic:
+            where: mutable Slot = Slot{x: 0.0, y: 0.0, side: 0.0}
+            slot_rect(&where, canvas, span, claw)
+            side: f64 = where.side
+            wanted: f64 = side * 0.1
+            arm: f64 = wanted if wanted > 2.0 else 2.0
+            reach: f64 = side * (0.85 if claw < span else -0.85)
+            low: f64 = where.y if where.y < where.y + reach else where.y + reach
+            long: f64 = reach if reach > 0.0 else -reach
+            put_rect(list, paint, where.x - arm / 2.0, low, arm, long,
+                     inked(paint, 150))
+            put_rect(list, paint, where.x - side * 0.52,
+                     where.y + reach - (arm if reach > 0.0 else 0.0),
+                     side * 1.04, arm, paint.ink)
+
+    # Actions left, as a bar as well as a number: what a player needs is to
+    # notice the room running out while there is still room, which is a
+    # length rather than a digit.
+    def put_budget(list: mutable Display::DisplayList&, paint: Paint&,
+                   canvas: Canvas&, budget: i64, spent: i64):
+        can Memory.Allocate, Abort.Panic:
+            wanted: f64 = canvas.width * 0.006
+            tall: f64 = wanted if wanted > 3.0 else 3.0
+            base: f64 = canvas.bottom - tall * 4.0
+            left: f64 = 1.0 - spent.f64() / budget.f64()
+            share: f64 = left if left > 0.0 else 0.0
+            put_rect(list, paint, canvas.left, base, canvas.width, tall,
+                     inked(paint, 45))
+            if share != 0.0:
+                put_rect(list, paint, canvas.left, base, canvas.width * share,
+                         tall, inked(paint, 170))
+
+    # The same colour at a different opacity.
+    def with_alpha(color: u32, opacity: i64) -> u32:
+        return (color & 4294967040.u32()) | opacity.u32()
