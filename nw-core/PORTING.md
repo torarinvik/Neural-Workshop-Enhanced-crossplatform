@@ -179,6 +179,85 @@ diverges while still looking right:
   actually iterates the set or only tests membership; membership needs no
   order at all.
 
+## Where the port stops, and how to say so
+
+Three kinds of thing belong to the shell rather than to the port, and the rule
+for all three is the same: take the boundary as INPUT, and say in the module
+header what is on the other side of it.
+
+- **Corpora.** Word lists, sentence banks, media pools, Parquet datasets. The
+  port takes integers, byte arrays or measurements. crossword takes a lexicon;
+  verbal and trivia take their questions.
+- **Sentences.** English built round numbers that are checked elsewhere.
+  ravens' `explain` hands back which rule ran on which attribute of which
+  component; algebra's `working` is not ported and its `candidates` column is
+  `log10(space)` taken on the `space` that is. The FACT crosses, the phrasing
+  does not.
+- **Engines.** chess.py asks `python-chess` five questions and no others. The
+  engine is not ported -- it is a bitboard move generator with its own legality
+  rules -- but everything AROUND it is, and the five answers are recorded live
+  off the real engine and replayed. See below.
+
+Before drawing an engine boundary, check whether its ORDER leaks. Every
+`mating_moves` call site in chess.py guards on `len(mates) == 1` before reading
+`mates[0]`, so what crosses is a COUNT, and a count is something a transcript
+can carry. Had one of them taken the first of several, no amount of supplied
+verdict would have reproduced it and the boundary would have been a fiction.
+
+**A transcript is better than a golden file.** Where the port needs answers it
+cannot compute, have the harness record them LIVE and write them to a file the
+sweep reads (`chess_diff.py`, `/tmp/nw_chess_oracle.txt`). Re-derived every
+run, so a change in the dependency shows up as a mismatch rather than as a
+stale recording that still passes. Have each case report how many answers it
+consumed: a port that asks one question more or fewer is then caught by the
+count before it is caught by the result.
+
+The same trick carries test CORPORA the other way -- `expressions_diff.py` and
+`algebra_diff.py` write the expressions and the typed answers to a file the
+sweep reads back, so the strings are written down once.
+
+## Big numbers
+
+`src/bigfrac.elisa` is `int` and `fractions.Fraction`: sign plus base-10
+magnitude, and exact rationals over them. Reach for it when i64 is not enough
+-- on this ladder that is algebra's top rung and nothing else.
+
+- **Python's `//` floors toward minus infinity and its `%` takes the sign of
+  the DIVISOR.** `-7 // 2` is -4 and `-7 % 2` is 1. Truncating gives -3 and -1,
+  and every congruence comes out wrong by a modulus.
+- **`getrandbits(k)` past 32 bits is several draws**, taken LEAST significant
+  first, and only the last is shifted down to the width still wanted. Taken the
+  other way round the bits are all there and the number is not.
+- **Keep the magnitude narrow.** `BIG_DIGITS` is 96, not decimal.elisa's 256,
+  because a polynomial holds sixteen of these rationals inline and a magnitude
+  four times too wide is a stack frame four times too wide. Which brings us to:
+
+## Large structs: the compiler used to hate them
+
+A struct literal holding a multi-kilobyte field was assembled as a first-class
+aggregate with `insertvalue` per field, which made LLVM scalarise the field
+into one `load i8` per byte -- 3,200 of them, in one basic block of 9,635
+instructions. SelectionDAG is superlinear in block size, and 98.6% of an
+eighty-six second compile was AArch64 instruction selection on that one block.
+
+Fixed in elisa-core (`emitStructLitExprInMemory`); repro at
+`repro/large_struct_literal_insertvalue_isel_blowup.elisa`. Two habits are
+still worth keeping, because they cost nothing:
+
+- **Split a big `main` into functions.** One frame holding every large local at
+  once is the shape that provokes this. `algebra_sweep.elisa` is four functions
+  for exactly this reason.
+- **Do not initialise what is never read.** `Expressions::zero()` leaves its
+  coefficients blank rather than building sixteen exact zeros nobody looks at.
+
+If a compile is inexplicably slow, the measurement takes two minutes:
+
+```bash
+elisacore -emit llvm -O0 -o /tmp/x.ll sweep.elisa
+opt -passes='default<O2>' -o /tmp/x.bc /tmp/x.ll     # the optimiser
+llc -O2 -filetype=obj -time-passes -o /dev/null /tmp/x.bc   # and codegen
+```
+
 ## Adding a suite
 
 1. `nw-core/src/<name>.elisa` — the port. No I/O, no globals; state arrives as
