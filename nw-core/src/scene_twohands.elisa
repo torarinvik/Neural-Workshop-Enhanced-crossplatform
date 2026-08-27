@@ -1,0 +1,610 @@
+# The Two Hands screen: game state in, display list out.
+#
+# Port of neural_workshop/ui/twohands.py -- the drawing, not the thinking.
+#
+# The only perspective in the workshop, and it is one function: `far(ahead)`
+# gives the screen y and the half-width of the road that many drawn rows away.
+# The width falls off as DEPTH / (ahead + DEPTH) and the road climbs the same
+# fraction of the way to the horizon. NOTHING ELSE HERE KNOWS HOW DEPTH WORKS.
+#
+# The road is drawn as trapezoids, which is the only shape perspective needs.
+# The bands sliding down it are what makes it MOVE -- without them a clear
+# stretch at four sub-rows a tick and one at a single sub-row look exactly
+# alike, and the throttle would be a number rather than something you feel.
+# The dashes go on the rows BETWEEN the bands so the two markings never land
+# on the same stretch and cancel each other out.
+#
+# Hazards are drawn FAR ONES FIRST. Painter's order is the only thing this
+# renderer does about occlusion and it is enough: a truck two rows away hides
+# the cone behind it exactly as it should.
+#
+# A hazard carries its two rule-bits in SHAPE rather than in colour --
+# everything a jump clears lies flat on the tarmac and everything it does not
+# stands up off it -- and the colour is left to say which of the nine it is.
+#
+# The dials stack down the LEFT VERGE, the one piece of the playfield the road
+# never reaches. The first two are bars one above the other on purpose: what a
+# driver needs is whether the pace is being held, and that is a comparison of
+# two fractions rather than either of them.
+#
+# NOTE: needs elisacore_math, strings, ints, geometry, verdict, display and
+# scene_verdict included by the driver.
+
+module SceneTwoHands:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SETTING: i64 = 1
+    const PHASE_RUNNING: i64 = 2
+    const PHASE_SCORED: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const LANES: f64 = 3.0
+    const SUB: f64 = 4.0
+    const BODY: f64 = 3.0
+    const SIGHT: i64 = 14
+    # The distance at which the road is half as wide as it is here.
+    const DEPTH: f64 = 6.0
+    const HORIZON: f64 = 0.58
+
+    const ROAD_ALPHA: i64 = 26
+    const BAND_ALPHA: i64 = 40
+    const MARK_ALPHA: i64 = 110
+    const GRASS_ALPHA: i64 = 14
+
+    # The nine kinds, in the model's own order.
+    const KIND_DONKEY: i64 = 0
+    const KIND_TRUCK: i64 = 1
+    const KIND_BARRIER: i64 = 2
+    const KIND_LOG: i64 = 3
+    const KIND_RUBBLE: i64 = 4
+    const KIND_CONE: i64 = 5
+    const KIND_RAMP: i64 = 6
+    const KIND_PAD: i64 = 7
+    const KIND_COIN: i64 = 8
+
+    def kind_color(kind: i64) -> u32:
+        if kind == KIND_DONKEY:
+            return Display::rgba(213, 94, 0, 255)       # vermillion
+        if kind == KIND_TRUCK:
+            return Display::rgba(204, 121, 167, 255)    # reddish purple
+        if kind == KIND_BARRIER:
+            return Display::rgba(230, 159, 0, 255)      # orange
+        if kind == KIND_LOG:
+            return Display::rgba(90, 62, 40, 255)       # a fallen tree
+        if kind == KIND_RUBBLE:
+            return Display::rgba(130, 130, 130, 255)
+        if kind == KIND_CONE:
+            return Display::rgba(240, 228, 66, 255)     # yellow
+        if kind == KIND_RAMP:
+            return Display::rgba(86, 180, 233, 255)     # sky blue
+        return Display::rgba(0, 158, 115, 255)          # bluish green
+
+    # How tall each kind stands, as a share of a lane's near width.
+    def kind_height(kind: i64) -> f64:
+        if kind == KIND_DONKEY:
+            return 0.80
+        if kind == KIND_TRUCK:
+            return 1.05
+        if kind == KIND_BARRIER:
+            return 0.62
+        if kind == KIND_RUBBLE:
+            return 0.46
+        if kind == KIND_LOG:
+            return 0.14
+        if kind == KIND_CONE:
+            return 0.36
+        if kind == KIND_RAMP:
+            return 0.20
+        if kind == KIND_PAD:
+            return 0.12
+        return 0.40
+
+    # Whether a jump goes over it, which is also what decides how wide it is
+    # drawn.
+    def kind_tall(kind: i64) -> bool:
+        return kind == KIND_DONKEY or kind == KIND_TRUCK or kind == KIND_BARRIER or kind == KIND_RUBBLE
+
+    def color_car() -> u32:
+        return Display::rgba(0, 114, 178, 255)
+
+    def color_target() -> u32:
+        return Display::rgba(240, 228, 66, 255)
+
+    def color_downed() -> u32:
+        return Display::rgba(0, 158, 115, 255)
+
+    struct Hazard:
+        # Drawn rows ahead of the car's tail.
+        ahead: f64
+        lane: f64
+        kind: i64
+
+    struct Target:
+        across: f64
+        up: f64
+        downed: bool
+
+    struct Paint:
+        ink: mutable u32
+        back: mutable u32
+        width: mutable f64
+        height: mutable f64
+        sx: mutable f64
+        sy: mutable f64
+
+    def paint_of(black_background: bool, width: f64, height: f64,
+                 sx: f64, sy: f64) -> Paint:
+        back: i64 = 0 if black_background else 255
+        fore: i64 = 255 - back
+        return Paint{ink: Display::rgba(fore, fore, fore, 255),
+                     back: Display::rgba(back, back, back, 255),
+                     width: width, height: height, sx: sx, sy: sy}
+
+    def inked(paint: Paint&, opacity: i64) -> u32:
+        channel: i64 = ((paint.ink >> 24.u32()) & 255.u32()).i64()
+        return Display::rgba(channel, channel, channel, opacity)
+
+    def with_alpha(color: u32, opacity: i64) -> u32:
+        return (color & 4294967040.u32()) | opacity.u32()
+
+    def put_text(list: mutable Display::DisplayList&, paint: Paint&, text: sview,
+                 x: f64, y: f64, size: f64, color: u32, anchor: u32, bold: bool):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, x / paint.sx, y / paint.sy,
+                                      size / paint.sy, color, anchor, bold)
+
+    def put_label(list: mutable Display::DisplayList&, paint: Paint&,
+                  text: sview, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            put_text(list, paint, text, x, y,
+                     Geometry::calc_fontsize(paint.height, 10.0), paint.ink,
+                     Display::ANCHOR_LEFT_CENTER, false)
+
+    def put_rect(list: mutable Display::DisplayList&, paint: Paint&,
+                 x: f64, y: f64, wide: f64, tall: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, x / paint.sx, y / paint.sy,
+                               (wide if wide > 1.0 else 1.0) / paint.sx,
+                               (tall if tall > 1.0 else 1.0) / paint.sy, color)
+
+    def put_dot(list: mutable Display::DisplayList&, paint: Paint&,
+                x: f64, y: f64, radius: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_circle(list, x / paint.sx, y / paint.sy,
+                                 (radius if radius > 1.0 else 1.0) / paint.sx,
+                                 color)
+
+    # A trapezoid of road, which is the only shape perspective needs.
+    def put_quad(list: mutable Display::DisplayList&, paint: Paint&,
+                 x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64,
+                 x4: f64, y4: f64, color: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::begin_polygon(list, 4, x1 / paint.sx, y1 / paint.sy, color)
+            Display::polygon_point(list, x1 / paint.sx, y1 / paint.sy)
+            Display::polygon_point(list, x2 / paint.sx, y2 / paint.sy)
+            Display::polygon_point(list, x3 / paint.sx, y3 / paint.sy)
+            Display::polygon_point(list, x4 / paint.sx, y4 / paint.sy)
+
+    struct Stage:
+        left: mutable f64
+        bottom: mutable f64
+        width: mutable f64
+        height: mutable f64
+
+    def stage_of(out: mutable Stage&, width: f64, height: f64):
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(height, 158.0).f64()
+            bottom: f64 = Verdict::above_the_band(height, Geometry::from_bottom_edge(height, 56.0).f64()).f64()
+            room: f64 = top - bottom
+            out.left <- width * 0.06
+            out.bottom <- bottom
+            out.width <- width * 0.88
+            out.height <- room if room > 80.0 else 80.0
+
+    def horizon_of(stage: Stage&) -> f64:
+        return stage.bottom + stage.height * HORIZON
+
+    # Half the road's width under the bonnet.
+    def near_half(stage: Stage&) -> f64:
+        across: f64 = stage.width * 0.34
+        down: f64 = stage.height * 0.78
+        return across if across < down else down
+
+    # The one piece of perspective in the module.
+    def far_y(stage: Stage&, ahead: f64) -> f64:
+        reach: f64 = ahead if ahead > 0.0 else 0.0
+        shrink: f64 = DEPTH / (reach + DEPTH)
+        return stage.bottom + (horizon_of(stage) - stage.bottom) * (1.0 - shrink)
+
+    def far_half(stage: Stage&, ahead: f64) -> f64:
+        reach: f64 = ahead if ahead > 0.0 else 0.0
+        return near_half(stage) * (DEPTH / (reach + DEPTH))
+
+    def lane_x(stage: Stage&, ahead: f64, lane: f64) -> f64:
+        across: f64 = (lane + 0.5) / LANES
+        return stage.left + stage.width / 2.0 + (across - 0.5) * 2.0 * far_half(stage, ahead)
+
+    def render(list: mutable Display::DisplayList&, paint: Paint&, phase: i64,
+               driving: bool, at: i64, hazards: darray[Hazard]&,
+               car_lane: f64, air_lift: f64, in_air: bool,
+               sky: darray[Target]&, cross_x: f64, cross_y: f64,
+               loaded: bool, road_share: f64, clock_share: f64, gear: i64,
+               top_gear: i64, rows_done: i64, road_rows: i64, ticks: i64,
+               road_clock: i64, points: i64, shot: i64, targets: i64,
+               asked: sview, trial: i64, total_trials: i64, message: sview,
+               verdict: i64, verdict_text: sview):
+        can Memory.Allocate, Abort.Panic:
+            middle: f64 = Geometry::width_center(paint.width).f64()
+
+            put_text(list, paint, sview("Two Hands", 0, -1), middle,
+                     Geometry::from_top_edge(paint.height, 36.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, true)
+
+            status: mutable dstr = []
+            if driving:
+                dstr_append_cstr(&status, "Road ")
+                dstr_append_i64(&status, trial)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, total_trials)
+                dstr_append_cstr(&status, "     ")
+                dstr_append_sview(&status, message)
+            else:
+                dstr_append_sview(&status, message)
+            put_text(list, paint, bytes_view(status), middle,
+                     Geometry::from_top_edge(paint.height, 70.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            put_text(list, paint, asked if driving else sview("", 0, -1),
+                     middle, Geometry::from_top_edge(paint.height, 94.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
+                     Display::ANCHOR_CENTER_TOP, false)
+
+            put_text(list, paint,
+                     sview("Esc: menu   ← → steer   ↑ ↓ gear   Space: start, then jump   Mouse: aim and fire   C: options", 0, -1),
+                     middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
+                     Geometry::calc_fontsize(paint.height, 11.0), paint.ink,
+                     Display::ANCHOR_CENTER_CENTER, false)
+
+            if verdict >= 0:
+                SceneVerdict::put(list, paint.width, paint.height, paint.sx, paint.sy,
+                                  verdict == 1, verdict_text, 60.0, 16.0)
+
+            if not driving or (phase != PHASE_SETTING and phase != PHASE_RUNNING and phase != PHASE_SCORED):
+                return
+
+            stage: mutable Stage = Stage{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
+            stage_of(&stage, paint.width, paint.height)
+            put_ground(list, paint, &stage)
+            put_road(list, paint, &stage, at)
+            put_hazards(list, paint, &stage, hazards)
+            put_car(list, paint, &stage, car_lane, air_lift, in_air)
+            put_sky(list, paint, &stage, sky)
+            put_crosshair(list, paint, &stage, cross_x, cross_y, loaded)
+            put_dials(list, paint, &stage, road_share, clock_share, gear,
+                      top_gear, rows_done, road_rows, ticks, road_clock,
+                      points, shot, targets)
+
+    # The verges, the sky, and the line between them. The sky is TINTED rather
+    # than left as page and the horizon is DRAWN rather than implied, because
+    # the sky is where the crosshair lives.
+    def put_ground(list: mutable Display::DisplayList&, paint: Paint&, stage: Stage&):
+        can Memory.Allocate, Abort.Panic:
+            sky: f64 = horizon_of(stage)
+            put_rect(list, paint, stage.left, stage.bottom, stage.width,
+                     sky - stage.bottom, inked(paint, GRASS_ALPHA))
+            put_rect(list, paint, stage.left, sky, stage.width,
+                     stage.bottom + stage.height - sky,
+                     inked(paint, GRASS_ALPHA + 8))
+            line: f64 = stage.height * 0.004
+            put_rect(list, paint, stage.left, sky, stage.width,
+                     line if line > 1.5 else 1.5, inked(paint, MARK_ALPHA))
+
+    def put_road(list: mutable Display::DisplayList&, paint: Paint&,
+                 stage: Stage&, at: i64):
+        can Memory.Allocate, Abort.Panic:
+            part: f64 = (at % SUB.i64()).f64() / SUB
+            row: i64 = at / SUB.i64()
+            centre: f64 = stage.left + stage.width / 2.0
+            near_ahead: f64 = 0.0 - part
+            far_ahead: f64 = (SIGHT + 1).f64() - part
+            near_top: f64 = far_y(stage, near_ahead)
+            near_wide: f64 = far_half(stage, near_ahead)
+            far_top: f64 = far_y(stage, far_ahead)
+            far_wide: f64 = far_half(stage, far_ahead)
+            put_quad(list, paint, centre - near_wide, near_top,
+                     centre + near_wide, near_top, centre + far_wide, far_top,
+                     centre - far_wide, far_top, inked(paint, ROAD_ALPHA))
+
+            for step in 0..<(SIGHT + 1) |list, paint, stage, part, row, centre|:
+                y_near: f64 = far_y(stage, step.f64() - part)
+                half_near: f64 = far_half(stage, step.f64() - part)
+                y_far: f64 = far_y(stage, (step + 1).f64() - part)
+                half_far: f64 = far_half(stage, (step + 1).f64() - part)
+                if (row + step) % 2 != 0:
+                    put_quad(list, paint, centre - half_near, y_near,
+                             centre + half_near, y_near, centre + half_far,
+                             y_far, centre - half_far, y_far,
+                             inked(paint, BAND_ALPHA))
+                else:
+                    # Dashes on the rows BETWEEN the bands, so the two
+                    # markings never land on the same stretch.
+                    for divider in 1..<LANES.i64() |list, paint, centre, half_near, half_far, y_near, y_far|:
+                        across: f64 = divider.f64() / LANES
+                        wanted_near: f64 = half_near * 0.035
+                        thick_near: f64 = wanted_near if wanted_near > 1.0 else 1.0
+                        wanted_far: f64 = half_far * 0.035
+                        thick_far: f64 = wanted_far if wanted_far > 0.6 else 0.6
+                        mid_near: f64 = centre + (across - 0.5) * 2.0 * half_near
+                        mid_far: f64 = centre + (across - 0.5) * 2.0 * half_far
+                        put_quad(list, paint, mid_near - thick_near, y_near,
+                                 mid_near + thick_near, y_near,
+                                 mid_far + thick_far, y_far,
+                                 mid_far - thick_far, y_far,
+                                 inked(paint, MARK_ALPHA))
+
+            put_verge(list, paint, centre, -1.0, near_wide, near_top, far_wide, far_top)
+            put_verge(list, paint, centre, 1.0, near_wide, near_top, far_wide, far_top)
+
+    def put_verge(list: mutable Display::DisplayList&, paint: Paint&,
+                  centre: f64, side: f64, near_wide: f64, near_top: f64,
+                  far_wide: f64, far_top: f64):
+        can Memory.Allocate, Abort.Panic:
+            put_quad(list, paint, centre + side * near_wide, near_top,
+                     centre + side * near_wide * 1.06, near_top,
+                     centre + side * far_wide * 1.06, far_top,
+                     centre + side * far_wide, far_top,
+                     inked(paint, MARK_ALPHA))
+
+    # Everything standing in the road, FAR ONES FIRST.
+    def put_hazards(list: mutable Display::DisplayList&, paint: Paint&,
+                    stage: Stage&, hazards: darray[Hazard]&):
+        can Memory.Allocate, Abort.Panic:
+            order: mutable darray[Hazard] = []
+            for index in 0..<hazards.count.i64() |order, hazards|:
+                order.push(get hazards[index.usize()] else Hazard{ahead: 0.0, lane: 0.0, kind: 0})
+            sort_far_first(&order)
+            for index in 0..<order.count.i64() |list, paint, stage, order|:
+                one: Hazard = get order[index.usize()] else Hazard{ahead: 0.0, lane: 0.0, kind: 0}
+                put_hazard(list, paint, stage, &one)
+
+    # `sorted(..., key=lambda item: -item[0])` -- a stable sort on the negated
+    # distance, so two things the same distance away keep the road's own order.
+    def sort_far_first(order: mutable darray[Hazard]&):
+        can Abort.Panic:
+            count: i64 = order.count.i64()
+            at: mutable i64 = 1
+            while at < count |order, count, at|:
+                held: Hazard = get order[at.usize()] else Hazard{ahead: 0.0, lane: 0.0, kind: 0}
+                back: mutable i64 = at - 1
+                while back >= 0 |order, held, back|:
+                    here: Hazard = get order[back.usize()] else Hazard{ahead: 0.0, lane: 0.0, kind: 0}
+                    if here.ahead >= held.ahead:
+                        break
+                    order[(back + 1).usize()] <- here
+                    back <- back - 1
+                order[(back + 1).usize()] <- held
+                at <- at + 1
+
+    def put_hazard(list: mutable Display::DisplayList&, paint: Paint&,
+                   stage: Stage&, haz: Hazard&):
+        can Memory.Allocate, Abort.Panic:
+            kind: i64 = haz.kind
+            colour: u32 = kind_color(kind)
+            ahead: f64 = haz.ahead if haz.ahead > 0.0 else 0.0
+            base: f64 = far_y(stage, ahead)
+            half: f64 = far_half(stage, ahead)
+            top: f64 = far_y(stage, ahead + BODY / SUB)
+            lane_wide: f64 = 2.0 * half / LANES
+            x: f64 = lane_x(stage, ahead, haz.lane)
+            tall: f64 = lane_wide * kind_height(kind)
+            standing: bool = kind_tall(kind)
+            wide: f64 = lane_wide * (0.74 if standing else 0.66)
+            # The FOOTPRINT: the road the thing actually blocks. Every kind
+            # gets one, so where a hazard is never depends on how it is drawn.
+            put_quad(list, paint, x - wide / 2.0, base, x + wide / 2.0, base,
+                     x + wide * 0.40, top, x - wide * 0.40, top,
+                     with_alpha(colour, 120 if standing else 200))
+            if kind == KIND_COIN:
+                put_dot(list, paint, x, base + tall * 1.1, tall * 0.5, colour)
+                put_dot(list, paint, x, base + tall * 1.1, tall * 0.26, paint.back)
+                return
+            if kind == KIND_RAMP:
+                put_quad(list, paint, x - wide / 2.0, base, x + wide / 2.0, base,
+                         x + wide * 0.40, top + tall, x - wide * 0.40, top + tall,
+                         colour)
+                return
+            if kind == KIND_PAD:
+                # A chevron pointing the way you are going: a pad is the one
+                # thing here that makes the road come at you faster.
+                put_chevron(list, paint, x, base, tall, wide, 0.0, colour)
+                put_chevron(list, paint, x, base, tall, wide, 0.5, colour)
+                return
+            if kind == KIND_CONE:
+                put_quad(list, paint, x - wide / 2.0, base, x + wide / 2.0, base,
+                         x + wide * 0.10, base + tall, x - wide * 0.10, base + tall,
+                         colour)
+                put_rect(list, paint, x - wide * 0.28, base + tall * 0.45,
+                         wide * 0.56, tall * 0.18, paint.back)
+                return
+            if kind == KIND_LOG:
+                put_rect(list, paint, x - wide / 2.0, base, wide, tall, colour)
+                put_rect(list, paint, x - wide / 2.0, base + tall * 0.45, wide,
+                         tall * 0.16, paint.back)
+                return
+            # Everything left stands up off the tarmac, which is the bit a
+            # jump does not get over.
+            put_rect(list, paint, x - wide / 2.0, base, wide, tall, colour)
+            if kind == KIND_DONKEY:
+                head: f64 = wide * 0.30
+                put_rect(list, paint, x + wide * 0.20, base + tall * 0.74,
+                         head, head, colour)
+                put_rect(list, paint, x + wide * 0.26, base + tall * 0.98,
+                         head * 0.26, head * 0.62, colour)
+                put_rect(list, paint, x + wide * 0.50, base + tall * 0.98,
+                         head * 0.26, head * 0.62, colour)
+            elif kind == KIND_TRUCK:
+                put_rect(list, paint, x - wide * 0.34, base + tall * 0.34,
+                         wide * 0.68, tall * 0.26, paint.back)
+                put_rect(list, paint, x - wide * 0.40, base + tall * 0.74,
+                         wide * 0.80, tall * 0.20, paint.back)
+            elif kind == KIND_BARRIER:
+                put_rect(list, paint, x - wide / 2.0, base + tall * 0.24, wide,
+                         tall * 0.18, paint.back)
+                put_rect(list, paint, x - wide / 2.0, base + tall * 0.64, wide,
+                         tall * 0.18, paint.back)
+            elif kind == KIND_RUBBLE:
+                put_rect(list, paint, x - wide * 0.30, base + tall,
+                         wide * 0.30, tall * 0.55 * 0.5, colour)
+                put_rect(list, paint, x + wide * 0.28, base + tall,
+                         wide * 0.30, tall * 0.75 * 0.5, colour)
+
+    def put_chevron(list: mutable Display::DisplayList&, paint: Paint&,
+                    x: f64, base: f64, tall: f64, wide: f64, step: f64,
+                    colour: u32):
+        can Memory.Allocate, Abort.Panic:
+            foot: f64 = base + tall * step
+            put_quad(list, paint, x - wide / 2.0, foot, x, foot + tall * 0.55,
+                     x + wide / 2.0, foot, x, foot + tall * 0.20, colour)
+
+    def put_car(list: mutable Display::DisplayList&, paint: Paint&,
+                stage: Stage&, car_lane: f64, air_lift: f64, in_air: bool):
+        can Memory.Allocate, Abort.Panic:
+            base: f64 = far_y(stage, 0.0)
+            half: f64 = far_half(stage, 0.0)
+            lane_wide: f64 = 2.0 * half / LANES
+            deep: f64 = horizon_of(stage) - stage.bottom
+            x: f64 = lane_x(stage, 0.0, car_lane)
+            # Wide enough to read as filling a lane and short enough not to be
+            # the view: a player looks PAST the car.
+            wide: f64 = lane_wide * 0.58
+            across: f64 = lane_wide * 0.30
+            down: f64 = deep * 0.20
+            tall: f64 = across if across < down else down
+            lift: mutable f64 = 0.0
+            if in_air:
+                lift <- tall * 1.3 * air_lift
+                shadow: f64 = tall * 0.12
+                put_rect(list, paint, x - wide * 0.36, base, wide * 0.72,
+                         shadow if shadow > 2.0 else 2.0, inked(paint, 60))
+            y: f64 = base + lift
+            put_rect(list, paint, x - wide / 2.0, y, wide, tall, color_car())
+            put_rect(list, paint, x - wide * 0.30, y + tall * 0.42,
+                     wide * 0.60, tall * 0.40, paint.back)
+            # INSIDE the body rather than under it: a wheel drawn below the
+            # bonnet is a wheel drawn below the playfield, and the playfield's
+            # bottom edge is the band the boundary reads.
+            put_rect(list, paint, x - wide * 0.40 - wide * 0.10, y,
+                     wide * 0.20, tall * 0.26, inked(paint, 200))
+            put_rect(list, paint, x + wide * 0.40 - wide * 0.10, y,
+                     wide * 0.20, tall * 0.26, inked(paint, 200))
+
+    # The targets, and a ring where one was taken.
+    def put_sky(list: mutable Display::DisplayList&, paint: Paint&,
+                stage: Stage&, sky: darray[Target]&):
+        can Memory.Allocate, Abort.Panic:
+            bottom: f64 = horizon_of(stage)
+            room: f64 = stage.bottom + stage.height - bottom
+            height: f64 = room if room > 20.0 else 20.0
+            least: f64 = stage.width if stage.width < height else height
+            wanted: f64 = least * 0.045
+            size: f64 = wanted if wanted > 4.0 else 4.0
+            for index in 0..<sky.count.i64() |list, paint, stage, sky, bottom, height, size|:
+                one: Target = get sky[index.usize()] else Target{across: 0.0, up: 0.0, downed: false}
+                x: f64 = stage.left + one.across * stage.width
+                y: f64 = bottom + one.up * height
+                if one.downed:
+                    put_dot(list, paint, x, y, size * 0.9, with_alpha(color_downed(), 110))
+                    put_dot(list, paint, x, y, size * 0.55, with_alpha(paint.back, 110))
+                else:
+                    put_dot(list, paint, x, y, size, color_target())
+                    put_dot(list, paint, x, y, size * 0.45, paint.back)
+
+    # Where the sights are pointing, whoever is pointing them.
+    def put_crosshair(list: mutable Display::DisplayList&, paint: Paint&,
+                      stage: Stage&, cross_x: f64, cross_y: f64, loaded: bool):
+        can Memory.Allocate, Abort.Panic:
+            bottom: f64 = horizon_of(stage)
+            room: f64 = stage.bottom + stage.height - bottom
+            height: f64 = room if room > 20.0 else 20.0
+            x: f64 = stage.left + cross_x * stage.width
+            y: f64 = bottom + cross_y * height
+            least: f64 = stage.width if stage.width < height else height
+            wanted: f64 = least * 0.055
+            arm: f64 = wanted if wanted > 5.0 else 5.0
+            wanted_thick: f64 = arm * 0.14
+            thick: f64 = wanted_thick if wanted_thick > 1.5 else 1.5
+            colour: u32 = color_target() if loaded else paint.ink
+            put_rect(list, paint, x - arm, y - thick / 2.0, arm * 2.0, thick, colour)
+            put_rect(list, paint, x - thick / 2.0, y - arm, thick, arm * 2.0, colour)
+            put_rect(list, paint, x - thick / 2.0, y - thick / 2.0, thick,
+                     thick, paint.back)
+
+    # Road behind, clock spent, gear, and what has been taken -- stacked down
+    # the left verge, the one piece of the playfield the road never reaches.
+    def put_dials(list: mutable Display::DisplayList&, paint: Paint&,
+                  stage: Stage&, road_share: f64, clock_share: f64,
+                  gear: i64, top_gear: i64, rows_done: i64, road_rows: i64,
+                  ticks: i64, road_clock: i64, points: i64, shot: i64,
+                  targets: i64):
+        can Memory.Allocate, Abort.Panic:
+            wanted_margin: f64 = stage.width * 0.012
+            margin: f64 = wanted_margin if wanted_margin > 6.0 else 6.0
+            share_wide: f64 = stage.width * 0.155
+            room: f64 = stage.width / 2.0 - near_half(stage) - margin * 2.0
+            least: f64 = share_wide if share_wide < room else room
+            span: f64 = least if least > 40.0 else 40.0
+            x: f64 = stage.left + margin
+            step: f64 = stage.height * 0.155
+            y: mutable f64 = horizon_of(stage) - stage.height * 0.06
+            wanted_thick: f64 = stage.height * 0.024
+            thick: f64 = wanted_thick if wanted_thick > 3.0 else 3.0
+
+            rows: mutable dstr = []
+            dstr_append_i64(&rows, rows_done)
+            dstr_append_cstr(&rows, " of ")
+            dstr_append_i64(&rows, road_rows)
+            dstr_append_cstr(&rows, " rows")
+            put_bar(list, paint, x, y, span, thick, road_share, color_downed())
+            put_label(list, paint, bytes_view(rows), x, y - stage.height * 0.05)
+            y <- y - step
+
+            clock: mutable dstr = []
+            dstr_append_i64(&clock, ticks)
+            dstr_append_cstr(&clock, " of ")
+            dstr_append_i64(&clock, road_clock)
+            dstr_append_cstr(&clock, " ticks")
+            put_bar(list, paint, x, y, span, thick, clock_share, kind_color(KIND_CONE))
+            put_label(list, paint, bytes_view(clock), x, y - stage.height * 0.05)
+            y <- y - step
+
+            pip: f64 = span / top_gear.f64()
+            for one in 0..<top_gear |list, paint, x, y, pip, thick, gear|:
+                put_rect(list, paint, x + one.f64() * pip, y, pip * 0.74,
+                         thick * 1.7,
+                         color_car() if one < gear else inked(paint, 40))
+            geared: mutable dstr = []
+            dstr_append_cstr(&geared, "gear ")
+            dstr_append_i64(&geared, gear)
+            dstr_append_cstr(&geared, " of ")
+            dstr_append_i64(&geared, top_gear)
+            put_label(list, paint, bytes_view(geared), x, y - stage.height * 0.05)
+            y <- y - step
+
+            scored: mutable dstr = []
+            dstr_append_i64(&scored, points)
+            dstr_append_cstr(&scored, " points")
+            put_label(list, paint, bytes_view(scored), x, y)
+            downed: mutable dstr = []
+            dstr_append_i64(&downed, shot)
+            dstr_append_cstr(&downed, " of ")
+            dstr_append_i64(&downed, targets)
+            dstr_append_cstr(&downed, " shot")
+            put_label(list, paint, bytes_view(downed), x, y - stage.height * 0.05)
+
+    def put_bar(list: mutable Display::DisplayList&, paint: Paint&,
+                x: f64, y: f64, span: f64, thick: f64, share: f64, colour: u32):
+        can Memory.Allocate, Abort.Panic:
+            put_rect(list, paint, x, y, span, thick, inked(paint, 40))
+            put_rect(list, paint, x, y, span * share, thick, colour)
