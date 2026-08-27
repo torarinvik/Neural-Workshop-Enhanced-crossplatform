@@ -31,7 +31,7 @@ from neural_workshop import display, geometry, state                # noqa: E402
 from neural_workshop.grid import (current_cell_px,                  # noqa: E402
                                   position_pixel_center)
 from neural_workshop.paths import load_pyglet_image                 # noqa: E402
-from neural_workshop.ui.field import Field                          # noqa: E402
+from neural_workshop.ui.field import Field, Visual                  # noqa: E402
 
 GLYPHS = ["7", "12", "-3", "K"]
 VARIABLES = ["2", "3", "5"]
@@ -64,7 +64,10 @@ def build(spec):
     cfg.GRID_SIZE_MAX = 32
     cfg.GRID_INCLUDE_CENTER = bool(spec["include_center"])
     cfg.GRID_3D = bool(spec["grid_3d"])
-    cfg.GRID_3D_CUBES = 1
+    cfg.GRID_3D_CUBES = spec["cubes"]
+    # No clock: `_spawn_3d_voxel` schedules the glow animation when this is on,
+    # and a frame under a running animation is not a frame.
+    cfg.ANIMATE_SQUARES = False
     cfg.VARIABLE_NBACK = bool(spec["variable_mode"])
     state.mode.paused = bool(spec["paused"])
     state.mode.modalities[state.mode.mode] = (
@@ -76,7 +79,10 @@ def build(spec):
         field = Field()
         KEEP.append(field)
         state.field = field
-        _put_stimulus(spec, field)
+        if spec["grid_3d"]:
+            _put_pattern(spec)
+        else:
+            _put_stimulus(spec, field)
 
     return _Nothing(), lay_out
 
@@ -86,6 +92,26 @@ class _Nothing:
 
     def close(self):
         pass
+
+
+def _put_pattern(spec):
+    """The real `Visual._spawn_3d_voxel`, on a Visual that was never built.
+
+    `Visual.__init__` is what cannot be run here -- two labels, eight sprites
+    and a randomly chosen image set, none of which the pattern touches. What
+    the pattern DOES touch is four attributes, so it gets those and then the
+    module's own code draws every polygon and every line. Nothing about the
+    cubes is restated on this side.
+    """
+    visual = Visual.__new__(Visual)
+    visual.color_id = spec["color_id"]
+    visual.poly_3d = []
+    visual.poly_3d_pulse = []
+    visual.age = 0.0
+    visual._spawn_3d_voxel(spec["pattern"])
+    KEEP.append(visual)
+    KEEP.extend(visual.poly_3d)
+    _put_variable(spec, state.field)
 
 
 def _put_stimulus(spec, field):
@@ -130,7 +156,12 @@ def _put_stimulus(spec, field):
         label.color = COLOR
         KEEP.append(label)
 
+    _put_variable(spec, field)
+
+
+def _put_variable(spec, field):
     if spec["variable"] >= 0:
+        font = max(8, int(current_cell_px() * 0.45))
         label = pyglet.text.Label(
             VARIABLES[spec["variable"]], font_size=font, weight='bold',
             anchor_x='center', anchor_y='center', batch=state.batch)

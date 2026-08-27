@@ -1,0 +1,237 @@
+# Differential sweep for src/trialphase.elisa against neural_workshop/events.py.
+# See trialphase_diff.py for the reference side.
+#
+# One spec is a session in a starting state, run for a fixed number of ticks;
+# every tick prints the phase, the two counters, the trial number and the seven
+# effects. The effects are printed because they are the whole point: a machine
+# that reached the right phase without asking for a stimulus would be wrong in
+# a way the phase alone cannot show.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/strings.elisa"
+include "../src/gamemode.elisa"
+include "../src/scheduling.elisa"
+include "../src/trialphase.elisa"
+
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr("|")
+        print_i64(value)
+
+def flag(value: bool) -> i64:
+    return 1 if value else 0
+
+# Only the fields the machine reads or writes carry a spec's state; the rest
+# are the constructor's own zeros.
+def blank_mode() -> Mode:
+    zeros: i64[15] = zeroed
+    rts: f64[15] = zeroed
+    stim: i64[13] = zeroed
+    return Mode{mode: 2, back: 2, ticks_per_trial: 6,
+                ticks_per_trial_is_float: false,
+                num_trials: 20, num_trials_factor: 1, num_trials_exponent: 2,
+                num_trials_total: 24, manual: true, inputs: zeroed,
+                input_rts: rts, hide_text: false, current_stim: stim,
+                current_operation: ArithOp.NoneOp,
+                started: true, paused: false, show_missed: false,
+                sound_select: false, draw_graph: false, saccadic: false,
+                title_screen: false, session_number: 1, trial_number: 0,
+                trial_starttime: 0.0, tick: 0, progress: 0,
+                phase: TrialPhase.NotStarted, phase_elapsed: 0,
+                step_mode: false, frame_seq: 0, session_done: false}
+
+# The input path and the three adjustments, printed as their own block after
+# the tick runs. A mode is named by its number; the buttons come back as
+# modality codes, which is what makes them comparable across the boundary.
+def sweep_input(tables: ModeTables&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        for step in 0..<24 |tables|:
+            mode: i64 = 2 if step % 6 == 0 else (3 if step % 6 == 1 else (4 if step % 6 == 2 else (5 if step % 6 == 3 else (20 if step % 6 == 4 else 107))))
+            printr("input")
+            emit_cell(step)
+            emit_cell(mode)
+            buttons: darray[Modality] = action_button_names(tables, mode)
+            emit_cell(modality_code(mouse_match_modality(tables, mode, false, true)))
+            emit_cell(modality_code(mouse_match_modality(tables, mode, true, true)))
+            emit_cell(modality_code(mouse_match_modality(tables, mode, false, false)))
+            emit_cell(buttons.count.i64())
+            for one in buttons:
+                emit_cell(modality_code(one))
+            print("")
+
+            # Press a spread of buttons, most of which the mode does not offer.
+            wanted: mutable darray[Modality] = []
+            for slot in 0..<INPUT_MODALITY_COUNT |wanted, step|:
+                if (slot + step) % 3 == 0:
+                    wanted.push(input_modality_at(slot))
+            wanted.push(Modality.Arithmetic)
+            game: mutable Mode = blank_mode()
+            game.mode <- mode
+            game.trial_starttime <- 100.0
+            now: f64 = 100.0 + (step % 5).f64() * 0.25 - 0.5
+            landed: InjectResult = inject_match_action(&game, tables, &wanted, now)
+            printr("press")
+            emit_cell(step)
+            emit_cell(landed.pressed.count.i64())
+            emit_cell(flag(landed.update_input_labels))
+            for one in landed.pressed:
+                emit_cell(modality_code(one))
+            print("")
+            printr("state")
+            emit_cell(step)
+            for slot in 0..<INPUT_MODALITY_COUNT |game|:
+                emit_cell(flag(game.inputs[slot]))
+            # Reaction times as MILLISECONDS times a thousand, so a float
+            # crosses as an integer without a formatter on either side.
+            for slot in 0..<INPUT_MODALITY_COUNT |game|:
+                emit_cell((game.input_rts[slot] * 1000000.0).i64())
+            print("")
+
+            adjusted: mutable Mode = blank_mode()
+            adjusted.back <- 1 + step % 4
+            adjusted.num_trials <- 15 + step % 7
+            adjust_level(&adjusted, (step % 5) - 2)
+            adjust_trials(&adjusted, (step % 7) - 3)
+            printr("adjust")
+            emit_cell(step)
+            emit_cell(adjusted.back)
+            emit_cell(adjusted.num_trials)
+            emit_cell(adjusted.num_trials_total)
+            interval: i64 = 400 + step % 9 * 700
+            tick_ms: i64 = 50 + step % 3 * 50
+            emit_cell(interval)
+            emit_cell(tick_ms)
+            emit_cell(adjust_speed_ms(interval, true, tick_ms, 3, 60000))
+            emit_cell(adjust_speed_ms(interval, false, tick_ms, 3, 60000))
+            print("")
+
+# The prompt's breath: one full turn of the angle, so both the clamped top and
+# the unclamped bottom are walked.
+def sweep_pulsate():
+    can Console.Write, Abort.Panic:
+        angle: mutable i64 = 0
+        for step in 0..<40 |angle|:
+            angle <- pulsate_angle(angle)
+            printr("pulse")
+            emit_cell(step)
+            emit_cell(angle)
+            emit_cell(pulsate_blue(angle))
+            print("")
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        print("names|spec|started|paused|selfpaced|step_mode|first_tick|total_trials|trial_ms|stimulus_ms|feedback_ms|tick_ms|ticks|jumps")
+        for spec in 0..<40:
+            started: bool = spec % 17 != 5
+            paused: bool = spec % 13 == 7
+            selfpaced: bool = spec % 5 == 2
+            step_mode: bool = spec % 7 == 3
+            # A negative first tick is the delay before the first trial.
+            first_tick: i64 = 0 - spec % 4
+            total_trials: i64 = 1 + spec % 3
+            trial_ms: i64 = 1200 + spec % 6 * 400
+            stimulus_ms: i64 = 300 + spec % 5 * 150
+            feedback_ms: i64 = 100 + spec % 4 * 250
+            tick_ms: i64 = 50 + spec % 3 * 50
+            ticks: i64 = 40
+            printr("spec|")
+            print_i64(spec)
+            emit_cell(flag(started))
+            emit_cell(flag(paused))
+            emit_cell(flag(selfpaced))
+            emit_cell(flag(step_mode))
+            emit_cell(first_tick)
+            emit_cell(total_trials)
+            emit_cell(trial_ms)
+            emit_cell(stimulus_ms)
+            emit_cell(feedback_ms)
+            emit_cell(tick_ms)
+            emit_cell(ticks)
+            emit_cell(6)
+            print("")
+
+            game: mutable Mode = blank_mode()
+            game.started <- started
+            game.paused <- paused
+            game.step_mode <- step_mode
+            game.tick <- first_tick
+            game.num_trials_total <- total_trials
+            plan: TrialPhases = plan_trial_phases(trial_ms, stimulus_ms, feedback_ms, tick_ms)
+            for _step in 0..<ticks |game, plan, selfpaced|:
+                step: TrialStep = trial_tick(&game, &plan, selfpaced)
+                # The reference's own return value: a phase name when
+                # something changed, and None otherwise. -1 stands for None,
+                # and cannot be confused with a phase -- `trial_tick` never
+                # returns the not-started phase, only None or one of the four.
+                print_i64(trial_phase_code(step.phase) if step.changed else -1)
+                emit_cell(flag(step.changed))
+                emit_cell(trial_phase_code(game.phase))
+                emit_cell(game.phase_elapsed)
+                emit_cell(game.tick)
+                emit_cell(game.trial_number)
+                emit_cell(game.ticks_per_trial)
+                emit_cell(flag(game.show_missed))
+                emit_cell(flag(game.session_done))
+                emit_cell(flag(step.effects.save_input))
+                emit_cell(flag(step.effects.end_session))
+                emit_cell(flag(step.effects.generate_stimulus))
+                emit_cell(flag(step.effects.reset_input))
+                emit_cell(flag(step.effects.hide_visuals))
+                emit_cell(flag(step.effects.update_input_labels))
+                emit_cell(flag(step.effects.update_trials_remaining))
+                emit_cell(flag(response_window_open(&game)))
+                emit_cell(flag(match_report_accepted(&game)))
+                emit_cell(flag(advance_selfpaced_wanted(&game, selfpaced)))
+                print("")
+            # A SECOND run of the same session, this time advancing to each
+            # visual change rather than tick by tick. A self-paced blank never
+            # advances on its own, so this is also where the guard is reached.
+            second: mutable Mode = blank_mode()
+            second.started <- started
+            second.paused <- paused
+            second.step_mode <- step_mode
+            second.tick <- first_tick
+            second.num_trials_total <- total_trials
+            for _jump in 0..<6 |second, plan, selfpaced|:
+                leap: TrialStep = trial_advance_significant(&second, &plan, selfpaced)
+                print_i64(trial_phase_code(leap.phase))
+                emit_cell(second.phase_elapsed)
+                emit_cell(second.tick)
+                emit_cell(second.trial_number)
+                emit_cell(flag(second.session_done))
+                emit_cell(flag(leap.effects.save_input))
+                emit_cell(flag(leap.effects.end_session))
+                emit_cell(flag(leap.effects.generate_stimulus))
+                emit_cell(flag(leap.effects.hide_visuals))
+                print("")
+            print("end")
+        region work(64 * 1024 * 1024)
+        in work:
+            tables: ModeTables = ModeTables()
+            sweep_input(&tables)
+        sweep_pulsate()
+        destroy work
+        return 0

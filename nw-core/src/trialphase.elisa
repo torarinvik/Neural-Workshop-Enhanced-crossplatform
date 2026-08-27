@@ -1,0 +1,293 @@
+# The trial phase machine: what a scheduler tick does to a session.
+#
+# Port of the phase machine in neural_workshop/events.py -- `trial_tick`,
+# `trial_advance_significant`, the three phase entries and `response_window_open`.
+# Everything else in that module is input dispatch and drawing, which is the
+# shell's, but this is not: it is the clock the whole game runs on, and a shell
+# that reimplemented it would be reimplementing when a stimulus appears.
+#
+# The machine calls out to six things it cannot do itself -- save the last
+# trial's input, generate the next stimulus, reset the input, hide the visuals,
+# refresh the feedback labels, end the session. They are returned as EFFECTS
+# rather than performed, in the order the reference performs them, so the
+# caller does them and the machine stays a function of its state. That is the
+# only structural change; every branch and every comparison below is the
+# reference's.
+#
+# Three edges worth naming, because each of them is a rule and not an accident:
+#
+#   * A NEGATIVE tick is the delay before the first trial appears, and it is
+#     counted down only when the session is NOT stepping. `step_mode` asks for
+#     the next trial now, and waiting out a countdown would be the opposite.
+#   * SELF-PACED holds in the mid-trial blank once `phase_elapsed` has reached
+#     one, and returns without advancing either counter. The hold is not a
+#     phase of its own: the trial resumes from exactly where it stopped.
+#   * `ticks_per_trial` is REWRITTEN from the plan on every tick, before any
+#     branch reads it. A session whose speed changed mid-trial finishes the
+#     trial on the new clock, which is what the reference does.
+#
+# NOTE: needs gamemode.elisa (Mode, ModeFlags) and scheduling.elisa
+# (TrialPhases, plan_trial_phases) included by the driver.
+
+# What the caller must do, in this order, before the next tick.
+struct TrialEffects:
+    save_input: mutable bool
+    end_session: mutable bool
+    generate_stimulus: mutable bool
+    reset_input: mutable bool
+    hide_visuals: mutable bool
+    update_input_labels: mutable bool
+    update_trials_remaining: mutable bool
+
+def no_effects() -> TrialEffects:
+    return TrialEffects{save_input: false, end_session: false,
+                        generate_stimulus: false, reset_input: false,
+                        hide_visuals: false, update_input_labels: false,
+                        update_trials_remaining: false}
+
+# `changed` is the reference's return value: the new phase when a SIGNIFICANT
+# visual change happened, and "nothing changed" otherwise. The two are not the
+# same as "the phase is X" -- a tick that leaves the machine in `stimulus`
+# because it is still in `stimulus` reports no change.
+struct TrialStep:
+    changed: mutable bool
+    phase: mutable TrialPhase
+    effects: mutable TrialEffects
+
+def no_step(game: Mode&) -> TrialStep:
+    return TrialStep{changed: false, phase: game.phase, effects: no_effects()}
+
+# _begin_stimulus_phase. `trial_starttime` is a wall clock and so is the
+# caller's to stamp; everything else here is state.
+def begin_stimulus_phase(game: mutable Mode&) -> TrialStep:
+    can Abort.Panic:
+        effects: mutable TrialEffects = no_effects()
+        game.show_missed <- false
+        if game.trial_number > 0:
+            effects.save_input <- true
+        game.trial_number <- game.trial_number + 1
+        effects.update_trials_remaining <- true
+
+        if game.trial_number > game.num_trials_total:
+            effects.end_session <- true
+            game.phase <- TrialPhase.Done
+            game.session_done <- true
+            return TrialStep{changed: true, phase: TrialPhase.Done, effects: effects}
+
+        effects.generate_stimulus <- true
+        effects.reset_input <- true
+        game.phase <- TrialPhase.Stimulus
+        game.phase_elapsed <- 0
+        game.tick <- 1
+        game.session_done <- false
+        return TrialStep{changed: true, phase: TrialPhase.Stimulus, effects: effects}
+
+def enter_blank_phase(game: mutable Mode&) -> TrialStep:
+    effects: mutable TrialEffects = no_effects()
+    effects.hide_visuals <- true
+    game.phase <- TrialPhase.Blank
+    game.phase_elapsed <- 0
+    return TrialStep{changed: true, phase: TrialPhase.Blank, effects: effects}
+
+def enter_feedback_phase(game: mutable Mode&) -> TrialStep:
+    effects: mutable TrialEffects = no_effects()
+    effects.hide_visuals <- true
+    game.show_missed <- true
+    effects.update_input_labels <- true
+    game.phase <- TrialPhase.Feedback
+    game.phase_elapsed <- 0
+    return TrialStep{changed: true, phase: TrialPhase.Feedback, effects: effects}
+
+# One scheduler tick.
+def trial_tick(game: mutable Mode&, plan: TrialPhases&, selfpaced: bool) -> TrialStep:
+    can Abort.Panic:
+        no_step(game) return if not game.started or game.paused
+
+        game.ticks_per_trial <- plan.total_ticks
+
+        no_step(game) return if game.phase == TrialPhase.Done
+        if game.phase == TrialPhase.NotStarted:
+            # Negative ticks are the delay before the first trial appears.
+            if not game.step_mode and game.tick < 0:
+                game.tick <- game.tick + 1
+                no_step(game) return if game.tick < 1
+            return begin_stimulus_phase(game)
+
+        # Self-paced: hold in the mid-trial blank until the player advances.
+        no_step(game) return if selfpaced and game.phase == TrialPhase.Blank and game.phase_elapsed >= 1
+
+        game.phase_elapsed <- game.phase_elapsed + 1
+        game.tick <- game.tick + 1
+
+        if game.phase == TrialPhase.Stimulus and game.phase_elapsed >= plan.stimulus_ticks:
+            enter_blank_phase(game) return if plan.blank_ticks > 0
+            return enter_feedback_phase(game)
+        enter_feedback_phase(game) return if game.phase == TrialPhase.Blank and game.phase_elapsed >= plan.blank_ticks
+        begin_stimulus_phase(game) return if game.phase == TrialPhase.Feedback and game.phase_elapsed >= plan.feedback_ticks
+        return no_step(game)
+
+# Ticks to run before giving up on reaching the next visual change. The guard
+# is the reference's own, and it is reachable: a self-paced blank never
+# advances on its own, so without it this would not return.
+const TRIAL_ADVANCE_GUARD: i64 = 100000
+
+# Run ticks until the visual phase changes, or the session ends. The effects of
+# EVERY tick matter, not just the last one's, so they are unioned rather than
+# taken from the step that finally reported a change -- a run that saved one
+# trial's input and then ended the session has done both.
+def trial_advance_significant(game: mutable Mode&, plan: TrialPhases&,
+                              selfpaced: bool) -> TrialStep:
+    can Abort.Panic:
+        total: mutable TrialEffects = no_effects()
+        step: mutable i64 = 0
+        while step <= TRIAL_ADVANCE_GUARD |game, plan, selfpaced, total, step|:
+            one: TrialStep = trial_tick(game, plan, selfpaced)
+            total.save_input <- total.save_input or one.effects.save_input
+            total.end_session <- total.end_session or one.effects.end_session
+            total.generate_stimulus <- total.generate_stimulus or one.effects.generate_stimulus
+            total.reset_input <- total.reset_input or one.effects.reset_input
+            total.hide_visuals <- total.hide_visuals or one.effects.hide_visuals
+            total.update_input_labels <- total.update_input_labels or one.effects.update_input_labels
+            total.update_trials_remaining <- total.update_trials_remaining or one.effects.update_trials_remaining
+            if one.changed:
+                return TrialStep{changed: true, phase: one.phase, effects: total}
+            step <- step + 1
+        # The guard ran out: the reference reports the phase it is stuck in,
+        # and reports it as a CHANGE even though nothing changed.
+        return TrialStep{changed: true, phase: game.phase, effects: total}
+
+# True only while a trial is showing its stimulus.
+def response_window_open(game: Mode&) -> bool:
+    return game.started and game.phase == TrialPhase.Stimulus
+
+# ------------------------------------------------------------
+# The input path, and the three in-session adjustments
+# ------------------------------------------------------------
+
+# action_button_names(): the match buttons the current mode offers, in SCREEN
+# order -- which is the mode's own modality order and not INPUT_MODALITIES'.
+# 'arithmetic' is dropped because it is answered by typing a number rather than
+# by pressing a button, which is also why it is absent from INPUT_MODALITIES.
+def action_button_names(tables: ModeTables&, mode: i64) -> darray[Modality]:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable darray[Modality] = []
+        at: i64 = mode_index(tables, mode)
+        out return if at < 0
+        entry: ModeEntry = tables.entries[at.usize()]
+        for one in entry.modalities |out|:
+            if one != Modality.Arithmetic:
+                out.push(one)
+        return out
+
+# inject_match_action(): apply match-button intentions through the HUMAN input
+# path, which is the whole point -- an agent presses the same buttons a player
+# does and learns nothing a player would not.
+#
+# A name the mode does not offer is IGNORED rather than rejected, and the
+# return says which ones landed. Reaction time is `max(0.0, now - start)`, so a
+# clock that has gone backwards records zero rather than a negative.
+#
+# `update_input_labels` is surfaced as an effect exactly as the phase machine
+# surfaces its callouts, and it fires only when at least one button landed.
+struct InjectResult:
+    pressed: mutable darray[Modality]
+    update_input_labels: mutable bool
+
+def inject_match_action(game: mutable Mode&, tables: ModeTables&,
+                        wanted: darray[Modality]&, now: f64) -> InjectResult:
+    can Memory.Allocate, Abort.Panic:
+        allowed: darray[Modality] = action_button_names(tables, game.mode)
+        start: f64 = game.trial_starttime
+        elapsed: f64 = now - start
+        pressed: mutable darray[Modality] = []
+        for one in wanted |game, allowed, pressed, elapsed|:
+            if modalities_contain(&allowed, one):
+                slot: i64 = modality_code(one)
+                game.inputs[slot] <- true
+                game.input_rts[slot] <- elapsed if elapsed > 0.0 else 0.0
+                pressed.push(one)
+        return InjectResult{pressed: pressed,
+                            update_input_labels: pressed.count > 0.usize()}
+
+# _adjust_level: the n-back level, never below one. The three labels it
+# refreshes are the caller's.
+def adjust_level(game: mutable Mode&, delta: i64):
+    wanted: i64 = game.back + delta
+    game.back <- wanted if wanted > 1 else 1
+
+# _adjust_trials: the session length. `num_trials` moves and the total is
+# re-derived from it -- the reference recomputes rather than adding the delta
+# to the total, so a level change between the two is not lost.
+def adjust_trials(game: mutable Mode&, delta: i64):
+    game.num_trials <- game.num_trials + delta
+    game.num_trials_total <- session_length(game.back, game.num_trials,
+                                            game.num_trials_factor,
+                                            game.num_trials_exponent)
+
+# _adjust_speed: faster subtracts one step, slower adds one, and the step
+# itself grows with the interval so the control stays usable at both ends.
+def adjust_speed_ms(interval_ms: i64, faster: bool, tick_ms: i64,
+                    min_ticks: i64, max_ms: i64) -> i64:
+    can Abort.Panic:
+        step: i64 = interval_adjust_step(interval_ms)
+        wanted: i64 = interval_ms - step if faster else interval_ms + step
+        return clamp_trial_interval_ms(wanted, tick_ms, min_ticks, max_ms)
+
+# The two rules inside `_on_key_in_session` that are not key plumbing.
+#
+# A match report is accepted only while the session has actually begun: the
+# tick is not zero AND at least one trial has been dealt.
+#
+# The first half is REDUNDANT and is kept anyway. `begin_stimulus_phase` sets
+# `tick` to 1 in the same breath that it raises `trial_number`, and nothing
+# ever puts `tick` back to zero, so in every state this machine can reach
+# `trial_number > 0` already implies `tick != 0`. The sweep therefore cannot
+# tell the two apart -- dropping `tick != 0` leaves it green, and that was
+# checked rather than assumed. Ported as written because the guard is the
+# reference's and a future change to either counter would make it matter.
+def match_report_accepted(game: Mode&) -> bool:
+    return game.tick != 0 and game.trial_number > 0
+
+# KEY_ADVANCE in a self-paced session jumps straight to feedback, and it does
+# so from the stimulus, from the blank, or from BEFORE THE FIRST TRIAL -- the
+# not-started phase is in the list, so the key answers a trial that has not
+# been dealt. That is the reference's, and a port that guarded it would make
+# the key do nothing on the screen where a player is most likely to press it.
+def advance_selfpaced_wanted(game: Mode&, selfpaced: bool) -> bool:
+    return selfpaced and (game.phase == TrialPhase.Stimulus
+                          or game.phase == TrialPhase.Blank
+                          or game.phase == TrialPhase.NotStarted)
+
+# pulsate(): the "press space" prompt breathes while the player is between
+# sessions. Fifteen degrees a frame, and a blue that is CLAMPED ON ONE SIDE
+# ONLY -- `191 + min(64, int(80 * cos(...)))` tops out at 255 and bottoms out
+# at 111, so the prompt darkens further than it brightens. That asymmetry is
+# the reference's, not a rounding artefact, and a symmetric breath would be a
+# different-looking screen.
+def pulsate_angle(angle: i64) -> i64:
+    return (angle + 15) % 360
+
+def pulsate_blue(angle: i64) -> i64:
+    can Abort.Panic:
+        swing: i64 = (80.0 * cos(degrees_to_radians(angle.f64()))).i64()
+        return 191 + (swing if swing < 64 else 64)
+
+# on_mouse_press(): in a TWO-modality mode the two mouse buttons are the two
+# match keys, left for the first modality and right for the second -- in the
+# mode's own order, so which button means what changes with the mode. Any
+# other mode is left alone, arithmetic included: a mode answered by typing a
+# number has nothing for a button to mean.
+#
+# Returns the modality a button reports, or Arithmetic as "no report" -- which
+# is safe precisely because arithmetic is the one modality this can never
+# return.
+def mouse_match_modality(tables: ModeTables&, mode: i64, right_button: bool,
+                         started: bool) -> Modality:
+    can Memory.Allocate, Abort.Panic:
+        Modality.Arithmetic return if not started
+        at: i64 = mode_index(tables, mode)
+        Modality.Arithmetic return if at < 0
+        entry: ModeEntry = tables.entries[at.usize()]
+        Modality.Arithmetic return if entry.modalities.count != 2.usize()
+        Modality.Arithmetic return if modalities_contain(&entry.modalities, Modality.Arithmetic)
+        return entry.modalities[1.usize()] if right_button else entry.modalities[0.usize()]
