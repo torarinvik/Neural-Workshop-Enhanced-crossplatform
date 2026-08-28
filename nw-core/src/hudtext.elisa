@@ -1,0 +1,244 @@
+# What the HUD SAYS: the `update()` bodies from neural_workshop/ui/hud.py.
+#
+# scene_hud.elisa already places each of these and colours it, and takes the
+# words as an sview -- because where a label goes is a fact about the window
+# and what it says is a fact about the session, and they change at different
+# times. This is the other half: the session's answer.
+#
+# The reference does not hide most of these widgets. It sets their text to the
+# empty string and keeps drawing them, so "not shown" and "shown with nothing
+# in it" are the same state, and a caller that wanted to know which is which
+# would be asking a question the game never asks. Reproduced: every function
+# below returns text, and empty text is how a widget goes away.
+#
+# The one exception is the three-strikes indicator, which recolours rather than
+# empties -- see `circle_color`.
+#
+# Translation is the shell's. Every string here is the msgid the reference
+# passes to `_()`, which is also what an untranslated build displays.
+#
+# NOTE: needs strings.elisa, board.elisa, gamemode.elisa and scene_title.elisa
+# (title_native_banner) included by the driver.
+
+# The parts of the config and the build these labels read. Gathered into one
+# struct rather than threaded individually: the reference reads them off two
+# globals, and a dozen bare booleans at every call site would be worse than the
+# globals it replaces.
+struct HudConfig:
+    clinical_mode: mutable bool
+    jaeggi_mode: mutable bool
+    grid_3d: mutable bool
+    variable_nback: mutable bool
+    window_fullscreen: mutable bool
+    black_background: mutable bool
+    use_session_feedback: mutable bool
+    # True when either audio set is the morse set, which is the only thing the
+    # key list asks about them.
+    morse_audio: mutable bool
+    threshold_fallback_sessions: mutable i64
+    # The board, for the cell counts mode 10 puts in its caption.
+    grid_size: mutable i64
+    include_center: mutable bool
+    active_cell_limit: mutable i64
+    cube_count: mutable i64
+
+# --- the three-strikes indicator ------------------------------------------
+
+# One circle per session below the fallback threshold. The reference builds
+# `range(THRESHOLD_FALLBACK_SESSIONS - 1)` of them.
+def circle_count(cfg: HudConfig&) -> i64:
+    return cfg.threshold_fallback_sessions - 1
+
+# The indicator does NOT hide by leaving: manual mode, a running session and
+# Jaeggi mode all recolour it to the background at zero alpha, and the row goes
+# on being drawn. So this returns a colour for every circle in every state, and
+# never a "not drawn".
+def circle_color(cfg: HudConfig&, game: Mode&, index: i64) -> u32:
+    if game.manual or game.started or cfg.jaeggi_mode:
+        return Display::rgba(0, 0, 0, 0) if cfg.black_background else Display::rgba(255, 255, 255, 0)
+    if index < game.progress:
+        return Display::rgba(64, 64, 255, 255)
+    dim: i64 = 64 if cfg.black_background else 192
+    return Display::rgba(dim.u8(), dim.u8(), dim.u8(), 255)
+
+# --- the update notice -----------------------------------------------------
+
+def update_notice_text(game: Mode&, update_available: bool, version: sview) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        out return if game.started or not update_available
+        dstr_append_cstr(&out, "An update is available (")
+        dstr_append_sview(&out, version)
+        dstr_append_cstr(&out, "). Press W to open web site")
+        return out
+
+# --- the mode and level caption -------------------------------------------
+
+# The caption above the field. `hide_text` empties it, but only during a
+# session: the same key pressed on the hub leaves the caption alone.
+def game_mode_text(tables: ModeTables&, game: Mode&, cfg: HudConfig&) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        out return if game.started and game.hide_text
+
+        if cfg.jaeggi_mode and not cfg.clinical_mode:
+            dstr_append_cstr(&out, "Jaeggi mode: ")
+        if game.manual:
+            dstr_append_cstr(&out, "Manual mode: ")
+        if cfg.grid_3d:
+            dstr_append_cstr(&out, "3D ")
+
+        # The reference indexes long_mode_names unguarded and raises KeyError
+        # on a mode the tables do not have. This contributes nothing and goes
+        # on, as mode_short_label already does -- and the sweep does not walk
+        # an unknown mode, because a frame the reference cannot produce is not
+        # a frame this can be checked against. mode_index() is the guard a
+        # caller should use.
+        index: i64 = mode_index(tables, game.mode)
+        if index >= 0:
+            dstr_append_dstr(&out, tables.entries[index.usize()].long_name)
+        dstr_append_cstr(&out, " ")
+
+        if cfg.variable_nback:
+            dstr_append_cstr(&out, "V. ")
+        dstr_append_i64(&out, game.back)
+        dstr_append_cstr(&out, "-Back")
+
+        if game.mode == 10:
+            active: darray[i64] = active_position_ids_for(cfg)
+            dstr_append_cstr(&out, " (")
+            dstr_append_i64(&out, active.count.i64())
+            dstr_append_cstr(&out, "/")
+            dstr_append_i64(&out, board_cell_count(cfg))
+            dstr_append_cstr(&out, " cells, ")
+            dstr_append_i64(&out, game.num_trials_total)
+            dstr_append_cstr(&out, " trials)")
+        return out
+
+# grid.current_cell_count: six faces per cube in 3D, and the board's own count
+# otherwise.
+def board_cell_count(cfg: HudConfig&) -> i64:
+    can Abort.Panic:
+        if cfg.grid_3d:
+            total: mutable i64 = 1
+            for _ in 0..<cfg.cube_count |total|:
+                total <- total * 6
+            return total
+        return grid_cell_count(cfg.grid_size, cfg.include_center, 2)
+
+# In 3D the ids are simply 1..cell_count; otherwise the board decides.
+def active_position_ids_for(cfg: HudConfig&) -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        if cfg.grid_3d:
+            out: mutable darray[i64] = []
+            total: i64 = board_cell_count(cfg)
+            for one in 0..<total |out|:
+                out.push(one + 1)
+            return out
+        return active_position_ids(cfg.grid_size, cfg.include_center,
+                                   cfg.active_cell_limit, 2)
+
+# --- the Jaeggi warning ----------------------------------------------------
+
+# Shown for three seconds by a mode key that Jaeggi mode refused, and cleared
+# by a timer. The timer is the shell's; the words are this.
+def jaeggi_warning_text() -> sview:
+    return "Please disable Jaeggi Mode to access additional modes."
+
+# --- the keyboard reference ------------------------------------------------
+
+# Thirty from the top in a session, in a clinical build, in manual mode and in
+# Jaeggi mode; forty otherwise, because the standard hub list is a line longer.
+def keys_list_lifted(game: Mode&, cfg: HudConfig&) -> bool:
+    if game.started or cfg.clinical_mode:
+        return true
+    return game.manual or cfg.jaeggi_mode
+
+def keys_list_text(game: Mode&, cfg: HudConfig&) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        if game.started:
+            # Hidden text hides this list too, and leaves the label empty.
+            out return if game.hide_text
+            dstr_append_cstr(&out, "P: Pause / Unpause\n")
+            dstr_append_cstr(&out, "\n")
+            dstr_append_cstr(&out, "F8: Hide / Reveal Text\n")
+            dstr_append_cstr(&out, "\n")
+            dstr_append_cstr(&out, "ESC: Cancel Session\n")
+            return out
+        if cfg.clinical_mode:
+            dstr_append_cstr(&out, "ESC: Exit")
+            return out
+
+        if cfg.morse_audio:
+            dstr_append_cstr(&out, "J: Morse Code Reference\n")
+            dstr_append_cstr(&out, "\n")
+        if game.manual:
+            dstr_append_cstr(&out, "F1: Decrease N-Back\n")
+            dstr_append_cstr(&out, "F2: Increase N-Back\n")
+            dstr_append_cstr(&out, "\n")
+            dstr_append_cstr(&out, "F3: Decrease Trials\n")
+            dstr_append_cstr(&out, "F4: Increase Trials\n")
+            dstr_append_cstr(&out, "\n")
+            dstr_append_cstr(&out, "F5: Decrease Speed\n")
+            dstr_append_cstr(&out, "F6: Increase Speed\n")
+            dstr_append_cstr(&out, "\n")
+            dstr_append_cstr(&out, "C: Choose Game Type\n")
+            dstr_append_cstr(&out, "S: Select Sounds\n")
+        dstr_append_cstr(&out, "I: Select Images\n")
+        if game.manual:
+            dstr_append_cstr(&out, "M: Standard Mode\n")
+        else:
+            dstr_append_cstr(&out, "M: Manual Mode\n")
+            dstr_append_cstr(&out, "\n")
+            dstr_append_cstr(&out, "G: Daily Progress Graph\n")
+            dstr_append_cstr(&out, "\n")
+            dstr_append_cstr(&out, "W: Brain Workshop Web Site\n")
+        if cfg.window_fullscreen:
+            dstr_append_cstr(&out, "E: Saccadic Eye Exercise\n")
+        dstr_append_cstr(&out, "\n")
+        dstr_append_cstr(&out, "F11: Full Screen\n")
+        dstr_append_cstr(&out, "ESC: Task menu\n")
+        return out
+
+# --- the native-backend tag ------------------------------------------------
+
+# `banner_code` names the accelerator the runtime loaded; the core cannot know
+# it, and scene_title.elisa already owns the coding.
+def native_tag_text(game: Mode&, cfg: HudConfig&, banner_code: i64) -> sview:
+    can Abort.Panic:
+        if cfg.clinical_mode or game.started:
+            return ""
+        return title_native_banner(banner_code)
+
+# --- paused ----------------------------------------------------------------
+
+# Not translated in the reference either: the string is a bare literal there.
+def paused_text(game: Mode&) -> sview:
+    return "Paused" if game.paused else ""
+
+# --- end-of-session praise -------------------------------------------------
+
+# The five praise bands are checked best-first and only one can win; the
+# level-change notice is separate and can appear on its own. A clinical build
+# and a session with feedback turned off get the notice without the praise.
+def congrats_text(cfg: HudConfig&, show: bool, advance: bool, fallback: bool,
+                  awesome: bool, great: bool, good: bool, perfect: bool) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        if show and not cfg.clinical_mode and cfg.use_session_feedback:
+            if perfect:
+                dstr_append_cstr(&out, "Perfect score! ")
+            elif awesome:
+                dstr_append_cstr(&out, "Awesome score! ")
+            elif great:
+                dstr_append_cstr(&out, "Great score! ")
+            elif good:
+                dstr_append_cstr(&out, "Not bad! ")
+            else:
+                dstr_append_cstr(&out, "Keep trying. You're getting there! ")
+        if advance:
+            dstr_append_cstr(&out, "N-Back increased")
+        elif fallback:
+            dstr_append_cstr(&out, "N-Back decreased")
+        return out
