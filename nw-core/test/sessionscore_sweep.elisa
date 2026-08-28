@@ -1,0 +1,181 @@
+# Differential sweep for src/sessionscore.elisa against bwaccel.analyze_session.
+# See sessionscore_diff.py for the reference side.
+#
+# A spec is a finished session: a modality set, a stimulus stream per key, an
+# input stream per modality, and the four scoring knobs. The frame is one row
+# per modality -- its code, whether the reference's dict would hold a pair, a
+# None or nothing at all, and the pair itself.
+#
+# Streams are generated arithmetically rather than randomly so both sides build
+# the same session without one of them having to send it: `(trial * mult + key)
+# % modulus`, with a small modulus so matches are common. A stream that never
+# matched would score zero everywhere and prove nothing.
+
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_runtime.elisa"
+include "../../worktrees/elisa-core-nw/compiler/runtime/elisacore_std/elisacore_math.elisa"
+include "../src/strings.elisa"
+include "../src/gamemode.elisa"
+include "../src/nback.elisa"
+include "../src/sessionscore.elisa"
+
+def print_i64(value: i64):
+    can Console.Write, Abort.Panic:
+        trusted Unsafe.PointerCast:
+            buf: u8[24] = zeroed
+            idx: mutable i64 = 23
+            n: mutable i64 = value
+            if n == 0:
+                idx <- 22
+                buf[22] <- 48
+            else:
+                negative: bool = n < 0
+                while n != 0:
+                    digit: i64 = n % 10
+                    magnitude: i64 = digit if digit >= 0 else -digit
+                    idx <- idx - 1
+                    buf[idx] <- (48 + magnitude).u8()
+                    n <- n / 10
+                if negative:
+                    idx <- idx - 1
+                    buf[idx] <- 45
+            printr((&buf[idx]).cast[cstr])
+
+def emit_cell(value: i64):
+    can Console.Write, Abort.Panic:
+        printr("|")
+        print_i64(value)
+
+def flag(value: bool) -> i64:
+    return 1 if value else 0
+
+# Six modality sets, chosen so every branch is walked: the direct families, the
+# three duals, arithmetic (which scores as None) and image (whose stream is its
+# own key even though it mirrors 'vis').
+def modality_set(which: i64) -> darray[Modality]:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable darray[Modality] = []
+        if which == 0:
+            out.push(Modality.Position1)
+            out.push(Modality.Audio)
+        elif which == 1:
+            out.push(Modality.Position1)
+            out.push(Modality.Color)
+            out.push(Modality.Image)
+            out.push(Modality.Audio)
+            out.push(Modality.Audio2)
+        elif which == 2:
+            out.push(Modality.VisVis)
+            out.push(Modality.VisAudio)
+            out.push(Modality.AudioVis)
+        elif which == 3:
+            out.push(Modality.Position1)
+            out.push(Modality.Arithmetic)
+        elif which == 4:
+            out.push(Modality.Position1)
+            out.push(Modality.Position2)
+            out.push(Modality.Position3)
+            out.push(Modality.Position4)
+            out.push(Modality.Vis1)
+            out.push(Modality.Vis2)
+            out.push(Modality.Vis3)
+            out.push(Modality.Vis4)
+        else:
+            out.push(Modality.VisVis)
+            out.push(Modality.Image)
+            out.push(Modality.Arithmetic)
+            out.push(Modality.Audio)
+        return out
+
+# The same arithmetic the harness uses, so neither side ships the session.
+def stream_values(key: i64, count: i64, mult: i64, modulus: i64) -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable darray[i64] = []
+        for trial in 0..<count |out|:
+            out.push((trial * mult + key) % modulus)
+        return out
+
+def input_values(key: i64, count: i64, stride: i64) -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable darray[i64] = []
+        for trial in 0..<count |out|:
+            out.push(1 if (trial + key) % stride == 0 else 0)
+        return out
+
+def main() -> i64:
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        region work(8 * 1024 * 1024)
+        in work:
+            print("names|spec|which|nback|crab|jaeggi|variable|trials|mult|modulus|stride|drop|input_trials")
+            for spec in 0..<72:
+                which: i64 = spec % 6
+                nback: i64 = 1 + spec % 4
+                crab: bool = spec % 5 == 2
+                jaeggi: bool = spec % 3 == 1
+                variable: bool = spec % 7 == 4
+                trials: i64 = 6 + spec % 11
+                mult: i64 = 1 + spec % 3
+                modulus: i64 = 2 + spec % 4
+                stride: i64 = 2 + spec % 3
+                # Which stream key, if any, the session is missing. -1 is the
+                # ordinary case; the rest reach the reference's two `continue`s.
+                drop: i64 = -1 if spec % 9 != 8 else (spec / 9) % SESSION_KEY_COUNT
+                # ALWAYS the same length as the stimulus stream. A shorter
+                # one is not swept because the reference does not have a single
+                # answer there: the C accelerator stops at the end of the input
+                # stream and the Python fallback goes on treating the missing
+                # answers as `False`, so the same session scores (1, 2) or
+                # (1, 8) depending on which one loaded. save_input appends to
+                # every stream once per trial, so a running game cannot reach
+                # it. An input stream missing ENTIRELY is swept, by `drop`, and
+                # there the two agree.
+                input_trials: i64 = trials
+
+                printr("spec|")
+                print_i64(spec)
+                emit_cell(which)
+                emit_cell(nback)
+                emit_cell(flag(crab))
+                emit_cell(flag(jaeggi))
+                emit_cell(flag(variable))
+                emit_cell(trials)
+                emit_cell(mult)
+                emit_cell(modulus)
+                emit_cell(stride)
+                emit_cell(drop)
+                emit_cell(input_trials)
+                print("")
+
+                streams: mutable SessionStreams = SessionStreams()
+                for key in 0..<STREAM_KEY_COUNT |streams, drop, trials, mult, modulus|:
+                    continue if key == drop
+                    values: darray[i64] = stream_values(key, trials, mult, modulus)
+                    put_stream(&streams, key, &values)
+                for code in 0..<16 |streams, drop, input_trials, stride|:
+                    key: i64 = input_key(code)
+                    continue if key == drop
+                    values: darray[i64] = input_values(code, input_trials, stride)
+                    put_stream(&streams, key, &values)
+
+                # variable_list is the per-trial n-back level; the reference
+                # indexes it at `x - back`, so it has to cover the session.
+                variable_list: mutable darray[i64] = []
+                for trial in 0..<trials |variable_list|:
+                    variable_list.push(1 + trial % 3)
+
+                modalities: darray[Modality] = modality_set(which)
+                scored: darray[ModalityScore] = analyze_session(&streams, &modalities,
+                                                                nback, crab, jaeggi,
+                                                                &variable_list, variable)
+                index: mutable i64 = 0
+                for one in modalities:
+                    row: ModalityScore = get scored[index.usize()] else ModalityScore{state: 2, rights: 0, wrongs: 0}
+                    printr("mod")
+                    emit_cell(modality_code(one))
+                    emit_cell(row.state)
+                    emit_cell(row.rights)
+                    emit_cell(row.wrongs)
+                    print("")
+                    index <- index + 1
+                print("end")
+        destroy work
+        return 0

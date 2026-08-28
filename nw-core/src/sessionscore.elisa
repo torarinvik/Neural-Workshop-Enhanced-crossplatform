@@ -1,0 +1,219 @@
+# Scoring a finished session: rights and wrongs per modality.
+#
+# Port of `_analyze_session_py` in bwaccel/fallback.py -- the function
+# AnalysisLabel calls when the session ends, and the one that decides what goes
+# in the stats file. The single-stream half of it is already here as
+# `score_direct` in nback.elisa; what this adds is the dispatch (which stream
+# each modality is scored against) and the DUAL modalities, which compare two
+# different streams against each other rather than one against itself.
+#
+# The reference reads its streams out of `state.stats.session`, a dict of
+# lists. A dict does not cross this boundary, so the streams arrive as one
+# flat buffer with a (start, length, present) row per key -- the same shape
+# SessionHistory uses, and for the same reason: an element of a nested
+# darray[darray[i64]] cannot name an allocation region.
+#
+# Two guards are reproduced that a real session never trips. `Stats.
+# initialize_session` creates EVERY stream up front, so `session.get(mod)`
+# cannot come back None and the reference's two `continue`s are unreachable
+# from a running game. They are kept because the sweep can reach them -- the
+# harness deletes the key -- and an unreachable branch that is wrong is still
+# wrong the day something else calls this.
+#
+# One divergence inside the reference itself is worth naming, because this
+# port had to choose. When an input stream is PRESENT but SHORTER than its
+# stimulus stream, bwaccel's two implementations disagree: the C accelerator
+# stops at the end of the input stream, and the Python fallback keeps going and
+# treats the missing answers as `False`. The same eleven-trial session scores
+# (1, 2) under one and (1, 8) under the other. `Stats.save_input` appends to
+# every stream once per trial, so a running game never produces it -- and the
+# two agree when the stream is missing altogether, which IS reachable. This
+# follows the fallback, as the plainer reading of `x < len(inp)`, and the sweep
+# does not walk the case: there is no single reference answer to be equal to.
+#
+# NOTE: needs gamemode.elisa (Modality, StimField) and nback.elisa
+# (resolve_back, score_direct, Score) included by the driver.
+
+# Stream keys. The first sixteen are the modalities' own streams, in
+# modality_code order; 'vis' is the seventeenth because it is an extra stream
+# with no modality of its own, and the dual modalities read it. 'audio' is NOT
+# given a second key: the dual pair reads the same 'audio' the Audio modality
+# does, which is one dict key in the reference and so is one key here.
+const STREAM_VIS: i64 = 16
+const STREAM_KEY_COUNT: i64 = 17
+# One input stream per modality, after the stimulus streams.
+const INPUT_KEY_BASE: i64 = STREAM_KEY_COUNT
+const SESSION_KEY_COUNT: i64 = INPUT_KEY_BASE + 16
+
+def input_key(modality_code_value: i64) -> i64:
+    return INPUT_KEY_BASE + modality_code_value
+
+# The session's streams, flattened. `start`/`length` index `flat`; `present`
+# is whether the dict had the key at all, which is not the same as a key whose
+# list is empty -- the reference skips the first and scores the second.
+struct SessionStreams:
+    flat: mutable darray[i64]
+    start: mutable darray[i64]
+    length: mutable darray[i64]
+    present: mutable darray[bool]
+
+def SessionStreams() -> SessionStreams:
+    can Memory.Allocate, Abort.Panic:
+        flat: mutable darray[i64] = []
+        start: mutable darray[i64] = []
+        length: mutable darray[i64] = []
+        present: mutable darray[bool] = []
+        for _ in 0..<SESSION_KEY_COUNT |start, length, present|:
+            start.push(0)
+            length.push(0)
+            present.push(false)
+        return SessionStreams{flat: flat, start: start, length: length,
+                              present: present}
+
+def put_stream(streams: mutable SessionStreams&, key: i64, values: darray[i64]&):
+    can Memory.Allocate, Abort.Panic:
+        streams.start[key.usize()] <- streams.flat.count.i64()
+        streams.length[key.usize()] <- values.count.i64()
+        streams.present[key.usize()] <- true
+        for one in values:
+            streams.flat.push(one)
+
+def stream_present(streams: SessionStreams&, key: i64) -> bool:
+    can Abort.Panic:
+        return get streams.present[key.usize()] else false
+
+def stream_length(streams: SessionStreams&, key: i64) -> i64:
+    can Abort.Panic:
+        return get streams.length[key.usize()] else 0
+
+def stream_at(streams: SessionStreams&, key: i64, index: i64) -> i64:
+    can Abort.Panic:
+        0 return if index < 0 or index >= stream_length(streams, key)
+        slot: i64 = (get streams.start[key.usize()] else 0) + index
+        return get streams.flat[slot.usize()] else 0
+
+# --- which stream a modality is scored against -----------------------------
+
+# The direct modalities read the stream named after them. 'image' is its own
+# key in the session dict -- it mirrors 'vis', because save_input appends to
+# both -- so it is its own key here too rather than an alias for STREAM_VIS.
+def is_dual(value: Modality) -> bool:
+    match value:
+        Modality.VisVis:
+            return true
+        Modality.VisAudio:
+            return true
+        Modality.AudioVis:
+            return true
+        _:
+            return false
+
+# `now_key = 'vis' if mod.startswith('vis') else 'audio'`. Only audiovis fails
+# that test, since it is the one of the three whose name starts with 'audio'.
+def dual_now_key(value: Modality) -> i64:
+    can Abort.Panic:
+        return modality_code(Modality.Audio) if value == Modality.AudioVis else STREAM_VIS
+
+# `then_key = 'vis' if mod.endswith('vis') else 'audio'`. Only visaudio fails.
+def dual_then_key(value: Modality) -> i64:
+    can Abort.Panic:
+        return modality_code(Modality.Audio) if value == Modality.VisAudio else STREAM_VIS
+
+# --- the two scoring loops -------------------------------------------------
+
+# The dual loop. Identical to score_direct except that the two sides come from
+# different streams, and that the trial count is the SHORTER of the two rather
+# than the length of the one stream -- `n = min(len(now), len(then))`.
+def score_dual(streams: SessionStreams&, now_key: i64, then_key: i64,
+               input_key_value: i64, nback: i64, crab: bool, jaeggi: bool,
+               variable_list: darray[i64]&, has_variable: bool) -> Score:
+    can Abort.Panic:
+        rights: mutable i64 = 0
+        wrongs: mutable i64 = 0
+        now_len: i64 = stream_length(streams, now_key)
+        then_len: i64 = stream_length(streams, then_key)
+        count: i64 = now_len if now_len < then_len else then_len
+        has_inputs: bool = stream_present(streams, input_key_value)
+        input_len: i64 = stream_length(streams, input_key_value)
+
+        trial: mutable i64 = nback
+        while trial < count |rights, wrongs, trial, streams, variable_list|:
+            back: i64 = resolve_back(trial, nback, crab, variable_list, has_variable)
+            if back > trial:
+                trial <- trial + 1
+                continue
+            match_here: bool = stream_at(streams, now_key, trial) == stream_at(streams, then_key, trial - back)
+            answered: bool = has_inputs and trial < input_len and stream_at(streams, input_key_value, trial) != 0
+            if match_here and answered:
+                rights <- rights + 1
+            if match_here != answered:
+                wrongs <- wrongs + 1
+            if jaeggi and not match_here and not answered:
+                rights <- rights + 1
+            trial <- trial + 1
+        return Score{rights: rights, wrongs: wrongs}
+
+# What the reference's dict says about one modality.
+const SCORE_COUNTED: i64 = 0     # out[mod] = (rights, wrongs)
+const SCORE_NONE: i64 = 1        # out[mod] = None -- arithmetic, scored elsewhere
+const SCORE_ABSENT: i64 = 2      # `continue`: the key is not in the result at all
+
+struct ModalityScore:
+    state: mutable i64
+    rights: mutable i64
+    wrongs: mutable i64
+
+def analyze_modality(streams: SessionStreams&, value: Modality, nback: i64,
+                     crab: bool, jaeggi: bool, variable_list: darray[i64]&,
+                     has_variable: bool) -> ModalityScore:
+    can Abort.Panic:
+        code: i64 = modality_code(value)
+        # Arithmetic is not scored by comparing a stream to itself: it is
+        # decimal arithmetic, and decimal.elisa's score_arithmetic does it.
+        ModalityScore{state: SCORE_NONE, rights: 0, wrongs: 0} return if value == Modality.Arithmetic
+
+        if is_dual(value):
+            now_key: i64 = dual_now_key(value)
+            then_key: i64 = dual_then_key(value)
+            if not stream_present(streams, now_key) or not stream_present(streams, then_key):
+                return ModalityScore{state: SCORE_ABSENT, rights: 0, wrongs: 0}
+            got: Score = score_dual(streams, now_key, then_key, input_key(code),
+                                    nback, crab, jaeggi, variable_list, has_variable)
+            return ModalityScore{state: SCORE_COUNTED, rights: got.rights, wrongs: got.wrongs}
+
+        ModalityScore{state: SCORE_ABSENT, rights: 0, wrongs: 0} return if not stream_present(streams, code)
+        # score_direct wants the stream itself; ours is a window on the flat
+        # buffer, so the same loop is run here against the window. Keeping one
+        # copy of it would mean copying the stream out, which is a per-session
+        # allocation to save eleven lines.
+        rights: mutable i64 = 0
+        wrongs: mutable i64 = 0
+        count: i64 = stream_length(streams, code)
+        has_inputs: bool = stream_present(streams, input_key(code))
+        input_len: i64 = stream_length(streams, input_key(code))
+        trial: mutable i64 = nback
+        while trial < count |rights, wrongs, trial, streams, variable_list|:
+            back: i64 = resolve_back(trial, nback, crab, variable_list, has_variable)
+            if back > trial:
+                trial <- trial + 1
+                continue
+            match_here: bool = stream_at(streams, code, trial) == stream_at(streams, code, trial - back)
+            answered: bool = has_inputs and trial < input_len and stream_at(streams, input_key(code), trial) != 0
+            if match_here and answered:
+                rights <- rights + 1
+            if match_here != answered:
+                wrongs <- wrongs + 1
+            if jaeggi and not match_here and not answered:
+                rights <- rights + 1
+            trial <- trial + 1
+        return ModalityScore{state: SCORE_COUNTED, rights: rights, wrongs: wrongs}
+
+def analyze_session(streams: SessionStreams&, modalities: darray[Modality]&,
+                    nback: i64, crab: bool, jaeggi: bool,
+                    variable_list: darray[i64]&, has_variable: bool) -> darray[ModalityScore]:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable darray[ModalityScore] = []
+        for one in modalities:
+            out.push(analyze_modality(streams, one, nback, crab, jaeggi,
+                                      variable_list, has_variable))
+        return out
