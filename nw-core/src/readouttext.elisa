@@ -1,0 +1,261 @@
+# The text produced by neural_workshop/ui/readouts.py.
+#
+# scene_readouts.elisa owns the window geometry. This module owns the contents
+# of those labels and the small amount of score arithmetic that decides which
+# contents appear. Everything is explicit because the reference reads global
+# state, while the core receives a typed snapshot from its caller.
+#
+# The score arrays use SCORABLE_MODALITIES order, not Modality's enum order:
+# position1..4, vis1..4, color, visvis, visaudio, audiovis, image, audio,
+# audio2, arithmetic. That order is also the order in which the reference
+# writes category columns to its stats row.
+#
+# NOTE: needs strings.elisa and gamemode.elisa included by the driver.
+
+const READOUT_MODALITY_COUNT: i64 = 16
+const READOUT_KEY_COUNT: i64 = 15
+const ROWS: i64 = 20
+
+struct ReadoutHistoryEntry:
+    session_number: i64
+    mode: i64
+    back: i64
+    percent: i64
+    manual: bool
+
+struct AnalysisSummary:
+    percent: i64
+    categories: mutable i64[16]
+
+# SCORABLE_MODALITIES, in the exact order of readouts.py.
+def readout_modality_at(index: i64) -> Modality:
+    Modality.Position1 return if index == 0
+    Modality.Position2 return if index == 1
+    Modality.Position3 return if index == 2
+    Modality.Position4 return if index == 3
+    Modality.Vis1 return if index == 4
+    Modality.Vis2 return if index == 5
+    Modality.Vis3 return if index == 6
+    Modality.Vis4 return if index == 7
+    Modality.Color return if index == 8
+    Modality.VisVis return if index == 9
+    Modality.VisAudio return if index == 10
+    Modality.AudioVis return if index == 11
+    Modality.Image return if index == 12
+    Modality.Audio return if index == 13
+    return Modality.Audio2 if index == 14
+    return Modality.Arithmetic
+
+# The key configuration is indexed by INPUT_MODALITIES order, which is the
+# Modality code for every non-arithmetic readout.
+def readout_key_at(keys: darray[sview]&, value: Modality) -> sview:
+    can Abort.Panic:
+        code: i64 = modality_code(value)
+        return get keys[code.usize()] else ""
+
+def readout_score_percent(right: i64, wrong: i64) -> i64:
+    can Abort.Panic:
+        total: i64 = right + wrong
+        return 0 if total == 0
+        return (right * 100) / total
+
+def readout_modality_index(value: Modality) -> i64:
+    can Abort.Panic:
+        index: mutable i64 = 0
+        while index < READOUT_MODALITY_COUNT |index, value|:
+            return index if readout_modality_at(index) == value
+            index <- index + 1
+        return -1
+
+def readout_has(modalities: darray[Modality]&, value: Modality) -> bool:
+    can Abort.Panic:
+        return modalities_contain(modalities, value)
+
+# Compute the category percentages and the session percentage shown by
+# AnalysisLabel. Unused categories remain zero, as they do in the stats row.
+def analysis_summary(modalities: darray[Modality]&, rights: i64[16],
+                     wrongs: i64[16], jaeggi: bool) -> AnalysisSummary:
+    can Abort.Panic:
+        categories: mutable i64[16] = zeroed
+        index: mutable i64 = 0
+        while index < READOUT_MODALITY_COUNT |index, categories, rights, wrongs|:
+            categories[index.usize()] <- readout_score_percent(rights[index.usize()], wrongs[index.usize()])
+            index <- index + 1
+
+        if jaeggi:
+            # The reference calls min() over the active modalities. An empty
+            # mode is not a real configuration; returning zero keeps this
+            # typed boundary total for diagnostic callers.
+            best: mutable i64 = 0
+            first: mutable bool = true
+            for one in modalities |best, first, categories|:
+                slot: i64 = readout_modality_index(one)
+                if slot < 0:
+                    continue
+                value: i64 = categories[slot.usize()]
+                if first or value < best:
+                    best <- value
+                    first <- false
+            return AnalysisSummary{percent: best, categories: categories}
+
+        total_right: mutable i64 = 0
+        total_wrong: mutable i64 = 0
+        for one in modalities |total_right, total_wrong, rights, wrongs|:
+            slot: i64 = readout_modality_index(one)
+            if slot < 0:
+                continue
+            total_right <- total_right + rights[slot.usize()]
+            total_wrong <- total_wrong + wrongs[slot.usize()]
+        return AnalysisSummary{
+            percent: readout_score_percent(total_right, total_wrong),
+            categories: categories}
+
+# The line shown after a completed session. `summary` already includes the
+# arithmetic score, which the caller obtains from Decimal scoring when that
+# modality is active.
+def analysis_text(modalities: darray[Modality]&, keys: darray[sview]&, 
+                  rights: i64[16], wrongs: i64[16], summary: AnalysisSummary,
+                  started: bool, session_number: i64, skip: bool,
+                  clinical: bool, jaeggi: bool) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        out return if started or session_number == 0 or skip
+
+        if not clinical:
+            dstr_append_cstr(&out, "Correct-Errors:   ")
+            index: mutable i64 = 0
+            while index < READOUT_MODALITY_COUNT - 1 |index, out, modalities, keys, rights, wrongs|:
+                value: Modality = readout_modality_at(index)
+                if readout_has(modalities, value):
+                    keytext: sview = readout_key_at(keys, value)
+                    if keytext == "SEMICOLON":
+                        dstr_append_cstr(&out, ";")
+                    else:
+                        dstr_append_sview(&out, keytext)
+                    dstr_append_cstr(&out, ":")
+                    dstr_append_i64(&out, rights[index.usize()])
+                    dstr_append_cstr(&out, "-")
+                    dstr_append_i64(&out, wrongs[index.usize()])
+                    dstr_append_cstr(&out, "   ")
+                index <- index + 1
+            if readout_has(modalities, Modality.Arithmetic):
+                dstr_append_cstr(&out, "Arithmetic:")
+                dstr_append_i64(&out, rights[15])
+                dstr_append_cstr(&out, "-")
+                dstr_append_i64(&out, wrongs[15])
+                dstr_append_cstr(&out, "   ")
+
+        if jaeggi:
+            if not clinical:
+                dstr_append_cstr(&out, "Lowest score: ")
+                dstr_append_i64(&out, summary.percent)
+                dstr_append_cstr(&out, "%")
+        else:
+            dstr_append_cstr(&out, "Score: ")
+            dstr_append_i64(&out, summary.percent)
+            dstr_append_cstr(&out, "%")
+        return out
+
+# The title above the chart.
+def chart_title_text(started: bool) -> sview:
+    return "" if started else "Today's Last 20:"
+
+const CHART_ROW_NORMAL: i64 = 0
+const CHART_ROW_ADVANCE: i64 = 1
+const CHART_ROW_FALLBACK: i64 = 2
+
+def chart_row_kind(manual: bool, percent: i64, advance: i64, fallback: i64) -> i64:
+    can Abort.Panic:
+        return CHART_ROW_NORMAL if manual
+        return CHART_ROW_ADVANCE if percent >= advance
+        return CHART_ROW_FALLBACK if percent < fallback
+        return CHART_ROW_NORMAL
+
+# One chart cell, before it is handed to scene_readouts for placement. Column
+# zero is the session marker, column one is the compact mode name, and column
+# two is the percentage.
+def chart_cell_text(tables: ModeTables&, entry: ReadoutHistoryEntry,
+                    column: i64) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        if column == 0:
+            if entry.manual:
+                dstr_append_cstr(&out, "M")
+            elif entry.session_number > -1:
+                dstr_append_cstr(&out, "#")
+                dstr_append_i64(&out, entry.session_number)
+            return out
+        if column == 1:
+            return mode_short_label(tables, entry.mode, entry.back)
+        if column == 2:
+            dstr_append_i64(&out, entry.percent)
+            dstr_append_cstr(&out, "%")
+        return out
+
+def chart_row_count(history: darray[ReadoutHistoryEntry]&) -> i64:
+    can Abort.Panic:
+        count: i64 = history.count.i64()
+        return ROWS if count > ROWS else count
+
+def chart_history_start(history: darray[ReadoutHistoryEntry]&) -> i64:
+    can Abort.Panic:
+        count: i64 = history.count.i64()
+        rows: i64 = chart_row_count(history)
+        return count - rows
+
+# Rolling average for the current mode. It averages the last twenty matching
+# entries by n-back level, not by score percentage.
+def average_text(tables: ModeTables&, history: darray[ReadoutHistoryEntry]&, 
+                 mode: i64, started: bool, clinical: bool) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        out return if started or clinical
+
+        total: mutable i64 = 0
+        count: mutable i64 = 0
+        index: mutable i64 = history.count.i64() - 1
+        while index >= 0 and count < ROWS |index, count, total, history|:
+            entry: ReadoutHistoryEntry = history[index.usize()]
+            if entry.mode == mode:
+                total <- total + entry.back
+                count <- count + 1
+            index <- index - 1
+
+        mode_index_value: i64 = mode_index(tables, mode)
+        if mode_index_value >= 0:
+            dstr_append_dstr(&out, tables.entries[mode_index_value.usize()].short_name)
+        dstr_append_cstr(&out, "NB average: ")
+        average: f64 = total.f64() / count.f64() if count > 0 else 0.0
+        dstr_append_fixed(&out, average, 2)
+        return out
+
+# Time and session counts for today and the last twenty-four hours.
+def today_text(time_today: i64, sessions_today: i64, time_hours: i64,
+               sessions_hours: i64, started: bool) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        out return if started
+        dstr_append_i64(&out, time_today / 60)
+        dstr_append_cstr(&out, " min ")
+        dstr_append_i64(&out, time_today % 60)
+        dstr_append_cstr(&out, " sec done today in ")
+        dstr_append_i64(&out, sessions_today)
+        dstr_append_cstr(&out, " sessions\n")
+        dstr_append_i64(&out, time_hours / 60)
+        dstr_append_cstr(&out, " min ")
+        dstr_append_i64(&out, time_hours % 60)
+        dstr_append_cstr(&out, " sec done in last 24 hours in ")
+        dstr_append_i64(&out, sessions_hours)
+        dstr_append_cstr(&out, " sessions")
+        return out
+
+# Trials left in a running session. `trial_number` is the zero-based counter
+# used by Mode, so this deliberately does not add one.
+def trials_remaining_text(total: i64, trial_number: i64, started: bool,
+                          hide_text: bool) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        out return if not started or hide_text
+        dstr_append_i64(&out, total - trial_number)
+        dstr_append_cstr(&out, " remaining")
+        return out
