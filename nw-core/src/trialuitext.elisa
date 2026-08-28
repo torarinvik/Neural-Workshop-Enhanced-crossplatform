@@ -1,0 +1,272 @@
+# The text and small state rules from neural_workshop/ui/trialui.py.
+#
+# scene_trialui.elisa owns placement and colours for the drawing commands. This
+# module owns the labels' contents: feedback prompts, the typed arithmetic
+# answer, session information, thresholds and the space-to-start prompt.
+# Resource-backed icons and the shell's clock/check_match calls stay outside
+# this core module; their results arrive as typed flags or verdict codes.
+#
+# NOTE: needs decimal.elisa, strings.elisa, gamemode.elisa and board.elisa
+# included by the driver.
+
+const TRIALUI_INPUT_NONE: i64 = 0
+const TRIALUI_INPUT_CORRECT: i64 = 1
+const TRIALUI_INPUT_UNKNOWN: i64 = 2
+const TRIALUI_INPUT_INCORRECT: i64 = 3
+
+struct ArithmeticAnswer:
+    answer: mutable dstr
+    negative: mutable bool
+    decimal: mutable bool
+
+def ArithmeticAnswer() -> ArithmeticAnswer:
+    can Memory.Allocate, Abort.Panic:
+        return ArithmeticAnswer{answer: [], negative: false, decimal: false}
+
+# The name used under a feedback key. Combination names are checked in the
+# same order as the reference: a suffix of "vis" wins over a suffix of
+# "audio", then the single-position special case is considered.
+def feedback_modality_name(value: Modality, multi: i64) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        if value == Modality.VisVis or value == Modality.AudioVis:
+            if value == Modality.AudioVis:
+                dstr_append_cstr(&out, "audio")
+            else:
+                dstr_append_cstr(&out, "vis")
+            dstr_append_cstr(&out, " & n-vis")
+            return out
+        if value == Modality.VisAudio:
+            dstr_append_cstr(&out, "vis & n-audio")
+            return out
+        if value == Modality.Position1 and multi == 1:
+            dstr_append_cstr(&out, "position")
+            return out
+
+        match value:
+            Modality.Position1:
+                dstr_append_cstr(&out, "position1")
+            Modality.Position2:
+                dstr_append_cstr(&out, "position2")
+            Modality.Position3:
+                dstr_append_cstr(&out, "position3")
+            Modality.Position4:
+                dstr_append_cstr(&out, "position4")
+            Modality.Color:
+                dstr_append_cstr(&out, "color")
+            Modality.Image:
+                dstr_append_cstr(&out, "image")
+            Modality.Vis1:
+                dstr_append_cstr(&out, "vis1")
+            Modality.Vis2:
+                dstr_append_cstr(&out, "vis2")
+            Modality.Vis3:
+                dstr_append_cstr(&out, "vis3")
+            Modality.Vis4:
+                dstr_append_cstr(&out, "vis4")
+            Modality.Audio:
+                dstr_append_cstr(&out, "audio")
+            Modality.Audio2:
+                dstr_append_cstr(&out, "audio2")
+            Modality.Arithmetic:
+                dstr_append_cstr(&out, "arithmetic")
+            _:
+                dstr_append_cstr(&out, "")
+        return out
+
+def feedback_mouse_prefix(pos: i64, total: i64, jaeggi: bool,
+                          enable_mouse: bool) -> sview:
+    can Abort.Panic:
+        return "" if total != 2 or jaeggi or not enable_mouse
+        return "Left-click or" if pos == 0 else "Right-click or"
+
+# The leading space is intentional: the reference formats an empty mouse
+# prefix with `%s %s: %s`, so ordinary keyboard prompts begin with one space.
+def feedback_label_text(keys: darray[sview]&, value: Modality, multi: i64,
+                        pos: i64, total: i64, jaeggi: bool,
+                        enable_mouse: bool) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        dstr_append_sview(&out, feedback_mouse_prefix(pos, total, jaeggi, enable_mouse))
+        dstr_append_cstr(&out, " ")
+        keytext: sview = get keys[modality_code(value).usize()] else ""
+        if keytext == "SEMICOLON":
+            dstr_append_cstr(&out, ";")
+        else:
+            dstr_append_sview(&out, keytext)
+        dstr_append_cstr(&out, ": ")
+        name: dstr = feedback_modality_name(value, multi)
+        dstr_append_dstr(&out, name)
+        dstr_append_cstr(&out, " match") if total < 4
+        return out
+
+def feedback_is_visible(started: bool, hide_text: bool,
+                        active: bool) -> bool:
+    return started and not hide_text and active
+
+# Convert the matching.py verdict and the two missed-answer flags into the
+# colour state used by FeedbackLabel. The return values are the same four
+# answer codes used by SceneTrialUI::answer_color.
+def feedback_answer_state(show_feedback: bool, pressed: bool, verdict: i64,
+                          audiovis_pressed: bool, show_missed: bool,
+                          missed: bool) -> i64:
+    if show_feedback and pressed:
+        # matching.Verdict uses Correct=0, Incorrect=1, Missed=2, Unknown=3;
+        # the widget's colour constants use Correct=1, Unknown=2,
+        # Incorrect=3.
+        if verdict == 0:
+            return TRIALUI_INPUT_CORRECT
+        if verdict == 3:
+            return TRIALUI_INPUT_UNKNOWN
+        return TRIALUI_INPUT_INCORRECT
+    if show_feedback and not audiovis_pressed and show_missed and missed:
+        return TRIALUI_INPUT_UNKNOWN
+    return TRIALUI_INPUT_NONE
+
+# The answer field's state machine. The key handler supplies ASCII bytes; the
+# reference accepts every non-sign/non-dot character it is handed, so this
+# deliberately has no extra digit validation.
+def arithmetic_input(state: mutable ArithmeticAnswer&, byte: u8):
+    can Memory.Allocate, Abort.Panic:
+        if byte == 45.u8():
+            state.negative <- not state.negative
+        elif byte == 46.u8():
+            if not state.decimal:
+                state.decimal <- true
+                state.answer.push(byte)
+        else:
+            state.answer.push(byte)
+
+def arithmetic_reset(state: mutable ArithmeticAnswer&):
+    can Memory.Allocate, Abort.Panic:
+        state.answer <- []
+        state.negative <- false
+        state.decimal <- false
+
+def decimal_text_append(out: mutable dstr&, text: DecimalText&):
+    can Memory.Allocate, Abort.Panic:
+        index: mutable i64 = 0
+        while index < text.count |index, out, text|:
+            out.push(text.b[index.usize()])
+            index <- index + 1
+
+# `str(Decimal('...'))`, with the separate sign toggle from ArithmeticAnswer.
+def arithmetic_number_text(state: ArithmeticAnswer&) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        length: i64 = state.answer.count.i64()
+        value: mutable Decimal = decimal_zero()
+        if length > 1 or (length == 1 and state.answer[0] != 46.u8()):
+            parsed: DecimalOutcome = decimal_from_string_checked(bytes_view(state.answer))
+            value <- parsed.value
+        # Python's unary `-Decimal('0.00')` normalises zero's sign away; the
+        # answer widget toggles the sign separately and then applies that
+        # unary operation in parse_answer().
+        value.sign <- 1 if state.negative and not coeff_is_zero(&value.coefficient) else 0
+        rendered: DecimalText = decimal_to_text(&value)
+        decimal_text_append(&out, &rendered)
+        return out
+
+def arithmetic_display_text(state: ArithmeticAnswer&, active: bool,
+                            started: bool, hide_text: bool,
+                            show_feedback: bool, show_missed: bool,
+                            verdict: i64) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        out return if not active or not started or hide_text
+        dstr_append_cstr(&out, "Answer: ")
+        number: dstr = arithmetic_number_text(state)
+        dstr_append_dstr(&out, number)
+        return out
+
+def arithmetic_answer_state(show_feedback: bool, show_missed: bool,
+                             verdict: i64) -> i64:
+    return TRIALUI_INPUT_NONE if not (show_feedback and show_missed) else (
+        TRIALUI_INPUT_CORRECT if verdict == 0 else (
+            TRIALUI_INPUT_INCORRECT if verdict == 1 else TRIALUI_INPUT_NONE))
+
+# Session timing and board description at the bottom left.
+def session_info_text(started: bool, clinical: bool, grid_size: i64,
+                      interval_ms: i64, num_trials: i64,
+                      num_trials_total: i64, cell_count: i64,
+                      active_count: i64, grid_3d: bool, cubes: i64) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        out return if started or clinical
+        dstr_append_cstr(&out, "Session:\n")
+        if interval_ms < 1000:
+            dstr_append_i64(&out, interval_ms)
+            dstr_append_cstr(&out, " ms/trial\n")
+        else:
+            dstr_append_fixed(&out, interval_ms.f64() / 1000.0, 2)
+            dstr_append_cstr(&out, " sec/trial\n")
+        dstr_append_i64(&out, num_trials)
+        dstr_append_cstr(&out, "+")
+        dstr_append_i64(&out, num_trials_total - num_trials)
+        dstr_append_cstr(&out, " trials\n")
+        session_seconds: i64 = (interval_ms.f64() / 1000.0 * num_trials_total.f64()).i64()
+        dstr_append_i64(&out, session_seconds)
+        dstr_append_cstr(&out, " seconds\n")
+        if grid_3d:
+            dstr_append_i64(&out, cubes)
+            dstr_append_cstr(&out, " cubes (")
+            dstr_append_i64(&out, cell_count)
+            dstr_append_cstr(&out, " face patterns)")
+        elif active_count < cell_count:
+            dstr_append_cstr(&out, "Grid ")
+            dstr_append_i64(&out, grid_size)
+            dstr_append_cstr(&out, "×")
+            dstr_append_i64(&out, grid_size)
+            dstr_append_cstr(&out, " (")
+            dstr_append_i64(&out, active_count)
+            dstr_append_cstr(&out, "/")
+            dstr_append_i64(&out, cell_count)
+            dstr_append_cstr(&out, " cells)")
+        else:
+            dstr_append_cstr(&out, "Grid ")
+            dstr_append_i64(&out, grid_size)
+            dstr_append_cstr(&out, "×")
+            dstr_append_i64(&out, grid_size)
+        return out
+
+def threshold_text(started: bool, manual: bool, clinical: bool,
+                   advance: i64, fallback: i64) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        out return if started or manual or clinical
+        dstr_append_cstr(&out, "Thresholds:\nRaise level: ≥ ")
+        dstr_append_i64(&out, advance)
+        dstr_append_cstr(&out, "%\nLower level: < ")
+        dstr_append_i64(&out, fallback)
+        dstr_append_cstr(&out, "%")
+        return out
+
+# The idle-session prompt. `mode` is looked up in the same generated table as
+# gamemode.Mode.long_mode_names; unknown modes are kept total here rather than
+# making a renderer crash while it is assembling a frame.
+def space_prompt_text(tables: ModeTables&, mode: i64, session_number: i64,
+                      back: i64, variable_nback: bool, started: bool,
+                      active_count: i64, cell_count: i64,
+                      total_trials: i64) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        out return if started
+        dstr_append_cstr(&out, "Press SPACE to begin session #")
+        dstr_append_i64(&out, session_number + 1)
+        dstr_append_cstr(&out, ": ")
+        index: i64 = mode_index(tables, mode)
+        if index >= 0:
+            dstr_append_dstr(&out, tables.entries[index.usize()].long_name)
+        dstr_append_cstr(&out, " ")
+        dstr_append_cstr(&out, "V. ") if variable_nback
+        dstr_append_i64(&out, back)
+        dstr_append_cstr(&out, "-Back")
+        if mode == 10:
+            dstr_append_cstr(&out, " (")
+            dstr_append_i64(&out, active_count)
+            dstr_append_cstr(&out, "/")
+            dstr_append_i64(&out, cell_count)
+            dstr_append_cstr(&out, " cells, ")
+            dstr_append_i64(&out, total_trials)
+            dstr_append_cstr(&out, " trials)")
+        return out
