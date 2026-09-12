@@ -233,6 +233,150 @@ module Custody:
         can Abort.Panic:
             return Ints::at(boxes.held, index) == 0 and Ints::at(boxes.delivered, index) == 0
 
+    # The guessing floor when a player has lost the Core: boxes wearing one
+    # coat, with one box's worth of chance for each coat. Keep the division in
+    # f64 because the reference reports this as a measurement, not a rounded
+    # count. The max is the reference's guard for a malformed zero-look layout.
+    def rivals_expected(boxes: i64, looks: i64) -> f64:
+        can Abort.Panic:
+            divisor: i64 = looks if looks > 0 else 1
+            return boxes.f64() / divisor.f64()
+
+    # Machine slots in ascending order. The Python Layout stores machines in
+    # slot order, so scanning the dense machine table has the same tie order
+    # for `min(..., key=gap)` in next_target.
+    def slots_of(layout: Layout&, kind: i64, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            found: mutable i64 = 0
+            for slot in 0..<layout.slots |slot, layout, kind, out, found|:
+                if machine_at(layout, slot) == kind:
+                    Ints::put(out, found, slot)
+                    found <- found + 1
+            return found
+
+    # The boxes actually riding the belt, in box-index order. The caller owns
+    # the output buffer because Elisa cannot safely grow a struct field through
+    # a helper; count is returned separately just as the other flat helpers do.
+    def loose(boxes: Boxes&, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            found: mutable i64 = 0
+            for index in 0..<boxes.count |index, boxes, out, found|:
+                if riding(boxes, index):
+                    Ints::put(out, found, index)
+                    found <- found + 1
+            return found
+
+    # The box riding a slot, or NO_BOX when the claw finds empty belt.
+    def box_at(boxes: Boxes&, slot: i64) -> i64:
+        can Abort.Panic:
+            for index in 0..<boxes.count |index, boxes, slot|:
+                if riding(boxes, index) and Ints::at(boxes.slot, index) == slot:
+                    return index
+            return -1
+
+    # Lift the box under the claw. A held box is deliberately not returned by
+    # box_at: it occupies the claw, not the belt, and may be put back into its
+    # old slot without colliding with itself.
+    def grab(boxes: mutable Boxes&, claw: i64) -> i64:
+        can Abort.Panic:
+            index: i64 = box_at(boxes, claw)
+            return index if index < 0
+            Ints::put(&boxes.held, index, 1)
+            Ints::put(&boxes.stalled, index, 0)
+            Ints::put(&boxes.slot, index, claw)
+            return index
+
+    # Put a held box down, work a machine if present, or deliver it at the bay.
+    # Returns false when another riding box already occupies the destination.
+    def put_down(boxes: mutable Boxes&, index: i64, claw: i64, layout: Layout&) -> bool:
+        can Abort.Panic:
+            return false if index < 0 or index >= boxes.count
+            return false if Ints::at(boxes.held, index) == 0
+            if claw == layout.bay:
+                Ints::put(&boxes.held, index, 0)
+                Ints::put(&boxes.delivered, index, 1)
+                Ints::put(&boxes.slot, index, OFF_BELT)
+                return true
+            return false if box_at(boxes, claw) >= 0
+            Ints::put(&boxes.held, index, 0)
+            Ints::put(&boxes.slot, index, claw)
+            kind: i64 = machine_at(layout, claw)
+            if kind >= 0:
+                treat(boxes, index, kind, layout)
+                Ints::put(&boxes.stalled, index, 1)
+            return true
+
+    # Is the box in the state the bay asks for? Delivered boxes retain their
+    # values, so this query is useful after delivery too, exactly like the
+    # reference's attribute-based predicate.
+    def wanted(boxes: Boxes&, index: i64, layout: Layout&) -> bool:
+        can Abort.Panic:
+            return false if index < 0 or index >= boxes.count
+            return Ints::at(boxes.charge, index) >= layout.need_charge and Ints::at(boxes.heat, index) <= layout.max_heat
+
+    # The nearest next destination for any box, independent of its identity.
+    # This is intentionally blind to layout.core: potential shaping may read
+    # only what a frame exposes and must not become an answer key.
+    def next_target(boxes: Boxes&, index: i64, layout: Layout&, claw: i64) -> i64:
+        can Abort.Panic:
+            return layout.bay if index < 0 or index >= boxes.count
+            target: mutable i64 = layout.bay
+            if Ints::at(boxes.charge, index) < layout.need_charge:
+                chargers: mutable darray[i64] = Ints::zeros(layout.slots + 1)
+                count: i64 = slots_of(layout, CHARGER, &chargers)
+                if count > 0:
+                    best: mutable i64 = Ints::at(chargers, 0)
+                    best_gap: mutable i64 = gap(claw, best, layout.slots)
+                    for at in 1..<count |at, chargers, count, claw, layout, best, best_gap|:
+                        candidate: i64 = Ints::at(chargers, at)
+                        distance: i64 = gap(claw, candidate, layout.slots)
+                        if distance < best_gap:
+                            best <- candidate
+                            best_gap <- distance
+                    return best
+            if Ints::at(boxes.heat, index) > layout.max_heat:
+                coolers: mutable darray[i64] = Ints::zeros(layout.slots + 1)
+                count: i64 = slots_of(layout, COOLER, &coolers)
+                if count > 0:
+                    best: mutable i64 = Ints::at(coolers, 0)
+                    best_gap: mutable i64 = gap(claw, best, layout.slots)
+                    for at in 1..<count |at, coolers, count, claw, layout, best, best_gap|:
+                        candidate: i64 = Ints::at(coolers, at)
+                        distance: i64 = gap(claw, candidate, layout.slots)
+                        if distance < best_gap:
+                            best <- candidate
+                            best_gap <- distance
+                    return best
+            return target
+
+    # Distance to the next destination, or -1 when the caller passes no box
+    # (index -1). The reference accepts a Box object rather than checking its
+    # `held` flag, so it still returns a distance for a box that has just been
+    # put down or delivered; preserve that observable behaviour here.
+    def potential(boxes: Boxes&, index: i64, claw: i64, layout: Layout&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return -1 if index < 0 or index >= boxes.count
+            return gap(claw, next_target(boxes, index, layout, claw), layout.slots)
+
+    # The marked box is an index in this struct-of-arrays representation. A
+    # delivered Core remains identifiable by index, which is also what the
+    # Python Box.latent field provides.
+    def core_of(boxes: Boxes&, layout: Layout&) -> i64:
+        can Abort.Panic:
+            return layout.core if layout.core >= 0 and layout.core < boxes.count else -1
+
+    # How many not-yet-delivered boxes currently share the Core's appearance.
+    def rivals(boxes: Boxes&, layout: Layout&) -> i64:
+        can Abort.Panic:
+            core: i64 = core_of(boxes, layout)
+            return 0 if core < 0
+            look: i64 = Ints::at(boxes.look, core)
+            found: mutable i64 = 0
+            for index in 0..<boxes.count |index, boxes, layout, look, found|:
+                if Ints::at(boxes.delivered, index) == 0 and Ints::at(boxes.look, index) == look:
+                    found <- found + 1
+            return found
+
     # Carry the belt on one slot, and bleed the charge of what rides it.
     def step_belt(boxes: mutable Boxes&, layout: Layout&, order: mutable darray[i64]&, taken: mutable darray[i64]&, gone: mutable darray[i64]&):
         can Abort.Panic:

@@ -11,10 +11,11 @@ pyglet-owning class and is transcribed.
 The bank is not lifted: it is a fetched corpus with a seed fallback, so both
 sides build the same synthetic pool from a fixed recipe instead.
 
-`letter_share` and `pace` are deliberately out of scope on both sides -- see
-the module comment in tasks/overrun.elisa.
+`letter_share` and `pace` are covered by the sweep as integer-scaled values;
+the fetched sentence bank remains outside the core port.
 """
 import ast
+from fractions import Fraction
 import math
 import random
 import subprocess
@@ -268,6 +269,14 @@ def reference():
                         scaled(words_a_minute(letters, tenths * 0.85))])
 
     pool = build_pool(64)
+
+    exact_share = sum(
+        (Fraction(sum(map(len, words)), len(" ".join(words)))
+         for words in pool), Fraction(0)) / len(pool)
+    out.append(["share", exact_share.numerator, exact_share.denominator])
+    share = float(exact_share)
+    out[-1].extend(scaled(12.0 * grade_of(rung).speed * share)
+                   for rung in range(1, 13))
 
     for s in range(64):
         for grade in range(len(GRADES)):

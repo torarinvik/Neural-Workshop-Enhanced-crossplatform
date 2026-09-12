@@ -83,12 +83,34 @@ def play_lines(out):
                            bench.wasted))
 
 
+def policy_lines(out):
+    for level in (1, 3, 6, 9, 11, 12):
+        for seed in (1, 7, 1234):
+            bout = ref.deal(level, seed=seed)
+            for player_seed in (0, 1, 42, 999):
+                for kind in range(4):
+                    bench = ref.Bench(bout)
+                    rng = random.Random(player_seed)
+                    if kind == 0:
+                        ref.play_random(bench, rng)
+                    elif kind == 1:
+                        ref.play_oracle(bench)
+                    elif kind == 2:
+                        ref.play_learner(bench, rng, relearn=True)
+                    else:
+                        ref.play_learner(bench, rng, relearn=False)
+                    out.append(row("policy", kind, level, seed, player_seed,
+                                   bench.at[0], bench.at[1], bench.presses,
+                                   bench.reached, bench.wasted))
+
+
 def python_lines():
     out = []
     grade_lines(out)
     gap_lines(out)
     deal_lines(out)
     play_lines(out)
+    policy_lines(out)
     return out
 
 

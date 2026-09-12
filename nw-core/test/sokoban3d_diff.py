@@ -14,8 +14,8 @@ game's generator runs its own solver on every attempt, which is minutes per
 rung in pure Python, and what is under test here is the arithmetic on top of a
 level rather than the generator.
 
-The route and the two foils are out of scope on both sides -- see the module
-comment in tasks/sokoban3d.elisa.
+The route and the two foils are included here. Route actions are emitted as
+the integer ordering used by the Elisa ABI (`AHEAD`, `BACK`, `LEFT`, `RIGHT`).
 """
 import ast
 import math
@@ -44,7 +44,8 @@ def lift(source, names, extra=None):
             if names.intersection(flat):
                 keep.append(node)
     typing = __import__("typing")
-    space = {"math": math, "heapq": __import__("heapq"),
+    space = {"math": math, "random": __import__("random"),
+             "heapq": __import__("heapq"),
              "deque": __import__("collections").deque,
              "Tuple": typing.Tuple, "Optional": typing.Optional,
              "Dict": typing.Dict, "List": typing.List,
@@ -73,10 +74,12 @@ MAZE3D = lift(PKG / "youarehere.py",
               extra={"Maze": MAZE["Maze"]})
 
 REF = lift(PKG / "sokoban3d.py",
-           {"Solid", "blocking", "look_around", "facing_at", "step_to",
+           {"Solid", "Outcome", "blocking", "look_around", "facing_at", "step_to",
             "move", "costs", "solved", "stuck", "floor_of", "walk_cost",
             "_pushes_from", "solve_bounded", "_unwind", "_way", "_walk_route",
-            "par", "certified", "marks", "clear_between", "STEP_BUDGET"},
+            "par", "certified", "route", "_run", "push_perfect",
+            "push_forgetful", "push_slipping", "marks", "clear_between",
+            "STEP_BUDGET"},
            extra={"Level": FLAT["Level"], "live_cells": FLAT["live_cells"],
                   "deadlocked": FLAT["deadlocked"],
                   "Pose": MAZE3D["Pose"], "Sight": MAZE3D["Sight"],
@@ -166,9 +169,22 @@ def reference():
             out.append(["reach", spec, which] + list(reach))
 
         for budget in (40, 4000):
-            found, bound, _route = REF["solve_bounded"](level, budget)
+            found, bound, route = REF["solve_bounded"](level, budget)
             out.append(["par", spec, budget, 0 if found is None else 1,
                         0 if found is None else found, bound, 0])
+            out.append(["route", spec, budget, len(route)]
+                       + [MOVES_ORDER.index(one) for one in route])
+
+        if spec < 8:
+            for mode, name in enumerate(("push_forgetful", "push_slipping")):
+                rng = __import__("random").Random(7000 + spec * 10 + mode)
+                if name == "push_forgetful":
+                    result = REF[name](level, 0.35, rng, 80, 4000)
+                else:
+                    result = REF[name](level, 0.35, rng, 80, 4000)
+                ending = {"solved": 0, "stuck": 1,
+                          "thinks it is done": 2, "adrift": 3}[result.ending]
+                out.append(["foil", spec, mode, ending, result.steps])
 
         for facing in range(4):
             here = Pose(level.player, facing)

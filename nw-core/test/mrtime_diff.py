@@ -7,8 +7,8 @@ constants are module-level, so they are LIFTED by AST and run as themselves --
 `band_rows`/`above_the_band` come from ui/verdict.py the same way. The run
 machinery is methods on the pyglet-owning class and is transcribed.
 
-`quantity` is a label and is out of scope on both sides -- see the module
-comment in tasks/mrtime.elisa.
+`quantity` is included as a small formatting stream as well; the task owns the
+rung ladder, while the scene owns where the label is drawn.
 """
 import ast
 import math
@@ -29,7 +29,7 @@ WANTED_CONST = {"RUNGS", "KINDS", "MIN_RUNG", "MAX_RUNG", "MIN_PRODUCE",
                 "RECALL", "PRODUCE", "BOTH",
                 # KINDS is built from these, so the tuple assign has to come
                 # along or the lifted module cannot evaluate it.
-                "CIRCLE", "TRIANGLE", "SQUARE", "PENTAGON", "STAR", "CROSS"}
+    "CIRCLE", "TRIANGLE", "SQUARE", "PENTAGON", "STAR", "CROSS"}
 
 
 def lift(source, want_fn, want_class, want_const, extra=None):
@@ -83,6 +83,8 @@ EPSILON = REF["EPSILON"]
 RECALL, PRODUCE, BOTH = REF["RECALL"], REF["PRODUCE"], REF["BOTH"]
 rung_at = REF["rung_at"]
 tolerance = REF["tolerance"]
+rung_per_second = lambda number: rung_at(number).per_second
+rung_short = lambda number: rung_at(number).short
 BAND_TOP = BAND["BAND_TOP"]
 CLEARANCE = BAND["CLEARANCE"]
 
@@ -356,6 +358,13 @@ def reference():
         out.append(["canvas", size, band_first_row(task.window_height),
                     above_the_band(task.window_height, 0.0),
                     scaled(left), scaled(bottom), scaled(width), scaled(height)])
+
+    for rung in range(-2, 10):
+        for step in range(7):
+            seconds = -2.5 + step * 2.5
+            reach = abs(seconds) * rung_per_second(rung)
+            text = f"{reach:.2f}" if reach < 10.0 else f"{round(reach):,}"
+            out.append([f"quantity|{text} {rung_short(rung)}"])
 
     for recipe in range(24):
         task = MrTime(random.Random(0))

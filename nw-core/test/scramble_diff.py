@@ -12,8 +12,9 @@ off disk -- by a stand-in with the same three attributes `candidates` uses.
 `choose(...)` on the sentence corpus. What stays the reference's own inside it
 is every RNG-spending step.
 
-`read_off`/`read_back` are out of scope on both sides -- see the module comment
-in tasks/scramble.elisa for why `candidates(...)[0]` is not reproducible.
+`read_off`/`read_back` receive a compatibility table of the first candidate
+for each `(grade, token)` lookup. Python's tie break belongs to the temporary
+SET built for that token, so a single global word order would be incorrect.
 """
 import ast
 import math
@@ -25,10 +26,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = (ROOT / "original-neural-workshop-enhanced" / "neural_workshop"
           / "scramble.py")
+ORDER_PATH = "/tmp/nw_scramble_order.txt"
 
 WANTED_FN = {"grade_of", "anchored", "removals", "additions", "bag_distance",
              "feasible", "scramble_word", "_shuffled", "blocks",
-             "shuffle_order", "respace", "candidates", "normalise", "_recipe"}
+             "shuffle_order", "respace", "candidates", "read_off", "read_back",
+             "normalise", "_recipe"}
 WANTED_CLASS = {"Grade"}
 WANTED_CONST = {"GRADES", "LETTERS", "NEAR_KEYS", "_FITS"}
 
@@ -61,7 +64,7 @@ def lifted():
              # `candidates` is annotated `words: Optional[Vocab]`, and a
              # lifted subset has no `from __future__` line to keep annotations
              # unevaluated -- so the name has to be bound before the exec.
-             "Vocab": object,
+             "Vocab": object, "Deal": object,
              "Sentence": object, "vocab_for": lambda grade: None,
              "_TIDY": __import__("re").compile(r"[^a-z ]+")}
     exec(compile(ast.Module(body=keep, type_ignores=[]), str(SOURCE), "exec"), space)
@@ -103,6 +106,33 @@ def build_vocab(count):
     return words, ranks, Vocab(words, ranks)
 
 
+def write_order(words, pool, bank):
+    """Persist this process's per-token candidate choice for the Elisa side."""
+    first = {}
+    for index, word in enumerate(words):
+        first.setdefault(word, index)
+    rows = []
+    for rung in range(1, 13):
+        grade = grade_of(rung)
+        for seed in range(1, 15):
+            made = deal_one(grade, bank, pool, random.Random(rung * 100 + seed))
+            blob = "".join(made["chunks"])
+            if grade.spaces < 1:
+                tokens = made["chunks"]
+            else:
+                tokens = (blob[start:stop]
+                          for start in range(len(blob))
+                          for stop in range(start + 1,
+                                            min(len(blob), start + pool.longest + grade.drop) + 1))
+            for token in tokens:
+                fits = REF["candidates"](grade, token, pool)
+                best = first[fits[0]] if fits else -1
+                rows.append(" ".join([str(rung), str(len(token)),
+                                       *(str(value) for value in coded(token)),
+                                       str(best)]))
+    Path(ORDER_PATH).write_text("\n".join(rows) + "\n")
+
+
 def build_bank(words, sentences):
     return [[words[(s * 5 + w * 3) % len(words)] for w in range(6 + s % 8)]
             for s in range(sentences)]
@@ -130,6 +160,15 @@ def deal_one(grade, bank, pool, rng):
 
 def coded(text):
     return [LETTERS.index(one) for one in text]
+
+
+class DealView(object):
+    """The small part of `scramble.Deal` consumed by read_off/read_back."""
+
+    def __init__(self, grade, chunks, truth):
+        self.grade = grade
+        self.chunks = chunks
+        self.in_view = truth
 
 
 def scaled(value):
@@ -200,6 +239,16 @@ def reference():
                     row.extend((at, len(chunk)))
                     at += len(chunk)
             out.append(row)
+            if made is not None:
+                view = DealView(g, made["chunks"],
+                                tuple(made["words"][where] for where in made["placing"]))
+                reading = REF["read_off"](view, pool)
+                row = ["read", rung, seed, len(reading)]
+                for word in reading:
+                    row.append(len(word))
+                    row.extend(coded(word))
+                row.append(scaled(REF["read_back"](view, pool)))
+                out.append(row)
 
     for sentence in range(24):
         words_here = bank[sentence]
@@ -230,6 +279,11 @@ def reference():
 
 
 def main():
+    # The binary is launched after this function starts. Write before launching
+    # it so the order belongs to exactly the same Python process whose output
+    # `read_off` below is the oracle.
+    words, _ranks, pool = build_vocab(240)
+    write_order(words, pool, build_bank(words, 40))
     got = subprocess.run([sys.argv[1]], capture_output=True, text=True, check=True)
     mine = [line for line in got.stdout.splitlines() if line.strip()]
     want = reference()

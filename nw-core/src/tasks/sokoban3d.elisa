@@ -21,24 +21,10 @@
 #     walking forwards, so the search offers both and the par is a par of what
 #     the keys can really do.
 #
-# NOT PORTED, and the reason is worth stating precisely:
-#
-#   `_unwind`/`route` and the two foils (`push_forgetful`, `push_slipping`)
-#   that replay a route. Everything they need is here EXCEPT the tie-break.
-#   `_pushes_from` iterates `for box in boxes` over a Python FROZENSET, and the
-#   iteration order of a frozenset built by `(boxes - {box}) | {beyond}` is the
-#   slot order of a table whose layout depends on which of set_difference's two
-#   branches ran, on whether set_merge could copy a table wholesale, and on
-#   where the dummies fell. That order decides the `tick` a state is pushed
-#   with, and `tick` breaks ties in the heap, and the tie-break decides WHICH
-#   of several equally cheap routes comes back.
-#
-#   The par does not depend on it, and that is not a hope: Dijkstra's distance
-#   labels are order-independent, states settle in nondecreasing cost, and so
-#   the cost of the (budget+1)-th settled state -- which is what the bounded
-#   search reports when it runs out -- is the (budget+1)-th smallest distance
-#   whatever order the ties were broken in. So `par`, `certified` and the
-#   bound are exact here, and the boxes are iterated in ascending cell order.
+# The search also retains parent nodes and rebuilds the keyboard route after a
+# solved state is settled. Its public core representation is integer actions;
+# callers map those to the four labels exported by YouAreHere. Box order is
+# ascending cell order, and that stable order is part of the route contract.
 
 module Sokoban3D:
 
@@ -234,6 +220,7 @@ module Sokoban3D:
     const HEAP_CAP: i64 = 300000
     const HASH_SLOTS: i64 = 1048576
     const HASH_MASK: i64 = 1048575
+    const ROUTE_CAP: i64 = 65536
 
     struct Search:
         count: mutable i64
@@ -256,6 +243,14 @@ module Sokoban3D:
         reach: mutable darray[i64]
         queue: mutable darray[i64]
         box_list: mutable darray[i64]
+        parent: mutable darray[i64]
+        route: mutable darray[i64]
+        route_count: mutable i64
+        chain: mutable darray[i64]
+        walk_came: mutable darray[i64]
+        walk_move: mutable darray[i64]
+        walk_queue: mutable darray[i64]
+        walk_path: mutable darray[i64]
 
     def new_search() -> Search:
         can Memory.Allocate, Abort.Panic:
@@ -269,7 +264,11 @@ module Sokoban3D:
                           boxes_flags: Ints::zeros(MOST_CELLS), moved_flags: Ints::zeros(MOST_CELLS),
                           floor_ok: Ints::zeros(MOST_CELLS),
                           reach: Ints::zeros(MOST_CELLS * 4), queue: Ints::zeros(MOST_CELLS * 4),
-                          box_list: Ints::zeros(MOST_CELLS)}
+                          box_list: Ints::zeros(MOST_CELLS), parent: Ints::zeros(NODE_CAP),
+                          route: Ints::zeros(ROUTE_CAP), route_count: 0,
+                          chain: Ints::zeros(NODE_CAP), walk_came: Ints::zeros(MOST_CELLS * 4),
+                          walk_move: Ints::zeros(MOST_CELLS * 4), walk_queue: Ints::zeros(MOST_CELLS * 4),
+                          walk_path: Ints::zeros(MOST_CELLS * 4)}
 
     def mask_clear(words: mutable darray[i64]&, base: i64):
         can Abort.Panic:
@@ -318,6 +317,7 @@ module Sokoban3D:
                 Ints::put(&search.words, fresh * STATE_WORDS + at, Ints::at_ref(words, base + at))
             Ints::put(&search.anchor, fresh, anchor)
             Ints::put(&search.best, fresh, BIG)
+            Ints::put(&search.parent, fresh, -1)
             Ints::put(&search.next, fresh, Ints::at_ref(&search.head, slot))
             Ints::put(&search.head, slot, fresh + 1)
             return fresh
@@ -401,6 +401,111 @@ module Sokoban3D:
         # True when the node table filled: a refusal, never a wrong answer.
         table_full: bool
 
+    # Rebuild one cheapest walk between two poses, in the same breadth-first
+    # neighbour order as Python's `_walk_route`: left, right, ahead, back.
+    # The resulting actions are placed in `walk_path` in forward order.
+    def walk_route(search: mutable Search&, level: mutable Sokoban::Level&, boxes_in: mutable darray[i64]&, floor_ok: mutable darray[i64]&, from_cell: i64, from_facing: i64, want_cell: i64, want_facing: i64) -> i64:
+        can Abort.Panic:
+            states: i64 = level.cells * 4
+            for at in 0..<states |search|:
+                Ints::put(&search.walk_came, at, -1)
+            first: i64 = from_cell * 4 + from_facing
+            target: i64 = want_cell * 4 + want_facing
+            Ints::put(&search.walk_came, first, -2)
+            Ints::put(&search.walk_queue, 0, first)
+            head: mutable i64 = 0
+            queue_end: mutable i64 = 1
+            found: mutable bool = false
+            while head < queue_end and not found |search, level, boxes_in, floor_ok, first, target, head, queue_end, found|:
+                state: i64 = Ints::at_ref(&search.walk_queue, head)
+                head <- head + 1
+                if state == target:
+                    found <- true
+                else:
+                    cell: i64 = state / 4
+                    facing: i64 = state % 4
+                    for turn in 0..<2 |search, queue_end, state, cell, facing|:
+                        turned: i64 = (facing + 3) % 4 if turn == 0 else (facing + 1) % 4
+                        below: i64 = cell * 4 + turned
+                        if Ints::at_ref(&search.walk_came, below) == -1:
+                            Ints::put(&search.walk_came, below, state)
+                            Ints::put(&search.walk_move, below, YouAreHere::LEFT if turn == 0 else YouAreHere::RIGHT)
+                            Ints::put(&search.walk_queue, queue_end, below)
+                            queue_end <- queue_end + 1
+                    for way in 0..<2 |search, level, boxes_in, floor_ok, queue_end, state, cell, facing|:
+                        heading: i64 = facing if way == 0 else (facing + 2) % 4
+                        step: i64 = step_to(level, cell, heading)
+                        continue if step < 0 or Ints::at_ref(boxes_in, step) == 1 or Ints::at_ref(floor_ok, step) == 0
+                        below: i64 = step * 4 + facing
+                        if Ints::at_ref(&search.walk_came, below) == -1:
+                            Ints::put(&search.walk_came, below, state)
+                            Ints::put(&search.walk_move, below, YouAreHere::AHEAD if way == 0 else YouAreHere::BACK)
+                            Ints::put(&search.walk_queue, queue_end, below)
+                            queue_end <- queue_end + 1
+            return -1 if not found
+            count: mutable i64 = 0
+            at: mutable i64 = target
+            while at != first |search, at, count|:
+                Ints::put(&search.walk_path, count, Ints::at_ref(&search.walk_move, at))
+                count <- count + 1
+                at <- Ints::at_ref(&search.walk_came, at)
+            for slot in 0..<(count / 2) |search, count|:
+                other: i64 = count - 1 - slot
+                held: i64 = Ints::at_ref(&search.walk_path, slot)
+                Ints::put(&search.walk_path, slot, Ints::at_ref(&search.walk_path, other))
+                Ints::put(&search.walk_path, other, held)
+            return count
+
+    def way_for_stride(stride: i64, width: i64) -> i64:
+        can Abort.Panic:
+            return YouAreHere::RIGHT if stride == 1
+            return YouAreHere::LEFT if stride == -1
+            return YouAreHere::BACK if stride > 0
+            return YouAreHere::AHEAD
+
+    # Rebuild the route by comparing the parent and child box masks. The edge
+    # does not retain an action during Dijkstra: this matches `_unwind`, which
+    # reconstructs the walk from the winning states after the search settles.
+    def unwind(search: mutable Search&, level: mutable Sokoban::Level&, state: i64):
+        can Abort.Panic:
+            search.route_count <- 0
+            chain_count: mutable i64 = 0
+            at: mutable i64 = state
+            while Ints::at_ref(&search.parent, at) >= 0 |search, at, chain_count|:
+                Ints::put(&search.chain, chain_count, at)
+                chain_count <- chain_count + 1
+                at <- Ints::at_ref(&search.parent, at)
+            for chain_at in 0..<chain_count |search, level, chain_count|:
+                child: i64 = Ints::at_ref(&search.chain, chain_count - 1 - chain_at)
+                parent: i64 = Ints::at_ref(&search.parent, child)
+                for word in 0..<STATE_WORDS |search, parent, child|:
+                    Ints::put(&search.mask, word, Ints::at_ref(&search.words, parent * STATE_WORDS + word))
+                    Ints::put(&search.moved, word, Ints::at_ref(&search.words, child * STATE_WORDS + word))
+                for cell in 0..<level.cells |search|:
+                    Ints::put(&search.boxes_flags, cell, 1 if mask_has(&search.mask, 0, cell) else 0)
+                origin: mutable i64 = -1
+                target: mutable i64 = -1
+                for cell in 0..<level.cells |search, origin, target|:
+                    if mask_has(&search.mask, 0, cell) and not mask_has(&search.moved, 0, cell):
+                        origin <- cell
+                    if mask_has(&search.moved, 0, cell) and not mask_has(&search.mask, 0, cell):
+                        target <- cell
+                stride: i64 = target - origin
+                anchor: i64 = Ints::at_ref(&search.anchor, child)
+                standing: i64 = anchor % 4
+                parent_anchor: i64 = Ints::at_ref(&search.anchor, parent)
+                want_cell: i64 = origin - stride
+                walked: i64 = walk_route(search, level, &search.boxes_flags, &search.floor_ok, parent_anchor / 4, parent_anchor % 4, want_cell, standing)
+                return if walked < 0
+                doing: i64 = YouAreHere::AHEAD if standing == way_for_stride(stride, level.width) else YouAreHere::BACK
+                for step_at in 0..<walked |search, walked|:
+                    return if search.route_count >= ROUTE_CAP
+                    Ints::put(&search.route, search.route_count, Ints::at_ref(&search.walk_path, step_at))
+                    search.route_count <- search.route_count + 1
+                return if search.route_count >= ROUTE_CAP
+                Ints::put(&search.route, search.route_count, doing)
+                search.route_count <- search.route_count + 1
+
     # (exact minimum steps or none, proven lower bound).
     #
     # Dijkstra over (boxes, cell, facing), contracted so that one edge is "walk
@@ -421,6 +526,7 @@ module Sokoban3D:
     def solve_bounded(search: mutable Search&, work: mutable Sokoban::Work&, level: mutable Sokoban::Level&, budget: i64, boxes_in: mutable darray[i64]&, from_cell: i64, from_facing: i64) -> Solution:
         can Abort.Panic:
             pushes_at_least: i64 = level.minimum if level.minimum >= 0 else level.at_least
+            search.route_count <- 0
             return Solution{found: true, steps: 0, bound: 0, table_full: false} if solved(level, boxes_in)
             work.width <- level.width
             work.height <- level.height
@@ -456,6 +562,7 @@ module Sokoban3D:
                 for cell in 0..<level.cells |search, level, state|:
                     Ints::put(&search.boxes_flags, cell, 1 if mask_has(&search.words, state * STATE_WORDS, cell) else 0)
                 if solved(level, &search.boxes_flags):
+                    unwind(search, level, state)
                     answer <- Solution{found: true, steps: spent, bound: spent, table_full: false}
                     running <- false
                 else:
@@ -499,6 +606,7 @@ module Sokoban3D:
                                     else:
                                         if total < Ints::at_ref(&search.best, below):
                                             Ints::put(&search.best, below, total)
+                                            Ints::put(&search.parent, below, state)
                                             tick <- tick + 1
                                             heap_push(search, total, tick, below)
             return answer
@@ -514,6 +622,88 @@ module Sokoban3D:
     def certified(search: mutable Search&, work: mutable Sokoban::Work&, level: mutable Sokoban::Level&, budget: i64) -> bool:
         can Abort.Panic:
             return solve_bounded(search, work, level, budget, &level.boxes_in, level.player, facing_at(level)).found
+
+    # The four endings used by the Python Outcome namedtuple. Integer codes
+    # keep the portable core free of strings; shells can render their labels.
+    struct FoilOutcome:
+        ending: i64
+        steps: i64
+
+    def copy_boxes(source: mutable darray[i64]&, target: mutable darray[i64]&, cells: i64):
+        can Abort.Panic:
+            for cell in 0..<cells |source, target|:
+                Ints::put(target, cell, Ints::at_ref(source, cell))
+
+    # Run the two imperfect players. Both plan from a belief with the exact
+    # route solver, execute the next action in the real warehouse, and then
+    # optionally drop one part of their state. The only difference between the
+    # foils is whether the dropped fact is the box load or the complete pose
+    # and load update.
+    def run_foil(search: mutable Search&, work: mutable Sokoban::Work&, level: mutable Sokoban::Level&, forget: f64, slip: f64, rng: mutable MT19937&, cap: i64, budget: i64) -> FoilOutcome:
+        can Memory.Allocate, Abort.Panic:
+            actual: mutable darray[i64] = Ints::zeros(MOST_CELLS)
+            believes: mutable darray[i64] = Ints::zeros(MOST_CELLS)
+            plan: mutable darray[i64] = Ints::zeros(ROUTE_CAP)
+            copy_boxes(&level.boxes_in, &actual, level.cells)
+            copy_boxes(&level.boxes_in, &believes, level.cells)
+            actual_cell: mutable i64 = level.player
+            actual_facing: mutable i64 = facing_at(level)
+            thinks_cell: mutable i64 = actual_cell
+            thinks_facing: mutable i64 = actual_facing
+            plan_count: mutable i64 = 0
+            plan_at: mutable i64 = 0
+            steps: mutable i64 = 0
+            acted: mutable i64 = 0
+            while acted < cap |search, work, level, actual, believes, plan, actual_cell, actual_facing, thinks_cell, thinks_facing, plan_count, plan_at, steps, acted, rng, forget, slip, budget|:
+                if solved(level, &actual):
+                    return FoilOutcome{ending: 0, steps: steps}
+                if stuck(work, level, &actual):
+                    return FoilOutcome{ending: 1, steps: steps}
+                if plan_at >= plan_count:
+                    if solved(level, &believes):
+                        return FoilOutcome{ending: 2, steps: steps}
+                    answer: Solution = solve_bounded(search, work, level, budget, &believes, thinks_cell, thinks_facing)
+                    return FoilOutcome{ending: 3, steps: steps} if not answer.found or search.route_count == 0
+                    plan_count <- search.route_count if search.route_count < ROUTE_CAP else ROUTE_CAP
+                    for at in 0..<plan_count |search, plan, plan_count|:
+                        Ints::put(&plan, at, Ints::at_ref(&search.route, at))
+                    plan_at <- 0
+                doing: i64 = Ints::at_ref(&plan, plan_at)
+                plan_at <- plan_at + 1
+                acted <- acted + 1
+                moved: Step = after(level, &actual, actual_cell, actual_facing, doing)
+                if moved.pushed:
+                    Ints::put(&actual, moved.from_cell, 0)
+                    Ints::put(&actual, moved.to_cell, 1)
+                actual_cell <- moved.cell
+                actual_facing <- moved.facing
+                steps <- steps + costs(doing, moved.moved)
+                if py_random(rng) < slip:
+                    plan_at <- plan_count
+                    continue
+                believed: Step = after(level, &believes, thinks_cell, thinks_facing, doing)
+                if believed.pushed:
+                    Ints::put(&believes, believed.from_cell, 0)
+                    Ints::put(&believes, believed.to_cell, 1)
+                thinks_cell <- believed.cell
+                thinks_facing <- believed.facing
+                if moved.pushed and py_random(rng) < forget:
+                    copy_boxes(&level.boxes_in, &believes, level.cells)
+                    plan_at <- plan_count
+            return FoilOutcome{ending: 3, steps: steps}
+
+    def push_perfect(search: mutable Search&, work: mutable Sokoban::Work&, level: mutable Sokoban::Level&, budget: i64) -> i64:
+        can Abort.Panic:
+            answer: Solution = solve_bounded(search, work, level, budget, &level.boxes_in, level.player, facing_at(level))
+            return answer.bound if not answer.found else answer.steps
+
+    def push_forgetful(search: mutable Search&, work: mutable Sokoban::Work&, level: mutable Sokoban::Level&, forget: f64, rng: mutable MT19937&, cap: i64, budget: i64) -> FoilOutcome:
+        can Memory.Allocate, Abort.Panic:
+            return run_foil(search, work, level, forget, 0.0, rng, cap, budget)
+
+    def push_slipping(search: mutable Search&, work: mutable Sokoban::Work&, level: mutable Sokoban::Level&, slip: f64, rng: mutable MT19937&, cap: i64, budget: i64) -> FoilOutcome:
+        can Memory.Allocate, Abort.Panic:
+            return run_foil(search, work, level, 0.0, slip, rng, cap, budget)
 
     # --- what can be seen -------------------------------------------------
 

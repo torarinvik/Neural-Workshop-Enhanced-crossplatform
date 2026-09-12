@@ -1,0 +1,153 @@
+# Grid state and coordinate helpers.
+#
+# Port of neural_workshop/grid.py. The Python module reads state.cfg and
+# state.field; the core keeps those inputs explicit so the same functions can
+# be used by a session, a scene, or a host-side preview without globals.
+#
+# Board topology itself lives in board.elisa. This module is the configuration
+# and pixel-coordinate layer above it, including the 3D pattern encodings.
+
+extern rint(x: f64) -> f64
+
+module Grid:
+
+    struct Config:
+        size: i64
+        size_min: i64
+        size_max: i64
+        include_center: bool
+        grid_3d: bool
+        cubes: i64
+        active_cells: i64
+        legacy_cell_count: i64
+
+    struct Field:
+        size: f64
+        center_x: f64
+        center_y: f64
+
+    struct Point:
+        x: i64
+        y: i64
+
+    struct Bounds:
+        low: i64
+        high: i64
+
+    # The source catches malformed config values. Config is typed at this
+    # boundary, so the only remaining normalization is the same lower-bound
+    # and ordering rule.
+    def current_grid_bounds(cfg: Config&) -> Bounds:
+        can Abort.Panic:
+            low: i64 = cfg.size_min if cfg.size_min > 2 else 2
+            high: i64 = cfg.size_max if cfg.size_max > low else low
+            return Bounds{low: low, high: high}
+
+    def current_grid_size(cfg: Config&) -> i64:
+        can Abort.Panic:
+            bounds: Bounds = current_grid_bounds(cfg)
+            size: mutable i64 = cfg.size
+            size <- bounds.low if size < bounds.low
+            size <- bounds.high if size > bounds.high
+            return size
+
+    def current_include_center(cfg: Config&) -> bool:
+        return cfg.include_center
+
+    def current_grid_3d(cfg: Config&) -> bool:
+        return cfg.grid_3d
+
+    def current_3d_cube_count(cfg: Config&) -> i64:
+        can Abort.Panic:
+            cubes: mutable i64 = cfg.cubes
+            cubes <- 1 if cubes < 1
+            cubes <- 6 if cubes > 6
+            return cubes
+
+    def decode_3d_pattern(position: i64, count: i64) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            cubes: i64 = count if count > 1 else 1
+            value: mutable i64 = position - 1 if position > 1 else 0
+            out: mutable darray[i64] = []
+            for _index in 0..<cubes |out, value|:
+                out.push(value % 6)
+                value <- value / 6
+            return out
+
+    def current_3d_palette_size() -> i64:
+        return 8
+
+    def decode_3d_colors(color: i64, count: i64) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            cubes: i64 = count if count > 1 else 1
+            value: mutable i64 = color - 1 if color > 1 else 0
+            out: mutable darray[i64] = []
+            for _index in 0..<cubes |out, value|:
+                out.push(value % 8 + 1)
+                value <- value / 8
+            return out
+
+    def current_3d_color_count(cfg: Config&) -> i64:
+        return ipow_grid(8, current_3d_cube_count(cfg))
+
+    def current_cell_count(cfg: Config&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if current_grid_3d(cfg):
+                return ipow_grid(6, current_3d_cube_count(cfg))
+            return grid_cell_count(current_grid_size(cfg),
+                                   current_include_center(cfg), 2)
+
+    # Kept local so grid.elisa is usable without the larger gamemode module.
+    def ipow_grid(base: i64, exponent: i64) -> i64:
+        result: mutable i64 = 1
+        for _index in 0..<exponent |result, base|:
+            result <- result * base
+        return result
+
+    def current_cell_px(cfg: Config&, field: Field&) -> f64:
+        return field.size / current_grid_size(cfg).f64()
+
+    def current_active_cell_limit(cfg: Config&) -> i64:
+        can Abort.Panic:
+            active: i64 = cfg.active_cells
+            return active if active > 0 else (cfg.legacy_cell_count if cfg.legacy_cell_count > 0 else 0)
+
+    def current_active_position_ids(cfg: Config&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            if current_grid_3d(cfg):
+                out: mutable darray[i64] = []
+                for id in 1 ..= current_cell_count(cfg) |out|:
+                    out.push(id)
+                return out
+            return active_position_ids(current_grid_size(cfg),
+                                       current_include_center(cfg),
+                                       current_active_cell_limit(cfg), 2)
+
+    const PERSPECTIVE_BACK_SCALE: f64 = 0.18
+
+    def round_grid(value: f64) -> i64:
+        return rint(value).i64()
+
+    # Project a 3D grid node into a room viewed along the depth axis. Python's
+    # round() is half-even; the runtime's rint-backed helper is the same rule.
+    def position_3d_node_px(field: Field&, i: f64, j: f64, k: f64, n: i64) -> Point:
+        can Abort.Panic:
+            depth: mutable f64 = k / n.f64()
+            depth <- 0.0 if depth < 0.0
+            depth <- 1.0 if depth > 1.0
+            scale: f64 = PERSPECTIVE_BACK_SCALE + (1.0 - PERSPECTIVE_BACK_SCALE) * depth
+            x: i64 = round_grid(field.center_x + (i / n.f64() - 0.5) * field.size * scale)
+            y: i64 = round_grid(field.center_y + (j / n.f64() - 0.5) * field.size * scale)
+            return Point{x: x, y: y}
+
+    def position_pixel_center(cfg: Config&, field: Field&, position: i64) -> Point:
+        can Memory.Allocate, Abort.Panic:
+            middle: Point = Point{x: field.center_x.i64(), y: field.center_y.i64()}
+            middle return if current_grid_3d(cfg)
+            cell: f64 = current_cell_px(cfg, field)
+            mapped: Cell = position_cell(position, current_grid_size(cfg),
+                                          current_include_center(cfg))
+            middle return if mapped.pid == 0
+            x: i64 = round_grid(field.center_x - field.size / 2.0 + cell * (mapped.col.f64() + 0.5))
+            y: i64 = round_grid(field.center_y - field.size / 2.0 + cell * (mapped.row.f64() + 0.5))
+            return Point{x: x, y: y}

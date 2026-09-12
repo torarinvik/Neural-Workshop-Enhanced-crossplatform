@@ -19,6 +19,16 @@
 extern int64_t nw_frame_alloc(int64_t size);
 extern int64_t nw_frame_write(int64_t dest, int64_t capacity, int64_t trial,
                               int64_t nback, int64_t position, int64_t verdict);
+extern int64_t nw_session_frame_write(int64_t dest, int64_t capacity, int64_t trial,
+                                      int64_t nback, int64_t seed, int64_t mode,
+                                      int64_t verdict);
+extern int64_t nw_batch_write(int64_t dest, int64_t capacity, int64_t trial,
+                              int64_t nback, int64_t seed, int64_t mode,
+                              int64_t black, int64_t started, int64_t hide_text,
+                              int64_t paused, int64_t grid_3d, int64_t expanded,
+                              int64_t gridlines, int64_t old_style,
+                              int64_t sharp_corners, int64_t session_number,
+                              int64_t verdict, int64_t input_answer);
 
 #define FRAME_CAPACITY 65536
 #define MAX_COMMANDS   1024
@@ -314,11 +324,13 @@ static int selftest(int frames) {
 
     nw_cmd scratch[MAX_COMMANDS];
     nw_events events = { -1, 0, { 0 } };
-    int64_t trial = 1, position = 4, verdict = -1;
+    int64_t trial = 1, seed = 1, mode = 2, verdict = -1;
     int bad = 0;
 
     for (int i = 0; i < frames; i++) {
-        int64_t length = nw_frame_write(buffer, FRAME_CAPACITY, trial, 2, position, verdict);
+        int64_t length = nw_batch_write(buffer, FRAME_CAPACITY, trial, 2,
+                                        seed, mode, 0, 1, 0, 0, 0, 0, 1, 0,
+                                        0, 0, verdict, 0);
         nw_frame frame;
         if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer, (size_t)length,
                                       scratch, MAX_COMMANDS, &frame)) {
@@ -355,8 +367,6 @@ static int selftest(int frames) {
             if (texts == 0) { printf("frame %lld: NO TEXT COMMANDS\n", (long long)trial); bad++; }
         }
         trial += 1;
-        position = 1 + ((position * 3 + trial) % 8);
-        verdict = (trial % 4 == 0) ? -1 : (trial % 3);
     }
     printf("selftest: %d frames, %d bad\n", frames, bad);
     return bad ? 1 : 0;
@@ -384,9 +394,8 @@ int main(int argc, char **argv) {
     nw_cmd scratch[MAX_COMMANDS];
     nw_events events = { -1, 0, { 0 } };
 
-    /* The same deterministic walk the web shell uses, so the two can be compared
-     * side by side before the session engine is wired in. */
-    int64_t trial = 1, position = 4, verdict = -1;
+    /* The same seeded session path used by the web and Python shells. */
+    int64_t trial = 1, seed = 1, mode = 2, verdict = -1;
     Uint64 last_step = SDL_GetTicks();
     bool playing = false, running = true;
 
@@ -404,11 +413,11 @@ int main(int argc, char **argv) {
         if (playing && SDL_GetTicks() - last_step > 700) { step = true; last_step = SDL_GetTicks(); }
         if (step) {
             trial += 1;
-            position = 1 + ((position * 3 + trial) % 8);
-            verdict = (trial % 4 == 0) ? -1 : (trial % 3);
         }
 
-        int64_t length = nw_frame_write(buffer, FRAME_CAPACITY, trial, 2, position, verdict);
+        int64_t length = nw_batch_write(buffer, FRAME_CAPACITY, trial, 2,
+                                        seed, mode, 0, 1, 0, 0, 0, 0, 1, 0,
+                                        0, 0, verdict, 0);
         int width = 0, height = 0;
         SDL_GetWindowSizeInPixels(window, &width, &height);
         nw_view v = view_for(width, height);

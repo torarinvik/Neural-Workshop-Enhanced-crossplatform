@@ -102,12 +102,28 @@ def drive_lines(out):
                                int(ref.cleared(car, road))))
 
 
+def plan_lines(out):
+    for level in (1, 6, 10):
+        for seed in (0, 1, 7, 42, 1234):
+            road = ref.generate(level, seed=seed)
+            plan = ref.line(road)
+            out.append(row("line", level, seed, int(plan is not None),
+                           len(plan or []), *(plan or [])))
+            for look in (ref.SUB, road.grade.crossing):
+                presses = ref.dodge(road, look)
+                car = ref.drive(road, presses)
+                out.append(row("dodge", level, seed, look, 1,
+                               len(presses), *presses, car.at, car.passed,
+                               int(car.hit), int(ref.cleared(car, road))))
+
+
 def python_lines():
     out = []
     grade_lines(out)
     feasible_lines(out)
     road_lines(out)
     drive_lines(out)
+    plan_lines(out)
     return out
 
 

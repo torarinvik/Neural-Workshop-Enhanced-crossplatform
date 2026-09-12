@@ -1,0 +1,151 @@
+# Host-facing session assembly.
+#
+# session.elisa contains the exact per-trial kernel, while the Python
+# application used to assemble that kernel in session.py/new_session(). This
+# module supplies the small default context needed by a standalone shell and
+# replays the completed trials needed to preview any requested trial. The
+# replay is intentionally deterministic: it uses the same MT19937 and records
+# each preceding stimulus into the same history shape as the live phase
+# machine.
+#
+# Audio playback, sprite spawning, persistence, and wall-clock scheduling stay
+# at the shell boundary. Nothing here changes the random stream on their
+# behalf.
+
+module SessionApp:
+
+    struct Preview:
+        status: GenerateStatus
+        position: i64
+        color: i64
+        visual: i64
+        audio: i64
+        audio2: i64
+        number: i64
+        operation: i64
+        real_back: i64
+        variable_back: i64
+        next_random: i64
+
+    def default_fractions() -> darray[Rational]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[Rational] = []
+            for tenth in 1..<9 |out|:
+                out.push(Rational{numerator: tenth, denominator: 10})
+            out.push(Rational{numerator: 125, denominator: 1000})
+            out.push(Rational{numerator: 25, denominator: 100})
+            out.push(Rational{numerator: 375, denominator: 1000})
+            out.push(Rational{numerator: 625, denominator: 1000})
+            out.push(Rational{numerator: 75, denominator: 100})
+            out.push(Rational{numerator: 875, denominator: 1000})
+            for fifth in [15, 35, 45, 55, 65, 85, 95] |out|:
+                out.push(Rational{numerator: fifth, denominator: 100})
+            return out
+
+    def default_colors() -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[i64] = []
+            for color in [1, 3, 8, 6] |out|:
+                out.push(color)
+            return out
+
+    def default_session_cfg() -> SessionCfg:
+        can Memory.Allocate, Abort.Panic:
+            return SessionCfg{
+                chance_of_guaranteed_match: 0.125,
+                chance_of_interference: 0.125,
+                variable_nback: false,
+                jaeggi_mode: false,
+                multi_mode_color: true,
+                visual_colors: default_colors(),
+                arithmetic_use_addition: true,
+                arithmetic_use_subtraction: true,
+                arithmetic_use_multiplication: true,
+                arithmetic_use_division: true,
+                arithmetic_use_negatives: false,
+                arithmetic_max_number: 12,
+                acceptable_fractions: default_fractions(),
+                grid_size: 3,
+                grid_size_min: 2,
+                grid_size_max: 32,
+                grid_include_center: false,
+                grid_3d: false,
+                grid_3d_cubes: 1,
+                active_position_cells: 0,
+                position_cell_count: 0}
+
+    def default_game_cfg(mode: i64, back: i64) -> GameCfg:
+        can Memory.Allocate, Abort.Panic:
+            no_back: mutable darray[ModeOverride] = []
+            no_ticks: mutable darray[ModeOverride] = []
+            return GameCfg{
+                game_mode: mode,
+                back_default: back,
+                ticks_default: 10,
+                bonus_ticks_crab: 0,
+                bonus_ticks_multi2: 5,
+                bonus_ticks_multi3: 10,
+                bonus_ticks_multi4: 15,
+                num_trials: 20,
+                num_trials_factor: 1,
+                num_trials_exponent: 2,
+                manual: true,
+                hide_text: false,
+                skip_title_screen: true,
+                black_background: false,
+                back_overrides: no_back,
+                ticks_overrides: no_ticks}
+
+    def empty_i64() -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[i64] = []
+            return out
+
+    # One complete generated trial, including the post-trial stream position.
+    # The caller supplies tables so a shell can reuse the immutable mode table
+    # across a sequence of frames.
+    def preview(tables: ModeTables&, seed: i64, trial: i64, mode: i64,
+                back: i64) -> Preview:
+        can Memory.Allocate, Abort.Panic:
+            requested: i64 = trial if trial > 0 else 1
+            game_cfg: GameCfg = default_game_cfg(mode, back)
+            session_cfg: SessionCfg = default_session_cfg()
+            game: mutable Mode = Mode(&game_cfg)
+            game.back <- back
+            game.trial_number <- 0
+            game.num_trials_total <- requested
+
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            buffers: mutable SessionBuffers = SessionBuffers{
+                history: SessionHistory(),
+                variable_list: empty_i64(),
+                bt_positions: empty_i64(),
+                bt_audio: empty_i64()}
+
+            outcome: mutable GenerateOutcome = GenerateOutcome{
+                status: GenerateStatus.Ok, real_back: 0, variable: 0}
+            step: mutable i64 = 0
+            alive: mutable bool = true
+            while step < requested and alive |tables, session_cfg, game, buffers, rng, outcome, step, requested, alive|:
+                if game.trial_number > 0:
+                    history_record_stimulus(&buffers.history, &game)
+                game.trial_number <- game.trial_number + 1
+                outcome <- generate_stimulus(&rng, &session_cfg, tables, &game, &buffers)
+                if outcome.status != GenerateStatus.Ok:
+                    alive <- false
+                else:
+                    step <- step + 1
+
+            return Preview{
+                status: outcome.status,
+                position: stim_get(&game, StimField.Position1),
+                color: stim_get(&game, StimField.Color),
+                visual: stim_get(&game, StimField.Vis),
+                audio: stim_get(&game, StimField.Audio),
+                audio2: stim_get(&game, StimField.Audio2),
+                number: stim_get(&game, StimField.Number),
+                operation: arith_op_code(game.current_operation),
+                real_back: outcome.real_back,
+                variable_back: outcome.variable,
+                next_random: py_getrandbits(&rng, 32).i64()}

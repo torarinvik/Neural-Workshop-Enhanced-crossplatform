@@ -9,7 +9,7 @@
     font: 14px/1.5 system-ui, sans-serif;
   }
   main { display: grid; gap: 12px; justify-items: center; }
-  canvas { background: #000; border-radius: 6px; max-width: 100%; }
+  canvas { background: #000; border-radius: 6px; max-width: 100%; cursor: pointer; }
   .row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; justify-content: center; }
   button { font: inherit; padding: 6px 14px; border-radius: 6px;
            border: 1px solid #3a3f47; background: #1e2229; color: inherit; cursor: pointer; }
@@ -17,11 +17,13 @@
   code { color: #9aa4b2; }
 </style>
 <main>
-  <canvas id="screen" width="912" height="684"></canvas>
+  <canvas id="screen" width="912" height="684" tabindex="0"></canvas>
   <div class="row">
     <button id="screen-title">Title</button>
-    <button id="screen-menu">Menu</button>
+    <button id="screen-taskhub">Games</button>
+    <button id="screen-menu">Mode</button>
     <button id="screen-nback">N-back</button>
+    <button id="screen-session">Session</button>
     <button id="step">Next</button>
     <button id="play">Play</button>
     <label><input type="checkbox" id="dark"> dark theme</label>
@@ -31,14 +33,41 @@
 <script type="module">
 import { instantiateElisa } from "./elisa-wasm-runtime.js";
 import { decode, render, REFERENCE_WIDTH, REFERENCE_HEIGHT } from "./display-list.js";
+import { decodeMarbleBoard, MarbleMazeGame, MARBLE } from "./marble-maze.js";
+import { loadMarbleMazeMuJoCo } from "./marble-maze-mujoco.js";
 
 const canvas = document.getElementById("screen");
 const ctx = canvas.getContext("2d");
 const status = document.getElementById("status");
 
-// The whole game core: one wasm module, no other dependency.
-const response = await fetch("../../build/nwcore.wasm");
+// The whole game core: one wasm module, no other dependency. Firefox blocks
+// fetch(file://...) for local pages, so turn its otherwise silent top-level
+// module failure into an actionable message instead of leaving `loading...`
+// on screen forever.
+let response;
+try {
+  response = await fetch("../../build/nwcore.wasm");
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+} catch (_error) {
+  status.innerHTML = "<code>WASM cannot load from file://. From nw-core run " +
+    "scripts/serve_web.sh, then open " +
+    "http://127.0.0.1:8000/shells/web/index.html</code>";
+  throw _error;
+}
 const { exports, instance } = await instantiateElisa(await response.arrayBuffer(), { warn: false });
+
+// Marble Maze uses MuJoCo in the native application. Load the same official
+// single-threaded WASM engine for the browser; the local solver remains a
+// deliberate fallback for a browser that cannot instantiate the vendored
+// runtime, so a missing optional physics asset never blanks the whole shell.
+let MarbleMazeGameImpl = MarbleMazeGame;
+let marblePhysicsEngine = "fallback";
+try {
+  MarbleMazeGameImpl = await loadMarbleMazeMuJoCo();
+  marblePhysicsEngine = "mujoco";
+} catch (error) {
+  console.warn("MuJoCo WASM unavailable; using the Marble Maze fallback solver", error);
+}
 
 // Artwork the core only ever NAMES. The ids match src/display.elisa, and the
 // core picks the dark one itself when the theme is black -- same rule as the
@@ -88,9 +117,69 @@ function titleFrame(black) {
     BigInt(framePtr), BigInt(FRAME_CAPACITY), 1n, BigInt(black), 0n, 0n)));
 }
 
+function taskhubFrame(category, selected, black) {
+  const length = Number(exports.nw_taskhub_write(
+    BigInt(framePtr), BigInt(FRAME_CAPACITY), BigInt(category), BigInt(selected),
+    BigInt(black), BigInt(canvas.width), BigInt(canvas.height)));
+  return view(length);
+}
+
+function taskFrame(category, selected, black, started) {
+  const length = Number(exports.nw_task_write(
+    BigInt(framePtr), BigInt(FRAME_CAPACITY), BigInt(category), BigInt(selected),
+    BigInt(black), BigInt(started), BigInt(canvas.width), BigInt(canvas.height)));
+  return view(length);
+}
+
+function taskGameFrame(category, selected, black, state) {
+  const length = Number(exports.nw_task_game_input_write(
+    BigInt(framePtr), BigInt(FRAME_CAPACITY), BigInt(category), BigInt(selected),
+    BigInt(black), BigInt(state.phase), BigInt(state.action),
+    BigInt(state.cursor), BigInt(state.value), BigInt(state.steps),
+    BigInt(state.verdict), BigInt(canvas.width), BigInt(canvas.height)));
+  return view(length);
+}
+
+function marbleBoardFrame(rung, seed) {
+  const length = Number(exports.nw_marble_board_write(
+    BigInt(framePtr), BigInt(FRAME_CAPACITY), BigInt(rung), BigInt(seed)));
+  if (!length) throw new Error("Marble Maze could not deal a tray");
+  return decodeMarbleBoard(view(length));
+}
+
+function monkeyLadderFrame(phase, level, clickedUpto, wrong, cursorCell,
+                          cursorEnabled, revealAnswer, seed) {
+  const length = Number(exports.nw_monkey_ladder_write(
+    BigInt(framePtr), BigInt(FRAME_CAPACITY), BigInt(phase), BigInt(level),
+    BigInt(clickedUpto), BigInt(wrong), BigInt(cursorCell),
+    BigInt(cursorEnabled), BigInt(revealAnswer), BigInt(seed),
+    BigInt(canvas.width), BigInt(canvas.height)));
+  return view(length);
+}
+
+const MENU_SPACERS = new Set([6, 8, 13, 17, 20, 22]);
+const MENU_BOOL_BITS = new Map([[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5],
+  [7, 6], [9, 7], [10, 8], [11, 9], [21, 10]]);
+const menuValues = {
+  bools: new Set([0]), cubes: 1, grid: 3, activeCells: 8, trialMs: 10,
+  multi: 1, multimode: 0, interferenceTenths: 125, applied: false,
+};
+
+function menuBoolMask() {
+  let mask = 0;
+  for (const [row, bit] of MENU_BOOL_BITS) {
+    if (menuValues.bools.has(row)) mask |= 1 << bit;
+  }
+  return mask;
+}
+
 function menuFrame(selpos, black) {
-  return view(Number(exports.nw_menu_write(
-    BigInt(framePtr), BigInt(FRAME_CAPACITY), BigInt(selpos), BigInt(black))));
+  return view(Number(exports.nw_menu_state_write(
+    BigInt(framePtr), BigInt(FRAME_CAPACITY), BigInt(selpos), BigInt(black),
+    BigInt(menuBoolMask()), BigInt(menuValues.cubes), BigInt(menuValues.grid),
+    BigInt(menuValues.activeCells), BigInt(menuValues.trialMs),
+    BigInt(menuValues.multi), BigInt(menuValues.multimode),
+    BigInt(menuValues.interferenceTenths))));
 }
 
 function frame(trial, nback, position, verdict) {
@@ -101,10 +190,30 @@ function frame(trial, nback, position, verdict) {
   return new Uint8Array(instance.exports.memory.buffer, framePtr, length);
 }
 
+function sessionFrame(trial, nback, seed, mode, verdict) {
+  const length = Number(exports.nw_session_frame_write(
+    BigInt(framePtr), BigInt(FRAME_CAPACITY),
+    BigInt(trial), BigInt(nback), BigInt(seed), BigInt(mode), BigInt(verdict)));
+  return new Uint8Array(instance.exports.memory.buffer, framePtr, length);
+}
+
+function batchFrame(trial, nback, seed, mode, black, started, hideText,
+                    paused, grid3d, expanded, gridlines, oldStyle,
+                    sharpCorners, sessionNumber, verdict, inputAnswer) {
+  const length = Number(exports.nw_batch_write(
+    BigInt(framePtr), BigInt(FRAME_CAPACITY), BigInt(trial), BigInt(nback),
+    BigInt(seed), BigInt(mode), BigInt(black), BigInt(started),
+    BigInt(hideText), BigInt(paused), BigInt(grid3d), BigInt(expanded),
+    BigInt(gridlines), BigInt(oldStyle), BigInt(sharpCorners),
+    BigInt(sessionNumber), BigInt(verdict), BigInt(inputAnswer)));
+  return new Uint8Array(instance.exports.memory.buffer, framePtr, length);
+}
+
 // The wasm32 darray-per-call bug that used to garble pooled strings from the
 // second frame onward is FIXED: the title screen, which is almost entirely
 // text, is byte-identical across repeated calls.
-window.__nw = { exports, instance, framePtr, frame };
+window.__nw = { exports, instance, framePtr, frame, sessionFrame, batchFrame,
+  taskhubFrame, taskFrame, taskGameFrame, monkeyLadderFrame, marblePhysicsEngine };
 
 function fit() {
   const ratio = window.devicePixelRatio || 1;
@@ -117,29 +226,728 @@ function fit() {
 }
 
 let trial = 1;
-let position = 4;
+const seed = 1;
+const mode = 2;
 let verdict = -1;
 let screen = "title";
 let selpos = 0;
 const MENU_ROWS = 24;
+const TASK_CATEGORIES = [
+  { name: "Working memory", tasks: ["N-Back", "Monkey Ladder", "In the Dark", "Fog of War", "Removals", "Chain of Custody"] },
+  { name: "Long-term memory", tasks: ["Concentration", "Seen It Before?", "Trivia"] },
+  { name: "Attention", tasks: ["Reflex", "N-Cup Monte", "Moving Targets", "Lookout", "Pursuit", "Buzz Wire", "Out of Sight", "Donkey", "Two Hands", "Overrun", "Marble Maze"] },
+  { name: "Perception", tasks: ["Count", "Mr. Time"] },
+  { name: "Reasoning", tasks: ["Graph Mapping", "Matrix Reasoning", "Jigsaw Puzzle", "Sudoku", "Find the Winning Move", "Crossed Wires", "Crossword", "Scrabble", "Scramble", "Algebra", "Numberology", "Syllogisms", "Winning Move", "Verbal Reasoning"] },
+  { name: "Planning", tasks: ["Tower of Hanoi", "Traveling Salesman", "Sokoban", "Maze", "3D Maze", "3D Sokoban", "Freeform Tetris", "N-in-a-row"] },
+  { name: "Self-control", tasks: ["Cookie Thief"] },
+];
+let taskCategory = 0;
+let taskSelected = 0;
+let taskApplied = false;
+const TASK_ACTION = Object.freeze({
+  NONE: 0, START: 1, PRIMARY: 2, LEFT: 3, RIGHT: 4,
+  UP: 5, DOWN: 6, ANSWER: 7, SUBMIT: 8, DELETE: 9,
+  LEVEL: 10, RESTART: 11,
+});
+let taskState = null;
+let marbleGame = null;
+let marbleHeld = new Set();
+let marbleLastTick = null;
+let marbleFrameHandle = null;
+let marbleSeed = 17;
+let marbleRung = 1;
+let marbleTrial = 1;
+const marbleTotalTrials = 5;
+let marbleTimedOut = false;
+let marbleFeedbackDeadline = null;
+function newTaskState() {
+  return { phase: 0, action: TASK_ACTION.NONE, cursor: 0, value: 0,
+    steps: 0, verdict: -1, text: "" };
+}
+function resetTaskState() { taskState = newTaskState(); }
+resetTaskState();
+
+// These cards ask for a discrete answer in the reference UI. Enter produces
+// feedback for them; movement/action games remain live after Enter so an
+// accidental second press cannot silently turn them into a fake result.
+const ANSWER_TASKS = new Set([
+  "0:2", "0:4", "1:1", "1:2", "2:1", "2:3", "2:6", "2:9", "3:0", "3:1",
+  "4:0", "4:1", "4:3", "4:4", "4:6", "4:7", "4:8", "4:9", "4:10",
+  "4:11", "4:12", "4:13", "5:7",
+]);
+const CHOICE_TASKS = new Set([
+  "1:1", "1:2", "2:1", "4:0", "4:1", "4:4", "4:7", "4:11",
+  "4:12", "4:13", "5:7",
+]);
+function taskKey() { return `${taskCategory}:${taskSelected}`; }
+function taskIsAnswerGame() { return ANSWER_TASKS.has(taskKey()); }
+function taskStarted() { return taskState.phase !== 0; }
+
+function isMarbleTask() {
+  return taskCategory === 2 && taskSelected === 10;
+}
+
+function stopMarbleClock() {
+  marbleHeld.clear();
+  marbleLastTick = null;
+  if (marbleFrameHandle !== null) {
+    cancelAnimationFrame(marbleFrameHandle);
+    marbleFrameHandle = null;
+  }
+}
+
+function clearMarbleGame() {
+  stopMarbleClock();
+  marbleFeedbackDeadline = null;
+  marbleGame = null;
+}
+
+function ensureMarbleGame() {
+  if (!isMarbleTask()) return null;
+  if (!marbleGame) {
+    // The native UI starts at rung one and deals a new certified tray for
+    // every trial. A stable seed is intentional in the browser: refreshes
+    // reproduce the same run, which makes input bugs and stage parity
+    // reproducible.
+    marbleGame = new MarbleMazeGameImpl(marbleBoardFrame(marbleRung, marbleSeed));
+  }
+  return marbleGame;
+}
+
+function marbleStartClock() {
+  if (marbleFrameHandle !== null) return;
+  marbleLastTick = null;
+  marbleFrameHandle = requestAnimationFrame(marbleTick);
+}
+
+function finishMarble(timedOut = false) {
+  const game = marbleGame;
+  if (!game || taskState.phase !== 1) return;
+  const won = !timedOut && game.won;
+  marbleTimedOut = timedOut;
+  taskState.phase = 2;
+  taskState.verdict = won ? 1 : 0;
+  taskState.action = TASK_ACTION.SUBMIT;
+  taskState.steps += 1;
+  stopMarbleClock();
+  // The native MarbleMaze leaves the verdict visible for 2.6 seconds, then
+  // deals the next tray from its clock even if Space is never pressed.
+  marbleFeedbackDeadline = performance.now() + 2600;
+  marbleFrameHandle = requestAnimationFrame(marbleTick);
+  draw();
+}
+
+function marbleTick(now) {
+  marbleFrameHandle = null;
+  if (!isMarbleTask() || screen !== "task" || !marbleGame) return;
+  if (taskState.phase === 2) {
+    if (marbleFeedbackDeadline !== null && now >= marbleFeedbackDeadline) {
+      advanceMarbleTrial();
+      draw();
+    } else {
+      marbleFrameHandle = requestAnimationFrame(marbleTick);
+    }
+    return;
+  }
+  if (taskState.phase !== 1) return;
+  const previous = marbleLastTick === null ? now : marbleLastTick;
+  marbleLastTick = now;
+  marbleGame.advance(Math.min(0.05, Math.max(0, (now - previous) / 1000)), marbleHeld);
+  if (marbleGame.settled) finishMarble(false);
+  else if (marbleGame.elapsed >= marbleGame.board.seconds) finishMarble(true);
+  draw();
+  if (isMarbleTask() && screen === "task" && taskState.phase === 1) {
+    marbleFrameHandle = requestAnimationFrame(marbleTick);
+  }
+}
+
+function taskStart() {
+  if (isMarbleTask()) {
+    const game = ensureMarbleGame();
+    game.reset();
+    marbleTimedOut = false;
+    marbleFeedbackDeadline = null;
+    stopMarbleClock();
+    taskState.phase = 1;
+    taskState.action = TASK_ACTION.START;
+    taskState.cursor = 0;
+    taskState.value = 0;
+    taskState.steps = 0;
+    taskState.verdict = -1;
+    taskState.text = "";
+    marbleStartClock();
+    return;
+  }
+  taskState.phase = 1;
+  taskState.action = TASK_ACTION.START;
+  taskState.cursor = 0;
+  taskState.value = 0;
+  taskState.steps = 0;
+  taskState.verdict = -1;
+  taskState.text = "";
+}
+
+function taskMove(action, delta) {
+  if (!taskStarted()) taskStart();
+  const max = taskIsAnswerGame() ? 7 : 24;
+  taskState.cursor = Math.max(0, Math.min(max, taskState.cursor + delta));
+  taskState.action = action;
+  taskState.steps += 1;
+  taskState.verdict = -1;
+}
+
+function taskDigit(digit) {
+  if (!taskStarted()) taskStart();
+  taskState.value = (taskState.value * 10 + digit) % 1000000;
+  taskState.text += String(digit);
+  taskState.action = TASK_ACTION.ANSWER;
+  taskState.steps += 1;
+  taskState.verdict = -1;
+}
+
+function taskLetter(letter) {
+  if (!taskStarted()) taskStart();
+  if (taskState.text.length < 32) taskState.text += letter.toLowerCase();
+  taskState.value = letter.toLowerCase().charCodeAt(0);
+  taskState.action = TASK_ACTION.ANSWER;
+  taskState.steps += 1;
+  taskState.verdict = -1;
+}
+
+function taskMarbleCommand(letter) {
+  const game = ensureMarbleGame();
+  const command = letter.toLowerCase();
+  if (command === "r") {
+    if (taskState.phase !== 1 || !game) return;
+    // Native restart recreates the Simulation but keeps started_at, so the
+    // marbles return to the door without giving the player extra seconds.
+    game.restart();
+    marbleTimedOut = false;
+    stopMarbleClock();
+    taskState.phase = 1;
+    taskState.action = TASK_ACTION.RESTART;
+    taskState.cursor = 0;
+    taskState.value = 0;
+    taskState.steps = 0;
+    taskState.verdict = -1;
+    taskState.text = "";
+    marbleStartClock();
+  } else if (command === "l") {
+    if (taskState.phase !== 1) return;
+    if (game) game.level();
+    taskState.phase = 1;
+    taskState.action = TASK_ACTION.LEVEL;
+    taskState.steps += 1;
+    taskState.verdict = -1;
+    marbleStartClock();
+  }
+}
+
+function taskDelete() {
+  if (!taskStarted()) return;
+  taskState.text = taskState.text.slice(0, -1);
+  taskState.value = Number.parseInt(taskState.text, 10) || 0;
+  taskState.action = TASK_ACTION.DELETE;
+  taskState.steps += 1;
+  taskState.verdict = -1;
+}
+
+function taskSubmit() {
+  if (!taskStarted()) { taskStart(); return; }
+  taskState.action = TASK_ACTION.SUBMIT;
+  taskState.steps += 1;
+  if (taskIsAnswerGame()) {
+    taskState.phase = 2;
+    // The reference adapters expose deterministic starter answers. A
+    // submitted answer is intentionally graded against those known fixtures
+    // instead of always showing a success banner.
+    const correct = {
+      "0:2": 2, "0:4": 1, "1:1": 0, "1:2": 2, "2:1": 2, "2:3": 1,
+      "2:6": 1, "2:9": 0, "3:0": 3, "3:1": 5, "4:0": 0, "4:1": 0,
+      "4:3": 1, "4:4": 0, "4:6": 0, "4:7": 0, "4:8": 0,
+      "4:9": 5, "4:10": 32, "4:11": 0, "4:12": 0, "4:13": 0,
+      "5:7": 12,
+    };
+    const submitted = CHOICE_TASKS.has(taskKey()) ? taskState.cursor : taskState.value;
+    taskState.verdict = submitted === (correct[taskKey()] ?? -1) ? 1 : 0;
+  }
+}
+
+function advanceMarbleTrial() {
+  if (taskState.phase !== 2) return;
+  const game = ensureMarbleGame();
+  marbleFeedbackDeadline = null;
+  stopMarbleClock();
+  if (marbleTrial >= marbleTotalTrials) {
+    // Match the native _finish transition after the last feedback window.
+    taskState.phase = 3;
+    taskState.action = TASK_ACTION.SUBMIT;
+    taskState.steps += 1;
+    return;
+  }
+  const won = !marbleTimedOut && game.won;
+  const par = game.board.route / 0.25 + 2.5 * game.marbles.length;
+  if (won && game.elapsed <= par * 1.6) marbleRung = Math.min(16, marbleRung + 1);
+  else if (!won) marbleRung = Math.max(1, marbleRung - 1);
+  marbleTrial += 1;
+  marbleSeed += 1;
+  clearMarbleGame();
+  taskState = newTaskState();
+  ensureMarbleGame();
+  taskStart();
+}
+
+function taskPrimary() {
+  if (isMarbleTask()) {
+    if (taskState.phase === 0) {
+      taskStart();
+    } else if (taskState.phase === 2) {
+      advanceMarbleTrial();
+    } else if (taskState.phase === 3) {
+      // Space after the run summary starts a fresh native-style run.
+      marbleSeed += 1;
+      marbleRung = 1;
+      marbleTrial = 1;
+      clearMarbleGame();
+      taskState = newTaskState();
+      ensureMarbleGame();
+      taskStart();
+    }
+    return;
+  }
+  if (!taskStarted()) { taskStart(); return; }
+  if (taskIsAnswerGame()) { taskSubmit(); return; }
+  taskState.action = TASK_ACTION.PRIMARY;
+  taskState.steps += 1;
+  taskState.verdict = -1;
+}
+
+function taskClick(event) {
+  const point = referencePointFromEvent(event);
+  if (!taskStarted()) { taskStart(); draw(); return; }
+  const column = Math.max(0, Math.min(4, Math.floor(point.x / (REFERENCE_WIDTH / 5))));
+  const row = Math.max(0, Math.min(4, Math.floor((REFERENCE_HEIGHT - point.y) / (REFERENCE_HEIGHT / 5))));
+  taskState.cursor = row * 5 + column;
+  taskState.action = TASK_ACTION.PRIMARY;
+  taskState.steps += 1;
+  taskState.verdict = -1;
+  draw();
+}
+
+function marbleReferenceTransform() {
+  const scale = Math.min(canvas.width / REFERENCE_WIDTH, canvas.height / REFERENCE_HEIGHT);
+  const offsetX = (canvas.width - REFERENCE_WIDTH * scale) / 2;
+  const offsetY = (canvas.height - REFERENCE_HEIGHT * scale) / 2;
+  ctx.setTransform(scale, 0, 0, -scale, offsetX, canvas.height - offsetY);
+  return scale;
+}
+
+function marbleText(text, x, y, size, color, align = "center", bold = false) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(1, -1);
+  ctx.fillStyle = color;
+  ctx.font = `${bold ? "bold " : ""}${size}px system-ui, sans-serif`;
+  ctx.textAlign = align;
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, 0, 0);
+  ctx.restore();
+}
+
+function marbleStatusText() {
+  const game = marbleGame;
+  if (!game) return "";
+  if (taskState.phase === 3) return `Run complete — ${marbleTotalTrials} trays played`;
+  const stateName = taskState.phase === 0 ? "ready" :
+    (taskState.phase === 2 ? "feedback" : "running");
+  const roll = Math.round(game.roll * 180 / Math.PI);
+  const pitch = Math.round(game.pitch * 180 / Math.PI);
+  if (taskState.phase === 2) {
+    if (marbleTimedOut) return `Out of time — ${game.home} of ${game.marbles.length} home`;
+    if (game.won) return `Home in ${Math.ceil(game.elapsed)}s — all marbles home`;
+    return `${game.lost} marble${game.lost === 1 ? "" : "s"} down a hole — ${game.home} of ${game.marbles.length} home`;
+  }
+  return `${stateName}     tray ${marbleTrial}/${marbleTotalTrials}   rung ${game.board.rung}   home ${game.home}/${game.marbles.length}   ${Math.ceil(game.secondsLeft)}s left   tilt ${roll}°/${pitch}°`;
+}
+
+function drawMarbleMaze() {
+  const game = marbleGame;
+  if (!game) return;
+  const board = game.board;
+  marbleReferenceTransform();
+  // Leave room for the title, status and original help line. The physical
+  // board keeps its dealt aspect ratio at every rung.
+  const maxWidth = 700;
+  const maxHeight = 380;
+  const boardScale = Math.min(maxWidth / board.width, maxHeight / board.depth);
+  const boardWidth = board.width * boardScale;
+  const boardHeight = board.depth * boardScale;
+  const left = (REFERENCE_WIDTH - boardWidth) / 2;
+  const bottom = 132 + (maxHeight - boardHeight) / 2;
+  const mapX = (x) => left + x * boardScale;
+  const mapY = (y) => bottom + y * boardScale;
+  const darkTheme = dark() !== 0;
+  const wood = darkTheme ? "#9d6e3d" : "#cd9d5d";
+  const woodShadow = darkTheme ? "#3c2717" : "#52331c";
+  const rail = darkTheme ? "#6d4525" : "#6f4523";
+  const floor = darkTheme ? "#94764f" : "#ddbb81";
+  const wall = darkTheme ? "#392719" : "#5d3d23";
+  const pit = darkTheme ? "#090806" : "#231811";
+
+  ctx.save();
+  ctx.fillStyle = woodShadow;
+  ctx.fillRect(left + 9, bottom - 10, boardWidth, boardHeight);
+  ctx.fillStyle = wood;
+  ctx.fillRect(left, bottom, boardWidth, boardHeight);
+  ctx.strokeStyle = rail;
+  ctx.lineWidth = 8;
+  ctx.strokeRect(left, bottom, boardWidth, boardHeight);
+  ctx.fillStyle = floor;
+  ctx.fillRect(mapX(MARBLE.RADIUS), mapY(MARBLE.RADIUS),
+              boardWidth - 2 * MARBLE.RADIUS * boardScale,
+              boardHeight - 2 * MARBLE.RADIUS * boardScale);
+
+  ctx.fillStyle = wall;
+  for (const segment of board.walls) {
+    const x = mapX(segment.x0), y = mapY(segment.y0);
+    const width = Math.max(2, (segment.x1 - segment.x0) * boardScale);
+    const height = Math.max(2, (segment.y1 - segment.y0) * boardScale);
+    ctx.fillRect(x, y, width, height);
+  }
+
+  for (const hole of board.holes) {
+    ctx.beginPath();
+    ctx.fillStyle = hole.home ? "#288f58" : pit;
+    ctx.arc(mapX(hole.x), mapY(hole.y), hole.radius * boardScale, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = hole.home ? "#9bdfb1" : "#976a38";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+
+  for (const marble of game.marbles) {
+    if (marble.state !== "rolling" && marble.state !== "falling") continue;
+    const radius = MARBLE.RADIUS * boardScale * (marble.state === "falling" ?
+      clamp(marble.z / MARBLE.RADIUS, 0.2, 1) : 1);
+    const x = mapX(marble.x), y = mapY(marble.y);
+    ctx.globalAlpha = marble.state === "falling" ? 0.7 : 1;
+    ctx.fillStyle = "rgba(70, 80, 92, .65)";
+    ctx.beginPath();
+    ctx.arc(x + 3, y - 4, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#ecf1f8";
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "#798696";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    // Carry a small painted mark with the simulated sphere. The mark is the
+    // 2D projection of the local +x direction after the browser solver's
+    // quaternion rotation, so a wall skid and a clean roll are visibly
+    // different rather than only different in hidden state.
+    const markX = 1 - 2 * (marble.qy * marble.qy + marble.qz * marble.qz);
+    const markY = 2 * (marble.qx * marble.qy + marble.qw * marble.qz);
+    ctx.fillStyle = "#4b79b7";
+    ctx.beginPath();
+    ctx.arc(x + markX * radius * 0.52, y + markY * radius * 0.52,
+            Math.max(1.5, radius * 0.16), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // The original controls have no visible numeric knob. This small indicator
+  // makes a held key and the level command legible without changing play.
+  const gaugeX = left + boardWidth - 30;
+  const gaugeY = bottom + boardHeight - 28;
+  ctx.fillStyle = floor;
+  ctx.beginPath();
+  ctx.arc(gaugeX, gaugeY, 18, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "#2e5c96";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(gaugeX, gaugeY);
+  ctx.lineTo(gaugeX + Math.sin(game.roll) * 28,
+             gaugeY + Math.sin(game.pitch) * 28);
+  ctx.stroke();
+  ctx.fillStyle = "#2e5c96";
+  ctx.beginPath();
+  ctx.arc(gaugeX, gaugeY, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  marbleText(marbleStatusText(), REFERENCE_WIDTH / 2, 62, 14,
+             darkTheme ? "#e8ebf0" : "#20242a");
+  if (taskState.phase >= 2) {
+    ctx.save();
+    ctx.fillStyle = darkTheme ? "rgba(18, 22, 29, .92)" : "rgba(238, 241, 247, .94)";
+    ctx.fillRect(280, 300, 352, 70);
+    ctx.restore();
+    marbleText(marbleStatusText(), REFERENCE_WIDTH / 2, 335, 16,
+               taskState.phase === 3 ? (darkTheme ? "#e8ebf0" : "#343a42") :
+                 (!marbleTimedOut && game.won ? "#246b3f" : "#9a3030"),
+               "center", true);
+    marbleText(taskState.phase === 3 ? "Space / Enter: new run" :
+      "Space / Enter: next trial   R: restart", REFERENCE_WIDTH / 2, 315, 11,
+               darkTheme ? "#e8ebf0" : "#343a42");
+  }
+}
+let monkeyPhase = 0;
+let monkeyLevel = 3;
+let monkeyClickedUpto = 0;
+let monkeyWrong = -1;
+let monkeyCursorCell = 0;
+let monkeyCursorEnabled = false;
+const monkeyRevealAnswer = 1;
+const monkeySeed = 1;
+let monkeyTimer = null;
 
 function dark() { return document.getElementById("dark").checked ? 1 : 0; }
 
+function moveMenu(step) {
+  for (let count = 0; count < MENU_ROWS; count++) {
+    selpos = (selpos + step + MENU_ROWS) % MENU_ROWS;
+    if (!MENU_SPACERS.has(selpos)) {
+      menuValues.applied = false;
+      return;
+    }
+  }
+}
+
+function modifyMenu(step = 1) {
+  if (MENU_SPACERS.has(selpos)) return;
+  if (MENU_BOOL_BITS.has(selpos)) {
+    if (menuValues.bools.has(selpos)) menuValues.bools.delete(selpos);
+    else menuValues.bools.add(selpos);
+  } else {
+    const cycles = {
+      12: [1, 2, 3, 4, 5, 6],
+      14: [3, 4, 5, 6, 7, 8],
+      15: [0, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64],
+      16: [1, 2, 5, 10, 16, 20, 25, 33, 50, 75, 100, 150, 200, 250, 333, 500, 750, 1000, 1500, 2000, 2500, 3000, 4000, 5000],
+      18: [1, 2, 3, 4],
+      19: [0, 1],
+      23: [0, 125, 250, 375, 500, 625, 750, 875, 1000],
+    };
+    const fields = {12: "cubes", 14: "grid", 15: "activeCells", 16: "trialMs",
+      18: "multi", 19: "multimode", 23: "interferenceTenths"};
+    const choices = cycles[selpos];
+    const field = fields[selpos];
+    if (choices && field) {
+      const current = choices.indexOf(menuValues[field]);
+      menuValues[field] = choices[(current + (step >= 0 ? 1 : -1) + choices.length) % choices.length];
+    }
+  }
+  menuValues.applied = false;
+}
+
+function moveTaskCategory(step) {
+  clearMarbleGame();
+  taskCategory = (taskCategory + step + TASK_CATEGORIES.length) % TASK_CATEGORIES.length;
+  taskSelected = 0;
+  taskApplied = false;
+  resetTaskState();
+}
+
+function moveTask(step) {
+  clearMarbleGame();
+  const count = TASK_CATEGORIES[taskCategory].tasks.length;
+  taskSelected = (taskSelected + step + count) % count;
+  taskApplied = false;
+  resetTaskState();
+}
+
+function launchTask() {
+  taskApplied = true;
+  if (taskCategory === 0 && taskSelected === 0) {
+    screen = "nback";
+    trial = 1;
+    verdict = -1;
+    return;
+  }
+  if (taskCategory === 0 && taskSelected === 1) {
+    resetMonkeyLadder();
+    screen = "monkey";
+    return;
+  }
+  resetTaskState();
+  if (isMarbleTask()) {
+    marbleRung = 1;
+    marbleTrial = 1;
+    marbleTimedOut = false;
+    clearMarbleGame();
+    ensureMarbleGame();
+  }
+  screen = "task";
+}
+
+function resetMonkeyLadder() {
+  if (monkeyTimer) {
+    clearTimeout(monkeyTimer);
+    monkeyTimer = null;
+  }
+  monkeyPhase = 0;
+  monkeyLevel = 3;
+  monkeyClickedUpto = 0;
+  monkeyWrong = -1;
+  monkeyCursorCell = 0;
+  monkeyCursorEnabled = false;
+}
+
+function startMonkeyRound() {
+  if (monkeyTimer) clearTimeout(monkeyTimer);
+  monkeyPhase = 1;
+  monkeyClickedUpto = 0;
+  monkeyWrong = -1;
+  monkeyCursorCell = 0;
+  draw();
+  monkeyTimer = setTimeout(() => {
+    monkeyTimer = null;
+    if (screen === "monkey" && monkeyPhase === 1) {
+      monkeyPhase = 2;
+      draw();
+    }
+  }, 700 + 280 * monkeyLevel);
+}
+
+function monkeyCellFromEvent(event) {
+  const { x, y } = referencePointFromEvent(event);
+  const grid = 5;
+  const size = Math.min(REFERENCE_WIDTH, REFERENCE_HEIGHT) * 0.62;
+  const cell = size / grid;
+  const originX = (REFERENCE_WIDTH - size) / 2;
+  const originY = (REFERENCE_HEIGHT - size) / 2 - 10;
+  const column = Math.floor((x - originX) / cell);
+  const row = Math.floor((y - originY) / cell);
+  if (column < 0 || column >= grid || row < 0 || row >= grid) return -1;
+  return row * grid + column;
+}
+
+function monkeyChooseCell(cell) {
+  if (monkeyPhase !== 2 || cell < 0) return;
+  if (cell === Number(exports.nw_monkey_ladder_expected(
+      BigInt(monkeySeed), BigInt(monkeyLevel), BigInt(monkeyClickedUpto)))) {
+    monkeyClickedUpto += 1;
+    if (monkeyClickedUpto >= monkeyLevel) {
+      monkeyPhase = 3;
+      monkeyLevel = Math.min(25, monkeyLevel + 1);
+    }
+  } else {
+    monkeyWrong = cell;
+    monkeyPhase = 3;
+    monkeyLevel = Math.max(2, monkeyLevel - 1);
+  }
+  draw();
+}
+
+function menuRowFromEvent(event) {
+  const rect = canvas.getBoundingClientRect();
+  const px = (event.clientX - rect.left) * canvas.width / rect.width;
+  const py = (rect.bottom - event.clientY) * canvas.height / rect.height;
+  const scale = Math.min(canvas.width / REFERENCE_WIDTH, canvas.height / REFERENCE_HEIGHT);
+  const offsetY = (canvas.height - REFERENCE_HEIGHT * scale) / 2;
+  const refY = (py - offsetY) / scale;
+  return Math.round((547.2 - refY) / 18.0);
+}
+
+function referencePointFromEvent(event) {
+  const rect = canvas.getBoundingClientRect();
+  const px = (event.clientX - rect.left) * canvas.width / rect.width;
+  const py = (rect.bottom - event.clientY) * canvas.height / rect.height;
+  const scale = Math.min(canvas.width / REFERENCE_WIDTH, canvas.height / REFERENCE_HEIGHT);
+  const offsetX = (canvas.width - REFERENCE_WIDTH * scale) / 2;
+  const offsetY = (canvas.height - REFERENCE_HEIGHT * scale) / 2;
+  return { x: (px - offsetX) / scale, y: (py - offsetY) / scale };
+}
+
+function taskhubHitFromEvent(event) {
+  const { x, y } = referencePointFromEvent(event);
+  const width = REFERENCE_WIDTH;
+  const height = REFERENCE_HEIGHT;
+  const count = TASK_CATEGORIES.length;
+  const gutter = Math.max(48, Math.trunc(width * 0.08));
+  const gap = Math.max(10, Math.trunc(width * 0.012));
+  const tabWidth = Math.trunc((width - 2 * gutter - gap * (count - 1)) / count);
+  const totalWidth = count * tabWidth + (count - 1) * gap;
+  const startX = Math.trunc((width - totalWidth) / 2);
+  const tabHeight = Math.max(48, Math.trunc(36));
+  const tabY = height - 128;
+  if (y >= tabY - tabHeight / 2 && y <= tabY + tabHeight / 2) {
+    const index = Math.floor((x - startX) / (tabWidth + gap));
+    const tabX = startX + index * (tabWidth + gap);
+    if (index >= 0 && index < count && x >= tabX && x <= tabX + tabWidth) {
+      return { kind: "category", index };
+    }
+  }
+
+  const tasks = TASK_CATEGORIES[taskCategory].tasks.length;
+  const rows = Math.ceil(tasks / 3);
+  const gridWidth = Math.min(width - 2 * gutter, Math.trunc(width * 0.68));
+  const cardGapX = Math.max(10, Math.trunc(width * 0.012));
+  const cardWidth = Math.trunc((gridWidth - cardGapX * 2) / 3);
+  const actualGridWidth = 3 * cardWidth + 2 * cardGapX;
+  const gridX = Math.trunc((width - actualGridWidth) / 2);
+  const top = height - 215;
+  const bottom = 72;
+  const cardGapY = Math.max(8, Math.min(18, Math.trunc(height * 0.015)));
+  const available = Math.max(1, top - bottom - cardGapY * (rows - 1));
+  const preferredHeight = Math.max(52, Math.min(100, Math.trunc(height * 0.095)));
+  const cardHeight = Math.max(36, Math.min(preferredHeight, Math.trunc(available / rows)));
+  for (let index = 0; index < tasks; index++) {
+    const row = Math.floor(index / 3);
+    const column = index % 3;
+    const cardX = gridX + column * (cardWidth + cardGapX);
+    const cardY = top - row * (cardHeight + cardGapY);
+    if (x >= cardX && x <= cardX + cardWidth &&
+        y >= cardY - cardHeight / 2 && y <= cardY + cardHeight / 2) {
+      return { kind: "task", index };
+    }
+  }
+  return null;
+}
+
 function draw() {
   let bytes, note;
+  canvas.style.background = dark() ? "#000" : "#fff";
   if (screen === "title") {
     bytes = titleFrame(dark());
     note = "title screen";
+  } else if (screen === "taskhub") {
+    bytes = taskhubFrame(taskCategory, taskSelected, dark());
+    const task = TASK_CATEGORIES[taskCategory].tasks[taskSelected];
+    note = `games · ${TASK_CATEGORIES[taskCategory].name} · ${task}${taskApplied ? " · selected" : ""}`;
+  } else if (screen === "task") {
+    bytes = taskGameFrame(taskCategory, taskSelected, dark(), taskState);
+    const task = TASK_CATEGORIES[taskCategory].tasks[taskSelected];
+    const stateName = taskState.phase === 0 ? "ready" :
+      (taskState.phase === 2 ? "feedback" : "running");
+    const input = taskState.text || (taskState.value ? String(taskState.value) : "—");
+    note = `game · ${task} · ${stateName} · input ${input} · moves ${taskState.steps}`;
+  } else if (screen === "monkey") {
+    bytes = monkeyLadderFrame(monkeyPhase, monkeyLevel, monkeyClickedUpto,
+                              monkeyWrong, monkeyCursorCell,
+                              monkeyCursorEnabled, monkeyRevealAnswer,
+                              monkeySeed);
+    const phaseName = ["ready", "showing", "input", "result"][monkeyPhase] ?? "ready";
+    note = `game · Monkey Ladder · ${phaseName} · length ${monkeyLevel}`;
   } else if (screen === "menu") {
     bytes = menuFrame(selpos, dark());
-    note = `menu · row ${selpos}/${MENU_ROWS - 1}`;
+    note = `menu · ${menuValues.applied ? "applied" : "editing"} · row ${selpos + 1}/${MENU_ROWS}`;
+  } else if (screen === "nback") {
+    bytes = sessionFrame(trial, 2, seed, mode, verdict);
+    note = `trial ${trial} · mode ${mode} · seed ${seed}`;
   } else {
-    bytes = frame(trial, 2, position, verdict);
-    note = `trial ${trial} · position ${position}`;
+    bytes = batchFrame(trial, 2, seed, mode, dark(), 1, 0, 0, 0, 0, 1, 0, 0, 0, verdict, 0);
+    note = `session · trial ${trial} · mode ${mode} · seed ${seed}`;
   }
   const commands = decode(bytes);
   const events = render(ctx, commands, { width: canvas.width, height: canvas.height, assets });
-  if (screen === "nback") {
+  if (screen === "task" && isMarbleTask()) {
+    drawMarbleMaze();
+    note = `game · Marble Maze · ${marbleStatusText()} · moves ${taskState.steps} · physics ${marblePhysicsEngine}`;
+  }
+  if (screen === "nback" || screen === "session") {
     const verdictName = ["correct", "incorrect", "missed", "unknown"][events.verdict] ?? "none";
     note += ` · verdict ${verdictName}`;
   }
@@ -147,24 +955,222 @@ function draw() {
 }
 
 function advance() {
-  if (screen === "menu") { selpos = (selpos + 1) % MENU_ROWS; draw(); return; }
+  if (screen === "taskhub") { moveTask(1); draw(); return; }
+  if (screen === "task") { taskPrimary(); draw(); return; }
+  if (screen === "monkey") {
+    if (monkeyPhase === 0 || monkeyPhase === 3) startMonkeyRound();
+    return;
+  }
+  if (screen === "menu") { moveMenu(1); draw(); return; }
   if (screen === "title") { draw(); return; }
   trial += 1;
-  // A deterministic walk so the page shows the board changing without needing
-  // the session engine wired up yet.
-  position = 1 + ((position * 3 + trial) % 8);
-  verdict = trial % 4 === 0 ? -1 : (trial % 3);
   draw();
 }
 
-for (const name of ["title", "menu", "nback"]) {
+for (const name of ["title", "taskhub", "menu", "nback", "session"]) {
   document.getElementById(`screen-${name}`).addEventListener("click", () => {
+    if (isMarbleTask()) clearMarbleGame();
     screen = name;
     draw();
   });
 }
 document.getElementById("dark").addEventListener("change", draw);
 document.getElementById("step").addEventListener("click", advance);
+canvas.addEventListener("click", (event) => {
+  canvas.focus();
+  if (screen === "taskhub") {
+    const hit = taskhubHitFromEvent(event);
+    if (!hit) return;
+    if (hit.kind === "category") {
+      taskCategory = hit.index;
+      taskSelected = 0;
+      taskApplied = false;
+    } else {
+      taskSelected = hit.index;
+      taskApplied = false;
+    }
+    draw();
+    return;
+  }
+  if (screen === "monkey") {
+    monkeyChooseCell(monkeyCellFromEvent(event));
+    return;
+  }
+  if (screen === "task") {
+    taskClick(event);
+    return;
+  }
+  if (screen !== "menu") return;
+  const row = menuRowFromEvent(event);
+  if (row < 0 || row >= MENU_ROWS || MENU_SPACERS.has(row)) return;
+  if (row === selpos) modifyMenu();
+  else { selpos = row; menuValues.applied = false; }
+  draw();
+});
+window.addEventListener("keydown", (event) => {
+  if (screen === "title") {
+    if (event.key === " " || event.key === "Enter" || event.key.toLowerCase() === "c") {
+      event.preventDefault();
+      if (event.key.toLowerCase() === "c") {
+        screen = "menu";
+        selpos = 0;
+        menuValues.applied = false;
+      } else {
+        screen = "taskhub";
+        taskCategory = 0;
+        taskSelected = 0;
+        taskApplied = false;
+      }
+      draw();
+    }
+    return;
+  }
+  if (screen === "taskhub") {
+    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " ", "Enter", "Escape", "c", "C"].includes(event.key)) event.preventDefault();
+    if (event.key === "ArrowLeft") moveTaskCategory(-1);
+    else if (event.key === "ArrowRight") moveTaskCategory(1);
+    else if (event.key === "ArrowUp") moveTask(-1);
+    else if (event.key === "ArrowDown") moveTask(1);
+    else if (event.key === " " || event.key === "Enter") launchTask();
+    else if (event.key === "Escape") screen = "title";
+    else if (event.key.toLowerCase() === "c") screen = "menu";
+    else return;
+    draw();
+    return;
+  }
+  if (screen === "task") {
+    if (isMarbleTask()) {
+      const directions = {
+        ArrowUp: "N", w: "N", W: "N",
+        ArrowDown: "S", s: "S", S: "S",
+        ArrowLeft: "W", a: "W", A: "W",
+        ArrowRight: "E", d: "E", D: "E",
+      };
+      const direction = directions[event.key];
+      if ([" ", "Enter", "Escape", "c", "C", "l", "L", "r", "R",
+        "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "w", "W",
+        "a", "A", "s", "S", "d", "D"].includes(event.key)) {
+        event.preventDefault();
+      }
+      if (event.key === "Escape") {
+        stopMarbleClock();
+        screen = "taskhub";
+      } else if (event.key.toLowerCase() === "c") {
+        stopMarbleClock();
+        screen = "menu";
+      } else if (event.key === " " || event.key === "Enter") {
+        taskPrimary();
+      } else if (event.key.toLowerCase() === "l" || event.key.toLowerCase() === "r") {
+        taskMarbleCommand(event.key);
+      } else if (direction && taskState.phase === 1) {
+        marbleHeld.add(direction);
+        taskState.action = {
+          N: TASK_ACTION.UP, S: TASK_ACTION.DOWN,
+          W: TASK_ACTION.LEFT, E: TASK_ACTION.RIGHT,
+        }[direction];
+        taskState.steps += 1;
+        taskState.verdict = -1;
+        marbleStartClock();
+      }
+      draw();
+      return;
+    }
+    if ([" ", "Enter", "Escape", "c", "C", "ArrowLeft", "ArrowRight",
+      "ArrowUp", "ArrowDown", "Backspace", "Delete"].includes(event.key) ||
+      /^[0-9a-zA-Z]$/.test(event.key)) event.preventDefault();
+    if (event.key === "Escape") screen = "taskhub";
+    else if (event.key.toLowerCase() === "c") screen = "menu";
+    else if (event.key === "ArrowLeft") taskMove(TASK_ACTION.LEFT, -1);
+    else if (event.key === "ArrowRight") taskMove(TASK_ACTION.RIGHT, 1);
+    else if (event.key === "ArrowUp") taskMove(TASK_ACTION.UP, -5);
+    else if (event.key === "ArrowDown") taskMove(TASK_ACTION.DOWN, 5);
+    else if (event.key === "Backspace" || event.key === "Delete") taskDelete();
+    else if (/^[0-9]$/.test(event.key)) taskDigit(Number(event.key));
+    else if (/^[a-zA-Z]$/.test(event.key)) {
+      if (taskCategory === 2 && taskSelected === 10 &&
+          ["l", "L", "r", "R"].includes(event.key)) taskMarbleCommand(event.key);
+      else taskLetter(event.key);
+    }
+    else if (event.key === " " || event.key === "Enter") taskPrimary();
+    else return;
+    draw();
+    return;
+  }
+  if (screen === "monkey") {
+    if ([" ", "Enter", "Escape", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "c", "C"].includes(event.key)) event.preventDefault();
+    if ((event.key === " " || event.key === "Enter") && (monkeyPhase === 0 || monkeyPhase === 3)) {
+      startMonkeyRound();
+    } else if (event.key === "Escape") {
+      if (monkeyTimer) clearTimeout(monkeyTimer);
+      monkeyTimer = null;
+      screen = "taskhub";
+      draw();
+    } else if (event.key.toLowerCase() === "c") {
+      screen = "menu";
+      draw();
+    } else if (monkeyPhase === 2 && event.key === "ArrowLeft") {
+      monkeyCursorEnabled = true;
+      monkeyCursorCell -= 1;
+      if (monkeyCursorCell % 5 === 4) monkeyCursorCell += 1;
+      if (monkeyCursorCell < 0) monkeyCursorCell = 0;
+      draw();
+    } else if (monkeyPhase === 2 && event.key === "ArrowRight") {
+      monkeyCursorEnabled = true;
+      monkeyCursorCell += 1;
+      if (monkeyCursorCell % 5 === 0) monkeyCursorCell -= 1;
+      if (monkeyCursorCell > 24) monkeyCursorCell = 24;
+      draw();
+    } else if (monkeyPhase === 2 && event.key === "ArrowUp") {
+      monkeyCursorEnabled = true;
+      monkeyCursorCell = Math.max(0, monkeyCursorCell - 5);
+      draw();
+    } else if (monkeyPhase === 2 && event.key === "ArrowDown") {
+      monkeyCursorEnabled = true;
+      monkeyCursorCell = Math.min(24, monkeyCursorCell + 5);
+      draw();
+    } else if (monkeyPhase === 2 && event.key === "Enter") {
+      monkeyChooseCell(monkeyCursorCell);
+    } else return;
+    return;
+  }
+  if (screen === "nback" || screen === "session") {
+    if ([" ", "Enter", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Escape"].includes(event.key)) event.preventDefault();
+    if (event.key === " " || event.key === "Enter" || event.key === "ArrowRight" || event.key === "ArrowDown") {
+      advance();
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      trial = Math.max(1, trial - 1);
+      draw();
+    } else if (event.key === "Escape") {
+      screen = "taskhub";
+      draw();
+    } else return;
+    return;
+  }
+  if (screen !== "menu") return;
+  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "PageUp", "PageDown",
+       " ", "Enter", "Escape"].includes(event.key)) event.preventDefault();
+  if (event.key === "ArrowUp") moveMenu(-1);
+  else if (event.key === "ArrowDown") moveMenu(1);
+  else if (event.key === "PageUp") for (let i = 0; i < 8; i++) moveMenu(-1);
+  else if (event.key === "PageDown") for (let i = 0; i < 8; i++) moveMenu(1);
+  else if (event.key === "ArrowLeft") modifyMenu(-1);
+  else if (event.key === "ArrowRight" || event.key === " ") modifyMenu(1);
+  else if (event.key === "Enter") menuValues.applied = true;
+  else if (event.key === "Escape") screen = "title";
+  else return;
+  draw();
+});
+window.addEventListener("keyup", (event) => {
+  if (!isMarbleTask()) return;
+  const directions = {
+    ArrowUp: "N", w: "N", W: "N",
+    ArrowDown: "S", s: "S", S: "S",
+    ArrowLeft: "W", a: "W", A: "W",
+    ArrowRight: "E", d: "E", D: "E",
+  };
+  const direction = directions[event.key];
+  if (direction) marbleHeld.delete(direction);
+});
 let timer = null;
 document.getElementById("play").addEventListener("click", (event) => {
   if (timer) { clearInterval(timer); timer = null; event.target.textContent = "Play"; }

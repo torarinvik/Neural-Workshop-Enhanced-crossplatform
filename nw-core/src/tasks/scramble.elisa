@@ -23,14 +23,12 @@
 #   * `substitute` draws its positions with `sample`, then a neighbour per
 #     position -- a typo is a NEAR MISS and a random letter is noise.
 #
-# NOT PORTED: `read_off` and the `read_back` that scores it. Both take
-# `candidates(...)[0]`, the commonest fitting word, and `candidates` sorts a
-# Python SET OF STRINGS by rank. Ranks tie -- every word the frequency list has
-# never seen ties at 1 << 30 -- and a tie is broken by the set's iteration
-# order, which for strings is randomised per process by PYTHONHASHSEED. It is
-# not reproducible between two runs of the reference itself, let alone across
-# languages. The COUNT of candidates is order-independent and is ported, which
-# is what `ambiguity` and `pinned` are measured from.
+# `read_off` is also portable, but its tie order needs to be explicit. The
+# reference sorts a Python SET OF STRINGS by rank; equal ranks retain that
+# set's iteration order, which is randomised per process by PYTHONHASHSEED.
+# Callers therefore provide the order of unique vocabulary words. A production
+# vocabulary can choose any stable order, while a compatibility harness can
+# pass the order observed from the reference process.
 
 module Scramble:
 
@@ -454,6 +452,7 @@ module Scramble:
     # STRINGS, so a vocabulary holding the same word twice counts it once.
     struct Vocab:
         count: mutable i64
+        longest: mutable i64
         start: mutable darray[i64]
         length: mutable darray[i64]
         letter: mutable darray[i64]
@@ -468,7 +467,7 @@ module Scramble:
 
     def new_vocab() -> Vocab:
         can Memory.Allocate, Abort.Panic:
-            return Vocab{count: 0, start: Ints::zeros(MOST_VOCAB), length: Ints::zeros(MOST_VOCAB),
+            return Vocab{count: 0, longest: 0, start: Ints::zeros(MOST_VOCAB), length: Ints::zeros(MOST_VOCAB),
                          letter: Ints::zeros(MOST_VOCAB * 32), rank: Ints::zeros(MOST_VOCAB),
                          bag: Ints::zeros(MOST_VOCAB * LETTER_COUNT), head: Ints::zeros(VOCAB_SLOTS),
                          next: Ints::zeros(MOST_VOCAB), found: Ints::zeros(MOST_VOCAB)}
@@ -492,9 +491,12 @@ module Scramble:
 
     def index_vocab(vocab: mutable Vocab&):
         can Abort.Panic:
+            vocab.longest <- 0
             for slot in 0..<VOCAB_SLOTS |vocab|:
                 Ints::put(&vocab.head, slot, 0)
             for word in 0..<vocab.count |vocab|:
+                length: i64 = Ints::at_ref(&vocab.length, word)
+                vocab.longest <- length if length > vocab.longest
                 bag_of(&vocab.letter, Ints::at_ref(&vocab.start, word), Ints::at_ref(&vocab.length, word), &vocab.bag, word * LETTER_COUNT)
                 slot: i64 = bag_hash(&vocab.bag, word * LETTER_COUNT)
                 # A word already chained under the same letters in the same
@@ -504,7 +506,12 @@ module Scramble:
                 twin: mutable bool = false
                 probe: mutable i64 = Ints::at_ref(&vocab.head, slot) - 1
                 while probe >= 0 and not twin |vocab, word, probe, twin|:
-                    twin <- true if same_word(vocab, probe, word)
+                    if same_word(vocab, probe, word):
+                        # `Vocab.rank` models Python's `dict(zip(words,
+                        # ranks))`: a duplicate word takes its LAST rank, even
+                        # though the candidate set keeps one string.
+                        Ints::put(&vocab.rank, probe, Ints::at_ref(&vocab.rank, word))
+                        twin <- true
                     probe <- Ints::at_ref(&vocab.next, probe) - 1
                 continue if twin
                 Ints::put(&vocab.next, word, Ints::at_ref(&vocab.head, slot))
@@ -607,6 +614,117 @@ module Scramble:
                 walk_extras(vocab, scratch, left - 1, value, depth + 1)
                 Ints::put(scratch, slot, Ints::at_ref(scratch, slot) - 1)
 
+    # The reference's tie break is a property of the SET built for one token,
+    # not of the vocabulary as a whole. A host that needs Python-compatible
+    # readings can provide the first ranked candidate for each (grade, token)
+    # lookup in this open-addressed table. An empty table falls back to the
+    # stable order supplied to candidate_best below.
+    const READ_ORDER_ENTRIES: i64 = 65536
+    const READ_ORDER_STRIDE: i64 = 16
+    const READ_ORDER_LETTERS: i64 = 1048576
+    const READ_ORDER_SLOTS: i64 = 131072
+    const READ_ORDER_MASK: i64 = 131071
+
+    struct ReadOrder:
+        count: mutable i64
+        grade: mutable darray[i64]
+        start: mutable darray[i64]
+        length: mutable darray[i64]
+        token: mutable darray[i64]
+        best: mutable darray[i64]
+        slots: mutable darray[i64]
+
+    def new_read_order() -> ReadOrder:
+        can Memory.Allocate, Abort.Panic:
+            return ReadOrder{count: 0, grade: Ints::zeros(READ_ORDER_ENTRIES),
+                              start: Ints::zeros(READ_ORDER_ENTRIES),
+                              length: Ints::zeros(READ_ORDER_ENTRIES),
+                              token: Ints::zeros(READ_ORDER_LETTERS),
+                              best: Ints::zeros(READ_ORDER_ENTRIES),
+                              slots: Ints::zeros(READ_ORDER_SLOTS)}
+
+    def read_order_hash(grade_index: i64, token: mutable darray[i64]&, token_start: i64, token_length: i64) -> i64:
+        can Abort.Panic:
+            mixed: mutable u64 = (14695981039346656037.u64() ^ grade_index.u64())
+            for at in 0..<token_length |token, token_start, mixed|:
+                mixed <- (mixed ^ Ints::at_ref(token, token_start + at).u64()) * 1099511628211.u64()
+            return (mixed >> 11.u64()).i64() & READ_ORDER_MASK
+
+    def read_order_same(book: mutable ReadOrder&, entry: i64, grade_index: i64, token: mutable darray[i64]&, token_start: i64, token_length: i64) -> bool:
+        can Abort.Panic:
+            false return if Ints::at_ref(&book.grade, entry) != grade_index
+            length: i64 = Ints::at_ref(&book.length, entry)
+            false return if length != token_length
+            start: i64 = Ints::at_ref(&book.start, entry)
+            for at in 0..<length |book, token, start, token_start|:
+                false return if Ints::at_ref(&book.token, start + at) != Ints::at_ref(token, token_start + at)
+            return true
+
+    # Return -2 when no policy entry exists. -1 is a real entry meaning that
+    # the token has no candidates and should be left as raw text by read_off.
+    def read_order_lookup(book: mutable ReadOrder&, grade_index: i64, token: mutable darray[i64]&, token_start: i64, token_length: i64) -> i64:
+        can Abort.Panic:
+            slot: mutable i64 = read_order_hash(grade_index, token, token_start, token_length)
+            for _probe in 0..<READ_ORDER_SLOTS |book, grade_index, token, token_start, token_length, slot|:
+                entry: i64 = Ints::at_ref(&book.slots, slot) - 1
+                return -2 if entry < 0
+                return Ints::at_ref(&book.best, entry) if read_order_same(book, entry, grade_index, token, token_start, token_length)
+                slot <- (slot + 1) & READ_ORDER_MASK
+            return -2
+
+    def read_order_put(book: mutable ReadOrder&, grade_index: i64, token: mutable darray[i64]&, token_length: i64, best: i64):
+        can Abort.Panic:
+            return if token_length <= 0 or book.count >= READ_ORDER_ENTRIES or book.count * READ_ORDER_STRIDE + token_length > READ_ORDER_LETTERS
+            slot: mutable i64 = read_order_hash(grade_index, token, 0, token_length)
+            while true |book, grade_index, token, token_length, slot|:
+                held: i64 = Ints::at_ref(&book.slots, slot) - 1
+                if held < 0:
+                    entry: i64 = book.count
+                    Ints::put(&book.grade, entry, grade_index)
+                    Ints::put(&book.start, entry, entry * READ_ORDER_STRIDE)
+                    Ints::put(&book.length, entry, token_length)
+                    Ints::put(&book.best, entry, best)
+                    for at in 0..<token_length |book, token, entry|:
+                        Ints::put(&book.token, entry * READ_ORDER_STRIDE + at, Ints::at_ref(token, at))
+                    Ints::put(&book.slots, slot, entry + 1)
+                    book.count <- entry + 1
+                    return
+                if read_order_same(book, held, grade_index, token, 0, token_length):
+                    Ints::put(&book.best, held, best)
+                    return
+                slot <- (slot + 1) & READ_ORDER_MASK
+
+    # Return the first candidate in the caller-supplied Python-compatible
+    # order, breaking ties only by that order. `candidates_count` leaves the
+    # order-independent membership in `found`, so this is just the final
+    # selection step from `sorted(set(words), key=rank)[0]`.
+    def candidate_best(grade: Grade&, token: mutable darray[i64]&, token_start: i64, token_length: i64, vocab: mutable Vocab&, scratch: mutable darray[i64]&, odometer: mutable darray[i64]&, distinct: mutable darray[i64]&, ordered: mutable darray[i64]&, order_count: i64, book: mutable ReadOrder&, grade_index: i64) -> i64:
+        can Abort.Panic:
+            _ = candidates_count(grade, token, token_start, token_length, vocab, scratch, odometer, distinct)
+            policy: i64 = read_order_lookup(book, grade_index, token, token_start, token_length)
+            if policy != -2:
+                return policy if policy < 0 or Ints::at_ref(&vocab.found, policy) != 0 else -1
+            best: mutable i64 = -1
+            best_rank: mutable i64 = 0
+            for at in 0..<order_count |vocab, ordered, best, best_rank, at|:
+                word: i64 = Ints::at_ref(ordered, at)
+                continue if word < 0 or word >= vocab.count
+                continue if Ints::at_ref(&vocab.found, word) == 0
+                rank: i64 = Ints::at_ref(&vocab.rank, word)
+                if best < 0 or rank < best_rank:
+                    best <- word
+                    best_rank <- rank
+            # Stable vocabulary order is a useful production fallback when a
+            # host has no persisted order for its corpus.
+            if best < 0:
+                for word in 0..<vocab.count |vocab, best, best_rank|:
+                    continue if Ints::at_ref(&vocab.found, word) == 0
+                    rank: i64 = Ints::at_ref(&vocab.rank, word)
+                    if best < 0 or rank < best_rank:
+                        best <- word
+                        best_rank <- rank
+            return best
+
     # --- one deal ---------------------------------------------------------
 
     # One corrupted sentence and everything measured about it.
@@ -642,6 +760,48 @@ module Scramble:
                         chunk_length: Ints::zeros(MOST_WORDS * 2),
                         ambiguity: 0.0, pinned: 0, sentence: -1}
 
+    # A reading is a sequence of selected vocabulary words, stored as slices
+    # into one flat letter buffer. Keeping both the word slices and the letters
+    # makes it usable by renderers without requiring strings in the core ABI.
+    struct Readout:
+        count: mutable i64
+        start: mutable darray[i64]
+        length: mutable darray[i64]
+        letter: mutable darray[i64]
+        letters: mutable i64
+
+    def new_readout() -> Readout:
+        can Memory.Allocate, Abort.Panic:
+            return Readout{count: 0, start: Ints::zeros(MOST_LETTERS),
+                           length: Ints::zeros(MOST_LETTERS),
+                           letter: Ints::zeros(MOST_LETTERS), letters: 0}
+
+    def readout_clear(out: mutable Readout&):
+        can Abort.Panic:
+            out.count <- 0
+            out.letters <- 0
+
+    def readout_append_vocab(out: mutable Readout&, vocab: mutable Vocab&, word: i64):
+        can Abort.Panic:
+            return if word < 0 or word >= vocab.count
+            start: i64 = Ints::at_ref(&vocab.start, word)
+            length: i64 = Ints::at_ref(&vocab.length, word)
+            Ints::put(&out.start, out.count, out.letters)
+            Ints::put(&out.length, out.count, length)
+            for at in 0..<length |out, vocab, start|:
+                Ints::put(&out.letter, out.letters + at, Ints::at_ref(&vocab.letter, start + at))
+            out.letters <- out.letters + length
+            out.count <- out.count + 1
+
+    def readout_append_raw(out: mutable Readout&, source: mutable darray[i64]&, start: i64, length: i64):
+        can Abort.Panic:
+            Ints::put(&out.start, out.count, out.letters)
+            Ints::put(&out.length, out.count, length)
+            for at in 0..<length |out, source, start|:
+                Ints::put(&out.letter, out.letters + at, Ints::at_ref(source, start + at))
+            out.letters <- out.letters + length
+            out.count <- out.count + 1
+
     # A bank of sentences, flattened: sentence s owns words
     # `word_at[s] .. word_at[s] + words[s]`, and word w owns letters
     # `letter_at[w] .. letter_at[w] + word_length[w]`.
@@ -665,6 +825,10 @@ module Scramble:
         odometer: mutable darray[i64]
         distinct: mutable darray[i64]
         one_word: mutable darray[i64]
+        read_cost: mutable darray[f64]
+        read_prev: mutable darray[i64]
+        read_word: mutable darray[i64]
+        read_path_word: mutable darray[i64]
 
     def new_work() -> Work:
         can Memory.Allocate, Abort.Panic:
@@ -672,7 +836,89 @@ module Scramble:
                         tried: Ints::zeros(64), picks: Ints::zeros(64),
                         sizes: Ints::zeros(MOST_WORDS), lengths: Ints::zeros(MOST_WORDS),
                         scratch: Ints::zeros(LETTER_COUNT * 3), odometer: Ints::zeros(8),
-                        distinct: Ints::zeros(LETTER_COUNT), one_word: Ints::zeros(64)}
+                        distinct: Ints::zeros(LETTER_COUNT), one_word: Ints::zeros(64),
+                        read_cost: Floats::zeros(MOST_LETTERS + 1),
+                        read_prev: Ints::zeros(MOST_LETTERS + 1),
+                        read_word: Ints::zeros(MOST_LETTERS + 1),
+                        read_path_word: Ints::zeros(MOST_LETTERS)}
+
+    # Decode the corrupted line by dynamic programming. Without spaces the
+    # reference reads each displayed chunk independently; with spaces it finds
+    # the lowest-rank segmentation of the concatenated letters.
+    def read_off(grade: Grade&, deal: mutable Deal&, vocab: mutable Vocab&, work: mutable Work&, ordered: mutable darray[i64]&, order_count: i64, book: mutable ReadOrder&, grade_index: i64, out: mutable Readout&):
+        can Abort.Panic:
+            readout_clear(out)
+            if grade.spaces < 1:
+                for slot in 0..<deal.chunks |deal, vocab, work, grade, ordered, order_count, out|:
+                    start: i64 = Ints::at_ref(&deal.chunk_start, slot)
+                    length: i64 = Ints::at_ref(&deal.chunk_length, slot)
+                    word: i64 = candidate_best(grade, &deal.corrupted_letter, start, length, vocab, &work.scratch, &work.odometer, &work.distinct, ordered, order_count, book, grade_index)
+                    if word >= 0:
+                        readout_append_vocab(out, vocab, word)
+                    else:
+                        readout_append_raw(out, &deal.corrupted_letter, start, length)
+                return
+
+            size: i64 = deal.corrupted_letters
+            for at in 0..<(size + 1) |work|:
+                Floats::put(&work.read_cost, at, 1.0e300)
+                Ints::put(&work.read_prev, at, -1)
+                Ints::put(&work.read_word, at, -1)
+            Floats::put(&work.read_cost, 0, 0.0)
+            reach: i64 = vocab.longest + grade.drop
+            for start in 0..<size |grade, deal, vocab, work, ordered, order_count, size, reach|:
+                cost: f64 = Floats::at_ref(&work.read_cost, start)
+                continue if cost >= 1.0e299
+                stop_limit: i64 = size if start + reach > size else start + reach
+                for stop in (start + 1)..<(stop_limit + 1) |grade, deal, vocab, work, ordered, order_count, cost, start, stop_limit|:
+                    word: i64 = candidate_best(grade, &deal.corrupted_letter, start, stop - start, vocab, &work.scratch, &work.odometer, &work.distinct, ordered, order_count, book, grade_index)
+                    continue if word < 0
+                    rank: mutable i64 = Ints::at_ref(&vocab.rank, word)
+                    rank <- 1 if rank < 1
+                    step: f64 = cost + log((rank + 1).f64())
+                    if step < Floats::at_ref(&work.read_cost, stop):
+                        Floats::put(&work.read_cost, stop, step)
+                        Ints::put(&work.read_prev, stop, start)
+                        Ints::put(&work.read_word, stop, word)
+            return if Floats::at_ref(&work.read_cost, size) >= 1.0e299
+            path: mutable i64 = 0
+            at: mutable i64 = size
+            while at > 0 |work, at, path|:
+                previous: i64 = Ints::at_ref(&work.read_prev, at)
+                return if previous < 0
+                Ints::put(&work.read_path_word, path, Ints::at_ref(&work.read_word, at))
+                path <- path + 1
+                at <- previous
+            while path > 0 |work, path, vocab, out|:
+                path <- path - 1
+                readout_append_vocab(out, vocab, Ints::at_ref(&work.read_path_word, path))
+
+    # Score the reading against the sentence's true written word order. This
+    # mirrors `sum(zip(truth, got)) / len(truth)`; extra guessed words do not
+    # improve the score and a short reading is penalised by the truth length.
+    def read_back(grade: Grade&, deal: mutable Deal&, bank: mutable Bank&, vocab: mutable Vocab&, work: mutable Work&, ordered: mutable darray[i64]&, order_count: i64, book: mutable ReadOrder&, grade_index: i64) -> f64:
+        can Memory.Allocate, Abort.Panic:
+            got: mutable Readout = new_readout()
+            read_off(grade, deal, vocab, work, ordered, order_count, book, grade_index, got)
+            return 0.0 if deal.words == 0
+            first: i64 = Ints::at_ref(&bank.word_at, deal.sentence)
+            right: mutable i64 = 0
+            paired: i64 = deal.words if deal.words < got.count else got.count
+            for slot in 0..<paired |bank, vocab, got, first, right|:
+                # `Deal.in_view` is the true words in the order shown, so a
+                # word shuffle is not charged to the reader's identification.
+                where: i64 = Ints::at_ref(&deal.placing, slot)
+                truth_word: i64 = first + where
+                truth_start: i64 = Ints::at_ref(&bank.letter_at, truth_word)
+                truth_length: i64 = Ints::at_ref(&bank.word_length, truth_word)
+                got_length: i64 = Ints::at_ref(&got.length, slot)
+                continue if truth_length != got_length
+                got_start: i64 = Ints::at_ref(&got.start, slot)
+                same: mutable bool = true
+                for at in 0..<truth_length |bank, got, truth_start, got_start, same|:
+                    same <- false if Ints::at_ref(&bank.letter, truth_start + at) != Ints::at_ref(&got.letter, got_start + at)
+                right <- right + 1 if same
+            return right.f64() / deal.words.f64()
 
     # One corrupted sentence at a grade, or nothing with nothing to use.
     def deal_one(grade: Grade&, bank: mutable Bank&, vocab: mutable Vocab&, work: mutable Work&, out: mutable Deal&, rng: mutable MT19937&):

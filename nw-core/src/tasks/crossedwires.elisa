@@ -394,3 +394,137 @@ module CrossedWires:
                 bench.reached <- bench.reached + 1
                 bench.goal_at <- bench.goal_at + 1
             return went_x * 4 + went_y + 2
+
+    # Every direction and the gap it would leave, best first. Python sorts the
+    # `(cost, direction)` pairs, so insertion keeps both the cost order and the
+    # lower direction as the stable tie-break.
+    def ranked(bench: Bench&, bout: Bout&, g: Grade&, costs: mutable darray[i64]&, directions: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            found: mutable i64 = 0
+            which: mutable i64 = 0
+            target: i64 = goal_index(bench, bout)
+            goal_x: i64 = Ints::at(bout.goals_x, target)
+            goal_y: i64 = Ints::at(bout.goals_y, target)
+            while which < g.keys |which, found, costs, directions, bench, g, goal_x, goal_y|:
+                way: i64 = way_for(g.keys, which)
+                moved_x: i64 = way_dx(way)
+                moved_y: i64 = way_dy(way)
+                next_x: i64 = ((bench.at_x + moved_x) % g.across + g.across) % g.across
+                next_y: i64 = ((bench.at_y + moved_y) % g.down + g.down) % g.down
+                cost: i64 = gap(next_x, next_y, goal_x, goal_y, g.across, g.down, g.keys)
+                slot: mutable i64 = found
+                while slot > 0 and Ints::at_ref(costs, slot - 1) > cost |slot, costs, cost, found|:
+                    Ints::put(costs, slot, Ints::at_ref(costs, slot - 1))
+                    Ints::put(directions, slot, Ints::at_ref(directions, slot - 1))
+                    slot <- slot - 1
+                Ints::put(costs, slot, cost)
+                Ints::put(directions, slot, which)
+                found <- found + 1
+                which <- which + 1
+            return found
+
+    # The directions that strictly shorten the current gap, still best first.
+    def helpful(bench: Bench&, bout: Bout&, g: Grade&, costs: mutable darray[i64]&, directions: mutable darray[i64]&, out: mutable darray[i64]&) -> i64:
+        can Abort.Panic:
+            found: i64 = ranked(bench, bout, g, costs, directions)
+            was: i64 = bench_gap(bench, bout, g)
+            useful: mutable i64 = 0
+            for at in 0..<found |at, costs, directions, was, out, useful|:
+                if Ints::at_ref(costs, at) < was:
+                    Ints::put(out, useful, Ints::at_ref(directions, at))
+                    useful <- useful + 1
+            return useful
+
+    # Press keys at random until the budget runs out. The reference uses a
+    # fresh Random for the player, separate from the one that dealt the bout.
+    def play_random(bench: mutable Bench&, bout: mutable Bout&, g: Grade&, rng: mutable MT19937&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            scratch: mutable darray[i64] = Ints::zeros(g.keys + 1)
+            while not over(bench, bout) |bench, bout, g, rng, scratch|:
+                keyed: i64 = py_randrange(rng, 0, g.keys)
+                press(bench, bout, g, keyed, scratch)
+            return bench.reached
+
+    # Play while knowing the wiring. This establishes the ceiling without
+    # planning around drift or the key that will later die.
+    def play_oracle(bench: mutable Bench&, bout: mutable Bout&, g: Grade&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            scratch: mutable darray[i64] = Ints::zeros(g.keys + 1)
+            costs: mutable darray[i64] = Ints::zeros(g.keys + 1)
+            directions: mutable darray[i64] = Ints::zeros(g.keys + 1)
+            while not over(bench, bout) |bench, bout, g, scratch, costs, directions|:
+                found: i64 = ranked(bench, bout, g, costs, directions)
+                wiring_now(bench, bout, g, scratch)
+                pressed: mutable i64 = -1
+                rank: mutable i64 = 0
+                while rank < found and pressed < 0 |rank, found, pressed, directions, scratch, g|:
+                    want: i64 = Ints::at(directions, rank)
+                    key: mutable i64 = 0
+                    while key < g.keys and pressed < 0 |key, g, pressed, want, scratch|:
+                        pressed <- key if Ints::at(scratch, key) == want
+                        key <- key + 1
+                    rank <- rank + 1
+                pressed <- 0 if pressed < 0
+                press(bench, bout, g, pressed, scratch)
+            return bench.reached
+
+    # Learn one direction per key while moving. `seen == -2` is Python's
+    # missing dict entry; `DEAD == -1` remains an observed dead key.
+    def play_learner(bench: mutable Bench&, bout: mutable Bout&, g: Grade&, rng: mutable MT19937&, relearn: bool) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            scratch: mutable darray[i64] = Ints::zeros(g.keys + 1)
+            costs: mutable darray[i64] = Ints::zeros(g.keys + 1)
+            directions: mutable darray[i64] = Ints::zeros(g.keys + 1)
+            useful: mutable darray[i64] = Ints::zeros(g.keys + 1)
+            seen: mutable darray[i64] = Ints::zeros(g.keys + 1)
+            order: mutable darray[i64] = Ints::zeros(g.keys + 1)
+            for key in 0..<g.keys |key, seen|:
+                Ints::put(&seen, key, -2)
+            seen_n: mutable i64 = 0
+            while not over(bench, bout) |bench, bout, g, rng, scratch, costs, directions, useful, seen, order, seen_n, relearn|:
+                useful_n: i64 = helpful(bench, bout, g, costs, directions, useful)
+                pressed: mutable i64 = -1
+                wanted_at: mutable i64 = 0
+                while wanted_at < useful_n and pressed < 0 |wanted_at, useful_n, pressed, useful, order, seen, seen_n|:
+                    want: i64 = Ints::at(useful, wanted_at)
+                    known_at: mutable i64 = 0
+                    while known_at < seen_n and pressed < 0 |known_at, seen_n, pressed, want, useful, order, seen|:
+                        key: i64 = Ints::at(order, known_at)
+                        pressed <- key if Ints::at(seen, key) == want
+                        known_at <- known_at + 1
+                    wanted_at <- wanted_at + 1
+                if pressed < 0:
+                    blind_n: mutable i64 = 0
+                    for key in 0..<g.keys |key, seen, order, seen_n, blind_n|:
+                        if Ints::at(seen, key) == -2:
+                            Ints::put(&order, seen_n + blind_n, key)
+                            blind_n <- blind_n + 1
+                    if blind_n > 0:
+                        picked: i64 = py_choice_index(rng, blind_n)
+                        pressed <- Ints::at(order, seen_n + picked)
+                    else:
+                        pressed <- py_randrange(rng, 0, g.keys)
+                expected: i64 = Ints::at(seen, pressed)
+                went: i64 = press(bench, bout, g, pressed, scratch)
+                found: mutable i64 = DEAD
+                if went != 2:
+                    way: mutable i64 = 0
+                    while way < g.keys |way, g, went, found|:
+                        if way_dx(way_for(g.keys, way)) * 4 + way_dy(way_for(g.keys, way)) + 2 == went:
+                            found <- way
+                        way <- way + 1
+                if not relearn:
+                    if expected == -2:
+                        Ints::put(&order, seen_n, pressed)
+                        seen_n <- seen_n + 1
+                        Ints::put(&seen, pressed, found)
+                else:
+                    if expected != -2 and expected != found:
+                        for key in 0..<g.keys |key, seen|:
+                            Ints::put(&seen, key, -2)
+                        seen_n <- 0
+                    if expected == -2 or (expected != -2 and expected != found):
+                        Ints::put(&order, seen_n, pressed)
+                        seen_n <- seen_n + 1
+                    Ints::put(&seen, pressed, found)
+            return bench.reached

@@ -28,3 +28,7 @@ python3 "$ROOT/scripts/gen_wasm_bindings.py" "$ROOT/build/nwcore.wasm" \
     --out "$ROOT/build/nwcore" >/dev/null
 
 node "$ROOT/test/wasm_diff.mjs"
+node "$ROOT/test/task_game_input_smoke.mjs"
+node "$ROOT/test/marble_maze_browser_test.mjs"
+node "$ROOT/test/marble_maze_mujoco_test.mjs"
+node "$ROOT/test/marble_board_abi_test.mjs"

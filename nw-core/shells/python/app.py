@@ -3,19 +3,21 @@
 
     python3 shells/python/app.py                    # a window; SPACE steps a trial
     python3 shells/python/app.py --screen menu      # the game-mode menu
+    python3 shells/python/app.py --screen session   # the assembled workshop batch
     python3 shells/python/app.py --screen title     # the title screen
     python3 shells/python/app.py --screenshot out.png
     python3 shells/python/app.py --dump             # canonical frame text, no window
 
-Frames come from the Elisa core itself. `nwcore.nback_frame()`, `title_frame()`
-and `menu_frame()` each return one encoded display list as `bytes` (build them
+Frames come from the Elisa core itself. `nwcore.nback_session_frame()`,
+`nwcore.batch_frame()`, `title_frame()` and `menu_frame()` each return one encoded display list as `bytes` (build them
 with scripts/build_pymodule.sh);
 renderer.py decodes and draws it. Nothing about the game's appearance is
 decided here -- this file owns a window, a keyboard and a clock, and that is
 the whole point of the display-list seam.
 
-The trial walk is byte-for-byte the same deterministic sequence shells/web/
-index.html uses, so the two shells can be put side by side on the same frame.
+The n-back screen asks the Elisa session generator for a seeded trial. The
+host still owns the window and clock; the core owns stimulus history and
+randomness.
 """
 from __future__ import annotations
 
@@ -50,82 +52,176 @@ def load_core(entry: str = "nback_frame"):
 
 
 class Session:
-    """The deterministic walk index.html uses, with a history so it can rewind.
+    """A rewindable view onto the core's seeded session generator."""
 
-    Not the real session engine -- that lands when scheduling and stimulus are
-    wired together. It exists so the shell shows the board CHANGING, and so a
-    given trial number names the same frame in every shell.
-    """
-
-    def __init__(self, nback: int = 2) -> None:
+    def __init__(self, nback: int = 2, seed: int = 1, mode: int = 2) -> None:
         self.nback = nback
-        self.states = [(1, 4, -1)]              # (trial, position, verdict)
-        self.index = 0
+        self.seed = seed
+        self.mode = mode
+        self.trial = 1
+        self.verdict = -1
 
     @property
     def state(self):
-        return self.states[self.index]
+        return (self.trial, self.mode, self.nback, self.seed, self.verdict)
 
     def advance(self) -> None:
-        if self.index + 1 < len(self.states):
-            self.index += 1
-            return
-        trial, position, _verdict = self.state
-        trial += 1
-        position = 1 + ((position * 3 + trial) % 8)
-        verdict = -1 if trial % 4 == 0 else trial % 3
-        self.states.append((trial, position, verdict))
-        self.index += 1
+        self.trial += 1
 
     def back(self) -> None:
-        self.index = max(0, self.index - 1)
+        self.trial = max(1, self.trial - 1)
 
     def seek(self, trial: int) -> None:
-        while self.state[0] < trial:
-            self.advance()
-        while self.state[0] > trial and self.index:
-            self.back()
+        self.trial = max(1, trial)
 
     def frame_bytes(self, core) -> bytes:
-        trial, position, verdict = self.state
-        return core.nback_frame(trial, self.nback, position, verdict)
+        return core.nback_session_frame(self.trial, self.nback, self.seed,
+                                        self.mode, self.verdict)
 
     def describe(self, frame) -> str:
-        trial, position, _verdict = self.state
-        return f"trial {trial} - position {position} - verdict {frame.verdict_name}"
+        return (f"trial {self.trial} - mode {self.mode} - n-back {self.nback} "
+                f"- seed {self.seed} - verdict {frame.verdict_name}")
 
 
 class MenuSession:
-    """The game-mode menu, walked one selectable row at a time.
+    """The game-mode menu, with the same edit/select controls as the app.
 
-    The core owns the row list; all this holds is which row the marker is on,
-    and it wraps rather than clamps so the walk cannot get stuck at an end.
+    The core owns the row layout and text formatting. The shell owns the
+    provisional values until Enter applies them, because the real app's config
+    object is not across this display-list boundary yet.
     """
 
     ROWS = 24                                   # selectable rows in gameselect
+    SPACERS = frozenset((6, 8, 13, 17, 20, 22))
+    BOOL_BITS = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5,
+                 7: 6, 9: 7, 10: 8, 11: 9, 21: 10}
+    CYCLES = {
+        12: (1, 2, 3, 4, 5, 6),
+        14: (3, 4, 5, 6, 7, 8),
+        15: (0, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64),
+        16: (1, 2, 5, 10, 16, 20, 25, 33, 50, 75, 100, 150, 200,
+             250, 333, 500, 750, 1000, 1500, 2000, 2500, 3000, 4000, 5000),
+        18: (1, 2, 3, 4),
+        19: (0, 1),
+        23: (0, 125, 250, 375, 500, 625, 750, 875, 1000),
+    }
+    NAMES = {
+        0: "Use position", 1: "Use color", 2: "Use image", 3: "Use audio",
+        4: "Use audio2", 5: "Use arithmetic", 7: "Combination N-back mode",
+        9: "Use variable N-Back levels",
+        10: "Crab-back mode (reverse order of sets of N stimuli)",
+        11: "3D face-pattern mode", 12: "Cubes in 3D pattern",
+        14: "2D grid size", 15: "Active 2D position cells",
+        16: "Trial interval (ms)", 18: "Simultaneous visual stimuli",
+        19: "Simultaneous stimuli differentiated by", 21: "Self-paced mode",
+        23: "Interference (tricky stimulus generation)",
+    }
 
     def __init__(self, black_background: bool = False) -> None:
         self.black_background = black_background
         self.index = 0
+        self.applied = False
+        self.values = {row: False for row in self.BOOL_BITS}
+        self.values[0] = True
+        self.values.update({row: choices[0] for row, choices in self.CYCLES.items()})
 
     @property
     def state(self):
-        return (self.index,)
+        return (self.index, self.applied, self.bool_mask(), self.values[12],
+                self.values[14], self.values[15], self.values[16],
+                self.values[18], self.values[19], self.values[23])
+
+    def bool_mask(self) -> int:
+        mask = 0
+        for row, bit in self.BOOL_BITS.items():
+            if self.values[row]:
+                mask |= 1 << bit
+        return mask
+
+    def _move(self, step: int) -> None:
+        for _ in range(self.ROWS):
+            self.index = (self.index + step) % self.ROWS
+            if self.index not in self.SPACERS:
+                self.applied = False
+                return
 
     def advance(self) -> None:
-        self.index = (self.index + 1) % self.ROWS
+        self._move(1)
 
     def back(self) -> None:
-        self.index = (self.index - 1) % self.ROWS
+        self._move(-1)
 
     def seek(self, position: int) -> None:
         self.index = max(0, min(self.ROWS - 1, position - 1))
+        if self.index in self.SPACERS:
+            self._move(1 if position < self.ROWS else -1)
+        self.applied = False
+
+    def modify(self, step: int = 1) -> None:
+        if self.index in self.SPACERS:
+            return
+        if self.index in self.BOOL_BITS:
+            self.values[self.index] = not self.values[self.index]
+        elif self.index in self.CYCLES:
+            choices = self.CYCLES[self.index]
+            current = choices.index(self.values[self.index])
+            self.values[self.index] = choices[(current + (1 if step >= 0 else -1)) % len(choices)]
+        self.applied = False
+
+    def apply(self) -> None:
+        self.applied = True
 
     def frame_bytes(self, core) -> bytes:
-        return core.menu_frame(self.index, 1 if self.black_background else 0)
+        return core.menu_state_frame(
+            self.index, 1 if self.black_background else 0, self.bool_mask(),
+            self.values[12], self.values[14], self.values[15], self.values[16],
+            self.values[18], self.values[19], self.values[23])
 
     def describe(self, _frame) -> str:
-        return f"row {self.index + 1}/{self.ROWS}"
+        action = "applied" if self.applied else "editing"
+        return f"menu · {action} · row {self.index + 1}/{self.ROWS} · {self.NAMES.get(self.index, 'spacer')}"
+
+
+class BatchSession(Session):
+    """The complete field/HUD/readout/trial-UI composition."""
+
+    def __init__(self, nback: int = 2, seed: int = 1, mode: int = 2,
+                 black_background: bool = False) -> None:
+        super().__init__(nback, seed, mode)
+        self.black_background = black_background
+        self.started = True
+        self.hide_text = False
+        self.paused = False
+        self.grid_3d = False
+        self.expanded = False
+        self.gridlines = True
+        self.old_style = False
+        self.sharp_corners = False
+        self.session_number = 0
+        self.input_answer = 0
+
+    @property
+    def state(self):
+        return (self.trial, self.mode, self.nback, self.seed,
+                self.started, self.hide_text, self.paused, self.verdict)
+
+    def frame_bytes(self, core) -> bytes:
+        return core.batch_frame(
+            self.trial, self.nback, self.seed, self.mode,
+            1 if self.black_background else 0,
+            1 if self.started else 0,
+            1 if self.hide_text else 0,
+            1 if self.paused else 0,
+            1 if self.grid_3d else 0,
+            1 if self.expanded else 0,
+            1 if self.gridlines else 0,
+            1 if self.old_style else 0,
+            1 if self.sharp_corners else 0,
+            self.session_number, self.verdict, self.input_answer)
+
+    def describe(self, frame) -> str:
+        return (f"batch trial {self.trial} - mode {self.mode} - n-back {self.nback} "
+                f"- seed {self.seed} - verdict {frame.verdict_name}")
 
 
 class TitleSession:
@@ -161,7 +257,8 @@ class TitleSession:
         return f"banner {self.banner}"
 
 
-SCREENS = {"nback": ("nback_frame", lambda args: Session(args.nback)),
+SCREENS = {"nback": ("nback_session_frame", lambda args: Session(args.nback, args.seed, args.mode)),
+           "session": ("batch_frame", lambda args: BatchSession(args.nback, args.seed, args.mode, args.black_background)),
            "menu": ("menu_frame", lambda args: MenuSession(args.black_background)),
            "title": ("title_frame", lambda args: TitleSession(args.black_background))}
 
@@ -224,6 +321,16 @@ def run_window(core, session, width: int, height: int,
 
     @window.event
     def on_key_press(symbol, _modifiers):
+        if isinstance(session, MenuSession):
+            if symbol == key.SPACE:
+                session.modify()
+                draw_frame()
+            elif symbol in (key.RETURN, key.ENTER):
+                session.apply()
+                draw_frame()
+            elif symbol == key.ESCAPE:
+                window.close()
+            return
         if symbol in (key.SPACE, key.RIGHT, key.RETURN, key.DOWN):
             session.advance()
             draw_frame()
@@ -232,6 +339,47 @@ def run_window(core, session, width: int, height: int,
             draw_frame()
         elif symbol == key.ESCAPE:
             window.close()
+
+    @window.event
+    def on_text_motion(motion):
+        if not isinstance(session, MenuSession):
+            return
+        if motion == key.MOTION_UP:
+            session.back()
+        elif motion == key.MOTION_DOWN:
+            session.advance()
+        elif motion == key.MOTION_PREVIOUS_PAGE:
+            for _ in range(8):
+                session.back()
+        elif motion == key.MOTION_NEXT_PAGE:
+            for _ in range(8):
+                session.advance()
+        elif motion == key.MOTION_LEFT:
+            session.modify(-1)
+        elif motion == key.MOTION_RIGHT:
+            session.modify(1)
+        else:
+            return
+        draw_frame()
+
+    @window.event
+    def on_mouse_press(x, y, _button, _modifiers):
+        if not isinstance(session, MenuSession):
+            return
+        ref_x = (x - renderer.viewport.offset_x) / renderer.viewport.scale
+        ref_y = (y - renderer.viewport.offset_y) / renderer.viewport.scale
+        if ref_x < 0 or ref_x > 900:
+            return
+        row = round((547.2 - ref_y) / 18.0)
+        if not 0 <= row < session.ROWS or row in session.SPACERS:
+            return
+        if row in session.SPACERS:
+            return
+        if row == session.index:
+            session.modify()
+        else:
+            session.seek(row + 1)
+        draw_frame()
 
     if screenshot:
         # One frame, saved, then out -- so this shell can produce an artefact to
@@ -257,6 +405,10 @@ def main(argv=None) -> int:
     parser.add_argument("--screen", choices=sorted(SCREENS), default="nback",
                         help="which screen the core should draw")
     parser.add_argument("--nback", type=int, default=2)
+    parser.add_argument("--mode", type=int, default=2,
+                        help="core n-back mode (2 is position + audio)")
+    parser.add_argument("--seed", type=int, default=1,
+                        help="seed for the core session generator")
     parser.add_argument("--black-background", action="store_true",
                         help="the dark theme, for the screens that have one")
     parser.add_argument("--trial", type=int, default=1,

@@ -29,7 +29,77 @@ esac
 BUILD="$ROOT/build"
 mkdir -p "$BUILD"
 
-SUITES=(pyset scheduling board nback pyrandom stimulus stats sessionscore readouttext trialuitext matching display config gamemode decimal session maze fogworld numberology ninarow inthedark crossedwires cookiethief custody donkey tetris removals sokoban go twohands buzzwire marblemaze syllogism title menu menurow sudoku youarehere hanoi monkeyladder ncupmonte reflex salesman counting tracking concentration recognition lookout pursuit outofsight overrun mrtime jigsaw sokoban3d verbal scramble scrabble trivia crossword graphmapping ravens chess bigfrac expressions algebra glyphs scene_removals scene_monkeyladder scene_hanoi scene_go scene_ninarow scene_crossedwires scene_ncupmonte scene_sudoku scene_chess scene_algebra scene_numberology scene_verbal scene_scramble scene_trivia scene_tracking scene_sokoban scene_salesman scene_counting scene_syllogism scene_maze scene_inthedark scene_overrun scene_crossword scene_lookout scene_pursuit scene_reflex scene_recognition scene_concentration scene_jigsaw scene_donkey scene_custody scene_cookiethief scene_youarehere scene_sokoban3d scene_scrabble scene_mrtime scene_graphmapping scene_outofsight scene_tetris scene_twohands scene_ravens scene_marblemaze scene_buzzwire scene_taskhub scene_fogofwar scene_trialui scene_notice scene_hud scene_readouts scene_graph scene_field scene_menuchrome trialphase textmetrics screen hudtext)
+# This checker deliberately exercises several suites through fixed ABI input
+# paths (for example /tmp/nw_chess_oracle.txt), and the stage0 artifacts below
+# also have stable names. Two check.sh processes therefore cannot safely run at
+# the same time: they can compile or write the other run's fixture between the
+# compiler invocation and its differential comparison, producing fake
+# mismatches. Serialize checker runs and recover a lock left by a terminated
+# process so the result is either isolated or waits, never cross-contaminated.
+CHECK_LOCK="$BUILD/.check.lock"
+CHECK_LOCK_TOKEN="$$-$RANDOM-$(date +%s)"
+process_start() {
+    ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+path_mtime() {
+    stat -f '%m' "$1" 2>/dev/null || stat -c '%Y' "$1" 2>/dev/null || true
+}
+while ! mkdir "$CHECK_LOCK" 2>/dev/null; do
+    owner_pid=""
+    owner_start=""
+    if [[ -f "$CHECK_LOCK/owner" ]]; then
+        owner_pid="$(sed -n '1p' "$CHECK_LOCK/owner")"
+        owner_start="$(sed -n '2p' "$CHECK_LOCK/owner")"
+    fi
+    if [[ "$owner_pid" =~ ^[0-9]+$ && -n "$owner_start" ]]; then
+        live_start="$(process_start "$owner_pid")"
+        if [[ -z "$live_start" || "$live_start" != "$owner_start" ]]; then
+            unlink "$CHECK_LOCK/owner" 2>/dev/null || true
+            rmdir "$CHECK_LOCK" 2>/dev/null || true
+            continue
+        fi
+    elif [[ -d "$CHECK_LOCK" ]]; then
+        # mkdir and writing the owner record are separate filesystem calls.
+        # Recover only a recordless/partial lock that has been idle for 5s;
+        # rmdir still refuses to remove any unexpected contents.
+        lock_mtime="$(path_mtime "$CHECK_LOCK")"
+        now="$(date +%s)"
+        if [[ "$lock_mtime" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]] &&
+           (( now - lock_mtime >= 5 )); then
+            [[ -e "$CHECK_LOCK/owner" ]] && unlink "$CHECK_LOCK/owner" 2>/dev/null || true
+            rmdir "$CHECK_LOCK" 2>/dev/null || true
+            continue
+        fi
+    fi
+    sleep 1
+done
+owner_start="$(process_start "$$")"
+printf '%s\n%s\n%s\n' "$$" "$owner_start" "$CHECK_LOCK_TOKEN" > "$CHECK_LOCK/owner"
+release_check_lock() {
+    if [[ -f "$CHECK_LOCK/owner" ]] &&
+       [[ "$(sed -n '3p' "$CHECK_LOCK/owner")" == "$CHECK_LOCK_TOKEN" ]]; then
+        unlink "$CHECK_LOCK/owner" 2>/dev/null || true
+        rmdir "$CHECK_LOCK" 2>/dev/null || true
+    fi
+}
+on_check_signal() {
+    case "$1" in
+        INT) exit 130 ;;
+        TERM) exit 143 ;;
+        HUP) exit 129 ;;
+    esac
+}
+trap release_check_lock EXIT
+trap 'on_check_signal INT' INT
+trap 'on_check_signal TERM' TERM
+trap 'on_check_signal HUP' HUP
+
+RUN_DIR="$(mktemp -d "$BUILD/check.XXXXXX")" || {
+    echo "check.sh: could not create an isolated run directory under $BUILD" >&2
+    exit 1
+}
+
+SUITES=(pyset scheduling timing board grid nback pyrandom stimulus stats sessionscore readouttext trialuitext matching display config gamemode decimal session sessionapp maze fogworld numberology ninarow inthedark crossedwires cookiethief custody donkey tetris removals sokoban go twohands buzzwire marblemaze syllogism title menu menurow sudoku youarehere hanoi monkeyladder ncupmonte reflex salesman counting tracking concentration recognition lookout pursuit outofsight overrun mrtime jigsaw sokoban3d verbal scramble scrabble trivia crossword graphmapping ravens chess bigfrac expressions algebra glyphs scene_removals scene_monkeyladder scene_hanoi scene_go scene_ninarow scene_crossedwires scene_ncupmonte scene_sudoku scene_chess scene_algebra scene_numberology scene_verbal scene_scramble scene_trivia scene_tracking scene_sokoban scene_salesman scene_counting scene_syllogism scene_maze scene_inthedark scene_overrun scene_crossword scene_lookout scene_pursuit scene_reflex scene_recognition scene_concentration scene_jigsaw scene_donkey scene_custody scene_cookiethief scene_youarehere scene_sokoban3d scene_scrabble scene_mrtime scene_graphmapping scene_outofsight scene_tetris scene_twohands scene_ravens scene_marblemaze scene_buzzwire scene_taskhub scene_fogofwar scene_trialui scene_notice scene_hud scene_readouts scene_graph scene_field scene_menuchrome trialphase textmetrics screen hudtext scene_batch)
 
 # One suite by name, for the inner loop.
 if [[ -n "${SUITE:-}" ]]; then
@@ -53,39 +123,71 @@ STAGE0_ONLY=()
 
 failures=0
 run_suite() {
-    local suite="$1" stage="$2" binary="$BUILD/${1}_sweep_${2}"
+    local suite="$1" stage="$2" binary="$RUN_DIR/${1}_sweep_${2}"
+    local compile_log="$RUN_DIR/${suite}_${stage}.compile.log"
+    local link_log="$RUN_DIR/${suite}_${stage}.link.log"
+    local stdout_log="$RUN_DIR/${suite}_${stage}.stdout.log"
+    local stderr_log="$RUN_DIR/${suite}_${stage}.stderr.log"
+    local result_json="$RUN_DIR/${suite}_${stage}.result.json"
+    local compile_exit=-1 link_exit=-1 checker_exit=-1
 
     if [[ "$stage" == "stage0" ]]; then
-        if ! "$ELISACORE_BIN" -emit obj -O2 -o "$BUILD/${suite}_${stage}.o" \
-                "$ROOT/test/${suite}_sweep.elisa" 2>"$BUILD/${suite}_${stage}.log"; then
-            echo "  ${suite} [${stage}]: COMPILE FAILED (see $BUILD/${suite}_${stage}.log)"
-            return 1
+        if "$ELISACORE_BIN" -emit obj -O2 -o "$RUN_DIR/${suite}_${stage}.o" \
+                "$ROOT/test/${suite}_sweep.elisa" >"$compile_log" 2>&1; then
+            compile_exit=0
+        else
+            compile_exit=$?
         fi
-        if ! clang -o "$binary" "$BUILD/${suite}_${stage}.o" 2>>"$BUILD/${suite}_${stage}.log"; then
-            echo "  ${suite} [${stage}]: LINK FAILED (see $BUILD/${suite}_${stage}.log)"
-            return 1
+        if (( compile_exit == 0 )); then
+            if clang -o "$binary" "$RUN_DIR/${suite}_${stage}.o" >"$link_log" 2>&1; then
+                link_exit=0
+            else
+                link_exit=$?
+            fi
         fi
     else
-        if ! "$ELISA_STAGE1_ROOT/scripts/elisac_stage1.sh" -emit exe -O2 -o "$binary" \
-                "$ROOT/test/${suite}_sweep.elisa" 2>"$BUILD/${suite}_${stage}.log"; then
-            echo "  ${suite} [${stage}]: COMPILE FAILED (see $BUILD/${suite}_${stage}.log)"
-            return 1
+        if "$ELISA_STAGE1_ROOT/scripts/elisac_stage1.sh" -emit exe -O2 -o "$binary" \
+                "$ROOT/test/${suite}_sweep.elisa" >"$compile_log" 2>&1; then
+            compile_exit=0
+            link_exit=0
+        else
+            compile_exit=$?
         fi
     fi
 
-    # The VERDICT is the last line, not the first. A diff re-execs into the
-    # reference venv and anything that venv writes to stderr on the way in --
-    # a pyglet warning about an ffmpeg it does not recognise, say -- lands
-    # ahead of the result. Testing the first line called those suites failures
-    # while their own output said PASS.
-    local result verdict
-    result="$(python3 "$ROOT/test/${suite}_diff.py" "$binary" 2>&1)"
-    verdict="$(printf '%s\n' "$result" | tail -1)"
-    if [[ "$verdict" == PASS* ]]; then
-        echo "  ${suite} [${stage}]: ${verdict}"
+    if (( compile_exit == 0 && link_exit == 0 )); then
+        if python3 "$ROOT/test/${suite}_diff.py" "$binary" >"$stdout_log" 2>"$stderr_log"; then
+            checker_exit=0
+        else
+            checker_exit=$?
+        fi
+    else
+        : > "$stdout_log"
+        : > "$stderr_log"
+    fi
+
+    local validation
+    if validation="$(python3 "$ROOT/scripts/check_result.py" \
+            --suite "$suite" --stage "$stage" \
+            --checker-exit "$checker_exit" --compile-exit "$compile_exit" \
+            --link-exit "$link_exit" --stdout "$stdout_log" \
+            --stderr "$stderr_log" --compile-log "$compile_log" \
+            --link-log "$link_log" --output "$result_json")"; then
+        local cases verdict
+        cases="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["case_count"])' "$result_json")"
+        verdict="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$result_json")"
+        echo "  ${suite} [${stage}]: ${verdict} (result: $result_json; cases: $cases)"
         return 0
     fi
-    echo "  ${suite} [${stage}]: ${result}"
+    echo "  ${suite} [${stage}]: FAILED (result: $result_json)"
+    if (( compile_exit != 0 )); then
+        sed -n '1,120p' "$compile_log"
+    elif (( link_exit != 0 )); then
+        sed -n '1,120p' "$link_log"
+    else
+        sed -n '1,160p' "$stdout_log"
+        sed -n '1,160p' "$stderr_log"
+    fi
     return 1
 }
 

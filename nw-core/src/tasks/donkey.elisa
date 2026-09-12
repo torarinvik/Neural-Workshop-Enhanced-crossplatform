@@ -246,6 +246,121 @@ module Donkey:
     def cleared(car: Car&, road: Road&) -> bool:
         return not car.hit and car.at >= road.length
 
+    # A reconstructed sequence of one control per sub-row. `ok` is false for a
+    # hand-written road with no surviving state; generated roads are passable by
+    # construction. The fixed state space is tiny (two lanes and at most twelve
+    # owed sub-rows), so the parent layers fit in one flat buffer.
+    const MAX_STATES: i64 = 32
+
+    struct Presses:
+        values: mutable darray[i64]
+        count: mutable i64
+        ok: mutable bool
+
+    def empty_presses(capacity: i64) -> Presses:
+        can Memory.Allocate, Abort.Panic:
+            return Presses{values: Ints::zeros(capacity + 1), count: 0, ok: false}
+
+    # One shortest line through the road. The transition is the same one used
+    # by feasible(), but each layer keeps a parent so the chosen controls can be
+    # read back. Holding is explored before switching, matching the reference's
+    # choice order for each state.
+    def line(road: Road&) -> Presses:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable Presses = empty_presses(road.length)
+            span: i64 = road.crossing + 1
+            parents: mutable darray[i64] = Ints::zeros((road.length + 1) * MAX_STATES)
+            moves: mutable darray[i64] = Ints::zeros((road.length + 1) * MAX_STATES)
+            alive: mutable i64 = states(road.start, road.crossing)
+            current_order: mutable darray[i64] = Ints::zeros(MAX_STATES)
+            next_order: mutable darray[i64] = Ints::zeros(MAX_STATES)
+            current_n: mutable i64 = 1
+            Ints::put(&current_order, 0, road.start * span)
+            at: mutable i64 = 0
+            while at < road.length and alive != 0 |at, road, parents, moves, alive, span, current_order, next_order, current_n|:
+                next: mutable i64 = 0
+                next_n: mutable i64 = 0
+                position: mutable i64 = 0
+                while position < current_n |position, current_n, current_order, next_order, next_n, at, road, parents, moves, alive, span, next|:
+                    compact: i64 = Ints::at(current_order, position)
+                    was: i64 = compact / span
+                    owed_in: i64 = compact % span
+                    choices: mutable i64 = 1
+                    choices <- 2 if owed_in == 0
+                    choice: mutable i64 = 0
+                    while choice < choices |choice, choices, owed_in, was, at, road, parents, moves, alive, span, next, next_order, next_n|:
+                        owed: i64 = owed_in if owed_in != 0 else (0 if choice == 0 else road.crossing)
+                        blocked_here: bool = Ints::at(road.blocked, at) != CLEAR and (owed != 0 or Ints::at(road.blocked, at) == was)
+                        if not blocked_here:
+                            left: mutable i64 = owed
+                            landed: mutable i64 = was
+                            if left != 0:
+                                left <- left - 1
+                                landed <- 1 - was if left == 0 else was
+                            below_compact: i64 = landed * span + left
+                            below: i64 = state_bit(landed, left, road.crossing)
+                            if (next / below) % 2 == 0:
+                                Ints::put(&parents, at * MAX_STATES + below_compact, compact + 1)
+                                Ints::put(&moves, at * MAX_STATES + below_compact, HOLD if choice == 0 else SWITCH)
+                                Ints::put(&next_order, next_n, below_compact)
+                                next_n <- next_n + 1
+                                next <- next | below
+                        choice <- choice + 1
+                    position <- position + 1
+                alive <- next
+                current_n <- next_n
+                copy_position: mutable i64 = 0
+                while copy_position < next_n |copy_position, next_n, current_order, next_order|:
+                    Ints::put(&current_order, copy_position, Ints::at(next_order, copy_position))
+                    copy_position <- copy_position + 1
+                at <- at + 1
+
+            return out if alive == 0
+            final_compact: i64 = Ints::at(current_order, 0)
+            count: mutable i64 = road.length
+            compact: mutable i64 = final_compact
+            while count > 0 |count, compact, parents, moves, out|:
+                row: i64 = count - 1
+                parent_code: i64 = Ints::at(parents, row * MAX_STATES + compact)
+                Ints::put(&out.values, row, Ints::at(moves, row * MAX_STATES + compact))
+                compact <- parent_code - 1 if parent_code > 0 else 0
+                count <- count - 1
+            out.count <- road.length
+            out.ok <- true
+            return out
+
+    # React when the blocked sub-row is `look` ahead. This is the policy the
+    # reference uses to show the gap between seeing a donkey and anticipating
+    # the width of the committed swerve.
+    def dodge(road: Road&, look: i64) -> Presses:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable Presses = empty_presses(road.length)
+            car: mutable Car = Car(road.start, road.swerve)
+            tick: mutable i64 = 0
+            while not over(&car, road) and tick < road.length |tick, car, road, out|:
+                aim: i64 = car.at + look
+                ahead: i64 = Ints::at(road.blocked, aim) if aim >= 0 and aim < road.length else CLEAR
+                want: i64 = SWITCH if car.crossing == 0 and ahead != CLEAR and ahead == car.lane else HOLD
+                steer(&car, want)
+                Ints::put(&out.values, out.count, want)
+                out.count <- out.count + 1
+                beat(&car, road)
+                tick <- tick + 1
+            out.ok <- true
+            return out
+
+    # Replay a caller-supplied control sequence from the start of the road.
+    # Controls after the round is over are ignored, as in the Python loop.
+    def drive(road: Road&, presses: darray[i64], count: i64) -> Car:
+        can Abort.Panic:
+            car: mutable Car = Car(road.start, road.swerve)
+            index: mutable i64 = 0
+            while index < count and not over(&car, road) |index, count, presses, car, road|:
+                steer(&car, Ints::at(presses, index))
+                beat(&car, road)
+                index <- index + 1
+            return car
+
     # ------------------------------------------------------------
     # Laying a road
     # ------------------------------------------------------------

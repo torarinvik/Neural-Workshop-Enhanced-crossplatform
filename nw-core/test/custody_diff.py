@@ -79,12 +79,58 @@ def belt_lines(out):
             out.append(row("belt", level, seed, *flat))
 
 
+def claw_lines(out):
+    """Exercise the mutable claw/objective half of the task."""
+    for level in (1, 4, 5, 10):
+        for seed in (0, 7, 1234):
+            rng = random.Random(seed)
+            layout = ref.generate(level, rng=rng)
+            boxes = ref.fresh_boxes(layout, rng)
+            values = [layout.core, ref.rivals(boxes, layout),
+                      int(ref.rivals_expected(layout.boxes, layout.looks) * 1000000),
+                      len(ref.loose(boxes))]
+            box_slot = boxes[0].slot
+            values += [box_slot, boxes.index(ref.box_at(boxes, box_slot)),
+                       ref.grab(boxes, box_slot).latent,
+                       -1 if ref.box_at(boxes, box_slot) is None else
+                       ref.box_at(boxes, box_slot).latent,
+                       ref.potential(boxes[0], box_slot, layout)]
+
+            occupied = boxes[1].slot if len(boxes) > 1 else -1
+            values.append(int(len(boxes) > 1 and
+                             ref.put_down(boxes[0], boxes, occupied, layout)))
+
+            machines = [m for m in layout.machines]
+            target = machines[0].slot if machines else layout.bay
+            next_target = ref.next_target(boxes[0], layout, box_slot)
+            values += [next_target, target,
+                       KIND_ID[ref.machine_at(layout, target)],
+                       int(ref.put_down(boxes[0], boxes, target, layout)),
+                       boxes[0].charge, boxes[0].heat, boxes[0].look,
+                       int(boxes[0].stalled), int(ref.wanted(boxes[0], layout)),
+                       ref.potential(boxes[0], target, layout)]
+            grabbed_again = ref.grab(boxes, target)
+            if grabbed_again is None:
+                values += [-1, 0]
+            else:
+                values += [grabbed_again.latent,
+                           int(ref.put_down(grabbed_again, boxes,
+                                            layout.bay, layout))]
+            values += [int(boxes[0].delivered), boxes[0].slot,
+                       ref.rivals(boxes, layout)]
+            for kind in (ref.CHARGER, ref.COOLER, ref.PAINTER):
+                slots = ref.slots_of(layout, kind)
+                values += [len(slots), slots[0] if slots else -1]
+            out.append(row("claw", level, seed, *values))
+
+
 def python_lines():
     out = []
     grade_lines(out)
     gap_lines(out)
     deal_lines(out)
     belt_lines(out)
+    claw_lines(out)
     return out
 
 

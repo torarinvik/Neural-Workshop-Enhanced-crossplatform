@@ -46,6 +46,17 @@ def reference():
             row.extend(MOVES[one] for one in route)
             out.append(row)
 
+            out.append(["route", level, seed, len(route),
+                        *(MOVES[one] for one in route)])
+            out.append(["perfect", level, seed, yah.walk_perfect(maze)])
+
+            pose = yah.Pose(maze.start, (facing + 2) % 4)
+            held = yah.picked_up(maze, maze.start, 0)
+            believed = yah.route_from(maze, pose, held)
+            row = ["from", level, seed, len(believed)]
+            row.extend(MOVES[one] for one in believed)
+            out.append(row)
+
             out.append(["hug", level, seed, yah.walk_hugging(maze, cap=20000)])
 
             # Low rungs only, and a short cap -- see the sweep: this walk
