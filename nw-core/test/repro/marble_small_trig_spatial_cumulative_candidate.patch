@@ -1,0 +1,172 @@
+diff --git a/src/engine/engine_util_spatial.c b/src/engine/engine_util_spatial.c
+index 012cb37..b4f4246 100644
+--- a/src/engine/engine_util_spatial.c
++++ b/src/engine/engine_util_spatial.c
+@@ -231,15 +231,100 @@ void mju_derivQuat(mjtNum res[4], const mjtNum quat[4], const mjtNum vel[3]) {
+ 
+ 
+ // integrate quaternion given 3D angular velocity
++#ifdef __EMSCRIPTEN__
++// Integration-local original ARM64 ordering; generic multiplication stays unchanged.
++extern mjtNum mj_marble_wheel_fma(mjtNum, mjtNum, mjtNum);
++mjtNum mj_marble_quaternion_normalize4(mjtNum q[4]) {
++  mjtNum norm = mju_sqrt(mj_marble_wheel_fma(q[3], q[3],
++                          mj_marble_wheel_fma(q[2], q[2],
++                            mj_marble_wheel_fma(q[0], q[0], q[1]*q[1]))));
++  if (norm < mjMINVAL) {
++    q[0] = 1; q[1] = q[2] = q[3] = 0;
++  } else if (mju_abs(norm-1) > mjMINVAL) {
++    mjtNum inverse = 1/norm;
++    for (int i = 0; i < 4; i++) q[i] *= inverse;
++  }
++  return norm;
++}
++static void marble_integrate_mulQuat(mjtNum res[4], const mjtNum a[4],
++                                     const mjtNum b[4]) {
++  mjtNum tmp[4] = {
++    mj_marble_wheel_fma(-a[3], b[3], mj_marble_wheel_fma(-a[2], b[2], mj_marble_wheel_fma(a[0], b[0], -(a[1]*b[1])))),
++    mj_marble_wheel_fma(-a[3], b[2], mj_marble_wheel_fma(a[2], b[3], mj_marble_wheel_fma(a[0], b[1], a[1]*b[0]))),
++    mj_marble_wheel_fma(a[3], b[1], mj_marble_wheel_fma(a[2], b[0], mj_marble_wheel_fma(a[0], b[2], -(a[1]*b[3])))),
++    mj_marble_wheel_fma(a[3], b[0], mj_marble_wheel_fma(-a[2], b[1], mj_marble_wheel_fma(a[0], b[3], a[1]*b[2])))
++  };
++  mji_copy4(res, tmp);
++}
++#endif
++
+ void mju_quatIntegrate(mjtNum quat[4], const mjtNum vel[3], mjtNum scale) {
+   mjtNum angle, tmp[4], qrot[4];
+ 
+   // form local rotation quaternion, apply
+   mji_copy3(tmp, vel);
++#ifdef __EMSCRIPTEN__
++  // Integration-local original-wheel norm ordering; generic normalization
++  // remains unchanged for unrelated engine callers.
++  mjtNum norm = mju_sqrt(mj_marble_wheel_fma(tmp[2], tmp[2],
++                          mj_marble_wheel_fma(tmp[0], tmp[0], tmp[1]*tmp[1])));
++  if (norm < mjMINVAL) {
++    tmp[0] = 1;
++    tmp[1] = tmp[2] = 0;
++  } else {
++    mjtNum inverse = 1/norm;
++    tmp[0] *= inverse;
++    tmp[1] *= inverse;
++    tmp[2] *= inverse;
++  }
++  angle = scale * norm;
++#else
+   angle = scale * mju_normalize3(tmp);
++#endif
++#ifdef __EMSCRIPTEN__
++  // Private bounded reconstruction of the original macOS combined trig ABI.
++  // Unsupported angles retain the existing path, NOT a parity guarantee.
++  mjtNum half = angle*0.5;
++  if (angle != 0 && mju_abs(half) <= 0.5) {
++    const mjtNum sine_coefficients[6] = {
++      0x1.5d8fd1fd19ccdp-33, -0x1.ae5e5a9291f5dp-26,
++      0x1.71de3567d48a1p-19, -0x1.a01a019bfdf03p-13,
++      0x1.111111110f7d0p-7, -0x1.5555555555548p-3
++    };
++    const mjtNum cosine_coefficients[7] = {
++      -0x1.8fa49a0861a9bp-37, 0x1.1ee9d7b4e3f05p-29,
++      -0x1.27e4f7eac4bc6p-22, 0x1.a01a019c844f5p-16,
++      -0x1.6c16c16c14f91p-10, 0x1.555555555554bp-5,
++      -0x1.0000000000000p-1
++    };
++    mjtNum square = half*half;
++    mjtNum polynomial = sine_coefficients[0];
++    for (int i=1; i<6; i++) {
++      polynomial = mj_marble_wheel_fma(square, polynomial, sine_coefficients[i]);
++    }
++    mjtNum sine = mj_marble_wheel_fma(half, square*polynomial, 0) + half;
++    square = mj_marble_wheel_fma(half, half, 0);
++    polynomial = cosine_coefficients[0];
++    for (int i=1; i<7; i++) {
++      polynomial = mj_marble_wheel_fma(square, polynomial, cosine_coefficients[i]);
++    }
++    qrot[0] = mj_marble_wheel_fma(square, polynomial, 1);
++    qrot[1] = tmp[0]*sine;
++    qrot[2] = tmp[1]*sine;
++    qrot[3] = tmp[2]*sine;
++  } else {
++    mji_axisAngle2Quat(qrot, tmp, angle);
++  }
++#else
+   mji_axisAngle2Quat(qrot, tmp, angle);
++#endif
++#ifdef __EMSCRIPTEN__
++  mj_marble_quaternion_normalize4(quat);
++  marble_integrate_mulQuat(quat, quat, qrot);
++#else
+   mju_normalize4(quat);
+   mju_mulQuat(quat, quat, qrot);
++#endif
+ }
+ 
+ 
+@@ -410,12 +495,21 @@ void mju_inertCom(mjtNum* restrict res, const mjtNum inert[3], const mjtNum mat[
+                    mat[2]*inert[2], mat[5]*inert[2], mat[8]*inert[2]};
+ 
+   // res_rot = mat * diag(inert) * mat'
++#if defined(__EMSCRIPTEN__)
++  res[0] = fma(mat[2], tmp[6], fma(mat[0], tmp[0], mat[1]*tmp[3]));
++  res[1] = fma(mat[5], tmp[7], fma(mat[3], tmp[1], mat[4]*tmp[4]));
++  res[2] = fma(mat[8], tmp[8], fma(mat[6], tmp[2], mat[7]*tmp[5]));
++  res[3] = fma(mat[2], tmp[7], fma(mat[0], tmp[1], mat[1]*tmp[4]));
++  res[4] = fma(mat[2], tmp[8], fma(mat[0], tmp[2], mat[1]*tmp[5]));
++  res[5] = fma(mat[5], tmp[8], fma(mat[3], tmp[2], mat[4]*tmp[5]));
++#else
+   res[0] = mat[0]*tmp[0] + mat[1]*tmp[3] + mat[2]*tmp[6];
+   res[1] = mat[3]*tmp[1] + mat[4]*tmp[4] + mat[5]*tmp[7];
+   res[2] = mat[6]*tmp[2] + mat[7]*tmp[5] + mat[8]*tmp[8];
+   res[3] = mat[0]*tmp[1] + mat[1]*tmp[4] + mat[2]*tmp[7];
+   res[4] = mat[0]*tmp[2] + mat[1]*tmp[5] + mat[2]*tmp[8];
+   res[5] = mat[3]*tmp[2] + mat[4]*tmp[5] + mat[5]*tmp[8];
++#endif
+ 
+   // res_rot -= mass * dif_cross * dif_cross
+   res[0] += mass*(dif[1]*dif[1] + dif[2]*dif[2]);
+@@ -436,15 +530,44 @@ void mju_inertCom(mjtNum* restrict res, const mjtNum inert[3], const mjtNum mat[
+ 
+ 
+ // multiply 6D vector (rotation, translation) by 6D inertia matrix
++#ifdef __EMSCRIPTEN__
++extern mjtNum mj_marble_wheel_fma(mjtNum, mjtNum, mjtNum);
++#endif
+ void mju_mulInertVec(mjtNum* restrict res, const mjtNum i[10], const mjtNum v[6]) {
++#ifdef __EMSCRIPTEN__
++  // Private combined candidate: actual original arm64 public routine order.
++  // This SHARED helper also serves mass-matrix/derivative callers, not only RNE.
++  res[0] = mj_marble_wheel_fma(i[7], v[5], mj_marble_wheel_fma(-i[8], v[4],
++      mj_marble_wheel_fma(i[4], v[2], mj_marble_wheel_fma(i[0], v[0], i[3]*v[1]))));
++  res[1] = mj_marble_wheel_fma(-i[6], v[5], mj_marble_wheel_fma(i[8], v[3],
++      mj_marble_wheel_fma(i[5], v[2], mj_marble_wheel_fma(i[3], v[0], i[1]*v[1]))));
++  res[2] = mj_marble_wheel_fma(i[6], v[4], mj_marble_wheel_fma(-i[7], v[3],
++      mj_marble_wheel_fma(i[2], v[2], mj_marble_wheel_fma(i[4], v[0], i[5]*v[1]))));
++  res[3] = mj_marble_wheel_fma(i[9], v[3], mj_marble_wheel_fma(i[8], v[1], (-i[7])*v[2]));
++  res[4] = mj_marble_wheel_fma(i[9], v[4], mj_marble_wheel_fma(i[6], v[2], (-i[8])*v[0]));
++  res[5] = mj_marble_wheel_fma(i[9], v[5], mj_marble_wheel_fma(i[7], v[0], (-i[6])*v[1]));
++#else
+   res[0] = i[0]*v[0] + i[3]*v[1] + i[4]*v[2] - i[8]*v[4] + i[7]*v[5];
+   res[1] = i[3]*v[0] + i[1]*v[1] + i[5]*v[2] + i[8]*v[3] - i[6]*v[5];
+   res[2] = i[4]*v[0] + i[5]*v[1] + i[2]*v[2] - i[7]*v[3] + i[6]*v[4];
+   res[3] = i[8]*v[1] - i[7]*v[2] + i[9]*v[3];
+   res[4] = i[6]*v[2] - i[8]*v[0] + i[9]*v[4];
+   res[5] = i[7]*v[0] - i[6]*v[1] + i[9]*v[5];
++#endif
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// Packet [schema1,inertia10,vector6]; validate the whole packet before pointers.
++MJAPI int mj_marble_inertia_probe(const mjtNum* packet, int size, mjtNum* output) {
++  if (!packet || !output || size != 17) return 0;
++  for (int i = 0; i < size; ++i) if (!isfinite(packet[i])) return 0;
++  if (packet[0] != 1) return 0;
++  mju_mulInertVec(output, packet+1, packet+11);
++  for (int i = 0; i < 6; ++i) if (!isfinite(output[i])) return 0;
++  return 1;
++}
++#endif
++
+ 
+ // express motion axis in com-based frame
+ void mju_dofCom(mjtNum* restrict res, const mjtNum axis[3], const mjtNum offset[3]) {

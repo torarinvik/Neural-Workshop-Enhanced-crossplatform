@@ -45,6 +45,14 @@ module Sudoku:
     # Not a heuristic to tune: it is the difference between bounded and not.
     const FILL_BUDGET: i64 = 20000
 
+    # A single generated deal owns many short-lived candidate grids while it
+    # fills, digs, and rates. Keep those allocations in a per-attempt region;
+    # otherwise rejection sampling retains every abandoned candidate until the
+    # whole rung is finished and the browser Wasm host eventually runs out of
+    # linear memory.  The value is deliberately the same order as the other
+    # bounded source-backed generators in this port.
+    const ATTEMPT_REGION_BYTES: i64 = 268435456
+
     # What falling short of a rung costs against overshooting it. A rung that
     # cannot find its band hands back something HARDER than promised.
     const UNDERSHOOT_COST: i64 = 3
@@ -67,7 +75,7 @@ module Sudoku:
     # One rung: the size, and the band a deal has to land in. A BAND rather
     # than a floor -- "at least tier two" is satisfied four times in ten by a
     # puzzle the logic cannot finish at all.
-    struct Grade:
+    struct SudokuGrade:
         box: i64
         floor: i64
         ceiling: i64
@@ -75,33 +83,33 @@ module Sudoku:
         keep: i64
         tries: i64
 
-    def grade_at(level_number: i64) -> Grade:
+    def grade_at(level_number: i64) -> SudokuGrade:
         index: mutable i64 = level_number - 1
         index <- 0 if index < 0
         index <- GRADE_COUNT - 1 if index > GRADE_COUNT - 1
         if index == 0:
-            return Grade{box: 2, floor: 0, ceiling: 0, guesses: 0, keep: 0, tries: 20}
+            return SudokuGrade{box: 2, floor: 0, ceiling: 0, guesses: 0, keep: 0, tries: 20}
         if index == 1:
-            return Grade{box: 3, floor: 0, ceiling: 0, guesses: 0, keep: 45, tries: 30}
+            return SudokuGrade{box: 3, floor: 0, ceiling: 0, guesses: 0, keep: 45, tries: 30}
         if index == 2:
-            return Grade{box: 3, floor: 1, ceiling: 1, guesses: 0, keep: 32, tries: 60}
+            return SudokuGrade{box: 3, floor: 1, ceiling: 1, guesses: 0, keep: 32, tries: 60}
         if index == 3:
-            return Grade{box: 3, floor: 2, ceiling: 2, guesses: 0, keep: 0, tries: 120}
+            return SudokuGrade{box: 3, floor: 2, ceiling: 2, guesses: 0, keep: 0, tries: 120}
         if index == 4:
-            return Grade{box: 3, floor: 3, ceiling: 3, guesses: 0, keep: 0, tries: 120}
+            return SudokuGrade{box: 3, floor: 3, ceiling: 3, guesses: 0, keep: 0, tries: 120}
         if index == 5:
-            return Grade{box: 3, floor: 4, ceiling: 5, guesses: 0, keep: 0, tries: 200}
+            return SudokuGrade{box: 3, floor: 4, ceiling: 5, guesses: 0, keep: 0, tries: 200}
         if index == 6:
-            return Grade{box: 3, floor: 6, ceiling: 6, guesses: 1, keep: 0, tries: 60}
+            return SudokuGrade{box: 3, floor: 6, ceiling: 6, guesses: 1, keep: 0, tries: 60}
         if index == 7:
-            return Grade{box: 3, floor: 6, ceiling: 6, guesses: 8, keep: 0, tries: 150}
+            return SudokuGrade{box: 3, floor: 6, ceiling: 6, guesses: 8, keep: 0, tries: 150}
         if index == 8:
-            return Grade{box: 4, floor: 0, ceiling: 1, guesses: 0, keep: 150, tries: 10}
+            return SudokuGrade{box: 4, floor: 0, ceiling: 1, guesses: 0, keep: 150, tries: 10}
         if index == 9:
-            return Grade{box: 4, floor: 1, ceiling: 1, guesses: 0, keep: 120, tries: 10}
+            return SudokuGrade{box: 4, floor: 1, ceiling: 1, guesses: 0, keep: 120, tries: 10}
         if index == 10:
-            return Grade{box: 4, floor: 3, ceiling: 6, guesses: 0, keep: 110, tries: 20}
-        return Grade{box: 4, floor: 6, ceiling: 6, guesses: 40, keep: 100, tries: 4}
+            return SudokuGrade{box: 4, floor: 3, ceiling: 6, guesses: 0, keep: 110, tries: 20}
+        return SudokuGrade{box: 4, floor: 6, ceiling: 6, guesses: 40, keep: 100, tries: 4}
 
     # ------------------------------------------------------------
     # Geometry
@@ -112,7 +120,7 @@ module Sudoku:
     # three module-level caches.
     # ------------------------------------------------------------
 
-    struct Board:
+    struct SudokuBoard:
         box: mutable i64
         size: mutable i64
         cells: mutable i64
@@ -126,11 +134,11 @@ module Sudoku:
         # cells
         box_of: mutable darray[i64]
 
-    def board_of(box: i64) -> Board:
+    def board_of(box: i64) -> SudokuBoard:
         can Memory.Allocate, Abort.Panic:
             size: i64 = box * box
             cells: i64 = size * size
-            out: mutable Board = Board{
+            out: mutable SudokuBoard = SudokuBoard{
                 box: box, size: size, cells: cells,
                 unit_count: 3 * size,
                 # row(size-1) + column(size-1) + the box's own remainder
@@ -143,7 +151,7 @@ module Sudoku:
             fill_peers(&out)
             return out
 
-    def fill_units(board: mutable Board&):
+    def fill_units(board: mutable SudokuBoard&):
         can Abort.Panic:
             size: i64 = board.size
             box: i64 = board.box
@@ -165,7 +173,7 @@ module Sudoku:
 
     # Every other cell sharing a unit, ASCENDING -- the reference sorts each
     # peer set, and `candidates` walks them in that order to strike.
-    def fill_peers(board: mutable Board&):
+    def fill_peers(board: mutable SudokuBoard&):
         can Memory.Allocate, Abort.Panic:
             size: i64 = board.size
             seen: mutable darray[i64] = Ints::zeros(board.cells)
@@ -195,16 +203,16 @@ module Sudoku:
             return get values[index.usize()] else 0
 
 
-    def box_of_cell(board: Board&, cell: i64) -> i64:
+    def box_of_cell(board: SudokuBoard&, cell: i64) -> i64:
         can Abort.Panic:
             return cell_at(board.box_of, cell)
 
 
-    def peer_at(board: Board&, cell: i64, index: i64) -> i64:
+    def peer_at(board: SudokuBoard&, cell: i64, index: i64) -> i64:
         can Abort.Panic:
             return get board.peers[(cell * board.peer_count + index).usize()] else 0
 
-    def unit_cell(board: Board&, unit: i64, slot: i64) -> i64:
+    def unit_cell(board: SudokuBoard&, unit: i64, slot: i64) -> i64:
         can Abort.Panic:
             return get board.units[(unit * board.size + slot).usize()] else 0
 
@@ -289,7 +297,7 @@ module Sudoku:
 
     # A candidate mask per cell into `cand`. False when the grid contradicts
     # itself -- a repeated digit in a unit, or a blank with nothing left.
-    def candidates(board: Board&, grid: darray[i64]&, cand: mutable darray[i64]&) -> bool:
+    def candidates(board: SudokuBoard&, grid: darray[i64]&, cand: mutable darray[i64]&) -> bool:
         can Abort.Panic:
             for cell in 0..<board.cells |board, cand|:
                 Ints::put(cand, cell, board.every)
@@ -311,7 +319,7 @@ module Sudoku:
 
     # Put `digit` in `cell` and strike it from the neighbours. False when that
     # empties one.
-    def assign(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&, cell: i64, digit: i64) -> bool:
+    def assign(board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&, cell: i64, digit: i64) -> bool:
         can Abort.Panic:
             Ints::put(grid, cell, digit)
             bit: i64 = 1 << (digit - 1)
@@ -333,7 +341,7 @@ module Sudoku:
     # The techniques
     # ------------------------------------------------------------
 
-    def naked_single(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+    def naked_single(board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
         can Abort.Panic:
             for cell in 0..<board.cells |board, grid, cand|:
                 continue if Ints::at_ref(grid, cell) != 0
@@ -343,7 +351,7 @@ module Sudoku:
                     return VERDICT_MOVED if assign(board, grid, cand, cell, bit_length(mask)) else VERDICT_BROKEN
             return VERDICT_NONE
 
-    def hidden_single(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+    def hidden_single(board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
         can Abort.Panic:
             size: i64 = board.size
             for unit in 0..<board.unit_count |board, grid, cand, size|:
@@ -378,7 +386,7 @@ module Sudoku:
     # Which row, column or box a set of cells shares is ARITHMETIC here, as in
     # the reference -- on a sixteen, computing it is the difference between
     # this technique costing nothing and costing more than the rest together.
-    def locked_candidates(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+    def locked_candidates(board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
         can Memory.Allocate, Abort.Panic:
             size: i64 = board.size
             spots: mutable darray[i64] = Ints::zeros(MOST_SIZE)
@@ -447,7 +455,7 @@ module Sudoku:
             return VERDICT_NONE
 
     # `width` cells between them holding only `width` digits own those digits.
-    def naked_subset(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+    def naked_subset(board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
         can Memory.Allocate, Abort.Panic:
             size: i64 = board.size
             open_cells: mutable darray[i64] = Ints::zeros(MOST_SIZE)
@@ -492,7 +500,7 @@ module Sudoku:
             return VERDICT_NONE
 
     # `width` digits between them living in only `width` cells own those cells.
-    def hidden_subset(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+    def hidden_subset(board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
         can Memory.Allocate, Abort.Panic:
             size: i64 = board.size
             open_cells: mutable darray[i64] = Ints::zeros(MOST_SIZE)
@@ -562,7 +570,7 @@ module Sudoku:
     # `lane` is a POSITION within a base line, which is exactly the index of a
     # cover line -- rows and columns are transposes of each other, which is why
     # this works without any geometry beyond the unit order.
-    def fish(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+    def fish(board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
         can Memory.Allocate, Abort.Panic:
             size: i64 = board.size
             spot_line: mutable darray[i64] = Ints::zeros(MOST_SIZE)
@@ -627,7 +635,7 @@ module Sudoku:
             return VERDICT_NONE
 
     # One pass of the stack, cheapest technique first.
-    def try_tier(tier: i64, board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+    def try_tier(tier: i64, board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
         can Memory.Allocate, Abort.Panic:
             return naked_single(board, grid, cand) if tier == TIER_NAKED_SINGLE
             return hidden_single(board, grid, cand) if tier == TIER_HIDDEN_SINGLE
@@ -640,7 +648,7 @@ module Sudoku:
     # Solving and rating
     # ------------------------------------------------------------
 
-    struct Solved:
+    struct SudokuSolved:
         tier: mutable i64
         sane: mutable bool
 
@@ -648,9 +656,9 @@ module Sudoku:
     # anything, and back to the top after every one that does -- which is what
     # makes the tier a floor on the puzzle rather than an artefact of the order
     # things were tried in.
-    def logic_solve(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> Solved:
+    def logic_solve(board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> SudokuSolved:
         can Memory.Allocate, Abort.Panic:
-            out: mutable Solved = Solved{tier: 0, sane: true}
+            out: mutable SudokuSolved = SudokuSolved{tier: 0, sane: true}
             running: mutable bool = true
             while running |board, grid, cand, out, running|:
                 blank: mutable bool = false
@@ -673,7 +681,7 @@ module Sudoku:
     # Naked and hidden singles to a fixpoint. Not a rater -- it exists because
     # the search needs to be CHEAP, and one that only forces naked singles
     # branches far more than it has to.
-    def propagate(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> bool:
+    def propagate(board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> bool:
         can Memory.Allocate, Abort.Panic:
             size: i64 = board.size
             moving: mutable bool = true
@@ -714,7 +722,7 @@ module Sudoku:
             return true
 
     # Shared state for the propagating depth-first search.
-    struct Search:
+    struct SudokuSearch:
         limit: mutable i64
         guesses: mutable i64
         found: mutable i64
@@ -730,7 +738,7 @@ module Sudoku:
     # The cell to branch on: fewest candidates, and the FIRST such in ascending
     # cell order -- `min` returns the first minimum, so the search branches on
     # the same cell CPython does.
-    def branch_cell(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
+    def branch_cell(board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&) -> i64:
         can Abort.Panic:
             best: mutable i64 = -1
             best_count: mutable i64 = 0
@@ -742,7 +750,7 @@ module Sudoku:
                     best_count <- count
             return best
 
-    def search_walk(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&, state: mutable Search&):
+    def search_walk(board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&, state: mutable SudokuSearch&):
         can Memory.Allocate, Abort.Panic:
             return if state.found >= state.limit
             return if not propagate(board, grid, cand)
@@ -762,12 +770,12 @@ module Sudoku:
                 if assign(board, &ahead, &spare, cell, Ints::at_ref(&choices, slot)):
                     search_walk(board, &ahead, &spare, state)
 
-    struct Rated:
+    struct SudokuRated:
         tier: mutable i64
         guesses: mutable i64
 
     # Up to `limit` complete grids the givens allow, into `state.wins`.
-    def solutions(board: Board&, givens: mutable darray[i64]&, limit: i64, state: mutable Search&):
+    def solutions(board: SudokuBoard&, givens: mutable darray[i64]&, limit: i64, state: mutable SudokuSearch&):
         can Memory.Allocate, Abort.Panic:
             state.limit <- limit
             state.guesses <- 0
@@ -780,13 +788,13 @@ module Sudoku:
     # The deepest technique this puzzle forces, and the guesses left over.
     # (TIER_SEARCH, n) when the stack runs dry with n branch points still to
     # guess at; (tier, 0) when the logic finished it.
-    def rate(board: Board&, givens: mutable darray[i64]&) -> Rated:
+    def rate(board: SudokuBoard&, givens: mutable darray[i64]&) -> SudokuRated:
         can Memory.Allocate, Abort.Panic:
-            out: mutable Rated = Rated{tier: TIER_SEARCH, guesses: 0}
+            out: mutable SudokuRated = SudokuRated{tier: TIER_SEARCH, guesses: 0}
             cand: mutable darray[i64] = Ints::zeros(board.cells)
             out return if not candidates(board, givens, &cand)
             grid: mutable darray[i64] = copy_of(givens, board.cells)
-            solved: Solved = logic_solve(board, &grid, &cand)
+            solved: SudokuSolved = logic_solve(board, &grid, &cand)
             filled: mutable bool = true
             for cell in 0..<board.cells |grid, filled|:
                 filled <- false if Ints::at_ref(&grid, cell) == 0
@@ -794,7 +802,7 @@ module Sudoku:
                 out.tier <- solved.tier
                 out.guesses <- 0
                 return out
-            state: mutable Search = Search{limit: 1, guesses: 0, found: 0, wins: Ints::zeros(board.cells)}
+            state: mutable SudokuSearch = SudokuSearch{limit: 1, guesses: 0, found: 0, wins: Ints::zeros(board.cells)}
             solutions(board, givens, 1, &state)
             out.tier <- TIER_SEARCH
             out.guesses <- state.guesses if state.found > 0 else 0
@@ -804,12 +812,12 @@ module Sudoku:
     # Generation
     # ------------------------------------------------------------
 
-    struct Fill:
+    struct SudokuFill:
         spent: mutable i64
         done: mutable bool
         grid: mutable darray[i64]
 
-    def fill_walk(board: Board&, grid: mutable darray[i64]&, cand: mutable darray[i64]&, rng: mutable MT19937&, state: mutable Fill&):
+    def fill_walk(board: SudokuBoard&, grid: mutable darray[i64]&, cand: mutable darray[i64]&, rng: mutable MT19937&, state: mutable SudokuFill&):
         can Memory.Allocate, Abort.Panic:
             return if state.done
             return if state.spent > FILL_BUDGET
@@ -835,7 +843,7 @@ module Sudoku:
     # One complete, valid grid. Randomised depth-first, propagating after every
     # placement, and RESTARTING an attempt that goes too deep rather than
     # backtracking out of it -- the restart is what bounds the sixteen.
-    def full_grid(board: Board&, rng: mutable MT19937&) -> darray[i64]:
+    def full_grid(board: SudokuBoard&, rng: mutable MT19937&) -> darray[i64]:
         can Memory.Allocate, Abort.Panic:
             out: mutable darray[i64] = Ints::zeros(board.cells)
             settled: mutable bool = false
@@ -843,7 +851,7 @@ module Sudoku:
                 grid: mutable darray[i64] = Ints::zeros(board.cells)
                 cand: mutable darray[i64] = Ints::zeros(board.cells)
                 continue if not candidates(board, &grid, &cand)
-                state: mutable Fill = Fill{spent: 0, done: false, grid: Ints::zeros(board.cells)}
+                state: mutable SudokuFill = SudokuFill{spent: 0, done: false, grid: Ints::zeros(board.cells)}
                 fill_walk(board, &grid, &cand, rng, &state)
                 if state.done:
                     for slot in 0..<board.cells |state, out|:
@@ -858,7 +866,7 @@ module Sudoku:
     # tree. Asking instead whether any PARTICULAR other digit fits pins that
     # cell first, and a pinned cell prunes so hard that nearly every one of
     # these dies during propagation.
-    def still_only_one(board: Board&, givens: mutable darray[i64]&, cell: i64, held: i64) -> bool:
+    def still_only_one(board: SudokuBoard&, givens: mutable darray[i64]&, cell: i64, held: i64) -> bool:
         can Memory.Allocate, Abort.Panic:
             cand: mutable darray[i64] = Ints::zeros(board.cells)
             false return if not candidates(board, givens, &cand)
@@ -869,7 +877,7 @@ module Sudoku:
                 continue if digit == held
                 trial: mutable darray[i64] = copy_of(givens, board.cells)
                 Ints::put(&trial, cell, digit)
-                state: mutable Search = Search{limit: 1, guesses: 0, found: 0, wins: Ints::zeros(board.cells)}
+                state: mutable SudokuSearch = SudokuSearch{limit: 1, guesses: 0, found: 0, wins: Ints::zeros(board.cells)}
                 solutions(board, &trial, 1, &state)
                 false return if state.found > 0
             return true
@@ -877,7 +885,7 @@ module Sudoku:
     # Blank as many cells as will still leave exactly one solution. `keep`
     # stops early, which is the whole lever for the easy end: a puzzle dug all
     # the way out is nearly always a hard one.
-    def dig(board: Board&, full: mutable darray[i64]&, rng: mutable MT19937&, keep: i64) -> darray[i64]:
+    def dig(board: SudokuBoard&, full: mutable darray[i64]&, rng: mutable MT19937&, keep: i64) -> darray[i64]:
         can Memory.Allocate, Abort.Panic:
             givens: mutable darray[i64] = copy_of(full, board.cells)
             order: mutable darray[i64] = Ints::zeros(board.cells)
@@ -897,7 +905,7 @@ module Sudoku:
             return givens
 
     # A dealt puzzle: what is shown, what it comes to, and what it cost.
-    struct Puzzle:
+    struct SudokuPuzzle:
         box: mutable i64
         cells: mutable i64
         tier: mutable i64
@@ -905,14 +913,19 @@ module Sudoku:
         givens: mutable darray[i64]
         solution: mutable darray[i64]
 
+    def copy_into(values: mutable darray[i64]&, out: mutable darray[i64]&, count: i64):
+        can Abort.Panic:
+            for cell in 0..<count |values, out|:
+                Ints::put(out, cell, Ints::at_ref(values, cell))
+
     # How far off the rung a puzzle is; smaller is better. Distance from the
     # BAND first, shortfall in guesses second -- a puzzle of the right depth
     # always beats one of the wrong depth, however much either branches.
-    struct Miss:
+    struct SudokuMiss:
         adrift: mutable i64
         short: mutable i64
 
-    def miss_of(made: Puzzle&, grade: Grade) -> Miss:
+    def miss_of(made: SudokuPuzzle&, grade: SudokuGrade) -> SudokuMiss:
         can Abort.Panic:
             adrift: mutable i64 = 0
             if made.tier < grade.floor:
@@ -921,21 +934,21 @@ module Sudoku:
                 adrift <- made.tier - grade.ceiling
             short: mutable i64 = grade.guesses - made.guesses
             short <- 0 if short < 0
-            return Miss{adrift: adrift, short: short}
+            return SudokuMiss{adrift: adrift, short: short}
 
-    def miss_beats(one: Miss, two: Miss) -> bool:
+    def miss_beats(one: SudokuMiss, two: SudokuMiss) -> bool:
         can Abort.Panic:
             true return if one.adrift < two.adrift
             false return if one.adrift > two.adrift
             return one.short < two.short
 
-    def deal_one(grade: Grade, rng: mutable MT19937&) -> Puzzle:
+    def deal_one(grade: SudokuGrade, rng: mutable MT19937&) -> SudokuPuzzle:
         can Memory.Allocate, Abort.Panic:
-            board: Board = board_of(grade.box)
+            board: SudokuBoard = board_of(grade.box)
             full: mutable darray[i64] = full_grid(&board, rng)
             givens: mutable darray[i64] = dig(&board, &full, rng, grade.keep)
-            rated: Rated = rate(&board, &givens)
-            return Puzzle{box: grade.box, cells: board.cells, tier: rated.tier,
+            rated: SudokuRated = rate(&board, &givens)
+            return SudokuPuzzle{box: grade.box, cells: board.cells, tier: rated.tier,
                           guesses: rated.guesses, givens: givens, solution: full}
 
     # A puzzle at `level_number`, inside that rung's band.
@@ -946,25 +959,44 @@ module Sudoku:
     # a DIRECTION: UNDERSHOOT_COST makes a puzzle harder than asked for beat one
     # that is easier, so a rung's name is a floor on the work even on the deals
     # where its band was not found.
-    def generate(level_number: i64, seed: i64, attempts: i64) -> Puzzle:
+    def generate(level_number: i64, seed: i64, attempts: i64) -> SudokuPuzzle:
         can Memory.Allocate, Abort.Panic:
-            grade: Grade = grade_at(level_number)
+            grade: SudokuGrade = grade_at(level_number)
             rng: mutable MT19937 = mt19937_new()
             mt_seed_int(&rng, seed.u64())
             tries: mutable i64 = attempts if attempts > 0 else grade.tries
             tries <- 1 if tries < 1
-            nearest: mutable Puzzle = Puzzle{box: grade.box, cells: 0, tier: 0, guesses: 0,
-                                             givens: [], solution: []}
-            closest: mutable Miss = Miss{adrift: 99, short: 99}
+            nearest_box: mutable i64 = grade.box
+            nearest_cells: mutable i64 = 0
+            nearest_tier: mutable i64 = 0
+            nearest_guesses: mutable i64 = 0
+            nearest_givens: mutable darray[i64] = Ints::zeros(MOST_CELLS)
+            nearest_solution: mutable darray[i64] = Ints::zeros(MOST_CELLS)
+            closest: mutable SudokuMiss = SudokuMiss{adrift: 99, short: 99}
             landed: mutable bool = false
-            for attempt in 0..<tries |grade, rng, nearest, closest, landed|:
+            for attempt in 0..<tries |grade, rng, nearest_box, nearest_cells, nearest_tier, nearest_guesses, nearest_givens, nearest_solution, closest, landed|:
                 break if landed
-                made: Puzzle = deal_one(grade, &rng)
-                adrift: Miss = miss_of(&made, grade)
-                if adrift.adrift == 0 and adrift.short == 0:
-                    nearest <- made
-                    landed <- true
-                elif miss_beats(adrift, closest):
-                    nearest <- made
-                    closest <- adrift
-            return nearest
+                region attempt_scratch(ATTEMPT_REGION_BYTES):
+                    in attempt_scratch:
+                        made: mutable SudokuPuzzle = deal_one(grade, &rng)
+                        adrift: SudokuMiss = miss_of(&made, grade)
+                        if adrift.adrift == 0 and adrift.short == 0:
+                            nearest_box <- made.box
+                            nearest_cells <- made.cells
+                            nearest_tier <- made.tier
+                            nearest_guesses <- made.guesses
+                            copy_into(&made.givens, &nearest_givens, made.cells)
+                            copy_into(&made.solution, &nearest_solution, made.cells)
+                            landed <- true
+                        elif miss_beats(adrift, closest):
+                            nearest_box <- made.box
+                            nearest_cells <- made.cells
+                            nearest_tier <- made.tier
+                            nearest_guesses <- made.guesses
+                            copy_into(&made.givens, &nearest_givens, made.cells)
+                            copy_into(&made.solution, &nearest_solution, made.cells)
+                            closest <- adrift
+                    destroy attempt_scratch
+            return SudokuPuzzle{box: nearest_box, cells: nearest_cells, tier: nearest_tier,
+                          guesses: nearest_guesses, givens: nearest_givens,
+                          solution: nearest_solution}

@@ -1,0 +1,149 @@
+diff --git a/src/engine/engine_solver.c b/src/engine/engine_solver.c
+index c86f983..4cf140a 100644
+--- a/src/engine/engine_solver.c
++++ b/src/engine/engine_solver.c
+@@ -1309,6 +1309,7 @@ typedef struct {
+ 
+ #include "engine/marble_primal_prepare_trace.h"
+ #include "engine/marble_primal_eval_trace.h"
++#include "engine/marble_gauss_trace.h"
+ 
+ // Diagnostic-only trace used by the Marble native/WASM parity investigation.
+ // Records Newton state at the first constraint update, line-search decisions,
+@@ -1651,6 +1652,7 @@ static void marbleRecordSparseInput(const mjPrimalContext* ctx) {
+ }
+ 
+ MJAPI void mj_solver_trace_reset(void) {
++  mj_solver_gauss_reset();
+   mj_solver_qcqp_kernel_reset();
+   marble_qcqp_trace_size = 0;
+   marble_qcqp_trace_calls = 0;
+@@ -1874,6 +1876,7 @@ MJAPI void mj_solver_trace_copy(mjtNum* output) {
+ 
+ MJAPI void mj_solver_trace_run(const mjModel* model, mjData* data) {
+   mj_solver_trace_reset();
++  mj_solver_gauss_begin();
+   marble_qcqp_trace_enabled = 1;
+   mj_solver_prepare_trace_begin();
+   mj_solver_eval_trace_begin();
+@@ -1889,6 +1892,7 @@ MJAPI void mj_solver_trace_run(const mjModel* model, mjData* data) {
+   mj_constraint_update_trace_end();
+   mj_solver_prepare_trace_end();
+   mj_solver_eval_trace_end();
++  mj_solver_gauss_end();
+   marble_qcqp_trace_enabled = 0;
+ }
+ 
+@@ -2247,12 +2251,17 @@ static void PrimalUpdateConstraint(mjPrimalContext* ctx, int flg_HessianCone) {
+ 
+   // add Gauss cost, set in quadratic[0]
+   mjtNum Gauss = 0;
++  mjtNum marble_partial[512];
++  mjtNum marble_constraint_cost = ctx->cost;
++  int marble_record_partial = marble_gauss_enabled && ctx->nv >= 0 && ctx->nv <= 512;
+   for (int i=0; i < nv; i++) {
+     Gauss += 0.5 * (ctx->Ma[i] - ctx->qfrc_smooth[i]) * (ctx->qacc[i] - ctx->qacc_smooth[i]);
++    if (marble_record_partial) marble_partial[i] = Gauss;
+   }
+ 
+   ctx->quadGauss[0] = Gauss;
+   ctx->cost += Gauss;
++  marbleRecordGauss(ctx, marble_constraint_cost, Gauss, marble_partial);
+ }
+ 
+ 
+diff --git a/wasm/codegen/generated/bindings.cc b/wasm/codegen/generated/bindings.cc
+index 61e3197..8480c41 100644
+--- a/wasm/codegen/generated/bindings.cc
++++ b/wasm/codegen/generated/bindings.cc
+@@ -50,6 +50,12 @@ extern "C" int mj_solver_qcqp_kernel_calls();
+ extern "C" int mj_solver_qcqp_kernel_overflow();
+ extern "C" int mj_solver_qcqp_kernel_invalid();
+ extern "C" void mj_solver_qcqp_kernel_copy(mjtNum*);
++extern "C" int mj_solver_gauss_schema();
++extern "C" int mj_solver_gauss_size();
++extern "C" int mj_solver_gauss_calls();
++extern "C" int mj_solver_gauss_overflow();
++extern "C" int mj_solver_gauss_invalid();
++extern "C" void mj_solver_gauss_copy(mjtNum*);
+ extern "C" int mj_marble_qcqp5_probe(const mjtNum*, int, mjtNum*, int*);
+ extern "C" int mj_noslip_input_trace_size();
+ extern "C" void mj_noslip_input_trace_copy(mjtNum*);
+@@ -2226,6 +2232,16 @@ val marble_newton_trace_wrapper(const MjModel& m, MjData& d) {
+   output.set("qcqpKernelOverflow", static_cast<bool>(mj_solver_qcqp_kernel_overflow()));
+   output.set("qcqpKernelInvalid", static_cast<bool>(mj_solver_qcqp_kernel_invalid()));
+   const int residual_input_size = mj_noslip_input_trace_size();
++  const int gauss_size = mj_solver_gauss_size();
++  std::vector<mjtNum> gauss_trace(gauss_size);
++  mj_solver_gauss_copy(gauss_trace.data());
++  val gauss_values = val::array();
++  for (int i = 0; i < gauss_size; ++i) gauss_values.set(i, gauss_trace[i]);
++  output.set("gaussTrace", gauss_values);
++  output.set("gaussSchema", mj_solver_gauss_schema());
++  output.set("gaussCalls", mj_solver_gauss_calls());
++  output.set("gaussOverflow", static_cast<bool>(mj_solver_gauss_overflow()));
++  output.set("gaussInvalid", static_cast<bool>(mj_solver_gauss_invalid()));
+   std::vector<mjtNum> residual_input(residual_input_size);
+   mj_noslip_input_trace_copy(residual_input.data());
+   val residual_input_states = val::array();
+diff --git a/src/engine/marble_gauss_trace.h b/src/engine/marble_gauss_trace.h
+new file mode 100644
+index 0000000..1270a61
+--- /dev/null
++++ b/src/engine/marble_gauss_trace.h
+@@ -0,0 +1,55 @@
++// Private, bounded assigned Gauss operands/partial sums; no arithmetic policy.
++#ifndef MARBLE_GAUSS_TRACE_H_
++#define MARBLE_GAUSS_TRACE_H_
++#define MARBLE_GAUSS_CAPACITY 300000
++static mjtNum marble_gauss_values[MARBLE_GAUSS_CAPACITY];
++static int marble_gauss_size, marble_gauss_calls;
++static int marble_gauss_overflow, marble_gauss_invalid, marble_gauss_enabled;
++MJAPI void mj_solver_gauss_reset(void) {
++  marble_gauss_size = marble_gauss_calls = 0;
++  marble_gauss_overflow = marble_gauss_invalid = marble_gauss_enabled = 0;
++}
++MJAPI void mj_solver_gauss_begin(void) { marble_gauss_enabled = 1; }
++MJAPI void mj_solver_gauss_end(void) { marble_gauss_enabled = 0; }
++MJAPI int mj_solver_gauss_schema(void) { return 1; }
++MJAPI int mj_solver_gauss_size(void) { return marble_gauss_size; }
++MJAPI int mj_solver_gauss_calls(void) { return marble_gauss_calls; }
++MJAPI int mj_solver_gauss_overflow(void) { return marble_gauss_overflow; }
++MJAPI int mj_solver_gauss_invalid(void) { return marble_gauss_invalid; }
++MJAPI void mj_solver_gauss_copy(mjtNum* out) {
++  if (out && marble_gauss_size) {
++    memcpy(out, marble_gauss_values, (size_t)marble_gauss_size*sizeof(mjtNum));
++  }
++}
++static void marbleRecordGauss(const mjPrimalContext* ctx, mjtNum before,
++                              mjtNum gauss, const mjtNum* partial) {
++  if (!marble_gauss_enabled) return;
++  int ordinal = marble_gauss_calls++;
++  if (ctx->nv < 0 || ctx->nv > 512 || ctx->nefc < 0 || ctx->nefc > 65536 ||
++      (ctx->marble_trace_valid & (MARBLE_VALID_COST | MARBLE_VALID_MA)) !=
++          (MARBLE_VALID_COST | MARBLE_VALID_MA)) {
++    marble_gauss_invalid = 1;
++    return;
++  }
++  int width = 9 + 5*ctx->nv;
++  if (marble_gauss_size + width > MARBLE_GAUSS_CAPACITY) {
++    marble_gauss_overflow = 1;
++    return;
++  }
++  mjtNum* out = marble_gauss_values + marble_gauss_size;
++  int offset = 0;
++  out[offset++] = 1; out[offset++] = ordinal;
++  out[offset++] = ctx->island; out[offset++] = ctx->nv;
++  out[offset++] = ctx->nefc; out[offset++] = 3;
++  out[offset++] = before; out[offset++] = ctx->cost; out[offset++] = gauss;
++  const mjtNum* arrays[] = {ctx->Ma, ctx->qfrc_smooth, ctx->qacc,
++                           ctx->qacc_smooth, partial};
++  for (int field = 0; field < 5; ++field) {
++    for (int i = 0; i < ctx->nv; ++i) out[offset++] = arrays[field][i];
++  }
++  for (int i = 0; i < width; ++i) {
++    if (!isfinite(out[i])) { marble_gauss_invalid = 1; return; }
++  }
++  marble_gauss_size += width;
++}
++#endif

@@ -1,0 +1,212 @@
+diff --git a/src/engine/engine_solver.c b/src/engine/engine_solver.c
+index d1f7d38..5a1df3d 100644
+--- a/src/engine/engine_solver.c
++++ b/src/engine/engine_solver.c
+@@ -1120,6 +1120,13 @@ void mj_solNoSlip_island(const mjModel* m, mjData* d, int island, int maxiter) {
+ 
+ //------------------------- Primal solvers ---------------------------------------------------------
+ 
++// Diagnostic validity only; these bits never change solver operands.
++enum {
++  MARBLE_VALID_COST = 1, MARBLE_VALID_JV = 2, MARBLE_VALID_SEARCH = 4,
++  MARBLE_VALID_MA = 8, MARBLE_VALID_GRAD = 16, MARBLE_VALID_MGRAD = 32,
++  MARBLE_VALID_JAREF = 64
++};
++
+ // Primal context
+ typedef struct {
+   int is_sparse;          // 1: sparse, 0: dense
+@@ -1233,6 +1240,7 @@ typedef struct {
+   int LSiter;             // number of linesearch iterations
+   int LSresult;           // linesearch result
+   mjtNum LSslope;         // linesearch slope at solution
++  unsigned int marble_trace_valid;  // reset by PrimalPointers; diagnostic only
+ } mjPrimalContext;
+ 
+ // Diagnostic-only trace used by the Marble native/WASM parity investigation.
+@@ -1273,6 +1281,7 @@ static int marble_constraint_output_recorded;
+ static mjtNum marble_constraint_iteration_trace[
+     MARBLE_CONSTRAINT_ITERATION_TRACE_CAPACITY];
+ static int marble_constraint_iteration_trace_size;
++static int marble_constraint_iteration_trace_overflow;
+ #define MARBLE_CHOL_SOLVE_CAPACITY 1000000
+ static mjtNum marble_chol_solve_trace[MARBLE_CHOL_SOLVE_CAPACITY];
+ static int marble_chol_solve_trace_size;
+@@ -1302,6 +1311,12 @@ MJAPI int mj_solver_constraint_iteration_trace_size(void) {
+   return marble_constraint_iteration_trace_size;
+ }
+ 
++MJAPI int mj_solver_constraint_iteration_trace_schema(void) { return 2; }
++
++MJAPI int mj_solver_constraint_iteration_trace_overflow(void) {
++  return marble_constraint_iteration_trace_overflow;
++}
++
+ MJAPI void mj_solver_constraint_iteration_trace_copy(mjtNum* output) {
+   if (output && marble_constraint_iteration_trace_size) {
+     memcpy(output, marble_constraint_iteration_trace,
+@@ -1379,12 +1394,17 @@ static void marbleRecordConstraintIteration(const mjPrimalContext* ctx,
+         ctx->efc_id[i] + 1 > ncontact) ncontact = ctx->efc_id[i] + 1;
+   }
+   const int nefc = ctx->nefc, nf = ctx->nf;
+-  const int width = 7 + 8*nefc + nf + 7*ncontact + 2*ctx->nv;
++  // Schema 2: ten header values, nefc-sized Jv, nv-sized search.
++  const int width = 10 + 8*nefc + nf + 7*ncontact + ctx->nv;
+   if (marble_constraint_iteration_trace_size + width >
+-      MARBLE_CONSTRAINT_ITERATION_TRACE_CAPACITY) return;
++      MARBLE_CONSTRAINT_ITERATION_TRACE_CAPACITY) {
++    marble_constraint_iteration_trace_overflow = 1;
++    return;
++  }
+   mjtNum* out = marble_constraint_iteration_trace +
+                 marble_constraint_iteration_trace_size;
+   int offset = 0;
++  out[offset++] = 2;
+   out[offset++] = phase;
+   out[offset++] = ctx->ne;
+   out[offset++] = nf;
+@@ -1392,7 +1412,9 @@ static void marbleRecordConstraintIteration(const mjPrimalContext* ctx,
+   out[offset++] = ncontact;
+   out[offset++] = ctx->nv;
+   out[offset++] = flg_coneHessian;
+-  out[offset++] = ctx->cost;
++  out[offset++] = (ctx->marble_trace_valid & MARBLE_VALID_COST) ? ctx->cost : 0;
++  out[offset++] = ctx->marble_trace_valid &
++                 (MARBLE_VALID_COST | MARBLE_VALID_JV | MARBLE_VALID_SEARCH);
+ #define MARBLE_ITER_COPY_NUMBERS(values, count) do { \
+     memcpy(out + offset, (values), (size_t)(count) * sizeof(mjtNum)); \
+     offset += (count); \
+@@ -1408,8 +1430,18 @@ static void marbleRecordConstraintIteration(const mjPrimalContext* ctx,
+   MARBLE_ITER_COPY_INTS(ctx->efc_id, nefc);
+   MARBLE_ITER_COPY_INTS(ctx->efc_state, nefc);
+   MARBLE_ITER_COPY_NUMBERS(ctx->efc_force, nefc);
+-  MARBLE_ITER_COPY_NUMBERS(ctx->Jv, ctx->nv);
+-  MARBLE_ITER_COPY_NUMBERS(ctx->search, ctx->nv);
++  if (ctx->marble_trace_valid & MARBLE_VALID_JV) {
++    MARBLE_ITER_COPY_NUMBERS(ctx->Jv, nefc);
++  } else {
++    memset(out + offset, 0, (size_t)nefc*sizeof(mjtNum));
++    offset += nefc;
++  }
++  if (ctx->marble_trace_valid & MARBLE_VALID_SEARCH) {
++    MARBLE_ITER_COPY_NUMBERS(ctx->search, ctx->nv);
++  } else {
++    memset(out + offset, 0, (size_t)ctx->nv*sizeof(mjtNum));
++    offset += ctx->nv;
++  }
+   for (int i = 0; i < ncontact; ++i) {
+     out[offset++] = ctx->contact[i].dim;
+     out[offset++] = ctx->contact[i].mu;
+@@ -1566,6 +1598,7 @@ MJAPI void mj_solver_trace_reset(void) {
+   marble_constraint_input_trace_size = 0;
+   marble_constraint_output_recorded = 0;
+   marble_constraint_iteration_trace_size = 0;
++  marble_constraint_iteration_trace_overflow = 0;
+   marble_chol_solve_trace_size = 0;
+   marble_hessian_trace_size = 0;
+   marble_hessian_output_recorded = 0;
+@@ -1806,13 +1839,21 @@ static void marbleRecordNewtonState(const mjPrimalContext* ctx, int label,
+     else memset(record + offset, 0, (size_t)(count) * sizeof(mjtNum)); \
+     offset += (count); \
+   } while (0)
++#define MARBLE_COPY_VALID_TRACE(field, count, bit) do { \
++    if (ctx->marble_trace_valid & (bit)) { MARBLE_COPY_TRACE(field, count); } \
++    else { \
++      memset(record + offset, 0, (size_t)(count)*sizeof(mjtNum)); \
++      offset += (count); \
++    } \
++  } while (0)
+   MARBLE_COPY_TRACE(efc_force, nefc);
+   MARBLE_COPY_TRACE(qacc, nv);
+-  MARBLE_COPY_TRACE(Ma, nv);
+-  MARBLE_COPY_TRACE(grad, nv);
+-  MARBLE_COPY_TRACE(Mgrad, nv);
+-  MARBLE_COPY_TRACE(search, nv);
+-  MARBLE_COPY_TRACE(Jaref, nefc);
++  MARBLE_COPY_VALID_TRACE(Ma, nv, MARBLE_VALID_MA);
++  MARBLE_COPY_VALID_TRACE(grad, nv, MARBLE_VALID_GRAD);
++  MARBLE_COPY_VALID_TRACE(Mgrad, nv, MARBLE_VALID_MGRAD);
++  MARBLE_COPY_VALID_TRACE(search, nv, MARBLE_VALID_SEARCH);
++  MARBLE_COPY_VALID_TRACE(Jaref, nefc, MARBLE_VALID_JAREF);
++#undef MARBLE_COPY_VALID_TRACE
+ #undef MARBLE_COPY_TRACE
+   marble_newton_trace_count++;
+   marble_newton_trace_value_count += width;
+@@ -2105,6 +2146,7 @@ static void PrimalUpdateConstraint(mjPrimalContext* ctx, int flg_HessianCone) {
+                            ctx->efc_frictionloss, ctx->Jaref, ctx->efc_type, ctx->efc_id,
+                            ctx->contact, ctx->efc_state, ctx->efc_force,
+                            &(ctx->cost), flg_HessianCone);
++  ctx->marble_trace_valid |= MARBLE_VALID_COST;
+   marbleRecordConstraintIteration(ctx, flg_HessianCone, 1);
+   marbleRecordConstraintOutput(ctx);
+ 
+@@ -2141,6 +2183,7 @@ static void PrimalUpdateGrad(mjPrimalContext* ctx) {
+   for (int i=0; i < nv; i++) {
+     ctx->grad[i] = ctx->Ma[i] - ctx->qfrc_smooth[i] - ctx->qfrc_constraint[i];
+   }
++  ctx->marble_trace_valid |= MARBLE_VALID_GRAD;
+ }
+ 
+ 
+@@ -2175,6 +2218,7 @@ static void PrimalUpdateMgrad(mjPrimalContext* ctx, int flg_Newton) {
+     mj_solveLD(ctx->Mgrad, ctx->qLD, ctx->qLDiagInv, nv, 1,
+                ctx->M_rownnz, ctx->M_rowadr, ctx->M_colind, NULL);
+   }
++  ctx->marble_trace_valid |= MARBLE_VALID_MGRAD;
+ }
+ 
+ 
+@@ -2717,6 +2761,7 @@ static mjtNum PrimalSearch(mjPrimalContext* ctx, mjtNum tolerance, mjtNum ls_ite
+     mju_mulMatVecSparse(ctx->Jv, ctx->J, ctx->search, nefc,
+                         ctx->J_rownnz, ctx->J_rowadr, ctx->J_colind, ctx->J_rowsuper);
+   }
++  ctx->marble_trace_valid |= MARBLE_VALID_JV;
+   marbleRecordJv(ctx);
+ 
+   // prepare quadratics and cones
+@@ -3227,6 +3272,7 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
+   if (ctx.flg_flex) {
+     mjd_effMulAdd(m, d, ctx.Ma, ctx.qacc);
+   }
++  ctx.marble_trace_valid |= MARBLE_VALID_MA;
+   marbleRecordNewtonState(&ctx, 11, 0, 0, 0, 0);
+ 
+ 
+@@ -3238,6 +3284,7 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
+                         ctx.J_rownnz, ctx.J_rowadr, ctx.J_colind, ctx.J_rowsuper);
+   }
+   mju_subFrom(ctx.Jaref, ctx.efc_aref, nefc);
++  ctx.marble_trace_valid |= MARBLE_VALID_JAREF;
+   marbleRecordJaref(&ctx);
+   marbleRecordNewtonState(&ctx, 12, 0, 0, 0, 0);
+ 
+@@ -3299,6 +3346,7 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
+   // start both with preconditioned gradient
+   if (!flg_done) {
+     mju_scl(ctx.search, ctx.Mgrad, -1, nv);
++    ctx.marble_trace_valid |= MARBLE_VALID_SEARCH;
+   }
+ 
+   // main loop
+diff --git a/wasm/codegen/generated/bindings.cc b/wasm/codegen/generated/bindings.cc
+index d02963e..450521a 100644
+--- a/wasm/codegen/generated/bindings.cc
++++ b/wasm/codegen/generated/bindings.cc
+@@ -45,6 +45,8 @@ extern "C" void mj_solver_sparse_input_copy(mjtNum*);
+ extern "C" int mj_solver_constraint_input_size();
+ extern "C" void mj_solver_constraint_input_copy(mjtNum*);
+ extern "C" int mj_solver_constraint_iteration_trace_size();
++extern "C" int mj_solver_constraint_iteration_trace_schema();
++extern "C" int mj_solver_constraint_iteration_trace_overflow();
+ extern "C" void mj_solver_constraint_iteration_trace_copy(mjtNum*);
+ extern "C" int mj_solver_chol_solve_size();
+ extern "C" void mj_solver_chol_solve_copy(mjtNum*);
+@@ -2238,6 +2240,8 @@ val marble_newton_trace_wrapper(const MjModel& m, MjData& d) {
+     constraint_iteration_values.set(i, constraint_iteration_trace[i]);
+   }
+   output.set("constraintIterationTrace", constraint_iteration_values);
++  output.set("constraintIterationTraceSchema", mj_solver_constraint_iteration_trace_schema());
++  output.set("constraintIterationTraceOverflow", mj_solver_constraint_iteration_trace_overflow() != 0);
+   const int chol_size = mj_solver_chol_solve_size();
+   std::vector<mjtNum> chol_input(chol_size);
+   mj_solver_chol_solve_copy(chol_input.data());

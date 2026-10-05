@@ -1,0 +1,245 @@
+diff --git a/src/engine/engine_solver.c b/src/engine/engine_solver.c
+index 3e119ef..0b30ce9 100644
+--- a/src/engine/engine_solver.c
++++ b/src/engine/engine_solver.c
+@@ -311,30 +311,57 @@ static void residual(const mjModel* m, const mjData* d, mjtNum* res, int i, int
+ 
+ 
+ #include "engine/marble_qcqp_trace.h"
++#include "engine/marble_costchange_trace.h"
+ 
+ // compute cost change
+ static mjtNum costChange(const mjtNum* A, mjtNum* force, const mjtNum* oldforce,
+                          const mjtNum* res, int dim, int* restored) {
+   mjtNum change;
++  mjtNum delta[6], marble_before_force[6];
++  mjtNum marble_quadratic = 0, marble_dot = 0;
++  int marble_record = marble_cost_owner.active;
++  int marble_restored = 0;
++  if (marble_record) {
++    if (dim != marble_cost_owner.dim || (dim != 2 && dim != 3 && dim != 5) ||
++        !A || !force || !oldforce || !res) {
++      marble_cost_invalid = 1;
++      marble_record = 0;
++    } else {
++      mju_copy(marble_before_force, force, dim);
++    }
++  }
+   if (restored) *restored = 0;
+ 
+   // compute change
+   if (dim == 1) {
+-    mjtNum delta = force[0] - oldforce[0];
+-    change = 0.5*delta*delta*A[0] + delta*res[0];
++    mjtNum scalar_delta = force[0] - oldforce[0];
++    change = 0.5*scalar_delta*scalar_delta*A[0] + scalar_delta*res[0];
+   } else {
+-    mjtNum delta[6];
+     mju_sub(delta, force, oldforce, dim);
+-    change = 0.5*mju_mulVecMatVec(delta, A, delta, dim) + mju_dot(delta, res, dim);
++    if (marble_record) {
++      // Retain each ACTUAL producer return; never evaluate it a second time.
++      marble_quadratic = mju_mulVecMatVec(delta, A, delta, dim);
++      marble_dot = mju_dot(delta, res, dim);
++      change = 0.5*marble_quadratic + marble_dot;
++    } else {
++      change = 0.5*mju_mulVecMatVec(delta, A, delta, dim) + mju_dot(delta, res, dim);
++    }
+   }
++  mjtNum marble_before_change = change;
+ 
+   // positive change: restore force
+   if (change > 1e-10) {
++    marble_restored = 1;
+     if (restored) *restored = 1;
+     mju_copy(force, oldforce, dim);
+     change = 0;
+   }
+ 
++  if (marble_record) {
++    marbleRecordCost(A, oldforce, marble_before_force, res, delta, force,
++                     dim, marble_quadratic, marble_dot, marble_before_change,
++                     change, marble_restored);
++  }
+   return change;
+ }
+ 
+@@ -1110,8 +1137,10 @@ static void solNoSlip(const mjModel* m, mjData* d, int island,
+ 
+         // accumulate improvement and retain the actual per-contact return
+         // value so it can be compared independently of iteration reduction.
++        marbleCostBegin(d, island, iter, i, dim, marble_qcqp_trace_calls);
+         mjtNum contact_change = costChange(Ac, force+i+1, oldforce, res, dim-1,
+             marble_qcqp_trace_enabled ? &force_restored : NULL);
++        marbleCostEnd();
+         improvement -= contact_change;
+         marbleRecordQCQP(d, island, iter, i, dim, mu, Ac, bc, oldforce, res,
+                          &qcqp_witness, force_restored, contact_change);
+@@ -1652,6 +1681,7 @@ static void marbleRecordSparseInput(const mjPrimalContext* ctx) {
+ }
+ 
+ MJAPI void mj_solver_trace_reset(void) {
++  marbleCostReset();
+   mj_solver_gauss_reset();
+   mj_solver_qcqp_kernel_reset();
+   marble_qcqp_trace_size = 0;
+@@ -1877,6 +1907,7 @@ MJAPI void mj_solver_trace_copy(mjtNum* output) {
+ MJAPI void mj_solver_trace_run(const mjModel* model, mjData* data) {
+   mj_solver_trace_reset();
+   mj_solver_gauss_begin();
++  marble_cost_enabled = 1;
+   marble_qcqp_trace_enabled = 1;
+   mj_solver_prepare_trace_begin();
+   mj_solver_eval_trace_begin();
+@@ -1893,6 +1924,8 @@ MJAPI void mj_solver_trace_run(const mjModel* model, mjData* data) {
+   mj_solver_prepare_trace_end();
+   mj_solver_eval_trace_end();
+   mj_solver_gauss_end();
++  marbleCostEnd();
++  marble_cost_enabled = 0;
+   marble_qcqp_trace_enabled = 0;
+ }
+ 
+diff --git a/wasm/codegen/generated/bindings.cc b/wasm/codegen/generated/bindings.cc
+index 2738430..a7e90d4 100644
+--- a/wasm/codegen/generated/bindings.cc
++++ b/wasm/codegen/generated/bindings.cc
+@@ -56,6 +56,12 @@ extern "C" int mj_solver_gauss_calls();
+ extern "C" int mj_solver_gauss_overflow();
+ extern "C" int mj_solver_gauss_invalid();
+ extern "C" void mj_solver_gauss_copy(mjtNum*);
++extern "C" int mj_solver_costchange_schema();
++extern "C" int mj_solver_costchange_size();
++extern "C" int mj_solver_costchange_calls();
++extern "C" int mj_solver_costchange_overflow();
++extern "C" int mj_solver_costchange_invalid();
++extern "C" void mj_solver_costchange_copy(mjtNum*);
+ extern "C" int mj_marble_gauss_probe(const mjtNum*, int, mjtNum*);
+ extern "C" int mj_marble_qcqp2_probe(const mjtNum*, int, mjtNum*, int*);
+ extern "C" int mj_marble_qcqp5_probe(const mjtNum*, int, mjtNum*, int*);
+@@ -2244,6 +2250,19 @@ val marble_newton_trace_wrapper(const MjModel& m, MjData& d) {
+   output.set("gaussCalls", mj_solver_gauss_calls());
+   output.set("gaussOverflow", static_cast<bool>(mj_solver_gauss_overflow()));
+   output.set("gaussInvalid", static_cast<bool>(mj_solver_gauss_invalid()));
++  const int cost_size = mj_solver_costchange_size();
++  if (cost_size < 0 || cost_size > 300000) {
++    throw std::runtime_error("unbounded costChange recorder size");
++  }
++  std::vector<mjtNum> cost_trace(cost_size);
++  mj_solver_costchange_copy(cost_trace.data());
++  val cost_values = val::array();
++  for (int i = 0; i < cost_size; ++i) cost_values.set(i, cost_trace[i]);
++  output.set("costChangeTrace", cost_values);
++  output.set("costChangeSchema", mj_solver_costchange_schema());
++  output.set("costChangeCalls", mj_solver_costchange_calls());
++  output.set("costChangeOverflow", static_cast<bool>(mj_solver_costchange_overflow()));
++  output.set("costChangeInvalid", static_cast<bool>(mj_solver_costchange_invalid()));
+   std::vector<mjtNum> residual_input(residual_input_size);
+   mj_noslip_input_trace_copy(residual_input.data());
+   val residual_input_states = val::array();
+diff --git a/src/engine/marble_costchange_trace.h b/src/engine/marble_costchange_trace.h
+new file mode 100644
+index 0000000..898e350
+--- /dev/null
++++ b/src/engine/marble_costchange_trace.h
+@@ -0,0 +1,100 @@
++// Private assigned no-slip costChange diagnostics; never a physics policy.
++#ifndef MARBLE_COSTCHANGE_TRACE_H_
++#define MARBLE_COSTCHANGE_TRACE_H_
++
++#define MARBLE_COSTCHANGE_CAPACITY 300000
++typedef struct {
++  int active;
++  int ordinal;
++  int island;
++  int iteration;
++  int row;
++  int contact;
++  int dim;
++} marbleCostOwner;
++static marbleCostOwner marble_cost_owner;
++static mjtNum marble_cost_trace[MARBLE_COSTCHANGE_CAPACITY];
++static int marble_cost_size;
++static int marble_cost_calls;
++static int marble_cost_overflow;
++static int marble_cost_invalid;
++static int marble_cost_enabled;
++
++MJAPI int mj_solver_costchange_schema(void) { return 1; }
++MJAPI int mj_solver_costchange_size(void) { return marble_cost_size; }
++MJAPI int mj_solver_costchange_calls(void) { return marble_cost_calls; }
++MJAPI int mj_solver_costchange_overflow(void) { return marble_cost_overflow; }
++MJAPI int mj_solver_costchange_invalid(void) { return marble_cost_invalid; }
++MJAPI void mj_solver_costchange_copy(mjtNum* output) {
++  if (output && marble_cost_size) {
++    memcpy(output, marble_cost_trace, (size_t)marble_cost_size * sizeof(mjtNum));
++  }
++}
++static void marbleCostReset(void) {
++  marble_cost_owner.active = 0;
++  marble_cost_size = marble_cost_calls = marble_cost_overflow = marble_cost_invalid = 0;
++}
++static void marbleCostBegin(const mjData* d, int island, int iteration,
++                            int row, int dim, int ordinal) {
++  marble_cost_owner.active = 0;
++  if (!marble_cost_enabled) return;
++  int call = marble_cost_calls++;
++  if (!d || !d->efc_id || !d->contact || (dim != 3 && dim != 4 && dim != 6) ||
++      row < 0 || row > d->nefc - dim || island < -1 || iteration < 0 ||
++      ordinal != call || d->efc_id[row] < 0 || d->efc_id[row] >= d->ncon ||
++      d->contact[d->efc_id[row]].dim != dim) {
++    marble_cost_invalid = 1;
++    return;
++  }
++  marble_cost_owner = (marbleCostOwner){1, ordinal, island, iteration, row,
++                                       d->efc_id[row], dim-1};
++}
++static void marbleCostEnd(void) { marble_cost_owner.active = 0; }
++
++static void marbleRecordCost(const mjtNum* A, const mjtNum* oldforce,
++                             const mjtNum* beforeforce, const mjtNum* res,
++                             const mjtNum* delta, const mjtNum* finalforce,
++                             int dim, mjtNum quadratic, mjtNum dot,
++                             mjtNum beforechange, mjtNum finalchange, int restored) {
++  if (!marble_cost_owner.active) return;
++  if (!A || !oldforce || !beforeforce || !res || !delta || !finalforce ||
++      dim != marble_cost_owner.dim || (dim != 2 && dim != 3 && dim != 5) ||
++      (restored != 0 && restored != 1)) {
++    marble_cost_invalid = 1;
++    return;
++  }
++  int width = 13 + dim*dim + 5*dim;
++  if (marble_cost_size > MARBLE_COSTCHANGE_CAPACITY - width) {
++    marble_cost_overflow = 1;
++    return;
++  }
++  mjtNum* out = marble_cost_trace + marble_cost_size;
++  int at = 0;
++  out[at++] = 1;
++  out[at++] = marble_cost_owner.ordinal;
++  out[at++] = marble_cost_owner.island;
++  out[at++] = marble_cost_owner.iteration;
++  out[at++] = marble_cost_owner.row;
++  out[at++] = marble_cost_owner.contact;
++  out[at++] = dim;
++  out[at++] = 7;  // actual delta, quadratic/dot, final/restoration assigned
++  out[at++] = restored;
++  out[at++] = quadratic;
++  out[at++] = dot;
++  out[at++] = beforechange;
++  out[at++] = finalchange;
++  for (int i = 0; i < dim*dim; ++i) out[at++] = A[i];
++  for (int i = 0; i < dim; ++i) out[at++] = oldforce[i];
++  for (int i = 0; i < dim; ++i) out[at++] = beforeforce[i];
++  for (int i = 0; i < dim; ++i) out[at++] = res[i];
++  for (int i = 0; i < dim; ++i) out[at++] = delta[i];
++  for (int i = 0; i < dim; ++i) out[at++] = finalforce[i];
++  for (int i = 0; i < width; ++i) {
++    if (!isfinite(out[i])) {
++      marble_cost_invalid = 1;
++      return;
++    }
++  }
++  marble_cost_size += width;
++}
++#endif

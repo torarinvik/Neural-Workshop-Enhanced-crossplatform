@@ -1,0 +1,558 @@
+# Common-v1 adapter for the source Buzz Wire task.
+#
+# The source kernel owns the wire and hand physics.  This module is the durable
+# ABI-facing controller: it keeps a fixed-size copy of the dealt wire and hand
+# state between calls, materialises the source objects for one operation, and
+# copies the state back before the temporary arena is destroyed.  Keeping that
+# boundary explicit is important here because the source wire is a darray-heavy
+# object and the source hand owns the Python-compatible Gaussian cache.
+
+module BuzzWireGame:
+
+    const MAX_WIRE_POINTS: i64 = 2048
+    const MAX_RESULTS: i64 = 32
+    const REFERENCE_WIDTH: f64 = 912.0
+    const REFERENCE_HEIGHT: f64 = 684.0
+    const CLIMB_AT: f64 = 0.68
+
+    const PHASE_READY: i64 = 0
+    const PHASE_FLYING: i64 = 1
+    const PHASE_SETTLED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    const ACTION_START: i64 = 0
+    const ACTION_PRESS: i64 = 1
+    const ACTION_RELEASE: i64 = 2
+    const ACTION_TAP: i64 = 3
+    const ACTION_CLEAR: i64 = 4
+
+    const INFO_PHASE: i64 = 0
+    const INFO_CURRENT_RUNG: i64 = 1
+    const INFO_TRIAL_RUNG: i64 = 2
+    const INFO_TRIAL: i64 = 3
+    const INFO_TOTAL_TRIALS: i64 = 4
+    const INFO_ADAPTIVE: i64 = 5
+    const INFO_TOUCHES_ALLOWED: i64 = 6
+    const INFO_BUZZES: i64 = 7
+    const INFO_ALONG_PPM: i64 = 8
+    const INFO_SECONDS_LEFT_MS: i64 = 9
+    const INFO_USED_PPM: i64 = 10
+    const INFO_BEAD: i64 = 11
+    const INFO_BEADS: i64 = 12
+    const INFO_WIRE_LENGTH_UM: i64 = 13
+    const INFO_WIRE_POINTS: i64 = 14
+    const INFO_CLOCK_MS: i64 = 15
+    const INFO_DEADLINE_MS: i64 = 16
+    const INFO_VERDICT: i64 = 17
+    const INFO_RESULT_COUNT: i64 = 18
+    const INFO_WINS: i64 = 19
+    const INFO_TOUCH_TOTAL: i64 = 20
+    const INFO_BEST_RUNG: i64 = 21
+    const INFO_HELD_MASK: i64 = 22
+    const INFO_SCRAPING: i64 = 23
+    const INFO_HOME: i64 = 24
+    const INFO_SHOW_METER: i64 = 25
+    const INFO_SHOW_BEADS: i64 = 26
+    const INFO_SHOW_SIGHT: i64 = 27
+    const INFO_LOSS_REASON: i64 = 28
+
+    const VALUE_CX: i64 = 0
+    const VALUE_CY: i64 = 1
+    const VALUE_CZ: i64 = 2
+    const VALUE_VX: i64 = 3
+    const VALUE_VY: i64 = 4
+    const VALUE_VZ: i64 = 5
+    const VALUE_YAW: i64 = 6
+    const VALUE_PITCH: i64 = 7
+    const VALUE_ARC: i64 = 8
+    const VALUE_TOUCHES: i64 = 9
+    const VALUE_HOME: i64 = 10
+    const VALUE_BEAD: i64 = 11
+    const VALUE_SCRAPING: i64 = 12
+    const VALUE_WIRE_X: i64 = 20
+    const VALUE_WIRE_Y: i64 = 21
+    const VALUE_WIRE_Z: i64 = 22
+    const VALUE_WIRE_TX: i64 = 23
+    const VALUE_WIRE_TY: i64 = 24
+    const VALUE_WIRE_TZ: i64 = 25
+    const VALUE_WIRE_ARC: i64 = 26
+    const RESULT_RUNG: i64 = 100
+    const RESULT_HOME: i64 = 101
+    const RESULT_BUZZES: i64 = 102
+    const RESULT_TIME_MS: i64 = 103
+
+    const LOSS_BUZZ: i64 = 1
+    const LOSS_TIMEOUT: i64 = 2
+
+    struct BuzzWireRun:
+        rng: mutable MT19937
+        gauss: mutable GaussCache
+        start_rung: mutable i64
+        current_rung: mutable i64
+        trial_rung: mutable i64
+        total_trials: mutable i64
+        adaptive: mutable bool
+        show_meter: mutable bool
+        show_beads: mutable bool
+        show_sight: mutable bool
+        trial: mutable i64
+        phase: mutable i64
+        verdict: mutable i64
+        loss_reason: mutable i64
+        clock_ms: mutable i64
+        started_ms: mutable i64
+        deadline_ms: mutable i64
+        trial_seconds_ms: mutable i64
+        touches_allowed: mutable i64
+        buzzes: mutable i64
+        held_mask: mutable i64
+        asked_port: mutable i64
+        scraping: mutable bool
+        home: mutable bool
+        centre_x: mutable f64
+        centre_y: mutable f64
+        centre_z: mutable f64
+        velocity_x: mutable f64
+        velocity_y: mutable f64
+        velocity_z: mutable f64
+        yaw: mutable f64
+        pitch: mutable f64
+        arc: mutable f64
+        offset: mutable f64
+        bead: mutable i64
+        wire_count: mutable i64
+        wire_span: mutable f64
+        wire_length: mutable f64
+        wire_radius: mutable f64
+        wire_beads: mutable i64
+        wire_px: mutable f64[MAX_WIRE_POINTS]
+        wire_py: mutable f64[MAX_WIRE_POINTS]
+        wire_pz: mutable f64[MAX_WIRE_POINTS]
+        wire_tx: mutable f64[MAX_WIRE_POINTS]
+        wire_ty: mutable f64[MAX_WIRE_POINTS]
+        wire_tz: mutable f64[MAX_WIRE_POINTS]
+        wire_arcs: mutable f64[MAX_WIRE_POINTS]
+        result_rung: mutable i64[MAX_RESULTS]
+        result_home: mutable i64[MAX_RESULTS]
+        result_buzzes: mutable i64[MAX_RESULTS]
+        result_time_ms: mutable i64[MAX_RESULTS]
+        result_count: mutable i64
+        wins: mutable i64
+        touch_total: mutable i64
+        best_rung: mutable i64
+
+    def port_bit(port: i64) -> i64:
+        can Abort.Panic:
+            return 1 if port == 0 else (2 if port == 1 else (4 if port == 2 else (8 if port == 3 else (16 if port == 4 else (32 if port == 5 else (64 if port == 6 else (128 if port == 7 else (256 if port == 8 else (512 if port == 9 else (1024 if port == 10 else 0))))))))))
+
+    def active(run: BuzzWireRun&, port: i64) -> bool:
+        can Abort.Panic:
+            bit: i64 = port_bit(port)
+            return false if bit == 0
+            return run.asked_port == port or (run.held_mask % (bit * 2)) >= bit
+
+    def clear_wire(run: mutable BuzzWireRun&):
+        can Abort.Panic:
+            run.wire_count <- 0
+            run.wire_span <- 0.0
+            run.wire_length <- 0.0
+            run.wire_radius <- 0.0
+            run.wire_beads <- 0
+            for at in 0..<MAX_WIRE_POINTS |at, run|:
+                run.wire_px[at.usize()] <- 0.0
+                run.wire_py[at.usize()] <- 0.0
+                run.wire_pz[at.usize()] <- 0.0
+                run.wire_tx[at.usize()] <- 0.0
+                run.wire_ty[at.usize()] <- 0.0
+                run.wire_tz[at.usize()] <- 0.0
+                run.wire_arcs[at.usize()] <- 0.0
+
+    def clear_results(run: mutable BuzzWireRun&):
+        can Abort.Panic:
+            run.result_count <- 0
+            run.wins <- 0
+            run.touch_total <- 0
+            run.best_rung <- 0
+            for at in 0..<MAX_RESULTS |at, run|:
+                run.result_rung[at.usize()] <- 0
+                run.result_home[at.usize()] <- 0
+                run.result_buzzes[at.usize()] <- 0
+                run.result_time_ms[at.usize()] <- 0
+
+    def reset(run: mutable BuzzWireRun&):
+        can Abort.Panic:
+            run.current_rung <- run.start_rung
+            run.trial_rung <- run.start_rung
+            run.trial <- 0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.loss_reason <- 0
+            run.clock_ms <- 0
+            run.started_ms <- 0
+            run.deadline_ms <- 0
+            run.trial_seconds_ms <- 0
+            run.touches_allowed <- 0
+            run.buzzes <- 0
+            run.held_mask <- 0
+            run.asked_port <- -1
+            run.scraping <- false
+            run.home <- false
+            run.centre_x <- 0.0
+            run.centre_y <- 0.0
+            run.centre_z <- 0.0
+            run.velocity_x <- 0.0
+            run.velocity_y <- 0.0
+            run.velocity_z <- 0.0
+            run.yaw <- 0.0
+            run.pitch <- 0.0
+            run.arc <- 0.0
+            run.offset <- 0.0
+            run.bead <- 0
+            clear_wire(run)
+            clear_results(run)
+
+    def copy_from_wire(run: mutable BuzzWireRun&, wire: Buzzwire::BuzzWireWire&):
+        can Abort.Panic:
+            Buzzwire::adapter_wire_save(wire, &run.wire_count, &run.wire_span, &run.wire_length,
+                &run.wire_radius, &run.wire_beads, &run.wire_px, &run.wire_py, &run.wire_pz,
+                &run.wire_tx, &run.wire_ty, &run.wire_tz, &run.wire_arcs)
+
+    def copy_to_wire(run: BuzzWireRun&, wire: mutable Buzzwire::BuzzWireWire&):
+        can Abort.Panic:
+            Buzzwire::adapter_wire_load(wire, run.wire_count, run.wire_span, run.wire_length,
+                run.wire_radius, run.wire_beads, run.wire_px, run.wire_py, run.wire_pz,
+                run.wire_tx, run.wire_ty, run.wire_tz, run.wire_arcs)
+
+    def copy_from_hand(run: mutable BuzzWireRun&, hand: Buzzwire::BuzzWireHand&):
+        can Abort.Panic:
+            run.centre_x <- hand.centre.x
+            run.centre_y <- hand.centre.y
+            run.centre_z <- hand.centre.z
+            run.velocity_x <- hand.velocity.x
+            run.velocity_y <- hand.velocity.y
+            run.velocity_z <- hand.velocity.z
+            run.yaw <- hand.yaw
+            run.pitch <- hand.pitch
+            run.arc <- hand.arc
+            run.scraping <- hand.scraping
+            run.home <- hand.home
+            run.rng <- hand.rng
+            run.gauss <- hand.gauss
+
+    def copy_to_hand(run: BuzzWireRun&, hand: mutable Buzzwire::BuzzWireHand&):
+        can Abort.Panic:
+            hand.centre <- Buzzwire::vec3(run.centre_x, run.centre_y, run.centre_z)
+            hand.velocity <- Buzzwire::vec3(run.velocity_x, run.velocity_y, run.velocity_z)
+            hand.yaw <- run.yaw
+            hand.pitch <- run.pitch
+            hand.arc <- run.arc
+            hand.scraping <- run.scraping
+            hand.home <- run.home
+            hand.rng <- run.rng
+            hand.gauss <- run.gauss
+
+    def wire_and_hand(run: BuzzWireRun&, wire: mutable Buzzwire::BuzzWireWire&, hand: mutable Buzzwire::BuzzWireHand&):
+        can Abort.Panic:
+            copy_to_wire(run, wire)
+            copy_to_hand(run, hand)
+
+    def allowed_seconds(run: BuzzWireRun&) -> f64:
+        can Abort.Panic:
+            return run.trial_seconds_ms.f64() / 1000.0
+
+    def deal_trial(run: mutable BuzzWireRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            region scratch(268435456):
+                in scratch:
+                    wire: mutable Buzzwire::BuzzWireWire = Buzzwire::BuzzWireWire()
+                    seed: i64 = py_randrange(&run.rng, 0, 1073741824)
+                    grade: Buzzwire::BuzzWireGrade = Buzzwire::deal(run.current_rung, seed, &wire)
+                    hand: mutable Buzzwire::BuzzWireHand = Buzzwire::BuzzWireHand(&wire, 0)
+                    hand.rng <- run.rng
+                    hand.gauss <- run.gauss
+                    copy_from_wire(run, &wire)
+                    copy_from_hand(run, &hand)
+                    run.trial_rung <- run.current_rung
+                    run.touches_allowed <- grade.touches
+                    run.trial_seconds_ms <- (grade.seconds * 1000.0).i64()
+                    run.offset <- Buzzwire::hand_offset(&hand, &wire, grade)
+                    run.bead <- Buzzwire::bead_at(&wire, hand.arc)
+                destroy scratch
+            run.trial <- run.trial + 1
+            run.clock_ms <- now_ms
+            run.started_ms <- now_ms
+            run.deadline_ms <- now_ms + run.trial_seconds_ms
+            run.buzzes <- 0
+            run.held_mask <- 0
+            run.asked_port <- -1
+            run.scraping <- false
+            run.home <- false
+            run.verdict <- -1
+            run.loss_reason <- 0
+            run.phase <- PHASE_FLYING
+
+    def commit_result(run: mutable BuzzWireRun&, settled: i64):
+        can Abort.Panic:
+            elapsed: i64 = run.clock_ms - run.started_ms
+            slot: i64 = run.result_count
+            if slot < MAX_RESULTS:
+                run.result_rung[slot.usize()] <- run.trial_rung
+                run.result_home[slot.usize()] <- settled
+                run.result_buzzes[slot.usize()] <- run.buzzes
+                run.result_time_ms[slot.usize()] <- elapsed
+                run.result_count <- slot + 1
+
+    def update_score(run: mutable BuzzWireRun&, settled: i64):
+        can Abort.Panic:
+            if settled == 1:
+                run.wins <- run.wins + 1
+                if run.trial_rung > run.best_rung:
+                    run.best_rung <- run.trial_rung
+            run.touch_total <- run.touch_total + run.buzzes
+
+    def update_adaptive(run: mutable BuzzWireRun&, settled: i64, elapsed: i64):
+        can Abort.Panic:
+            if run.adaptive:
+                if settled == 1:
+                    # Keep this decision in integer milliseconds.  The source
+                    # uses a 0.68 fraction of the trial allowance; spelling
+                    # that as integer arithmetic keeps the controller in the
+                    # backend's simple scalar subset while retaining the same
+                    # floor-at-the-millisecond boundary as the source timer.
+                    climb_limit_ms: i64 = (run.trial_seconds_ms * 68) / 100
+                    next_rung: i64 = Buzzwire::clamped_rung(run.current_rung + 1)
+                    run.current_rung <- next_rung if elapsed <= climb_limit_ms
+                else:
+                    next_rung: i64 = Buzzwire::clamped_rung(run.current_rung - 1)
+                    run.current_rung <- next_rung
+
+    def wanted(run: BuzzWireRun&, grade: Buzzwire::BuzzWireGrade) -> Buzzwire::BuzzWireVec3:
+        can Abort.Panic:
+            shove: mutable Buzzwire::BuzzWireVec3 = Buzzwire::vec3(0.0, 0.0, 0.0)
+            shove <- Buzzwire::v_add(shove, Buzzwire::push_vector(grade, 0)) if active(run, 0)
+            shove <- Buzzwire::v_add(shove, Buzzwire::push_vector(grade, 1)) if active(run, 1)
+            shove <- Buzzwire::v_add(shove, Buzzwire::push_vector(grade, 2)) if active(run, 2)
+            shove <- Buzzwire::v_add(shove, Buzzwire::push_vector(grade, 3)) if active(run, 3)
+            shove <- Buzzwire::v_add(shove, Buzzwire::push_vector(grade, 4)) if active(run, 4)
+            shove <- Buzzwire::v_add(shove, Buzzwire::push_vector(grade, 5)) if active(run, 5)
+            return shove
+
+    def has_push(run: BuzzWireRun&) -> bool:
+        can Abort.Panic:
+            shove: mutable Buzzwire::BuzzWireVec3 = Buzzwire::vec3(0.0, 0.0, 0.0)
+            grade: Buzzwire::BuzzWireGrade = Buzzwire::grade_of(run.trial_rung)
+            shove <- Buzzwire::v_add(shove, Buzzwire::push_vector(grade, 0)) if active(run, 0)
+            shove <- Buzzwire::v_add(shove, Buzzwire::push_vector(grade, 1)) if active(run, 1)
+            shove <- Buzzwire::v_add(shove, Buzzwire::push_vector(grade, 2)) if active(run, 2)
+            shove <- Buzzwire::v_add(shove, Buzzwire::push_vector(grade, 3)) if active(run, 3)
+            shove <- Buzzwire::v_add(shove, Buzzwire::push_vector(grade, 4)) if active(run, 4)
+            shove <- Buzzwire::v_add(shove, Buzzwire::push_vector(grade, 5)) if active(run, 5)
+            return Buzzwire::v_length(shove) > 1e-9
+
+    def advance(run: mutable BuzzWireRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 2 if run.phase != PHASE_FLYING
+            delta: i64 = now_ms - run.clock_ms
+            bounded: i64 = 100 if delta > 100 else (0 if delta < 0 else delta)
+            grade: Buzzwire::BuzzWireGrade = Buzzwire::grade_of(run.trial_rung)
+            push: mutable Buzzwire::BuzzWireVec3 = wanted(run, grade)
+            pushing: bool = has_push(run)
+            length: f64 = Buzzwire::v_length(push)
+            push <- Buzzwire::v_scale(push, 1.0 / length) if pushing and length > 1e-9
+            pitch_push: mutable f64 = 0.0
+            yaw_push: mutable f64 = 0.0
+            pitch_push <- pitch_push + 1.0 if active(run, Buzzwire::TILT_UP)
+            pitch_push <- pitch_push - 1.0 if active(run, Buzzwire::TILT_DOWN)
+            yaw_push <- yaw_push + 1.0 if active(run, Buzzwire::TILT_LEFT)
+            yaw_push <- yaw_push - 1.0 if active(run, Buzzwire::TILT_RIGHT)
+            brace: bool = active(run, Buzzwire::GRIP)
+            before_touch: i64 = run.buzzes
+            region scratch(268435456):
+                in scratch:
+                    wire: mutable Buzzwire::BuzzWireWire = Buzzwire::BuzzWireWire()
+                    copy_to_wire(run, &wire)
+                    hand: mutable Buzzwire::BuzzWireHand = Buzzwire::BuzzWireHand(&wire, 0)
+                    copy_to_hand(run, &hand)
+                    step: Buzzwire::BuzzWireStep = Buzzwire::advance(&hand, &wire, grade,
+                        bounded.f64() / 1000.0, pushing, push, pitch_push,
+                        yaw_push, brace)
+                    copy_from_hand(run, &hand)
+                    run.offset <- Buzzwire::hand_offset(&hand, &wire, grade)
+                    run.bead <- Buzzwire::bead_at(&wire, hand.arc)
+                    run.buzzes <- hand.touches
+                    run.scraping <- step.scraping
+                    run.home <- step.home
+                destroy scratch
+            run.clock_ms <- now_ms
+            run.asked_port <- -1
+            settled: mutable i64 = -1
+            reason: mutable i64 = 0
+            if run.buzzes > run.touches_allowed:
+                settled <- 0
+                reason <- LOSS_BUZZ
+            elif run.home:
+                settled <- 1
+            elif now_ms >= run.deadline_ms:
+                settled <- 0
+                reason <- LOSS_TIMEOUT
+            if settled >= 0:
+                commit_result(run, settled)
+                update_score(run, settled)
+                update_adaptive(run, settled, run.clock_ms - run.started_ms)
+                run.verdict <- settled
+                run.loss_reason <- reason
+                run.phase <- PHASE_SETTLED
+            return 1 if run.phase != PHASE_FLYING or run.buzzes != before_touch or bounded > 0 else 2
+
+    def info(run: BuzzWireRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_CURRENT_RUNG: return run.current_rung
+            if field == INFO_TRIAL_RUNG: return run.trial_rung
+            if field == INFO_TRIAL: return run.trial
+            if field == INFO_TOTAL_TRIALS: return run.total_trials
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_TOUCHES_ALLOWED: return run.touches_allowed
+            if field == INFO_BUZZES: return run.buzzes
+            if field == INFO_ALONG_PPM: return 0 if run.wire_length <= 0.0 else (run.arc * 1000000.0 / run.wire_length).i64()
+            if field == INFO_SECONDS_LEFT_MS: return 0 if run.phase != PHASE_FLYING or run.deadline_ms <= run.clock_ms else run.deadline_ms - run.clock_ms
+            if field == INFO_USED_PPM:
+                grade: Buzzwire::BuzzWireGrade = Buzzwire::grade_of(run.trial_rung)
+                room: f64 = Buzzwire::clearance(grade)
+                return 0 if room <= 0.0 else (run.offset * 1000000.0 / room).i64()
+            if field == INFO_BEAD: return run.bead
+            if field == INFO_BEADS: return run.wire_beads
+            if field == INFO_WIRE_LENGTH_UM: return (run.wire_length * 1000000.0).i64()
+            if field == INFO_WIRE_POINTS: return run.wire_count
+            if field == INFO_CLOCK_MS: return run.clock_ms
+            if field == INFO_DEADLINE_MS: return run.deadline_ms
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_RESULT_COUNT: return run.result_count
+            if field == INFO_WINS: return run.wins
+            if field == INFO_TOUCH_TOTAL: return run.touch_total
+            if field == INFO_BEST_RUNG: return run.best_rung
+            if field == INFO_HELD_MASK: return run.held_mask
+            if field == INFO_SCRAPING: return 1 if run.scraping else 0
+            if field == INFO_HOME: return 1 if run.home else 0
+            if field == INFO_SHOW_METER: return 1 if run.show_meter else 0
+            if field == INFO_SHOW_BEADS: return 1 if run.show_beads else 0
+            if field == INFO_SHOW_SIGHT: return 1 if run.show_sight else 0
+            if field == INFO_LOSS_REASON: return run.loss_reason
+            return -1
+
+    def value(run: BuzzWireRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            if field == RESULT_RUNG or field == RESULT_HOME or field == RESULT_BUZZES or field == RESULT_TIME_MS:
+                return -1 if at < 0 or at >= run.result_count
+                if field == RESULT_RUNG: return run.result_rung[at.usize()]
+                if field == RESULT_HOME: return run.result_home[at.usize()]
+                if field == RESULT_BUZZES: return run.result_buzzes[at.usize()]
+                return run.result_time_ms[at.usize()]
+            if field == VALUE_CX: return (run.centre_x * 1000000.0).i64() if at == 0 else -1
+            if field == VALUE_CY: return (run.centre_y * 1000000.0).i64() if at == 0 else -1
+            if field == VALUE_CZ: return (run.centre_z * 1000000.0).i64() if at == 0 else -1
+            if field == VALUE_VX: return (run.velocity_x * 1000000.0).i64() if at == 0 else -1
+            if field == VALUE_VY: return (run.velocity_y * 1000000.0).i64() if at == 0 else -1
+            if field == VALUE_VZ: return (run.velocity_z * 1000000.0).i64() if at == 0 else -1
+            if field == VALUE_YAW: return (run.yaw * 1000000.0).i64() if at == 0 else -1
+            if field == VALUE_PITCH: return (run.pitch * 1000000.0).i64() if at == 0 else -1
+            if field == VALUE_ARC: return (run.arc * 1000000.0).i64() if at == 0 else -1
+            if field == VALUE_TOUCHES: return run.buzzes if at == 0 else -1
+            if field == VALUE_HOME: return 1 if run.home and at == 0 else (0 if at == 0 else -1)
+            if field == VALUE_BEAD: return run.bead if at == 0 else -1
+            if field == VALUE_SCRAPING: return 1 if run.scraping and at == 0 else (0 if at == 0 else -1)
+            if field == VALUE_WIRE_X: return -1 if at < 0 or at >= run.wire_count else (run.wire_px[at.usize()] * 1000000.0).i64()
+            if field == VALUE_WIRE_Y: return -1 if at < 0 or at >= run.wire_count else (run.wire_py[at.usize()] * 1000000.0).i64()
+            if field == VALUE_WIRE_Z: return -1 if at < 0 or at >= run.wire_count else (run.wire_pz[at.usize()] * 1000000.0).i64()
+            if field == VALUE_WIRE_TX: return -1 if at < 0 or at >= run.wire_count else (run.wire_tx[at.usize()] * 1000000.0).i64()
+            if field == VALUE_WIRE_TY: return -1 if at < 0 or at >= run.wire_count else (run.wire_ty[at.usize()] * 1000000.0).i64()
+            if field == VALUE_WIRE_TZ: return -1 if at < 0 or at >= run.wire_count else (run.wire_tz[at.usize()] * 1000000.0).i64()
+            if field == VALUE_WIRE_ARC: return -1 if at < 0 or at >= run.wire_count else (run.wire_arcs[at.usize()] * 1000000.0).i64()
+            return -1
+
+    def append_message(out: mutable dstr&, run: BuzzWireRun&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(out, "Press Space to start")
+            elif run.phase == PHASE_FLYING:
+                dstr_append_cstr(out, "Level ")
+                dstr_append_i64(out, run.trial_rung)
+                dstr_append_cstr(out, " — ")
+                dstr_append_i64(out, run.touches_allowed)
+                dstr_append_cstr(out, " touches allowed")
+            elif run.phase == PHASE_SETTLED:
+                if run.verdict == 1:
+                    dstr_append_cstr(out, "Home in ")
+                    dstr_append_i64(out, run.clock_ms - run.started_ms)
+                    dstr_append_cstr(out, " ms")
+                elif run.loss_reason == LOSS_TIMEOUT:
+                    dstr_append_cstr(out, "Out of time")
+                else:
+                    dstr_append_cstr(out, "Buzz")
+            else:
+                dstr_append_i64(out, run.wins)
+                dstr_append_cstr(out, " wires home — best level ")
+                dstr_append_i64(out, run.best_rung)
+
+    def render(run: BuzzWireRun&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            sx: f64 = width / REFERENCE_WIDTH
+            sy: f64 = height / REFERENCE_HEIGHT
+            paint: SceneBuzzWire::BuzzWirePaint = SceneBuzzWire::paint_of(
+                black_background, width, height, sx, sy)
+            message: mutable dstr = []
+            append_message(&message, run)
+            seconds_left: i64 = info(run, INFO_SECONDS_LEFT_MS) / 1000
+            along: i64 = info(run, INFO_ALONG_PPM) / 10000
+            used: f64 = info(run, INFO_USED_PPM).f64() / 1000000.0
+            SceneBuzzWire::render(list, &paint, run.phase,
+                run.phase == PHASE_FLYING, run.trial, run.total_trials,
+                along, seconds_left, run.buzzes, run.touches_allowed,
+                run.show_meter, used, bytes_view(message), run.verdict,
+                bytes_view(message))
+
+    def initialize(run: mutable BuzzWireRun&, rung: i64, trials: i64, adaptive: bool,
+                   meter: bool, beads: bool, sight: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.gauss <- GaussCache{has: false, value: 0.0}
+            run.start_rung <- Buzzwire::clamped_rung(rung)
+            run.total_trials <- trials
+            run.adaptive <- adaptive
+            run.show_meter <- meter
+            run.show_beads <- beads
+            run.show_sight <- sight
+            reset(run)
+
+    def apply(run: mutable BuzzWireRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                if run.phase == PHASE_READY or run.phase == PHASE_DONE:
+                    reset(run)
+                    deal_trial(run, now_ms)
+                    return 1
+                if run.phase == PHASE_SETTLED:
+                    if run.trial >= run.total_trials:
+                        run.phase <- PHASE_DONE
+                        return 1
+                    deal_trial(run, now_ms)
+                    return 1
+                return 2
+            if action == ACTION_PRESS or action == ACTION_RELEASE or action == ACTION_TAP:
+                return 2 if run.phase != PHASE_FLYING or value < 0 or value >= Buzzwire::PORTS
+                bit: i64 = port_bit(value)
+                if action == ACTION_PRESS:
+                    run.held_mask <- run.held_mask | bit
+                elif action == ACTION_RELEASE:
+                    run.held_mask <- run.held_mask - bit if active(run, value) and run.held_mask % (bit * 2) >= bit else run.held_mask
+                else:
+                    run.asked_port <- value
+                return 1
+            if action == ACTION_CLEAR:
+                run.held_mask <- 0
+                run.asked_port <- -1
+                return 1
+            return -6

@@ -1,0 +1,370 @@
+# Stateful Concentration run controller.
+#
+# The source UI keeps Card objects and darrays alive in a Python object.  The
+# common WASM ABI cannot retain arena-backed darrays between calls, so this
+# adapter keeps the same board in fixed arrays and reconstructs a temporary
+# Concentration::Board whenever it invokes the source rule kernel.  The deal,
+# CPython-compatible shuffle, identity-aware lapse accounting, and timed
+# peek/mismatch transitions therefore remain owned by the port rather than by
+# the browser shell.
+
+module ConcentrationGame:
+
+    const MAX_PAIRS: i64 = 64
+    const MAX_CARDS: i64 = 128
+
+    const MEDIUM_PICTURE: i64 = 0
+    const MEDIUM_SOUND: i64 = 1
+
+    const PHASE_READY: i64 = Concentration::PHASE_READY
+    const PHASE_PEEK: i64 = Concentration::PHASE_PEEK
+    const PHASE_PLAYING: i64 = Concentration::PHASE_PLAYING
+    const PHASE_DONE: i64 = Concentration::PHASE_DONE
+
+    const ACTION_START: i64 = 0
+    const ACTION_SELECT: i64 = 1
+    const ACTION_CURSOR: i64 = 2
+
+    const INFO_PHASE: i64 = 0
+    const INFO_PAIRS: i64 = 1
+    const INFO_COUNT: i64 = 2
+    const INFO_MEDIUM: i64 = 3
+    const INFO_TURNS: i64 = 4
+    const INFO_LAPSES: i64 = 5
+    const INFO_FLIPPED_COUNT: i64 = 6
+    const INFO_MATCHED_PAIRS: i64 = 7
+    const INFO_VERDICT: i64 = 8
+    const INFO_CURSOR: i64 = 9
+    const INFO_SHOW_TURNS: i64 = 10
+    const INFO_COACH: i64 = 11
+    const INFO_PEEK_UNTIL_MS: i64 = 12
+    const INFO_HIDE_UNTIL_MS: i64 = 13
+    const INFO_STARTED_AT_MS: i64 = 14
+    const INFO_FINISHED_AT_MS: i64 = 15
+
+    const CARD_INDEX: i64 = 0
+    const CARD_FACE_UP: i64 = 1
+    const CARD_MATCHED: i64 = 2
+
+    struct ConcentrationRun:
+        rng: mutable MT19937
+        pairs: mutable i64
+        medium: mutable i64
+        peek_ms: mutable i64
+        hide_ms: mutable i64
+        show_turns: mutable bool
+        coach: mutable bool
+        count: mutable i64
+        index: mutable i64[128]
+        face_up: mutable i64[128]
+        matched: mutable i64[128]
+        flipped: mutable i64[2]
+        flipped_count: mutable i64
+        turns: mutable i64
+        lapses: mutable i64
+        phase: mutable i64
+        owed: mutable bool
+        verdict: mutable i64
+        cursor: mutable i64
+        peek_until_ms: mutable i64
+        hide_until_ms: mutable i64
+        started_at_ms: mutable i64
+        finished_at_ms: mutable i64
+        seen_a: mutable i64[64]
+        seen_b: mutable i64[64]
+
+    def allowed_pairs(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 4 or value == 6 or value == 8 or value == 10 or value == 12 or value == 15 or value == 18 or value == 21 or value == 24 or value == 30 or value == 36 or value == 42 or value == 50
+
+    def allowed_medium(value: i64) -> bool:
+        can Abort.Panic:
+            return value == MEDIUM_PICTURE or value == MEDIUM_SOUND
+
+    def allowed_peek(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 0 or value == 500 or value == 1000 or value == 2000 or value == 3000 or value == 5000
+
+    def allowed_hide(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 300 or value == 500 or value == 700 or value == 900 or value == 1200 or value == 1600 or value == 2000
+
+    def clear_storage(run: mutable ConcentrationRun&):
+        can Abort.Panic:
+            for at in 0..<MAX_CARDS |at, run|:
+                run.index[at.usize()] <- 0
+                run.face_up[at.usize()] <- 0
+                run.matched[at.usize()] <- 0
+            for at in 0..<2 |at, run|:
+                run.flipped[at.usize()] <- -1
+            for pair in 0..<MAX_PAIRS |pair, run|:
+                run.seen_a[pair.usize()] <- -1
+                run.seen_b[pair.usize()] <- -1
+
+    # Copy the arena-backed source Board into storage that remains valid after
+    # this ABI call.  Copy all fields, including identity sets: lapse scoring
+    # depends on which physical card slot was previously shown, not just on a
+    # count of how many cards of a pair were seen.
+    def save_board(run: mutable ConcentrationRun&, board: mutable Concentration::ConcentrationBoard&):
+        can Abort.Panic:
+            run.pairs <- board.pairs
+            run.count <- board.count
+            run.flipped_count <- board.flipped_count
+            run.turns <- board.turns
+            run.lapses <- board.lapses
+            run.phase <- board.phase
+            run.owed <- board.owed
+            run.verdict <- board.verdict
+            at: mutable i64 = 0
+            while at < MAX_CARDS |at, run, board|:
+                run.index[at.usize()] <- Ints::at_ref(&board.index, at)
+                run.face_up[at.usize()] <- Ints::at_ref(&board.face_up, at)
+                run.matched[at.usize()] <- Ints::at_ref(&board.matched, at)
+                at <- at + 1
+            at <- 0
+            while at < 2 |at, run, board|:
+                run.flipped[at.usize()] <- Ints::at_ref(&board.flipped, at)
+                at <- at + 1
+            at <- 0
+            while at < MAX_PAIRS |at, run, board|:
+                run.seen_a[at.usize()] <- Ints::at_ref(&board.seen_a, at)
+                run.seen_b[at.usize()] <- Ints::at_ref(&board.seen_b, at)
+                at <- at + 1
+
+    # Rebuild the exact source representation only for the duration of an
+    # operation.  No darray returned by this function is retained in Run.
+    def load_board(run: ConcentrationRun&) -> Concentration::ConcentrationBoard:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable Concentration::ConcentrationBoard = Concentration::new_board()
+            out.pairs <- run.pairs
+            out.count <- run.count
+            out.flipped_count <- run.flipped_count
+            out.turns <- run.turns
+            out.lapses <- run.lapses
+            out.phase <- run.phase
+            out.owed <- run.owed
+            out.coach <- run.coach
+            out.verdict <- run.verdict
+            at: mutable i64 = 0
+            while at < MAX_CARDS |at, run, out|:
+                Ints::put(&out.index, at, run.index[at.usize()])
+                Ints::put(&out.face_up, at, run.face_up[at.usize()])
+                Ints::put(&out.matched, at, run.matched[at.usize()])
+                at <- at + 1
+            at <- 0
+            while at < 2 |at, run, out|:
+                Ints::put(&out.flipped, at, run.flipped[at.usize()])
+                at <- at + 1
+            at <- 0
+            while at < MAX_PAIRS |at, run, out|:
+                Ints::put(&out.seen_a, at, run.seen_a[at.usize()])
+                Ints::put(&out.seen_b, at, run.seen_b[at.usize()])
+                at <- at + 1
+            return out
+
+    def matched_pairs(run: ConcentrationRun&) -> i64:
+        can Abort.Panic:
+            found: mutable i64 = 0
+            for at in 0..<run.count |at, run, found|:
+                found <- found + 1 if run.matched[at.usize()] != 0
+            return found / 2
+
+    def initialize(run: mutable ConcentrationRun&, pairs: i64, medium: i64,
+                   peek_ms: i64, hide_ms: i64, show_turns: bool,
+                   coach: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.pairs <- pairs
+            run.medium <- medium
+            run.peek_ms <- peek_ms
+            run.hide_ms <- hide_ms
+            run.show_turns <- show_turns
+            run.coach <- coach
+            run.count <- 0
+            run.flipped_count <- 0
+            run.turns <- 0
+            run.lapses <- 0
+            run.phase <- PHASE_READY
+            run.owed <- false
+            run.verdict <- Concentration::VERDICT_NONE
+            run.cursor <- 0
+            run.peek_until_ms <- 0
+            run.hide_until_ms <- 0
+            run.started_at_ms <- 0
+            run.finished_at_ms <- 0
+            clear_storage(run)
+
+    def deal(run: mutable ConcentrationRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            board: mutable Concentration::ConcentrationBoard = load_board(run)
+            Concentration::reset(&board)
+            Concentration::deal(&board, run.pairs, run.peek_ms,
+                                run.medium == MEDIUM_SOUND, &run.rng)
+            save_board(run, board)
+            run.cursor <- 0
+            run.started_at_ms <- now_ms
+            run.finished_at_ms <- 0
+            run.peek_until_ms <- now_ms + run.peek_ms if run.phase == PHASE_PEEK else 0
+            run.hide_until_ms <- 0
+
+    def start(run: mutable ConcentrationRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.count <- 0
+            run.flipped_count <- 0
+            run.turns <- 0
+            run.lapses <- 0
+            run.phase <- PHASE_READY
+            run.owed <- false
+            run.verdict <- Concentration::VERDICT_NONE
+            run.peek_until_ms <- 0
+            run.hide_until_ms <- 0
+            run.finished_at_ms <- 0
+            clear_storage(run)
+            deal(run, now_ms)
+
+    def select(run: mutable ConcentrationRun&, card: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 2 if run.phase != PHASE_PLAYING
+            return 2 if card < 0 or card >= run.count
+            return 2 if run.face_up[card.usize()] != 0 or run.matched[card.usize()] != 0
+            board: mutable Concentration::ConcentrationBoard = load_board(run)
+            Concentration::flip(&board, card)
+            save_board(run, board)
+            if run.phase == PHASE_DONE:
+                run.finished_at_ms <- now_ms
+                run.verdict <- 1 if run.lapses == 0 else 0
+                run.hide_until_ms <- 0
+            elif run.flipped_count == 2:
+                run.hide_until_ms <- now_ms + run.hide_ms
+            else:
+                run.hide_until_ms <- 0
+            return 1
+
+    def apply(run: mutable ConcentrationRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_CURSOR:
+                return 2 if value < 0 or value >= run.count
+                run.cursor <- value
+                return 1
+            if action == ACTION_START:
+                return 2 if run.phase != PHASE_READY and run.phase != PHASE_DONE
+                start(run, now_ms)
+                return 1
+            elif action == ACTION_SELECT:
+                return select(run, value, now_ms)
+            return -6
+
+    def advance(run: mutable ConcentrationRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_PEEK and now_ms >= run.peek_until_ms:
+                board: mutable Concentration::ConcentrationBoard = load_board(run)
+                Concentration::peek_over(&board)
+                save_board(run, board)
+                run.peek_until_ms <- 0
+                return 1
+            if run.phase == PHASE_PLAYING and run.flipped_count == 2 and now_ms >= run.hide_until_ms:
+                board: mutable Concentration::ConcentrationBoard = load_board(run)
+                Concentration::resolve(&board)
+                save_board(run, board)
+                run.hide_until_ms <- 0
+                return 1
+            return 2
+
+    def info(run: ConcentrationRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_PAIRS: return run.pairs
+            if field == INFO_COUNT: return run.count
+            if field == INFO_MEDIUM: return run.medium
+            if field == INFO_TURNS: return run.turns
+            if field == INFO_LAPSES: return run.lapses
+            if field == INFO_FLIPPED_COUNT: return run.flipped_count
+            if field == INFO_MATCHED_PAIRS: return matched_pairs(run)
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_CURSOR: return run.cursor
+            if field == INFO_SHOW_TURNS: return 1 if run.show_turns else 0
+            if field == INFO_COACH: return 1 if run.coach else 0
+            if field == INFO_PEEK_UNTIL_MS: return run.peek_until_ms
+            if field == INFO_HIDE_UNTIL_MS: return run.hide_until_ms
+            if field == INFO_STARTED_AT_MS: return run.started_at_ms
+            if field == INFO_FINISHED_AT_MS: return run.finished_at_ms
+            return -1
+
+    def card(run: ConcentrationRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return -1 if at < 0 or at >= run.count
+            if field == CARD_INDEX: return run.index[at.usize()]
+            if field == CARD_FACE_UP: return run.face_up[at.usize()]
+            if field == CARD_MATCHED: return run.matched[at.usize()]
+            return -1
+
+    # Pointer coordinates use the common 912x684 reference viewport and a
+    # bottom-left origin.  Use the same band clearance as SceneConcentration;
+    # otherwise a card selected at the bottom edge could disagree with the
+    # card that was rendered there.
+    def pointer_card(run: ConcentrationRun&, x_millionths: i64, y_millionths: i64) -> i64:
+        can Abort.Panic:
+            return -1 if run.phase != PHASE_PLAYING
+            x: f64 = x_millionths.f64() * 912.0 / 1000000.0
+            y: f64 = y_millionths.f64() * 684.0 / 1000000.0
+            floor: f64 = Verdict::above_the_band(684.0, 0.0).f64()
+            ceiling: f64 = Geometry::from_top_edge(684.0, 88.0).f64()
+            plan: Concentration::ConcentrationLayout = Concentration::layout_board(
+                run.count, run.pairs, 912.0, floor, ceiling)
+            return Concentration::card_at(&plan, run.count, x, y)
+
+    def append_done_message(out: mutable dstr&, run: ConcentrationRun&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_cstr(out, "Cleared in ")
+            dstr_append_i64(out, run.turns)
+            dstr_append_cstr(out, " turns, ")
+            dstr_append_i64(out, (run.finished_at_ms - run.started_at_ms) / 1000)
+            dstr_append_cstr(out, "s")
+
+    def append_verdict(out: mutable dstr&, run: ConcentrationRun&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_cstr(out, "Cleared in ")
+            dstr_append_i64(out, run.turns)
+            if run.lapses == 0:
+                dstr_append_cstr(out, " turns — nothing forgotten")
+            else:
+                dstr_append_cstr(out, " turns — ")
+                dstr_append_i64(out, run.lapses)
+                dstr_append_cstr(out, " forgotten")
+
+    def render(run: ConcentrationRun&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            cards: mutable darray[SceneConcentration::SceneConcentrationCard] = []
+            for at in 0..<run.count |at, run, cards|:
+                pair: i64 = run.index[at.usize()]
+                cards.push(SceneConcentration::SceneConcentrationCard{
+                    face_up: run.face_up[at.usize()] != 0,
+                    matched: run.matched[at.usize()] != 0,
+                    index: pair,
+                    asset: 1000 + pair,
+                    image_width: 64,
+                    image_height: 64})
+
+            sx: f64 = width / Display::REFERENCE_WIDTH
+            sy: f64 = height / Display::REFERENCE_HEIGHT
+            paint: mutable SceneConcentration::SceneConcentrationPaint = SceneConcentration::paint_of(
+                black_background, width, height, sx, sy)
+            message: mutable dstr = []
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(&message, "Press Space to deal")
+            elif run.phase == PHASE_PEEK:
+                dstr_append_cstr(&message, "Look")
+            elif run.phase == PHASE_PLAYING:
+                dstr_append_cstr(&message, "Find the pairs")
+            else:
+                append_done_message(&message, run)
+            verdict_text: mutable dstr = []
+            if run.phase == PHASE_DONE:
+                append_verdict(&verdict_text, run)
+            SceneConcentration::render(list, &paint, run.medium, &cards,
+                run.pairs, run.turns, run.show_turns, bytes_view(message),
+                run.verdict if run.phase == PHASE_DONE or run.coach else Concentration::VERDICT_NONE,
+                bytes_view(verdict_text))

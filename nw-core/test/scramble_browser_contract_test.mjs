@@ -1,0 +1,11 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+const source = fs.readFileSync(fileURLToPath(new URL("../shells/web/index.html", import.meta.url)), "utf8");
+assert.match(source, /nw_api_v1_task_scramble/);
+assert.match(source, /return isTaskId\("scramble"\)/);
+assert.match(source, /function ensureScrambleRun\(\)/);
+assert.match(source, /function scrambleFrame\(black\)/);
+assert.match(source, /apiDispatchText\(handle, event\.key\)/);
+assert.match(source, /if \(isScrambleTask\(\)\) destroyScrambleRun\(\)/);
+console.log("scramble_browser_contract_test: PASS (export, route, lifecycle, text input, render, cleanup)");

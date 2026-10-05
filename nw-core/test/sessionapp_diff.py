@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Differential harness for the assembled session preview."""
+"""Differential harness for the port's 3D-only N-Back preview."""
 import random
 import subprocess
 import sys
@@ -40,7 +40,6 @@ CFG = dict(
     GRID_INCLUDE_CENTER=False, GRID_3D=False, GRID_3D_CUBES=1,
     ACTIVE_POSITION_CELLS=0, POSITION_CELL_COUNT=0)
 
-MODES = [2, 3, 4, 5, 7, 8, 20, 21, 100, 107, 130, 258]
 BACKS = [1, 2, 3, 5]
 SEEDS = [1, 7, 12345]
 TRIALS = [1, 2, 5, 11, 18]
@@ -57,9 +56,12 @@ def fresh_session():
     return out
 
 
-def one(case, seed, trial, mode, back):
+def one(case, seed, trial, mode, back, grid_3d=False, cubes=1,
+        reported_mode=None):
     cfg = DotDict(CFG)
     cfg.GAME_MODE = mode
+    cfg.GRID_3D = grid_3d
+    cfg.GRID_3D_CUBES = cubes
     state.cfg = cfg
     game = gamemode.Mode()
     game.back = back
@@ -84,7 +86,8 @@ def one(case, seed, trial, mode, back):
             break
     values = [game.current_stim[key] for key in FIELDS]
     return [
-        'case', case, seed, trial, mode, back, outcome[0], values[0],
+        'case', case, seed, trial,
+        mode if reported_mode is None else reported_mode, back, outcome[0], values[0],
         values[4], values[5], values[10], values[11], values[12],
         OP[game.current_operation], outcome[1], outcome[2],
         random.getrandbits(32)]
@@ -93,11 +96,16 @@ def one(case, seed, trial, mode, back):
 def python_lines():
     out = []
     case = 0
-    for mode in MODES:
-        for back in BACKS:
-            for seed in SEEDS:
-                for trial in TRIALS:
-                    out.append('|'.join(str(x) for x in one(case, seed, trial, mode, back)))
+    # Port scope: mode 10 with the source's 3D face-pattern field. Encode the
+    # cube-count in the reported mode column so the line schema distinguishes
+    # each option case without generating any other N-Back mode.
+    for cubes in (1, 2, 3, 6):
+        for back in (1, 2, 5):
+            for seed in (1, 7, 17, 12345):
+                for trial in (1, 4, 10):
+                    out.append('|'.join(str(x) for x in one(
+                        case, seed, trial, 10, back, True, cubes,
+                        1000 + cubes)))
                     case += 1
     return out
 

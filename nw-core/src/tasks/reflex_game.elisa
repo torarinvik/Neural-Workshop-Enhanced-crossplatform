@@ -1,0 +1,382 @@
+# Stateful controller for the source Reflex task.
+#
+# The reference owns a live list of shrinking image targets.  This adapter
+# keeps the source clock, target geometry, target identity, score, and
+# adaptive lifetime in WASM-owned fixed storage; the browser supplies only
+# synthetic image assets and pointer coordinates.  A target is removed by its
+# identity, never by a browser-side array index that could change after an
+# overlap or expiry.
+
+module ReflexGame:
+
+    const MAX_TARGETS: i64 = 12
+    const MAX_RUN_TARGETS: i64 = 500
+    const ASSET_COUNT: i64 = 64
+    const REFERENCE_WIDTH: f64 = 912.0
+    const REFERENCE_HEIGHT: f64 = 684.0
+
+    const PHASE_READY: i64 = 0
+    const PHASE_RUNNING: i64 = 1
+    const PHASE_DONE: i64 = 2
+
+    const ACTION_START: i64 = 0
+
+    const INFO_PHASE: i64 = 0
+    const INFO_TOTAL_TARGETS: i64 = 1
+    const INFO_SPAWNED: i64 = 2
+    const INFO_MAX_ACTIVE: i64 = 3
+    const INFO_BASE_LIFETIME_MS: i64 = 4
+    const INFO_SPAWN_GAP_MS: i64 = 5
+    const INFO_START_SIZE: i64 = 6
+    const INFO_ADAPTIVE: i64 = 7
+    const INFO_LIFETIME_MS: i64 = 8
+    const INFO_HITS: i64 = 9
+    const INFO_MISSES: i64 = 10
+    const INFO_PRESENTED: i64 = 11
+    const INFO_ACCURACY: i64 = 12
+    const INFO_MEAN_MS: i64 = 13
+    const INFO_ACTIVE_COUNT: i64 = 14
+    const INFO_VERDICT: i64 = 15
+    const INFO_CLOCK_MS: i64 = 16
+    const INFO_NEXT_SPAWN_MS: i64 = 17
+    const INFO_LAST_REACTION_MS: i64 = 18
+
+    const VALUE_ID: i64 = 0
+    const VALUE_X: i64 = 1
+    const VALUE_Y: i64 = 2
+    const VALUE_BORN_MS: i64 = 3
+    const VALUE_LIFETIME_MS: i64 = 4
+    const VALUE_REMAINING_PPM: i64 = 5
+    const VALUE_ASSET: i64 = 6
+
+    struct ReflexRun:
+        rng: mutable MT19937
+        total_targets: mutable i64
+        base_lifetime_ms: mutable i64
+        spawn_gap_ms: mutable i64
+        max_active: mutable i64
+        start_size: mutable i64
+        adaptive: mutable bool
+        lifetime: mutable f64
+        phase: mutable i64
+        spawned: mutable i64
+        hits: mutable i64
+        misses: mutable i64
+        reaction_n: mutable i64
+        reactions: mutable f64[500]
+        verdict: mutable i64
+        last_reaction_ms: mutable i64
+        clock_ms: mutable i64
+        next_spawn_ms: mutable i64
+        active_n: mutable i64
+        target_id: mutable i64[12]
+        x: mutable f64[12]
+        y: mutable f64[12]
+        born_ms: mutable i64[12]
+        target_lifetime: mutable f64[12]
+        asset: mutable i64[12]
+
+    def allowed_targets(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 10 or value == 20 or value == 30 or value == 40 or value == 60 or value == 80 or value == 120 or value == 200 or value == 300 or value == 500
+
+    def allowed_lifetime(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 400 or value == 600 or value == 800 or value == 1200 or value == 1600 or value == 2200 or value == 3000 or value == 4000
+
+    def allowed_spawn_gap(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 150 or value == 250 or value == 400 or value == 550 or value == 700 or value == 1000 or value == 1500 or value == 2000
+
+    def allowed_max_active(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 1 or value == 2 or value == 3 or value == 4 or value == 5 or value == 6 or value == 8 or value == 10 or value == 12
+
+    def allowed_size(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 60 or value == 80 or value == 100 or value == 130 or value == 170 or value == 220 or value == 280
+
+    def full_side(height: f64, start_size: i64) -> f64:
+        can Abort.Panic:
+            scaled: f64 = Geometry::scale_to_height(height, start_size.f64()).f64()
+            return scaled if scaled > 16.0 else 16.0
+
+    def clear_targets(run: mutable ReflexRun&):
+        can Abort.Panic:
+            run.active_n <- 0
+            for at in 0..<MAX_TARGETS |at, run|:
+                run.target_id[at.usize()] <- -1
+                run.x[at.usize()] <- 0.0
+                run.y[at.usize()] <- 0.0
+                run.born_ms[at.usize()] <- 0
+                run.target_lifetime[at.usize()] <- 0.0
+                run.asset[at.usize()] <- 0
+
+    def clear_score(run: mutable ReflexRun&):
+        can Abort.Panic:
+            run.spawned <- 0
+            run.hits <- 0
+            run.misses <- 0
+            run.reaction_n <- 0
+            run.verdict <- -1
+            run.last_reaction_ms <- 0
+            for at in 0..<MAX_RUN_TARGETS |at, run|:
+                run.reactions[at.usize()] <- 0.0
+
+    def accuracy(run: ReflexRun&) -> i64:
+        can Abort.Panic:
+            presented: i64 = run.hits + run.misses
+            return 0 if presented <= 0
+            return py_round_half_even(100.0 * run.hits.f64() / presented.f64())
+
+    def mean_ms(run: ReflexRun&) -> i64:
+        can Abort.Panic:
+            return 0 if run.reaction_n <= 0
+            total: mutable f64 = 0.0
+            for at in 0..<run.reaction_n |at, run, total|:
+                total <- total + run.reactions[at.usize()]
+            return py_round_half_even(1000.0 * total / run.reaction_n.f64())
+
+    def score_hit(run: mutable ReflexRun&, reaction_s: f64):
+        can Abort.Panic:
+            run.hits <- run.hits + 1
+            run.last_reaction_ms <- (reaction_s * 1000.0).i64()
+            if run.reaction_n < MAX_RUN_TARGETS:
+                run.reactions[run.reaction_n.usize()] <- reaction_s
+                run.reaction_n <- run.reaction_n + 1
+            if run.adaptive:
+                run.lifetime <- Reflex::adapt(run.lifetime,
+                    run.base_lifetime_ms.f64() / 1000.0, true)
+            run.verdict <- 1
+
+    def score_miss(run: mutable ReflexRun&):
+        can Abort.Panic:
+            run.misses <- run.misses + 1
+            run.last_reaction_ms <- 0
+            if run.adaptive:
+                run.lifetime <- Reflex::adapt(run.lifetime,
+                    run.base_lifetime_ms.f64() / 1000.0, false)
+            run.verdict <- 0
+
+    def remove_target(run: mutable ReflexRun&, index: i64):
+        can Abort.Panic:
+            last: i64 = run.active_n - 1
+            if index < 0 or index > last:
+                return
+            at: mutable i64 = index
+            while at < last |at, last, run|:
+                next_at: i64 = at + 1
+                run.target_id[at.usize()] <- run.target_id[next_at.usize()]
+                run.x[at.usize()] <- run.x[next_at.usize()]
+                run.y[at.usize()] <- run.y[next_at.usize()]
+                run.born_ms[at.usize()] <- run.born_ms[next_at.usize()]
+                run.target_lifetime[at.usize()] <- run.target_lifetime[next_at.usize()]
+                run.asset[at.usize()] <- run.asset[next_at.usize()]
+                at <- next_at
+            run.active_n <- last
+            run.target_id[run.active_n.usize()] <- -1
+
+    def expire_targets(run: mutable ReflexRun&, now_ms: i64) -> i64:
+        can Abort.Panic:
+            expired: mutable i64 = 0
+            at: mutable i64 = 0
+            while at < run.active_n |at, run, now_ms, expired|:
+                born_s: f64 = run.born_ms[at.usize()].f64() / 1000.0
+                now_s: f64 = now_ms.f64() / 1000.0
+                gone: bool = Reflex::is_gone(born_s,
+                    run.target_lifetime[at.usize()], now_s)
+                if gone:
+                    score_miss(run)
+                    remove_target(run, at)
+                    expired <- expired + 1
+                else:
+                    at <- at + 1
+            return expired
+
+    def spawn_target(run: mutable ReflexRun&, now_ms: i64):
+        can Abort.Panic:
+            return if run.active_n >= MAX_TARGETS or run.spawned >= run.total_targets
+            margin: f64 = full_side(REFERENCE_HEIGHT, run.start_size) / 2.0
+            low_x: f64 = margin / REFERENCE_WIDTH
+            low_y_pixels: f64 = Verdict::above_the_band(
+                REFERENCE_HEIGHT, REFERENCE_HEIGHT * 0.10).f64() + margin
+            low_y: f64 = low_y_pixels / REFERENCE_HEIGHT
+            high_y: f64 = 1.0 - margin / REFERENCE_HEIGHT - 0.14
+            slot: i64 = run.active_n
+            run.target_id[slot.usize()] <- run.spawned
+            run.x[slot.usize()] <- py_uniform(&run.rng, low_x, 1.0 - low_x)
+            run.y[slot.usize()] <- py_uniform(&run.rng, low_y, high_y)
+            run.born_ms[slot.usize()] <- now_ms
+            run.target_lifetime[slot.usize()] <- run.lifetime
+            run.asset[slot.usize()] <- 3000 + (run.spawned % ASSET_COUNT)
+            run.active_n <- run.active_n + 1
+            run.spawned <- run.spawned + 1
+            # A new target removes the old verdict, exactly as the source's
+            # _spawn clears verdict_shown before the next visible trial.
+            run.verdict <- -1
+            run.last_reaction_ms <- 0
+
+    def initialize(run: mutable ReflexRun&, total_targets: i64, lifetime_ms: i64,
+                   spawn_gap_ms: i64, max_active: i64, start_size: i64,
+                   adaptive: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.total_targets <- total_targets
+            run.base_lifetime_ms <- lifetime_ms
+            run.spawn_gap_ms <- spawn_gap_ms
+            run.max_active <- max_active
+            run.start_size <- start_size
+            run.adaptive <- adaptive
+            run.lifetime <- lifetime_ms.f64() / 1000.0
+            run.phase <- PHASE_READY
+            run.clock_ms <- 0
+            run.next_spawn_ms <- 0
+            clear_targets(run)
+            clear_score(run)
+
+    def start(run: mutable ReflexRun&, now_ms: i64):
+        can Abort.Panic:
+            clear_targets(run)
+            clear_score(run)
+            run.lifetime <- run.base_lifetime_ms.f64() / 1000.0
+            run.phase <- PHASE_RUNNING
+            run.clock_ms <- now_ms
+            run.next_spawn_ms <- now_ms
+
+    def advance(run: mutable ReflexRun&, now_ms: i64) -> i64:
+        can Abort.Panic:
+            return 2 if run.phase != PHASE_RUNNING
+            run.clock_ms <- now_ms
+            changed: mutable bool = expire_targets(run, now_ms) > 0
+            if run.spawned < run.total_targets and run.active_n < run.max_active and now_ms >= run.next_spawn_ms:
+                spawn_target(run, now_ms)
+                run.next_spawn_ms <- now_ms + run.spawn_gap_ms
+                changed <- true
+            elif run.spawned >= run.total_targets and run.active_n == 0:
+                run.phase <- PHASE_DONE
+                changed <- true
+            return 1 if changed else 2
+
+    def pointer_target(run: mutable ReflexRun&, now_ms: i64,
+                       x_millionths: i64, y_millionths: i64) -> i64:
+        can Abort.Panic:
+            return -1 if run.phase != PHASE_RUNNING
+            run.clock_ms <- now_ms
+            expire_targets(run, now_ms)
+            px: f64 = x_millionths.f64() * REFERENCE_WIDTH / 1000000.0
+            py: f64 = y_millionths.f64() * REFERENCE_HEIGHT / 1000000.0
+            best: mutable i64 = -1
+            best_side: mutable f64 = 1000000000.0
+            full: f64 = full_side(REFERENCE_HEIGHT, run.start_size)
+            for at in 0..<run.active_n |at, run, px, py, full, best, best_side|:
+                born_s: f64 = run.born_ms[at.usize()].f64() / 1000.0
+                left: f64 = Reflex::remaining(born_s,
+                    run.target_lifetime[at.usize()], now_ms.f64() / 1000.0)
+                side: f64 = full * left
+                cx: f64 = run.x[at.usize()] * REFERENCE_WIDTH
+                cy: f64 = run.y[at.usize()] * REFERENCE_HEIGHT
+                if Reflex::contains(cx, cy, side, px, py) and side < best_side:
+                    best <- at
+                    best_side <- side
+            return -1 if best < 0
+            target: i64 = run.target_id[best.usize()]
+            reaction_s: f64 = (now_ms - run.born_ms[best.usize()]).f64() / 1000.0
+            score_hit(run, reaction_s)
+            remove_target(run, best)
+            return target
+
+    def apply(run: mutable ReflexRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Abort.Panic:
+            if action == ACTION_START:
+                return 2 if run.phase != PHASE_READY and run.phase != PHASE_DONE
+                start(run, now_ms)
+                return 1
+            return -6
+
+    def info(run: ReflexRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_TOTAL_TARGETS: return run.total_targets
+            if field == INFO_SPAWNED: return run.spawned
+            if field == INFO_MAX_ACTIVE: return run.max_active
+            if field == INFO_BASE_LIFETIME_MS: return run.base_lifetime_ms
+            if field == INFO_SPAWN_GAP_MS: return run.spawn_gap_ms
+            if field == INFO_START_SIZE: return run.start_size
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_LIFETIME_MS: return (run.lifetime * 1000.0).i64()
+            if field == INFO_HITS: return run.hits
+            if field == INFO_MISSES: return run.misses
+            if field == INFO_PRESENTED: return run.hits + run.misses
+            if field == INFO_ACCURACY: return accuracy(run)
+            if field == INFO_MEAN_MS: return mean_ms(run)
+            if field == INFO_ACTIVE_COUNT: return run.active_n
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_CLOCK_MS: return run.clock_ms
+            if field == INFO_NEXT_SPAWN_MS: return run.next_spawn_ms
+            if field == INFO_LAST_REACTION_MS: return run.last_reaction_ms
+            return -1
+
+    def value(run: ReflexRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return -1 if at < 0 or at >= run.active_n
+            if field == VALUE_ID: return run.target_id[at.usize()]
+            if field == VALUE_X: return (run.x[at.usize()] * 1000000.0).i64()
+            if field == VALUE_Y: return (run.y[at.usize()] * 1000000.0).i64()
+            if field == VALUE_BORN_MS: return run.born_ms[at.usize()]
+            if field == VALUE_LIFETIME_MS: return (run.target_lifetime[at.usize()] * 1000.0).i64()
+            if field == VALUE_REMAINING_PPM:
+                left: f64 = Reflex::remaining(run.born_ms[at.usize()].f64() / 1000.0,
+                    run.target_lifetime[at.usize()], run.clock_ms.f64() / 1000.0)
+                return (left * 1000000.0).i64()
+            if field == VALUE_ASSET: return run.asset[at.usize()]
+            return -1
+
+    def append_done_message(out: mutable dstr&, run: ReflexRun&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_i64(out, accuracy(run))
+            dstr_append_cstr(out, "% — ")
+            dstr_append_i64(out, run.hits)
+            dstr_append_cstr(out, " of ")
+            dstr_append_i64(out, run.hits + run.misses)
+            dstr_append_cstr(out, ", ")
+            dstr_append_i64(out, mean_ms(run))
+            dstr_append_cstr(out, " ms average")
+
+    def append_message(out: mutable dstr&, run: ReflexRun&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(out, "Press Space to start")
+            elif run.phase == PHASE_RUNNING:
+                dstr_append_cstr(out, "Click them before they go")
+            else:
+                append_done_message(out, run)
+
+    def render(run: ReflexRun&, black_background: bool, width: f64,
+               height: f64, list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            targets: mutable darray[SceneReflex::ReflexTarget] = []
+            full: f64 = full_side(height, run.start_size)
+            for at in 0..<run.active_n |at, run, targets, full|:
+                left: f64 = Reflex::remaining(run.born_ms[at.usize()].f64() / 1000.0,
+                    run.target_lifetime[at.usize()], run.clock_ms.f64() / 1000.0)
+                targets.push(SceneReflex::ReflexTarget{
+                    x: run.x[at.usize()], y: run.y[at.usize()], remaining: left,
+                    asset: run.asset[at.usize()], image_width: 64, image_height: 64})
+            sx: f64 = width / REFERENCE_WIDTH
+            sy: f64 = height / REFERENCE_HEIGHT
+            paint: mutable SceneReflex::ReflexPaint = SceneReflex::paint_of(
+                black_background, width, height, sx, sy)
+            message: mutable dstr = []
+            append_message(&message, run)
+            verdict_text: mutable dstr = []
+            if run.verdict == 1:
+                dstr_append_i64(&verdict_text, run.last_reaction_ms)
+                dstr_append_cstr(&verdict_text, " ms")
+            elif run.verdict == 0:
+                dstr_append_cstr(&verdict_text, "Gone")
+            SceneReflex::render(list, &paint, run.phase, &targets,
+                run.start_size.f64(), run.spawned, run.total_targets,
+                run.hits, run.misses, bytes_view(message), run.verdict,
+                bytes_view(verdict_text))

@@ -1,0 +1,27 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import { instantiateElisa } from "../shells/web/elisa-wasm-runtime.js";
+
+const wasm = process.env.NWCORE_WASM_PATH ?? fileURLToPath(new URL("../build/nwcore.wasm", import.meta.url));
+const { exports } = await instantiateElisa(fs.readFileSync(wasm), { warn: false });
+const task = BigInt(exports.nw_api_v1_task_chess());
+const run = exports.nw_api_v1_create(task, 1n, 1n, 1n, 0n, 0n, 0n, 0n, 17n);
+assert.equal(exports.nw_api_v1_chess_info(run, 0n), 0n);
+assert.equal(exports.nw_api_v1_dispatch(run, 2n, 1000n, 0n, 1n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(exports.nw_api_v1_chess_info(run, 0n), 1n);
+assert.equal(exports.nw_api_v1_chess_value(run, 0n, 45n), 6n);
+const frame = Number(exports.nw_frame_alloc(1048576n));
+assert.ok(exports.nw_api_v1_render(run, BigInt(frame), 1048576n, 0n, 912n, 684n) > 0n);
+assert.equal(exports.nw_api_v1_dispatch(run, 1n, 1001n, 1n, 3n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(exports.nw_api_v1_dispatch(run, 1n, 1002n, 2n, 3n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(exports.nw_api_v1_dispatch(run, 1n, 1003n, 3n, 5n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(exports.nw_api_v1_dispatch(run, 1n, 1005n, 5n, 3n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(exports.nw_api_v1_dispatch(run, 1n, 1006n, 6n, 3n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(exports.nw_api_v1_dispatch(run, 1n, 1007n, 7n, 3n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(exports.nw_api_v1_dispatch(run, 1n, 1008n, 8n, 3n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(exports.nw_api_v1_dispatch(run, 1n, 1009n, 9n, 1n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(exports.nw_api_v1_chess_info(run, 0n), 2n);
+assert.equal(exports.nw_api_v1_chess_info(run, 6n), 1n);
+assert.equal(exports.nw_api_v1_destroy(run), 0n);
+console.log("chess_game_smoke: PASS (source motif, selection, grading, render, cleanup; engine oracle gap explicit)");

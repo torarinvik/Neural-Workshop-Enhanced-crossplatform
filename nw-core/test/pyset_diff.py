@@ -5,16 +5,17 @@ The set emulation exists for ONE observable property -- iteration order -- so
 that is all this compares, over a deterministic grid of add/discard sequences.
 
 It is a suite in its own right because the rules are not guessable. The one that
-matters most: a discarded slot becomes a DUMMY and is NEVER refilled. A later add
-skips it and takes the first EMPTY slot, bumping `fill` as well as `used`.
-Refilling the dummy -- the obvious implementation -- holds `fill` down, the table
-misses its `fill * 5 >= mask * 3` resize, and every subsequent iteration order is
-different. Minimal witness:
+matters most: a discarded slot becomes a DUMMY, and a later add remembers the
+most recent DUMMY while continuing to probe for an existing key or the first
+EMPTY slot. CPython overwrites its ``freeslot`` for every later DUMMY in the
+hybrid probe. If the key is new, that DUMMY is reused without increasing
+``fill``; only an EMPTY insertion increases ``fill``. Minimal witness:
 
     add 8; discard 8; add 24; add 11; add 28; add 23
 
-A real set resizes to 32 slots and yields [11, 23, 24, 28]; a dummy-reusing model
-stays at 8 slots and yields [24, 11, 28, 23].
+A real set reuses the tombstone and yields the CPython iteration order; a model
+that skips the DUMMY and inserts at the first EMPTY slot increases `fill`, takes
+a different resize path, and yields a different order.
 
 The sequences mirror sweep_trial's LCG exactly, so both sides see the same ops.
 """

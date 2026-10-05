@@ -1,0 +1,36 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import { instantiateElisa } from "../shells/web/elisa-wasm-runtime.js";
+
+const wasm = process.env.NWCORE_WASM_PATH ?? fileURLToPath(new URL("../build/nwcore.wasm", import.meta.url));
+const { exports } = await instantiateElisa(fs.readFileSync(wasm), { warn: false });
+const task = BigInt(exports.nw_api_v1_task_go_winning_move());
+const run = exports.nw_api_v1_create(task, 1n, 1n, 1n, 0n, 0n, 0n, 0n, 17n);
+assert.ok(run > 0n);
+const info = (field) => Number(exports.nw_api_v1_go_info(run, BigInt(field)));
+const value = (field, at) => Number(exports.nw_api_v1_go_value(run, BigInt(field), BigInt(at)));
+const framePtr = Number(exports.nw_frame_alloc(1048576n));
+const frame = () => {
+  const length = exports.nw_api_v1_render(run, BigInt(framePtr), 1048576n, 0n, 912n, 684n);
+  assert.ok(length > 0n);
+  return Number(length);
+};
+assert.equal(info(0), 0);
+assert.ok(frame() > 0);
+assert.equal(exports.nw_api_v1_dispatch(run, 1n, 100n, 0n, 0n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(info(0), 1);
+const size = info(4);
+assert.ok(size >= 5 && size <= 19);
+assert.ok(info(11) >= 0 && info(11) < size * size);
+assert.equal(value(0, 0) >= 0, true);
+assert.equal(exports.nw_api_v1_dispatch(run, 1n, 101n, 1n, 1n, BigInt(info(11)), 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(info(0), 2);
+assert.equal(info(8), 1);
+assert.equal(info(7), 1);
+assert.ok(frame() > 0);
+assert.equal(exports.nw_api_v1_dispatch(run, 1n, 102n, 2n, 2n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(info(0), 3);
+assert.equal(exports.nw_api_v1_destroy(run), 0n);
+assert.equal(exports.nw_api_v1_destroy(run), 0n);
+console.log("go_game_smoke: PASS (generated Go board, unique winning move, grading, render, and cleanup)");

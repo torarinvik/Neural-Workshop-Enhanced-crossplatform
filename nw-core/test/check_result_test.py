@@ -2,6 +2,8 @@
 """Mutation-focused checks for the differential verdict validator."""
 
 import importlib.util
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -27,6 +29,21 @@ class CheckResultTests(unittest.TestCase):
     def test_pass_text_cannot_hide_nonzero_exit(self):
         result = check_result.validate(7, "PASS: 12 cases identical\n")
         self.assertFalse(result["passed"])
+        self.assertEqual(result["error"], "checker exited with status 7")
+
+    def test_real_process_printing_pass_then_exiting_nonzero_fails(self):
+        process = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; print('PASS: 12 cases identical', flush=True); sys.exit(7)"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(process.returncode, 7)
+        self.assertEqual(process.stdout, "PASS: 12 cases identical\n")
+        result = check_result.validate(process.returncode, process.stdout)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["case_count"], 12)
         self.assertEqual(result["error"], "checker exited with status 7")
 
     def test_zero_cases_is_not_a_pass(self):

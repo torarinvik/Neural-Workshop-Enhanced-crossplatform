@@ -1,0 +1,21 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import { instantiateElisa } from "../shells/web/elisa-wasm-runtime.js";
+
+const wasm = process.env.NWCORE_WASM_PATH ?? fileURLToPath(new URL("../build/nwcore.wasm", import.meta.url));
+const { exports } = await instantiateElisa(fs.readFileSync(wasm), { warn: false });
+const task = BigInt(exports.nw_api_v1_task_scrabble());
+const run = exports.nw_api_v1_create(task, 1n, 1n, 1n, 0n, 0n, 0n, 0n, 17n);
+assert.equal(exports.nw_api_v1_scrabble_info(run, 0n), 0n);
+assert.equal(exports.nw_api_v1_dispatch(run, 2n, 1000n, 0n, 1n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(exports.nw_api_v1_scrabble_info(run, 0n), 1n);
+assert.equal(exports.nw_api_v1_scrabble_info(run, 4n), 7n);
+assert.ok(exports.nw_api_v1_scrabble_value(run, 1n, 112n) >= 0n);
+const frame = Number(exports.nw_frame_alloc(1048576n));
+assert.ok(exports.nw_api_v1_render(run, BigInt(frame), 1048576n, 0n, 912n, 684n) > 0n);
+assert.equal(exports.nw_api_v1_dispatch(run, 2n, 1001n, 1n, 2n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(exports.nw_api_v1_scrabble_info(run, 0n), 2n);
+assert.equal(exports.nw_api_v1_scrabble_info(run, 7n), 1n);
+assert.equal(exports.nw_api_v1_destroy(run), 0n);
+console.log("scrabble_game_smoke: PASS (source lexicon, legal play, score, render, cleanup)");

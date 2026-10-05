@@ -1,0 +1,433 @@
+# Stateful controller for Moving Targets.
+#
+# The source task is a continuous multiple-object-tracking experiment.  The
+# browser is allowed to schedule frames and provide pointer coordinates, but
+# the WASM controller owns ball identity, the hidden target set, the random
+# stream, wall bounces, phase deadlines, picks, scoring, and adaptive target
+# count.  Ball identity is the stable spawn index; it is never inferred from
+# a current screen position.
+
+module TrackingGame:
+
+    const MAX_BALLS: i64 = 30
+    const REFERENCE_WIDTH: f64 = 912.0
+    const REFERENCE_HEIGHT: f64 = 684.0
+    const CUE_MS: i64 = 2000
+    const REVEAL_MS: i64 = 1800
+
+    const PHASE_READY: i64 = 0
+    const PHASE_CUEING: i64 = 1
+    const PHASE_TRACKING: i64 = 2
+    const PHASE_PICKING: i64 = 3
+    const PHASE_REVEALING: i64 = 4
+    const PHASE_DONE: i64 = 5
+
+    const ACTION_START: i64 = 0
+
+    const INFO_PHASE: i64 = 0
+    const INFO_BALLS: i64 = 1
+    const INFO_START_TARGETS: i64 = 2
+    const INFO_SECONDS: i64 = 3
+    const INFO_SPEED: i64 = 4
+    const INFO_TOTAL_ROUNDS: i64 = 5
+    const INFO_ADAPTIVE: i64 = 6
+    const INFO_TRACKED: i64 = 7
+    const INFO_ROUND: i64 = 8
+    const INFO_DEADLINE_MS: i64 = 9
+    const INFO_ASKED: i64 = 10
+    const INFO_PICKED: i64 = 11
+    const INFO_CAUGHT: i64 = 12
+    const INFO_ROUNDS_DONE: i64 = 13
+    const INFO_TOTAL_ASKED: i64 = 14
+    const INFO_TOTAL_CAUGHT: i64 = 15
+    const INFO_VERDICT: i64 = 16
+    const INFO_LAST_TICK_MS: i64 = 17
+    const INFO_MAX_TRACKED: i64 = 18
+
+    const VALUE_ID: i64 = 0
+    const VALUE_X: i64 = 1
+    const VALUE_Y: i64 = 2
+    const VALUE_VX: i64 = 3
+    const VALUE_VY: i64 = 4
+    const VALUE_TARGET: i64 = 5
+    const VALUE_PICKED: i64 = 6
+
+    struct TrackingRun:
+        rng: mutable MT19937
+        ball_count: mutable i64
+        start_targets: mutable i64
+        seconds: mutable i64
+        speed_percent: mutable i64
+        speed: mutable f64
+        total_rounds: mutable i64
+        adaptive: mutable bool
+        tracked: mutable i64
+        round: mutable i64
+        phase: mutable i64
+        deadline_ms: mutable i64
+        last_tick_ms: mutable i64
+        verdict: mutable i64
+        asked: mutable i64
+        picked_n: mutable i64
+        caught: mutable i64
+        rounds_done: mutable i64
+        total_asked: mutable i64
+        total_caught: mutable i64
+        max_tracked: mutable i64
+        x: mutable f64[30]
+        y: mutable f64[30]
+        vx: mutable f64[30]
+        vy: mutable f64[30]
+        target: mutable i64[30]
+        picked: mutable i64[30]
+
+    def allowed_balls(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 3 or value == 4 or value == 5 or value == 6 or value == 8 or value == 10 or value == 12 or value == 15 or value == 20 or value == 25 or value == 30
+
+    def allowed_targets(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 1 or value == 2 or value == 3 or value == 4 or value == 5 or value == 6 or value == 8 or value == 10 or value == 12 or value == 15
+
+    def allowed_seconds(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 3 or value == 5 or value == 8 or value == 10 or value == 15 or value == 20 or value == 30 or value == 45 or value == 60
+
+    def allowed_speed(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 8 or value == 12 or value == 16 or value == 22 or value == 30 or value == 40 or value == 55 or value == 75
+
+    def allowed_rounds(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 3 or value == 5 or value == 8 or value == 10 or value == 15 or value == 20 or value == 30 or value == 50
+
+    def clamped_targets(run: TrackingRun&, value: i64) -> i64:
+        can Abort.Panic:
+            floor: i64 = 1 if value < 1 else value
+            ceiling: i64 = run.ball_count - 1
+            return ceiling if floor > ceiling else floor
+
+    def radius(height: f64) -> f64:
+        can Abort.Panic:
+            scaled: f64 = Geometry::scale_to_height(height, 21.0).f64()
+            return scaled if scaled > 8.0 else 8.0
+
+    def clear_balls(run: mutable TrackingRun&):
+        can Abort.Panic:
+            for at in 0..<MAX_BALLS |at, run|:
+                run.x[at.usize()] <- 0.0
+                run.y[at.usize()] <- 0.0
+                run.vx[at.usize()] <- 0.0
+                run.vy[at.usize()] <- 0.0
+                run.target[at.usize()] <- 0
+                run.picked[at.usize()] <- 0
+
+    def reset_score(run: mutable TrackingRun&):
+        can Abort.Panic:
+            run.round <- 0
+            run.tracked <- clamped_targets(run, run.start_targets)
+            run.rounds_done <- 0
+            run.total_asked <- 0
+            run.total_caught <- 0
+            run.max_tracked <- run.tracked
+            run.asked <- 0
+            run.picked_n <- 0
+            run.caught <- 0
+            run.verdict <- -1
+
+    # The source uses the current window radius and fractional bounds.  The
+    # browser's reference transform is 912x684, so using those dimensions here
+    # preserves the source draw order and random stream while CSS scaling stays
+    # a renderer concern.
+    def deal_round(run: mutable TrackingRun&):
+        can Memory.Allocate, Abort.Panic:
+            count: i64 = clamped_targets(run, run.tracked)
+            r: f64 = radius(REFERENCE_HEIGHT)
+            low_x: f64 = r / REFERENCE_WIDTH + 0.01
+            high_x: f64 = 1.0 - r / REFERENCE_WIDTH - 0.01
+            low_y: f64 = r / REFERENCE_HEIGHT + 0.11
+            high_y: f64 = 1.0 - r / REFERENCE_HEIGHT - 0.15
+            apart: f64 = 2.4 * r / REFERENCE_HEIGHT
+            region generation(67108864):
+                in generation:
+                    flock: mutable Tracking::Flock = Tracking::new_flock()
+                    Tracking::deal_round(&flock, run.ball_count, count,
+                        run.speed, apart, low_x, high_x, low_y, high_y, &run.rng)
+                    for at in 0..<MAX_BALLS |at, run, flock|:
+                        if at < run.ball_count:
+                            run.x[at.usize()] <- Floats::at(flock.x, at)
+                            run.y[at.usize()] <- Floats::at(flock.y, at)
+                            run.vx[at.usize()] <- Floats::at(flock.vx, at)
+                            run.vy[at.usize()] <- Floats::at(flock.vy, at)
+                            run.target[at.usize()] <- Ints::at(flock.target, at)
+                            run.picked[at.usize()] <- 0
+                        else:
+                            run.x[at.usize()] <- 0.0
+                            run.y[at.usize()] <- 0.0
+                            run.vx[at.usize()] <- 0.0
+                            run.vy[at.usize()] <- 0.0
+                            run.target[at.usize()] <- 0
+                            run.picked[at.usize()] <- 0
+                destroy generation
+            run.asked <- count
+            run.picked_n <- 0
+            run.caught <- 0
+            run.verdict <- -1
+
+    def tracked_now(run: TrackingRun&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for at in 0..<run.ball_count |at, run, total|:
+                total <- total + 1 if run.target[at.usize()] != 0
+            return total
+
+    def picked_now(run: TrackingRun&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for at in 0..<run.ball_count |at, run, total|:
+                total <- total + 1 if run.picked[at.usize()] != 0
+            return total
+
+    def caught_now(run: TrackingRun&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for at in 0..<run.ball_count |at, run, total|:
+                total <- total + 1 if run.target[at.usize()] != 0 and run.picked[at.usize()] != 0
+            return total
+
+    def next_round(run: mutable TrackingRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.round >= run.total_rounds:
+                run.phase <- PHASE_DONE
+                run.deadline_ms <- 0
+                return
+            run.round <- run.round + 1
+            deal_round(run)
+            run.phase <- PHASE_CUEING
+            run.deadline_ms <- now_ms + CUE_MS
+            run.last_tick_ms <- now_ms
+
+    def start_run(run: mutable TrackingRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            reset_score(run)
+            clear_balls(run)
+            run.phase <- PHASE_READY
+            next_round(run, now_ms)
+
+    def advance_balls(run: mutable TrackingRun&, dt: f64, aspect: f64,
+                      low_x: f64, high_x: f64, low_y: f64, high_y: f64):
+        can Abort.Panic:
+            for at in 0..<run.ball_count |at, run, dt, aspect, low_x, high_x, low_y, high_y|:
+                nx: f64 = run.x[at.usize()] + run.vx[at.usize()] * dt * aspect
+                ny: f64 = run.y[at.usize()] + run.vy[at.usize()] * dt
+                across: Tracking::Axis = Tracking::bounced(nx, run.vx[at.usize()], low_x, high_x)
+                down: Tracking::Axis = Tracking::bounced(ny, run.vy[at.usize()], low_y, high_y)
+                run.x[at.usize()] <- across.position
+                run.vx[at.usize()] <- across.velocity
+                run.y[at.usize()] <- down.position
+                run.vy[at.usize()] <- down.velocity
+
+    def score(run: mutable TrackingRun&, now_ms: i64):
+        can Abort.Panic:
+            asked: i64 = tracked_now(run)
+            caught: i64 = caught_now(run)
+            run.asked <- asked
+            run.caught <- caught
+            run.rounds_done <- run.rounds_done + 1
+            run.total_asked <- run.total_asked + asked
+            run.total_caught <- run.total_caught + caught
+            run.verdict <- 1 if caught == asked else 0
+            if run.adaptive:
+                run.tracked <- clamped_targets(run, run.tracked + 1) if caught == asked
+                run.tracked <- clamped_targets(run, run.tracked - 1) if caught != asked
+            run.max_tracked <- run.tracked if run.tracked > run.max_tracked
+            run.phase <- PHASE_REVEALING
+            run.deadline_ms <- now_ms + REVEAL_MS
+
+    def advance(run: mutable TrackingRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 2 if run.phase == PHASE_READY or run.phase == PHASE_DONE
+            if run.phase == PHASE_CUEING:
+                return 2 if now_ms < run.deadline_ms
+                run.phase <- PHASE_TRACKING
+                run.deadline_ms <- now_ms + run.seconds * 1000
+                run.last_tick_ms <- now_ms
+                return 1
+            if run.phase == PHASE_TRACKING:
+                delta: i64 = now_ms - run.last_tick_ms
+                bounded: i64 = 100 if delta > 100 else (0 if delta < 0 else delta)
+                if bounded > 0:
+                    r: f64 = radius(REFERENCE_HEIGHT)
+                    low_x: f64 = r / REFERENCE_WIDTH + 0.01
+                    high_x: f64 = 1.0 - r / REFERENCE_WIDTH - 0.01
+                    low_y: f64 = r / REFERENCE_HEIGHT + 0.11
+                    high_y: f64 = 1.0 - r / REFERENCE_HEIGHT - 0.15
+                    advance_balls(run, bounded.f64() / 1000.0,
+                        REFERENCE_HEIGHT / REFERENCE_WIDTH, low_x, high_x,
+                        low_y, high_y)
+                run.last_tick_ms <- now_ms
+                if now_ms >= run.deadline_ms:
+                    run.phase <- PHASE_PICKING
+                    return 1
+                return 1 if bounded > 0 else 2
+            if run.phase == PHASE_REVEALING:
+                return 2 if now_ms < run.deadline_ms
+                next_round(run, now_ms)
+                return 1
+            return 2
+
+    def pointer_ball(run: mutable TrackingRun&, now_ms: i64,
+                     x_millionths: i64, y_millionths: i64) -> i64:
+        can Abort.Panic:
+            return -1 if run.phase != PHASE_PICKING
+            px: f64 = x_millionths.f64() * REFERENCE_WIDTH / 1000000.0
+            py: f64 = y_millionths.f64() * REFERENCE_HEIGHT / 1000000.0
+            reach: f64 = radius(REFERENCE_HEIGHT) * 1.3
+            best: mutable i64 = -1
+            best_distance: mutable f64 = 1000000000000.0
+            for at in 0..<run.ball_count |at, run, px, py, reach, best, best_distance|:
+                dx: f64 = run.x[at.usize()] * REFERENCE_WIDTH - px
+                dy: f64 = run.y[at.usize()] * REFERENCE_HEIGHT - py
+                distance: f64 = dx * dx + dy * dy
+                if distance <= reach * reach and distance < best_distance:
+                    best <- at
+                    best_distance <- distance
+            return -1 if best < 0
+            run.picked[best.usize()] <- 0 if run.picked[best.usize()] != 0 else 1
+            run.picked_n <- picked_now(run)
+            if run.picked_n >= tracked_now(run):
+                score(run, now_ms)
+            return best
+
+    def apply(run: mutable TrackingRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                return 2 if run.phase != PHASE_READY and run.phase != PHASE_DONE
+                start_run(run, now_ms)
+                return 1
+            return -6
+
+    def info(run: TrackingRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_BALLS: return run.ball_count
+            if field == INFO_START_TARGETS: return run.start_targets
+            if field == INFO_SECONDS: return run.seconds
+            if field == INFO_SPEED: return run.speed_percent
+            if field == INFO_TOTAL_ROUNDS: return run.total_rounds
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_TRACKED: return run.tracked
+            if field == INFO_ROUND: return run.round
+            if field == INFO_DEADLINE_MS: return run.deadline_ms
+            if field == INFO_ASKED: return run.asked
+            if field == INFO_PICKED: return run.picked_n
+            if field == INFO_CAUGHT: return run.caught
+            if field == INFO_ROUNDS_DONE: return run.rounds_done
+            if field == INFO_TOTAL_ASKED: return run.total_asked
+            if field == INFO_TOTAL_CAUGHT: return run.total_caught
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_LAST_TICK_MS: return run.last_tick_ms
+            if field == INFO_MAX_TRACKED: return run.max_tracked
+            return -1
+
+    def value(run: TrackingRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return -1 if at < 0 or at >= run.ball_count
+            if field == VALUE_ID: return at
+            if field == VALUE_X: return (run.x[at.usize()] * 1000000.0).i64()
+            if field == VALUE_Y: return (run.y[at.usize()] * 1000000.0).i64()
+            if field == VALUE_VX: return (run.vx[at.usize()] * 1000000.0).i64()
+            if field == VALUE_VY: return (run.vy[at.usize()] * 1000000.0).i64()
+            if field == VALUE_TARGET: return run.target[at.usize()]
+            if field == VALUE_PICKED: return run.picked[at.usize()]
+            return -1
+
+    def append_round_message(out: mutable dstr&, run: TrackingRun&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_CUEING:
+                dstr_append_cstr(out, "Follow the ")
+                dstr_append_i64(out, run.asked)
+                dstr_append_cstr(out, " coloured ball")
+                dstr_append_cstr(out, "s") if run.asked != 1
+            elif run.phase == PHASE_TRACKING:
+                dstr_append_cstr(out, "Keep watching")
+            elif run.phase == PHASE_PICKING:
+                dstr_append_cstr(out, "Click the ")
+                dstr_append_cstr(out, "ball" if run.asked == 1 else "balls")
+                dstr_append_cstr(out, " you followed")
+            elif run.phase == PHASE_REVEALING:
+                if run.verdict == 1:
+                    dstr_append_cstr(out, "All ")
+                    dstr_append_i64(out, run.asked)
+                    dstr_append_cstr(out, " — perfect")
+                else:
+                    dstr_append_i64(out, run.caught)
+                    dstr_append_cstr(out, " of ")
+                    dstr_append_i64(out, run.asked)
+
+    def append_done_message(out: mutable dstr&, run: TrackingRun&):
+        can Memory.Allocate, Abort.Panic:
+            accuracy: i64 = py_round_half_even(100.0 * run.total_caught.f64() / run.total_asked.f64()) if run.total_asked > 0 else 0
+            dstr_append_i64(out, accuracy)
+            dstr_append_cstr(out, "% — ")
+            dstr_append_i64(out, run.total_caught)
+            dstr_append_cstr(out, " of ")
+            dstr_append_i64(out, run.total_asked)
+            dstr_append_cstr(out, " balls held over ")
+            dstr_append_i64(out, run.rounds_done)
+            dstr_append_cstr(out, " rounds")
+
+    def render(run: TrackingRun&, black_background: bool, width: f64,
+               height: f64, list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            balls: mutable darray[SceneTracking::TrackingBall] = []
+            for at in 0..<run.ball_count |at, run, balls|:
+                balls.push(SceneTracking::TrackingBall{
+                    x: run.x[at.usize()], y: run.y[at.usize()],
+                    target: run.target[at.usize()] != 0,
+                    picked: run.picked[at.usize()] != 0})
+            sx: f64 = width / REFERENCE_WIDTH
+            sy: f64 = height / REFERENCE_HEIGHT
+            paint: mutable SceneTracking::TrackingPaint = SceneTracking::paint_of(
+                black_background, width, height, sx, sy)
+            message: mutable dstr = []
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(&message, "Press Space to start")
+            elif run.phase == PHASE_DONE:
+                append_done_message(&message, run)
+            else:
+                append_round_message(&message, run)
+            verdict_text: mutable dstr = []
+            if run.phase == PHASE_REVEALING:
+                dstr_append_dstr(&verdict_text, message)
+            SceneTracking::render(list, &paint, run.phase, &balls, run.round,
+                run.total_rounds, bytes_view(message), run.verdict,
+                bytes_view(verdict_text))
+
+    def initialize(run: mutable TrackingRun&, balls: i64, targets: i64, seconds: i64,
+                   speed: i64, rounds: i64, adaptive: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.ball_count <- balls
+            run.start_targets <- targets
+            run.seconds <- seconds
+            run.speed_percent <- speed
+            run.speed <- speed.f64() / 100.0
+            run.total_rounds <- rounds
+            run.adaptive <- adaptive
+            run.tracked <- clamped_targets(run, targets)
+            run.round <- 0
+            run.phase <- PHASE_READY
+            run.deadline_ms <- 0
+            run.last_tick_ms <- 0
+            run.verdict <- -1
+            run.asked <- 0
+            run.picked_n <- 0
+            run.caught <- 0
+            run.rounds_done <- 0
+            run.total_asked <- 0
+            run.total_caught <- 0
+            run.max_tracked <- run.tracked
+            clear_balls(run)

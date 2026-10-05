@@ -1,0 +1,394 @@
+# Stateful N-in-a-row run controller.
+#
+# The source UI deals one deterministic position per trial, lets the player
+# move a cursor or click an empty cell, and grades only on Enter.  This adapter
+# keeps that lifecycle in fixed storage while the exact board generator runs in
+# a temporary region.  The browser, native shell, and tests therefore all see
+# the same cells and the same answer rather than a shell-side approximation.
+
+module NinaRowGame:
+
+    const MAX_CELLS: i64 = 16384
+
+    const PHASE_READY: i64 = 0
+    const PHASE_ASKING: i64 = 1
+    const PHASE_JUDGED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    const ACTION_START: i64 = 0
+    const ACTION_SELECT: i64 = 1
+    const ACTION_UP: i64 = 2
+    const ACTION_DOWN: i64 = 3
+    const ACTION_LEFT: i64 = 4
+    const ACTION_RIGHT: i64 = 5
+    const ACTION_SUBMIT: i64 = 6
+
+    const INFO_PHASE: i64 = 0
+    const INFO_RUNG: i64 = 1
+    const INFO_TRIAL: i64 = 2
+    const INFO_TOTAL_TRIALS: i64 = 3
+    const INFO_SIZE: i64 = 4
+    const INFO_CHOICE: i64 = 5
+    const INFO_ANSWER: i64 = 6
+    const INFO_PELLETS: i64 = 7
+    const INFO_LENGTH: i64 = 8
+    const INFO_VERDICT: i64 = 9
+    const INFO_SHOW_ANSWER: i64 = 10
+    const INFO_ADAPTIVE: i64 = 11
+    const INFO_RIGHT: i64 = 12
+    const INFO_ASKED: i64 = 13
+    const INFO_BEST_RUNG: i64 = 14
+    const INFO_SECONDS: i64 = 15
+    const INFO_GRID_OPTION: i64 = 16
+    const INFO_PELLETS_OPTION: i64 = 17
+    const INFO_LENGTH_OPTION: i64 = 18
+
+    const MESSAGE_NONE: i64 = 0
+    const MESSAGE_UNAVAILABLE: i64 = 1
+
+    struct Run:
+        rng: mutable MT19937
+        start_rung: mutable i64
+        total_trials: mutable i64
+        grid_option: mutable i64
+        pellets_option: mutable i64
+        length_option: mutable i64
+        show_answer: mutable bool
+        adaptive: mutable bool
+        rung: mutable i64
+        trial: mutable i64
+        size: mutable i64
+        pellets: mutable i64
+        length: mutable i64
+        choice: mutable i64
+        answer: mutable i64
+        phase: mutable i64
+        verdict: mutable i64
+        message_kind: mutable i64
+        has_puzzle: mutable bool
+        started_at_ms: mutable i64
+        total_time_ms: mutable i64
+        right: mutable i64
+        asked: mutable i64
+        best_rung: mutable i64
+        cells: mutable i64[16384]
+
+    def clamp_rung(value: i64) -> i64:
+        can Abort.Panic:
+            return 1 if value < 1 else (NinaRow::GRADE_COUNT if value > NinaRow::GRADE_COUNT else value)
+
+    def clamp_trials(value: i64) -> i64:
+        can Abort.Panic:
+            return 1 if value < 1 else value
+
+    def allowed_grid(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 0 or value == 5 or value == 6 or value == 8 or value == 12 or value == 16 or value == 24 or value == 32 or value == 64 or value == 128
+
+    def allowed_pellets(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 0 or value == 7 or value == 12 or value == 22 or value == 45 or value == 80 or value == 150 or value == 300 or value == 1200 or value == 6000
+
+    def allowed_length(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 0 or value == 3 or value == 4 or value == 5 or value == 8 or value == 15 or value == 40 or value == 100
+
+    def option_flags(value: i64, bit: i64) -> bool:
+        can Abort.Panic:
+            return ((value >> bit) & 1) != 0
+
+    # Match neural_workshop.ninarow.generate: length is clamped first, then the
+    # requested board is enlarged when a custom line would not fit.  Pellets
+    # are clamped to the resulting board and never below the line length.
+    def target_length(run: Run&) -> i64:
+        can Abort.Panic:
+            grade: NinaRow::Grade = NinaRow::grade_at(run.rung)
+            value: i64 = grade.length if run.length_option == 0 else run.length_option
+            return NinaRow::MIN_LENGTH if value < NinaRow::MIN_LENGTH else (NinaRow::MAX_SIZE if value > NinaRow::MAX_SIZE else value)
+
+    def board_size(run: Run&, length: i64) -> i64:
+        can Abort.Panic:
+            grade: NinaRow::Grade = NinaRow::grade_at(run.rung)
+            requested: mutable i64 = grade.size if run.grid_option == 0 else run.grid_option
+            requested <- NinaRow::MAX_SIZE if requested > NinaRow::MAX_SIZE else requested
+            requested <- 1 if requested < 1 else requested
+            return length if requested < length else requested
+
+    def pellet_count(run: Run&, size: i64, length: i64) -> i64:
+        can Abort.Panic:
+            grade: NinaRow::Grade = NinaRow::grade_at(run.rung)
+            count: mutable i64 = grade.pellets if run.pellets_option == 0 else run.pellets_option
+            minimum: i64 = NinaRow::MIN_LENGTH
+            limit: i64 = size * size - 1
+            count <- minimum if count < minimum else count
+            count <- limit if count > limit else count
+            count <- length if count < length else count
+            return count
+
+    def clear_cells(run: mutable Run&):
+        can Abort.Panic:
+            for cell in 0..<MAX_CELLS |cell, run|:
+                run.cells[cell.usize()] <- NinaRow::EMPTY
+
+    # NinaRow::generate writes the stable board into its caller-provided
+    # `cells` buffer. Copy it before destroying the scratch region; retaining a
+    # darray from that region would make the next WASM call use dangling data.
+    def generate_puzzle(run: mutable Run&, deal_seed: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            generated: mutable bool = false
+            length: i64 = target_length(run)
+            size: i64 = board_size(run, length)
+            pellets: i64 = pellet_count(run, size, length)
+            area: i64 = size * size
+            region generation(134217728):
+                in generation:
+                    table: mutable NinaRow::Lines = NinaRow::lines_new(size, length)
+                    patterns: mutable NinaRow::Patterns = NinaRow::candidate_patterns(&table)
+                    cells: mutable darray[i64] = Ints::zeros(area + 1)
+                    scratch: mutable darray[i64] = Ints::zeros(area + 1)
+                    extras: mutable darray[i64] = Ints::zeros(area + 1)
+                    order: mutable darray[i64] = Ints::zeros(area + 1)
+                    puzzle: NinaRow::Puzzle = NinaRow::generate(
+                        &table, &patterns, run.rung, deal_seed, pellets,
+                        cells, scratch, extras, order)
+                    if puzzle.ok:
+                        run.size <- puzzle.size
+                        run.pellets <- puzzle.pellets
+                        run.length <- puzzle.length
+                        run.answer <- puzzle.answer
+                        run.choice <- 0
+                        run.has_puzzle <- true
+                        cell: mutable i64 = 0
+                        while cell < MAX_CELLS |cell, run, cells, area|:
+                            run.cells[cell.usize()] <- Ints::at(cells, cell) if cell < area else NinaRow::EMPTY
+                            cell <- cell + 1
+                        generated <- true
+                destroy generation
+            return generated
+
+    def first_empty(run: Run&) -> i64:
+        can Abort.Panic:
+            area: i64 = run.size * run.size
+            for cell in 0..<area |cell, run|:
+                return cell if run.cells[cell.usize()] == NinaRow::EMPTY
+            return 0
+
+    def next_trial(run: mutable Run&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.trial >= run.total_trials:
+                run.phase <- PHASE_DONE
+                run.verdict <- -1
+                run.message_kind <- MESSAGE_NONE
+                return
+            run.trial <- run.trial + 1
+            deal_seed: i64 = py_randbelow(&run.rng, 1073741824.u64()).i64()
+            run.has_puzzle <- false
+            run.verdict <- -1
+            run.message_kind <- MESSAGE_NONE
+            if not generate_puzzle(run, deal_seed):
+                run.phase <- PHASE_DONE
+                run.message_kind <- MESSAGE_UNAVAILABLE
+                return
+            run.choice <- first_empty(run)
+            run.started_at_ms <- now_ms
+            run.phase <- PHASE_ASKING
+
+    def initialize(run: mutable Run&, start_rung: i64, total_trials: i64,
+                   grid_option: i64, pellets_option: i64, length_option: i64,
+                   flags: i64, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.start_rung <- clamp_rung(start_rung)
+            run.total_trials <- clamp_trials(total_trials)
+            run.grid_option <- grid_option
+            run.pellets_option <- pellets_option
+            run.length_option <- length_option
+            run.show_answer <- option_flags(flags, 0)
+            run.adaptive <- option_flags(flags, 1)
+            run.rung <- run.start_rung
+            run.trial <- 0
+            run.size <- 0
+            run.pellets <- 0
+            run.length <- 0
+            run.choice <- 0
+            run.answer <- -1
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.message_kind <- MESSAGE_NONE
+            run.has_puzzle <- false
+            run.started_at_ms <- 0
+            run.total_time_ms <- 0
+            run.right <- 0
+            run.asked <- 0
+            run.best_rung <- 0
+            clear_cells(run)
+
+    def start_run(run: mutable Run&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.rung <- run.start_rung
+            run.trial <- 0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.message_kind <- MESSAGE_NONE
+            run.has_puzzle <- false
+            run.started_at_ms <- now_ms
+            run.total_time_ms <- 0
+            run.right <- 0
+            run.asked <- 0
+            run.best_rung <- 0
+            run.answer <- -1
+            clear_cells(run)
+            next_trial(run, now_ms)
+
+    def move_cursor(run: mutable Run&, dr: i64, dc: i64):
+        can Abort.Panic:
+            return if run.phase != PHASE_ASKING or not run.has_puzzle
+            row: mutable i64 = run.choice / run.size
+            col: mutable i64 = run.choice % run.size
+            row <- 0 if row + dr < 0 else (run.size - 1 if row + dr >= run.size else row + dr)
+            col <- 0 if col + dc < 0 else (run.size - 1 if col + dc >= run.size else col + dc)
+            run.choice <- row * run.size + col
+
+    def select(run: mutable Run&, cell: i64):
+        can Abort.Panic:
+            return if run.phase != PHASE_ASKING or not run.has_puzzle
+            return if cell < 0 or cell >= run.size * run.size
+            return if run.cells[cell.usize()] != NinaRow::EMPTY
+            run.choice <- cell
+
+    def judge(run: mutable Run&, now_ms: i64) -> i64:
+        can Abort.Panic:
+            return 2 if run.phase != PHASE_ASKING or not run.has_puzzle
+            correct: bool = run.choice == run.answer
+            elapsed: mutable i64 = now_ms - run.started_at_ms
+            elapsed <- 0 if elapsed < 0
+            run.total_time_ms <- run.total_time_ms + elapsed
+            run.asked <- run.asked + 1
+            run.verdict <- 1 if correct else 0
+            run.right <- run.right + 1 if correct
+            run.best_rung <- run.rung if correct and run.rung > run.best_rung
+            if run.adaptive:
+                run.rung <- clamp_rung(run.rung + (1 if correct else -1))
+            run.phase <- PHASE_JUDGED
+            return 1
+
+    def apply(run: mutable Run&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                if run.phase == PHASE_READY or run.phase == PHASE_DONE:
+                    start_run(run, now_ms)
+                    return 1
+                elif run.phase == PHASE_JUDGED:
+                    next_trial(run, now_ms)
+                    return 1
+                return 2
+            elif action == ACTION_SELECT:
+                return 2 if run.phase != PHASE_ASKING
+                select(run, value)
+                return 1
+            elif action == ACTION_UP:
+                return 2 if run.phase != PHASE_ASKING
+                move_cursor(run, -1, 0)
+                return 1
+            elif action == ACTION_DOWN:
+                return 2 if run.phase != PHASE_ASKING
+                move_cursor(run, 1, 0)
+                return 1
+            elif action == ACTION_LEFT:
+                return 2 if run.phase != PHASE_ASKING
+                move_cursor(run, 0, -1)
+                return 1
+            elif action == ACTION_RIGHT:
+                return 2 if run.phase != PHASE_ASKING
+                move_cursor(run, 0, 1)
+                return 1
+            elif action == ACTION_SUBMIT:
+                return judge(run, now_ms)
+            return -6
+
+    def info(run: Run&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_RUNG: return run.rung
+            if field == INFO_TRIAL: return run.trial
+            if field == INFO_TOTAL_TRIALS: return run.total_trials
+            if field == INFO_SIZE: return run.size
+            if field == INFO_CHOICE: return run.choice
+            if field == INFO_ANSWER: return run.answer
+            if field == INFO_PELLETS: return run.pellets
+            if field == INFO_LENGTH: return run.length
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_SHOW_ANSWER: return 1 if run.show_answer else 0
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_RIGHT: return run.right
+            if field == INFO_ASKED: return run.asked
+            if field == INFO_BEST_RUNG: return run.best_rung
+            if field == INFO_SECONDS: return run.total_time_ms / 1000
+            if field == INFO_GRID_OPTION: return run.grid_option
+            if field == INFO_PELLETS_OPTION: return run.pellets_option
+            if field == INFO_LENGTH_OPTION: return run.length_option
+            return -1
+
+    def pointer_cell(run: Run&, x_millionths: i64, y_millionths: i64) -> i64:
+        can Abort.Panic:
+            return -1 if run.phase != PHASE_ASKING or not run.has_puzzle
+            px: i64 = x_millionths * 912 / 1000000
+            py: i64 = y_millionths * 684 / 1000000
+            # SceneNinaRow::board_box at the 912x684 reference size:
+            # bottom=187, top=552, side=365, left=273.5.
+            left: i64 = 273
+            bottom: i64 = 187
+            side: i64 = 365
+            return -1 if px < left or px >= left + side or py < bottom or py >= bottom + side
+            col: i64 = (px - left) * run.size / side
+            row_from_bottom: i64 = (py - bottom) * run.size / side
+            row: i64 = run.size - 1 - row_from_bottom
+            return row * run.size + col
+
+    def append_done_text(out: mutable dstr&, run: Run&):
+        can Memory.Allocate, Abort.Panic:
+            if run.message_kind == MESSAGE_UNAVAILABLE:
+                dstr_append_cstr(out, "No unique position at this setting")
+                return
+            dstr_append_i64(out, run.right)
+            dstr_append_cstr(out, " of ")
+            dstr_append_i64(out, run.asked)
+            dstr_append_cstr(out, " right, highest level ")
+            dstr_append_i64(out, run.best_rung)
+
+    def render(run: Run&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            cells: mutable darray[i64] = []
+            area: i64 = run.size * run.size
+            for cell in 0..<area |cell, run, cells|:
+                cells.push(run.cells[cell.usize()])
+
+            puzzle: mutable NinaRow::Puzzle = zeroed
+            puzzle.ok <- run.has_puzzle
+            puzzle.size <- run.size
+            puzzle.pellets <- run.pellets
+            puzzle.length <- run.length
+            puzzle.answer <- run.answer
+            puzzle.rung <- run.rung
+
+            sx: f64 = width / Display::REFERENCE_WIDTH
+            sy: f64 = height / Display::REFERENCE_HEIGHT
+            paint: mutable SceneNinaRow::Paint = SceneNinaRow::paint_of(
+                black_background, width, height, sx, sy)
+            message: mutable dstr = []
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(&message, "Press Space to start")
+            elif run.phase == PHASE_ASKING:
+                dstr_append_cstr(&message, "Find the move that completes ")
+                dstr_append_i64(&message, run.length)
+                dstr_append_cstr(&message, " in a row")
+            elif run.phase == PHASE_JUDGED:
+                dstr_append_cstr(&message, "Right" if run.verdict == 1 else "Not that cell")
+            else:
+                append_done_text(&message, run)
+            SceneNinaRow::render(list, &paint, &puzzle, &cells,
+                run.has_puzzle, run.phase, run.trial, run.total_trials,
+                run.choice, run.show_answer, bytes_view(message))

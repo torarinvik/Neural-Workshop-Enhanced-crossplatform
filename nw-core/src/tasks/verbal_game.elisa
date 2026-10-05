@@ -1,0 +1,133 @@
+# Stateful common-v1 Verbal Reasoning controller. Verbal::draw owns row
+# validation and answer shuffling; this slice supplies a deterministic
+# source-compatible row until the host corpus adapter is connected.
+module VerbalGame:
+    const TASK_ID: i64 = 1300493934
+    const READY: i64 = 0
+    const ASKING: i64 = 1
+    const JUDGED: i64 = 2
+    const DONE: i64 = 3
+    const START: i64 = 0
+    const ANSWER: i64 = 1
+    const LEFT: i64 = 2
+    const RIGHT: i64 = 3
+    const UP: i64 = 4
+    const DOWN: i64 = 5
+
+    struct Run:
+        rng: mutable MT19937
+        trials: mutable i64
+        trial: mutable i64
+        right: mutable i64
+        phase: mutable i64
+        verdict: mutable i64
+        choice: mutable i64
+        answer: mutable i64
+        choices: mutable i64
+        order: mutable i64[Verbal::MAX_CHOICES]
+
+    def allowed_trials(value: i64) -> bool:
+        return value >= 1 and value <= 100
+
+    def clear(run: mutable Run&):
+        can Abort.Panic:
+            run.trial <- 0
+            run.right <- 0
+            run.phase <- READY
+            run.verdict <- -1
+            run.choice <- 0
+            run.answer <- 0
+            run.choices <- 0
+
+    def deal(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            region row(67108864):
+                in row:
+                    bank: mutable Verbal::Bank = Verbal::new_bank()
+                    order: mutable darray[i64] = Ints::zeros(Verbal::MAX_CHOICES)
+                    bank.rows <- 1
+                    Ints::put(&bank.english, 0, 1)
+                    Ints::put(&bank.answer_is_digit, 0, 1)
+                    Ints::put(&bank.answer, 0, 1)
+                    Ints::put(&bank.choices, 0, 3)
+                    Ints::put(&bank.prompt_length, 0, 28)
+                    for slot in 0..<3 |slot, bank|:
+                        Ints::put(&bank.choice_length, slot, 1)
+                    question: Verbal::Question = Verbal::draw(&bank, &order, &run.rng)
+                    run.choices <- question.choices
+                    run.answer <- question.answer
+                    for slot in 0..<question.choices |slot, order, run|:
+                        run.order[slot.usize()] <- Ints::at_ref(&order, slot)
+                destroy row
+
+    def initialize(run: mutable Run&, trials: i64, seed: i64):
+        can Abort.Panic:
+            run.rng <- mt19937_new()
+            mt_seed_int(&run.rng, seed.u64())
+            run.trials <- trials
+            clear(run)
+
+    def apply(run: mutable Run&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Abort.Panic:
+            _ = value
+            _ = now_ms
+            if action == START:
+                if run.phase == ASKING: return 2
+                if run.trial >= run.trials:
+                    run.phase <- DONE
+                    return 2
+                run.trial <- run.trial + 1
+                deal(run)
+                run.choice <- 0
+                run.verdict <- -1
+                run.phase <- ASKING
+                return 1
+            if run.phase != ASKING: return 2
+            if action == LEFT or action == UP:
+                run.choice <- run.choice - 1 if run.choice > 0
+                return 1
+            if action == RIGHT or action == DOWN:
+                run.choice <- run.choice + 1 if run.choice + 1 < run.choices
+                return 1
+            if action == ANSWER:
+                run.verdict <- 1 if run.choice == run.answer else 0
+                if run.verdict == 1: run.right <- run.right + 1
+                run.phase <- JUDGED
+                return 1
+            return 2
+
+    def info(run: Run&, field: i64) -> i64:
+        if field == 0: return run.phase
+        if field == 1: return run.trial
+        if field == 2: return run.trials
+        if field == 3: return run.choices
+        if field == 4: return run.choice
+        if field == 5: return run.answer
+        if field == 6: return run.verdict
+        if field == 7: return run.right
+        return -1
+
+    def value(run: Run&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            if field == 0: return run.answer if at == 0 else -1
+            if field == 1:
+                return run.order[at.usize()] if at >= 0 and at < run.choices else -1
+            return -1
+
+    def render(run: Run&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            region frame(67108864):
+                in frame:
+                    choices: mutable darray[sview] = []
+                    source0: darray[sview] = [sview("2", 0, -1), sview("4", 0, -1), sview("6", 0, -1)]
+                    for slot in 0..<run.choices |slot, choices, source0, run|:
+                        choices.push(source0[run.order[slot.usize()].usize()])
+                    sx: f64 = width / Display::REFERENCE_WIDTH
+                    sy: f64 = height / Display::REFERENCE_HEIGHT
+                    paint: SceneVerbal::Paint = SceneVerbal::paint_of(black, width, height, sx, sy)
+                    SceneVerbal::render(list, &paint, run.phase, run.choices > 0,
+                        sview("Which number is even?", 0, -1), choices, run.choice,
+                        run.choice if run.phase == JUDGED else -1, run.trial, run.trials,
+                        sview("Press Space to start", 0, -1), run.phase == JUDGED,
+                        sview("", 0, -1), run.verdict, sview("", 0, -1))
+                destroy frame

@@ -1,0 +1,118 @@
+diff --git a/src/engine/engine_util_solve.c b/src/engine/engine_util_solve.c
+index 7a478d4..aeaf4ea 100644
+--- a/src/engine/engine_util_solve.c
++++ b/src/engine/engine_util_solve.c
+@@ -1251,6 +1251,10 @@ int mju_eig3(mjtNum eigval[3], mjtNum eigvec[9], mjtNum quat[4], const mjtNum ma
+ // solve QCQP in 2 dimensions:
+ //  min  0.5*x'*A*x + x'*b  s.t.  sum (xi/di)^2 <= r^2
+ // return 0 if unconstrained, 1 if constrained
++#if defined(__EMSCRIPTEN__)
++extern mjtNum mj_marble_wheel_fma(mjtNum, mjtNum, mjtNum);
++#endif
++
+ int mju_QCQP2(mjtNum* res, const mjtNum* Ain, const mjtNum* bin,
+               const mjtNum* d, mjtNum r) {
+   mjtNum A11, A22, A12, b1, b2;
+@@ -1267,7 +1271,11 @@ int mju_QCQP2(mjtNum* res, const mjtNum* Ain, const mjtNum* bin,
+   la = 0;
+   for (int iter=0; iter < 20; iter++) {
+     // det(A+la)
++#if defined(__EMSCRIPTEN__)
++    det = mj_marble_wheel_fma(A11+la, A22+la, -(A12*A12));
++#else
+     det = (A11+la)*(A22+la) - A12*A12;
++#endif
+ 
+     // check SPD, with 1e-10 threshold
+     if (det < 1e-10) {
+@@ -1283,11 +1291,20 @@ int mju_QCQP2(mjtNum* res, const mjtNum* Ain, const mjtNum* bin,
+     P12 = -A12*detinv;
+ 
+     // v = -P*b
++#if defined(__EMSCRIPTEN__)
++    v1 = mj_marble_wheel_fma(-P11, b1, (-P12)*b2);
++    v2 = mj_marble_wheel_fma(-P12, b1, (-P22)*b2);
++#else
+     v1 = -P11*b1 - P12*b2;
+     v2 = -P12*b1 - P22*b2;
++#endif
+ 
+     // val = v'*v - r*r
++#if defined(__EMSCRIPTEN__)
++    val = mj_marble_wheel_fma(-r, r, mj_marble_wheel_fma(v1, v1, v2*v2));
++#else
+     val = v1*v1 + v2*v2 - r*r;
++#endif
+ 
+     // check for convergence, or initial solution inside constraint set
+     if (val < 1e-10) {
+@@ -1295,7 +1312,14 @@ int mju_QCQP2(mjtNum* res, const mjtNum* Ain, const mjtNum* bin,
+     }
+ 
+     // deriv = -2 * v' * P * v
++#if defined(__EMSCRIPTEN__)
++    // Original arm64 0x12048c..0x1204ac: fused ordered terms, then double.
++    mjtNum half_deriv = mj_marble_wheel_fma(P11*v1, v1, ((P12+P12)*v1)*v2);
++    half_deriv = mj_marble_wheel_fma(P22*v2, v2, half_deriv);
++    deriv = -(half_deriv+half_deriv);
++#else
+     deriv = -2.0*(P11*v1*v1 + 2.0*P12*v1*v2 + P22*v2*v2);
++#endif
+ 
+     // compute update, exit if too small
+     mjtNum delta = -val/deriv;
+@@ -1315,6 +1339,18 @@ int mju_QCQP2(mjtNum* res, const mjtNum* Ain, const mjtNum* bin,
+ }
+ 
+ 
++// Bounded actual two-tangent kernel probe, separate from the generic probe.
++MJAPI int mj_marble_qcqp2_probe(const mjtNum* packet, int size,
++                               mjtNum* output, int* active) {
++  if (!packet || !output || !active || size != 11) return 0;
++  for (int i = 0; i < size; ++i) if (!isfinite(packet[i])) return 0;
++  if (packet[0] != 1 || packet[1] != 2 || packet[2] < 0 ||
++      packet[9] <= 0 || packet[10] <= 0) return 0;
++  *active = mju_QCQP2(output, packet+3, packet+7, packet+9, packet[2]);
++  return (*active == 0 || *active == 1) &&
++         isfinite(output[0]) && isfinite(output[1]);
++}
++
+ // solve QCQP in 3 dimensions:
+ //  min  0.5*x'*A*x + x'*b  s.t.  sum (xi/di)^2 <= r^2
+ // return 0 if unconstrained, 1 if constrained
+diff --git a/wasm/codegen/generated/bindings.cc b/wasm/codegen/generated/bindings.cc
+index 665ae4c..2738430 100644
+--- a/wasm/codegen/generated/bindings.cc
++++ b/wasm/codegen/generated/bindings.cc
+@@ -57,6 +57,7 @@ extern "C" int mj_solver_gauss_overflow();
+ extern "C" int mj_solver_gauss_invalid();
+ extern "C" void mj_solver_gauss_copy(mjtNum*);
+ extern "C" int mj_marble_gauss_probe(const mjtNum*, int, mjtNum*);
++extern "C" int mj_marble_qcqp2_probe(const mjtNum*, int, mjtNum*, int*);
+ extern "C" int mj_marble_qcqp5_probe(const mjtNum*, int, mjtNum*, int*);
+ extern "C" int mj_noslip_input_trace_size();
+ extern "C" void mj_noslip_input_trace_copy(mjtNum*);
+@@ -6895,6 +6896,23 @@ EMSCRIPTEN_BINDINGS(mujoco_bindings) {
+     result.set("gauss", output[0]); result.set("cost", output[1]);
+     return result;
+   }));
++  function("marbleQCQP2Probe", emscripten::optional_override([](val packet) {
++    val result = val::object(); result.set("accepted", false);
++    if (!val::global("Array").call<bool>("isArray", packet) ||
++        packet["length"].as<double>() != 11) return result;
++    std::vector<mjtNum> values(11);
++    for (int i = 0; i < 11; ++i) {
++      if (packet[i].typeOf().as<std::string>() != "number") return result;
++      values[i] = packet[i].as<mjtNum>();
++    }
++    mjtNum output[2] = {0}; int active = 0;
++    if (!mj_marble_qcqp2_probe(values.data(), 11, output, &active)) return result;
++    result.set("accepted", true); result.set("active", active != 0);
++    val raw = val::array();
++    for (int i = 0; i < 2; ++i) raw.call<void>("push", output[i]);
++    result.set("rawForce", raw);
++    return result;
++  }));
+   function("marbleQCQP5Probe", emscripten::optional_override([](val packet) {
+     val result = val::object();
+     result.set("accepted", false);

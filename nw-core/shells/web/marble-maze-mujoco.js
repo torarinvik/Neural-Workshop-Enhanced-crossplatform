@@ -5,14 +5,62 @@
 // MJCF, state adapter, and wrapper rules as neural_workshop/marblemaze.py.
 
 import loadMujoco from "./vendor/mujoco/mujoco.js";
-import { MARBLE } from "./marble-maze.js";
+import { MARBLE, clamp } from "./marble-maze.js";
+import { pythonHypot2 } from "./python-hypot.js";
 
-function clamp(value, low, high) {
-  return Math.max(low, Math.min(high, value));
+export const MARBLE_MUJOCO_LOAD_TIMEOUT_MS = 15000;
+
+// These counters are deliberately outside the game class. They are diagnostic
+// bookkeeping for the host-owned engine lifetime, not gameplay state; exposing
+// them lets a headed soak distinguish a real model/data leak from the WASM
+// allocator retaining capacity after a correct delete().
+const RESOURCE_STATS = {
+  modelsCreated: 0,
+  modelsDeleted: 0,
+  dataCreated: 0,
+  dataDeleted: 0,
+};
+const DELETED_RESOURCES = {
+  models: new WeakSet(),
+  data: new WeakSet(),
+};
+
+function resourceCreated(kind, resource) {
+  if (resource && (typeof resource === "object" || typeof resource === "function")) {
+    RESOURCE_STATS[`${kind}Created`] += 1;
+  }
+}
+
+function disposeResource(resource, kind) {
+  if (!resource || typeof resource.delete !== "function") return null;
+  if (DELETED_RESOURCES[kind].has(resource)) return null;
+  try {
+    resource.delete();
+    // Count only a completed native delete. If a binding reports a cleanup
+    // failure, the live-object diagnostic must not quietly turn that failure
+    // into a false zero-leak result.
+    DELETED_RESOURCES[kind].add(resource);
+    RESOURCE_STATS[`${kind}Deleted`] += 1;
+    return null;
+  } catch (error) {
+    return error;
+  }
+}
+
+export function marbleMazeMuJoCoResourceStats() {
+  return {
+    ...RESOURCE_STATS,
+    liveModels: RESOURCE_STATS.modelsCreated - RESOURCE_STATS.modelsDeleted,
+    liveData: RESOURCE_STATS.dataCreated - RESOURCE_STATS.dataDeleted,
+  };
+}
+
+if (typeof globalThis !== "undefined") {
+  globalThis.__NW_MARBLE_MUJOCO_RESOURCE_STATS__ = marbleMazeMuJoCoResourceStats;
 }
 
 function hypot2(x, y) {
-  return Math.hypot(x, y);
+  return pythonHypot2(x, y);
 }
 
 function quatRotate(q, v) {
@@ -40,7 +88,7 @@ function stateFor(start) {
   };
 }
 
-function mjcf(board, count) {
+export function buildMarbleMazeMjcf(board, count) {
   const crr = MARBLE.ROLLING_RESISTANCE * MARBLE.RADIUS;
   const parts = [
     "<mujoco>",
@@ -48,8 +96,8 @@ function mjcf(board, count) {
       `noslip_iterations="2" timestep="0.004" ` +
       `gravity="0 0 -${MARBLE.GRAVITY.toFixed(5)}"/>`,
     "<worldbody>",
-    `<geom name="floor" type="plane" size="${Math.max(board.width, 1).toFixed(4)} ` +
-      `${Math.max(board.depth, 1).toFixed(4)} 0.1" ` +
+    `<geom name="floor" type="plane" size="${(Math.max(board.width, 1.0) * 2).toFixed(4)} ` +
+      `${(Math.max(board.depth, 1.0) * 2).toFixed(4)} 0.1" ` +
       `friction="${MARBLE.FRICTION_STATIC.toFixed(3)} ` +
       `${MARBLE.SPIN_GRIP.toFixed(4)} ${crr.toFixed(6)}" ` +
       `condim="6" contype="1" conaffinity="1"/>`,
@@ -102,6 +150,16 @@ function setVector(vector, values) {
   for (let index = 0; index < values.length; index++) vector[index] = values[index];
 }
 
+function disposeMujocoResources(data, model) {
+  const dataFailure = disposeResource(data, "data");
+  const modelFailure = disposeResource(model, "models");
+  return {
+    dataFailure,
+    modelFailure,
+    failure: dataFailure || modelFailure,
+  };
+}
+
 export function makeMarbleMazeMuJoCoGame(mujoco) {
   return class MarbleMazeMuJoCoGame {
     constructor(board) {
@@ -137,18 +195,31 @@ export function makeMarbleMazeMuJoCoGame(mujoco) {
     }
 
     restart() {
-      const elapsed = this.elapsed;
+      // The source UI replaces its Simulation here, and Simulation.__init__
+      // resets elapsed to zero. Its held-key fractional nudge accumulator is
+      // UI state, however, and survives until the next no-key update clears it.
+      const nudgeDue = this.nudgeDue;
       this.reset();
-      this.elapsed = elapsed;
+      this.nudgeDue = nudgeDue;
     }
 
     disposeEngine() {
-      if (this.data) this.data.delete();
-      if (this.model) this.model.delete();
-      this.data = null;
-      this.model = null;
+      const data = this.data;
+      const model = this.model;
       this.ballGeoms = [];
       this.builtFor = -1;
+      // Keep a handle whose native delete failed. Clearing it before the
+      // call made the failure unrecoverable: the caller could report the
+      // leak, but could never retry the binding cleanup, and a subsequent
+      // ensureEngine() could treat the half-disposed pair as gone. A
+      // successful delete is the ownership boundary; only then may the JS
+      // reference be dropped.
+      const dataFailure = disposeResource(data, "data");
+      if (!dataFailure) this.data = null;
+      const modelFailure = disposeResource(model, "models");
+      if (!modelFailure) this.model = null;
+      const failure = dataFailure || modelFailure;
+      if (failure) throw failure;
     }
 
     tilt(which) {
@@ -190,7 +261,6 @@ export function makeMarbleMazeMuJoCoGame(mujoco) {
 
     advance(dt, held = []) {
       const piece = clamp(Number(dt) || 0, 0, 0.05);
-      if (!piece || this.settled) return;
       const keys = held instanceof Set ? held : new Set(held);
       if (keys.size) {
         this.nudgeDue += piece;
@@ -201,18 +271,20 @@ export function makeMarbleMazeMuJoCoGame(mujoco) {
       } else {
         this.nudgeDue = 0;
       }
+      if (!piece) return;
       let left = piece;
-      while (left > 1e-9) {
+      // The source UI steps every positive remainder, including tiny dt.
+      // The final bite is exactly the remainder, so this cannot stall.
+      while (left > 0) {
         const bite = Math.min(left, 1 / 60);
         this.step(bite);
         left -= bite;
-        if (this.settled) break;
       }
     }
 
     step(dt) {
       const amount = Number(dt) || 0;
-      if (amount <= 0 || this.settled) return;
+      if (!(amount > 0) || !Number.isFinite(amount)) return;
       this.cuppedThisStep = 0;
       this.lostThisStep = 0;
       this.struckThisStep = 0;
@@ -225,12 +297,37 @@ export function makeMarbleMazeMuJoCoGame(mujoco) {
       const count = this.marbles.length;
       if (this.model && count === this.builtFor) return;
       this.disposeEngine();
-      this.model = this.mujoco.MjModel.from_xml_string(mjcf(this.board, count));
-      this.data = new this.mujoco.MjData(this.model);
-      // MJCF emits floor, walls, then one sphere geom per ball.
-      const firstBall = 1 + this.board.walls.length;
-      this.ballGeoms = Array.from({ length: count }, (_, index) => firstBall + index);
-      this.builtFor = count;
+      let model = null;
+      let data = null;
+      try {
+        model = this.mujoco.MjModel.from_xml_string(
+          buildMarbleMazeMjcf(this.board, count));
+        resourceCreated("models", model);
+        data = new this.mujoco.MjData(model);
+        resourceCreated("data", data);
+        // MJCF emits floor, walls, then one sphere geom per ball.
+        const firstBall = 1 + this.board.walls.length;
+        const ballGeoms = Array.from({ length: count }, (_, index) => firstBall + index);
+        this.model = model;
+        this.data = data;
+        this.ballGeoms = ballGeoms;
+        this.builtFor = count;
+      } catch (error) {
+        const cleanup = disposeMujocoResources(data, model);
+        // Constructor failure can happen after the model exists but before
+        // MjData is constructed. Keep any native object whose delete failed
+        // attached to this game so a later disposeEngine() can retry it. A
+        // thrown constructor must never turn a recoverable native failure
+        // into an unreachable allocation.
+        this.data = cleanup.dataFailure ? data : null;
+        this.model = cleanup.modelFailure ? model : null;
+        this.ballGeoms = [];
+        this.builtFor = -1;
+        if (cleanup.failure) {
+          console.error("Marble Maze failed to dispose a partial MuJoCo engine", cleanup.failure);
+        }
+        throw error;
+      }
     }
 
     substep(dt) {
@@ -374,7 +471,6 @@ export function makeMarbleMazeMuJoCoGame(mujoco) {
 
     swallow(marble, hole) {
       marble.state = hole.home ? "home" : "lost";
-      marble.over = null;
       if (hole.home) this.cuppedThisStep += 1;
       else this.lostThisStep += 1;
     }
@@ -391,6 +487,30 @@ export function makeMarbleMazeMuJoCoGame(mujoco) {
   };
 }
 
-export async function loadMarbleMazeMuJoCo() {
-  return makeMarbleMazeMuJoCoGame(await loadMujoco());
+export async function loadMarbleMazeMuJoCo(
+  loader = loadMujoco,
+  timeoutMs = MARBLE_MUJOCO_LOAD_TIMEOUT_MS,
+) {
+  // Keep loading injectable so the shell's deliberate fallback and its
+  // rejection path can be tested without replacing the vendored WASM module.
+  // A failed load must reject before a game class is published: callers can
+  // then label the fallback solver instead of silently claiming MuJoCo.
+  const pending = Promise.resolve().then(() => loader());
+  const bounded = Number.isFinite(timeoutMs) && timeoutMs > 0;
+  let timer = null;
+  try {
+    const mujoco = bounded
+      ? await Promise.race([
+        pending,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(
+            `MuJoCo WASM load timed out after ${Math.trunc(timeoutMs)}ms`,
+          )), Math.trunc(timeoutMs));
+        }),
+      ])
+      : await pending;
+    return makeMarbleMazeMuJoCoGame(mujoco);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
 }

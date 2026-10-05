@@ -108,6 +108,21 @@ export function createElisaRuntime() {
         // --- allocation -------------------------------------------------
         malloc: (size) => alloc(size),
         free: (ptr) => release(ptr, 0),
+        realloc: (ptr, size) => {
+            const old = Number(ptr);
+            const nextSize = Number(size);
+            if (old === 0) return alloc(nextSize);
+            if (nextSize === 0) {
+                release(old, 0);
+                return 0;
+            }
+            const block = blocks.find((entry) => entry !== null && entry.at === old);
+            if (!block) throw new Error(`elisa: realloc of unknown heap block ${old}`);
+            const next = alloc(nextSize);
+            u8().copyWithin(next, old, old + Math.min(block.size, nextSize));
+            release(old, block.size);
+            return next;
+        },
         // Arena backing. prot/flags/fd are ignored: there is one flat address
         // space and no file mapping in the browser.
         //
@@ -117,6 +132,22 @@ export function createElisaRuntime() {
         // declared signature rather than assuming a convention.
         mmap: (_addr, length) => alloc(length, PAGE),
         munmap: (addr, length) => release(addr, length),
+
+        // --- optional allocation profiler ABI -------------------------
+        // Native standalone builds link these weak no-op definitions from
+        // compiler/runtime/profile_hooks.c. Keep the same contract in the
+        // browser: negotiate returns 0 (unsupported), and event callbacks
+        // intentionally have no side effects. These are real imports used by
+        // arena allocation, not missing functions to defer-fail on first use.
+        elisa_profile_allocation_negotiate: (_version) => 0,
+        elisa_profile_region_layout_negotiate: (_version) => 0,
+        elisa_profile_region_layout_v1: () => 0,
+        elisa_profile_allocation_event_v1: () => 0,
+        // Stage1 emits this runtime helper for explicit region creation. The
+        // helper only reports an event after the negotiation above succeeds;
+        // because this browser host advertises profiling as unsupported, the
+        // equivalent host implementation is intentionally a no-op.
+        arena_profile_explicit_create: () => 0,
 
         // --- mem / string -----------------------------------------------
         memcpy: (dest, src, n) => {
@@ -212,6 +243,17 @@ export function createElisaRuntime() {
             const r = Math.round(x);
             return (Math.abs(x % 1) === 0.5 && r % 2 !== 0) ? r - Math.sign(x) : r;
         },
+        cos: (x) => Math.cos(x),
+        sin: (x) => Math.sin(x),
+        sqrt: (x) => Math.sqrt(x),
+        exp: (x) => Math.exp(x),
+        log: (x) => Math.log(x),
+        log10: (x) => Math.log10(x),
+        asin: (x) => Math.asin(x),
+        atan2: (y, x) => Math.atan2(y, x),
+        pow: (base, exponent) => Math.pow(base, exponent),
+        fabs: (x) => Math.abs(x),
+        copysign: (magnitude, sign) => Math.abs(magnitude) * (sign < 0 || Object.is(sign, -0) ? -1 : 1),
 
         // compiler-rt: 128-bit multiply, result written through a pointer.
         __multi3: (out, aLo, aHi, bLo, bHi) => {

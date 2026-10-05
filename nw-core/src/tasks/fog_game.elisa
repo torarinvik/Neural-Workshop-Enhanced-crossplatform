@@ -1,0 +1,346 @@
+# Stateful Fog of War run controller.
+#
+# The source UI is deliberately quiet: walking into a wall spends one move but
+# changes no visible state, and the only state that survives a world boundary
+# is the run tally.  This adapter keeps the same distinction.  Fog::generate
+# and Fog::visible are the source kernels; all darrays returned from a
+# generation arena are copied into the fixed Run arrays before that arena is
+# destroyed.
+
+module FogGame:
+
+    const WIDTH: i64 = 25
+    const HEIGHT: i64 = 15
+    const MAX_CELLS: i64 = 375
+    const MAX_TRIALS: i64 = 10
+
+    const PHASE_READY: i64 = 0
+    const PHASE_EXPLORING: i64 = 1
+    const PHASE_FINISHED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    # The environment's five opaque ports are stay, up, down, left, right.
+    # Space is represented by START and is the only lifecycle action in the
+    # original UI; a world closes itself when the move budget is spent.
+    const ACTION_START: i64 = 0
+    const ACTION_STAY: i64 = 1
+    const ACTION_UP: i64 = 2
+    const ACTION_DOWN: i64 = 3
+    const ACTION_LEFT: i64 = 4
+    const ACTION_RIGHT: i64 = 5
+
+    const INFO_PHASE: i64 = 0
+    const INFO_TRIAL: i64 = 1
+    const INFO_TOTAL_TRIALS: i64 = 2
+    const INFO_WALKER: i64 = 3
+    const INFO_MOVES: i64 = 4
+    const INFO_MOVES_ALLOWED: i64 = 5
+    const INFO_WIDTH: i64 = 6
+    const INFO_HEIGHT: i64 = 7
+    const INFO_START: i64 = 8
+    const INFO_OPEN_COUNT: i64 = 9
+    const INFO_WALKED_COUNT: i64 = 10
+    const INFO_PERSIST: i64 = 11
+
+    const INFO_RADIUS: i64 = 12
+    const INFO_VISIBLE_COUNT: i64 = 13
+    const INFO_COVERAGE_PPM: i64 = 14
+    const INFO_RESULTS: i64 = 15
+    const INFO_TOTAL_MOVES: i64 = 16
+    const INFO_AVERAGE_PERCENT: i64 = 17
+    const INFO_BUMPS: i64 = 18
+    const INFO_MESSAGE: i64 = 19
+
+    const CELL_WALL: i64 = 0
+    const CELL_REVEALED: i64 = 1
+    const CELL_WALKED: i64 = 2
+
+    struct FogRun:
+        rng: mutable MT19937
+        radius: mutable i64
+        moves_allowed: mutable i64
+        total_trials: mutable i64
+        persist: mutable bool
+        walls: mutable i64[375]
+        revealed: mutable i64[375]
+        walked: mutable i64[375]
+        width: mutable i64
+        height: mutable i64
+        cells: mutable i64
+        start: mutable i64
+        walker: mutable i64
+        open_count: mutable i64
+        walked_count: mutable i64
+        visible_count: mutable i64
+        trial: mutable i64
+        moves: mutable i64
+        bumps: mutable i64
+        phase: mutable i64
+        coverage: mutable f64
+        coverage_sum: mutable f64
+        results: mutable i64
+        total_moves: mutable i64
+
+    def allowed_radius(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 1 or value == 2 or value == 3 or value == 4 or value == 5
+
+    def allowed_moves(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 100 or value == 200 or value == 300 or value == 400 or value == 600 or value == 800 or value == 1200
+
+    def allowed_trials(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 1 or value == 2 or value == 3 or value == 5 or value == 8 or value == 10
+
+    def clear_arrays(run: mutable FogRun&):
+        can Abort.Panic:
+            cell: mutable i64 = 0
+            while cell < MAX_CELLS |cell, run|:
+                run.walls[cell.usize()] <- 1
+                run.revealed[cell.usize()] <- 0
+                run.walked[cell.usize()] <- 0
+                cell <- cell + 1
+
+    def initialize(run: mutable FogRun&, radius: i64, moves_allowed: i64,
+                   total_trials: i64, persist: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.radius <- radius
+            run.moves_allowed <- moves_allowed
+            run.total_trials <- total_trials
+            run.persist <- persist
+            run.width <- WIDTH
+            run.height <- HEIGHT
+            run.cells <- WIDTH * HEIGHT
+            run.start <- 0
+            run.walker <- 0
+            run.open_count <- 0
+            run.walked_count <- 0
+            run.visible_count <- 0
+            run.trial <- 0
+            run.moves <- 0
+            run.bumps <- 0
+            run.phase <- PHASE_READY
+            run.coverage <- 0.0
+            run.coverage_sum <- 0.0
+            run.results <- 0
+            run.total_moves <- 0
+            clear_arrays(run)
+
+    # Copy a complete source World out of the temporary Fog::Work arena.
+    def generate_world(run: mutable FogRun&, deal_seed: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            generated: mutable bool = false
+            region generation(67108864):
+                in generation:
+                    work: mutable Maze::Work = Fog::work_new(Fog::ROOMS_ACROSS, Fog::ROOMS_DOWN)
+                    deal_rng: mutable MT19937 = mt19937_new()
+                    mt_seed_int(&deal_rng, deal_seed.u64())
+                    world: Fog::World = Fog::generate(
+                        &work, &deal_rng, Fog::ROOMS_ACROSS, Fog::ROOMS_DOWN, Fog::OPENNESS)
+                    run.width <- world.width
+                    run.height <- world.height
+                    run.cells <- world.width * world.height
+                    run.start <- world.start
+                    run.walker <- world.start
+                    run.open_count <- world.open_n
+                    run.walked_count <- 0
+                    run.visible_count <- 0
+                    cell: mutable i64 = 0
+                    while cell < MAX_CELLS |cell, run, world|:
+                        if cell < run.cells:
+                            run.walls[cell.usize()] <- 0 if Ints::at(world.open_flag, cell) == 1 else 1
+                        else:
+                            run.walls[cell.usize()] <- 1
+                        run.revealed[cell.usize()] <- 0
+                        run.walked[cell.usize()] <- 0
+                        cell <- cell + 1
+                    run.walked[run.start.usize()] <- 1
+                    run.walked_count <- 1
+                    generated <- run.open_count > 0 and run.start >= 0 and run.start < run.cells
+                destroy generation
+            return generated
+
+    def look(run: mutable FogRun&):
+        can Memory.Allocate, Abort.Panic:
+            seen: mutable darray[i64] = Ints::zeros(MAX_CELLS)
+            count: i64 = Fog::visible(run.width, run.height, run.walker,
+                                      run.radius, &seen)
+            if not run.persist:
+                cell: mutable i64 = 0
+                while cell < run.cells |cell, run|:
+                    run.revealed[cell.usize()] <- 0
+                    cell <- cell + 1
+            at: mutable i64 = 0
+            while at < count |at, run, seen|:
+                cell: i64 = Ints::at(seen, at)
+                if cell >= 0 and cell < run.cells:
+                    run.revealed[cell.usize()] <- 1
+                at <- at + 1
+            run.visible_count <- count
+
+    def clear_world_state(run: mutable FogRun&):
+        can Abort.Panic:
+            cell: mutable i64 = 0
+            while cell < run.cells |cell, run|:
+                run.revealed[cell.usize()] <- 0
+                run.walked[cell.usize()] <- 0
+                cell <- cell + 1
+            run.walked[run.start.usize()] <- 1
+            run.walked_count <- 1
+            run.walker <- run.start
+            run.moves <- 0
+            run.bumps <- 0
+            run.coverage <- 1.0 / run.open_count.f64()
+            look(run)
+
+    def next_trial(run: mutable FogRun&):
+        can Memory.Allocate, Abort.Panic:
+            if run.trial >= run.total_trials:
+                run.phase <- PHASE_DONE
+                return
+            run.trial <- run.trial + 1
+            deal_seed: i64 = py_randbelow(&run.rng, 1073741824.u64()).i64()
+            if not generate_world(run, deal_seed):
+                run.phase <- PHASE_DONE
+                return
+            clear_world_state(run)
+            run.phase <- PHASE_EXPLORING
+
+    def start_run(run: mutable FogRun&):
+        can Memory.Allocate, Abort.Panic:
+            run.trial <- 0
+            run.results <- 0
+            run.total_moves <- 0
+            run.coverage_sum <- 0.0
+            run.coverage <- 0.0
+            run.phase <- PHASE_READY
+            next_trial(run)
+
+    def finish_world(run: mutable FogRun&):
+        can Abort.Panic:
+            run.coverage <- run.walked_count.f64() / run.open_count.f64() if run.open_count > 0 else 0.0
+            run.coverage_sum <- run.coverage_sum + run.coverage
+            run.results <- run.results + 1
+            run.total_moves <- run.total_moves + run.moves
+            run.phase <- PHASE_FINISHED
+
+    def step(run: mutable FogRun&, action: i64) -> i64:
+        can Abort.Panic:
+            return 2 if run.phase != PHASE_EXPLORING
+            return 1 if action == ACTION_STAY
+            direction: i64 = action - ACTION_UP
+            dx: i64 = 0 if direction < 2 else (-1 if direction == 2 else 1)
+            dy: i64 = -1 if direction == 0 else (1 if direction == 1 else 0)
+            x: i64 = run.walker % run.width
+            y: i64 = run.walker / run.width
+            nx: i64 = x + dx
+            ny: i64 = y + dy
+            moved: mutable bool = false
+            if nx >= 0 and nx < run.width and ny >= 0 and ny < run.height:
+                ahead: i64 = ny * run.width + nx
+                if run.walls[ahead.usize()] == 0:
+                    run.walker <- ahead
+                    if run.walked[ahead.usize()] == 0:
+                        run.walked_count <- run.walked_count + 1
+                    run.walked[ahead.usize()] <- 1
+                    look(run)
+                    moved <- true
+            if not moved:
+                run.bumps <- run.bumps + 1
+            run.moves <- run.moves + 1
+            if run.moves >= run.moves_allowed:
+                finish_world(run)
+            return 1
+
+    def apply(run: mutable FogRun&, action: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                if run.phase == PHASE_READY or run.phase == PHASE_DONE:
+                    start_run(run)
+                    return 1
+                if run.phase == PHASE_FINISHED:
+                    next_trial(run)
+                    return 1
+                return 2
+            if action >= ACTION_STAY and action <= ACTION_RIGHT:
+                return step(run, action)
+            return -6
+
+    def coverage_percent(run: FogRun&) -> i64:
+        can Abort.Panic:
+            return py_round_half_even(100.0 * run.coverage)
+
+    def average_percent(run: FogRun&) -> i64:
+        can Abort.Panic:
+            return 0 if run.results <= 0 else py_round_half_even(100.0 * run.coverage_sum / run.results.f64())
+
+    def info(run: FogRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_TRIAL: return run.trial
+            if field == INFO_TOTAL_TRIALS: return run.total_trials
+            if field == INFO_WALKER: return run.walker
+            if field == INFO_MOVES: return run.moves
+            if field == INFO_MOVES_ALLOWED: return run.moves_allowed
+            if field == INFO_WIDTH: return run.width
+            if field == INFO_HEIGHT: return run.height
+            if field == INFO_START: return run.start
+            if field == INFO_OPEN_COUNT: return run.open_count
+            if field == INFO_WALKED_COUNT: return run.walked_count
+            if field == INFO_PERSIST: return 1 if run.persist else 0
+            if field == INFO_RADIUS: return run.radius
+            if field == INFO_VISIBLE_COUNT: return run.visible_count
+            if field == INFO_COVERAGE_PPM: return rint(run.coverage * 1000000.0).i64()
+            if field == INFO_RESULTS: return run.results
+            if field == INFO_TOTAL_MOVES: return run.total_moves
+            if field == INFO_AVERAGE_PERCENT: return average_percent(run)
+            if field == INFO_BUMPS: return run.bumps
+            if field == INFO_MESSAGE: return coverage_percent(run)
+            return -1
+
+    def cell(run: FogRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return 0 if at < 0 or at >= run.cells
+            if field == CELL_WALL: return run.walls[at.usize()]
+            if field == CELL_REVEALED: return run.revealed[at.usize()]
+            if field == CELL_WALKED: return run.walked[at.usize()]
+            return -1
+
+    def message(run: FogRun&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(out, "Press Space to start")
+            elif run.phase == PHASE_FINISHED:
+                dstr_append_i64(out, coverage_percent(run))
+                dstr_append_cstr(out, "% of that world walked, in ")
+                dstr_append_i64(out, run.moves)
+                dstr_append_cstr(out, " moves")
+            elif run.phase == PHASE_DONE:
+                dstr_append_i64(out, run.results)
+                dstr_append_cstr(out, " worlds, ")
+                dstr_append_i64(out, average_percent(run))
+                dstr_append_cstr(out, "% walked on average")
+
+    def render(run: FogRun&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            walls: mutable darray[bool] = []
+            revealed: mutable darray[bool] = []
+            cell_index: mutable i64 = 0
+            while cell_index < run.cells |cell_index, run, walls, revealed|:
+                walls.push(run.walls[cell_index.usize()] != 0)
+                revealed.push(run.revealed[cell_index.usize()] != 0)
+                cell_index <- cell_index + 1
+            text: mutable dstr = []
+            message(run, &text)
+            sx: f64 = width / Display::REFERENCE_WIDTH
+            sy: f64 = height / Display::REFERENCE_HEIGHT
+            paint: SceneFogOfWar::FogPaint = SceneFogOfWar::paint_of(
+                black_background, width, height, sx, sy)
+            SceneFogOfWar::render(list, &paint, run.phase, run.phase != PHASE_READY and run.phase != PHASE_DONE,
+                run.width, run.height, &walls, &revealed, run.walker, run.trial,
+                run.total_trials, bytes_view(text))

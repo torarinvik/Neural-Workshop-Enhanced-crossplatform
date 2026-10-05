@@ -75,15 +75,47 @@ export function css(color) {
     return `rgba(${r},${g},${b},${(a / 255).toFixed(3)})`;
 }
 
+// Pyglet's Quartz glyph renderer rounds each glyph's advance to a whole
+// framebuffer pixel. Canvas normally keeps fractional advances, which makes
+// long fixed-width strings visibly wider. Round after the active x scale and
+// convert the advances back to user coordinates for placement.
+export function fillTextRoundedAdvances(ctx, text, x, y, {
+    align = "left", pixelScale = 1, strokeWidth = 0,
+} = {}) {
+    const glyphs = Array.from(text);
+    const advances = glyphs.map(glyph =>
+        Math.round(ctx.measureText(glyph).width * pixelScale) / pixelScale);
+    const width = advances.reduce((sum, advance) => sum + advance, 0);
+    let cursor = x - (align === "center" ? width / 2 : align === "right" ? width : 0);
+    if (strokeWidth > 0) {
+        ctx.lineWidth = strokeWidth;
+        ctx.strokeStyle = ctx.fillStyle;
+    }
+    for (let index = 0; index < glyphs.length; index++) {
+        if (strokeWidth > 0) ctx.strokeText(glyphs[index], cursor, y);
+        ctx.fillText(glyphs[index], cursor, y);
+        cursor += advances[index];
+    }
+    return width;
+}
+
 // Renders into a canvas sized to any device pixel ratio. The core works in
 // reference space with y UP; the canvas has y DOWN, so the transform flips
 // once here rather than in every command.
-export function render(ctx, commands, { width, height, assets = {} } = {}) {
+export function render(ctx, commands, {
+    width, height, assets = {}, fontFamily = "system-ui, sans-serif",
+    fontScale = 1, textOffsetY = 0, roundGlyphAdvances = false,
+    glyphStrokeRatio = 0,
+} = {}) {
     const scale = Math.min(width / REFERENCE_WIDTH, height / REFERENCE_HEIGHT);
     const offsetX = (width - REFERENCE_WIDTH * scale) / 2;
     const offsetY = (height - REFERENCE_HEIGHT * scale) / 2;
 
     ctx.save();
+    // Host game layers can leave a scaled/flipped transform behind. Clearing
+    // under that transform erases only part of the framebuffer, so old text
+    // and geometry accumulate on every animation frame.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, width, height);
     ctx.setTransform(scale, 0, 0, -scale, offsetX, height - offsetY);
 
@@ -211,8 +243,15 @@ export function render(ctx, commands, { width, height, assets = {} } = {}) {
             case Kind.SPRITE: {
                 const image = assets[cmd.ref];
                 if (image) {
+                    // CMD_SPRITE stores pyglet's bottom-left origin, not its
+                    // centre. Keep the rotation centre at the sprite's visual
+                    // centre while preserving that wire-level origin. (The
+                    // separate SPRITE_FIT command stores a room centre.)
+                    const drawWidth = image.width * cmd.c;
+                    const drawHeight = image.height * cmd.c;
                     ctx.save();
-                    ctx.translate(cmd.a, cmd.b);
+                    ctx.translate(cmd.a + drawWidth / 2,
+                                  cmd.b + drawHeight / 2);
                     ctx.rotate((cmd.e * Math.PI) / 180);
                     ctx.scale(cmd.c, -cmd.c); // un-flip: images are y-down
                     ctx.drawImage(image, -image.width / 2, -image.height / 2);
@@ -239,18 +278,36 @@ export function render(ctx, commands, { width, height, assets = {} } = {}) {
             case Kind.TEXT: {
                 // Text must not be mirrored by the y-flip, so it draws in a
                 // temporarily un-flipped frame.
-                ctx.save();
-                ctx.translate(cmd.a, cmd.b);
-                ctx.scale(1, -1);
-                ctx.fillStyle = css(cmd.color);
+        ctx.save();
+        ctx.fillStyle = css(cmd.color);
+        const commandTextOffsetY = typeof textOffsetY === "function"
+            ? textOffsetY(cmd) : textOffsetY;
                 // `d` is the weight: every task screen's title asks for bold,
                 // and a title back at normal weight is a different frame.
-                ctx.font = `${cmd.d ? "bold " : ""}${cmd.c}px system-ui, sans-serif`;
-                ctx.textAlign = cmd.anchor ? cmd.anchor[0] : "left";
-                ctx.textBaseline = cmd.anchor
-                    ? { bottom: "alphabetic", middle: "middle", top: "top" }[cmd.anchor[1]]
-                    : "alphabetic";
-                ctx.fillText(cmd.text, 0, 0);
+                if (roundGlyphAdvances) {
+                    const align = cmd.anchor ? cmd.anchor[0] : "left";
+                    ctx.setTransform(1, 0, 0, 1, 0, 0);
+                    ctx.font = `${cmd.d ? "bold " : ""}${cmd.c * fontScale * scale}px ${fontFamily}`;
+                    ctx.textAlign = "left";
+                    ctx.textBaseline = cmd.anchor
+                        ? { bottom: "alphabetic", middle: "middle", top: "top" }[cmd.anchor[1]]
+                        : "alphabetic";
+                    const x = offsetX + cmd.a * scale;
+                    const y = height - offsetY - (cmd.b + commandTextOffsetY) * scale;
+                    fillTextRoundedAdvances(ctx, cmd.text, x, y, {
+                        align, pixelScale: 1,
+                        strokeWidth: cmd.c * fontScale * scale * glyphStrokeRatio,
+                    });
+                } else {
+                    ctx.translate(cmd.a, cmd.b + commandTextOffsetY);
+                    ctx.scale(1, -1);
+                    ctx.font = `${cmd.d ? "bold " : ""}${cmd.c * fontScale}px ${fontFamily}`;
+                    ctx.textAlign = cmd.anchor ? cmd.anchor[0] : "left";
+                    ctx.textBaseline = cmd.anchor
+                        ? { bottom: "alphabetic", middle: "middle", top: "top" }[cmd.anchor[1]]
+                        : "alphabetic";
+                    ctx.fillText(cmd.text, 0, 0);
+                }
                 ctx.restore();
                 break;
             }

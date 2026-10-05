@@ -528,8 +528,8 @@ def test_decoders_agree() -> None:
     # fixture, and a fixture cannot notice the encoder changing under it.
     core = _load_core()
     if core is not None:
-        blobs.append(("nwcore.nback_frame(5, 2, 4, 0)", core.nback_frame(5, 2, 4, 0)))
-        blobs.append(("nwcore.nback_frame(9, 3, 7, -1)", core.nback_frame(9, 3, 7, -1)))
+        blobs.append(("nwcore.title_frame(1, 0, 1, 1)", core.title_frame(1, 0, 1, 1)))
+        blobs.append(("nwcore.title_frame(2, 0, 1, 1)", core.title_frame(2, 0, 1, 1)))
 
     for label, blob in blobs:
         mine = canonical(decode(blob))
@@ -555,7 +555,7 @@ def _load_core():
         import nwcore                                              # noqa: PLC0415
     except ImportError:
         return None
-    return nwcore if hasattr(nwcore, "nback_frame") else None
+    return nwcore if hasattr(nwcore, "title_frame") else None
 
 
 def test_core_frames() -> None:
@@ -564,35 +564,32 @@ def test_core_frames() -> None:
         print("  skip live core (run scripts/build_pymodule.sh)")
         return
 
-    blob = core.nback_frame(5, 2, 4, 0)
+    blob = core.title_frame(1, 0, 1, 1)
     check(isinstance(blob, bytes) and len(blob) > 16,
-          "nback_frame returns bytes", repr(type(blob)))
+          "title_frame returns bytes", repr(type(blob)))
 
     frame = plan(decode(blob), Viewport(REFERENCE_WIDTH, REFERENCE_HEIGHT))
     kinds = [op.kind for op in frame.ops]
-    check(kinds.count("line") == 4 and kinds.count("box") == 1,
-          "a 3x3 board is one outline and four interior lines", repr(kinds))
-    check([op.fields["text"] for op in frame.ops if op.kind == "text"]
-          == ["Dual N-Back", "N =", "Trial"],
-          "the chrome labels survive the pool round trip")
-    check(frame.verdict == 0 and frame.markers == ["frame-end"],
-          "verdict and marker come through", repr(frame))
-
-    board = [op.fields for op in frame.ops if op.kind == "box"][0]
-    check(close(board["x"], 286.0) and close(board["y"], 180.0)
-          and close(board["width"], 340.0),
-          "the field is centred in the reference space", repr(board))
+    check(kinds.count("rect") == 1 and kinds.count("sprite_fit") == 1,
+          "title frame contains its background and splash", repr(kinds))
+    texts = [op.fields["text"] for op in frame.ops if op.kind == "text"]
+    check("Press SPACE to enter the Workshop" in texts
+          and "F11: Full Screen" in texts
+          and all("N-Back" not in text for text in texts),
+          "the port title contains no generic mode affordance", repr(texts))
+    check(frame.markers == ["frame-end"],
+          "title marker comes through", repr(frame))
 
     # The wasm build returns stale darray storage from the second call onward
     # (repro/nw_wasm32_darray_second_call.elisa). Native must not: if this ever
     # fails, the bug is not wasm-specific after all.
-    repeats = {core.nback_frame(5, 2, 4, 0) for _ in range(64)}
+    repeats = {core.title_frame(1, 0, 1, 1) for _ in range(64)}
     check(repeats == {blob}, "64 repeat calls return identical bytes",
           f"{len(repeats)} distinct results")
-    varied = [core.nback_frame(t, 2, 1 + (t % 8), t % 4 - 1) for t in range(1, 40)]
+    varied = [core.title_frame(t % 4, 0, 1, 1) for t in range(1, 40)]
     texts = {tuple(c["text"] for c in decode(b) if "text" in c) for b in varied}
-    check(texts == {("Dual N-Back", "N =", "Trial", "frame-end")},
-          "pooled strings stay intact across calls", repr(texts))
+    check(all("N-Back" not in text for group in texts for text in group),
+          "pooled title strings stay intact across calls", repr(texts))
 
 
 def main() -> int:

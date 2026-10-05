@@ -1,0 +1,537 @@
+# Stateful controller for the source Out of Sight task.
+#
+# OutOfSight's portable kernel deliberately keeps its moving flock, blind
+# slabs, and per-round tables in arena-backed darrays.  The common v1 ABI
+# needs a stable, fixed-size record instead, so this adapter owns the durable
+# state in WASM memory and materializes the source OutOfSightRun/Blinds/Flock only for a
+# single operation.  The copy boundary is explicit: identities, timings,
+# hidden-state markers, RNG-sensitive schedules, and completed-round results
+# all survive between calls.
+
+module OutOfSightGame:
+
+    const MAX_DOTS: i64 = 30
+    const MAX_BLINDS: i64 = 32
+    const MAX_PROBES: i64 = 64
+    const MAX_ROUNDS: i64 = 64
+    const MAX_REACTIONS: i64 = 4096
+    const REFERENCE_WIDTH: f64 = 912.0
+    const REFERENCE_HEIGHT: f64 = 684.0
+
+    const PHASE_READY: i64 = 0
+    const PHASE_CUEING: i64 = 1
+    const PHASE_TRACKING: i64 = 2
+    const PHASE_REVEALING: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const ACTION_START: i64 = 0
+    const ACTION_MINE: i64 = 1
+    const ACTION_NOT_MINE: i64 = 2
+
+    const INFO_PHASE: i64 = 0
+    const INFO_DOTS: i64 = 1
+    const INFO_START_TARGETS: i64 = 2
+    const INFO_SPEED: i64 = 3
+    const INFO_BLINDS: i64 = 4
+    const INFO_BLIND_WIDTH: i64 = 5
+    const INFO_CROSS_MS: i64 = 6
+    const INFO_PROBES: i64 = 7
+    const INFO_TOTAL_ROUNDS: i64 = 8
+    const INFO_ADAPTIVE: i64 = 9
+    const INFO_ROUND: i64 = 10
+    const INFO_HELD: i64 = 11
+    const INFO_HITS: i64 = 12
+    const INFO_WRONG: i64 = 13
+    const INFO_LATE: i64 = 14
+    const INFO_REACTION_COUNT: i64 = 15
+    const INFO_MEAN_MS: i64 = 16
+    const INFO_ACCURACY: i64 = 17
+    const INFO_MOST_HELD: i64 = 18
+    const INFO_RESULT_COUNT: i64 = 19
+    const INFO_PROBES_DONE: i64 = 20
+    const INFO_PROBE: i64 = 21
+    const INFO_PROBE_AT_MS: i64 = 22
+    const INFO_PROBE_UNTIL_MS: i64 = 23
+    const INFO_VERDICT: i64 = 24
+    const INFO_UNTIL_MS: i64 = 25
+    const INFO_CLOCK_MS: i64 = 26
+    const INFO_NEXT_PROBE_MS: i64 = 27
+    const INFO_NEXT_CROSS_MS: i64 = 28
+    const INFO_ROUND_RIGHT: i64 = 29
+
+    const VALUE_X: i64 = 0
+    const VALUE_Y: i64 = 1
+    const VALUE_VX: i64 = 2
+    const VALUE_VY: i64 = 3
+    const VALUE_TARGET: i64 = 4
+    const VALUE_BUSY_UNTIL_MS: i64 = 5
+    const VALUE_RISKY_UNTIL_MS: i64 = 6
+    const VALUE_WAS_HIDDEN: i64 = 7
+
+    # A separate namespace exposes the generated slabs without confusing
+    # them with dot rows.  Result rows use 200+ and are indexed by round.
+    const VALUE_BLIND_LEFT: i64 = 100
+    const VALUE_BLIND_BOTTOM: i64 = 101
+    const VALUE_BLIND_WIDTH: i64 = 102
+    const VALUE_BLIND_HEIGHT: i64 = 103
+    const RESULT_HELD: i64 = 200
+    const RESULT_ASKED: i64 = 201
+    const RESULT_RIGHT: i64 = 202
+
+    const BLIND_WIDTH_COUNT: i64 = 6
+    const PROBE_COUNT: i64 = 7
+    const ROUND_COUNT: i64 = 8
+
+    struct OutOfSightRun:
+        rng: mutable MT19937
+        dot_count: mutable i64
+        start_targets: mutable i64
+        speed_percent: mutable i64
+        blind_count: mutable i64
+        blind_count_current: mutable i64
+        blind_width: mutable i64
+        cross_ms: mutable i64
+        probes_per_round: mutable i64
+        total_rounds: mutable i64
+        adaptive: mutable bool
+        packed_extra: mutable i64
+        speed: mutable f64
+        cross_gap: mutable f64
+        round_number: mutable i64
+        held: mutable i64
+        hits: mutable i64
+        wrong: mutable i64
+        late: mutable i64
+        reaction_count: mutable i64
+        result_count: mutable i64
+        probes_done: mutable i64
+        round_right: mutable i64
+        probe: mutable i64
+        probe_at_ms: mutable i64
+        probe_ends_ms: mutable i64
+        verdict: mutable i64
+        verdict_until_ms: mutable i64
+        next_probe_ms: mutable i64
+        next_cross_ms: mutable i64
+        phase: mutable i64
+        until_ms: mutable i64
+        clock_ms: mutable i64
+        reaction_times: mutable f64[MAX_REACTIONS]
+        result_held: mutable i64[MAX_ROUNDS]
+        result_asked: mutable i64[MAX_ROUNDS]
+        result_right: mutable i64[MAX_ROUNDS]
+        schedule: mutable i64[MAX_PROBES]
+        x: mutable f64[MAX_DOTS]
+        y: mutable f64[MAX_DOTS]
+        vx: mutable f64[MAX_DOTS]
+        vy: mutable f64[MAX_DOTS]
+        target: mutable i64[MAX_DOTS]
+        busy_until_ms: mutable i64[MAX_DOTS]
+        risky_until_ms: mutable i64[MAX_DOTS]
+        was_hidden: mutable i64[MAX_DOTS]
+        blind_left: mutable f64[MAX_BLINDS]
+        blind_bottom: mutable f64[MAX_BLINDS]
+        blind_widths: mutable f64[MAX_BLINDS]
+        blind_height: mutable f64[MAX_BLINDS]
+
+    def allowed_dots(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 3 or value == 4 or value == 5 or value == 6 or value == 8 or value == 10 or value == 12 or value == 15 or value == 20 or value == 25 or value == 30
+
+    def allowed_targets(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 1 or value == 2 or value == 3 or value == 4 or value == 5 or value == 6 or value == 8 or value == 10 or value == 12 or value == 15
+
+    def allowed_speed(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 8 or value == 12 or value == 16 or value == 22 or value == 30 or value == 40 or value == 55 or value == 75
+
+    def allowed_cross_ms(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 0 or value == 600 or value == 900 or value == 1200 or value == 1600 or value == 2200 or value == 3000 or value == 5000
+
+    def allowed_blinds(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 0 or value == 1 or value == 2 or value == 3 or value == 4 or value == 5 or value == 6 or value == 8
+
+    def allowed_blind_width(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 4 or value == 6 or value == 9 or value == 12 or value == 16 or value == 20
+
+    def allowed_probes(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 2 or value == 4 or value == 6 or value == 8 or value == 10 or value == 15 or value == 20
+
+    def allowed_rounds(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 1 or value == 2 or value == 3 or value == 5 or value == 8 or value == 10 or value == 15 or value == 20
+
+    def packed_blind_width(value: i64) -> i64:
+        can Abort.Panic:
+            index: i64 = value % BLIND_WIDTH_COUNT
+            return 4 if index == 0 else (6 if index == 1 else (9 if index == 2 else (12 if index == 3 else (16 if index == 4 else 20))))
+
+    def packed_probes(value: i64) -> i64:
+        can Abort.Panic:
+            index: i64 = (value / BLIND_WIDTH_COUNT) % PROBE_COUNT
+            return 2 if index == 0 else (4 if index == 1 else (6 if index == 2 else (8 if index == 3 else (10 if index == 4 else (15 if index == 5 else 20)))))
+
+    def packed_rounds(value: i64) -> i64:
+        can Abort.Panic:
+            index: i64 = (value / (BLIND_WIDTH_COUNT * PROBE_COUNT)) % ROUND_COUNT
+            return 1 if index == 0 else (2 if index == 1 else (3 if index == 2 else (5 if index == 3 else (8 if index == 4 else (10 if index == 5 else (15 if index == 6 else 20))))))
+
+    def packed_adaptive(value: i64) -> bool:
+        can Abort.Panic:
+            return ((value / (BLIND_WIDTH_COUNT * PROBE_COUNT * ROUND_COUNT)) % 2) != 0
+
+    def allowed_packed(value: i64) -> bool:
+        can Abort.Panic:
+            return false if value < 0
+            return false if value >= BLIND_WIDTH_COUNT * PROBE_COUNT * ROUND_COUNT * 2
+            return allowed_blind_width(packed_blind_width(value)) and allowed_probes(packed_probes(value)) and allowed_rounds(packed_rounds(value))
+
+    def clear_arrays(run: mutable OutOfSightRun&):
+        can Abort.Panic:
+            for at in 0..<MAX_REACTIONS |at, run|:
+                run.reaction_times[at.usize()] <- 0.0
+            for at in 0..<MAX_ROUNDS |at, run|:
+                run.result_held[at.usize()] <- 0
+                run.result_asked[at.usize()] <- 0
+                run.result_right[at.usize()] <- 0
+            for at in 0..<MAX_PROBES |at, run|:
+                run.schedule[at.usize()] <- 0
+            for at in 0..<MAX_DOTS |at, run|:
+                run.x[at.usize()] <- 0.0
+                run.y[at.usize()] <- 0.0
+                run.vx[at.usize()] <- 0.0
+                run.vy[at.usize()] <- 0.0
+                run.target[at.usize()] <- 0
+                run.busy_until_ms[at.usize()] <- 0
+                run.risky_until_ms[at.usize()] <- 0
+                run.was_hidden[at.usize()] <- 0
+            for at in 0..<MAX_BLINDS |at, run|:
+                run.blind_left[at.usize()] <- 0.0
+                run.blind_bottom[at.usize()] <- 0.0
+                run.blind_widths[at.usize()] <- 0.0
+                run.blind_height[at.usize()] <- 0.0
+
+    def clear_score(run: mutable OutOfSightRun&):
+        can Abort.Panic:
+            run.round_number <- 0
+            run.held <- run.start_targets
+            run.hits <- 0
+            run.wrong <- 0
+            run.late <- 0
+            run.reaction_count <- 0
+            run.result_count <- 0
+            run.blind_count_current <- 0
+            run.probes_done <- 0
+            run.round_right <- 0
+            run.probe <- -1
+            run.probe_at_ms <- 0
+            run.probe_ends_ms <- 0
+            run.verdict <- -1
+            run.verdict_until_ms <- 0
+            run.next_probe_ms <- 0
+            run.next_cross_ms <- 0
+            run.phase <- PHASE_READY
+            run.until_ms <- 0
+            run.clock_ms <- 0
+
+    def copy_config(run: OutOfSightRun&, source: mutable OutOfSight::OutOfSightSourceRun&):
+        can Abort.Panic:
+            OutOfSight::adapter_load(source, run.dot_count, run.start_targets, run.speed,
+                run.blind_count, run.blind_width.f64(), run.cross_gap, run.probes_per_round,
+                run.total_rounds, run.adaptive, run.round_number, run.held, run.hits, run.wrong,
+                run.late, run.reaction_count, run.result_count, run.probes_done, run.round_right,
+                run.probe, run.probe_at_ms.f64() / 1000.0, run.probe_ends_ms.f64() / 1000.0,
+                run.verdict, run.verdict_until_ms.f64() / 1000.0, run.next_probe_ms.f64() / 1000.0,
+                run.next_cross_ms.f64() / 1000.0, run.phase, run.until_ms.f64() / 1000.0,
+                run.reaction_times, run.result_held, run.result_asked, run.result_right, run.schedule)
+
+    def copy_to_source(run: OutOfSightRun&, source: mutable OutOfSight::OutOfSightSourceRun&):
+        can Abort.Panic:
+            copy_config(run, source)
+
+    def copy_from_source(run: mutable OutOfSightRun&, source: OutOfSight::OutOfSightSourceRun&):
+        can Abort.Panic:
+            probe_at: mutable f64 = 0.0
+            probe_ends: mutable f64 = 0.0
+            verdict_until: mutable f64 = 0.0
+            next_probe: mutable f64 = 0.0
+            next_cross: mutable f64 = 0.0
+            until: mutable f64 = 0.0
+            OutOfSight::adapter_save(source, &run.round_number, &run.held, &run.hits, &run.wrong, &run.late,
+                &run.reaction_count, &run.result_count, &run.probes_done, &run.round_right, &run.probe,
+                &probe_at, &probe_ends, &run.verdict, &verdict_until, &next_probe, &next_cross,
+                &run.phase, &until, &run.reaction_times, &run.result_held, &run.result_asked, &run.result_right, &run.schedule)
+            run.probe_at_ms <- (probe_at * 1000.0).i64()
+            run.probe_ends_ms <- (probe_ends * 1000.0).i64()
+            run.verdict_until_ms <- (verdict_until * 1000.0).i64()
+            run.next_probe_ms <- (next_probe * 1000.0).i64()
+            run.next_cross_ms <- (next_cross * 1000.0).i64()
+            run.until_ms <- (until * 1000.0).i64()
+
+    def copy_to_blinds(run: OutOfSightRun&, slabs: mutable OutOfSight::OutOfSightSourceBlinds&):
+        can Abort.Panic:
+            OutOfSight::adapter_blinds_load(slabs, run.blind_count_current, run.blind_left,
+                run.blind_bottom, run.blind_widths, run.blind_height)
+
+    def copy_from_blinds(run: mutable OutOfSightRun&, slabs: OutOfSight::OutOfSightSourceBlinds&):
+        can Abort.Panic:
+            OutOfSight::adapter_blinds_save(slabs, &run.blind_count_current, &run.blind_left,
+                &run.blind_bottom, &run.blind_widths, &run.blind_height)
+
+    def copy_to_flock(run: OutOfSightRun&, flock: mutable OutOfSight::OutOfSightSourceFlock&):
+        can Abort.Panic:
+            busy: mutable f64[30]
+            risky: mutable f64[30]
+            for at in 0..<MAX_DOTS |at, run, busy, risky|:
+                busy[at.usize()] <- run.busy_until_ms[at.usize()].f64() / 1000.0
+                risky[at.usize()] <- run.risky_until_ms[at.usize()].f64() / 1000.0
+            OutOfSight::adapter_flock_load(flock, run.dot_count, run.x, run.y, run.vx, run.vy,
+                run.target, busy, risky, run.was_hidden)
+
+    def copy_from_flock(run: mutable OutOfSightRun&, flock: OutOfSight::OutOfSightSourceFlock&):
+        can Abort.Panic:
+            busy: mutable f64[30]
+            risky: mutable f64[30]
+            OutOfSight::adapter_flock_save(flock, &run.x, &run.y, &run.vx, &run.vy,
+                &run.target, &busy, &risky, &run.was_hidden)
+            for at in 0..<MAX_DOTS |at, run, busy, risky|:
+                run.busy_until_ms[at.usize()] <- (busy[at.usize()] * 1000.0).i64()
+                run.risky_until_ms[at.usize()] <- (risky[at.usize()] * 1000.0).i64()
+
+    def start(run: mutable OutOfSightRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            clear_score(run)
+            clear_arrays(run)
+            region scratch(268435456):
+                in scratch:
+                    source: mutable OutOfSight::OutOfSightSourceRun = OutOfSight::new_run()
+                    slabs: mutable OutOfSight::OutOfSightSourceBlinds = OutOfSight::new_blinds()
+                    flock: mutable OutOfSight::OutOfSightSourceFlock = OutOfSight::new_flock()
+                    spots_x: mutable darray[f64] = Floats::zeros(MAX_DOTS)
+                    spots_y: mutable darray[f64] = Floats::zeros(MAX_DOTS)
+                    copy_to_source(run, &source)
+                    OutOfSight::start_run(&source, &slabs, &flock, &spots_x, &spots_y,
+                        REFERENCE_WIDTH, REFERENCE_HEIGHT, now_ms.f64() / 1000.0, &run.rng)
+                    copy_from_source(run, &source)
+                    copy_from_blinds(run, &slabs)
+                    copy_from_flock(run, &flock)
+                destroy scratch
+            run.clock_ms <- now_ms
+
+    def advance(run: mutable OutOfSightRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 2 if run.phase == PHASE_READY or run.phase == PHASE_DONE
+            delta: i64 = now_ms - run.clock_ms
+            bounded: i64 = 100 if delta > 100 else (0 if delta < 0 else delta)
+            before_phase: i64 = run.phase
+            region scratch(268435456):
+                in scratch:
+                    source: mutable OutOfSight::OutOfSightSourceRun = OutOfSight::new_run()
+                    slabs: mutable OutOfSight::OutOfSightSourceBlinds = OutOfSight::new_blinds()
+                    flock: mutable OutOfSight::OutOfSightSourceFlock = OutOfSight::new_flock()
+                    spots_x: mutable darray[f64] = Floats::zeros(MAX_DOTS)
+                    spots_y: mutable darray[f64] = Floats::zeros(MAX_DOTS)
+                    copy_to_source(run, &source)
+                    copy_to_blinds(run, &slabs)
+                    copy_to_flock(run, &flock)
+                    for at in 0..<MAX_DOTS |at, run, spots_x, spots_y|:
+                        Floats::put(&spots_x, at, run.x[at.usize()])
+                        Floats::put(&spots_y, at, run.y[at.usize()])
+                    OutOfSight::update(&source, &slabs, &flock, &spots_x, &spots_y,
+                        bounded.f64() / 1000.0, REFERENCE_WIDTH, REFERENCE_HEIGHT,
+                        now_ms.f64() / 1000.0, &run.rng)
+                    copy_from_source(run, &source)
+                    copy_from_blinds(run, &slabs)
+                    copy_from_flock(run, &flock)
+                destroy scratch
+            run.clock_ms <- now_ms
+            return 1 if run.phase != before_phase or bounded > 0 else 2
+
+    def answer(run: mutable OutOfSightRun&, mine: bool, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 2 if run.phase != PHASE_TRACKING or run.probe < 0 or run.verdict >= 0
+            before_hits: i64 = run.hits
+            before_wrong: i64 = run.wrong
+            region scratch(268435456):
+                in scratch:
+                    source: mutable OutOfSight::OutOfSightSourceRun = OutOfSight::new_run()
+                    slabs: mutable OutOfSight::OutOfSightSourceBlinds = OutOfSight::new_blinds()
+                    flock: mutable OutOfSight::OutOfSightSourceFlock = OutOfSight::new_flock()
+                    copy_to_source(run, &source)
+                    copy_to_flock(run, &flock)
+                    OutOfSight::answer(&source, &flock, mine, now_ms.f64() / 1000.0)
+                    copy_from_source(run, &source)
+                    copy_from_flock(run, &flock)
+                destroy scratch
+            run.clock_ms <- now_ms
+            return 1 if run.hits > before_hits or run.wrong > before_wrong else 2
+
+    def mean_ms(run: OutOfSightRun&) -> i64:
+        can Abort.Panic:
+            return 0 if run.reaction_count <= 0
+            total: mutable f64 = 0.0
+            for at in 0..<run.reaction_count |at, run, total|:
+                total <- total + run.reaction_times[at.usize()]
+            return py_round_half_even(total * 1000.0 / run.reaction_count.f64())
+
+    def accuracy(run: OutOfSightRun&) -> i64:
+        can Abort.Panic:
+            asked: i64 = run.hits + run.wrong + run.late
+            return 0 if asked == 0
+            return py_round_half_even(100.0 * run.hits.f64() / asked.f64())
+
+    def most_held(run: OutOfSightRun&) -> i64:
+        can Abort.Panic:
+            best: mutable i64 = 0
+            for at in 0..<run.result_count |at, run, best|:
+                asked: i64 = run.result_asked[at.usize()]
+                right: i64 = run.result_right[at.usize()]
+                continue if asked == 0 or right != asked
+                best <- run.result_held[at.usize()] if run.result_held[at.usize()] > best
+            return best
+
+    def info(run: OutOfSightRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_DOTS: return run.dot_count
+            if field == INFO_START_TARGETS: return run.start_targets
+            if field == INFO_SPEED: return run.speed_percent
+            if field == INFO_BLINDS: return run.blind_count
+            if field == INFO_BLIND_WIDTH: return run.blind_width
+            if field == INFO_CROSS_MS: return run.cross_ms
+            if field == INFO_PROBES: return run.probes_per_round
+            if field == INFO_TOTAL_ROUNDS: return run.total_rounds
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_ROUND: return run.round_number
+            if field == INFO_HELD: return run.held
+            if field == INFO_HITS: return run.hits
+            if field == INFO_WRONG: return run.wrong
+            if field == INFO_LATE: return run.late
+            if field == INFO_REACTION_COUNT: return run.reaction_count
+            if field == INFO_MEAN_MS: return mean_ms(run)
+            if field == INFO_ACCURACY: return accuracy(run)
+            if field == INFO_MOST_HELD: return most_held(run)
+            if field == INFO_RESULT_COUNT: return run.result_count
+            if field == INFO_PROBES_DONE: return run.probes_done
+            if field == INFO_PROBE: return run.probe
+            if field == INFO_PROBE_AT_MS: return run.probe_at_ms
+            if field == INFO_PROBE_UNTIL_MS: return run.probe_ends_ms
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_UNTIL_MS: return run.until_ms
+            if field == INFO_CLOCK_MS: return run.clock_ms
+            if field == INFO_NEXT_PROBE_MS: return run.next_probe_ms
+            if field == INFO_NEXT_CROSS_MS: return run.next_cross_ms
+            if field == INFO_ROUND_RIGHT: return run.round_right
+            return -1
+
+    def value(run: OutOfSightRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            if field == RESULT_HELD or field == RESULT_ASKED or field == RESULT_RIGHT:
+                return -1 if at < 0 or at >= run.result_count
+                return run.result_held[at.usize()] if field == RESULT_HELD else (run.result_asked[at.usize()] if field == RESULT_ASKED else run.result_right[at.usize()])
+            if field == VALUE_BLIND_LEFT or field == VALUE_BLIND_BOTTOM or field == VALUE_BLIND_WIDTH or field == VALUE_BLIND_HEIGHT:
+                return -1 if at < 0 or at >= run.blind_count_current
+                if field == VALUE_BLIND_LEFT: return (run.blind_left[at.usize()] * 1000000.0).i64()
+                if field == VALUE_BLIND_BOTTOM: return (run.blind_bottom[at.usize()] * 1000000.0).i64()
+                if field == VALUE_BLIND_WIDTH: return (run.blind_widths[at.usize()] * 1000000.0).i64()
+                return (run.blind_height[at.usize()] * 1000000.0).i64()
+            return -1 if at < 0 or at >= run.dot_count
+            if field == VALUE_X: return (run.x[at.usize()] * 1000000.0).i64()
+            if field == VALUE_Y: return (run.y[at.usize()] * 1000000.0).i64()
+            if field == VALUE_VX: return (run.vx[at.usize()] * 1000000.0).i64()
+            if field == VALUE_VY: return (run.vy[at.usize()] * 1000000.0).i64()
+            if field == VALUE_TARGET: return run.target[at.usize()]
+            if field == VALUE_BUSY_UNTIL_MS: return run.busy_until_ms[at.usize()]
+            if field == VALUE_RISKY_UNTIL_MS: return run.risky_until_ms[at.usize()]
+            if field == VALUE_WAS_HIDDEN: return run.was_hidden[at.usize()]
+            return -1
+
+    def append_message(out: mutable dstr&, run: OutOfSightRun&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(out, "Press Space to start")
+            elif run.phase == PHASE_CUEING:
+                dstr_append_cstr(out, "Remember your dots")
+            elif run.phase == PHASE_TRACKING:
+                if run.verdict == 1:
+                    dstr_append_cstr(out, "Right")
+                elif run.verdict == 0:
+                    dstr_append_cstr(out, "Wrong")
+                else:
+                    dstr_append_cstr(out, "J: mine     F: not mine")
+            elif run.phase == PHASE_REVEALING:
+                dstr_append_cstr(out, "Round complete")
+            else:
+                dstr_append_i64(out, run.hits)
+                dstr_append_cstr(out, " right, ")
+                dstr_append_i64(out, run.wrong)
+                dstr_append_cstr(out, " wrong, ")
+                dstr_append_i64(out, run.late)
+                dstr_append_cstr(out, " late — ")
+                dstr_append_i64(out, accuracy(run))
+                dstr_append_cstr(out, "% accuracy")
+
+    def render(run: OutOfSightRun&, black_background: bool, width: f64,
+               height: f64, list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            dots: mutable darray[SceneOutOfSight::Dot] = []
+            for at in 0..<run.dot_count |at, run, dots|:
+                dots.push(SceneOutOfSight::Dot{x: run.x[at.usize()],
+                    y: run.y[at.usize()], target: run.target[at.usize()] != 0})
+            blinds: mutable darray[SceneOutOfSight::Blind] = []
+            for at in 0..<run.blind_count_current |at, run, blinds|:
+                blinds.push(SceneOutOfSight::Blind{left: run.blind_left[at.usize()],
+                    bottom: run.blind_bottom[at.usize()], width: run.blind_widths[at.usize()],
+                    height: run.blind_height[at.usize()]})
+            sx: f64 = width / REFERENCE_WIDTH
+            sy: f64 = height / REFERENCE_HEIGHT
+            paint: SceneOutOfSight::OutOfSightPaint = SceneOutOfSight::paint_of(
+                black_background, width, height, sx, sy)
+            message: mutable dstr = []
+            append_message(&message, run)
+            has_probe: bool = run.probe >= 0
+            probe_x: f64 = run.x[run.probe.usize()] if has_probe else 0.0
+            probe_y: f64 = run.y[run.probe.usize()] if has_probe else 0.0
+            SceneOutOfSight::render(list, &paint, run.phase, &dots, &blinds,
+                has_probe, probe_x, probe_y, run.verdict, run.round_number,
+                run.total_rounds, run.probes_done, run.probes_per_round,
+                bytes_view(message))
+
+    def initialize(run: mutable OutOfSightRun&, dots: i64, targets: i64, speed: i64,
+                   cross_ms: i64, blinds: i64, packed_extra: i64, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.dot_count <- dots
+            run.start_targets <- targets
+            run.speed_percent <- speed
+            run.blind_count <- blinds
+            run.blind_count_current <- 0
+            run.cross_ms <- cross_ms
+            run.packed_extra <- packed_extra
+            run.blind_width <- packed_blind_width(packed_extra)
+            run.probes_per_round <- packed_probes(packed_extra)
+            run.total_rounds <- packed_rounds(packed_extra)
+            run.adaptive <- packed_adaptive(packed_extra)
+            run.speed <- speed.f64() / 100.0
+            run.cross_gap <- cross_ms.f64() / 1000.0
+            clear_arrays(run)
+            clear_score(run)
+
+    def apply(run: mutable OutOfSightRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                return 2 if run.phase != PHASE_READY and run.phase != PHASE_DONE
+                start(run, now_ms)
+                return 1
+            if action == ACTION_MINE:
+                return answer(run, true, now_ms)
+            if action == ACTION_NOT_MINE:
+                return answer(run, false, now_ms)
+            return -6

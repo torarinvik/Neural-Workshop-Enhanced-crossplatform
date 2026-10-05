@@ -1,0 +1,234 @@
+# Stateful Monkey Ladder run controller.
+#
+# The shell supplies monotonic time and semantic input; this module owns the
+# random stream, dealt sequence, reveal deadline, cursor, answer validation,
+# adaptive length, and result phase. The Run record is fixed-layout so a host
+# can keep it behind a scalar pointer across WASM calls without retaining any
+# arena-backed containers.
+
+module MonkeyLadderGame:
+
+    const MAX_GRID: i64 = 10
+    const MAX_CELLS: i64 = 100
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SHOW: i64 = 1
+    const PHASE_INPUT: i64 = 2
+    const PHASE_RESULT: i64 = 3
+
+    const ACTION_START: i64 = 0
+    const ACTION_TICK: i64 = 1
+    const ACTION_SELECT: i64 = 2
+    const ACTION_UP: i64 = 3
+    const ACTION_DOWN: i64 = 4
+    const ACTION_LEFT: i64 = 5
+    const ACTION_RIGHT: i64 = 6
+    const ACTION_COMMIT: i64 = 7
+
+    const INFO_PHASE: i64 = 0
+    const INFO_GRID: i64 = 1
+    const INFO_LEVEL: i64 = 2
+    const INFO_ROUND_LEVEL: i64 = 3
+    const INFO_LENGTH: i64 = 4
+    const INFO_NEXT_INDEX: i64 = 5
+    const INFO_WRONG: i64 = 6
+    const INFO_CURSOR: i64 = 7
+    const INFO_CURSOR_ENABLED: i64 = 8
+    const INFO_ADAPTIVE: i64 = 9
+    const INFO_REVEAL_ANSWER: i64 = 10
+    const INFO_DEADLINE_MS: i64 = 11
+    const INFO_SHOW_MS: i64 = 12
+    const INFO_PER_TILE_MS: i64 = 13
+
+    const CELL_SEQUENCE: i64 = 0
+    const CELL_CLICKED: i64 = 1
+
+    struct MonkeyLadderRun:
+        rng: mutable MT19937
+        sequence: mutable i64[100]
+        clicked: mutable i64[100]
+        grid: mutable i64
+        start_level: mutable i64
+        level: mutable i64
+        round_level: mutable i64
+        show_ms: mutable i64
+        per_tile_ms: mutable i64
+        length: mutable i64
+        next_index: mutable i64
+        clicked_n: mutable i64
+        wrong: mutable i64
+        cursor_cell: mutable i64
+        deadline_ms: mutable i64
+        phase: mutable i64
+        adaptive: mutable bool
+        reveal_answer: mutable bool
+        cursor_enabled: mutable bool
+
+    def clamp_grid(grid: i64) -> i64:
+        can Abort.Panic:
+            return 3 if grid < 3 else (MAX_GRID if grid > MAX_GRID else grid)
+
+    def clamp_level(level: i64, cells: i64) -> i64:
+        can Abort.Panic:
+            return cells if level > cells else (2 if level < 2 else level)
+
+    def initialize(run: mutable MonkeyLadderRun&, grid: i64, start_level: i64,
+                   adaptive: bool, show_ms: i64, per_tile_ms: i64,
+                   reveal_answer: bool, seed: i64):
+        can Abort.Panic:
+            actual_grid: i64 = clamp_grid(grid)
+            actual_cells: i64 = actual_grid * actual_grid
+            actual_start: i64 = clamp_level(start_level, actual_cells)
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.grid <- actual_grid
+            run.start_level <- actual_start
+            run.level <- actual_start
+            run.round_level <- actual_start
+            run.adaptive <- adaptive
+            run.reveal_answer <- reveal_answer
+            run.show_ms <- 0 if show_ms < 0 else show_ms
+            run.per_tile_ms <- 0 if per_tile_ms < 0 else per_tile_ms
+            run.length <- 0
+            run.next_index <- 0
+            run.clicked_n <- 0
+            run.wrong <- -1
+            run.cursor_cell <- 0
+            run.cursor_enabled <- false
+            run.deadline_ms <- 0
+            run.phase <- PHASE_READY
+            for at in 0..<MAX_CELLS |run|:
+                run.sequence[at.usize()] <- 0
+                run.clicked[at.usize()] <- 0
+
+    # Copy scalar sample results through a helper whose darray is a read-only
+    # parameter. The sampled backing storage may live in the caller's inferred
+    # arena, but only the i64 elements cross into the persistent fixed record.
+    def copy_deal(run: mutable MonkeyLadderRun&, picked: darray[i64], count: i64):
+        can Abort.Panic:
+            for at in 0..<count |run, picked|:
+                run.sequence[at.usize()] <- Ints::at(picked, at)
+
+    def start_round(run: mutable MonkeyLadderRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.round_level <- clamp_level(run.level, run.grid * run.grid)
+            run.length <- run.round_level
+            run.next_index <- 0
+            run.clicked_n <- 0
+            run.wrong <- -1
+            run.cursor_cell <- 0
+            run.cursor_enabled <- false
+            # Match Python's random.sample over row-major cell IDs. The sampled
+            # values are copied into the fixed run record before this function's
+            # allocation scope is released.
+            picked: darray[i64] = py_sample_range(&run.rng, 0,
+                run.grid * run.grid - 1, run.length)
+            copy_deal(run, picked, run.length)
+            duration: i64 = run.show_ms + run.per_tile_ms * run.length
+            run.deadline_ms <- now_ms + duration
+            run.phase <- PHASE_SHOW
+
+    def already_clicked(run: MonkeyLadderRun&, cell: i64) -> bool:
+        can Abort.Panic:
+            for at in 0..<run.clicked_n |run, cell|:
+                true return if run.clicked[at.usize()] == cell
+            return false
+
+    def select_cell(run: mutable MonkeyLadderRun&, cell: i64):
+        can Abort.Panic:
+            return if run.phase != PHASE_INPUT
+            return if cell < 0 or cell >= run.grid * run.grid
+            return if already_clicked(run, cell)
+            expected: i64 = run.sequence[run.next_index.usize()]
+            if cell == expected:
+                run.clicked[run.clicked_n.usize()] <- cell
+                run.clicked_n <- run.clicked_n + 1
+                run.next_index <- run.next_index + 1
+                if run.next_index >= run.length:
+                    if run.adaptive:
+                        run.level <- clamp_level(run.level + 1,
+                                                 run.grid * run.grid)
+                    run.phase <- PHASE_RESULT
+            else:
+                run.wrong <- cell
+                if run.adaptive:
+                    run.level <- clamp_level(run.level - 1,
+                                             run.grid * run.grid)
+                run.phase <- PHASE_RESULT
+
+    def move_cursor(run: mutable MonkeyLadderRun&, d_row: i64, d_col: i64):
+        can Abort.Panic:
+            return if run.phase != PHASE_INPUT
+            row: mutable i64 = run.cursor_cell / run.grid
+            col: mutable i64 = run.cursor_cell % run.grid
+            row <- row + d_row
+            col <- col + d_col
+            row <- 0 if row < 0
+            col <- 0 if col < 0
+            row <- run.grid - 1 if row >= run.grid
+            col <- run.grid - 1 if col >= run.grid
+            run.cursor_cell <- row * run.grid + col
+            run.cursor_enabled <- true
+
+    def action(run: mutable MonkeyLadderRun&, kind: i64, value: i64, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if kind == ACTION_START:
+                if run.phase == PHASE_READY or run.phase == PHASE_RESULT:
+                    start_round(run, now_ms)
+            elif kind == ACTION_TICK:
+                if run.phase == PHASE_SHOW and now_ms >= run.deadline_ms:
+                    run.phase <- PHASE_INPUT
+            elif kind == ACTION_SELECT:
+                select_cell(run, value)
+            elif kind == ACTION_UP:
+                move_cursor(run, -1, 0)
+            elif kind == ACTION_DOWN:
+                move_cursor(run, 1, 0)
+            elif kind == ACTION_LEFT:
+                move_cursor(run, 0, -1)
+            elif kind == ACTION_RIGHT:
+                move_cursor(run, 0, 1)
+            elif kind == ACTION_COMMIT:
+                select_cell(run, run.cursor_cell)
+
+    def info(run: MonkeyLadderRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE:
+                return run.phase
+            elif field == INFO_GRID:
+                return run.grid
+            elif field == INFO_LEVEL:
+                return run.level
+            elif field == INFO_ROUND_LEVEL:
+                return run.round_level
+            elif field == INFO_LENGTH:
+                return run.length
+            elif field == INFO_NEXT_INDEX:
+                return run.next_index
+            elif field == INFO_WRONG:
+                return run.wrong
+            elif field == INFO_CURSOR:
+                return run.cursor_cell
+            elif field == INFO_CURSOR_ENABLED:
+                return 1 if run.cursor_enabled else 0
+            elif field == INFO_ADAPTIVE:
+                return 1 if run.adaptive else 0
+            elif field == INFO_REVEAL_ANSWER:
+                return 1 if run.reveal_answer else 0
+            elif field == INFO_DEADLINE_MS:
+                return run.deadline_ms
+            elif field == INFO_SHOW_MS:
+                return run.show_ms
+            elif field == INFO_PER_TILE_MS:
+                return run.per_tile_ms
+            return -1
+
+    def cell(run: MonkeyLadderRun&, kind: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return -1 if at < 0
+            if kind == CELL_SEQUENCE and at < run.length:
+                return run.sequence[at.usize()]
+            elif kind == CELL_CLICKED and at < run.clicked_n:
+                return run.clicked[at.usize()]
+            return -1

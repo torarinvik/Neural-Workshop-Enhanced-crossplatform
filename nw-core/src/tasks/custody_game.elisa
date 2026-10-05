@@ -1,0 +1,605 @@
+# Stateful Chain of Custody run controller.
+#
+# The source kernel owns the belt, machine, identity, and scoring rules.  This
+# adapter owns only the lifetime across ABI calls: fixed storage for the source
+# Layout/Boxes, the marking/running/scored clock, the claw, and the run tally.
+# The browser never keeps a second copy of the Core or of a box's machine state.
+
+module CustodyGame:
+
+    const MAX_BOXES: i64 = 12
+    const MAX_SLOTS: i64 = 20
+    const MAX_HISTORY: i64 = 4
+    const VERDICT_MS: i64 = 1000
+
+    const PHASE_READY: i64 = 0
+    const PHASE_MARKING: i64 = 1
+    const PHASE_RUNNING: i64 = 2
+    const PHASE_SCORED: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const ACTION_START: i64 = 0
+    const ACTION_LEFT: i64 = 1
+    const ACTION_RIGHT: i64 = 2
+    const ACTION_GRAB: i64 = 3
+
+    const INFO_PHASE: i64 = 0
+    const INFO_RUNG: i64 = 1
+    const INFO_TRIAL: i64 = 2
+    const INFO_TOTAL_TRIALS: i64 = 3
+    const INFO_WIDTH: i64 = 4
+    const INFO_SLOTS: i64 = 5
+    const INFO_BOXES: i64 = 6
+    const INFO_BAY: i64 = 7
+    const INFO_CLAW: i64 = 8
+    const INFO_HELD: i64 = 9
+    const INFO_SPENT: i64 = 10
+    const INFO_BUDGET: i64 = 11
+    const INFO_VERDICT: i64 = 12
+    const INFO_DEADLINE_MS: i64 = 13
+    const INFO_BELT_MS: i64 = 14
+    const INFO_MARK_MS: i64 = 15
+    const INFO_NEED_CHARGE: i64 = 16
+    const INFO_MAX_HEAT: i64 = 17
+    const INFO_MOVING: i64 = 18
+    const INFO_RIGHT: i64 = 19
+    const INFO_BEST_RUNG: i64 = 20
+    const INFO_FLOOR_PERCENT: i64 = 21
+    const INFO_BELT_DEADLINE_MS: i64 = 22
+
+    const VALUE_LOOK: i64 = 0
+    const VALUE_CHARGE: i64 = 1
+    const VALUE_HEAT: i64 = 2
+    const VALUE_SLOT: i64 = 3
+    const VALUE_HELD: i64 = 4
+    const VALUE_DELIVERED: i64 = 5
+    const VALUE_MACHINE: i64 = 6
+
+    const MESSAGE_READY: i64 = 0
+    const MESSAGE_MARKING: i64 = 1
+    const MESSAGE_RUNNING: i64 = 2
+    const MESSAGE_PICKED: i64 = 3
+    const MESSAGE_NOTHING: i64 = 4
+    const MESSAGE_PUT_DOWN: i64 = 5
+    const MESSAGE_INTO_CHARGER: i64 = 6
+    const MESSAGE_INTO_COOLER: i64 = 7
+    const MESSAGE_INTO_PAINTER: i64 = 8
+    const MESSAGE_TAKEN: i64 = 9
+    const MESSAGE_OUT_OF_ACTIONS: i64 = 10
+    const MESSAGE_NOT_CORE: i64 = 11
+    const MESSAGE_BAD_STATE: i64 = 12
+    const MESSAGE_DELIVERED: i64 = 13
+    const MESSAGE_DONE: i64 = 14
+
+    struct CustodyRun:
+        rng: mutable MT19937
+        start_rung: mutable i64
+        rung: mutable i64
+        total_trials: mutable i64
+        belt_ms: mutable i64
+        mark_ms: mutable i64
+        adaptive: mutable bool
+        trial: mutable i64
+        phase: mutable i64
+        deadline_ms: mutable i64
+        belt_deadline_ms: mutable i64
+        width: mutable i64
+        slots: mutable i64
+        boxes: mutable i64
+        looks: mutable i64
+        bay: mutable i64
+        need_charge: mutable i64
+        max_heat: mutable i64
+        decay: mutable i64
+        moving: mutable bool
+        budget: mutable i64
+        core: mutable i64
+        claw: mutable i64
+        held: mutable i64
+        spent: mutable i64
+        verdict: mutable i64
+        message: mutable i64
+        right: mutable i64
+        best_rung: mutable i64
+        floor_sum: mutable f64
+        history_n: mutable i64
+        history: mutable i64[4]
+        last_charge: mutable i64
+        last_heat: mutable i64
+        machine: mutable i64[20]
+        look: mutable i64[12]
+        charge: mutable i64[12]
+        heat: mutable i64[12]
+        slot: mutable i64[12]
+        box_held: mutable i64[12]
+        delivered: mutable i64[12]
+        stalled: mutable i64[12]
+
+    def clamp_rung(value: i64) -> i64:
+        can Abort.Panic:
+            return 1 if value < 1 else (Custody::GRADE_COUNT if value > Custody::GRADE_COUNT else value)
+
+    def allowed_trials(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 1 or value == 2 or value == 3 or value == 5 or value == 8 or value == 10 or value == 15 or value == 20
+
+    def allowed_belt_ms(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 150 or value == 250 or value == 400 or value == 600 or value == 900 or value == 1500
+
+    def allowed_mark_ms(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 400 or value == 800 or value == 1200 or value == 1600 or value == 2500 or value == 4000
+
+    def clear_round(run: mutable CustodyRun&):
+        can Abort.Panic:
+            run.width <- 0
+            run.slots <- 0
+            run.boxes <- 0
+            run.looks <- 0
+            run.bay <- 0
+            run.need_charge <- 0
+            run.max_heat <- 100
+            run.decay <- 0
+            run.moving <- false
+            run.budget <- 0
+            run.core <- -1
+            run.claw <- 0
+            run.held <- -1
+            run.spent <- 0
+            run.deadline_ms <- 0
+            run.belt_deadline_ms <- 0
+            run.verdict <- -1
+            run.message <- MESSAGE_READY
+            run.last_charge <- 0
+            run.last_heat <- 0
+            for at in 0..<MAX_SLOTS |at, run|:
+                run.machine[at.usize()] <- Custody::NO_MACHINE
+            for at in 0..<MAX_BOXES |at, run|:
+                run.look[at.usize()] <- 0
+                run.charge[at.usize()] <- 0
+                run.heat[at.usize()] <- 0
+                run.slot[at.usize()] <- Custody::OFF_BELT
+                run.box_held[at.usize()] <- 0
+                run.delivered[at.usize()] <- 0
+                run.stalled[at.usize()] <- 0
+
+    def save_layout(run: mutable CustodyRun&, layout: Custody::CustodyLayout&):
+        can Abort.Panic:
+            run.width <- layout.width
+            run.slots <- layout.slots
+            run.boxes <- layout.boxes
+            run.looks <- layout.looks
+            run.bay <- layout.bay
+            run.need_charge <- layout.need_charge
+            run.max_heat <- layout.max_heat
+            run.decay <- layout.decay
+            run.moving <- layout.moving
+            run.budget <- layout.budget
+            run.core <- layout.core
+            for at in 0..<MAX_SLOTS |at, run, layout|:
+                run.machine[at.usize()] <- Ints::at(layout.machine, at) if at < layout.slots else Custody::NO_MACHINE
+
+    def load_layout(run: CustodyRun&) -> Custody::CustodyLayout:
+        can Memory.Allocate, Abort.Panic:
+            layout: mutable Custody::CustodyLayout = zeroed
+            layout.width <- run.width
+            layout.slots <- run.slots
+            layout.boxes <- run.boxes
+            layout.looks <- run.looks
+            layout.bay <- run.bay
+            layout.need_charge <- run.need_charge
+            layout.max_heat <- run.max_heat
+            layout.decay <- run.decay
+            layout.moving <- run.moving
+            layout.budget <- run.budget
+            layout.core <- run.core
+            layout.machine <- Ints::zeros(MAX_SLOTS)
+            for at in 0..<MAX_SLOTS |at, run, layout|:
+                Ints::put(&layout.machine, at, run.machine[at.usize()])
+            return layout
+
+    def save_boxes(run: mutable CustodyRun&, boxes: Custody::CustodyBoxes&):
+        can Abort.Panic:
+            # `fresh_boxes` sizes each source array to the current round, not
+            # to the adapter's maximum capacity. Only copy live box entries;
+            # walking MAX_BOXES here reads past the darray on the first small
+            # rungs and traps during start-up.
+            for at in 0..<boxes.count |at, run, boxes|:
+                run.look[at.usize()] <- boxes.look[at.usize()]
+                run.charge[at.usize()] <- boxes.charge[at.usize()]
+                run.heat[at.usize()] <- boxes.heat[at.usize()]
+                run.slot[at.usize()] <- boxes.slot[at.usize()]
+                run.box_held[at.usize()] <- boxes.held[at.usize()]
+                run.delivered[at.usize()] <- boxes.delivered[at.usize()]
+                run.stalled[at.usize()] <- boxes.stalled[at.usize()]
+
+    def load_boxes(run: CustodyRun&) -> Custody::CustodyBoxes:
+        can Memory.Allocate, Abort.Panic:
+            boxes: mutable Custody::CustodyBoxes = zeroed
+            boxes.look <- Ints::zeros(MAX_BOXES)
+            boxes.charge <- Ints::zeros(MAX_BOXES)
+            boxes.heat <- Ints::zeros(MAX_BOXES)
+            boxes.slot <- Ints::zeros(MAX_BOXES)
+            boxes.held <- Ints::zeros(MAX_BOXES)
+            boxes.delivered <- Ints::zeros(MAX_BOXES)
+            boxes.stalled <- Ints::zeros(MAX_BOXES)
+            boxes.count <- run.boxes
+            for at in 0..<MAX_BOXES |at, run, boxes|:
+                Ints::put(&boxes.look, at, run.look[at.usize()])
+                Ints::put(&boxes.charge, at, run.charge[at.usize()])
+                Ints::put(&boxes.heat, at, run.heat[at.usize()])
+                Ints::put(&boxes.slot, at, run.slot[at.usize()])
+                Ints::put(&boxes.held, at, run.box_held[at.usize()])
+                Ints::put(&boxes.delivered, at, run.delivered[at.usize()])
+                Ints::put(&boxes.stalled, at, run.stalled[at.usize()])
+            return boxes
+
+    def generate_trial(run: mutable CustodyRun&):
+        can Memory.Allocate, Abort.Panic:
+            # The Python UI seeds the layout from one outer randrange, then
+            # deals boxes from the UI RNG. Keep those two streams separate.
+            layout_seed: i64 = py_randbelow(&run.rng, 1073741824.u64()).i64()
+            layout_rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&layout_rng, layout_seed.u64())
+            region generation(268435456):
+                in generation:
+                    layout: mutable Custody::CustodyLayout = Custody::generate(&layout_rng, run.rung)
+                    boxes: mutable Custody::CustodyBoxes = Custody::fresh_boxes(&run.rng, &layout)
+                    save_layout(run, &layout)
+                    save_boxes(run, &boxes)
+                destroy generation
+
+    def initialize(run: mutable CustodyRun&, start_rung: i64, total_trials: i64,
+                   belt_ms: i64, mark_ms: i64, adaptive: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.start_rung <- clamp_rung(start_rung)
+            run.rung <- run.start_rung
+            run.total_trials <- total_trials
+            run.belt_ms <- belt_ms
+            run.mark_ms <- mark_ms
+            run.adaptive <- adaptive
+            run.trial <- 0
+            run.phase <- PHASE_READY
+            run.right <- 0
+            run.best_rung <- 0
+            run.floor_sum <- 0.0
+            run.history_n <- 0
+            for at in 0..<MAX_HISTORY |at, run|:
+                run.history[at.usize()] <- 0
+            clear_round(run)
+
+    def append_grade_name(out: mutable dstr&, rung: i64):
+        can Memory.Allocate, Abort.Panic:
+            if rung == 1:
+                dstr_append_cstr(out, "one box")
+            elif rung == 2:
+                dstr_append_cstr(out, "two boxes")
+            elif rung == 3:
+                dstr_append_cstr(out, "the belt")
+            elif rung == 4:
+                dstr_append_cstr(out, "charge it")
+            elif rung == 5:
+                dstr_append_cstr(out, "keep it cool")
+            elif rung == 6:
+                dstr_append_cstr(out, "a new coat")
+            elif rung == 7:
+                dstr_append_cstr(out, "it leaks")
+            elif rung == 8:
+                dstr_append_cstr(out, "a busy belt")
+            elif rung == 9:
+                dstr_append_cstr(out, "two coats")
+            else:
+                dstr_append_cstr(out, "the yard")
+
+    def next_trial(run: mutable CustodyRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.trial >= run.total_trials:
+                run.phase <- PHASE_DONE
+                run.deadline_ms <- 0
+                run.belt_deadline_ms <- 0
+                run.message <- MESSAGE_DONE
+                clear_round(run)
+                run.message <- MESSAGE_DONE
+                return
+            run.trial <- run.trial + 1
+            run.verdict <- -1
+            run.message <- MESSAGE_MARKING
+            run.held <- -1
+            run.claw <- 0
+            run.spent <- 0
+            generate_trial(run)
+            run.phase <- PHASE_MARKING
+            run.deadline_ms <- now_ms + run.mark_ms
+            run.belt_deadline_ms <- now_ms + run.belt_ms
+
+    def start_run(run: mutable CustodyRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.rung <- clamp_rung(run.start_rung)
+            run.trial <- 0
+            run.right <- 0
+            run.best_rung <- 0
+            run.floor_sum <- 0.0
+            run.history_n <- 0
+            run.verdict <- -1
+            run.message <- MESSAGE_READY
+            next_trial(run, now_ms)
+
+    def update_history(run: mutable CustodyRun&, right: i64):
+        can Abort.Panic:
+            if run.history_n < MAX_HISTORY:
+                run.history[run.history_n.usize()] <- right
+                run.history_n <- run.history_n + 1
+                return
+            at: mutable i64 = 1
+            while at < MAX_HISTORY |at, run|:
+                run.history[(at - 1).usize()] <- run.history[at.usize()]
+                at <- at + 1
+            run.history[(MAX_HISTORY - 1).usize()] <- right
+
+    def settle(run: mutable CustodyRun&, layout: Custody::CustodyLayout&, boxes: mutable Custody::CustodyBoxes&,
+               delivered: i64, now_ms: i64):
+        can Abort.Panic:
+            core: i64 = Custody::core_of(boxes, layout)
+            right: mutable i64 = 0
+            if delivered >= 0 and delivered == core and Custody::wanted(boxes, delivered, layout):
+                right <- 1
+            run.right <- run.right + right
+            run.best_rung <- run.rung if run.rung > run.best_rung
+            run.floor_sum <- run.floor_sum + (100.0 / Custody::rivals_expected(run.boxes, run.looks))
+            update_history(run, right)
+            if right != 0:
+                run.message <- MESSAGE_DELIVERED
+            elif delivered < 0:
+                run.message <- MESSAGE_OUT_OF_ACTIONS
+            elif delivered != core:
+                run.message <- MESSAGE_NOT_CORE
+            else:
+                run.message <- MESSAGE_BAD_STATE
+            run.last_charge <- 0 if delivered < 0 else boxes.charge[delivered.usize()]
+            run.last_heat <- 0 if delivered < 0 else boxes.heat[delivered.usize()]
+            if run.adaptive:
+                recent: mutable i64 = 0
+                at: mutable i64 = 0
+                while at < run.history_n |at, run, recent|:
+                    recent <- recent + run.history[at.usize()]
+                    at <- at + 1
+                share: f64 = recent.f64() / run.history_n.f64()
+                if share >= 0.75:
+                    run.rung <- clamp_rung(run.rung + 1)
+                elif share < 0.4:
+                    run.rung <- clamp_rung(run.rung - 1)
+            run.phase <- PHASE_SCORED
+            run.verdict <- right
+            run.deadline_ms <- now_ms + VERDICT_MS
+            run.belt_deadline_ms <- 0
+
+    def tick(run: mutable CustodyRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_MARKING:
+                return 2 if now_ms < run.deadline_ms
+                run.phase <- PHASE_RUNNING
+                run.message <- MESSAGE_RUNNING
+                return 1
+            if run.phase != PHASE_RUNNING:
+                return 2
+            return 2 if now_ms < run.belt_deadline_ms
+            layout: mutable Custody::CustodyLayout = load_layout(run)
+            boxes: mutable Custody::CustodyBoxes = load_boxes(run)
+            order: mutable darray[i64] = Ints::zeros(MAX_BOXES)
+            taken: mutable darray[i64] = Ints::zeros(MAX_SLOTS)
+            gone: mutable darray[i64] = Ints::zeros(MAX_BOXES)
+            Custody::step_belt(&boxes, &layout, &order, &taken, &gone)
+            save_boxes(run, &boxes)
+            run.spent <- run.spent + 1
+            run.belt_deadline_ms <- now_ms + run.belt_ms
+            if run.spent >= run.budget:
+                settle(run, &layout, &boxes, -1, now_ms)
+            return 1
+
+    def move_claw(run: mutable CustodyRun&, delta: i64):
+        can Memory.Allocate, Abort.Panic:
+            return if run.phase != PHASE_RUNNING or run.slots <= 0
+            run.claw <- (run.claw + delta + run.slots) % run.slots
+            if run.held >= 0:
+                boxes: mutable Custody::CustodyBoxes = load_boxes(run)
+                Ints::put(&boxes.slot, run.held, run.claw)
+                save_boxes(run, &boxes)
+
+    def toggle_grab(run: mutable CustodyRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 2 if run.phase != PHASE_RUNNING
+            layout: mutable Custody::CustodyLayout = load_layout(run)
+            boxes: mutable Custody::CustodyBoxes = load_boxes(run)
+            if run.held < 0:
+                grabbed: i64 = Custody::grab(&boxes, run.claw)
+                if grabbed < 0:
+                    run.message <- MESSAGE_NOTHING
+                else:
+                    run.held <- grabbed
+                    run.message <- MESSAGE_PICKED
+                save_boxes(run, &boxes)
+                return 1
+            if not Custody::put_down(&boxes, run.held, run.claw, &layout):
+                run.message <- MESSAGE_TAKEN
+                save_boxes(run, &boxes)
+                return 1
+            delivered: i64 = run.held
+            run.held <- -1
+            save_boxes(run, &boxes)
+            if boxes.delivered[delivered.usize()] != 0:
+                settle(run, &layout, &boxes, delivered, now_ms)
+                return 1
+            machine: i64 = Custody::machine_at(&layout, run.claw)
+            run.message <- MESSAGE_PUT_DOWN
+            if machine == Custody::CHARGER: run.message <- MESSAGE_INTO_CHARGER
+            elif machine == Custody::COOLER: run.message <- MESSAGE_INTO_COOLER
+            elif machine == Custody::PAINTER: run.message <- MESSAGE_INTO_PAINTER
+            return 1
+
+    def apply(run: mutable CustodyRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                if run.phase == PHASE_READY or run.phase == PHASE_DONE:
+                    start_run(run, now_ms)
+                    return 1
+                if run.phase == PHASE_SCORED:
+                    return 2 if now_ms < run.deadline_ms
+                    next_trial(run, now_ms)
+                    return 1
+                return 2
+            if action == ACTION_LEFT:
+                move_claw(run, -1)
+                return 1 if run.phase == PHASE_RUNNING else 2
+            if action == ACTION_RIGHT:
+                move_claw(run, 1)
+                return 1 if run.phase == PHASE_RUNNING else 2
+            if action == ACTION_GRAB:
+                return toggle_grab(run, now_ms)
+            return -6
+
+    def info(run: CustodyRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_RUNG: return run.rung
+            if field == INFO_TRIAL: return run.trial
+            if field == INFO_TOTAL_TRIALS: return run.total_trials
+            if field == INFO_WIDTH: return run.width
+            if field == INFO_SLOTS: return run.slots
+            if field == INFO_BOXES: return run.boxes
+            if field == INFO_BAY: return run.bay
+            if field == INFO_CLAW: return run.claw
+            if field == INFO_HELD: return run.held
+            if field == INFO_SPENT: return run.spent
+            if field == INFO_BUDGET: return run.budget
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_DEADLINE_MS: return run.deadline_ms
+            if field == INFO_BELT_MS: return run.belt_ms
+            if field == INFO_MARK_MS: return run.mark_ms
+            if field == INFO_NEED_CHARGE: return run.need_charge
+            if field == INFO_MAX_HEAT: return run.max_heat
+            if field == INFO_MOVING: return 1 if run.moving else 0
+            if field == INFO_RIGHT: return run.right
+            if field == INFO_BEST_RUNG: return run.best_rung
+            if field == INFO_FLOOR_PERCENT: return py_round_half_even(run.floor_sum / run.trial) if run.trial > 0 else 0
+            if field == INFO_BELT_DEADLINE_MS: return run.belt_deadline_ms
+            return -1
+
+    def value(run: CustodyRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            if field == VALUE_MACHINE:
+                return -1 if at < 0 or at >= run.slots else run.machine[at.usize()]
+            return -1 if at < 0 or at >= run.boxes else (
+                run.look[at.usize()] if field == VALUE_LOOK else (
+                run.charge[at.usize()] if field == VALUE_CHARGE else (
+                run.heat[at.usize()] if field == VALUE_HEAT else (
+                run.slot[at.usize()] if field == VALUE_SLOT else (
+                run.box_held[at.usize()] if field == VALUE_HELD else (
+                run.delivered[at.usize()] if field == VALUE_DELIVERED else -1))))))
+
+    def append_message(out: mutable dstr&, run: CustodyRun&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(out, "Press Space to start")
+            elif run.phase == PHASE_MARKING:
+                dstr_append_cstr(out, "This one")
+            elif run.phase == PHASE_RUNNING:
+                if run.message == MESSAGE_RUNNING:
+                    dstr_append_cstr(out, "Which one was it?")
+                elif run.message == MESSAGE_PICKED:
+                    dstr_append_cstr(out, "Picked it up")
+                elif run.message == MESSAGE_NOTHING:
+                    dstr_append_cstr(out, "Nothing there")
+                elif run.message == MESSAGE_TAKEN:
+                    dstr_append_cstr(out, "That slot is taken")
+                elif run.message == MESSAGE_INTO_CHARGER:
+                    dstr_append_cstr(out, "Into the charge")
+                elif run.message == MESSAGE_INTO_COOLER:
+                    dstr_append_cstr(out, "Into the cool")
+                elif run.message == MESSAGE_INTO_PAINTER:
+                    dstr_append_cstr(out, "Into the paint")
+                else:
+                    dstr_append_cstr(out, "Put down")
+            elif run.phase == PHASE_SCORED:
+                if run.message == MESSAGE_DELIVERED:
+                    dstr_append_cstr(out, "Delivered, in ")
+                    dstr_append_i64(out, run.spent)
+                    dstr_append_cstr(out, " actions")
+                elif run.message == MESSAGE_NOT_CORE:
+                    dstr_append_cstr(out, "That was not the one")
+                elif run.message == MESSAGE_BAD_STATE:
+                    dstr_append_cstr(out, "The right box, but ")
+                    dstr_append_i64(out, run.last_charge)
+                    dstr_append_cstr(out, " charge and ")
+                    dstr_append_i64(out, run.last_heat)
+                    dstr_append_cstr(out, " heat")
+                else:
+                    dstr_append_cstr(out, "Out of actions")
+            else:
+                dstr_append_i64(out, run.right)
+                dstr_append_cstr(out, " of ")
+                dstr_append_i64(out, run.trial)
+                dstr_append_cstr(out, " delivered, highest rung ")
+                dstr_append_i64(out, run.best_rung)
+                dstr_append_cstr(out, " — guessing would have scored about ")
+                dstr_append_i64(out, info(run, INFO_FLOOR_PERCENT))
+                dstr_append_cstr(out, "%")
+
+    def append_asked(out: mutable dstr&, run: CustodyRun&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_cstr(out, "rung ")
+            dstr_append_i64(out, run.rung)
+            dstr_append_cstr(out, ", ")
+            append_grade_name(out, run.rung)
+            dstr_append_cstr(out, ":   deliver the ringed box to the bay")
+            if run.need_charge != 0:
+                dstr_append_cstr(out, "   charged to ")
+                dstr_append_i64(out, run.need_charge)
+            if run.max_heat < 100:
+                dstr_append_cstr(out, "   under ")
+                dstr_append_i64(out, run.max_heat)
+                dstr_append_cstr(out, " heat")
+
+    def render(run: CustodyRun&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            has_layout: bool = run.slots > 0 and run.boxes > 0
+            layout: mutable Custody::CustodyLayout = load_layout(run)
+            machines: mutable darray[SceneCustody::CustodyMachine] = []
+            if has_layout:
+                for at in 0..<run.slots |at, run, machines|:
+                    kind: i64 = run.machine[at.usize()]
+                    if kind >= 0:
+                        machines.push(SceneCustody::CustodyMachine{slot: at, kind: kind})
+            boxes: mutable darray[SceneCustody::CustodyBox] = []
+            if has_layout:
+                for at in 0..<run.boxes |at, run, boxes|:
+                    boxes.push(SceneCustody::CustodyBox{
+                        slot: run.slot[at.usize()],
+                        held: run.box_held[at.usize()] != 0,
+                        delivered: run.delivered[at.usize()] != 0,
+                        look: run.look[at.usize()],
+                        charge: run.charge[at.usize()],
+                        heat: run.heat[at.usize()],
+                        is_core: run.phase == PHASE_MARKING and at == run.core})
+            message: mutable dstr = []
+            append_message(&message, run)
+            asked: mutable dstr = []
+            if has_layout:
+                append_asked(&asked, run)
+            verdict_text: mutable dstr = []
+            if run.phase == PHASE_SCORED:
+                dstr_append_dstr(&verdict_text, message)
+            sx: f64 = width / Display::REFERENCE_WIDTH
+            sy: f64 = height / Display::REFERENCE_HEIGHT
+            paint: SceneCustody::CustodyPaint = SceneCustody::paint_of(
+                black_background, width, height, sx, sy)
+            SceneCustody::render(list, &paint, run.phase, has_layout,
+                run.width, run.slots, run.bay, &machines, &boxes, run.claw,
+                run.need_charge, run.max_heat, run.budget, run.spent,
+                bytes_view(asked), run.trial, run.total_trials,
+                bytes_view(message), run.verdict if run.phase == PHASE_SCORED else -1,
+                bytes_view(verdict_text))

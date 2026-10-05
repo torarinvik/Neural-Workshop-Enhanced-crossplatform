@@ -1,0 +1,2537 @@
+diff --git a/src/engine/engine_core_constraint.c b/src/engine/engine_core_constraint.c
+index 3bf123d..e686376 100644
+--- a/src/engine/engine_core_constraint.c
++++ b/src/engine/engine_core_constraint.c
+@@ -16,6 +16,7 @@
+ 
+ #include <stdio.h>
+ #include <stddef.h>
++#include <string.h>
+ 
+ #include <mujoco/mjdata.h>
+ #include <mujoco/mjmacro.h>
+@@ -32,6 +33,7 @@
+ #include "engine/engine_util_misc.h"
+ #include "engine/engine_util_sparse.h"
+ #include "engine/engine_util_spatial.h"
++#include "engine/marble_constraint_hessian_trace.h"
+ 
+ #ifdef MEMORY_SANITIZER
+   #include <sanitizer/msan_interface.h>
+@@ -3278,6 +3280,7 @@ void mj_constraintUpdate_impl(int ne, int nf, int nefc,
+                               mjContact* contact, int* state, mjtNum* force, mjtNum cost[1],
+                               int flg_coneHessian) {
+   mjtNum s = 0;
++  const int hessian_trace_call = marble_cone_hessian_trace_call();
+ 
+   // no constraints: clear cost, return
+   if (!nefc) {
+@@ -3448,6 +3451,10 @@ void mj_constraintUpdate_impl(int ne, int nf, int nefc,
+               H[j*dim+k] = H[k*dim+j];
+             }
+           }
++          // Every active slot is initialized above. Copy only this prefix.
++          marble_cone_hessian_trace_record(
++              hessian_trace_call, i, nefc, dim, id[i], cost != NULL,
++              mu, N, T, Dm, NmT, friction, jar+i, D+i, R+i, force+i, H);
+         }
+       }
+ 
+@@ -3465,6 +3472,12 @@ void mj_constraintUpdate_impl(int ne, int nf, int nefc,
+   if (cost) {
+     *cost = s;
+   }
++
++  // Diagnostic-only: expose the classified state and resulting force for
++  // this exact update in both native and WASM traces.
++  extern void mj_constraint_state_trace_record_arrays(int, int, const int*,
++                                                       const mjtNum*);
++  mj_constraint_state_trace_record_arrays(300, nefc, state, force);
+ }
+ 
+ 
+@@ -3477,3 +3490,141 @@ void mj_constraintUpdate(const mjModel* m, mjData* d, const mjtNum* jar,
+                            cost, flg_coneHessian);
+   mj_mulJacTVec(m, d, d->qfrc_constraint, d->efc_force);
+ }
++
++// Diagnostic-only capture for reproducing the warmstart's constraint updates.
++// The solver trace explicitly enables this around one mj_fwdConstraint call.
++#define MARBLE_CONSTRAINT_UPDATE_TRACE_CAPACITY 100000
++static mjtNum marble_constraint_update_trace[
++    MARBLE_CONSTRAINT_UPDATE_TRACE_CAPACITY];
++static int marble_constraint_update_trace_size;
++static int marble_constraint_update_trace_recording;
++#define MARBLE_CONSTRAINT_STATE_TRACE_CAPACITY 100000
++static mjtNum marble_constraint_state_trace[
++    MARBLE_CONSTRAINT_STATE_TRACE_CAPACITY];
++static int marble_constraint_state_trace_size;
++
++MJAPI void mj_constraint_update_trace_begin(void) {
++  marble_constraint_update_trace_size = 0;
++  marble_constraint_state_trace_size = 0;
++  marble_constraint_update_trace_recording = 1;
++  marble_cone_hessian_trace_begin();
++}
++
++MJAPI void mj_constraint_update_trace_end(void) {
++  marble_constraint_update_trace_recording = 0;
++  marble_cone_hessian_trace_end();
++}
++
++MJAPI int mj_constraint_update_trace_size(void) {
++  return marble_constraint_update_trace_size;
++}
++
++MJAPI void mj_constraint_update_trace_copy(mjtNum* output) {
++  if (output && marble_constraint_update_trace_size > 0) {
++    memcpy(output, marble_constraint_update_trace,
++           (size_t)marble_constraint_update_trace_size * sizeof(mjtNum));
++  }
++}
++
++MJAPI void mj_constraint_state_trace_record(int label, const mjData* d) {
++  if (!marble_constraint_update_trace_recording) return;
++  const int nefc = d->nefc;
++  const int width = 2 + 2*nefc;
++  const int offset = marble_constraint_state_trace_size;
++  if (offset + width > MARBLE_CONSTRAINT_STATE_TRACE_CAPACITY) return;
++  mjtNum* out = marble_constraint_state_trace + offset;
++  out[0] = label;
++  out[1] = nefc;
++  for (int i = 0; i < nefc; ++i) out[2+i] = d->efc_state[i];
++  for (int i = 0; i < nefc; ++i) out[2+nefc+i] = d->efc_force[i];
++  marble_constraint_state_trace_size += width;
++}
++
++MJAPI void mj_constraint_state_trace_record_arrays(int label, int nefc,
++                                                    const int* state,
++                                                    const mjtNum* force) {
++  if (!marble_constraint_update_trace_recording || nefc < 0 || !state || !force) return;
++  const int width = 2 + 2*nefc;
++  const int offset = marble_constraint_state_trace_size;
++  if (offset + width > MARBLE_CONSTRAINT_STATE_TRACE_CAPACITY) return;
++  mjtNum* out = marble_constraint_state_trace + offset;
++  out[0] = label;
++  out[1] = nefc;
++  for (int i = 0; i < nefc; ++i) out[2+i] = (mjtNum)state[i];
++  for (int i = 0; i < nefc; ++i) out[2+nefc+i] = force[i];
++  marble_constraint_state_trace_size += width;
++}
++
++MJAPI int mj_constraint_state_trace_size(void) {
++  return marble_constraint_state_trace_size;
++}
++
++MJAPI void mj_constraint_state_trace_copy(mjtNum* output) {
++  if (output && marble_constraint_state_trace_size > 0) {
++    memcpy(output, marble_constraint_state_trace,
++           (size_t)marble_constraint_state_trace_size * sizeof(mjtNum));
++  }
++}
++
++MJAPI int mj_constraint_update_trace_record(const mjModel* m, const mjData* d,
++                                             const mjtNum* jar,
++                                             mjtNum* cost,
++                                             int flg_coneHessian) {
++  if (!marble_constraint_update_trace_recording) return -1;
++  const int ne = d->ne, nf = d->nf, nefc = d->nefc, ncon = d->ncon;
++  const int has_cost = cost != NULL;
++  const int width = 7 + 8*nefc + nf + 7*ncon + 2*nefc + has_cost + m->nv;
++  const int offset = marble_constraint_update_trace_size;
++  if (offset + width > MARBLE_CONSTRAINT_UPDATE_TRACE_CAPACITY) {
++    marble_constraint_update_trace_size = 0;
++    marble_constraint_update_trace_recording = 0;
++    return -1;
++  }
++  mjtNum* out = marble_constraint_update_trace + offset;
++  out[0] = ne;
++  out[1] = nf;
++  out[2] = nefc;
++  out[3] = ncon;
++  out[4] = flg_coneHessian;
++  out[5] = has_cost;
++  out[6] = m->nv;
++  int cursor = 7;
++#define MARBLE_TRACE_COPY_NUMBERS(values, count) do { \
++    memcpy(out + cursor, (values), (size_t)(count) * sizeof(mjtNum)); \
++    cursor += (count); \
++  } while (0)
++#define MARBLE_TRACE_COPY_INTS(values, count) do { \
++    for (int k = 0; k < (count); ++k) out[cursor++] = (values)[k]; \
++  } while (0)
++  MARBLE_TRACE_COPY_NUMBERS(jar, nefc);
++  MARBLE_TRACE_COPY_NUMBERS(d->efc_D, nefc);
++  MARBLE_TRACE_COPY_NUMBERS(d->efc_R, nefc);
++  MARBLE_TRACE_COPY_NUMBERS(d->efc_frictionloss, nf);
++  MARBLE_TRACE_COPY_NUMBERS(d->efc_aref, nefc);
++  MARBLE_TRACE_COPY_INTS(d->efc_type, nefc);
++  MARBLE_TRACE_COPY_INTS(d->efc_id, nefc);
++  MARBLE_TRACE_COPY_INTS(d->efc_state, nefc);
++  MARBLE_TRACE_COPY_NUMBERS(d->efc_force, nefc);
++  for (int i = 0; i < ncon; ++i) {
++    out[cursor++] = d->contact[i].dim;
++    out[cursor++] = d->contact[i].mu;
++    MARBLE_TRACE_COPY_NUMBERS(d->contact[i].friction, 5);
++  }
++#undef MARBLE_TRACE_COPY_NUMBERS
++#undef MARBLE_TRACE_COPY_INTS
++  return offset;
++}
++
++MJAPI void mj_constraint_update_trace_finish(const mjData* d, mjtNum* cost,
++                                              int offset) {
++  if (!marble_constraint_update_trace_recording || offset < 0) return;
++  const mjtNum* header = marble_constraint_update_trace + offset;
++  const int nf = (int)header[1], nefc = (int)header[2], ncon = (int)header[3];
++  const int has_cost = (int)header[5], nv = (int)header[6];
++  int cursor = offset + 7 + 8*nefc + nf + 7*ncon;
++  for (int i = 0; i < nefc; ++i) marble_constraint_update_trace[cursor++] = d->efc_force[i];
++  for (int i = 0; i < nefc; ++i) marble_constraint_update_trace[cursor++] = d->efc_state[i];
++  if (has_cost) marble_constraint_update_trace[cursor++] = *cost;
++  for (int i = 0; i < nv; ++i) marble_constraint_update_trace[cursor++] = d->qfrc_constraint[i];
++  marble_constraint_update_trace_size = cursor;
++}
+diff --git a/src/engine/engine_core_smooth.c b/src/engine/engine_core_smooth.c
+index 0ee2da8..de9fe0b 100644
+--- a/src/engine/engine_core_smooth.c
++++ b/src/engine/engine_core_smooth.c
+@@ -15,6 +15,7 @@
+ #include "engine/engine_core_smooth.h"
+ 
+ #include <stddef.h>
++#include <string.h>
+ 
+ #include <mujoco/mjdata.h>
+ #include <mujoco/mjmacro.h>
+@@ -33,6 +34,80 @@
+ #include "engine/engine_util_sparse.h"
+ #include "engine/engine_util_spatial.h"
+ 
++MJAPI int mj_rne_projection_trace_size(const mjModel* m) {
++  return 36 * m->nbody + 13 * m->nv;
++}
++
++MJAPI void mj_rne_projection_trace(const mjModel* m, mjData* d,
++                                   mjtNum* output) {
++  memset(output, 0, mj_rne_projection_trace_size(m) * sizeof(mjtNum));
++  int sleep_filter = mjENABLED(mjENBL_SLEEP) && d->nbody_awake < m->nbody;
++  int nbody = sleep_filter ? d->nbody_awake : m->nbody;
++  int nparent = sleep_filter ? d->nparent_awake : m->nbody;
++  int nv = sleep_filter ? d->nv_awake : m->nv;
++
++  // Diagnostic mirror of mj_rne's forward/backward passes. Each body's six
++  // slots record cacc, inertial acceleration, inertial velocity, cross force,
++  // body force before accumulation, and body force after accumulation.
++  mj_markStack(d);
++  mjtNum* loc_cacc = mjSTACKALLOC(d, m->nbody*6, mjtNum);
++  mjtNum* loc_cfrc_body = mjSTACKALLOC(d, m->nbody*6, mjtNum);
++  mju_zero(loc_cacc, 6);
++  if (!mjDISABLED(mjDSBL_GRAVITY)) {
++    mju_scl3(loc_cacc+3, m->opt.gravity, -1);
++  }
++  for (int b=1; b < nbody; b++) {
++    int i = sleep_filter ? d->body_awake_ind[b] : b;
++    int bda = m->body_dofadr[i];
++    mjtNum tmp[6];
++    mju_mulDofVec(tmp, d->cdof_dot+6*bda, d->qvel+bda,
++                  m->body_dofnum[i]);
++    mju_add(loc_cacc+6*i, loc_cacc+6*m->body_parentid[i], tmp, 6);
++    memcpy(output + 36*i, loc_cacc+6*i, 6*sizeof(mjtNum));
++
++    mju_mulInertVec(loc_cfrc_body+6*i, d->cinert+10*i, loc_cacc+6*i);
++    memcpy(output + 36*i + 6, loc_cfrc_body+6*i, 6*sizeof(mjtNum));
++    mju_mulInertVec(tmp, d->cinert+10*i, d->cvel+6*i);
++    memcpy(output + 36*i + 12, tmp, 6*sizeof(mjtNum));
++    mjtNum tmp1[6];
++    mji_crossForce(tmp1, d->cvel+6*i, tmp);
++    memcpy(output + 36*i + 18, tmp1, 6*sizeof(mjtNum));
++    mju_addTo(loc_cfrc_body+6*i, tmp1, 6);
++    memcpy(output + 36*i + 24, loc_cfrc_body+6*i, 6*sizeof(mjtNum));
++  }
++  mju_zero(loc_cfrc_body, 6);
++  for (int b=nparent-1; b > 0; b--) {
++    int i = sleep_filter ? d->parent_awake_ind[b] : b;
++    int j = m->body_parentid[i];
++    if (j) {
++      mju_addTo(loc_cfrc_body+6*j, loc_cfrc_body+6*i, 6);
++    }
++  }
++  for (int i=0; i < m->nbody; i++) {
++    memcpy(output + 36*i + 30, loc_cfrc_body+6*i, 6*sizeof(mjtNum));
++  }
++  mjtNum* projection = output + 36*m->nbody + m->nv;
++  for (int v=0; v < nv; v++) {
++    int i = sleep_filter ? d->dof_awake_ind[v] : v;
++    int body = m->dof_bodyid[i];
++    memcpy(projection + 12*i, d->cdof+6*i, 6*sizeof(mjtNum));
++    memcpy(projection + 12*i + 6, loc_cfrc_body+6*body,
++           6*sizeof(mjtNum));
++  }
++  mj_rne(m, d, 0, output + 36*m->nbody);
++  mj_freeStack(d);
++}
++
++// Compatibility names expected by the Python diagnostic harness.
++MJAPI int mj_rne_trace_size(const mjModel* m) {
++  return mj_rne_projection_trace_size(m);
++}
++
++MJAPI void mj_rne_trace(const mjModel* m, mjData* d, mjtNum* output) {
++  memset(output, 0, mj_rne_trace_size(m) * sizeof(mjtNum));
++  mj_rne_projection_trace(m, d, output);
++}
++
+ 
+ //--------------------------- position -------------------------------------------------------------
+ 
+diff --git a/src/engine/engine_derivative.c b/src/engine/engine_derivative.c
+index e164b7f..8bd7a66 100644
+--- a/src/engine/engine_derivative.c
++++ b/src/engine/engine_derivative.c
+@@ -722,10 +722,22 @@ static void mjd_rne_vel(const mjModel* m, mjData* d) {
+ //   d tau / d w = [w]_x Iw - [Iw*w]_x  =>  rot = R' * (-mass*[s]_x K + d tau/d w) * R
+ static void freeBias_vel_blocks(mjtNum mass, const mjtNum R[9], const mjtNum Xi[9],
+                                 const mjtNum inertia[3], const mjtNum s[3],
+-                                const mjtNum qvel_rot[3], mjtNum lin[9], mjtNum rot[9]) {
++                                const mjtNum qvel_rot[3], mjtNum lin[9], mjtNum rot[9],
++                                mjtNum* trace) {
++  int traceadr = 0;
++#define TRACE_VALUES(values, count) do { \
++  if (trace) mju_copy(trace + traceadr, values, count); \
++  traceadr += count; \
++} while (0)
++  TRACE_VALUES(R, 9);
++  TRACE_VALUES(Xi, 9);
++  TRACE_VALUES(inertia, 3);
++  TRACE_VALUES(s, 3);
++  TRACE_VALUES(qvel_rot, 3);
+   // world-frame angular velocity
+   mjtNum w[3];
+   mji_mulMatVec3(w, R, qvel_rot);
++  TRACE_VALUES(w, 3);
+ 
+   // world-frame inertia about CoM: Iw = Xi * diag(inertia) * Xi^T
+   mjtNum Xi_I[9];
+@@ -734,6 +746,7 @@ static void freeBias_vel_blocks(mjtNum mass, const mjtNum R[9], const mjtNum Xi[
+     Xi_I[3*i+1] = Xi[3*i+1] * inertia[1];
+     Xi_I[3*i+2] = Xi[3*i+2] * inertia[2];
+   }
++  TRACE_VALUES(Xi_I, 9);
+   mjtNum Iw[9];
+   Iw[0] = Xi_I[0]*Xi[0] + Xi_I[1]*Xi[1] + Xi_I[2]*Xi[2];
+   Iw[4] = Xi_I[3]*Xi[3] + Xi_I[4]*Xi[4] + Xi_I[5]*Xi[5];
+@@ -741,14 +754,18 @@ static void freeBias_vel_blocks(mjtNum mass, const mjtNum R[9], const mjtNum Xi[
+   Iw[1] = Iw[3] = Xi_I[0]*Xi[3] + Xi_I[1]*Xi[4] + Xi_I[2]*Xi[5];
+   Iw[2] = Iw[6] = Xi_I[0]*Xi[6] + Xi_I[1]*Xi[7] + Xi_I[2]*Xi[8];
+   Iw[5] = Iw[7] = Xi_I[3]*Xi[6] + Xi_I[4]*Xi[7] + Xi_I[5]*Xi[8];
++  TRACE_VALUES(Iw, 9);
+ 
+   // intermediate vectors: ws = w x s  (CoM offset velocity),  Iww = Iw * w  (angular momentum)
+   mjtNum ws[3], Iww[3];
+   mji_cross(ws, w, s);
+   mji_mulMatVec3(Iww, Iw, w);
++  TRACE_VALUES(ws, 3);
++  TRACE_VALUES(Iww, 3);
+ 
+   // K = [w x s]_x + [w]_x [s]_x = s w^T - (w . s) I + [ws]_x
+   mjtNum w_dot_s = w[0]*s[0] + w[1]*s[1] + w[2]*s[2];
++  TRACE_VALUES(&w_dot_s, 1);
+   mjtNum K[9];
+   K[0] = s[0]*w[0] - w_dot_s;
+   K[1] = s[0]*w[1] - ws[2];
+@@ -761,9 +778,11 @@ static void freeBias_vel_blocks(mjtNum mass, const mjtNum R[9], const mjtNum Xi[
+   K[6] = s[2]*w[0] - ws[1];
+   K[7] = s[2]*w[1] + ws[0];
+   K[8] = s[2]*w[2] - w_dot_s;
++  TRACE_VALUES(K, 9);
+ 
+   // lin = K * R
+   mji_mulMatMat3(lin, K, R);
++  TRACE_VALUES(lin, 9);
+ 
+   // C = -mass * [s]_x K + [w]_x Iw - [Iww]_x,  column by column
+   // the last term (-[Iww]_x) is the negated cross-product matrix, added via ternaries
+@@ -781,11 +800,15 @@ static void freeBias_vel_blocks(mjtNum mass, const mjtNum R[9], const mjtNum Xi[
+     C[3 + c] = -mass * s_x_K_row1 + w_x_Iw_row1 + (c == 0 ? -Iww[2] : (c == 2 ? Iww[0] : 0));
+     C[6 + c] = -mass * s_x_K_row2 + w_x_Iw_row2 + (c == 0 ? Iww[1] : (c == 1 ? -Iww[0] : 0));
+   }
++  TRACE_VALUES(C, 9);
+ 
+   // rot = R^T * C * R
+   mjtNum tmp[9];
+   mji_mulMatTMat3(tmp, R, C);
++  TRACE_VALUES(tmp, 9);
+   mji_mulMatMat3(rot, tmp, R);
++  TRACE_VALUES(rot, 9);
++#undef TRACE_VALUES
+ }
+ 
+ 
+@@ -806,7 +829,7 @@ void mjd_freeBias_vel(const mjModel* m, const mjData* d, int jnt, mjtNum B[36])
+   mji_sub3(s, d->xipos + 3*body, d->xpos + 3*body);
+ 
+   mjtNum lin[9], rot[9];
+-  freeBias_vel_blocks(mass, R, Xi, inertia, s, d->qvel + adr + 3, lin, rot);
++  freeBias_vel_blocks(mass, R, Xi, inertia, s, d->qvel + adr + 3, lin, rot, NULL);
+ 
+   mju_zero(B, 36);
+   for (int r=0; r < 3; r++) {
+@@ -817,6 +840,18 @@ void mjd_freeBias_vel(const mjModel* m, const mjData* d, int jnt, mjtNum B[36])
+   }
+ }
+ 
++void mjd_freeBias_vel_trace(const mjModel* m, const mjData* d, int jnt,
++                            mjtNum trace[100]) {
++  int body = m->jnt_bodyid[jnt];
++  int adr = m->jnt_dofadr[jnt];
++  mjtNum lin[9], rot[9];
++  mjtNum s[3];
++  mji_sub3(s, d->xipos + 3*body, d->xpos + 3*body);
++  freeBias_vel_blocks(m->body_mass[body], d->xmat + 9*body,
++                      d->ximat + 9*body, m->body_inertia + 3*body,
++                      s, d->qvel + adr + 3, lin, rot, trace);
++}
++
+ 
+ // return 1 if body is a standalone free body (single free joint, no children)
+ mjtBool mj_isFreeBody(const mjModel* m, int body) {
+@@ -879,7 +914,7 @@ int mjd_freeMhat(const mjModel* m, const mjData* d, int jnt, mjtNum h, mjtNum A[
+   mjtNum mass = m->body_mass[body];
+   mjtNum lin[9], rot[9];
+   freeBias_vel_blocks(mass, d->xmat + 9*body, d->ximat + 9*body,
+-                      m->body_inertia + 3*body, s, d->qvel + adr + 3, lin, rot);
++                      m->body_inertia + 3*body, s, d->qvel + adr + 3, lin, rot, NULL);
+ 
+   mjtNum h_mass = -h * mass;
+   for (int r=0; r < 3; r++) {
+@@ -3164,6 +3199,24 @@ void mjd_smooth_vel(const mjModel* m, mjData* d, int flg_bias) {
+   }
+ }
+ 
++void mjd_freeJoint_qDeriv_probe(const mjModel* m, const mjData* d, int jnt,
++                                mjtNum block[36]) {
++  mjData* copy = mj_copyData(NULL, m, d);
++  mjd_smooth_vel(m, copy, /*flg_bias=*/0);
++  mju_zero(block, 36);
++  int dof = m->jnt_dofadr[jnt];
++  for (int row = 0; row < 6; ++row) {
++    int global_row = dof + row;
++    int rowadr = m->D_rowadr[global_row];
++    for (int k = 0; k < m->D_rownnz[global_row]; ++k) {
++      int offset = rowadr + k;
++      int col = m->D_colind[offset] - dof;
++      if (col >= 0 && col < 6) block[6*row + col] = copy->qDeriv[offset];
++    }
++  }
++  mj_deleteData(copy);
++}
++
+ 
+ //------------------------- implicit effective metric Mtilde = M + K -------------------------------
+ // K = (h^2 + h*damping) * (K_bend + K_stretch), the PSD implicit flex stiffness. Built once per step on the arena by
+diff --git a/src/engine/engine_forward.c b/src/engine/engine_forward.c
+index 858a25a..9fc4213 100644
+--- a/src/engine/engine_forward.c
++++ b/src/engine/engine_forward.c
+@@ -1055,6 +1055,8 @@ void mj_fwdAcceleration(const mjModel* m, mjData* d) {
+ // warmstart/init solver
+ static void warmstart(const mjModel* m, mjData* d) {
+   int nv = m->nv, nefc = d->nefc;
++  extern void mj_constraint_state_trace_record(int, const mjData*);
++  mj_constraint_state_trace_record(100, d);
+ 
+   // warmstart with best of (qacc_warmstart, qacc_smooth)
+   if (!mjDISABLED(mjDSBL_WARMSTART)) {
+@@ -1070,7 +1072,14 @@ static void warmstart(const mjModel* m, mjData* d) {
+ 
+     // update constraints, save cost(qacc_warmstart)
+     mjtNum cost_warmstart;
++    extern int mj_constraint_update_trace_record(const mjModel*, const mjData*,
++                                                  const mjtNum*, mjtNum*, int);
++    extern void mj_constraint_update_trace_finish(const mjData*, mjtNum*, int);
++    int warmstart_trace = mj_constraint_update_trace_record(
++        m, d, jar, &cost_warmstart, 0);
+     mj_constraintUpdate(m, d, jar, &cost_warmstart, 0);
++    mj_constraint_update_trace_finish(d, &cost_warmstart, warmstart_trace);
++    mj_constraint_state_trace_record(101, d);
+ 
+     // PGS
+     if (m->opt.solver == mjSOL_PGS) {
+@@ -1104,7 +1113,11 @@ static void warmstart(const mjModel* m, mjData* d) {
+ 
+       // cost(qacc_smooth)
+       mjtNum cost_smooth;
++      int smooth_trace = mj_constraint_update_trace_record(
++          m, d, d->efc_b, &cost_smooth, 0);
+       mj_constraintUpdate(m, d, d->efc_b, &cost_smooth, 0);
++      mj_constraint_update_trace_finish(d, &cost_smooth, smooth_trace);
++      mj_constraint_state_trace_record(102, d);
+ 
+       // use qacc_smooth if better
+       if (cost_warmstart > cost_smooth) {
+@@ -1129,6 +1142,7 @@ static void warmstart(const mjModel* m, mjData* d) {
+     mju_copy(d->qacc, d->qacc_smooth, nv);
+     mju_zero(d->efc_force, nefc);
+   }
++  mj_constraint_state_trace_record(103, d);
+ }
+ 
+ 
+@@ -1202,6 +1216,9 @@ void mj_fwdConstraint(const mjModel* m, mjData* d) {
+       mju_gather(d->iacc_smooth,     d->qacc_smooth,     d->map_idof2dof, nidof);
+       mju_gather(d->iacc,            d->qacc,            d->map_idof2dof, nidof);
+       mju_gather(d->iefc_force,      d->efc_force,       d->map_iefc2efc, nefc);
++      for (int i = 0; i < nefc; ++i) {
++        d->iefc_state[i] = d->efc_state[d->map_iefc2efc[i]];
++      }
+       mju_gather(d->iefc_aref,       d->efc_aref,        d->map_iefc2efc, nefc);
+ 
+       mju_dispatch(m, d, solveIslandTask, NULL, nisland);
+diff --git a/src/engine/engine_inline.h b/src/engine/engine_inline.h
+index d5f97a9..d9139fc 100644
+--- a/src/engine/engine_inline.h
++++ b/src/engine/engine_inline.h
+@@ -126,7 +126,11 @@ void mji_addScl3(mjtNum* restrict res, const mjtNum* vec1, const mjtNum* vec2, m
+ // (for use in this file only)
+ static inline
+ mjtNum mji__normalize3(mjtNum vec[3]) {
++#if defined(__EMSCRIPTEN__)
++  mjtNum norm = mju_sqrt(fma(vec[2], vec[2], fma(vec[0], vec[0], vec[1]*vec[1])));
++#else
+   mjtNum norm = mju_sqrt(vec[0]*vec[0] + vec[1]*vec[1] + vec[2]*vec[2]);
++#endif
+ 
+   if (norm < mjMINVAL) {
+     vec[0] = 1;
+@@ -227,7 +231,12 @@ void mji_copy4(mjtNum* restrict res, const mjtNum data[4]) {
+ // (for use in this file only)
+ static inline
+ mjtNum mji__normalize4(mjtNum vec[4]) {
++#if defined(__EMSCRIPTEN__)
++  mjtNum norm = mju_sqrt(fma(vec[3], vec[3], fma(vec[2], vec[2],
++                       fma(vec[0], vec[0], vec[1]*vec[1]))));
++#else
+   mjtNum norm = mju_sqrt(vec[0]*vec[0] + vec[1]*vec[1] + vec[2]*vec[2] + vec[3]*vec[3]);
++#endif
+ 
+   if (norm < mjMINVAL) {
+     vec[0] = 1;
+@@ -286,10 +295,17 @@ void mji_negQuat(mjtNum* restrict res, const mjtNum quat[4]) {
+ static inline
+ void mji_mulQuat(mjtNum* restrict res, const mjtNum qa[4], const mjtNum qb[4]) {
+   assert(res != qa && res != qb);
++#if defined(__EMSCRIPTEN__)
++  res[0] = fma(-qa[3], qb[3], fma(-qa[2], qb[2], fma(qa[0], qb[0], -qa[1]*qb[1])));
++  res[1] = fma(-qa[3], qb[2], fma(qa[2], qb[3], fma(qa[0], qb[1], qa[1]*qb[0])));
++  res[2] = fma(qa[3], qb[1], fma(qa[2], qb[0], fma(qa[0], qb[2], -qa[1]*qb[3])));
++  res[3] = fma(qa[3], qb[0], fma(-qa[2], qb[1], fma(qa[0], qb[3], qa[1]*qb[2])));
++#else
+   res[0] = qa[0]*qb[0] - qa[1]*qb[1] - qa[2]*qb[2] - qa[3]*qb[3];
+   res[1] = qa[0]*qb[1] + qa[1]*qb[0] + qa[2]*qb[3] - qa[3]*qb[2];
+   res[2] = qa[0]*qb[2] - qa[1]*qb[3] + qa[2]*qb[0] + qa[3]*qb[1];
+   res[3] = qa[0]*qb[3] + qa[1]*qb[2] - qa[2]*qb[1] + qa[3]*qb[0];
++#endif
+ }
+ 
+ 
+@@ -418,7 +434,11 @@ void mji_quatIntegrate(mjtNum* restrict quat, const mjtNum vel[3], mjtNum scale)
+ static inline
+ void mji_cross(mjtNum* restrict res, const mjtNum a[3], const mjtNum b[3]) {
+   assert(res != a && res != b);
++#ifdef __EMSCRIPTEN__
++  res[0] = fma(a[1], b[2], -a[2]*b[1]);
++#else
+   res[0] = a[1]*b[2] - a[2]*b[1];
++#endif
+   res[1] = a[2]*b[0] - a[0]*b[2];
+   res[2] = a[0]*b[1] - a[1]*b[0];
+ }
+@@ -445,6 +465,18 @@ void mji_crossMotion(mjtNum* restrict res, const mjtNum vel[6], const mjtNum v[6
+ static inline
+ void mji_crossForce(mjtNum* restrict res, const mjtNum vel[6], const mjtNum f[6]) {
+   assert(res != vel && res != f);
++#if defined(__EMSCRIPTEN__)
++  res[0] = fma(-vel[2], f[1], vel[1]*f[2]);
++  res[1] = fma(vel[2], f[0], -vel[0]*f[2]);
++  res[2] = fma(-vel[1], f[0], vel[0]*f[1]);
++  res[3] = fma(-vel[2], f[4], vel[1]*f[5]);
++  res[4] = fma(vel[2], f[3], -vel[0]*f[5]);
++  res[5] = fma(-vel[1], f[3], vel[0]*f[4]);
++
++  res[0] += fma(-vel[5], f[4], vel[4]*f[5]);
++  res[1] += fma(vel[5], f[3], -vel[3]*f[5]);
++  res[2] += fma(-vel[4], f[3], vel[3]*f[4]);
++#else
+   res[0] = -vel[2]*f[1] + vel[1]*f[2];
+   res[1] =  vel[2]*f[0] - vel[0]*f[2];
+   res[2] = -vel[1]*f[0] + vel[0]*f[1];
+@@ -455,6 +487,7 @@ void mji_crossForce(mjtNum* restrict res, const mjtNum vel[6], const mjtNum f[6]
+   res[0] += -vel[5]*f[4] + vel[4]*f[5];
+   res[1] +=  vel[5]*f[3] - vel[3]*f[5];
+   res[2] += -vel[4]*f[3] + vel[3]*f[4];
++#endif
+ }
+ 
+ 
+diff --git a/src/engine/engine_solver.c b/src/engine/engine_solver.c
+index 1aa1ea3..d1f7d38 100644
+--- a/src/engine/engine_solver.c
++++ b/src/engine/engine_solver.c
+@@ -16,6 +16,8 @@
+ 
+ #include <stddef.h>
+ #include <stdint.h>
++#include <math.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include <mujoco/mjdata.h>
+@@ -23,6 +25,7 @@
+ #include <mujoco/mjmodel.h>
+ #include <mujoco/mjsan.h>  // IWYU pragma: keep
+ #include "engine/engine_core_constraint.h"
++#include "engine/engine_forward.h"
+ #include "engine/engine_core_smooth.h"
+ #include "engine/engine_derivative.h"
+ #include "engine/engine_core_util.h"
+@@ -34,6 +37,11 @@
+ #include "engine/engine_util_solve.h"
+ #include "engine/engine_util_sparse.h"
+ 
++MJAPI void mj_solver_dense_solve_trace_reset(void);
++MJAPI void mj_solver_dense_solve_trace_begin(void);
++MJAPI void mj_solver_dense_solve_trace_end(void);
++
++
+ 
+ //---------------------------------- utility functions ---------------------------------------------
+ 
+@@ -183,6 +191,51 @@ static void extractBlock(const mjModel* m, const mjData* d, mjtNum* Ac,
+ }
+ 
+ 
++#if defined(__EMSCRIPTEN__)
++// Match MuJoCo's native four-lane dot-product accumulation for the no-slip
++// residual. The general Emscripten mju_dot kernel intentionally uses FMA for
++// parity in other paths, but native mju_dot accumulates each product with a
++// separately rounded add. No-slip's later R subtraction is fused, so a one-ULP
++// dot difference can otherwise become a visible residual sign/magnitude change.
++static mjtNum residualDotNativeOrder(const mjtNum* vec1, const mjtNum* vec2,
++                                     int n) {
++  int i = 0;
++  int n_4 = n - 4;
++  mjtNum res0 = 0;
++  mjtNum res1 = 0;
++  mjtNum res2 = 0;
++  mjtNum res3 = 0;
++
++  for (; i <= n_4; i += 4) {
++    volatile mjtNum product0 = vec1[i] * vec2[i];
++    volatile mjtNum product1 = vec1[i+1] * vec2[i+1];
++    volatile mjtNum product2 = vec1[i+2] * vec2[i+2];
++    volatile mjtNum product3 = vec1[i+3] * vec2[i+3];
++    res0 += product0;
++    res1 += product1;
++    res2 += product2;
++    res3 += product3;
++  }
++  mjtNum res = (res0 + res2) + (res1 + res3);
++
++  int n_i = n - i;
++  if (n_i == 3) {
++    volatile mjtNum product0 = vec1[i] * vec2[i];
++    volatile mjtNum product1 = vec1[i+1] * vec2[i+1];
++    volatile mjtNum product2 = vec1[i+2] * vec2[i+2];
++    res += product0 + product1 + product2;
++  } else if (n_i == 2) {
++    volatile mjtNum product0 = vec1[i] * vec2[i];
++    volatile mjtNum product1 = vec1[i+1] * vec2[i+1];
++    res += product0 + product1;
++  } else if (n_i == 1) {
++    volatile mjtNum product = vec1[i] * vec2[i];
++    res += product;
++  }
++  return res;
++}
++#endif
++
+ // compute residual for one block
+ static void residual(const mjModel* m, const mjData* d, mjtNum* res, int i, int dim, int flg_subR) {
+   int nefc = d->nefc;
+@@ -200,15 +253,25 @@ static void residual(const mjModel* m, const mjData* d, mjtNum* res, int i, int
+   // dense
+   else {
+     for (int j=0; j < dim; j++) {
++#if defined(__EMSCRIPTEN__)
++      res[j] = d->efc_b[i+j] + residualDotNativeOrder(
++          d->efc_AR+(i+j)*nefc, d->efc_force, nefc);
++#else
+       res[j] = d->efc_b[i+j] + mju_dot(d->efc_AR+(i+j)*nefc, d->efc_force, nefc);
++#endif
+     }
+   }
+ 
+   if (flg_subR) {
+     for (int j=0; j < dim; j++) {
++#if defined(__EMSCRIPTEN__)
++      res[j] = fma(-d->efc_R[i+j], d->efc_force[i+j], res[j]);
++#else
+       res[j] -= d->efc_R[i+j]*d->efc_force[i+j];
++#endif
+     }
+   }
++
+ }
+ 
+ 
+@@ -760,6 +823,73 @@ void mj_solPGS_island(const mjModel* m, mjData* d, int island, int maxiter) {
+ 
+ //---------------------------- NoSlip solver -------------------------------------------------------
+ 
++static void marbleRecordNoSlip(const mjData*, int, int, int, const int*,
++                               mjtNum, int, int);
++static void marbleRecordNoSlipStep(const mjData*, int, int, int, const int*,
++                                   mjtNum, mjtNum, mjtNum, int, int,
++                                   const int*);
++static void marbleRecordNoSlipContact(const mjData*, int, int, int, int,
++                                      mjtNum, const mjtNum*, const mjtNum*,
++                                      const mjtNum*, const mjtNum*, const mjtNum*, mjtNum);
++#define MARBLE_NOSLIP_INPUT_CAPACITY 262144
++static mjtNum marble_noslip_input_trace[MARBLE_NOSLIP_INPUT_CAPACITY];
++static int marble_noslip_input_trace_size;
++static void marbleRecordNoSlipInput(const mjModel* m, const mjData* d,
++                                   int island, int nefc,
++                                   const int* efclist) {
++  const int global_nefc = d->nefc;
++  const bool sparse = mj_isSparse(m);
++  bool ar_available = !global_nefc || (d->efc_AR &&
++      (!sparse || (d->efc_AR_rowadr && d->efc_AR_rownnz && d->efc_AR_colind)));
++  const int ar_size = ar_available ? global_nefc * global_nefc : 0;
++  const int needed = 4 + nefc + 3*global_nefc + ar_size;
++  if (needed > MARBLE_NOSLIP_INPUT_CAPACITY) return;
++  if (marble_noslip_input_trace_size + needed > MARBLE_NOSLIP_INPUT_CAPACITY) return;
++  const int record_start = marble_noslip_input_trace_size;
++  int offset = record_start;
++  marble_noslip_input_trace[offset++] = island;
++  marble_noslip_input_trace[offset++] = nefc;
++  marble_noslip_input_trace[offset++] = global_nefc;
++  marble_noslip_input_trace[offset++] = ar_available;
++  for (int c = 0; c < nefc; ++c) {
++    marble_noslip_input_trace[offset++] = efclist ? efclist[c] : c;
++  }
++  for (int i = 0; i < global_nefc; ++i) marble_noslip_input_trace[offset++] = d->efc_b[i];
++  for (int i = 0; i < global_nefc; ++i) marble_noslip_input_trace[offset++] = d->efc_R[i];
++  for (int i = 0; i < global_nefc; ++i) marble_noslip_input_trace[offset++] = d->efc_force[i];
++  if (ar_available && !sparse) {
++    for (int i = 0; i < global_nefc*global_nefc; ++i) {
++      marble_noslip_input_trace[offset++] = d->efc_AR[i];
++    }
++  } else if (ar_available) {
++    const int ar_offset = offset;
++    for (int row = 0; row < global_nefc; ++row) {
++      const int adr = d->efc_AR_rowadr[row];
++      const int nnz = d->efc_AR_rownnz[row];
++      if (adr < 0 || nnz < 0 || adr + nnz > d->nA) { ar_available = false; break; }
++      for (int k = 0; k < nnz; ++k) {
++        const int column = d->efc_AR_colind[adr+k];
++        if (column < 0 || column >= global_nefc) { ar_available = false; break; }
++        marble_noslip_input_trace[ar_offset + row*global_nefc + column] = d->efc_AR[adr+k];
++      }
++      if (!ar_available) break;
++    }
++    if (ar_available) offset += ar_size;
++  }
++  marble_noslip_input_trace[record_start + 3] = ar_available;
++  marble_noslip_input_trace_size = offset;
++}
++
++MJAPI int mj_noslip_input_trace_size(void) {
++  return marble_noslip_input_trace_size;
++}
++MJAPI void mj_noslip_input_trace_copy(mjtNum* output) {
++  if (output && marble_noslip_input_trace_size) {
++    memcpy(output, marble_noslip_input_trace,
++           (size_t)marble_noslip_input_trace_size * sizeof(mjtNum));
++  }
++}
++
+ // core NoSlip solver: iterates over constraints specified by efclist
+ //   island: island index for stats (use -1 for monolithic, mapped to 0)
+ //   ne, nf, nefc: constraint type counts
+@@ -773,6 +903,7 @@ static void solNoSlip(const mjModel* m, mjData* d, int island,
+   mjtNum *mu, improvement;
+   mjtNum Ac[25], bc[5], res[5], oldforce[5], delta[5], mid, y, K0, K1;
+   mjContact* con;
++  marbleRecordNoSlipInput(m, d, island, nefc, efclist);
+   mj_markStack(d);
+   mjtNum* ARinv = mjSTACKALLOC(d, nefc, mjtNum);
+   int* oldstate = mjSTACKALLOC(d, nefc, int);
+@@ -917,8 +1048,12 @@ static void solNoSlip(const mjModel* m, mjData* d, int island,
+           solveQCQP(force, i, dim, Ac, bc, mu);
+         }
+ 
+-        // accumulate improvement
+-        improvement -= costChange(Ac, force+i+1, oldforce, res, dim-1);
++        // accumulate improvement and retain the actual per-contact return
++        // value so it can be compared independently of iteration reduction.
++        mjtNum contact_change = costChange(Ac, force+i+1, oldforce, res, dim-1);
++        improvement -= contact_change;
++        marbleRecordNoSlipContact(d, island, iter, i, dim, force[i],
++                                  mu, res, oldforce, Ac, bc, contact_change);
+ 
+         // skip the rest of this contact
+         c += (dim-1);
+@@ -929,6 +1064,10 @@ static void solNoSlip(const mjModel* m, mjData* d, int island,
+     int nchange;
+     int nactive = dualStateChange(d, d->efc_state, oldstate, ne, nf, nefc, efclist, &nchange);
+ 
++    // Keep both values: the unscaled reduction is the solver's arithmetic
++    // decision, while the scaled value is the value used by the tolerance.
++    mjtNum raw_improvement = improvement;
++
+     // scale improvement, save stats
+     improvement *= scale;
+ 
+@@ -938,6 +1077,12 @@ static void solNoSlip(const mjModel* m, mjData* d, int island,
+       saveStats(m, d, island_stat, stats_iter, improvement, 0, 0, nactive, nchange, 0, 0);
+     }
+ 
++    marbleRecordNoSlip(d, island, iter, nefc, efclist,
++                       improvement, nactive, nchange);
++    marbleRecordNoSlipStep(d, island, iter, nefc, efclist,
++                           raw_improvement, scale, improvement,
++                           nactive, nchange, oldstate);
++
+     // increment iteration count
+     iter++;
+ 
+@@ -1090,6 +1235,589 @@ typedef struct {
+   mjtNum LSslope;         // linesearch slope at solution
+ } mjPrimalContext;
+ 
++// Diagnostic-only trace used by the Marble native/WASM parity investigation.
++// Records Newton state at the first constraint update, line-search decisions,
++// and each completed primal update. It is opt-in and does not affect arithmetic.
++#define MARBLE_NEWTON_TRACE_CAPACITY 1000000
++static mjtNum marble_newton_trace[MARBLE_NEWTON_TRACE_CAPACITY];
++static int marble_newton_trace_count;
++static int marble_newton_trace_value_count;
++static int marble_newton_eval_count;
++#define MARBLE_NOSLIP_TRACE_CAPACITY 200000
++static mjtNum marble_noslip_trace[MARBLE_NOSLIP_TRACE_CAPACITY];
++static int marble_noslip_trace_size;
++#define MARBLE_JAREF_TRACE_CAPACITY 20000
++static mjtNum marble_jaref_trace[MARBLE_JAREF_TRACE_CAPACITY];
++static int marble_jaref_trace_size;
++#define MARBLE_JV_TRACE_CAPACITY 20000
++static mjtNum marble_jv_trace[MARBLE_JV_TRACE_CAPACITY];
++static int marble_jv_trace_size;
++#define MARBLE_JAREF_UPDATE_TRACE_CAPACITY 20000
++static mjtNum marble_jaref_update_trace[
++    MARBLE_JAREF_UPDATE_TRACE_CAPACITY];
++static int marble_jaref_update_trace_size;
++#define MARBLE_NOSLIP_STEP_TRACE_CAPACITY 200000
++static mjtNum marble_noslip_step_trace[MARBLE_NOSLIP_STEP_TRACE_CAPACITY];
++static int marble_noslip_step_trace_size;
++#define MARBLE_NOSLIP_CONTACT_TRACE_CAPACITY 200000
++static mjtNum marble_noslip_contact_trace[MARBLE_NOSLIP_CONTACT_TRACE_CAPACITY];
++static int marble_noslip_contact_trace_size;
++#define MARBLE_SPARSE_INPUT_CAPACITY 1000000
++static mjtNum marble_sparse_input_trace[MARBLE_SPARSE_INPUT_CAPACITY];
++static int marble_sparse_input_trace_size;
++#define MARBLE_CONSTRAINT_INPUT_CAPACITY 1000000
++static mjtNum marble_constraint_input_trace[MARBLE_CONSTRAINT_INPUT_CAPACITY];
++static int marble_constraint_input_trace_size;
++static int marble_constraint_output_recorded;
++#define MARBLE_CONSTRAINT_ITERATION_TRACE_CAPACITY 1000000
++static mjtNum marble_constraint_iteration_trace[
++    MARBLE_CONSTRAINT_ITERATION_TRACE_CAPACITY];
++static int marble_constraint_iteration_trace_size;
++#define MARBLE_CHOL_SOLVE_CAPACITY 1000000
++static mjtNum marble_chol_solve_trace[MARBLE_CHOL_SOLVE_CAPACITY];
++static int marble_chol_solve_trace_size;
++#define MARBLE_HESSIAN_TRACE_CAPACITY 1000000
++static mjtNum marble_hessian_trace[MARBLE_HESSIAN_TRACE_CAPACITY];
++static int marble_hessian_trace_size;
++static int marble_hessian_output_recorded;
++static int marble_cone_output_recorded;
++#define MARBLE_CONE_TRACE_CAPACITY 1000000
++static mjtNum marble_cone_trace[MARBLE_CONE_TRACE_CAPACITY];
++static int marble_cone_trace_size;
++static int marble_cone_trace_offset;
++static int marble_cone_trace_recording;
++
++MJAPI int mj_solver_constraint_input_size(void) {
++  return marble_constraint_input_trace_size;
++}
++
++MJAPI void mj_solver_constraint_input_copy(mjtNum* output) {
++  if (output && marble_constraint_input_trace_size) {
++    memcpy(output, marble_constraint_input_trace,
++           (size_t)marble_constraint_input_trace_size * sizeof(mjtNum));
++  }
++}
++
++MJAPI int mj_solver_constraint_iteration_trace_size(void) {
++  return marble_constraint_iteration_trace_size;
++}
++
++MJAPI void mj_solver_constraint_iteration_trace_copy(mjtNum* output) {
++  if (output && marble_constraint_iteration_trace_size) {
++    memcpy(output, marble_constraint_iteration_trace,
++           (size_t)marble_constraint_iteration_trace_size * sizeof(mjtNum));
++  }
++}
++
++static void marbleRecordConstraintInput(const mjPrimalContext* ctx,
++                                        int flg_coneHessian) {
++  if (marble_constraint_input_trace_size) return;
++  int ncontact = 0;
++  for (int i = ctx->ne + ctx->nf; i < ctx->nefc; ++i) {
++    if (ctx->efc_type[i] == mjCNSTR_CONTACT_ELLIPTIC &&
++        ctx->efc_id[i] + 1 > ncontact) ncontact = ctx->efc_id[i] + 1;
++  }
++  const int nefc = ctx->nefc, nf = ctx->nf;
++  const int needed = 7 + 9*nefc + nf + 7*ncontact;
++  marble_constraint_input_trace_size = 1;
++  if (needed > MARBLE_CONSTRAINT_INPUT_CAPACITY) return;
++  mjtNum* out = marble_constraint_input_trace;
++  int offset = 0;
++  out[offset++] = ctx->ne;
++  out[offset++] = nf;
++  out[offset++] = nefc;
++  out[offset++] = ncontact;
++  out[offset++] = flg_coneHessian;
++  out[offset++] = ctx->cost;
++#define MARBLE_COPY_NUMBERS(field, count) do { \
++    memcpy(out + offset, ctx->field, (size_t)(count) * sizeof(mjtNum)); \
++    offset += (count); \
++  } while (0)
++#define MARBLE_COPY_INTS(field, count) do { \
++    for (int k = 0; k < (count); ++k) out[offset++] = ctx->field[k]; \
++  } while (0)
++  MARBLE_COPY_NUMBERS(efc_D, nefc);
++  MARBLE_COPY_NUMBERS(efc_R, nefc);
++  MARBLE_COPY_NUMBERS(efc_frictionloss, nf);
++  MARBLE_COPY_NUMBERS(Jaref, nefc);
++  MARBLE_COPY_INTS(efc_type, nefc);
++  MARBLE_COPY_INTS(efc_id, nefc);
++  MARBLE_COPY_INTS(efc_state, nefc);
++  MARBLE_COPY_NUMBERS(efc_force, nefc);
++  for (int i = 0; i < ncontact; ++i) {
++    out[offset++] = ctx->contact[i].dim;
++    out[offset++] = ctx->contact[i].mu;
++    for (int j = 0; j < 5; ++j) out[offset++] = ctx->contact[i].friction[j];
++  }
++  marble_constraint_input_trace_size = offset;
++#undef MARBLE_COPY_NUMBERS
++#undef MARBLE_COPY_INTS
++}
++
++static void marbleRecordConstraintOutput(const mjPrimalContext* ctx) {
++  if (marble_constraint_input_trace_size <= 1 || marble_constraint_output_recorded) return;
++  int offset = marble_constraint_input_trace_size;
++  for (int i = 0; i < ctx->nefc; ++i) {
++    marble_constraint_input_trace[offset++] = ctx->efc_force[i];
++  }
++  for (int i = 0; i < ctx->nefc; ++i) {
++    marble_constraint_input_trace[offset++] = ctx->efc_state[i];
++  }
++  marble_constraint_input_trace[offset++] = ctx->cost;
++  marble_constraint_input_trace_size = offset;
++  marble_constraint_output_recorded = 1;
++}
++
++// Snapshot the exact operands/results of each iterative primal constraint update.
++// Record pairs are tagged with phase 0 (inputs) or 1 (outputs).
++static void marbleRecordConstraintIteration(const mjPrimalContext* ctx,
++                                            int flg_coneHessian,
++                                            int phase) {
++  int ncontact = 0;
++  for (int i = ctx->ne + ctx->nf; i < ctx->nefc; ++i) {
++    if (ctx->efc_type[i] == mjCNSTR_CONTACT_ELLIPTIC &&
++        ctx->efc_id[i] + 1 > ncontact) ncontact = ctx->efc_id[i] + 1;
++  }
++  const int nefc = ctx->nefc, nf = ctx->nf;
++  const int width = 7 + 8*nefc + nf + 7*ncontact + 2*ctx->nv;
++  if (marble_constraint_iteration_trace_size + width >
++      MARBLE_CONSTRAINT_ITERATION_TRACE_CAPACITY) return;
++  mjtNum* out = marble_constraint_iteration_trace +
++                marble_constraint_iteration_trace_size;
++  int offset = 0;
++  out[offset++] = phase;
++  out[offset++] = ctx->ne;
++  out[offset++] = nf;
++  out[offset++] = nefc;
++  out[offset++] = ncontact;
++  out[offset++] = ctx->nv;
++  out[offset++] = flg_coneHessian;
++  out[offset++] = ctx->cost;
++#define MARBLE_ITER_COPY_NUMBERS(values, count) do { \
++    memcpy(out + offset, (values), (size_t)(count) * sizeof(mjtNum)); \
++    offset += (count); \
++  } while (0)
++#define MARBLE_ITER_COPY_INTS(values, count) do { \
++    for (int k = 0; k < (count); ++k) out[offset++] = (values)[k]; \
++  } while (0)
++  MARBLE_ITER_COPY_NUMBERS(ctx->efc_D, nefc);
++  MARBLE_ITER_COPY_NUMBERS(ctx->efc_R, nefc);
++  MARBLE_ITER_COPY_NUMBERS(ctx->efc_frictionloss, nf);
++  MARBLE_ITER_COPY_NUMBERS(ctx->Jaref, nefc);
++  MARBLE_ITER_COPY_INTS(ctx->efc_type, nefc);
++  MARBLE_ITER_COPY_INTS(ctx->efc_id, nefc);
++  MARBLE_ITER_COPY_INTS(ctx->efc_state, nefc);
++  MARBLE_ITER_COPY_NUMBERS(ctx->efc_force, nefc);
++  MARBLE_ITER_COPY_NUMBERS(ctx->Jv, ctx->nv);
++  MARBLE_ITER_COPY_NUMBERS(ctx->search, ctx->nv);
++  for (int i = 0; i < ncontact; ++i) {
++    out[offset++] = ctx->contact[i].dim;
++    out[offset++] = ctx->contact[i].mu;
++    MARBLE_ITER_COPY_NUMBERS(ctx->contact[i].friction, 5);
++  }
++#undef MARBLE_ITER_COPY_NUMBERS
++#undef MARBLE_ITER_COPY_INTS
++  marble_constraint_iteration_trace_size += offset;
++}
++
++static void marbleRecordCholSolve(const mjPrimalContext* ctx,
++                                  const mjtNum* factor) {
++  if (marble_chol_solve_trace_size) return;
++  const int n = ctx->nv;
++  const int nnz = ctx->is_sparse
++      ? ctx->L_rowadr[n-1] + ctx->L_rownnz[n-1] : -1;
++  const int factor_size = ctx->is_sparse ? nnz : n*n;
++  const int needed = 2 + (ctx->is_sparse ? 2*n + 2*nnz : 0) +
++                     factor_size + n;
++  if (needed > MARBLE_CHOL_SOLVE_CAPACITY) return;
++  int offset = 0;
++  marble_chol_solve_trace[offset++] = n;
++  marble_chol_solve_trace[offset++] = nnz;
++  if (ctx->is_sparse) {
++    for (int i = 0; i < n; ++i) marble_chol_solve_trace[offset++] = ctx->L_rownnz[i];
++    for (int i = 0; i < n; ++i) marble_chol_solve_trace[offset++] = ctx->L_rowadr[i];
++    for (int i = 0; i < nnz; ++i) marble_chol_solve_trace[offset++] = ctx->L_colind[i];
++  }
++  for (int i = 0; i < factor_size; ++i) marble_chol_solve_trace[offset++] = factor[i];
++  for (int i = 0; i < n; ++i) marble_chol_solve_trace[offset++] = ctx->grad[i];
++  marble_chol_solve_trace_size = offset;
++}
++
++MJAPI int mj_solver_chol_solve_size(void) { return marble_chol_solve_trace_size; }
++MJAPI void mj_solver_chol_solve_copy(mjtNum* output) {
++  if (output && marble_chol_solve_trace_size) {
++    memcpy(output, marble_chol_solve_trace,
++           (size_t)marble_chol_solve_trace_size * sizeof(mjtNum));
++  }
++}
++
++static void marbleRecordHessianInput(const mjPrimalContext* ctx) {
++  if (marble_hessian_trace_size) return;
++  const int n = ctx->nv, nefc = ctx->nefc;
++  const int needed = 2 + 2*n*n + nefc + nefc*n + (ctx->ncone ? n*n : 0);
++  if (needed > MARBLE_HESSIAN_TRACE_CAPACITY) return;
++  int offset = 0;
++  marble_hessian_trace[offset++] = n;
++  marble_hessian_trace[offset++] = nefc;
++  for (int i = 0; i < nefc; ++i) marble_hessian_trace[offset++] = ctx->D[i];
++  for (int i = 0; i < nefc*n; ++i) marble_hessian_trace[offset++] = ctx->J[i];
++  for (int i = 0; i < n*n; ++i) marble_hessian_trace[offset++] = ctx->L[i];
++  marble_hessian_trace_size = offset;
++}
++
++static void marbleRecordHessianOutput(const mjPrimalContext* ctx) {
++  if (!marble_hessian_trace_size || marble_hessian_output_recorded) return;
++  const int n = ctx->nv;
++  int offset = marble_hessian_trace_size;
++  for (int i = 0; i < n*n; ++i) marble_hessian_trace[offset++] = ctx->L[i];
++  marble_hessian_trace_size = offset;
++  marble_hessian_output_recorded = 1;
++}
++
++static void marbleRecordConeOutput(const mjPrimalContext* ctx) {
++  if (!marble_hessian_trace_size || marble_cone_output_recorded || !ctx->ncone ||
++      !ctx->Lcone) return;
++  const int n = ctx->nv;
++  int offset = marble_hessian_trace_size;
++  for (int i = 0; i < n*n; ++i) marble_hessian_trace[offset++] = ctx->Lcone[i];
++  marble_hessian_trace_size = offset;
++  marble_cone_output_recorded = 1;
++}
++
++MJAPI int mj_solver_hessian_size(void) { return marble_hessian_trace_size; }
++MJAPI void mj_solver_hessian_copy(mjtNum* output) {
++  if (output && marble_hessian_trace_size) {
++    memcpy(output, marble_hessian_trace,
++           (size_t)marble_hessian_trace_size * sizeof(mjtNum));
++  }
++}
++
++static void marbleConeAppend(const mjtNum* values, int count) {
++  if (!marble_cone_trace_recording || marble_cone_trace_size == 1) return;
++  if (marble_cone_trace_offset + count > MARBLE_CONE_TRACE_CAPACITY) {
++    marble_cone_trace_size = 1;
++    return;
++  }
++  memcpy(marble_cone_trace + marble_cone_trace_offset, values,
++         (size_t)count * sizeof(mjtNum));
++  marble_cone_trace_offset += count;
++}
++
++MJAPI void mj_solver_cone_trace_cholupdate_step(int k, int n,
++                                                const mjtNum* x,
++                                                const mjtNum* mat) {
++  if (!marble_cone_trace_recording || marble_cone_trace_size == 1) return;
++  const mjtNum header[2] = {k, n};
++  marbleConeAppend(header, 2);
++  marbleConeAppend(x, n);
++  marbleConeAppend(mat, n*n);
++}
++
++MJAPI int mj_solver_cone_trace_size(void) { return marble_cone_trace_size; }
++MJAPI void mj_solver_cone_trace_copy(mjtNum* output) {
++  if (output && marble_cone_trace_size) {
++    memcpy(output, marble_cone_trace,
++           (size_t)marble_cone_trace_size * sizeof(mjtNum));
++  }
++}
++
++MJAPI int mj_solver_sparse_input_size(void) {
++  return marble_sparse_input_trace_size;
++}
++
++MJAPI void mj_solver_sparse_input_copy(mjtNum* output) {
++  if (output && marble_sparse_input_trace_size) {
++    memcpy(output, marble_sparse_input_trace,
++           (size_t)marble_sparse_input_trace_size * sizeof(mjtNum));
++  }
++}
++
++static void marbleRecordSparseInput(const mjPrimalContext* ctx) {
++  if (marble_sparse_input_trace_size) return;
++  const int nv = ctx->nv;
++  const int nnz = ctx->M_rowadr[nv - 1] + ctx->M_rownnz[nv - 1];
++  mjtNum* out = marble_sparse_input_trace;
++  out[0] = nv;
++  out[1] = nnz;
++  marble_sparse_input_trace_size = 2;
++  const int needed = 2 + 4*nv + 2*nnz;
++  if (needed > MARBLE_SPARSE_INPUT_CAPACITY) return;
++  int offset = 2;
++  for (int i = 0; i < nv; ++i) out[offset++] = ctx->M_rownnz[i];
++  for (int i = 0; i < nv; ++i) out[offset++] = ctx->M_rowadr[i];
++  for (int i = 0; i < nnz; ++i) out[offset++] = ctx->M_colind[i];
++  for (int i = 0; i < nnz; ++i) out[offset++] = ctx->M[i];
++  for (int i = 0; i < nv; ++i) out[offset++] = ctx->qacc[i];
++  marble_sparse_input_trace_size = offset;
++}
++
++MJAPI void mj_solver_trace_reset(void) {
++  marble_newton_trace_count = 0;
++  marble_newton_trace_value_count = 0;
++  marble_newton_eval_count = 0;
++  marble_noslip_trace_size = 0;
++  marble_jaref_trace_size = 0;
++  marble_jv_trace_size = 0;
++  marble_jaref_update_trace_size = 0;
++  marble_noslip_step_trace_size = 0;
++  marble_noslip_contact_trace_size = 0;
++  marble_noslip_input_trace_size = 0;
++  marble_sparse_input_trace_size = 0;
++  marble_constraint_input_trace_size = 0;
++  marble_constraint_output_recorded = 0;
++  marble_constraint_iteration_trace_size = 0;
++  marble_chol_solve_trace_size = 0;
++  marble_hessian_trace_size = 0;
++  marble_hessian_output_recorded = 0;
++  marble_cone_output_recorded = 0;
++  marble_cone_trace_size = 0;
++  marble_cone_trace_offset = 0;
++  marble_cone_trace_recording = 0;
++  mj_solver_dense_solve_trace_reset();
++}
++
++MJAPI int mj_noslip_trace_size(void) { return marble_noslip_trace_size; }
++MJAPI void mj_noslip_trace_copy(mjtNum* output) {
++  if (output && marble_noslip_trace_size) {
++    memcpy(output, marble_noslip_trace,
++           (size_t)marble_noslip_trace_size * sizeof(mjtNum));
++  }
++}
++MJAPI int mj_jaref_trace_size(void) { return marble_jaref_trace_size; }
++MJAPI void mj_jaref_trace_copy(mjtNum* output) {
++  if (output && marble_jaref_trace_size) {
++    memcpy(output, marble_jaref_trace,
++           (size_t)marble_jaref_trace_size * sizeof(mjtNum));
++  }
++}
++MJAPI int mj_jv_trace_size(void) { return marble_jv_trace_size; }
++MJAPI void mj_jv_trace_copy(mjtNum* output) {
++  if (output && marble_jv_trace_size) {
++    memcpy(output, marble_jv_trace,
++           (size_t)marble_jv_trace_size * sizeof(mjtNum));
++  }
++}
++MJAPI int mj_jaref_update_trace_size(void) {
++  return marble_jaref_update_trace_size;
++}
++MJAPI void mj_jaref_update_trace_copy(mjtNum* output) {
++  if (output && marble_jaref_update_trace_size) {
++    memcpy(output, marble_jaref_update_trace,
++           (size_t)marble_jaref_update_trace_size * sizeof(mjtNum));
++  }
++}
++MJAPI int mj_noslip_step_trace_size(void) { return marble_noslip_step_trace_size; }
++MJAPI void mj_noslip_step_trace_copy(mjtNum* output) {
++  if (output && marble_noslip_step_trace_size) {
++    memcpy(output, marble_noslip_step_trace,
++           (size_t)marble_noslip_step_trace_size * sizeof(mjtNum));
++  }
++}
++MJAPI int mj_noslip_contact_trace_size(void) {
++  return marble_noslip_contact_trace_size;
++}
++MJAPI void mj_noslip_contact_trace_copy(mjtNum* output) {
++  if (output && marble_noslip_contact_trace_size) {
++    memcpy(output, marble_noslip_contact_trace,
++           (size_t)marble_noslip_contact_trace_size * sizeof(mjtNum));
++  }
++}
++static void marbleRecordNoSlipStep(const mjData* d, int island, int iteration,
++                                   int nefc, const int* efclist,
++                                   mjtNum raw_improvement, mjtNum scale,
++                                   mjtNum scaled_improvement, int nactive,
++                                   int nchange, const int* oldstate) {
++  const int width = 8 + 4*nefc;
++  if (marble_noslip_step_trace_size + width >
++      MARBLE_NOSLIP_STEP_TRACE_CAPACITY) return;
++  mjtNum* record = marble_noslip_step_trace + marble_noslip_step_trace_size;
++  int offset = 0;
++  record[offset++] = island;
++  record[offset++] = iteration;
++  record[offset++] = nefc;
++  record[offset++] = raw_improvement;
++  record[offset++] = scale;
++  record[offset++] = scaled_improvement;
++  record[offset++] = nactive;
++  record[offset++] = nchange;
++  for (int c = 0; c < nefc; ++c) {
++    int i = efclist ? efclist[c] : c;
++    record[offset++] = i;
++    record[offset++] = d->efc_force[i];
++    record[offset++] = oldstate[c];
++    record[offset++] = d->efc_state[i];
++  }
++  marble_noslip_step_trace_size += width;
++}
++static void marbleRecordJaref(const mjPrimalContext* ctx) {
++  // The first investigation targets the dense path. Sparse records need a
++  // separate row/column schema and are intentionally omitted rather than
++  // pretending a packed J array has dense semantics.
++  if (ctx->is_sparse) return;
++  const int nefc = ctx->nefc;
++  const int nv = ctx->nv;
++  const int width = 4 + nv + nefc + nefc*nv + nefc;
++  if (marble_jaref_trace_size + width > MARBLE_JAREF_TRACE_CAPACITY) return;
++  mjtNum* record = marble_jaref_trace + marble_jaref_trace_size;
++  int offset = 0;
++  record[offset++] = ctx->island;
++  record[offset++] = nefc;
++  record[offset++] = nv;
++  record[offset++] = ctx->is_sparse;
++  for (int i = 0; i < nv; ++i) record[offset++] = ctx->qacc[i];
++  for (int i = 0; i < nefc; ++i) record[offset++] = ctx->efc_aref[i];
++  for (int i = 0; i < nefc*nv; ++i) record[offset++] = ctx->J[i];
++  for (int i = 0; i < nefc; ++i) record[offset++] = ctx->Jaref[i];
++  marble_jaref_trace_size += width;
++}
++static void marbleRecordJv(const mjPrimalContext* ctx) {
++  // This is the dense J*search result used as the line-search direction.
++  if (ctx->is_sparse) return;
++  const int nefc = ctx->nefc;
++  const int nv = ctx->nv;
++  const int width = 4 + nv + nefc*nv + nefc;
++  if (marble_jv_trace_size + width > MARBLE_JV_TRACE_CAPACITY) return;
++  mjtNum* record = marble_jv_trace + marble_jv_trace_size;
++  int offset = 0;
++  record[offset++] = ctx->island;
++  record[offset++] = nefc;
++  record[offset++] = nv;
++  record[offset++] = ctx->is_sparse;
++  for (int i = 0; i < nv; ++i) record[offset++] = ctx->search[i];
++  for (int i = 0; i < nefc*nv; ++i) record[offset++] = ctx->J[i];
++  for (int i = 0; i < nefc; ++i) record[offset++] = ctx->Jv[i];
++  marble_jv_trace_size += width;
++}
++static int marbleBeginJarefUpdate(const mjPrimalContext* ctx, mjtNum alpha) {
++  const int nefc = ctx->nefc;
++  const int width = 3 + 3*nefc;
++  if (marble_jaref_update_trace_size + width >
++      MARBLE_JAREF_UPDATE_TRACE_CAPACITY) return -1;
++  const int offset = marble_jaref_update_trace_size;
++  mjtNum* record = marble_jaref_update_trace + offset;
++  int cursor = 0;
++  record[cursor++] = ctx->island;
++  record[cursor++] = nefc;
++  record[cursor++] = alpha;
++  for (int i = 0; i < nefc; ++i) record[cursor++] = ctx->Jaref[i];
++  for (int i = 0; i < nefc; ++i) record[cursor++] = ctx->Jv[i];
++  return offset;
++}
++static void marbleFinishJarefUpdate(const mjPrimalContext* ctx, int offset) {
++  if (offset < 0) return;
++  const int nefc = ctx->nefc;
++  mjtNum* record = marble_jaref_update_trace + offset;
++  int cursor = 3 + 2*nefc;
++  for (int i = 0; i < nefc; ++i) record[cursor++] = ctx->Jaref[i];
++  marble_jaref_update_trace_size = offset + cursor;
++}
++static void marbleRecordNoSlipContact(const mjData* d, int island, int iter,
++                                      int row, int dim, mjtNum normal,
++                                      const mjtNum* mu, const mjtNum* residual,
++                                      const mjtNum* oldforce, const mjtNum* Ac,
++                                      const mjtNum* bc, mjtNum costchange) {
++  const int tangent = dim - 1;
++  const int width = 12 + 7*tangent + tangent*tangent;
++  if (marble_noslip_contact_trace_size + width > MARBLE_NOSLIP_CONTACT_TRACE_CAPACITY) return;
++  mjtNum* record = marble_noslip_contact_trace + marble_noslip_contact_trace_size;
++  int offset = 0;
++  record[offset++] = island; record[offset++] = iter; record[offset++] = row;
++  record[offset++] = dim; record[offset++] = d->efc_id[row]; record[offset++] = normal;
++  for (int j = 0; j < 5; ++j) record[offset++] = mu[j];
++  for (int j = 0; j < tangent; ++j) record[offset++] = residual[j];
++  for (int j = 0; j < tangent; ++j) record[offset++] = oldforce[j];
++  for (int j = 0; j < tangent*tangent; ++j) record[offset++] = Ac[j];
++  for (int j = 0; j < tangent; ++j) record[offset++] = bc[j];
++  for (int j = 0; j < tangent; ++j) record[offset++] = d->efc_force[row+1+j];
++  record[offset++] = costchange;
++  for (int j = 0; j < tangent; ++j) record[offset++] = d->efc_b[row+1+j];
++  for (int j = 0; j < tangent; ++j) record[offset++] = d->efc_R[row+1+j];
++  for (int j = 0; j < tangent; ++j) record[offset++] = d->efc_force[row+1+j];
++  marble_noslip_contact_trace_size += width;
++}
++static void marbleRecordNoSlip(const mjData* d, int island, int iteration,
++                               int nefc, const int* efclist,
++                               mjtNum improvement, int nactive, int nchange) {
++  const int width = 6 + 3*nefc;
++  if (marble_noslip_trace_size + width > MARBLE_NOSLIP_TRACE_CAPACITY) return;
++  mjtNum* record = marble_noslip_trace + marble_noslip_trace_size;
++  record[0] = island; record[1] = iteration; record[2] = nefc;
++  record[3] = improvement; record[4] = nactive; record[5] = nchange;
++  int offset = 6;
++  for (int c = 0; c < nefc; ++c) {
++    int i = efclist ? efclist[c] : c;
++    record[offset++] = i; record[offset++] = d->efc_force[i];
++    record[offset++] = d->efc_state[i];
++  }
++  marble_noslip_trace_size += width;
++}
++
++MJAPI int mj_solver_trace_size(void) {
++  return marble_newton_trace_value_count;
++}
++
++MJAPI int mj_solver_trace_records(void) {
++  return marble_newton_trace_count;
++}
++
++MJAPI void mj_solver_trace_copy(mjtNum* output) {
++  if (output && marble_newton_trace_count && marble_newton_trace_value_count) {
++    memcpy(output, marble_newton_trace,
++           (size_t)mj_solver_trace_size() * sizeof(mjtNum));
++  }
++}
++
++MJAPI void mj_solver_trace_run(const mjModel* model, mjData* data) {
++  mj_solver_trace_reset();
++  extern void mj_constraint_update_trace_begin(void);
++  extern void mj_constraint_update_trace_end(void);
++  mj_constraint_update_trace_begin();
++  // The trace buffer is process-global; force the same independent island tasks
++  // through MuJoCo's serial dispatch path while collecting diagnostic records.
++  uintptr_t threadpool = data->threadpool;
++  data->threadpool = 0;
++  mj_fwdConstraint(model, data);
++  data->threadpool = threadpool;
++  mj_constraint_update_trace_end();
++}
++
++static void marbleRecordNewtonState(const mjPrimalContext* ctx, int label,
++                                    mjtNum alpha, mjtNum cost,
++                                    mjtNum deriv0, mjtNum deriv1) {
++  const int nv = ctx->nv;
++  const int nefc = ctx->nefc;
++  const int width = 9 + 5*nv + 2*nefc;
++  const int needed = marble_newton_trace_value_count + width;
++  if (needed > MARBLE_NEWTON_TRACE_CAPACITY) return;
++  mjtNum* record = marble_newton_trace + marble_newton_trace_value_count;
++  record[0] = label;
++  record[1] = alpha;
++  record[2] = ctx->LSiter;
++  record[3] = ctx->LSslope;
++  record[4] = nv;
++  record[5] = nefc;
++  record[6] = cost;
++  record[7] = deriv0;
++  record[8] = deriv1;
++  int offset = 9;
++#define MARBLE_COPY_TRACE(field, count) do { \
++    if (ctx->field) memcpy(record + offset, ctx->field, \
++                           (size_t)(count) * sizeof(mjtNum)); \
++    else memset(record + offset, 0, (size_t)(count) * sizeof(mjtNum)); \
++    offset += (count); \
++  } while (0)
++  MARBLE_COPY_TRACE(efc_force, nefc);
++  MARBLE_COPY_TRACE(qacc, nv);
++  MARBLE_COPY_TRACE(Ma, nv);
++  MARBLE_COPY_TRACE(grad, nv);
++  MARBLE_COPY_TRACE(Mgrad, nv);
++  MARBLE_COPY_TRACE(search, nv);
++  MARBLE_COPY_TRACE(Jaref, nefc);
++#undef MARBLE_COPY_TRACE
++  marble_newton_trace_count++;
++  marble_newton_trace_value_count += width;
++}
++
+ 
+ // set sizes and pointers to mjData arrays in mjPrimalContext
+ static void PrimalPointers(const mjModel* m, const mjData* d, mjPrimalContext* ctx, int island) {
+@@ -1371,10 +2099,14 @@ static void PrimalUpdateConstraint(mjPrimalContext* ctx, int flg_HessianCone) {
+   int nefc = ctx->nefc, nv = ctx->nv;
+ 
+   // update constraints
++  marbleRecordConstraintInput(ctx, flg_HessianCone);
++  marbleRecordConstraintIteration(ctx, flg_HessianCone, 0);
+   mj_constraintUpdate_impl(ctx->ne, ctx->nf, ctx->nefc, ctx->efc_D, ctx->efc_R,
+                            ctx->efc_frictionloss, ctx->Jaref, ctx->efc_type, ctx->efc_id,
+                            ctx->contact, ctx->efc_state, ctx->efc_force,
+                            &(ctx->cost), flg_HessianCone);
++  marbleRecordConstraintIteration(ctx, flg_HessianCone, 1);
++  marbleRecordConstraintOutput(ctx);
+ 
+   // compute qfrc_constraint (dense or sparse)
+   if (!ctx->is_sparse) {
+@@ -1419,10 +2151,16 @@ static void PrimalUpdateMgrad(mjPrimalContext* ctx, int flg_Newton) {
+   // Newton: Mgrad = H \ grad
+   if (flg_Newton) {
+     if (ctx->is_sparse) {
++      const mjtNum* factor = ctx->ncone ? ctx->Lcone : ctx->L;
++      marbleRecordCholSolve(ctx, factor);
+       mju_cholSolveSparse(ctx->Mgrad, (ctx->ncone ? ctx->Lcone : ctx->L),
+                           ctx->grad, nv, ctx->L_rownnz, ctx->L_rowadr, ctx->L_colind);
+     } else {
++      const mjtNum* factor = ctx->ncone ? ctx->Lcone : ctx->L;
++      marbleRecordCholSolve(ctx, factor);
++      mj_solver_dense_solve_trace_begin();
+       mju_cholSolve(ctx->Mgrad, (ctx->ncone ? ctx->Lcone : ctx->L), ctx->grad, nv);
++      mj_solver_dense_solve_trace_end();
+     }
+   }
+ 
+@@ -1472,6 +2210,7 @@ static void PrimalPrepare(mjPrimalContext* ctx) {
+     quad[0] = Jaref[0]*DJ0;
+     quad[1] = Jv[0]*DJ0;
+     quad[2] = Jv[0]*D[0]*Jv[0];
++    marbleRecordNewtonState(ctx, 910000 + i*1000, 0, quad[1], quad[2], DJ0);
+ 
+     // elliptic cone: extra processing
+     if (ctx->efc_type[i] == mjCNSTR_CONTACT_ELLIPTIC) {
+@@ -1484,9 +2223,18 @@ static void PrimalPrepare(mjPrimalContext* ctx) {
+       // complete vector quadratic (for bottom zone)
+       for (int j=1; j < dim; j++) {
+         mjtNum DJj = D[j]*Jaref[j];
++        marbleRecordNewtonState(ctx, 910000 + i*1000 + j*10 + 1,
++                                0, quad[1], quad[2], DJj);
++        marbleRecordNewtonState(ctx, 910000 + i*1000 + j*10 + 2,
++                                0, DJj, Jv[j]*DJj,
++                                Jv[j]*D[j]*Jv[j]);
++        marbleRecordNewtonState(ctx, 910000 + i*1000 + j*10 + 4,
++                                0, Jv[j], D[j], Jaref[j]);
+         quad[0] += Jaref[j]*DJj;
+         quad[1] += Jv[j]*DJj;
+         quad[2] += Jv[j]*D[j]*Jv[j];
++        marbleRecordNewtonState(ctx, 910000 + i*1000 + j*10 + 3,
++                                0, quad[1], quad[2], DJj);
+       }
+ 
+       // rescale to make primal cone circular
+@@ -1502,6 +2250,13 @@ static void PrimalPrepare(mjPrimalContext* ctx) {
+         UU += U[j]*U[j];
+         UV += U[j]*V[j];
+         VV += V[j]*V[j];
++        // Diagnostic-only per-tangent accumulation trace for Marble parity.
++        const int probe = 25000 + i*100 + j*10;
++        marbleRecordNewtonState(ctx, probe, 0, U[j], V[j], U[j]*U[j]);
++        marbleRecordNewtonState(ctx, probe+1, 0, U[j]*V[j], V[j]*V[j], UU);
++        marbleRecordNewtonState(ctx, probe+2, 0, UV, VV, 0);
++        marbleRecordNewtonState(ctx, probe+3, 0, Jaref[j], Jv[j],
++                                friction[j-1]);
+       }
+ 
+       // store in quad[3-8], using the fact that dim>=3
+@@ -1571,7 +2326,8 @@ static mjtNum frictionCostDif(mjtNum start, mjtNum x, mjtNum f, mjtNum Rf, mjtNu
+ 
+ 
+ // compute cost difference of an elliptic cone at a given alpha: cost(alpha) - cost(0)
+-static mjtNum ellipticCostDif(const mjtNum* quad, mjtNum alpha, mjtNum mu, mjtNum Dm) {
++static mjtNum ellipticCostDif(const mjtNum* quad, mjtNum alpha,
++                              mjtNum mu, mjtNum Dm) {
+   mjtNum U0 = quad[3], V0 = quad[4], UU = quad[5];
+   mjtNum UV = quad[6], VV = quad[7];
+ 
+@@ -1684,10 +2440,17 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+ 
+   // process constraints
+   for (int i=0; i < nefc; i++) {
++    const int cost_row_probe =
++        9100000 + marble_newton_eval_count*10000 + i*10;
++    marbleRecordNewtonState(ctx, cost_row_probe+1, alpha, cost, i,
++                            i < ne ? 1 : (i < ne+nf ? 2 : 3));
+     // equality: shifted quad (skip quad[0])
+     if (i < ne) {
+       quadTotal[1] += ctx->quad[3*i+1];
+       quadTotal[2] += ctx->quad[3*i+2];
++      marbleRecordNewtonState(ctx, 4000 + marble_newton_eval_count*1000 + i,
++                              alpha, cost, deriv[0], deriv[1]);
++      marbleRecordNewtonState(ctx, cost_row_probe+2, alpha, cost, i, 1);
+       continue;
+     }
+ 
+@@ -1719,6 +2482,9 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+       else {
+         deriv[0] += f*dir;
+       }
++      marbleRecordNewtonState(ctx, 4000 + marble_newton_eval_count*1000 + i,
++                              alpha, cost, deriv[0], deriv[1]);
++      marbleRecordNewtonState(ctx, cost_row_probe+2, alpha, cost, i, 2);
+       continue;
+     }
+ 
+@@ -1740,10 +2506,32 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+ 
+       // shifted cost
+       cost += ellipticCostDif(quad, alpha, mu, Dm);
++      marbleRecordNewtonState(ctx, cost_row_probe+4, alpha, cost, i, 0);
+ 
+       // compute N, Tsqr for derivatives
+       mjtNum N = U0 + alpha*V0;
+       mjtNum Tsqr = UU + alpha*(2*UV + alpha*VV);
++      marbleRecordNewtonState(ctx,
++          600000 + marble_newton_eval_count*1000 + i,
++          alpha, N, Tsqr, ctx->efc_id[i]);
++      const int probe_label =
++          700000 + marble_newton_eval_count*10000 + i*10;
++      marbleRecordNewtonState(ctx, probe_label + 1, alpha, quad[3], i,
++                              ctx->efc_id[i]);
++      marbleRecordNewtonState(ctx, probe_label + 2, alpha, quad[4], i,
++                              ctx->efc_id[i]);
++      marbleRecordNewtonState(ctx, probe_label + 3, alpha, quad[5], i,
++                              ctx->efc_id[i]);
++      marbleRecordNewtonState(ctx, probe_label + 4, alpha, quad[6], i,
++                              ctx->efc_id[i]);
++      marbleRecordNewtonState(ctx, probe_label + 5, alpha, quad[7], i,
++                              ctx->efc_id[i]);
++      marbleRecordNewtonState(ctx, probe_label + 6, alpha, quad[8], i,
++                              ctx->efc_id[i]);
++      marbleRecordNewtonState(ctx, probe_label + 7, alpha,
++          ctx->contact[ctx->efc_id[i]].mu, i, ctx->efc_id[i]);
++      const int zone_probe_label =
++          800000 + marble_newton_eval_count*100000 + i*10;
+ 
+       // no tangential force : top or bottom zone
+       if (Tsqr <= 0) {
+@@ -1760,9 +2548,16 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+       else {
+         // tangential force
+         mjtNum T = mju_sqrt(Tsqr);
++        mjtNum top_zone_margin = N - mu*T;
++        marbleRecordNewtonState(ctx,
++            zone_probe_label + 1,
++            alpha, T, top_zone_margin, 0);
++        marbleRecordNewtonState(ctx,
++            zone_probe_label + 2,
++            alpha, mu*N + T, quad[1], quad[2]);
+ 
+         // N>=mu*T : top zone
+-        if (N >= mu*T) {
++        if (top_zone_margin >= 0) {
+           // nothing to do
+         }
+ 
+@@ -1770,6 +2565,9 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+         else if (mu*N+T <= 0) {
+           deriv[0] += 2*alpha*quad[2] + quad[1];
+           deriv[1] += 2*quad[2];
++          marbleRecordNewtonState(ctx,
++              zone_probe_label + 4,
++              alpha, deriv[0], deriv[1], 0);
+         }
+ 
+         // otherwise middle zone
+@@ -1778,8 +2576,26 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+           mjtNum N1 = V0;
+           mjtNum T1 = (UV + alpha*VV)/T;
+           mjtNum T2 = VV/T - (UV + alpha*VV)*T1/(T*T);
+-          deriv[0] += Dm*(N-mu*T)*(N1-mu*T1);
+-          deriv[1] += Dm*((N1-mu*T1)*(N1-mu*T1) + (N-mu*T)*(-mu*T2));
++          mjtNum normal_slope = N1 - mu*T1;
++          mjtNum second_derivative_increment;
++          second_derivative_increment =
++              Dm*((N1-mu*T1)*(N1-mu*T1) +
++                  (N-mu*T)*(-mu*T2));
++          marbleRecordNewtonState(ctx,
++              zone_probe_label + 5,
++              alpha, top_zone_margin, normal_slope,
++              Dm*top_zone_margin*normal_slope);
++          marbleRecordNewtonState(ctx,
++              zone_probe_label + 6,
++              alpha, second_derivative_increment, deriv[0], deriv[1]);
++          marbleRecordNewtonState(ctx,
++              zone_probe_label + 7,
++              alpha, T1, T2, 0);
++          deriv[0] += Dm*top_zone_margin*normal_slope;
++          deriv[1] += second_derivative_increment;
++          marbleRecordNewtonState(ctx,
++              zone_probe_label + 8,
++              alpha, deriv[0], deriv[1], 0);
+         }
+       }
+ 
+@@ -1791,6 +2607,13 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+       mjtNum x = start + alpha*ctx->Jv[i];
+       mjtNum cost0 = start < 0 ? ctx->quad[3*i] : 0;
+ 
++      marbleRecordNewtonState(ctx,
++          20000 + marble_newton_eval_count*100 + (i % 10),
++          alpha, ctx->efc_type[i], start, ctx->Jv[i]);
++      marbleRecordNewtonState(ctx,
++          20010 + marble_newton_eval_count*100 + (i % 10),
++          alpha, x, cost0, ctx->quad[3*i]);
++
+       // active
+       if (x < 0) {
+         // shifted quad: add quad[1], quad[2] and (quad[0] - cost0)
+@@ -1801,6 +2624,9 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+         cost -= cost0;
+       }
+     }
++    marbleRecordNewtonState(ctx, 4000 + marble_newton_eval_count*1000 + i,
++                            alpha, cost, deriv[0], deriv[1]);
++    marbleRecordNewtonState(ctx, cost_row_probe+2, alpha, cost, i, 3);
+   }
+ 
+   // add total quadratic (quadTotal[0] contains only shifted residuals)
+@@ -1819,6 +2645,8 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+   p->deriv[0] = deriv[0];
+   p->deriv[1] = deriv[1];
+   ctx->LSiter++;
++  marbleRecordNewtonState(ctx, 3000 + marble_newton_eval_count++, alpha,
++                          cost, deriv[0], deriv[1]);
+ }
+ 
+ 
+@@ -1889,6 +2717,7 @@ static mjtNum PrimalSearch(mjPrimalContext* ctx, mjtNum tolerance, mjtNum ls_ite
+     mju_mulMatVecSparse(ctx->Jv, ctx->J, ctx->search, nefc,
+                         ctx->J_rownnz, ctx->J_rowadr, ctx->J_colind, ctx->J_rowsuper);
+   }
++  marbleRecordJv(ctx);
+ 
+   // prepare quadratics and cones
+   PrimalPrepare(ctx);
+@@ -2202,13 +3031,16 @@ static void FactorizeHessian(mjData* d, mjPrimalContext* ctx, int flg_recompute)
+     }
+ 
+     // factorize H
++    marbleRecordHessianInput(ctx);
+     mju_cholFactor(ctx->L, nv, mjMINVAL);
++    marbleRecordHessianOutput(ctx);
+   }
+ 
+   // add cones to factor if present
+   if (ctx->ncone) {
+     HessianCone(d, ctx);
+   }
++  marbleRecordConeOutput(ctx);
+ 
+   // mark full update
+   ctx->nupdate = nefc;
+@@ -2220,9 +3052,15 @@ static void HessianCone(mjData* d, mjPrimalContext* ctx) {
+   int nv = ctx->nv, nefc = ctx->nefc;
+   mjtNum* LTJ = ctx->LTJ;
+   mjtNum local[36];
++  if (!marble_cone_trace_size) {
++    marble_cone_trace_recording = 1;
++    const mjtNum header[2] = {nv, ctx->ncone};
++    marbleConeAppend(header, 2);
++  }
+ 
+   // start with Hcone = H
+   mju_copy(ctx->Lcone, ctx->L, ctx->nL);
++  marbleConeAppend(ctx->Lcone, ctx->nL);
+ 
+   // add contributions
+   for (int i=0; i < nefc; i++) {
+@@ -2232,7 +3070,11 @@ static void HessianCone(mjData* d, mjPrimalContext* ctx) {
+ 
+       // Cholesky of local Hessian
+       mju_copy(local, con->H, dim*dim);
++      const mjtNum contact_header[2] = {i, dim};
++      marbleConeAppend(contact_header, 2);
++      marbleConeAppend(con->H, dim*dim);
+       mju_cholFactor(local, dim, mjMINVAL);
++      marbleConeAppend(local, dim*dim);
+ 
+       // sparse
+       if (ctx->is_sparse) {
+@@ -2264,10 +3106,15 @@ static void HessianCone(mjData* d, mjPrimalContext* ctx) {
+             mju_addToScl(LTJ+c*nv, ctx->J+(i+r)*nv, local[r*dim+c], nv);
+           }
+         }
++        for (int r = 0; r < dim; ++r) marbleConeAppend(ctx->J+(i+r)*nv, nv);
++        marbleConeAppend(LTJ, dim*nv);
+ 
+         // update
+         for (int r=0; r < dim; r++) {
++          marbleConeAppend(ctx->Lcone, ctx->nL);
+           mju_cholUpdate(ctx->Lcone, LTJ+r*nv, nv, 1);
++          marbleConeAppend(ctx->Lcone, ctx->nL);
++          marbleConeAppend(LTJ+r*nv, nv);
+         }
+       }
+ 
+@@ -2278,6 +3125,10 @@ static void HessianCone(mjData* d, mjPrimalContext* ctx) {
+       i += (dim-1);
+     }
+   }
++  if (marble_cone_trace_recording) {
++    if (marble_cone_trace_size != 1) marble_cone_trace_size = marble_cone_trace_offset;
++    marble_cone_trace_recording = 0;
++  }
+ }
+ 
+ 
+@@ -2350,6 +3201,11 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
+   // make context
+   PrimalPointers(m, d, &ctx, island);
+   PrimalAllocate(m, d, &ctx, flg_Newton);
++  extern void mj_constraint_state_trace_record_arrays(int, int, const int*,
++                                                       const mjtNum*);
++  mj_constraint_state_trace_record_arrays(200, ctx.nefc, ctx.efc_state,
++                                           ctx.efc_force);
++  marbleRecordNewtonState(&ctx, 10, 0, 0, 0, 0);
+ 
+   // local copies
+   int nv   = ctx.nv;
+@@ -2357,11 +3213,21 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
+   int* oldstate = ctx.oldstate;
+ 
+   // compute Ma = Mtilde * qacc
++  marbleRecordSparseInput(&ctx);
+   mju_mulSymVecSparse(ctx.Ma, ctx.M, ctx.qacc, nv,
+                       ctx.M_rownnz, ctx.M_rowadr, ctx.M_colind);
++  if (marble_sparse_input_trace_size > 2) {
++    const int sparse_nnz = ctx.M_rowadr[nv - 1] + ctx.M_rownnz[nv - 1];
++    const int offset = 2 + 3*nv + 2*sparse_nnz;
++    memcpy(marble_sparse_input_trace + offset, ctx.Ma,
++           (size_t)nv * sizeof(mjtNum));
++    marble_sparse_input_trace_size = offset + nv;
++    marble_sparse_input_trace_size = offset + nv;
++  }
+   if (ctx.flg_flex) {
+     mjd_effMulAdd(m, d, ctx.Ma, ctx.qacc);
+   }
++  marbleRecordNewtonState(&ctx, 11, 0, 0, 0, 0);
+ 
+ 
+   // compute Jaref = J * qacc - aref  (dense or sparse)
+@@ -2372,10 +3238,16 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
+                         ctx.J_rownnz, ctx.J_rowadr, ctx.J_colind, ctx.J_rowsuper);
+   }
+   mju_subFrom(ctx.Jaref, ctx.efc_aref, nefc);
++  marbleRecordJaref(&ctx);
++  marbleRecordNewtonState(&ctx, 12, 0, 0, 0, 0);
+ 
+   // first update
+   PrimalUpdateConstraint(&ctx, flg_Newton & (m->opt.cone == mjCONE_ELLIPTIC));
++  mj_constraint_state_trace_record_arrays(201, ctx.nefc, ctx.efc_state,
++                                           ctx.efc_force);
++  marbleRecordNewtonState(&ctx, 13, 0, 0, 0, 0);
+   PrimalUpdateGrad(&ctx);
++  marbleRecordNewtonState(&ctx, 14, 0, 0, 0, 0);
+ 
+   // compute and save scaling factor
+   mjtNum scale;
+@@ -2390,9 +3262,12 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
+     scale = 1 / island_inertia;
+   }
+   ctx.scale = scale;
++  marbleRecordNewtonState(&ctx, 15, 0, scale, 0, 0);
+ 
+   // Mgrad = M \ grad: the CG preconditioned gradient, also the convergence certificate
+   PrimalUpdateMgrad(&ctx, /*flg_Newton=*/0);
++  marbleRecordNewtonState(&ctx, 16, 0, 0, 0, 0);
++  marbleRecordNewtonState(&ctx, 0, 0, 0, 0, 0);
+ 
+   // convergence certificate: the cost is strongly convex in the M-norm, bounding the
+   // suboptimality by the duality gap at the current constraint forces:
+@@ -2413,6 +3288,7 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
+     MakeHessian(d, &ctx);
+     FactorizeHessian(d, &ctx, /*flg_recompute=*/0);
+     PrimalUpdateMgrad(&ctx, /*flg_Newton=*/1);
++    marbleRecordNewtonState(&ctx, 1, 0, 0, 0, 0);
+ 
+     // Newton decrement already below tolerance: converged, skip the first line search
+     // (gradient-gated like the certificate: H^-1 suppresses stiff-direction force errors)
+@@ -2431,6 +3307,7 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
+     mjtNum ls_improvement;
+     alpha = PrimalSearch(&ctx, m->opt.tolerance * m->opt.ls_tolerance, m->opt.ls_iterations,
+                          &ls_improvement);
++    marbleRecordNewtonState(&ctx, 100 + iter, alpha, 0, 0, 0);
+ 
+     // no improvement: done
+     if (alpha == 0) {
+@@ -2440,7 +3317,10 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
+     // move to new solution
+     mju_addToScl(ctx.qacc, ctx.search, alpha, nv);
+     mju_addToScl(ctx.Ma, ctx.Mv, alpha, nv);
++    const int jaref_update_trace_offset =
++        marbleBeginJarefUpdate(&ctx, alpha);
+     mju_addToScl(ctx.Jaref, ctx.Jv, alpha, nefc);
++    marbleFinishJarefUpdate(&ctx, jaref_update_trace_offset);
+ 
+     // save old
+     if (!flg_Newton) {
+@@ -2455,6 +3335,7 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
+       HessianIncremental(d, &ctx, oldstate);
+     }
+     PrimalUpdateGradient(&ctx, flg_Newton);
++    marbleRecordNewtonState(&ctx, 200 + iter, alpha, 0, 0, 0);
+ 
+     // count state changes
+     int nchange = 0;
+diff --git a/src/engine/engine_util_blas.c b/src/engine/engine_util_blas.c
+index e829fea..3d0e97a 100644
+--- a/src/engine/engine_util_blas.c
++++ b/src/engine/engine_util_blas.c
+@@ -435,7 +435,11 @@ void mju_addToScl(mjtNum* res, const mjtNum* vec, mjtNum scl, int n) {
+ #endif
+ 
+   for (; i < n; i++) {
++#ifdef __EMSCRIPTEN__
++    res[i] = fma(vec[i], scl, res[i]);
++#else
+     res[i] += vec[i]*scl;
++#endif
+   }
+ }
+ 
+@@ -506,10 +510,17 @@ mjtNum mju_dot(const mjtNum* vec1, const mjtNum* vec2, int n) {
+   mjtNum res3 = 0;
+ 
+   for (; i <= n_4; i+=4) {
++#if defined(__EMSCRIPTEN__)
++    res0 = fma(vec1[i], vec2[i], res0);
++    res1 = fma(vec1[i+1], vec2[i+1], res1);
++    res2 = fma(vec1[i+2], vec2[i+2], res2);
++    res3 = fma(vec1[i+3], vec2[i+3], res3);
++#else
+     res0 += vec1[i] * vec2[i];
+     res1 += vec1[i+1] * vec2[i+1];
+     res2 += vec1[i+2] * vec2[i+2];
+     res3 += vec1[i+3] * vec2[i+3];
++#endif
+   }
+   res = (res0 + res2) + (res1 + res3);
+ #endif
+@@ -517,11 +528,24 @@ mjtNum mju_dot(const mjtNum* vec1, const mjtNum* vec2, int n) {
+   // process remaining
+   int n_i = n - i;
+   if (n_i == 3) {
++#if defined(__EMSCRIPTEN__)
++    res += fma(vec1[i+2], vec2[i+2],
++               fma(vec1[i], vec2[i], vec1[i+1] * vec2[i+1]));
++#else
+     res += vec1[i]*vec2[i] + vec1[i+1]*vec2[i+1] + vec1[i+2]*vec2[i+2];
++#endif
+   } else if (n_i == 2) {
++#if defined(__EMSCRIPTEN__)
++    res += fma(vec1[i], vec2[i], vec1[i+1] * vec2[i+1]);
++#else
+     res += vec1[i]*vec2[i] + vec1[i+1]*vec2[i+1];
++#endif
+   } else if (n_i == 1) {
++#if defined(__EMSCRIPTEN__)
++    res = fma(vec1[i], vec2[i], res);
++#else
+     res += vec1[i]*vec2[i];
++#endif
+   }
+   return res;
+ }
+diff --git a/src/engine/engine_util_solve.c b/src/engine/engine_util_solve.c
+index ca35a5c..78c6a91 100644
+--- a/src/engine/engine_util_solve.c
++++ b/src/engine/engine_util_solve.c
+@@ -14,7 +14,35 @@
+ 
+ #include "engine/engine_util_solve.h"
+ 
++#include <math.h>
+ #include <stdio.h>
++#include <string.h>
++
++#define MARBLE_DENSE_SOLVE_TRACE_CAPACITY 1000000
++static mjtNum marble_dense_solve_trace[MARBLE_DENSE_SOLVE_TRACE_CAPACITY];
++static int marble_dense_solve_trace_size;
++static int marble_dense_solve_trace_enabled;
++
++MJAPI void mj_solver_dense_solve_trace_reset(void) {
++  marble_dense_solve_trace_size = 0;
++  marble_dense_solve_trace_enabled = 0;
++}
++MJAPI void mj_solver_dense_solve_trace_begin(void) {
++  if (marble_dense_solve_trace_size) return;
++  marble_dense_solve_trace_enabled = 1;
++}
++MJAPI void mj_solver_dense_solve_trace_end(void) {
++  marble_dense_solve_trace_enabled = 0;
++}
++MJAPI int mj_solver_dense_solve_trace_size(void) {
++  return marble_dense_solve_trace_size;
++}
++MJAPI void mj_solver_dense_solve_trace_copy(mjtNum* output) {
++  if (output && marble_dense_solve_trace_size) {
++    memcpy(output, marble_dense_solve_trace,
++           (size_t)marble_dense_solve_trace_size * sizeof(mjtNum));
++  }
++}
+ 
+ #include <mujoco/mjdata.h>
+ #include <mujoco/mjmacro.h>
+@@ -27,6 +55,10 @@
+ #include "engine/engine_memory.h"
+ #include "engine/engine_util_spatial.h"
+ 
++extern void mj_solver_cone_trace_cholupdate_step(int k, int n,
++                                                 const mjtNum* x,
++                                                 const mjtNum* mat);
++
+ //---------------------------- dense Cholesky ------------------------------------------------------
+ 
+ // Cholesky decomposition: mat = L*L'; return 'rank'
+@@ -72,6 +104,19 @@ int mju_cholFactor(mjtNum* mat, int n, mjtNum mindiag) {
+ 
+ // Cholesky solve
+ void mju_cholSolve(mjtNum* res, const mjtNum* mat, const mjtNum* vec, int n) {
++  const int trace = marble_dense_solve_trace_enabled &&
++                    marble_dense_solve_trace_size == 0 &&
++                    1 + n*n + n + 2*n*n <= MARBLE_DENSE_SOLVE_TRACE_CAPACITY;
++  int trace_offset = 0;
++  if (trace) {
++    marble_dense_solve_trace[trace_offset++] = n;
++    memcpy(marble_dense_solve_trace + trace_offset, mat,
++           (size_t)n*n*sizeof(mjtNum));
++    trace_offset += n*n;
++    memcpy(marble_dense_solve_trace + trace_offset, vec,
++           (size_t)n*sizeof(mjtNum));
++    trace_offset += n;
++  }
+   // copy if source and destination are different
+   if (res != vec) {
+     mju_copy(res, vec, n);
+@@ -85,6 +130,11 @@ void mju_cholSolve(mjtNum* res, const mjtNum* mat, const mjtNum* vec, int n) {
+ 
+     // diagonal
+     res[i] /= mat[i*(n+1)];
++    if (trace) {
++      memcpy(marble_dense_solve_trace + trace_offset, res,
++             (size_t)n*sizeof(mjtNum));
++      trace_offset += n;
++    }
+   }
+ 
+   // backward substitution: solve L'*res = res
+@@ -96,7 +146,13 @@ void mju_cholSolve(mjtNum* res, const mjtNum* mat, const mjtNum* vec, int n) {
+     }
+     // diagonal
+     res[i] /= mat[i*(n+1)];
++    if (trace) {
++      memcpy(marble_dense_solve_trace + trace_offset, res,
++             (size_t)n*sizeof(mjtNum));
++      trace_offset += n;
++    }
+   }
++  if (trace) marble_dense_solve_trace_size = trace_offset;
+ }
+ 
+ 
+@@ -137,6 +193,7 @@ int mju_cholUpdate(mjtNum* mat, mjtNum* x, int n, int flg_plus) {
+       for (int i=k+1; i < n; i++) {
+         x[i] = c*x[i] - s*mat[i*n+k];
+       }
++      mj_solver_cone_trace_cholupdate_step(k, n, x, mat);
+     }
+   }
+ 
+diff --git a/src/engine/engine_util_spatial.c b/src/engine/engine_util_spatial.c
+index 012cb37..8777fad 100644
+--- a/src/engine/engine_util_spatial.c
++++ b/src/engine/engine_util_spatial.c
+@@ -410,12 +410,21 @@ void mju_inertCom(mjtNum* restrict res, const mjtNum inert[3], const mjtNum mat[
+                    mat[2]*inert[2], mat[5]*inert[2], mat[8]*inert[2]};
+ 
+   // res_rot = mat * diag(inert) * mat'
++#if defined(__EMSCRIPTEN__)
++  res[0] = fma(mat[2], tmp[6], fma(mat[0], tmp[0], mat[1]*tmp[3]));
++  res[1] = fma(mat[5], tmp[7], fma(mat[3], tmp[1], mat[4]*tmp[4]));
++  res[2] = fma(mat[8], tmp[8], fma(mat[6], tmp[2], mat[7]*tmp[5]));
++  res[3] = fma(mat[2], tmp[7], fma(mat[0], tmp[1], mat[1]*tmp[4]));
++  res[4] = fma(mat[2], tmp[8], fma(mat[0], tmp[2], mat[1]*tmp[5]));
++  res[5] = fma(mat[5], tmp[8], fma(mat[3], tmp[2], mat[4]*tmp[5]));
++#else
+   res[0] = mat[0]*tmp[0] + mat[1]*tmp[3] + mat[2]*tmp[6];
+   res[1] = mat[3]*tmp[1] + mat[4]*tmp[4] + mat[5]*tmp[7];
+   res[2] = mat[6]*tmp[2] + mat[7]*tmp[5] + mat[8]*tmp[8];
+   res[3] = mat[0]*tmp[1] + mat[1]*tmp[4] + mat[2]*tmp[7];
+   res[4] = mat[0]*tmp[2] + mat[1]*tmp[5] + mat[2]*tmp[8];
+   res[5] = mat[3]*tmp[2] + mat[4]*tmp[5] + mat[5]*tmp[8];
++#endif
+ 
+   // res_rot -= mass * dif_cross * dif_cross
+   res[0] += mass*(dif[1]*dif[1] + dif[2]*dif[2]);
+diff --git a/wasm/codegen/generated/bindings.cc b/wasm/codegen/generated/bindings.cc
+index ac8092e..d02963e 100644
+--- a/wasm/codegen/generated/bindings.cc
++++ b/wasm/codegen/generated/bindings.cc
+@@ -19,6 +19,52 @@
+ 
+ #include "wasm/codegen/generated/bindings.h"
+ 
++extern "C" int mj_rne_projection_trace_size(const mjModel*);
++extern "C" void mj_rne_projection_trace(const mjModel*, mjData*, mjtNum*);
++extern "C" void mjd_freeBias_vel_trace(const mjModel*, const mjData*, int, mjtNum*);
++extern "C" void mj_solver_trace_run(const mjModel*, mjData*);
++extern "C" int mj_solver_trace_size();
++extern "C" int mj_solver_trace_records();
++extern "C" void mj_solver_trace_copy(mjtNum*);
++extern "C" int mj_noslip_trace_size();
++extern "C" void mj_noslip_trace_copy(mjtNum*);
++extern "C" int mj_jaref_trace_size();
++extern "C" void mj_jaref_trace_copy(mjtNum*);
++extern "C" int mj_jv_trace_size();
++extern "C" void mj_jv_trace_copy(mjtNum*);
++extern "C" int mj_jaref_update_trace_size();
++extern "C" void mj_jaref_update_trace_copy(mjtNum*);
++extern "C" int mj_noslip_step_trace_size();
++extern "C" void mj_noslip_step_trace_copy(mjtNum*);
++extern "C" int mj_noslip_contact_trace_size();
++extern "C" void mj_noslip_contact_trace_copy(mjtNum*);
++extern "C" int mj_noslip_input_trace_size();
++extern "C" void mj_noslip_input_trace_copy(mjtNum*);
++extern "C" int mj_solver_sparse_input_size();
++extern "C" void mj_solver_sparse_input_copy(mjtNum*);
++extern "C" int mj_solver_constraint_input_size();
++extern "C" void mj_solver_constraint_input_copy(mjtNum*);
++extern "C" int mj_solver_constraint_iteration_trace_size();
++extern "C" void mj_solver_constraint_iteration_trace_copy(mjtNum*);
++extern "C" int mj_solver_chol_solve_size();
++extern "C" void mj_solver_chol_solve_copy(mjtNum*);
++extern "C" int mj_solver_hessian_size();
++extern "C" void mj_solver_hessian_copy(mjtNum*);
++extern "C" int mj_solver_cone_trace_size();
++extern "C" void mj_solver_cone_trace_copy(mjtNum*);
++extern "C" int mj_solver_dense_solve_trace_size();
++extern "C" void mj_solver_dense_solve_trace_copy(mjtNum*);
++extern "C" int mj_constraint_update_trace_size();
++extern "C" void mj_constraint_update_trace_copy(mjtNum*);
++extern "C" void mj_constraint_update_trace_begin();
++extern "C" void mj_constraint_update_trace_end();
++extern "C" int mj_constraint_hessian_trace_size();
++extern "C" int mj_constraint_hessian_trace_calls();
++extern "C" int mj_constraint_hessian_trace_overflow();
++extern "C" void mj_constraint_hessian_trace_copy(mjtNum*);
++extern "C" int mj_constraint_state_trace_size();
++extern "C" void mj_constraint_state_trace_copy(mjtNum*);
++
+ #include <emscripten.h>
+ #include <emscripten/bind.h>
+ #include <emscripten/em_asm.h>
+@@ -43,6 +89,8 @@
+ #include <mujoco/mjvisualize.h>
+ #include <mujoco/mujoco.h>
+ #include "engine/engine_util_errmem.h"
++#include "engine/engine_derivative.h"
++#include "engine/engine_util_solve.h"
+ #include "wasm/unpack.h"
+ #include "python/mujoco/indexer_xmacro.h"
+ 
+@@ -1143,6 +1191,107 @@ mjData* MjData::get() const { return ptr_; }
+ 
+ void MjData::set(mjData* ptr) { ptr_ = ptr; }
+ 
++// Diagnostic-only copy-isolated capture of MuJoCo's standalone free-joint
++// implicit solve. Each row is [A(36), LU(36), pivots(6), qacc(6)].
++std::vector<double> marble_free_joint_solve_probe(const MjModel& model,
++                                                   const MjData& source) {
++  MjData copy(model, source);
++  mjModel* m = model.get();
++  mjData* d = copy.get();
++  mjd_smooth_vel(m, d, /*flg_bias=*/0);
++  std::vector<double> result;
++  for (int joint = 0; joint < m->njnt; ++joint) {
++    if (m->jnt_type[joint] != mjJNT_FREE) continue;
++    mjtNum A[36];
++    if (!mjd_freeMhat(m, d, joint, m->opt.timestep, A)) continue;
++    mjtNum LU[36];
++    mju_copy(LU, A, 36);
++    int pivot[6];
++    int singular = mju_factorLU6(LU, pivot);
++    int adr = m->jnt_dofadr[joint];
++    mjtNum rhs[6], x[6] = {};
++    for (int i = 0; i < 6; ++i) {
++      rhs[i] = d->qfrc_smooth[adr + i] + d->qfrc_constraint[adr + i];
++    }
++    if (singular) mju_solveLU6(x, LU, rhs, pivot);
++    result.insert(result.end(), A, A + 36);
++    result.insert(result.end(), LU, LU + 36);
++    for (int value : pivot) result.push_back(value);
++    result.insert(result.end(), x, x + 6);
++  }
++  return result;
++}
++
++// Copy-isolated remainder of mj_advance for these free-body-only models:
++// return qacc, updated qvel, and updated qpos after the velocity/position step.
++std::vector<double> marble_free_joint_advance_probe(const MjModel& model,
++                                                     const MjData& source) {
++  const mjModel* m = model.get();
++  const mjData* d = source.get();
++  std::vector<double> solve = marble_free_joint_solve_probe(model, source);
++  std::vector<double> qacc(m->nv, 0.0);
++  int free_index = 0;
++  for (int joint = 0; joint < m->njnt; ++joint) {
++    if (m->jnt_type[joint] != mjJNT_FREE) continue;
++    const int adr = m->jnt_dofadr[joint];
++    const int solved_offset = free_index++ * 84 + 78;
++    for (int i = 0; i < 6; ++i) qacc[adr + i] = solve[solved_offset + i];
++  }
++  std::vector<double> qvel(d->qvel, d->qvel + m->nv);
++  mju_addToScl(qvel.data(), qacc.data(), m->opt.timestep, m->nv);
++  std::vector<double> qpos(d->qpos, d->qpos + m->nq);
++  mj_integratePos(m, qpos.data(), qvel.data(), m->opt.timestep);
++  std::vector<double> result;
++  result.insert(result.end(), qacc.begin(), qacc.end());
++  result.insert(result.end(), qvel.begin(), qvel.end());
++  result.insert(result.end(), qpos.begin(), qpos.end());
++  return result;
++}
++
++std::vector<double> marble_free_joint_derivative_probe(const MjModel& model,
++                                                        const MjData& source) {
++  MjData copy(model, source);
++  const mjModel* m = model.get();
++  mjData* d = copy.get();
++  mjd_smooth_vel(m, d, /*flg_bias=*/0);
++  std::vector<double> result;
++  for (int joint = 0; joint < m->njnt; ++joint) {
++    if (m->jnt_type[joint] != mjJNT_FREE) continue;
++    const int dof = m->jnt_dofadr[joint];
++    double block[36] = {};
++    for (int row = 0; row < 6; ++row) {
++      const int global_row = dof + row;
++      const int rowadr = m->D_rowadr[global_row];
++      for (int k = 0; k < m->D_rownnz[global_row]; ++k) {
++        const int col = m->D_colind[rowadr + k] - dof;
++        if (col >= 0 && col < 6) {
++          block[6 * row + col] = d->qDeriv[rowadr + k];
++        }
++      }
++    }
++    result.insert(result.end(), block, block + 36);
++    mjtNum bias[36];
++    mjd_freeBias_vel(m, d, joint, bias);
++    result.insert(result.end(), bias, bias + 36);
++  }
++  return result;
++}
++
++std::vector<double> marble_free_bias_intermediate_probe(
++    const MjModel& model, const MjData& source) {
++  MjData copy(model, source);
++  const mjModel* m = model.get();
++  const mjData* d = copy.get();
++  std::vector<double> result;
++  for (int joint = 0; joint < m->njnt; ++joint) {
++    if (m->jnt_type[joint] != mjJNT_FREE) continue;
++    mjtNum trace[100];
++    mjd_freeBias_vel_trace(m, d, joint, trace);
++    result.insert(result.end(), trace, trace + 100);
++  }
++  return result;
++}
++
+ std::vector<MjContact> MjData::contact() const {
+   return InitWrapperArray<MjContact>(get()->contact, get()->ncon);
+ }
+@@ -1961,6 +2110,237 @@ void mj_rne_wrapper(const MjModel& m, MjData& d, int flg_acc, const val& result)
+   mj_rne(m.get(), d.get(), flg_acc, result_.data());
+ }
+ 
++val mj_rne_projection_trace_wrapper(const MjModel& m, MjData& d) {
++  int size = mj_rne_projection_trace_size(m.get());
++  std::vector<mjtNum> trace(size);
++  mj_rne_projection_trace(m.get(), d.get(), trace.data());
++  val output = val::array();
++  for (int i = 0; i < size; ++i) output.call<void>("push", trace[i]);
++  return output;
++}
++
++val marble_newton_trace_wrapper(const MjModel& m, MjData& d) {
++  mj_solver_trace_run(m.get(), d.get());
++  const int records = mj_solver_trace_records();
++  const int size = mj_solver_trace_size();
++  std::vector<mjtNum> trace(size);
++  mj_solver_trace_copy(trace.data());
++  val output = val::object();
++  output.set("records", records);
++  output.set("modelDisableFlags", m.get()->opt.disableflags);
++  output.set("modelSolver", m.get()->opt.solver);
++  output.set("dataConstraintCount", d.get()->nefc);
++  val values = val::array();
++  for (int i = 0; i < size; i++) values.set(i, trace[i]);
++  output.set("values", values);
++  const int noslip_size = mj_noslip_trace_size();
++  std::vector<mjtNum> noslip_trace(noslip_size);
++  mj_noslip_trace_copy(noslip_trace.data());
++  val noslip_values = val::array();
++  for (int i = 0; i < noslip_size; ++i) noslip_values.set(i, noslip_trace[i]);
++  output.set("noSlipTrace", noslip_values);
++  const int jaref_size = mj_jaref_trace_size();
++  std::vector<mjtNum> jaref_trace(jaref_size);
++  mj_jaref_trace_copy(jaref_trace.data());
++  val jaref_values = val::array();
++  for (int i = 0; i < jaref_size; ++i) jaref_values.set(i, jaref_trace[i]);
++  output.set("jarefTrace", jaref_values);
++  const int jv_size = mj_jv_trace_size();
++  std::vector<mjtNum> jv_trace(jv_size);
++  mj_jv_trace_copy(jv_trace.data());
++  val jv_values = val::array();
++  for (int i = 0; i < jv_size; ++i) jv_values.set(i, jv_trace[i]);
++  output.set("jvTrace", jv_values);
++  const int jaref_update_size = mj_jaref_update_trace_size();
++  std::vector<mjtNum> jaref_update_trace(jaref_update_size);
++  mj_jaref_update_trace_copy(jaref_update_trace.data());
++  val jaref_update_values = val::array();
++  for (int i = 0; i < jaref_update_size; ++i) {
++    jaref_update_values.set(i, jaref_update_trace[i]);
++  }
++  output.set("jarefUpdateTrace", jaref_update_values);
++  const int noslip_step_size = mj_noslip_step_trace_size();
++  std::vector<mjtNum> noslip_step_trace(noslip_step_size);
++  mj_noslip_step_trace_copy(noslip_step_trace.data());
++  val noslip_step_values = val::array();
++  for (int i = 0; i < noslip_step_size; ++i) {
++    noslip_step_values.set(i, noslip_step_trace[i]);
++  }
++  output.set("noSlipStepTrace", noslip_step_values);
++  const int noslip_contact_size = mj_noslip_contact_trace_size();
++  std::vector<mjtNum> noslip_contact_trace(noslip_contact_size);
++  mj_noslip_contact_trace_copy(noslip_contact_trace.data());
++  val noslip_contact_values = val::array();
++  for (int i = 0; i < noslip_contact_size; ++i) {
++    noslip_contact_values.set(i, noslip_contact_trace[i]);
++  }
++  output.set("noSlipContactTrace", noslip_contact_values);
++  const int residual_input_size = mj_noslip_input_trace_size();
++  std::vector<mjtNum> residual_input(residual_input_size);
++  mj_noslip_input_trace_copy(residual_input.data());
++  val residual_input_states = val::array();
++  int residual_offset = 0;
++  int residual_state_count = 0;
++  while (residual_offset + 4 <= residual_input_size) {
++    const int island = static_cast<int>(residual_input[residual_offset++]);
++    const int island_nefc = static_cast<int>(residual_input[residual_offset++]);
++    const int nefc = static_cast<int>(residual_input[residual_offset++]);
++    const bool ar_available = residual_input[residual_offset++] != 0;
++    const int record_start = residual_offset - 4;
++    const int required = island_nefc + 3*nefc + (ar_available ? nefc*nefc : 0);
++    if (island_nefc < 0 || nefc < 0 || residual_offset + required > residual_input_size) break;
++    val state = val::object();
++    state.set("island", island);
++    state.set("islandNefc", island_nefc);
++    state.set("nefc", nefc);
++    state.set("arAvailable", ar_available);
++    val rows = val::array();
++    for (int i = 0; i < island_nefc; ++i) rows.set(i, residual_input[residual_offset++]);
++    state.set("efclist", rows);
++    const char* field_names[] = {"b", "R", "force"};
++    for (const char* field : field_names) {
++      val field_values = val::array();
++      for (int i = 0; i < nefc; ++i) field_values.set(i, residual_input[residual_offset++]);
++      state.set(field, field_values);
++    }
++    val matrix = val::array();
++    if (ar_available) {
++      for (int i = 0; i < nefc*nefc; ++i) matrix.set(i, residual_input[residual_offset++]);
++    }
++    state.set("AR", matrix);
++    residual_input_states.set(residual_state_count++, state);
++    if (residual_offset <= record_start) break;
++  }
++  output.set("residualInputStates", residual_input_states);
++  if (residual_state_count) {
++    output.set("residualInputState", residual_input_states[0]);
++  }
++  const int sparse_size = mj_solver_sparse_input_size();
++  std::vector<mjtNum> sparse_input(sparse_size);
++  mj_solver_sparse_input_copy(sparse_input.data());
++  val sparse_values = val::array();
++  for (int i = 0; i < sparse_size; i++) sparse_values.set(i, sparse_input[i]);
++  output.set("sparseInput", sparse_values);
++  const int constraint_size = mj_solver_constraint_input_size();
++  std::vector<mjtNum> constraint_input(constraint_size);
++  mj_solver_constraint_input_copy(constraint_input.data());
++  val constraint_values = val::array();
++  for (int i = 0; i < constraint_size; i++) {
++    constraint_values.set(i, constraint_input[i]);
++  }
++  output.set("constraintInput", constraint_values);
++  const int constraint_iteration_size =
++      mj_solver_constraint_iteration_trace_size();
++  std::vector<mjtNum> constraint_iteration_trace(constraint_iteration_size);
++  mj_solver_constraint_iteration_trace_copy(constraint_iteration_trace.data());
++  val constraint_iteration_values = val::array();
++  for (int i = 0; i < constraint_iteration_size; i++) {
++    constraint_iteration_values.set(i, constraint_iteration_trace[i]);
++  }
++  output.set("constraintIterationTrace", constraint_iteration_values);
++  const int chol_size = mj_solver_chol_solve_size();
++  std::vector<mjtNum> chol_input(chol_size);
++  mj_solver_chol_solve_copy(chol_input.data());
++  val chol_values = val::array();
++  for (int i = 0; i < chol_size; i++) chol_values.set(i, chol_input[i]);
++  output.set("cholSolveInput", chol_values);
++  const int hessian_size = mj_solver_hessian_size();
++  std::vector<mjtNum> hessian_trace(hessian_size);
++  mj_solver_hessian_copy(hessian_trace.data());
++  val hessian_values = val::array();
++  for (int i = 0; i < hessian_size; i++) {
++    hessian_values.set(i, hessian_trace[i]);
++  }
++  output.set("hessianTrace", hessian_values);
++  const int cone_size = mj_solver_cone_trace_size();
++  std::vector<mjtNum> cone_trace(cone_size);
++  mj_solver_cone_trace_copy(cone_trace.data());
++  val cone_values = val::array();
++  for (int i = 0; i < cone_size; i++) cone_values.set(i, cone_trace[i]);
++  output.set("coneTrace", cone_values);
++  const int solve_stage_size = mj_solver_dense_solve_trace_size();
++  std::vector<mjtNum> solve_stages(solve_stage_size);
++  mj_solver_dense_solve_trace_copy(solve_stages.data());
++  val solve_stage_values = val::array();
++  for (int i = 0; i < solve_stage_size; i++) {
++    solve_stage_values.set(i, solve_stages[i]);
++  }
++  output.set("denseSolveStages", solve_stage_values);
++  const int constraint_update_size = mj_constraint_update_trace_size();
++  std::vector<mjtNum> constraint_updates(constraint_update_size);
++  mj_constraint_update_trace_copy(constraint_updates.data());
++  val constraint_update_values = val::array();
++  for (int i = 0; i < constraint_update_size; i++) {
++    constraint_update_values.set(i, constraint_updates[i]);
++  }
++  output.set("constraintUpdateTrace", constraint_update_values);
++  output.set("constraintUpdateCaptureSize", mj_constraint_update_trace_size());
++  const int hessian_update_size = mj_constraint_hessian_trace_size();
++  std::vector<mjtNum> hessian_updates(hessian_update_size);
++  mj_constraint_hessian_trace_copy(hessian_updates.data());
++  val hessian_update_values = val::array();
++  for (int i = 0; i < hessian_update_size; i++) {
++    hessian_update_values.set(i, hessian_updates[i]);
++  }
++  output.set("coneHessianUpdateTrace", hessian_update_values);
++  output.set("coneHessianUpdateSchema", 1);
++  output.set("coneHessianUpdateCalls", mj_constraint_hessian_trace_calls());
++  output.set("coneHessianUpdateOverflow", mj_constraint_hessian_trace_overflow());
++  const int state_trace_size = mj_constraint_state_trace_size();
++  std::vector<mjtNum> state_trace(state_trace_size);
++  mj_constraint_state_trace_copy(state_trace.data());
++  val state_trace_values = val::array();
++  for (int i = 0; i < state_trace_size; i++) {
++    state_trace_values.set(i, state_trace[i]);
++  }
++  output.set("constraintStateTrace", state_trace_values);
++  return output;
++}
++
++// Diagnostic-only helper: MjData::contact() returns value-copied wrappers,
++// so JS writes to those wrappers do not reach mjData::contact.  Copy the
++// captured solver contacts through the backing C array instead.
++bool marble_sync_solver_contacts_wrapper(MjData& d, const val& contacts) {
++  mjData* data = d.get();
++  const int count = contacts["length"].as<int>();
++  if (count != data->ncon) return false;
++  for (int i = 0; i < count; ++i) {
++    const val source = contacts[i];
++    mjContact* target = data->contact + i;
++    target->geom1 = source["geom1"].as<int>();
++    target->geom2 = source["geom2"].as<int>();
++    target->dist = source["dist"].as<mjtNum>();
++    target->dim = source["dim"].as<int>();
++    target->mu = source["mu"].as<mjtNum>();
++    const val pos = source["pos"];
++    const val frame = source["frame"];
++    const val friction = source["friction"];
++    for (int j = 0; j < 3; ++j) target->pos[j] = pos[j].as<mjtNum>();
++    for (int j = 0; j < 9; ++j) target->frame[j] = frame[j].as<mjtNum>();
++    for (int j = 0; j < 5; ++j) {
++      target->friction[j] = friction[j].as<mjtNum>();
++    }
++  }
++  return true;
++}
++
++void marble_constraint_update_trace_begin_wrapper() {
++  mj_constraint_update_trace_begin();
++}
++
++void marble_constraint_update_trace_end_wrapper() {
++  mj_constraint_update_trace_end();
++}
++
++val marble_constraint_update_trace_copy_wrapper() {
++  const int size = mj_constraint_update_trace_size();
++  std::vector<mjtNum> trace(size);
++  mj_constraint_update_trace_copy(trace.data());
++  val output = val::array();
++  for (int i = 0; i < size; ++i) output.set(i, trace[i]);
++  return output;
++}
++
+ void mj_rnePostConstraint_wrapper(const MjModel& m, MjData& d) {
+   mj_rnePostConstraint(m.get(), d.get());
+ }
+@@ -6331,6 +6711,10 @@ EMSCRIPTEN_BINDINGS(mujoco_bindings) {
+   function("mj_getTotalmass", &mj_getTotalmass_wrapper);
+   function("mj_id2name", &mj_id2name_wrapper);
+   function("mj_implicit", &mj_implicit_wrapper);
++  function("marbleFreeJointSolveProbe", &marble_free_joint_solve_probe);
++  function("marbleFreeJointAdvanceProbe", &marble_free_joint_advance_probe);
++  function("marbleFreeJointDerivativeProbe", &marble_free_joint_derivative_probe);
++  function("marbleFreeBiasIntermediateProbe", &marble_free_bias_intermediate_probe);
+   function("mj_initCtrlHistory", &mj_initCtrlHistory_wrapper);
+   function("mj_initSensorHistory", &mj_initSensorHistory_wrapper);
+   function("mj_integratePos", &mj_integratePos_wrapper);
+@@ -6385,6 +6769,12 @@ EMSCRIPTEN_BINDINGS(mujoco_bindings) {
+   function("mj_resetDataDebug", &mj_resetDataDebug_wrapper);
+   function("mj_resetDataKeyframe", &mj_resetDataKeyframe_wrapper);
+   function("mj_rne", &mj_rne_wrapper);
++  function("marbleRneProjectionTrace", &mj_rne_projection_trace_wrapper);
++  function("marbleNewtonTrace", &marble_newton_trace_wrapper);
++  function("marbleSyncSolverContacts", &marble_sync_solver_contacts_wrapper);
++  function("marbleConstraintUpdateTraceBegin", &marble_constraint_update_trace_begin_wrapper);
++  function("marbleConstraintUpdateTraceEnd", &marble_constraint_update_trace_end_wrapper);
++  function("marbleConstraintUpdateTraceCopy", &marble_constraint_update_trace_copy_wrapper);
+   function("mj_rnePostConstraint", &mj_rnePostConstraint_wrapper);
+   function("mj_sensorAcc", &mj_sensorAcc_wrapper);
+   function("mj_sensorPos", &mj_sensorPos_wrapper);
+diff --git a/src/engine/marble_constraint_hessian_trace.h b/src/engine/marble_constraint_hessian_trace.h
+new file mode 100644
+index 0000000..563f498
+--- /dev/null
++++ b/src/engine/marble_constraint_hessian_trace.h
+@@ -0,0 +1,94 @@
++// Diagnostic-only MuJoCo 3.12 recorder; never included in production builds.
++// Captures only fully written active cone Hessians. It never reads incoming H
++// or unused storage outside dim*dim, and performs no floating-point arithmetic.
++#ifndef MARBLE_CONSTRAINT_HESSIAN_TRACE_H_
++#define MARBLE_CONSTRAINT_HESSIAN_TRACE_H_
++
++#define MARBLE_CONE_HESSIAN_TRACE_CAPACITY 300000
++static mjtNum marble_cone_hessian_trace[MARBLE_CONE_HESSIAN_TRACE_CAPACITY];
++static int marble_cone_hessian_trace_size;
++static int marble_cone_hessian_trace_enabled;
++static int marble_cone_hessian_trace_overflow;
++static int marble_cone_hessian_trace_calls;
++
++static void marble_cone_hessian_trace_begin(void) {
++  marble_cone_hessian_trace_size = 0;
++  marble_cone_hessian_trace_overflow = 0;
++  marble_cone_hessian_trace_calls = 0;
++  marble_cone_hessian_trace_enabled = 1;
++}
++
++static void marble_cone_hessian_trace_end(void) {
++  marble_cone_hessian_trace_enabled = 0;
++}
++
++static int marble_cone_hessian_trace_call(void) {
++  return marble_cone_hessian_trace_enabled ? marble_cone_hessian_trace_calls++ : -1;
++}
++
++MJAPI int mj_constraint_hessian_trace_size(void) {
++  return marble_cone_hessian_trace_size;
++}
++
++MJAPI int mj_constraint_hessian_trace_overflow(void) {
++  return marble_cone_hessian_trace_overflow;
++}
++
++MJAPI int mj_constraint_hessian_trace_calls(void) {
++  return marble_cone_hessian_trace_calls;
++}
++
++MJAPI void mj_constraint_hessian_trace_copy(mjtNum* output) {
++  if (output && marble_cone_hessian_trace_size) {
++    memcpy(output, marble_cone_hessian_trace,
++           (size_t)marble_cone_hessian_trace_size * sizeof(mjtNum));
++  }
++}
++
++#if defined(__GNUC__) || defined(__clang__)
++__attribute__((noinline))
++#endif
++static void marble_cone_hessian_trace_record(
++    int call, int row, int nefc, int dim, int contact_id, int has_cost,
++    mjtNum mu, mjtNum N, mjtNum T, mjtNum Dm, mjtNum NmT,
++    const mjtNum* friction, const mjtNum* jar, const mjtNum* D,
++    const mjtNum* R, const mjtNum* force, const mjtNum* H) {
++  if (!marble_cone_hessian_trace_enabled || call < 0) return;
++  const int width = 17 + 4*dim + dim*dim;
++  if ((dim != 3 && dim != 4 && dim != 6) || row < 0 ||
++      row + dim > nefc ||
++      marble_cone_hessian_trace_size + width > MARBLE_CONE_HESSIAN_TRACE_CAPACITY) {
++    marble_cone_hessian_trace_overflow = 1;
++    marble_cone_hessian_trace_enabled = 0;
++    return;
++  }
++  mjtNum* out = marble_cone_hessian_trace + marble_cone_hessian_trace_size;
++  // Schema 1. Call ordinal counts every impl entry, including non-cone calls.
++  out[0] = 1;
++  out[1] = call;
++  out[2] = row;
++  out[3] = nefc;
++  out[4] = dim;
++  out[5] = contact_id;
++  out[6] = has_cost;
++  out[7] = mu;
++  out[8] = N;
++  out[9] = T;
++  out[10] = Dm;
++  out[11] = NmT;
++  int cursor = 12;
++#define MARBLE_HESSIAN_COPY(values, count) do { \
++    memcpy(out + cursor, values, (size_t)(count)*sizeof(mjtNum)); \
++    cursor += count; \
++  } while (0)
++  MARBLE_HESSIAN_COPY(friction, 5);
++  MARBLE_HESSIAN_COPY(jar, dim);
++  MARBLE_HESSIAN_COPY(D, dim);
++  MARBLE_HESSIAN_COPY(R, dim);
++  MARBLE_HESSIAN_COPY(force, dim);
++  MARBLE_HESSIAN_COPY(H, dim*dim);
++#undef MARBLE_HESSIAN_COPY
++  marble_cone_hessian_trace_size += width;
++}
++
++#endif  // MARBLE_CONSTRAINT_HESSIAN_TRACE_H_

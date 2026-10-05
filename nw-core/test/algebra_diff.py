@@ -136,9 +136,12 @@ def reference():
 
 
 def main():
+    # The Elisa sweep reads typed answers from TYPED_PATH at startup. Generate
+    # them before running the binary, or the run emits only the ungraded base
+    # columns from an absent/stale fixture.
+    want = reference()
     got = subprocess.run([sys.argv[1]], capture_output=True, text=True, check=True)
     mine = [line for line in got.stdout.splitlines() if line.strip()]
-    want = reference()
     if len(mine) != len(want):
         print("MISMATCH line count: elisa %d, python %d" % (len(mine), len(want)))
         for index, (a, b) in enumerate(zip(mine, want)):

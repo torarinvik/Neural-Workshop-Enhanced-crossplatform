@@ -1,0 +1,418 @@
+# Stateful Graph Mapping run controller.
+#
+# The source GraphMapping module owns the graph generator, isomorphism test,
+# relabelling, and ring placement.  This adapter keeps the values that must
+# live across a common-v1 ABI call in fixed storage.  The darrays used by the
+# source generator are deliberately confined to one temporary region; every
+# edge, point, option, and timing value needed by the next render or input
+# call is copied before that region is destroyed.
+
+module GraphMappingGame:
+
+    const MAX_NODES: i64 = GraphMapping::MAX_NODES
+    const MAX_EDGES: i64 = GraphMapping::MAX_EDGES
+    const REFERENCE_WIDTH: f64 = 912.0
+    const REFERENCE_HEIGHT: f64 = 684.0
+    const FEEDBACK_MS: i64 = 900
+    const MOST_TRIALS: i64 = 400
+
+    const PHASE_READY: i64 = GraphMapping::READY
+    const PHASE_ASKING: i64 = GraphMapping::ASKING
+    const PHASE_HIDDEN: i64 = GraphMapping::HIDDEN
+    const PHASE_FEEDBACK: i64 = GraphMapping::FEEDBACK
+    const PHASE_DONE: i64 = GraphMapping::DONE
+
+    const ACTION_START: i64 = 0
+    const ACTION_SAME: i64 = 1
+    const ACTION_DIFFERENT: i64 = 2
+
+    const INFO_PHASE: i64 = 0
+    const INFO_START_NODES: i64 = 1
+    const INFO_NODES: i64 = 2
+    const INFO_DENSITY: i64 = 3
+    const INFO_TRIAL: i64 = 4
+    const INFO_TOTAL_TRIALS: i64 = 5
+    const INFO_CORRECT: i64 = 6
+    const INFO_SAME_TOTAL: i64 = 7
+    const INFO_SAME_RIGHT: i64 = 8
+    const INFO_DIFFERENT_TOTAL: i64 = 9
+    const INFO_DIFFERENT_RIGHT: i64 = 10
+    const INFO_SUBTLE: i64 = 11
+    const INFO_EXPOSURE_MS: i64 = 12
+    const INFO_ADAPTIVE: i64 = 13
+    const INFO_FEEDBACK: i64 = 14
+    const INFO_VERDICT: i64 = 15
+    const INFO_FEEDBACK_UNTIL_MS: i64 = 16
+    const INFO_SETTLED_FOR: i64 = 17
+    const INFO_ANSWERED: i64 = 18
+    const INFO_MEAN_MS: i64 = 19
+    const INFO_ASKED_AT_MS: i64 = 20
+    # This field is useful to deterministic replay tests and is never drawn
+    # by SceneGraphMapping.  It is additive ABI state, not part of the common
+    # twelve-field envelope, so the renderer cannot accidentally leak it.
+    const INFO_REALLY_SAME: i64 = 21
+
+    const VALUE_LEFT_EDGE: i64 = 0
+    const VALUE_RIGHT_EDGE: i64 = 1
+    const VALUE_LEFT_X: i64 = 2
+    const VALUE_LEFT_Y: i64 = 3
+    const VALUE_RIGHT_X: i64 = 4
+    const VALUE_RIGHT_Y: i64 = 5
+    const VALUE_REALLY_SAME: i64 = 6
+
+    struct GraphMappingRun:
+        rng: mutable MT19937
+        start_nodes: mutable i64
+        density: mutable i64
+        total_trials: mutable i64
+        exposure_ms: mutable i64
+        adaptive: mutable bool
+        subtle: mutable bool
+        feedback: mutable bool
+        nodes: mutable i64
+        trial: mutable i64
+        correct: mutable i64
+        same_total: mutable i64
+        same_right: mutable i64
+        different_total: mutable i64
+        different_right: mutable i64
+        settled_for: mutable i64
+        answered: mutable i64
+        total_time_ms: mutable i64
+        phase: mutable i64
+        verdict: mutable i64
+        really_same: mutable bool
+        pair_subtle: mutable bool
+        deck: mutable i64[6]
+        deck_count: mutable i64
+        asked_at_ms: mutable i64
+        feedback_until_ms: mutable i64
+        first_count: mutable i64
+        second_count: mutable i64
+        first_edges: mutable i64[120]
+        second_edges: mutable i64[120]
+        first_x: mutable f64[16]
+        first_y: mutable f64[16]
+        second_x: mutable f64[16]
+        second_y: mutable f64[16]
+
+    def allowed_start_nodes(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 4 or value == 5 or value == 6 or value == 7 or value == 8 or value == 9 or value == 10 or value == 12 or value == 14 or value == 16
+
+    def allowed_density(value: i64) -> bool:
+        can Abort.Panic:
+            return value == GraphMapping::SPARSE or value == GraphMapping::MEDIUM or value == GraphMapping::DENSE
+
+    def allowed_trials(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 5 or value == 10 or value == 15 or value == 20 or value == 30 or value == 50 or value == 80 or value == 100
+
+    def allowed_exposure(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 0 or value == 3000 or value == 5000 or value == 8000 or value == 12000 or value == 20000
+
+    def allowed_flag(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 0 or value == 1
+
+    def floor_for(density: i64, subtle: bool) -> i64:
+        can Abort.Panic:
+            return GraphMapping::subtle_floor(density) if subtle else GraphMapping::MIN_NODES
+
+    def clamp_nodes(density: i64, subtle: bool, value: i64) -> i64:
+        can Abort.Panic:
+            held: i64 = value if value < MAX_NODES else MAX_NODES
+            low: i64 = floor_for(density, subtle)
+            return low if low > held else held
+
+    def clear_arrays(run: mutable GraphMappingRun&):
+        can Abort.Panic:
+            run.first_count <- 0
+            run.second_count <- 0
+            for at in 0..<MAX_EDGES |at, run|:
+                run.first_edges[at.usize()] <- 0
+                run.second_edges[at.usize()] <- 0
+            for at in 0..<MAX_NODES |at, run|:
+                run.first_x[at.usize()] <- 0.0
+                run.first_y[at.usize()] <- 0.0
+                run.second_x[at.usize()] <- 0.0
+                run.second_y[at.usize()] <- 0.0
+
+    def initialize(run: mutable GraphMappingRun&, start_nodes: i64, density: i64,
+                   total_trials: i64, subtle: bool, exposure_ms: i64,
+                   adaptive: bool, feedback: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.start_nodes <- start_nodes
+            run.density <- density
+            run.total_trials <- total_trials
+            run.subtle <- subtle
+            run.exposure_ms <- exposure_ms
+            run.adaptive <- adaptive
+            run.feedback <- feedback
+            run.nodes <- clamp_nodes(density, subtle, start_nodes)
+            run.trial <- 0
+            run.correct <- 0
+            run.same_total <- 0
+            run.same_right <- 0
+            run.different_total <- 0
+            run.different_right <- 0
+            run.settled_for <- 0
+            run.answered <- 0
+            run.total_time_ms <- 0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.really_same <- true
+            run.pair_subtle <- false
+            run.deck_count <- 0
+            run.asked_at_ms <- 0
+            run.feedback_until_ms <- 0
+            clear_arrays(run)
+            for at in 0..<6 |at, run|:
+                run.deck[at.usize()] <- 0
+
+    def draw_answer(run: mutable GraphMappingRun&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            if run.deck_count == 0:
+                for at in 0..<6 |at, run|:
+                    run.deck[at.usize()] <- 1 if at < 3 else 0
+                run.deck_count <- 6
+                # CPython's random.shuffle walks down from the last slot.
+                # The controller keeps this six-entry deck inline, so mirror
+                # that exact draw order rather than using a forward pass.
+                at: mutable i64 = 5
+                while at >= 1 |at, run|:
+                    picked: i64 = py_randbelow(&run.rng, (at + 1).u64()).i64()
+                    held: i64 = run.deck[at.usize()]
+                    run.deck[at.usize()] <- run.deck[picked.usize()]
+                    run.deck[picked.usize()] <- held
+                    at <- at - 1
+            run.deck_count <- run.deck_count - 1
+            return run.deck[run.deck_count.usize()] != 0
+
+    def copy_graph(run_edges: mutable i64[120]&, out_count: mutable i64&,
+                   graph: mutable GraphMapping::Graph&):
+        can Abort.Panic:
+            out_count <- graph.count
+            for at in 0..<MAX_EDGES |at, run_edges, graph|:
+                run_edges[at.usize()] <- Ints::at_ref(&graph.edges, at) if at < graph.count else 0
+
+    # The source generator allocates Graph, Pair, Bench, and Probe darrays in
+    # this region.  Nothing from those objects escapes it.
+    def generate_trial(run: mutable GraphMappingRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.trial >= run.total_trials:
+                run.phase <- PHASE_DONE
+                run.verdict <- -1
+                clear_arrays(run)
+                return
+            run.trial <- run.trial + 1
+            run.verdict <- -1
+            run.feedback_until_ms <- 0
+            same: bool = draw_answer(run)
+            lines: i64 = GraphMapping::edge_count(run.nodes, run.density)
+            region generation(134217728):
+                in generation:
+                    pair: mutable GraphMapping::Pair = GraphMapping::new_pair()
+                    bench: mutable GraphMapping::Bench = GraphMapping::new_bench()
+                    probe: mutable GraphMapping::Probe = GraphMapping::new_probe()
+                    base: mutable GraphMapping::Graph = GraphMapping::new_graph()
+                    other: mutable GraphMapping::Graph = GraphMapping::new_graph()
+                    first_x: mutable darray[f64] = Floats::zeros(MAX_NODES)
+                    first_y: mutable darray[f64] = Floats::zeros(MAX_NODES)
+                    second_x: mutable darray[f64] = Floats::zeros(MAX_NODES)
+                    second_y: mutable darray[f64] = Floats::zeros(MAX_NODES)
+                    GraphMapping::build_pair(&pair, &bench, &probe, &base, &other,
+                        run.nodes, lines, same, run.subtle, &run.rng)
+                    copy_graph(&run.first_edges, &run.first_count, &pair.first)
+                    copy_graph(&run.second_edges, &run.second_count, &pair.second)
+                    run.pair_subtle <- pair.subtle
+                    GraphMapping::ring_positions(&first_x, &first_y, &bench.naming,
+                        run.nodes, &run.rng)
+                    GraphMapping::ring_positions(&second_x, &second_y, &bench.naming,
+                        run.nodes, &run.rng)
+                    run.really_same <- pair.same
+                    for at in 0..<MAX_NODES |at, run, first_x, first_y, second_x, second_y|:
+                        run.first_x[at.usize()] <- Floats::at_ref(&first_x, at)
+                        run.first_y[at.usize()] <- Floats::at_ref(&first_y, at)
+                        run.second_x[at.usize()] <- Floats::at_ref(&second_x, at)
+                        run.second_y[at.usize()] <- Floats::at_ref(&second_y, at)
+                destroy generation
+            if run.subtle and not run.really_same and not run.pair_subtle:
+                run.settled_for <- run.settled_for + 1
+            run.asked_at_ms <- now_ms
+            run.phase <- PHASE_ASKING
+
+    def start_run(run: mutable GraphMappingRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.nodes <- clamp_nodes(run.density, run.subtle, run.start_nodes)
+            run.trial <- 0
+            run.correct <- 0
+            run.same_total <- 0
+            run.same_right <- 0
+            run.different_total <- 0
+            run.different_right <- 0
+            run.settled_for <- 0
+            run.answered <- 0
+            run.total_time_ms <- 0
+            run.deck_count <- 0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.pair_subtle <- false
+            run.feedback_until_ms <- 0
+            clear_arrays(run)
+            generate_trial(run, now_ms)
+
+    def answer(run: mutable GraphMappingRun&, choice: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 2 if choice != GraphMapping::SAME and choice != GraphMapping::DIFFERENT
+            return 2 if run.phase != PHASE_ASKING and run.phase != PHASE_HIDDEN
+            said_same: bool = choice == GraphMapping::SAME
+            right: bool = said_same == run.really_same
+            if run.answered < MOST_TRIALS:
+                run.answered <- run.answered + 1
+                run.total_time_ms <- run.total_time_ms + (now_ms - run.asked_at_ms if now_ms >= run.asked_at_ms else 0)
+            if run.really_same:
+                run.same_total <- run.same_total + 1
+                run.same_right <- run.same_right + 1 if said_same
+            else:
+                run.different_total <- run.different_total + 1
+                run.different_right <- run.different_right + 1 if not said_same
+            run.correct <- run.correct + 1 if right
+            if run.adaptive:
+                run.nodes <- clamp_nodes(run.density, run.subtle, run.nodes + (1 if right else -1))
+            if run.feedback:
+                run.phase <- PHASE_FEEDBACK
+                run.verdict <- 1 if right else 0
+                run.feedback_until_ms <- now_ms + FEEDBACK_MS
+            else:
+                generate_trial(run, now_ms)
+            return 1
+
+    def advance(run: mutable GraphMappingRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_FEEDBACK and now_ms >= run.feedback_until_ms:
+                generate_trial(run, now_ms)
+                return 1
+            if run.phase == PHASE_ASKING and run.exposure_ms > 0 and now_ms >= run.asked_at_ms + run.exposure_ms:
+                run.phase <- PHASE_HIDDEN
+                return 1
+            return 2
+
+    def info(run: GraphMappingRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_START_NODES: return run.start_nodes
+            if field == INFO_NODES: return run.nodes
+            if field == INFO_DENSITY: return run.density
+            if field == INFO_TRIAL: return run.trial
+            if field == INFO_TOTAL_TRIALS: return run.total_trials
+            if field == INFO_CORRECT: return run.correct
+            if field == INFO_SAME_TOTAL: return run.same_total
+            if field == INFO_SAME_RIGHT: return run.same_right
+            if field == INFO_DIFFERENT_TOTAL: return run.different_total
+            if field == INFO_DIFFERENT_RIGHT: return run.different_right
+            if field == INFO_SUBTLE: return 1 if run.subtle else 0
+            if field == INFO_EXPOSURE_MS: return run.exposure_ms
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_FEEDBACK: return 1 if run.feedback else 0
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_FEEDBACK_UNTIL_MS: return run.feedback_until_ms
+            if field == INFO_SETTLED_FOR: return run.settled_for
+            if field == INFO_ANSWERED: return run.answered
+            if field == INFO_MEAN_MS: return 0 if run.answered <= 0 else run.total_time_ms / run.answered
+            if field == INFO_ASKED_AT_MS: return run.asked_at_ms
+            if field == INFO_REALLY_SAME: return 1 if run.really_same else 0
+            return -1
+
+    def value(run: GraphMappingRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            if field == VALUE_REALLY_SAME:
+                return 1 if run.really_same else 0
+            return -1 if at < 0
+            if field == VALUE_LEFT_EDGE:
+                return -1 if at >= run.first_count else run.first_edges[at.usize()]
+            if field == VALUE_RIGHT_EDGE:
+                return -1 if at >= run.second_count else run.second_edges[at.usize()]
+            if field == VALUE_LEFT_X:
+                return -1 if at >= run.nodes else (run.first_x[at.usize()] * 1000000.0).i64()
+            if field == VALUE_LEFT_Y:
+                return -1 if at >= run.nodes else (run.first_y[at.usize()] * 1000000.0).i64()
+            if field == VALUE_RIGHT_X:
+                return -1 if at >= run.nodes else (run.second_x[at.usize()] * 1000000.0).i64()
+            if field == VALUE_RIGHT_Y:
+                return -1 if at >= run.nodes else (run.second_y[at.usize()] * 1000000.0).i64()
+            return -1
+
+    def append_done_message(out: mutable dstr&, run: GraphMappingRun&):
+        can Memory.Allocate, Abort.Panic:
+            accuracy: mutable i64 = 0
+            if run.answered > 0:
+                accuracy <- py_round_half_even(100.0 * run.correct.f64() / run.answered.f64())
+            dstr_append_i64(out, accuracy)
+            dstr_append_cstr(out, "% — matches ")
+            dstr_append_i64(out, run.same_right)
+            dstr_append_cstr(out, "/")
+            dstr_append_i64(out, run.same_total)
+            dstr_append_cstr(out, ", mismatches ")
+            dstr_append_i64(out, run.different_right)
+            dstr_append_cstr(out, "/")
+            dstr_append_i64(out, run.different_total)
+            dstr_append_cstr(out, ", ")
+            mean: f64 = 0.0 if run.answered <= 0 else run.total_time_ms.f64() / run.answered.f64() / 1000.0
+            dstr_append_fixed(out, mean, 1)
+            dstr_append_cstr(out, "s each")
+            if run.settled_for > 0:
+                dstr_append_cstr(out, "     (")
+                dstr_append_i64(out, run.settled_for)
+                dstr_append_cstr(out, " had to differ by their counts)")
+
+    def render(run: GraphMappingRun&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            edges_left: mutable darray[SceneGraphMapping::Edge] = []
+            edges_right: mutable darray[SceneGraphMapping::Edge] = []
+            spots_left: mutable darray[SceneGraphMapping::GraphMappingPoint] = []
+            spots_right: mutable darray[SceneGraphMapping::GraphMappingPoint] = []
+            for at in 0..<run.first_count |at, run, edges_left|:
+                code: i64 = run.first_edges[at.usize()]
+                edges_left.push(SceneGraphMapping::Edge{first: GraphMapping::edge_low(code), second: GraphMapping::edge_high(code)})
+            for at in 0..<run.second_count |at, run, edges_right|:
+                code: i64 = run.second_edges[at.usize()]
+                edges_right.push(SceneGraphMapping::Edge{first: GraphMapping::edge_low(code), second: GraphMapping::edge_high(code)})
+            for at in 0..<run.nodes |at, run, spots_left, spots_right|:
+                spots_left.push(SceneGraphMapping::GraphMappingPoint{x: run.first_x[at.usize()], y: run.first_y[at.usize()]})
+                spots_right.push(SceneGraphMapping::GraphMappingPoint{x: run.second_x[at.usize()], y: run.second_y[at.usize()]})
+            message: mutable dstr = []
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(&message, "Press Space to start")
+                if run.subtle and run.start_nodes < floor_for(run.density, true):
+                    dstr_append_cstr(&message, " — keeping the counts needs ")
+                    dstr_append_i64(&message, floor_for(run.density, true))
+                    dstr_append_cstr(&message, " dots")
+            elif run.phase == PHASE_ASKING or run.phase == PHASE_HIDDEN:
+                dstr_append_cstr(&message, "The same network?")
+            elif run.phase == PHASE_FEEDBACK:
+                if run.really_same:
+                    dstr_append_cstr(&message, "Yes — the same network")
+                else:
+                    dstr_append_cstr(&message, "No — not the same network")
+            else:
+                append_done_message(&message, run)
+            verdict_text: mutable dstr = []
+            if run.phase == PHASE_FEEDBACK:
+                if run.verdict == 1:
+                    dstr_append_cstr(&verdict_text, "Right")
+                else:
+                    dstr_append_cstr(&verdict_text, "Wrong")
+            paint: mutable SceneGraphMapping::GraphMappingPaint = SceneGraphMapping::paint_of(
+                black_background, width, height, width / REFERENCE_WIDTH,
+                height / REFERENCE_HEIGHT)
+            SceneGraphMapping::render(list, &paint, run.phase, run.nodes,
+                &edges_left, &edges_right, &spots_left, &spots_right,
+                run.trial, run.total_trials, run.correct, bytes_view(message),
+                run.verdict if run.phase == PHASE_FEEDBACK else -1,
+                bytes_view(verdict_text))

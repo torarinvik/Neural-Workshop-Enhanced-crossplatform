@@ -1,0 +1,388 @@
+# Stateful Traveling Salesman run controller.
+#
+# The source screen owns the city scatter, exact Held-Karp optimum, click
+# route, adaptive city ladder, and timed feedback.  This adapter keeps those
+# values in fixed storage so a common-ABI handle remains valid after the
+# temporary generation arena is destroyed.  Rendering is delegated to the
+# source-shaped SceneSalesman module.
+
+module SalesmanGame:
+
+    const MAX_CITIES: i64 = Salesman::MOST_CITIES
+    const REFERENCE_WIDTH: f64 = 912.0
+    const REFERENCE_HEIGHT: f64 = 684.0
+    const FEEDBACK_WITH_BEST_MS: i64 = 2200
+    const FEEDBACK_WITHOUT_BEST_MS: i64 = 1400
+
+    const PHASE_READY: i64 = 0
+    const PHASE_TOURING: i64 = 1
+    const PHASE_TOURED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    const ACTION_START: i64 = 0
+    const ACTION_PICK: i64 = 1
+
+    const INFO_PHASE: i64 = 0
+    const INFO_START_CITIES: i64 = 1
+    const INFO_CITY_COUNT: i64 = 2
+    const INFO_TRIAL_CITIES: i64 = 3
+    const INFO_ROUND: i64 = 4
+    const INFO_TOTAL_ROUNDS: i64 = 5
+    const INFO_ROUTE_COUNT: i64 = 6
+    const INFO_BEST_COUNT: i64 = 7
+    const INFO_VERDICT: i64 = 8
+    const INFO_ADAPTIVE: i64 = 9
+    const INFO_SHOW_BEST: i64 = 10
+    const INFO_FEEDBACK_UNTIL_MS: i64 = 11
+    const INFO_TAKEN_MS: i64 = 12
+    const INFO_RESULT_COUNT: i64 = 13
+    const INFO_TOTAL_TIME_MS: i64 = 14
+    const INFO_BEST_CITIES: i64 = 15
+    const INFO_CLOSENESS_PERCENT: i64 = 16
+    const INFO_STARTED_AT_MS: i64 = 17
+    const INFO_CITY_STORAGE_COUNT: i64 = 18
+    const INFO_BEST_LENGTH_PPM: i64 = 19
+    const INFO_PLAYER_LENGTH_PPM: i64 = 20
+
+    const VALUE_X: i64 = 0
+    const VALUE_Y: i64 = 1
+    const VALUE_ROUTE: i64 = 2
+    const VALUE_BEST: i64 = 3
+    const VALUE_BEST_LENGTH_PPM: i64 = 4
+    const VALUE_PLAYER_LENGTH_PPM: i64 = 5
+
+    struct Run:
+        rng: mutable MT19937
+        start_cities: mutable i64
+        city_count: mutable i64
+        trial_cities: mutable i64
+        total_rounds: mutable i64
+        adaptive: mutable bool
+        show_best: mutable bool
+        round: mutable i64
+        phase: mutable i64
+        verdict: mutable i64
+        started_at_ms: mutable i64
+        feedback_until_ms: mutable i64
+        taken_ms: mutable i64
+        result_count: mutable i64
+        total_time_ms: mutable i64
+        total_closeness: mutable f64
+        best_cities: mutable i64
+        best_length: mutable f64
+        player_length: mutable f64
+        city_n: mutable i64
+        route_n: mutable i64
+        best_n: mutable i64
+        x: mutable f64[18]
+        y: mutable f64[18]
+        route: mutable i64[18]
+        best_order: mutable i64[18]
+
+    def allowed_start_cities(value: i64) -> bool:
+        can Abort.Panic:
+            return value >= Salesman::FEWEST_CITIES and value <= Salesman::MOST_CITIES
+
+    def allowed_rounds(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 3 or value == 5 or value == 8 or value == 10 or value == 15 or value == 20
+
+    def allowed_flag(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 0 or value == 1
+
+    def clear_arrays(run: mutable Run&):
+        can Abort.Panic:
+            run.city_n <- 0
+            run.route_n <- 0
+            run.best_n <- 0
+            for at in 0..<MAX_CITIES |at, run|:
+                run.x[at.usize()] <- 0.0
+                run.y[at.usize()] <- 0.0
+                run.route[at.usize()] <- -1
+                run.best_order[at.usize()] <- -1
+
+    # Held-Karp and scatter allocate darrays in a temporary generation region.
+    # Copy every value that the next ABI call needs before destroying it; a
+    # darray retained from the region would be a use-after-free on the next
+    # render or click.
+    def generate_round(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            region generation(134217728):
+                in generation:
+                    cities: mutable Salesman::Cities = Salesman::new_cities(MAX_CITIES)
+                    Salesman::scatter(&cities, run.trial_cities, &run.rng)
+                    best: mutable Salesman::Tour = Salesman::optimal_tour(
+                        &cities, run.trial_cities)
+                    run.city_n <- cities.count
+                    run.best_n <- best.count
+                    run.best_length <- best.length
+                    for at in 0..<MAX_CITIES |at, run, cities, best|:
+                        if at < run.city_n:
+                            run.x[at.usize()] <- Floats::at_ref(&cities.x, at)
+                            run.y[at.usize()] <- Floats::at_ref(&cities.y, at)
+                        else:
+                            run.x[at.usize()] <- 0.0
+                            run.y[at.usize()] <- 0.0
+                        if at < run.best_n:
+                            run.best_order[at.usize()] <- Ints::at_ref(&best.order, at)
+                        else:
+                            run.best_order[at.usize()] <- -1
+                destroy generation
+
+    def clear_results(run: mutable Run&):
+        can Abort.Panic:
+            run.round <- 0
+            run.result_count <- 0
+            run.total_time_ms <- 0
+            run.total_closeness <- 0.0
+            run.best_cities <- 0
+
+    def initialize(run: mutable Run&, start_cities: i64, total_rounds: i64,
+                   adaptive: bool, show_best: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.start_cities <- Salesman::clamped(start_cities)
+            run.city_count <- run.start_cities
+            run.trial_cities <- run.start_cities
+            run.total_rounds <- total_rounds if total_rounds > 0 else 1
+            run.adaptive <- adaptive
+            run.show_best <- show_best
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.started_at_ms <- 0
+            run.feedback_until_ms <- 0
+            run.taken_ms <- 0
+            run.best_length <- 0.0
+            run.player_length <- 0.0
+            clear_results(run)
+            clear_arrays(run)
+
+    def next_round(run: mutable Run&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.round >= run.total_rounds:
+                run.phase <- PHASE_DONE
+                run.verdict <- -1
+                run.city_n <- 0
+                run.route_n <- 0
+                run.best_n <- 0
+                return
+            run.round <- run.round + 1
+            run.trial_cities <- Salesman::clamped(run.city_count)
+            run.route_n <- 0
+            run.best_n <- 0
+            run.verdict <- -1
+            run.taken_ms <- 0
+            run.feedback_until_ms <- 0
+            generate_round(run)
+            run.started_at_ms <- now_ms
+            run.phase <- PHASE_TOURING
+
+    def start_run(run: mutable Run&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.city_count <- Salesman::clamped(run.start_cities)
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.started_at_ms <- now_ms
+            run.feedback_until_ms <- 0
+            run.taken_ms <- 0
+            run.best_length <- 0.0
+            run.player_length <- 0.0
+            clear_results(run)
+            clear_arrays(run)
+            next_round(run, now_ms)
+
+    def player_tour_length(run: Run&) -> f64:
+        can Abort.Panic:
+            return 0.0 if run.route_n <= 0
+            total: mutable f64 = 0.0
+            for at in 0..<run.route_n |at, run, total|:
+                one: i64 = run.route[at.usize()]
+                two: i64 = run.route[((at + 1) % run.route_n).usize()]
+                total <- total + py_hypot(run.x[one.usize()] - run.x[two.usize()],
+                                          run.y[one.usize()] - run.y[two.usize()])
+            return total
+
+    def route_contains(run: Run&, city: i64) -> bool:
+        can Abort.Panic:
+            for at in 0..<run.route_n |at, run, city|:
+                return true if run.route[at.usize()] == city
+            return false
+
+    def settle(run: mutable Run&, now_ms: i64):
+        can Abort.Panic:
+            elapsed: mutable i64 = now_ms - run.started_at_ms
+            elapsed <- 0 if elapsed < 0
+            run.taken_ms <- elapsed
+            run.player_length <- player_tour_length(run)
+            close: f64 = Salesman::closeness(run.best_length, run.player_length)
+            run.result_count <- run.result_count + 1
+            run.total_time_ms <- run.total_time_ms + elapsed
+            run.total_closeness <- run.total_closeness + close
+            run.best_cities <- run.trial_cities if run.trial_cities > run.best_cities
+            if run.adaptive:
+                run.city_count <- Salesman::next_count(run.city_count, close)
+            over: f64 = 100.0 * (run.player_length / run.best_length - 1.0)
+            run.verdict <- 1 if over < 0.05 else 0
+            run.phase <- PHASE_TOURED
+            run.feedback_until_ms <- now_ms + (FEEDBACK_WITH_BEST_MS if run.show_best else FEEDBACK_WITHOUT_BEST_MS)
+
+    def pick(run: mutable Run&, city: i64, now_ms: i64):
+        can Abort.Panic:
+            return if run.phase != PHASE_TOURING
+            return if city < 0 or city >= run.city_n
+            if run.route_n > 0 and run.route[(run.route_n - 1).usize()] == city:
+                run.route_n <- run.route_n - 1
+                return
+            return if route_contains(run, city)
+            return if run.route_n >= MAX_CITIES
+            run.route[run.route_n.usize()] <- city
+            run.route_n <- run.route_n + 1
+            if run.route_n == run.trial_cities:
+                settle(run, now_ms)
+
+    def pointer_city(run: Run&, x_millionths: i64, y_millionths: i64) -> i64:
+        can Abort.Panic:
+            return -1 if run.phase != PHASE_TOURING
+            px: f64 = x_millionths.f64() * REFERENCE_WIDTH / 1000000.0
+            py: f64 = y_millionths.f64() * REFERENCE_HEIGHT / 1000000.0
+            left: f64 = REFERENCE_WIDTH * 0.06
+            bottom: f64 = Geometry::from_bottom_edge(REFERENCE_HEIGHT, 56.0).f64()
+            top: f64 = Geometry::from_top_edge(REFERENCE_HEIGHT, 100.0).f64()
+            canvas_width: f64 = REFERENCE_WIDTH * 0.88
+            canvas_height: f64 = top - bottom
+            nearest: mutable i64 = -1
+            best_distance: mutable f64 = 18.0 * 18.0
+            for city in 0..<run.city_n |city, run, px, py, left, bottom, canvas_width, canvas_height, nearest, best_distance|:
+                cx: f64 = left + run.x[city.usize()] * canvas_width
+                cy: f64 = bottom + run.y[city.usize()] * canvas_height
+                distance: f64 = (px - cx) * (px - cx) + (py - cy) * (py - cy)
+                if distance < best_distance:
+                    best_distance <- distance
+                    nearest <- city
+            return nearest
+
+    def apply(run: mutable Run&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                return 2 if run.phase != PHASE_READY and run.phase != PHASE_DONE
+                start_run(run, now_ms)
+                return 1
+            if action == ACTION_PICK:
+                return 2 if run.phase != PHASE_TOURING
+                pick(run, value, now_ms)
+                return 1
+            return -6
+
+    def advance(run: mutable Run&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_TOURED and now_ms >= run.feedback_until_ms:
+                next_round(run, now_ms)
+                return 1
+            return 2
+
+    def closeness_percent(run: Run&) -> i64:
+        can Abort.Panic:
+            return 0 if run.result_count <= 0
+            return py_round_half_even(100.0 * run.total_closeness / run.result_count.f64())
+
+    def info(run: Run&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_START_CITIES: return run.start_cities
+            if field == INFO_CITY_COUNT: return run.city_count
+            if field == INFO_TRIAL_CITIES: return run.trial_cities
+            if field == INFO_ROUND: return run.round
+            if field == INFO_TOTAL_ROUNDS: return run.total_rounds
+            if field == INFO_ROUTE_COUNT: return run.route_n
+            if field == INFO_BEST_COUNT: return run.best_n
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_SHOW_BEST: return 1 if run.show_best else 0
+            if field == INFO_FEEDBACK_UNTIL_MS: return run.feedback_until_ms
+            if field == INFO_TAKEN_MS: return run.taken_ms
+            if field == INFO_RESULT_COUNT: return run.result_count
+            if field == INFO_TOTAL_TIME_MS: return run.total_time_ms
+            if field == INFO_BEST_CITIES: return run.best_cities
+            if field == INFO_CLOSENESS_PERCENT: return closeness_percent(run)
+            if field == INFO_STARTED_AT_MS: return run.started_at_ms
+            if field == INFO_CITY_STORAGE_COUNT: return run.city_n
+            if field == INFO_BEST_LENGTH_PPM: return (run.best_length * 1000000.0).i64()
+            if field == INFO_PLAYER_LENGTH_PPM: return (run.player_length * 1000000.0).i64()
+            return -1
+
+    def value(run: Run&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            if field == VALUE_BEST_LENGTH_PPM:
+                return (run.best_length * 1000000.0).i64()
+            if field == VALUE_PLAYER_LENGTH_PPM:
+                return (run.player_length * 1000000.0).i64()
+            return -1 if at < 0
+            if field == VALUE_X:
+                return -1 if at >= run.city_n else (run.x[at.usize()] * 1000000.0).i64()
+            if field == VALUE_Y:
+                return -1 if at >= run.city_n else (run.y[at.usize()] * 1000000.0).i64()
+            if field == VALUE_ROUTE:
+                return -1 if at >= run.route_n else run.route[at.usize()]
+            if field == VALUE_BEST:
+                return -1 if at >= run.best_n else run.best_order[at.usize()]
+            return -1
+
+    def append_round_message(out: mutable dstr&, run: Run&):
+        can Memory.Allocate, Abort.Panic:
+            over: f64 = 100.0 * (run.player_length / run.best_length - 1.0)
+            if over < 0.05:
+                dstr_append_cstr(out, "The shortest route there is — in ")
+            else:
+                dstr_append_fixed(out, over, 0)
+                dstr_append_cstr(out, "% longer than the shortest route — in ")
+            dstr_append_fixed(out, run.taken_ms.f64() / 1000.0, 0)
+            dstr_append_cstr(out, "s")
+
+    def append_done_message(out: mutable dstr&, run: Run&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_i64(out, run.result_count)
+            dstr_append_cstr(out, " routes, ")
+            dstr_append_i64(out, closeness_percent(run))
+            dstr_append_cstr(out, "% of optimal on average, ")
+            mean: mutable f64 = 0.0
+            if run.result_count > 0:
+                mean <- run.total_time_ms.f64() / 1000.0 / run.result_count.f64()
+            dstr_append_fixed(out, mean, 0)
+            dstr_append_cstr(out, "s each, most cities ")
+            dstr_append_i64(out, run.best_cities)
+
+    def render(run: Run&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            cities: mutable darray[SceneSalesman::Point] = []
+            route: mutable darray[i64] = []
+            best: mutable darray[i64] = []
+            for at in 0..<run.city_n |at, run, cities|:
+                cities.push(SceneSalesman::Point{x: run.x[at.usize()], y: run.y[at.usize()]})
+            for at in 0..<run.route_n |at, run, route|:
+                route.push(run.route[at.usize()])
+            for at in 0..<run.best_n |at, run, best|:
+                best.push(run.best_order[at.usize()])
+            message: mutable dstr = []
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(&message, "Press Space to start")
+            elif run.phase == PHASE_TOURING:
+                dstr_append_cstr(&message, "Visit every city and come home, the short way")
+            elif run.phase == PHASE_TOURED:
+                append_round_message(&message, run)
+            else:
+                append_done_message(&message, run)
+            verdict_text: mutable dstr = []
+            if run.phase == PHASE_TOURED:
+                append_round_message(&verdict_text, run)
+            paint: mutable SceneSalesman::Paint = SceneSalesman::paint_of(
+                black_background, width, height, width / REFERENCE_WIDTH,
+                height / REFERENCE_HEIGHT)
+            SceneSalesman::render(list, &paint, run.phase, &cities, &route,
+                run.route_n, &best, run.best_n, run.show_best, run.round,
+                run.total_rounds, run.trial_cities, bytes_view(message),
+                run.verdict if run.phase == PHASE_TOURED else -1,
+                bytes_view(verdict_text))

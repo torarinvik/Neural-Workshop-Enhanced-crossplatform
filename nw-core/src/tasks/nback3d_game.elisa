@@ -1,0 +1,385 @@
+# Stateful controller for the port-scoped 3D N-Back task.
+#
+# The original application has many N-Back modes. This module intentionally
+# implements exactly one of them: mode 10 (Position) with the 3D face-pattern
+# field enabled. The generic session helpers remain available to source-parity
+# tests and to the original-only paths, but no other N-Back mode enters this
+# controller or the browser task registry.
+#
+# SessionApp::preview_3d replays the source generator from the initial MT19937
+# seed to the requested trial. That is slightly more work than keeping a
+# growing darray, but it gives this fixed-layout ABI record the same stimulus
+# stream without retaining a temporary arena allocation. The generated
+# position is copied into the controller's fixed history before the preview
+# region is released.
+
+module NBack3DGame:
+
+    const MODE_POSITION: i64 = 10
+    const MAX_TRIALS: i64 = 100
+    # The original human-facing scheduler wakes every 100 ms. Millisecond
+    # options are retained at the API boundary, but phase edges are snapped
+    # to this same clock.
+    const TICK_MS: i64 = 100
+    # session.new_session() starts mode.tick at -9 for one stimulus channel;
+    # the first visible trial is emitted on the tenth scheduler wake-up.
+    const STARTUP_DELAY_MS: i64 = 1000
+
+    const PHASE_READY: i64 = 0
+    const PHASE_STIMULUS: i64 = 1
+    const PHASE_RESPONSE: i64 = 2
+    const PHASE_FEEDBACK: i64 = 3
+    const PHASE_DONE: i64 = 4
+    const PHASE_PAUSED: i64 = 5
+    const PHASE_ERROR: i64 = 6
+    const PHASE_STARTUP: i64 = 7
+
+    const ACTION_START: i64 = 0
+    const ACTION_MATCH: i64 = 1
+    const ACTION_TICK: i64 = 2
+    const ACTION_PAUSE: i64 = 3
+    const ACTION_RESTART: i64 = 4
+
+    const VERDICT_NONE: i64 = -1
+    const VERDICT_HIT: i64 = 1
+    const VERDICT_FALSE_ALARM: i64 = 0
+    const VERDICT_MISS: i64 = 2
+    const VERDICT_CORRECT_REJECTION: i64 = 3
+
+    const INFO_PHASE: i64 = 0
+    const INFO_NBACK: i64 = 1
+    const INFO_TRIAL: i64 = 2
+    const INFO_TOTAL_TRIALS: i64 = 3
+    const INFO_CUBES: i64 = 4
+    const INFO_POSITION: i64 = 5
+    const INFO_COLOR: i64 = 6
+    const INFO_VERDICT: i64 = 7
+    const INFO_ANSWERED: i64 = 8
+    const INFO_HITS: i64 = 9
+    const INFO_MISSES: i64 = 10
+    const INFO_FALSE_ALARMS: i64 = 11
+    const INFO_CORRECT_REJECTIONS: i64 = 12
+    const INFO_DEADLINE_MS: i64 = 13
+    const INFO_INTERVAL_MS: i64 = 14
+    const INFO_STIMULUS_MS: i64 = 15
+    const INFO_FEEDBACK_MS: i64 = 16
+    const INFO_SEED: i64 = 17
+    const INFO_PAUSED: i64 = 18
+    const INFO_ERROR: i64 = 19
+
+    struct NBack3DRun:
+        seed: mutable i64
+        nback: mutable i64
+        cubes: mutable i64
+        total_trials: mutable i64
+        interval_ms: mutable i64
+        stimulus_ms: mutable i64
+        feedback_ms: mutable i64
+        trial: mutable i64
+        trial_started_ms: mutable i64
+        trial_deadline_ms: mutable i64
+        deadline_ms: mutable i64
+        paused_remaining_ms: mutable i64
+        resume_phase: mutable i64
+        position: mutable i64[100]
+        color: mutable i64[100]
+        phase: mutable i64
+        verdict: mutable i64
+        answered: mutable bool
+        paused: mutable bool
+        failed: mutable bool
+        hits: mutable i64
+        misses: mutable i64
+        false_alarms: mutable i64
+        correct_rejections: mutable i64
+
+    def clamp_nback(value: i64) -> i64:
+        can Abort.Panic:
+            return 1 if value < 1 else (8 if value > 8 else value)
+
+    def clamp_cubes(value: i64) -> i64:
+        can Abort.Panic:
+            return 1 if value < 1 else (6 if value > 6 else value)
+
+    def clamp_trials(value: i64) -> i64:
+        can Abort.Panic:
+            return 4 if value < 4 else (MAX_TRIALS if value > MAX_TRIALS else value)
+
+    def clear_history(run: mutable NBack3DRun&):
+        can Abort.Panic:
+            for at in 0..<MAX_TRIALS |at, run|:
+                run.position[at.usize()] <- 0
+                run.color[at.usize()] <- 0
+
+    # The original config normally supplies positive feedback (200 ms). The
+    # controller also exposes feedback=0 for deterministic/headless callers,
+    # so preserve that explicit no-feedback option instead of turning it into
+    # the scheduling kernel's minimum one tick.
+    def phase_plan(run: NBack3DRun&) -> TrialPhases:
+        can Abort.Panic:
+            if run.feedback_ms > 0:
+                return plan_trial_phases(run.interval_ms, run.stimulus_ms,
+                                         run.feedback_ms, TICK_MS)
+            total: mutable i64 = ms_to_ticks(run.interval_ms.f64(), TICK_MS)
+            total <- 3 if total < 3
+            stimulus: mutable i64 = ms_to_ticks(run.stimulus_ms.f64(), TICK_MS)
+            stimulus <- total if stimulus > total
+            return TrialPhases{
+                total_ticks: total,
+                stimulus_ticks: stimulus,
+                blank_ticks: total - stimulus,
+                feedback_ticks: 0,
+                stimulus_ms: stimulus * TICK_MS,
+                blank_ms: (total - stimulus) * TICK_MS,
+                feedback_ms: 0,
+            }
+
+    def initialize(run: mutable NBack3DRun&, nback: i64, cubes: i64,
+                   total_trials: i64, interval_ms: i64, stimulus_ms: i64,
+                   feedback_ms: i64, seed: i64):
+        can Abort.Panic:
+            run.seed <- seed
+            run.nback <- clamp_nback(nback)
+            run.cubes <- clamp_cubes(cubes)
+            run.total_trials <- clamp_trials(total_trials)
+            wanted_interval: i64 = interval_ms if interval_ms > 0 else 3000
+            run.interval_ms <- clamp_trial_interval_ms(
+                wanted_interval, TICK_MS, 3, 60000)
+            run.stimulus_ms <- stimulus_ms if stimulus_ms > 0 else 500
+            run.feedback_ms <- 0 if feedback_ms < 0 else feedback_ms
+            run.trial <- 0
+            run.trial_started_ms <- 0
+            run.trial_deadline_ms <- 0
+            run.deadline_ms <- 0
+            run.paused_remaining_ms <- 0
+            run.resume_phase <- PHASE_READY
+            run.phase <- PHASE_READY
+            run.verdict <- VERDICT_NONE
+            run.answered <- false
+            run.paused <- false
+            run.failed <- false
+            run.hits <- 0
+            run.misses <- 0
+            run.false_alarms <- 0
+            run.correct_rejections <- 0
+            clear_history(run)
+
+    def current_index(run: NBack3DRun&) -> i64:
+        can Abort.Panic:
+            return run.trial - 1
+
+    # The 3D task is position-only: the full face-pattern ID is the value that
+    # is compared N trials back. The independently generated colour ID is
+    # still retained for rendering, because it is part of the source visual.
+    def current_matches(run: NBack3DRun&) -> bool:
+        can Abort.Panic:
+            index: i64 = current_index(run)
+            return false if index < run.nback
+            return run.position[index.usize()] == run.position[(index - run.nback).usize()]
+
+    def deal_trial(run: mutable NBack3DRun&):
+        can Memory.Allocate, Abort.Panic:
+            tables: ModeTables = ModeTables()
+            generated: SessionApp::Preview = SessionApp::preview_3d(
+                &tables, run.seed, run.trial, MODE_POSITION, run.nback, run.cubes)
+            if generated.status != GenerateStatus.Ok:
+                run.failed <- true
+                run.phase <- PHASE_ERROR
+                run.deadline_ms <- 0
+                return
+            index: i64 = current_index(run)
+            run.position[index.usize()] <- generated.position
+            run.color[index.usize()] <- generated.color
+
+    def start_trial(run: mutable NBack3DRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.trial >= run.total_trials:
+                run.phase <- PHASE_DONE
+                run.deadline_ms <- 0
+                return
+            run.trial <- run.trial + 1
+            run.verdict <- VERDICT_NONE
+            run.answered <- false
+            deal_trial(run)
+            return if run.failed
+            phases: TrialPhases = phase_plan(run)
+            run.trial_started_ms <- now_ms
+            run.trial_deadline_ms <- now_ms + phases.total_ticks * TICK_MS
+            run.deadline_ms <- now_ms + phases.stimulus_ms
+            run.phase <- PHASE_STIMULUS
+
+    def reset_and_start(run: mutable NBack3DRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.trial <- 0
+            run.hits <- 0
+            run.misses <- 0
+            run.false_alarms <- 0
+            run.correct_rejections <- 0
+            run.verdict <- VERDICT_NONE
+            run.answered <- false
+            run.paused <- false
+            run.failed <- false
+            run.resume_phase <- PHASE_READY
+            run.paused_remaining_ms <- 0
+            clear_history(run)
+            run.phase <- PHASE_STARTUP
+            run.deadline_ms <- now_ms + STARTUP_DELAY_MS
+
+    def settle_trial(run: mutable NBack3DRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if not run.answered:
+                if current_matches(run):
+                    run.verdict <- VERDICT_MISS
+                    run.misses <- run.misses + 1
+                else:
+                    run.verdict <- VERDICT_CORRECT_REJECTION
+                    run.correct_rejections <- run.correct_rejections + 1
+            if run.feedback_ms > 0:
+                run.phase <- PHASE_FEEDBACK
+                # Feedback occupies the final slice inside this trial. The
+                # following stimulus starts at trial_deadline_ms, so adding
+                # feedback_ms here would lengthen every trial incorrectly.
+                run.deadline_ms <- run.trial_deadline_ms
+                return
+            start_trial(run, run.trial_deadline_ms if run.trial_deadline_ms > now_ms else now_ms)
+
+    def advance(run: mutable NBack3DRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 2 if run.paused or run.phase == PHASE_READY or run.phase == PHASE_DONE or run.phase == PHASE_ERROR
+            changed: mutable bool = false
+            if run.phase == PHASE_STARTUP and now_ms >= run.deadline_ms:
+                start_trial(run, run.deadline_ms)
+                changed <- true
+            if run.phase == PHASE_STIMULUS and now_ms >= run.deadline_ms:
+                phases: TrialPhases = phase_plan(run)
+                run.phase <- PHASE_RESPONSE
+                run.deadline_ms <- run.trial_deadline_ms - phases.feedback_ms
+                changed <- true
+            if run.phase == PHASE_RESPONSE and now_ms >= run.deadline_ms:
+                settle_trial(run, now_ms)
+                changed <- true
+            elif run.phase == PHASE_FEEDBACK and now_ms >= run.deadline_ms:
+                start_trial(run, now_ms)
+                changed <- true
+            return 1 if changed else 2
+
+    def answer_match(run: mutable NBack3DRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            # The original input path accepts the match key throughout the
+            # active trial, including the short feedback phase.
+            return 2 if run.phase != PHASE_STIMULUS and run.phase != PHASE_RESPONSE and run.phase != PHASE_FEEDBACK
+            return 2 if run.answered
+            run.answered <- true
+            if current_matches(run):
+                if run.phase == PHASE_FEEDBACK:
+                    if run.verdict == VERDICT_MISS:
+                        run.misses <- run.misses - 1
+                    elif run.verdict == VERDICT_CORRECT_REJECTION:
+                        run.correct_rejections <- run.correct_rejections - 1
+                run.verdict <- VERDICT_HIT
+                run.hits <- run.hits + 1
+            else:
+                if run.phase == PHASE_FEEDBACK:
+                    if run.verdict == VERDICT_MISS:
+                        run.misses <- run.misses - 1
+                    elif run.verdict == VERDICT_CORRECT_REJECTION:
+                        run.correct_rejections <- run.correct_rejections - 1
+                run.verdict <- VERDICT_FALSE_ALARM
+                run.false_alarms <- run.false_alarms + 1
+            return 1
+
+    def toggle_pause(run: mutable NBack3DRun&, now_ms: i64) -> i64:
+        can Abort.Panic:
+            if run.phase == PHASE_PAUSED:
+                run.paused <- false
+                run.phase <- run.resume_phase
+                run.deadline_ms <- now_ms + run.paused_remaining_ms
+                return 1
+            if run.phase != PHASE_STARTUP and run.phase != PHASE_STIMULUS and run.phase != PHASE_RESPONSE and run.phase != PHASE_FEEDBACK:
+                return 2
+            run.resume_phase <- run.phase
+            run.paused_remaining_ms <- run.deadline_ms - now_ms if run.deadline_ms > now_ms else 0
+            run.deadline_ms <- 0
+            run.paused <- true
+            run.phase <- PHASE_PAUSED
+            return 1
+
+    def apply(run: mutable NBack3DRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                return 2 if run.phase != PHASE_READY and run.phase != PHASE_DONE and run.phase != PHASE_ERROR
+                reset_and_start(run, now_ms)
+                return 1
+            elif action == ACTION_MATCH:
+                return answer_match(run, now_ms)
+            elif action == ACTION_TICK:
+                return advance(run, now_ms)
+            elif action == ACTION_PAUSE:
+                return toggle_pause(run, now_ms)
+            elif action == ACTION_RESTART:
+                reset_and_start(run, now_ms)
+                return 1
+            return -6
+
+    def info(run: NBack3DRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_NBACK: return run.nback
+            if field == INFO_TRIAL: return run.trial
+            if field == INFO_TOTAL_TRIALS: return run.total_trials
+            if field == INFO_CUBES: return run.cubes
+            if field == INFO_POSITION:
+                return 0 if run.phase != PHASE_STIMULUS else run.position[current_index(run).usize()]
+            if field == INFO_COLOR:
+                return 0 if run.phase != PHASE_STIMULUS else run.color[current_index(run).usize()]
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_ANSWERED: return 1 if run.answered else 0
+            if field == INFO_HITS: return run.hits
+            if field == INFO_MISSES: return run.misses
+            if field == INFO_FALSE_ALARMS: return run.false_alarms
+            if field == INFO_CORRECT_REJECTIONS: return run.correct_rejections
+            if field == INFO_DEADLINE_MS: return run.deadline_ms
+            if field == INFO_INTERVAL_MS: return run.interval_ms
+            if field == INFO_STIMULUS_MS: return run.stimulus_ms
+            if field == INFO_FEEDBACK_MS: return run.feedback_ms
+            if field == INFO_SEED: return run.seed
+            if field == INFO_PAUSED: return 1 if run.paused else 0
+            if field == INFO_ERROR: return 1 if run.failed else 0
+            return -1
+
+    def append_message(out: mutable dstr&, run: NBack3DRun&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(out, "Press SPACE to begin")
+            elif run.phase == PHASE_STIMULUS:
+                dstr_append_cstr(out, "Match: press A")
+            elif run.phase == PHASE_RESPONSE:
+                dstr_append_cstr(out, "Respond if it matches N trials back")
+            elif run.phase == PHASE_FEEDBACK:
+                if run.verdict == VERDICT_HIT:
+                    dstr_append_cstr(out, "Hit")
+                elif run.verdict == VERDICT_FALSE_ALARM:
+                    dstr_append_cstr(out, "False alarm")
+                elif run.verdict == VERDICT_MISS:
+                    dstr_append_cstr(out, "Miss")
+                else:
+                    dstr_append_cstr(out, "Correct rejection")
+            elif run.phase == PHASE_DONE:
+                dstr_append_cstr(out, "Session complete")
+            elif run.phase == PHASE_PAUSED:
+                dstr_append_cstr(out, "Paused")
+            elif run.phase == PHASE_STARTUP:
+                dstr_append_cstr(out, "Get ready")
+            else:
+                dstr_append_cstr(out, "3D N-Back could not generate this trial")
+
+    def render(run: NBack3DRun&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            message: mutable dstr = []
+            append_message(&message, run)
+            SceneNBack3D::render(list, black_background, width, height,
+                run.phase, run.trial, run.total_trials, run.nback, run.cubes,
+                info(run, INFO_POSITION), info(run, INFO_COLOR), run.verdict,
+                run.hits, run.misses, run.false_alarms,
+                run.correct_rejections, bytes_view(message))

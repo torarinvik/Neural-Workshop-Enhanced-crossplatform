@@ -1,24 +1,66 @@
 #!/usr/bin/env bash
 # Build the native SDL3 desktop shell.
 #
-# The core is compiled ONCE to a native object from the same export surface the
-# wasm build uses (src/wasm/wasm_exports.elisa): every entry point there is
-# scalar C ABI, which is exactly what a C host needs too. No second export file.
+# The SDL shell uses an explicit native export unit rather than the browser
+# WASM export surface. The browser unit contains a wasm32 memory intrinsic and
+# the full controller registry; native controllers are added to the SDL unit
+# with their own lifecycle and frame-buffer ABI.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/scripts/env.sh"
 mkdir -p "$ROOT/build"
 
+PROJECTS_ROOT="$(cd -- "$ROOT/../.." && pwd)"
+LATEST_ROOT="${ELISA_LATEST_STAGE1_ROOT:-$PROJECTS_ROOT/Elisa-compiler-latest-protocol-bound-fix}"
+LATEST_BIN="${ELISA_LATEST_STAGE1_BIN:-$LATEST_ROOT/bin/elisac-stage1}"
+
 SDL_CFLAGS="$(pkg-config --cflags sdl3 2>/dev/null || echo "-I/opt/homebrew/include")"
 SDL_LIBS="$(pkg-config --libs sdl3 2>/dev/null || echo "-L/opt/homebrew/lib -lSDL3")"
 
-"$ELISACORE_BIN" -emit obj -O2 -o "$ROOT/build/nwcore_native.o" \
-    "$ROOT/src/wasm/wasm_exports.elisa"
+if [[ -n "${ELISA_SDL_COMPILER:-}" ]]; then
+    NATIVE_COMPILER="$ELISA_SDL_COMPILER"
+else
+    if [[ ! -x "$LATEST_ROOT/scripts/elisac_stage1.sh" || ! -x "$LATEST_BIN" ]]; then
+        echo "build_sdl3.sh: latest Elisa Stage1 checkout/product missing" >&2
+        echo "  checkout: $LATEST_ROOT" >&2
+        echo "  product:  $LATEST_BIN" >&2
+        echo "Set ELISA_SDL_COMPILER for an explicit override, or set" >&2
+        echo "ELISA_LATEST_STAGE1_ROOT and ELISA_LATEST_STAGE1_BIN." >&2
+        exit 2
+    fi
+    stale_source="$(python3 "$ROOT/scripts/stage1_fresh.py" \
+        "$LATEST_ROOT" "$LATEST_BIN" 2>/dev/null || true)"
+    if [[ -n "$stale_source" ]]; then
+        echo "build_sdl3.sh: latest Elisa Stage1 product is stale: $stale_source" >&2
+        echo "Re-seed/rebuild the latest Elisa compiler product before building." >&2
+        exit 2
+    fi
+    latest_head="$(git -C "$LATEST_ROOT" -c core.hooksPath=/dev/null rev-parse HEAD 2>/dev/null || true)"
+    latest_origin_head="$(git -C "$LATEST_ROOT" -c core.hooksPath=/dev/null rev-parse --verify refs/remotes/origin/main 2>/dev/null || true)"
+    if [[ -n "$latest_head" && -n "$latest_origin_head" ]]; then
+        latest_behind="$(git -C "$LATEST_ROOT" -c core.hooksPath=/dev/null rev-list --count "$latest_head..$latest_origin_head" 2>/dev/null || echo 0)"
+        if [[ "$latest_behind" != 0 ]]; then
+            echo "build_sdl3.sh: selected Elisa Stage1 checkout is $latest_behind commit(s) behind origin/main" >&2
+            exit 2
+        fi
+    fi
+    NATIVE_COMPILER="$LATEST_BIN"
+fi
+
+printf 'Elisa Stage1 compiler: %s\n' "$NATIVE_COMPILER"
+
+"$NATIVE_COMPILER" -emit obj -O2 -o "$ROOT/build/nwcore_native.o" \
+    "$ROOT/src/native/sdl_exports.elisa"
+
+SHIM_OBJ="$ROOT/build/sdl_runtime_shim.o"
+cc -c -fPIC -fno-builtin -O2 -o "$SHIM_OBJ" \
+    "$ROOT/scripts/pymodule_runtime_shim.c"
 
 cc -O2 -std=c11 $SDL_CFLAGS \
     -o "$ROOT/build/nw-sdl3" \
     "$ROOT/shells/sdl3/main.c" \
     "$ROOT/build/nwcore_native.o" \
+    "$SHIM_OBJ" \
     $SDL_LIBS
 
 # Prove it RUNS, not just that it linked. --selftest drives the same decode and
@@ -27,7 +69,68 @@ cc -O2 -std=c11 $SDL_CFLAGS \
 # corrupted exactly those while geometry stayed correct, so a check that counted
 # commands would have passed straight through that bug.
 "$ROOT/build/nw-sdl3" --selftest 180
+"$ROOT/build/nw-sdl3" --selftest-3d-maze
+"$ROOT/build/nw-sdl3" --selftest-taskhub
+"$ROOT/build/nw-sdl3" --selftest-sokoban
+"$ROOT/build/nw-sdl3" --selftest-monkey-ladder
+"$ROOT/build/nw-sdl3" --selftest-nback3d
+"$ROOT/build/nw-sdl3" --selftest-tetris
+"$ROOT/build/nw-sdl3" --selftest-mr-time
+"$ROOT/build/nw-sdl3" --selftest-graph-mapping
+"$ROOT/build/nw-sdl3" --selftest-matrix-reasoning
+"$ROOT/build/nw-sdl3" --selftest-marble
+"$ROOT/build/nw-sdl3" --selftest-in-the-dark
+"$ROOT/build/nw-sdl3" --selftest-fog
+"$ROOT/build/nw-sdl3" --selftest-removals
+"$ROOT/build/nw-sdl3" --selftest-custody
+"$ROOT/build/nw-sdl3" --selftest-concentration
+"$ROOT/build/nw-sdl3" --selftest-recognition
+"$ROOT/build/nw-sdl3" --selftest-trivia
+"$ROOT/build/nw-sdl3" --selftest-reflex
+"$ROOT/build/nw-sdl3" --selftest-algebra
+"$ROOT/build/nw-sdl3" --selftest-numberology
+"$ROOT/build/nw-sdl3" --selftest-jigsaw
+"$ROOT/build/nw-sdl3" --selftest-sudoku
+"$ROOT/build/nw-sdl3" --selftest-go
+"$ROOT/build/nw-sdl3" --selftest-ncup-monte
+"$ROOT/build/nw-sdl3" --selftest-moving-targets
+"$ROOT/build/nw-sdl3" --selftest-lookout
+"$ROOT/build/nw-sdl3" --selftest-pursuit
+"$ROOT/build/nw-sdl3" --selftest-out-of-sight
+"$ROOT/build/nw-sdl3" --selftest-buzz-wire
+"$ROOT/build/nw-sdl3" --selftest-donkey
+"$ROOT/build/nw-sdl3" --selftest-count
 
 printf 'built %s\n' "$ROOT/build/nw-sdl3"
 printf 'run it with: %s\n' "$ROOT/build/nw-sdl3"
-printf '  space = play/pause, right arrow = step, q/esc = quit\n'
+printf '  --screen 3d-maze: Space/Enter=start, arrows=walk/turn, R=restart\n'
+printf '  --screen taskhub: arrows=navigate, Space/Enter=launch implemented native controllers\n'
+printf '  --screen sokoban: Space/Enter=start, arrows=move, U=undo, R=restart\n'
+printf '  --screen monkey-ladder: Space/Enter=start/commit, arrows=move cursor\n'
+printf '  --screen nback3d: Space/Enter=start, A=match, P=pause, R=restart\n'
+printf '  --screen tetris: Space/Enter=start/drop, arrows=move/rotate, 1-6=select, R=restart\n'
+printf '  --screen mr-time: Space/Enter=start/submit, digits/decimal/backspace=answer\n'
+printf '  --screen graph-mapping: Space/Enter=start, Y/S/N/D or arrows=answer\n'
+printf '  --screen matrix-reasoning: Space/Enter=start, 1-8=answer\n'
+printf '  --screen marble: Space=start/next, arrows=hold tilt, L=level, R=restart\n'
+printf '  --screen in-the-dark: Space/Enter=start, 1-5=answer\n'
+printf '  --screen fog-of-war: Space/Enter=start, arrows=walk\n'
+printf '  --screen removals: Space/Enter=start, 1-5=answer\n'
+printf '  --screen chain-of-custody: Space/Enter=start, arrows=claw, Z=grab/drop\n'
+printf '  --screen concentration: Space=start, arrows=cursor, Enter=select\n'
+printf '  --screen recognition: Space=start, left=seen, right=new\n'
+printf '  --screen trivia: Space=start/submit/advance, arrows=choice, 1-8=answer\n'
+printf '  --screen reflex: Space/Enter=start, click=target, Esc=menu\n'
+printf '  --screen algebra: Space=start, digits/type answer, Enter=submit\n'
+printf '  --screen numberology: Space=start, digits/type answer, Enter=submit\n'
+printf '  --screen jigsaw: Space=start, 0-9=select tile, Enter=advance\n'
+printf '  --screen sudoku: Space=start, arrows=cursor, 1-9=write, P=pencil\n'
+printf '  --screen go: Space=start/answer/next, arrows=cursor, mouse=intersection\n'
+printf '  --screen ncup-monte: Space=start/next, mouse=choose cup\n'
+printf '  --screen moving-targets: Space=start, mouse=select tracked balls\n'
+printf '  --screen lookout: Space=start, F=form, J=colour\n'
+printf '  --screen pursuit: Space=start, arrows/mesh=follow the shape\n'
+printf '  --screen out-of-sight: Space=start, J=mine, F=not mine\n'
+printf '  --screen buzz-wire: Space=start, arrows/W/S=move, I/K/J/L=turn, Shift=brace\n'
+printf '  --screen donkey: Space=start, arrows/Space=swerve\n'
+printf '  title mode: space=play/pause, right arrow=step, q/esc=quit\n'

@@ -26,17 +26,56 @@ case "$STAGES" in
         exit 2
         ;;
 esac
-BUILD="$ROOT/build"
+
+# Stage0 differential compiles may cause the selected compiler to emit its
+# generated fmt_*_probe.elisa fixtures. Establish freshness before that can
+# happen, then allow those generated probe mtimes during the Stage1 loop. This
+# does not weaken the gate for real compiler edits: the snapshot check below
+# still rejects a product older than any non-generated compiler source.
+if [[ "$STAGES" == "both" || "$STAGES" == "stage1" ]]; then
+    stage1_stale_source="$(python3 "$ROOT/scripts/stage1_fresh.py" \
+        "$ELISA_STAGE1_ROOT" "$ELISA_STAGE1_BIN" 2>/dev/null || true)"
+    if [[ -n "$stage1_stale_source" ]]; then
+        echo "check.sh: latest Stage1 product is stale: $stage1_stale_source" >&2
+        exit 2
+    fi
+fi
+
+# The latest compiler checkout is shared with other Elisa work.  A source edit
+# or reseed after the freshness check would otherwise let this long sweep mix
+# results from two different compiler products and report an ambiguous failure.
+# Capture a content-aware snapshot now; generated formatting probes are already
+# excluded by source_fingerprint.py.  The snapshot is checked again after the
+# final suite, so a concurrent compiler edit is reported as provenance drift
+# rather than being mistaken for a port regression.
+STAGE1_SNAPSHOT_HEAD=""
+STAGE1_SNAPSHOT_ORIGIN_HEAD=""
+STAGE1_SNAPSHOT_FINGERPRINT=""
+STAGE1_SNAPSHOT_PRODUCT=""
+stage1_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+if [[ "$STAGES" == "both" || "$STAGES" == "stage1" ]]; then
+    STAGE1_SNAPSHOT_HEAD="$(git -C "$ELISA_STAGE1_ROOT" -c core.hooksPath=/dev/null rev-parse HEAD 2>/dev/null || echo unknown)"
+    STAGE1_SNAPSHOT_ORIGIN_HEAD="$(git -C "$ELISA_STAGE1_ROOT" -c core.hooksPath=/dev/null rev-parse --verify refs/remotes/origin/main 2>/dev/null || true)"
+    STAGE1_SNAPSHOT_FINGERPRINT="$(python3 "$ROOT/scripts/source_fingerprint.py" "$ELISA_STAGE1_ROOT")"
+    STAGE1_SNAPSHOT_PRODUCT="$(stage1_sha256 "$ELISA_STAGE1_BIN")"
+fi
+# Tests and scratch invocations can provide a private build root; ordinary
+# developer and release runs continue to use the repository build directory.
+BUILD="${NW_CHECK_BUILD_DIR:-$ROOT/build}"
 mkdir -p "$BUILD"
 
-# This checker deliberately exercises several suites through fixed ABI input
-# paths (for example /tmp/nw_chess_oracle.txt), and the stage0 artifacts below
-# also have stable names. Two check.sh processes therefore cannot safely run at
-# the same time: they can compile or write the other run's fixture between the
-# compiler invocation and its differential comparison, producing fake
-# mismatches. Serialize checker runs and recover a lock left by a terminated
-# process so the result is either isolated or waits, never cross-contaminated.
-CHECK_LOCK="$BUILD/.check.lock"
+# Several suites still exchange data through fixed /tmp/nw_* oracle paths.
+# Serialize all official check.sh runs for this user, including invocations
+# from different worktrees, or one run can replace another's fixture between
+# compilation and comparison. NW_CHECK_LOCK_PATH is available for isolated
+# harness tests; normal runs share a per-user lock in TMPDIR.
+CHECK_LOCK="${NW_CHECK_LOCK_PATH:-${TMPDIR:-/tmp}/nw-core-check-${UID}.lock}"
 CHECK_LOCK_TOKEN="$$-$RANDOM-$(date +%s)"
 process_start() {
     ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
@@ -99,7 +138,7 @@ RUN_DIR="$(mktemp -d "$BUILD/check.XXXXXX")" || {
     exit 1
 }
 
-SUITES=(pyset scheduling timing board grid nback pyrandom stimulus stats sessionscore readouttext trialuitext matching display config gamemode decimal session sessionapp maze fogworld numberology ninarow inthedark crossedwires cookiethief custody donkey tetris removals sokoban go twohands buzzwire marblemaze syllogism title menu menurow sudoku youarehere hanoi monkeyladder ncupmonte reflex salesman counting tracking concentration recognition lookout pursuit outofsight overrun mrtime jigsaw sokoban3d verbal scramble scrabble trivia crossword graphmapping ravens chess bigfrac expressions algebra glyphs scene_removals scene_monkeyladder scene_hanoi scene_go scene_ninarow scene_crossedwires scene_ncupmonte scene_sudoku scene_chess scene_algebra scene_numberology scene_verbal scene_scramble scene_trivia scene_tracking scene_sokoban scene_salesman scene_counting scene_syllogism scene_maze scene_inthedark scene_overrun scene_crossword scene_lookout scene_pursuit scene_reflex scene_recognition scene_concentration scene_jigsaw scene_donkey scene_custody scene_cookiethief scene_youarehere scene_sokoban3d scene_scrabble scene_mrtime scene_graphmapping scene_outofsight scene_tetris scene_twohands scene_ravens scene_marblemaze scene_buzzwire scene_taskhub scene_fogofwar scene_trialui scene_notice scene_hud scene_readouts scene_graph scene_field scene_menuchrome trialphase textmetrics screen hudtext scene_batch)
+SUITES=(pyset scheduling timing board grid nback pyrandom stimulus stats sessionscore readouttext trialuitext matching display config gamemode decimal session sessionapp maze fogworld numberology ninarow inthedark crossedwires cookiethief custody donkey tetris removals sokoban sokoban_game go twohands buzzwire marblemaze syllogism title menu menurow sudoku youarehere hanoi monkeyladder ncupmonte reflex salesman counting tracking concentration recognition lookout pursuit outofsight overrun mrtime jigsaw sokoban3d verbal scramble scrabble trivia crossword graphmapping ravens chess bigfrac expressions algebra glyphs scene_removals scene_monkeyladder scene_hanoi scene_go scene_ninarow scene_crossedwires scene_ncupmonte scene_sudoku scene_chess scene_algebra scene_numberology scene_verbal scene_scramble scene_trivia scene_tracking scene_sokoban scene_salesman scene_counting scene_syllogism scene_maze scene_inthedark scene_overrun scene_crossword scene_lookout scene_pursuit scene_reflex scene_recognition scene_concentration scene_jigsaw scene_donkey scene_custody scene_cookiethief scene_youarehere scene_sokoban3d scene_scrabble scene_mrtime scene_graphmapping scene_outofsight scene_tetris scene_twohands scene_ravens scene_marblemaze scene_buzzwire scene_taskhub scene_fogofwar scene_trialui scene_notice scene_hud scene_readouts scene_graph scene_field scene_menuchrome trialphase textmetrics screen hudtext)
 
 # One suite by name, for the inner loop.
 if [[ -n "${SUITE:-}" ]]; then
@@ -139,14 +178,19 @@ run_suite() {
             compile_exit=$?
         fi
         if (( compile_exit == 0 )); then
-            if clang -o "$binary" "$RUN_DIR/${suite}_${stage}.o" >"$link_log" 2>&1; then
+            # A standalone sweep needs the same weak profiler-hook fallback as
+            # ordinary native executables. Linking the complete runtime object
+            # here also pulls in the runtime's native callback ABI, which these
+            # sweeps do not use and cannot satisfy.
+            if clang -o "$binary" "$RUN_DIR/${suite}_${stage}.o" \
+                    "$ELISA_CORE/compiler/runtime/profile_hooks.c" >"$link_log" 2>&1; then
                 link_exit=0
             else
                 link_exit=$?
             fi
         fi
     else
-        if "$ELISA_STAGE1_ROOT/scripts/elisac_stage1.sh" -emit exe -O2 -o "$binary" \
+        if ELISA_ALLOW_STALE_STAGE1=1 "$ELISA_STAGE1_ROOT/scripts/elisac_stage1.sh" -emit exe -O2 -o "$binary" \
                 "$ROOT/test/${suite}_sweep.elisa" >"$compile_log" 2>&1; then
             compile_exit=0
             link_exit=0
@@ -204,6 +248,23 @@ for stage in stage0 stage1; do
         run_suite "$suite" "$stage" || failures=$((failures + 1))
     done
 done
+
+if [[ -n "$STAGE1_SNAPSHOT_FINGERPRINT" ]]; then
+    stage1_post_head="$(git -C "$ELISA_STAGE1_ROOT" -c core.hooksPath=/dev/null rev-parse HEAD 2>/dev/null || echo unknown)"
+    stage1_post_origin_head="$(git -C "$ELISA_STAGE1_ROOT" -c core.hooksPath=/dev/null rev-parse --verify refs/remotes/origin/main 2>/dev/null || true)"
+    stage1_post_fingerprint="$(python3 "$ROOT/scripts/source_fingerprint.py" "$ELISA_STAGE1_ROOT")"
+    stage1_post_product="$(stage1_sha256 "$ELISA_STAGE1_BIN")"
+    if [[ "$stage1_post_head" != "$STAGE1_SNAPSHOT_HEAD" ||
+          "$stage1_post_origin_head" != "$STAGE1_SNAPSHOT_ORIGIN_HEAD" ||
+          "$stage1_post_fingerprint" != "$STAGE1_SNAPSHOT_FINGERPRINT" ||
+          "$stage1_post_product" != "$STAGE1_SNAPSHOT_PRODUCT" ]]; then
+        echo "check.sh: latest Stage1 compiler provenance changed during the sweep" >&2
+        echo "  before: HEAD=$STAGE1_SNAPSHOT_HEAD origin/main=${STAGE1_SNAPSHOT_ORIGIN_HEAD:-<absent>} fingerprint=$STAGE1_SNAPSHOT_FINGERPRINT product=$STAGE1_SNAPSHOT_PRODUCT" >&2
+        echo "  after:  HEAD=$stage1_post_head origin/main=${stage1_post_origin_head:-<absent>} fingerprint=$stage1_post_fingerprint product=$stage1_post_product" >&2
+        echo "check.sh: rerun only after the shared Elisa compiler checkout is quiescent" >&2
+        failures=$((failures + 1))
+    fi
+fi
 
 echo
 if (( failures )); then

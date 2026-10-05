@@ -16,6 +16,40 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Newer Elisa runtimes call the optional allocation-profiler ABI even when
+ * profiling is disabled. Keep the native pymodule link self-contained: the
+ * production shell does not install a profiler, so negotiation declines the
+ * ABI and event delivery becomes a no-op. */
+uint32_t elisa_profile_allocation_negotiate(uint32_t requested_version) {
+    (void)requested_version;
+    return 0;
+}
+uint32_t elisa_profile_region_layout_negotiate(uint32_t requested_version) {
+    (void)requested_version;
+    return 0;
+}
+void elisa_profile_region_layout_v1(uintptr_t arena, size_t region,
+                                    uintptr_t header, uintptr_t data,
+                                    size_t capacity) {
+    (void)arena;
+    (void)region;
+    (void)header;
+    (void)data;
+    (void)capacity;
+}
+void elisa_profile_allocation_event_v1(uint32_t kind, uintptr_t address,
+                                       size_t size, uintptr_t old_address,
+                                       size_t old_size, uintptr_t arena,
+                                       size_t region) {
+    (void)kind;
+    (void)address;
+    (void)size;
+    (void)old_address;
+    (void)old_size;
+    (void)arena;
+    (void)region;
+}
+
 void *elisa_native_callback_ptr(uint8_t *name) {
     (void)name;
     return NULL;

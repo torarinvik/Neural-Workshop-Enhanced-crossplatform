@@ -1,0 +1,706 @@
+diff --git a/src/engine/engine_solver.c b/src/engine/engine_solver.c
+index a2e3731..6de5970 100644
+--- a/src/engine/engine_solver.c
++++ b/src/engine/engine_solver.c
+@@ -37,6 +37,19 @@
+ #include "engine/engine_util_solve.h"
+ #include "engine/engine_util_sparse.h"
+ 
++// Isolated candidate: keep explicit FMA exact under Emscripten/LTO. The
++// volatile indirect call cannot be folded into separately rounded mul/add.
++#ifdef __EMSCRIPTEN__
++static double (*volatile marble_wheel_fma_target)(double, double, double) = fma;
++#endif
++MJAPI __attribute__((noinline)) mjtNum mj_marble_wheel_fma(mjtNum a, mjtNum b, mjtNum c) {
++#ifdef __EMSCRIPTEN__
++  return marble_wheel_fma_target(a, b, c);
++#else
++  return fma(a, b, c);
++#endif
++}
++
+ MJAPI void mj_solver_dense_solve_trace_reset(void);
+ MJAPI void mj_solver_dense_solve_trace_begin(void);
+ MJAPI void mj_solver_dense_solve_trace_end(void);
+@@ -192,13 +205,12 @@ static void extractBlock(const mjModel* m, const mjData* d, mjtNum* Ac,
+ 
+ 
+ #if defined(__EMSCRIPTEN__)
+-// Match MuJoCo's native four-lane dot-product accumulation for the no-slip
+-// residual. The general Emscripten mju_dot kernel intentionally uses FMA for
+-// parity in other paths, but native mju_dot accumulates each product with a
+-// separately rounded add. No-slip's later R subtraction is fused, so a one-ULP
+-// dot difference can otherwise become a visible residual sign/magnitude change.
++// Original SDK-26 arm64 wheel: full 32-element chunks use separately
++// rounded products; remaining quads and selected tails are fused. Keep this
++// correction local to dense no-slip residuals, not the general dot kernel.
+ static mjtNum residualDotNativeOrder(const mjtNum* vec1, const mjtNum* vec2,
+                                      int n) {
++  #pragma clang fp contract(off)
+   int i = 0;
+   int n_4 = n - 4;
+   mjtNum res0 = 0;
+@@ -206,7 +218,8 @@ static mjtNum residualDotNativeOrder(const mjtNum* vec1, const mjtNum* vec2,
+   mjtNum res2 = 0;
+   mjtNum res3 = 0;
+ 
+-  for (; i <= n_4; i += 4) {
++  const int rounded_end = (n/32)*32;
++  for (; i < rounded_end; i += 4) {
+     volatile mjtNum product0 = vec1[i] * vec2[i];
+     volatile mjtNum product1 = vec1[i+1] * vec2[i+1];
+     volatile mjtNum product2 = vec1[i+2] * vec2[i+2];
+@@ -216,26 +229,48 @@ static mjtNum residualDotNativeOrder(const mjtNum* vec1, const mjtNum* vec2,
+     res2 += product2;
+     res3 += product3;
+   }
++  for (; i <= n_4; i += 4) {
++    res0 = mj_marble_wheel_fma(vec1[i], vec2[i], res0);
++    res1 = mj_marble_wheel_fma(vec1[i+1], vec2[i+1], res1);
++    res2 = mj_marble_wheel_fma(vec1[i+2], vec2[i+2], res2);
++    res3 = mj_marble_wheel_fma(vec1[i+3], vec2[i+3], res3);
++  }
+   mjtNum res = (res0 + res2) + (res1 + res3);
+ 
+   int n_i = n - i;
+   if (n_i == 3) {
+-    volatile mjtNum product0 = vec1[i] * vec2[i];
+     volatile mjtNum product1 = vec1[i+1] * vec2[i+1];
+-    volatile mjtNum product2 = vec1[i+2] * vec2[i+2];
+-    res += product0 + product1 + product2;
++    res += mj_marble_wheel_fma(vec1[i+2], vec2[i+2],
++               mj_marble_wheel_fma(vec1[i], vec2[i], product1));
+   } else if (n_i == 2) {
+-    volatile mjtNum product0 = vec1[i] * vec2[i];
+     volatile mjtNum product1 = vec1[i+1] * vec2[i+1];
+-    res += product0 + product1;
++    res += mj_marble_wheel_fma(vec1[i], vec2[i], product1);
+   } else if (n_i == 1) {
+-    volatile mjtNum product = vec1[i] * vec2[i];
+-    res += product;
++    res = mj_marble_wheel_fma(vec1[i], vec2[i], res);
+   }
+   return res;
+ }
+ #endif
+ 
++// Bounded diagnostic packet [1,bias,R,force,n,ARrow[n],allforce[n]].
++// Calls the exact same local kernel and final operations used by residual().
++// Zero bias/regularizer/force also exposes the local dot result.
++MJAPI int mj_marble_residual_probe(const mjtNum* packet, int size, mjtNum* output) {
++  if (!packet || !output || size < 5 || size > 1029) return 0;
++  for (int i=0; i < size; ++i) if (!isfinite(packet[i])) return 0;
++  const mjtNum length = packet[4];
++  if (packet[0] != 1 || length < 0 || length > 512 || floor(length) != length ||
++      size != 5 + 2*(int)length) return 0;
++  const int n = (int)length;
++#ifdef __EMSCRIPTEN__
++  mjtNum dot = residualDotNativeOrder(packet+5, packet+5+n, n);
++#else
++  mjtNum dot = mju_dot(packet+5, packet+5+n, n);
++#endif
++  *output = mj_marble_wheel_fma(-packet[2], packet[3], packet[1]+dot);
++  return isfinite(*output);
++}
++
+ // compute residual for one block
+ static void residual(const mjModel* m, const mjData* d, mjtNum* res, int i, int dim, int flg_subR) {
+   int nefc = d->nefc;
+@@ -265,7 +300,7 @@ static void residual(const mjModel* m, const mjData* d, mjtNum* res, int i, int
+   if (flg_subR) {
+     for (int j=0; j < dim; j++) {
+ #if defined(__EMSCRIPTEN__)
+-      res[j] = fma(-d->efc_R[i+j], d->efc_force[i+j], res[j]);
++      res[j] = mj_marble_wheel_fma(-d->efc_R[i+j], d->efc_force[i+j], res[j]);
+ #else
+       res[j] -= d->efc_R[i+j]*d->efc_force[i+j];
+ #endif
+@@ -2240,6 +2275,7 @@ static void PrimalUpdateGradient(mjPrimalContext* ctx, int flg_Newton) {
+ 
+ // prepare quadratic polynomials and contact cone quantities
+ static void PrimalPrepare(mjPrimalContext* ctx) {
++  #pragma clang fp contract(off)
+   int nv = ctx->nv, nefc = ctx->nefc;
+   const mjtNum* v = ctx->search;
+ 
+@@ -2283,9 +2319,9 @@ static void PrimalPrepare(mjPrimalContext* ctx) {
+                                 Jv[j]*D[j]*Jv[j]);
+         marbleRecordNewtonState(ctx, 910000 + i*1000 + j*10 + 4,
+                                 0, Jv[j], D[j], Jaref[j]);
+-        quad[0] += Jaref[j]*DJj;
+-        quad[1] += Jv[j]*DJj;
+-        quad[2] += Jv[j]*D[j]*Jv[j];
++        quad[0] = mj_marble_wheel_fma(Jaref[j], DJj, quad[0]);
++        quad[1] = mj_marble_wheel_fma(Jv[j], DJj, quad[1]);
++        quad[2] = mj_marble_wheel_fma(Jv[j]*D[j], Jv[j], quad[2]);
+         marbleRecordNewtonState(ctx, 910000 + i*1000 + j*10 + 3,
+                                 0, quad[1], quad[2], DJj);
+       }
+@@ -2300,9 +2336,9 @@ static void PrimalPrepare(mjPrimalContext* ctx) {
+ 
+       // accumulate sums of squares
+       for (int j=1; j < dim; j++) {
+-        UU += U[j]*U[j];
+-        UV += U[j]*V[j];
+-        VV += V[j]*V[j];
++        UU = mj_marble_wheel_fma(U[j], U[j], UU);
++        UV = mj_marble_wheel_fma(U[j], V[j], UV);
++        VV = mj_marble_wheel_fma(V[j], V[j], VV);
+         // Diagnostic-only per-tangent accumulation trace for Marble parity.
+         const int probe = 25000 + i*100 + j*10;
+         marbleRecordNewtonState(ctx, probe, 0, U[j], V[j], U[j]*U[j]);
+@@ -2318,7 +2354,7 @@ static void PrimalPrepare(mjPrimalContext* ctx) {
+       quad[5] = UU;
+       quad[6] = UV;
+       quad[7] = VV;
+-      quad[8] = D[0] / ((mu*mu) * (1 + (mu*mu)));
++      quad[8] = D[0] / ((mu*mu) * mj_marble_wheel_fma(mu, mu, 1));
+ 
+       // advance to next constraint
+       i += (dim-1);
+@@ -2342,25 +2378,27 @@ typedef struct _mjPrimalPnt mjPrimalPnt;
+ 
+ // Huber cost of a single friction constraint at a given point x
+ static mjtNum frictionCost(mjtNum x, mjtNum f, mjtNum Rf, mjtNum D) {
++  #pragma clang fp contract(off)
+   // -bound < x < bound : quadratic
+   if (-Rf < x && x < Rf) return 0.5*D*x*x;
+ 
+   // x < -bound : linear negative
+-  else if (x <= -Rf) return f*(-0.5*Rf - x);
++  else if (x <= -Rf) return f*mj_marble_wheel_fma(-0.5, Rf, -x);
+ 
+   // bound < x : linear positive
+-  else return f*(-0.5*Rf + x);
++  else return f*mj_marble_wheel_fma(-0.5, Rf, x);
+ }
+ 
+ 
+ // Huber cost difference of a single friction constraint: cost(x) - cost(start)
+ static mjtNum frictionCostDif(mjtNum start, mjtNum x, mjtNum f, mjtNum Rf, mjtNum D) {
++  #pragma clang fp contract(off)
+   int state_start = (-Rf < start && start < Rf) ? 0 : (start <= -Rf ? -1 : 1);
+   int state_x = (-Rf < x && x < Rf) ? 0 : (x <= -Rf ? -1 : 1);
+ 
+   // both quadratic
+   if (state_start == 0 && state_x == 0) {
+-    return 0.5*D*(x - start)*(x + start);
++    return ((x - start)*(0.5*D))*(start + x);
+   }
+ 
+   // both linear negative
+@@ -2381,6 +2419,7 @@ static mjtNum frictionCostDif(mjtNum start, mjtNum x, mjtNum f, mjtNum Rf, mjtNu
+ // compute cost difference of an elliptic cone at a given alpha: cost(alpha) - cost(0)
+ static mjtNum ellipticCostDif(const mjtNum* quad, mjtNum alpha,
+                               mjtNum mu, mjtNum Dm) {
++  #pragma clang fp contract(off)
+   mjtNum U0 = quad[3], V0 = quad[4], UU = quad[5];
+   mjtNum UV = quad[6], VV = quad[7];
+ 
+@@ -2393,7 +2432,7 @@ static mjtNum ellipticCostDif(const mjtNum* quad, mjtNum alpha,
+     T0 = mju_sqrt(UU);
+     if (U0 >= mu*T0) {
+       zone0 = 1;  // top zone
+-    } else if (mu*U0 + T0 <= 0) {
++    } else if (mj_marble_wheel_fma(mu, U0, T0) <= 0) {
+       zone0 = 2;  // bottom zone
+     } else {
+       zone0 = 3;  // middle zone
+@@ -2401,8 +2440,9 @@ static mjtNum ellipticCostDif(const mjtNum* quad, mjtNum alpha,
+   }
+ 
+   // determine zone at alpha
+-  mjtNum N = U0 + alpha*V0;
+-  mjtNum Tsqr = UU + alpha*(2*UV + alpha*VV);
++  mjtNum N = mj_marble_wheel_fma(alpha, V0, U0);
++  mjtNum inner = mj_marble_wheel_fma(2, UV, alpha*VV);
++  mjtNum Tsqr = mj_marble_wheel_fma(alpha, inner, UU);
+   int zone_alpha = 0;
+   mjtNum T = 0;
+ 
+@@ -2412,7 +2452,7 @@ static mjtNum ellipticCostDif(const mjtNum* quad, mjtNum alpha,
+     T = mju_sqrt(Tsqr);
+     if (N >= mu*T) {
+       zone_alpha = 1;  // top zone
+-    } else if (mu*N + T <= 0) {
++    } else if (mj_marble_wheel_fma(mu, N, T) <= 0) {
+       zone_alpha = 2;  // bottom zone
+     } else {
+       zone_alpha = 3;  // middle zone
+@@ -2426,48 +2466,46 @@ static mjtNum ellipticCostDif(const mjtNum* quad, mjtNum alpha,
+ 
+   // both bottom zone
+   if (zone0 == 2 && zone_alpha == 2) {
+-    return alpha*alpha*quad[2] + alpha*quad[1];
++    return mj_marble_wheel_fma(alpha*alpha, quad[2], alpha*quad[1]);
+   }
+ 
+   // both middle zone: apply rationalized formula to avoid cancellation
+   if (zone0 == 3 && zone_alpha == 3) {
+-    mjtNum Tsqr_delta = alpha*(2*UV + alpha*VV);
+-    mjtNum T_delta = Tsqr_delta / (T + T0);
+-    mjtNum r_delta = alpha*V0 - mu*T_delta;
+-    mjtNum r0 = U0 - mu*T0;
+-    return 0.5*Dm*r_delta*(2*r0 + r_delta);
++    mjtNum T_delta = -(inner*alpha) / (T0 + T);
++    mjtNum r_delta = mj_marble_wheel_fma(alpha, V0, mu*T_delta);
++    mjtNum r0 = mj_marble_wheel_fma(-mu, T0, U0);
++    return (0.5*Dm*r_delta)*mj_marble_wheel_fma(2, r0, r_delta);
+   }
+ 
+   // CONE -> QUADRATIC (3 -> 2)
+   if (zone0 == 3 && zone_alpha == 2) {
+-    mjtNum dq = alpha*(alpha*quad[2] + quad[1]);
+-    mjtNum boundary0 = mu*U0 + T0;
++    mjtNum dq = alpha*mj_marble_wheel_fma(alpha, quad[2], quad[1]);
++    mjtNum boundary0 = mj_marble_wheel_fma(mu, U0, T0);
+     mjtNum gap0 = 0.5*Dm*boundary0*boundary0;
+-    return dq + gap0;
++    return gap0 + dq;
+   }
+ 
+   // QUADRATIC -> CONE (2 -> 3)
+   if (zone0 == 2 && zone_alpha == 3) {
+-    mjtNum dq = alpha*(alpha*quad[2] + quad[1]);
+-    mjtNum boundary = mu*N + T;
+-    mjtNum gap = 0.5*Dm*boundary*boundary;
+-    return dq - gap;
++    mjtNum dq = alpha*mj_marble_wheel_fma(alpha, quad[2], quad[1]);
++    mjtNum boundary = mj_marble_wheel_fma(mu, N, T);
++    return dq + (-0.5*Dm*boundary)*boundary;
+   }
+ 
+   // SATISFIED -> QUADRATIC (1 -> 2)
+   if (zone0 == 1 && zone_alpha == 2) {
+-    return alpha*alpha*quad[2] + alpha*quad[1] + quad[0];
++    return quad[0] + mj_marble_wheel_fma(alpha*alpha, quad[2], alpha*quad[1]);
+   }
+ 
+   // SATISFIED -> CONE (1 -> 3)
+   if (zone0 == 1 && zone_alpha == 3) {
+-    mjtNum r = N - mu*T;
++    mjtNum r = mj_marble_wheel_fma(-mu, T, N);
+     return 0.5*Dm*r*r;
+   }
+ 
+   // CONE -> SATISFIED (3 -> 1)
+   if (zone0 == 3 && zone_alpha == 1) {
+-    mjtNum r0 = U0 - mu*T0;
++    mjtNum r0 = mj_marble_wheel_fma(-mu, T0, U0);
+     return -0.5*Dm*r0*r0;
+   }
+ 
+@@ -2482,6 +2520,7 @@ static mjtNum ellipticCostDif(const mjtNum* quad, mjtNum alpha,
+ 
+ // evaluate shifted linesearch cost: cost(alpha) - cost(0), and derivatives
+ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
++  #pragma clang fp contract(off)
+   int ne = ctx->ne, nf = ctx->nf, nefc = ctx->nefc;
+ 
+   // clear result
+@@ -2512,7 +2551,7 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+       // search point, friction loss, bound (Rf)
+       mjtNum start = ctx->Jaref[i];
+       mjtNum dir = ctx->Jv[i];
+-      mjtNum x = start + alpha*dir;
++      mjtNum x = mj_marble_wheel_fma(alpha, dir, start);
+       mjtNum f = ctx->efc_frictionloss[i];
+       mjtNum D = ctx->efc_D[i];
+       mjtNum Rf = ctx->efc_R[i]*f;
+@@ -2522,18 +2561,18 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+ 
+       // -bound < x < bound : quadratic
+       if (-Rf < x && x < Rf) {
+-        deriv[0] += D*x*dir;
+-        deriv[1] += D*dir*dir;
++        deriv[0] = mj_marble_wheel_fma(x*D, dir, deriv[0]);
++        deriv[1] = mj_marble_wheel_fma(dir*D, dir, deriv[1]);
+       }
+ 
+       // x < -bound : linear negative
+       else if (x <= -Rf) {
+-        deriv[0] += -f*dir;
++        deriv[0] = mj_marble_wheel_fma(-f, dir, deriv[0]);
+       }
+ 
+       // bound < x : linear positive
+       else {
+-        deriv[0] += f*dir;
++        deriv[0] = mj_marble_wheel_fma(f, dir, deriv[0]);
+       }
+       marbleRecordNewtonState(ctx, 4000 + marble_newton_eval_count*1000 + i,
+                               alpha, cost, deriv[0], deriv[1]);
+@@ -2562,8 +2601,9 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+       marbleRecordNewtonState(ctx, cost_row_probe+4, alpha, cost, i, 0);
+ 
+       // compute N, Tsqr for derivatives
+-      mjtNum N = U0 + alpha*V0;
+-      mjtNum Tsqr = UU + alpha*(2*UV + alpha*VV);
++      mjtNum N = mj_marble_wheel_fma(alpha, V0, U0);
++      mjtNum Tsqr = mj_marble_wheel_fma(alpha,
++          mj_marble_wheel_fma(2, UV, alpha*VV), UU);
+       marbleRecordNewtonState(ctx,
+           600000 + marble_newton_eval_count*1000 + i,
+           alpha, N, Tsqr, ctx->efc_id[i]);
+@@ -2590,8 +2630,8 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+       if (Tsqr <= 0) {
+         // bottom zone: quadratic derivatives
+         if (N < 0) {
+-          deriv[0] += 2*alpha*quad[2] + quad[1];
+-          deriv[1] += 2*quad[2];
++          deriv[0] += mj_marble_wheel_fma(alpha+alpha, quad[2], quad[1]);
++          deriv[1] = mj_marble_wheel_fma(2, quad[2], deriv[1]);
+         }
+ 
+         // top zone: nothing to do
+@@ -2601,7 +2641,7 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+       else {
+         // tangential force
+         mjtNum T = mju_sqrt(Tsqr);
+-        mjtNum top_zone_margin = N - mu*T;
++        mjtNum top_zone_margin = mj_marble_wheel_fma(-mu, T, N);
+         marbleRecordNewtonState(ctx,
+             zone_probe_label + 1,
+             alpha, T, top_zone_margin, 0);
+@@ -2610,14 +2650,14 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+             alpha, mu*N + T, quad[1], quad[2]);
+ 
+         // N>=mu*T : top zone
+-        if (top_zone_margin >= 0) {
++        if (N >= mu*T) {
+           // nothing to do
+         }
+ 
+         // mu*N+T<=0 : bottom zone
+-        else if (mu*N+T <= 0) {
+-          deriv[0] += 2*alpha*quad[2] + quad[1];
+-          deriv[1] += 2*quad[2];
++        else if (mj_marble_wheel_fma(mu, N, T) <= 0) {
++          deriv[0] += mj_marble_wheel_fma(alpha+alpha, quad[2], quad[1]);
++          deriv[1] = mj_marble_wheel_fma(2, quad[2], deriv[1]);
+           marbleRecordNewtonState(ctx,
+               zone_probe_label + 4,
+               alpha, deriv[0], deriv[1], 0);
+@@ -2627,13 +2667,14 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+         else {
+           // derivatives
+           mjtNum N1 = V0;
+-          mjtNum T1 = (UV + alpha*VV)/T;
+-          mjtNum T2 = VV/T - (UV + alpha*VV)*T1/(T*T);
+-          mjtNum normal_slope = N1 - mu*T1;
++          mjtNum tangent = mj_marble_wheel_fma(alpha, VV, UV);
++          mjtNum T1 = tangent/T;
++          mjtNum T2 = VV/T - (tangent*T1)/(T*T);
++          mjtNum normal_slope = mj_marble_wheel_fma(-mu, T1, N1);
+           mjtNum second_derivative_increment;
+-          second_derivative_increment =
+-              Dm*((N1-mu*T1)*(N1-mu*T1) +
+-                  (N-mu*T)*(-mu*T2));
++          mjtNum second = mj_marble_wheel_fma(normal_slope, normal_slope,
++                                             top_zone_margin*((-mu)*T2));
++          second_derivative_increment = Dm*second;
+           marbleRecordNewtonState(ctx,
+               zone_probe_label + 5,
+               alpha, top_zone_margin, normal_slope,
+@@ -2644,8 +2685,8 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+           marbleRecordNewtonState(ctx,
+               zone_probe_label + 7,
+               alpha, T1, T2, 0);
+-          deriv[0] += Dm*top_zone_margin*normal_slope;
+-          deriv[1] += second_derivative_increment;
++          deriv[0] = mj_marble_wheel_fma(Dm*top_zone_margin, normal_slope, deriv[0]);
++          deriv[1] = mj_marble_wheel_fma(Dm, second, deriv[1]);
+           marbleRecordNewtonState(ctx,
+               zone_probe_label + 8,
+               alpha, deriv[0], deriv[1], 0);
+@@ -2657,7 +2698,7 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+     } else {                                                  // inequality
+       // search point
+       mjtNum start = ctx->Jaref[i];
+-      mjtNum x = start + alpha*ctx->Jv[i];
++      mjtNum x = mj_marble_wheel_fma(alpha, ctx->Jv[i], start);
+       mjtNum cost0 = start < 0 ? ctx->quad[3*i] : 0;
+ 
+       marbleRecordNewtonState(ctx,
+@@ -2683,9 +2724,10 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+   }
+ 
+   // add total quadratic (quadTotal[0] contains only shifted residuals)
+-  cost += alpha*alpha*quadTotal[2] + alpha*quadTotal[1] + quadTotal[0];
+-  deriv[0] += 2*alpha*quadTotal[2] + quadTotal[1];
+-  deriv[1] += 2*quadTotal[2];
++  cost = (quadTotal[0] + mj_marble_wheel_fma(alpha*alpha, quadTotal[2],
++                                          alpha*quadTotal[1])) + cost;
++  deriv[0] = mj_marble_wheel_fma(alpha+alpha, quadTotal[2], quadTotal[1]) + deriv[0];
++  deriv[1] = mj_marble_wheel_fma(2, quadTotal[2], deriv[1]);
+ 
+   const mjtNum marble_unclamped_second = deriv[1];
+   // check for convexity; SHOULD NOT OCCUR
+@@ -2705,6 +2747,71 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+ }
+ 
+ 
++// Diagnostic-only bounded packet bridge calls the SAME compiled PrimalEval.
++// Schema: [1,alpha,ne,nf,n,ncon],Gauss[3],Jar/Jv/D/R[n],loss[nf],
++//         type/id[n],contact(dim,mu)[ncon],quad[3*n]. Unused quad slots are
++// initialized transport padding, not captured or compared solver scratch.
++MJAPI int mj_marble_eval_probe(const mjtNum* values, int count, mjtNum* output) {
++  if (!values || !output || count < 9 || count > 800000) return 0;
++  for (int k=0; k < count; ++k) if (!isfinite(values[k])) return 0;
++  if (values[0] != 1) return 0;
++  for (int k=2; k < 6; ++k) {
++    if (values[k] < 0 || values[k] > 65536 || values[k] != floor(values[k])) return 0;
++  }
++  int ne = (int)values[2], nf = (int)values[3];
++  int n = (int)values[4], ncon = (int)values[5];
++  if (ne+nf > n || count != 9+9*n+nf+2*ncon) return 0;
++  const mjtNum* jar = values+9;
++  const mjtNum* jv = jar+n;
++  const mjtNum* D = jv+n;
++  const mjtNum* R = D+n;
++  const mjtNum* loss = R+n;
++  const mjtNum* types = loss+nf;
++  const mjtNum* ids = types+n;
++  const mjtNum* contact_values = ids+n;
++  const mjtNum* quad = contact_values+2*ncon;
++  for (int i=0; i < n; ++i) {
++    if (D[i] < 0 || R[i] < 0 || types[i] < 0 || types[i] > 7 ||
++        types[i] != floor(types[i]) || ids[i] < -1 || ids[i] > 2147483647 ||
++        ids[i] != floor(ids[i])) return 0;
++  }
++  for (int i=0; i < nf; ++i) if (loss[i] < 0) return 0;
++  for (int i=0; i < ncon; ++i) {
++    mjtNum dim = contact_values[2*i];
++    if ((dim != 1 && dim != 3 && dim != 4 && dim != 6) || contact_values[2*i+1] < 0) return 0;
++  }
++  for (int i=0; i < n; ++i) {
++    if (types[i] != mjCNSTR_CONTACT_ELLIPTIC) continue;
++    if (i < ne+nf || ids[i] < 0 || ids[i] >= ncon) return 0;
++    int c = (int)ids[i], dim = (int)contact_values[2*c];
++    if (dim < 3 || i+dim > n || contact_values[2*c+1] <= 0) return 0;
++    for (int j=1; j < dim; ++j) if (types[i+j] != 7 || ids[i+j] != c) return 0;
++    i += dim-1;
++  }
++  int* integer_arrays = malloc((size_t)(n ? 2*n : 2)*sizeof(int));
++  mjContact* contacts = calloc((size_t)(ncon ? ncon : 1), sizeof(mjContact));
++  mjtNum* full_loss = calloc((size_t)(ne+nf ? ne+nf : 1), sizeof(mjtNum));
++  if (!integer_arrays || !contacts || !full_loss) {
++    free(integer_arrays); free(contacts); free(full_loss); return 0;
++  }
++  for (int i=0; i < n; ++i) { integer_arrays[i] = (int)types[i]; integer_arrays[n+i] = (int)ids[i]; }
++  for (int i=0; i < ncon; ++i) {
++    contacts[i].dim = (int)contact_values[2*i]; contacts[i].mu = contact_values[2*i+1];
++  }
++  for (int i=0; i < nf; ++i) full_loss[ne+i] = loss[i];
++  mjPrimalContext ctx = {0};
++  ctx.island = -1; ctx.ne = ne; ctx.nf = nf; ctx.nefc = n;
++  ctx.contact = contacts; ctx.efc_D = D; ctx.efc_R = R; ctx.efc_frictionloss = full_loss;
++  ctx.efc_type = integer_arrays; ctx.efc_id = integer_arrays+n;
++  ctx.Jaref = (mjtNum*)jar; ctx.Jv = (mjtNum*)jv; ctx.quad = (mjtNum*)quad;
++  memcpy(ctx.quadGauss, values+6, 3*sizeof(mjtNum));
++  mjPrimalPnt p = {0}; p.alpha = values[1];
++  PrimalEval(&ctx, &p);
++  output[0] = p.cost; output[1] = p.deriv[0]; output[2] = p.deriv[1];
++  free(integer_arrays); free(contacts); free(full_loss);
++  return ctx.LSiter == 1 && isfinite(output[0]) && isfinite(output[1]) && isfinite(output[2]);
++}
++
+ // update bracket point given 3 candidate points
+ static int updateBracket(mjPrimalContext* ctx,
+                          mjPrimalPnt* p, const mjPrimalPnt candidates[3], mjPrimalPnt* pnext) {
+diff --git a/src/engine/engine_core_constraint.c b/src/engine/engine_core_constraint.c
+index e686376..d8074b6 100644
+--- a/src/engine/engine_core_constraint.c
++++ b/src/engine/engine_core_constraint.c
+@@ -3300,7 +3300,7 @@ void mj_constraintUpdate_impl(int ne, int nf, int nefc,
+     // ==== equality
+     if (i < ne) {
+       if (cost) {
+-        s += 0.5*D[i]*jar[i]*jar[i];
++        s = fma(0.5*D[i]*jar[i], jar[i], s);
+       }
+       state[i] = mjCNSTRSTATE_QUADRATIC;
+       continue;
+@@ -3311,7 +3311,7 @@ void mj_constraintUpdate_impl(int ne, int nf, int nefc,
+       // linear negative
+       if (jar[i] <= -R[i]*floss[i]) {
+         if (cost) {
+-          s += -0.5*R[i]*floss[i]*floss[i] - floss[i]*jar[i];
++          s += fma(-0.5*R[i]*floss[i], floss[i], -floss[i]*jar[i]);
+         }
+ 
+         force[i] = floss[i];
+@@ -3321,7 +3321,7 @@ void mj_constraintUpdate_impl(int ne, int nf, int nefc,
+       // linear positive
+       else if (jar[i] >= R[i]*floss[i]) {
+         if (cost) {
+-          s += -0.5*R[i]*floss[i]*floss[i] + floss[i]*jar[i];
++          s += fma(-0.5*R[i]*floss[i], floss[i], floss[i]*jar[i]);
+         }
+ 
+         force[i] = -floss[i];
+@@ -3331,7 +3331,7 @@ void mj_constraintUpdate_impl(int ne, int nf, int nefc,
+       // quadratic
+       else {
+         if (cost) {
+-          s += 0.5*D[i]*jar[i]*jar[i];
++          s = fma(0.5*D[i]*jar[i], jar[i], s);
+         }
+         state[i] = mjCNSTRSTATE_QUADRATIC;
+       }
+@@ -3352,7 +3352,7 @@ void mj_constraintUpdate_impl(int ne, int nf, int nefc,
+       // quadratic
+       else {
+         if (cost) {
+-          s += 0.5*D[i]*jar[i]*jar[i];
++          s = fma(0.5*D[i]*jar[i], jar[i], s);
+         }
+         state[i] = mjCNSTRSTATE_QUADRATIC;
+       }
+@@ -3383,10 +3383,10 @@ void mj_constraintUpdate_impl(int ne, int nf, int nefc,
+       }
+ 
+       // bottom zone
+-      else if (mu*N+T <= 0 || (T <= 0 && N < 0)) {
++      else if (fma(mu, N, T) <= 0 || (T <= 0 && N < 0)) {
+         if (cost) {
+           for (int j=0; j < dim; j++) {
+-            s += 0.5*D[i+j]*jar[i+j]*jar[i+j];
++            s = fma(0.5*D[i+j]*jar[i+j], jar[i+j], s);
+           }
+         }
+         state[i] = mjCNSTRSTATE_QUADRATIC;
+@@ -3395,11 +3395,11 @@ void mj_constraintUpdate_impl(int ne, int nf, int nefc,
+       // middle zone
+       else {
+         // cost: 0.5*D0/(mu*mu*(1+mu*mu))*(N-mu*T)^2
+-        mjtNum Dm = D[i]/(mu*mu*(1+mu*mu));
+-        mjtNum NmT = N - mu*T;
++        mjtNum Dm = D[i]/(mu*mu*fma(mu, mu, 1));
++        mjtNum NmT = fma(-mu, T, N);
+ 
+         if (cost) {
+-          s += 0.5*Dm*NmT*NmT;
++          s = fma(0.5*Dm*NmT, NmT, s);
+         }
+ 
+         // force: - ds/djar = dU/djar * ds/dU  (dU/djar = diag(mu, friction))
+@@ -3432,7 +3432,7 @@ void mj_constraintUpdate_impl(int ne, int nf, int nefc,
+           }
+ 
+           // add to diagonal: (mu^2 - mu*N/T) * I
+-          scl = mu*mu - mu*N/T;
++          scl = fma(mu, mu, -(mu*N)/T);
+           for (int j=1; j < dim; j++) {
+             H[j*(dim+1)] += scl;
+           }
+diff --git a/src/engine/engine_util_solve.c b/src/engine/engine_util_solve.c
+index 78c6a91..5f72b01 100644
+--- a/src/engine/engine_util_solve.c
++++ b/src/engine/engine_util_solve.c
+@@ -141,7 +141,7 @@ void mju_cholSolve(mjtNum* res, const mjtNum* mat, const mjtNum* vec, int n) {
+   for (int i=n-1; i >= 0; i--) {
+     if (i < n-1) {
+       for (int j=i+1; j < n; j++) {
+-        res[i] -= mat[j*n+i] * res[j];
++        res[i] = fma(-mat[j*n+i], res[j], res[i]);
+       }
+     }
+     // diagonal
+@@ -165,7 +165,7 @@ int mju_cholUpdate(mjtNum* mat, mjtNum* x, int n, int flg_plus) {
+     if (x[k]) {
+       // prepare constants
+       Lkk = mat[k*(n+1)];
+-      tmp = Lkk*Lkk + (flg_plus ? x[k]*x[k] : -x[k]*x[k]);
++      tmp = fma(Lkk, Lkk, flg_plus ? x[k]*x[k] : -(x[k]*x[k]));
+       if (tmp < mjMINVAL) {
+         tmp = mjMINVAL;
+         rank--;
+@@ -173,7 +173,7 @@ int mju_cholUpdate(mjtNum* mat, mjtNum* x, int n, int flg_plus) {
+       r = mju_sqrt(tmp);
+       c = r / Lkk;
+       cinv = 1 / c;
+-      s = x[k] / Lkk;
++      s = flg_plus ? x[k] / Lkk : (-x[k]) / Lkk;
+ 
+       // update diagonal
+       mat[k*(n+1)] = r;
+@@ -181,17 +181,17 @@ int mju_cholUpdate(mjtNum* mat, mjtNum* x, int n, int flg_plus) {
+       // update mat
+       if (flg_plus) {
+         for (int i=k+1; i < n; i++) {
+-          mat[i*n+k] = (mat[i*n+k] + s*x[i])*cinv;
++          mat[i*n+k] = fma(s, x[i], mat[i*n+k])*cinv;
+         }
+       } else {
+         for (int i=k+1; i < n; i++) {
+-          mat[i*n+k] = (mat[i*n+k] - s*x[i])*cinv;
++          mat[i*n+k] = fma(s, x[i], mat[i*n+k])*cinv;
+         }
+       }
+ 
+       // update x
+       for (int i=k+1; i < n; i++) {
+-        x[i] = c*x[i] - s*mat[i*n+k];
++        x[i] = fma(c, x[i], (flg_plus ? -s : s)*mat[i*n+k]);
+       }
+       mj_solver_cone_trace_cholupdate_step(k, n, x, mat);
+     }
+diff --git a/wasm/codegen/generated/bindings.cc b/wasm/codegen/generated/bindings.cc
+index ea004b2..2a50bc1 100644
+--- a/wasm/codegen/generated/bindings.cc
++++ b/wasm/codegen/generated/bindings.cc
+@@ -53,6 +53,9 @@ extern "C" int mj_solver_prepare_trace_overflow();
+ extern "C" int mj_solver_prepare_trace_invalid();
+ extern "C" void mj_solver_prepare_trace_copy(mjtNum*);
+ extern "C" int mj_solver_eval_trace_schema();
++extern "C" int mj_marble_eval_probe(const mjtNum*, int, mjtNum*);
++extern "C" int mj_marble_residual_probe(const mjtNum*, int, mjtNum*);
++extern "C" mjtNum mj_marble_wheel_fma(mjtNum, mjtNum, mjtNum);
+ extern "C" int mj_solver_eval_trace_size();
+ extern "C" int mj_solver_eval_trace_calls();
+ extern "C" int mj_solver_eval_trace_overflow();
+@@ -6807,6 +6810,43 @@ EMSCRIPTEN_BINDINGS(mujoco_bindings) {
+   function("mj_rne", &mj_rne_wrapper);
+   function("marbleRneProjectionTrace", &mj_rne_projection_trace_wrapper);
+   function("marbleNewtonTrace", &marble_newton_trace_wrapper);
++  function("marbleWheelFmaProbe", &mj_marble_wheel_fma);
++  function("marbleWheelResidualProbe", emscripten::optional_override([](val packet) {
++    const int n = packet["length"].as<int>();
++    val result = val::object();
++    if (n < 5 || n > 1029) { result.set("accepted", false); return result; }
++    std::vector<mjtNum> values(n);
++    for (int i=0; i < n; ++i) {
++      if (packet[i].typeOf().as<std::string>() != "number") {
++        result.set("accepted", false); return result;
++      }
++      values[i] = packet[i].as<mjtNum>();
++    }
++    mjtNum output = 0;
++    const bool accepted = mj_marble_residual_probe(values.data(), n, &output) != 0;
++    result.set("accepted", accepted);
++    if (accepted) result.set("result", output);
++    return result;
++  }));
++  function("marbleWheelEvalProbe", emscripten::optional_override([](val packet) {
++    const int n = packet["length"].as<int>();
++    val result = val::object();
++    if (n < 9 || n > 800000) { result.set("accepted", false); return result; }
++    std::vector<mjtNum> values(n);
++    for (int i=0; i < n; ++i) {
++      if (packet[i].typeOf().as<std::string>() != "number") {
++        result.set("accepted", false); return result;
++      }
++      values[i] = packet[i].as<mjtNum>();
++    }
++    mjtNum output[3] = {0};
++    const bool accepted = mj_marble_eval_probe(values.data(), n, output) != 0;
++    result.set("accepted", accepted);
++    val outputs = val::array();
++    if (accepted) for (int i=0; i < 3; ++i) outputs.set(i, output[i]);
++    result.set("result", outputs);
++    return result;
++  }));
+   function("marbleSyncSolverContacts", &marble_sync_solver_contacts_wrapper);
+   function("marbleConstraintUpdateTraceBegin", &marble_constraint_update_trace_begin_wrapper);
+   function("marbleConstraintUpdateTraceEnd", &marble_constraint_update_trace_end_wrapper);

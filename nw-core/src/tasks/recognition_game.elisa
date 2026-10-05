@@ -1,0 +1,346 @@
+# Stateful controller for the source Seen It Before? task.
+#
+# The Python task's MediaPool owns filesystem paths and decoded pyglet objects.
+# Those host objects cannot cross the common WASM ABI, so this controller keeps
+# the source's run-generation and phase semantics while exposing stable item
+# identities. The browser supplies the media projection for those identities;
+# the run itself, repeat decisions, scoring, deadlines, and feedback remain
+# authoritative here.
+
+module RecognitionGame:
+
+    const MAX_TRIALS: i64 = 500
+    const MAX_ITEMS: i64 = 500
+
+    const MEDIUM_PICTURE: i64 = 0
+    const MEDIUM_SOUND: i64 = 1
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SHOWING: i64 = 1
+    const PHASE_HIDDEN: i64 = 2
+    const PHASE_FEEDBACK: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const ACTION_START: i64 = 0
+    const ACTION_SEEN: i64 = 1
+    const ACTION_NEW: i64 = 2
+    const ACTION_REPLAY: i64 = 3
+
+    const INFO_PHASE: i64 = 0
+    const INFO_TOTAL_TRIALS: i64 = 1
+    const INFO_INDEX: i64 = 2
+    const INFO_MEDIUM: i64 = 3
+    const INFO_REPEAT_PERCENT: i64 = 4
+    const INFO_MIN_LAG: i64 = 5
+    const INFO_STUDY_MS: i64 = 6
+    const INFO_FEEDBACK: i64 = 7
+    const INFO_ITEM: i64 = 8
+    const INFO_REPEAT: i64 = 9
+    const INFO_LAST_CORRECT: i64 = 10
+    const INFO_SHOWN_AT_MS: i64 = 11
+    const INFO_DEADLINE_MS: i64 = 12
+    const INFO_HITS: i64 = 13
+    const INFO_MISSES: i64 = 14
+    const INFO_FALSE_ALARMS: i64 = 15
+    const INFO_CORRECT_REJECTIONS: i64 = 16
+    const INFO_ANSWERED: i64 = 17
+    const INFO_ASSET: i64 = 18
+
+    const ITEM_ID: i64 = 0
+    const ITEM_REPEAT: i64 = 1
+    const ITEM_ANSWERED: i64 = 2
+    const ITEM_CHOICE: i64 = 3
+
+    struct RecognitionRun:
+        rng: mutable MT19937
+        total_trials: mutable i64
+        medium: mutable i64
+        repeat_percent: mutable i64
+        min_lag: mutable i64
+        study_ms: mutable i64
+        feedback: mutable bool
+        trial_count: mutable i64
+        index: mutable i64
+        item: mutable i64[500]
+        repeat: mutable i64[500]
+        choice: mutable i64[500]
+        shown_at_ms: mutable i64
+        deadline_ms: mutable i64
+        phase: mutable i64
+        verdict: mutable i64
+        last_correct: mutable i64
+
+    def allowed_trials(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 10 or value == 20 or value == 30 or value == 40 or value == 60 or value == 80 or value == 100 or value == 150 or value == 200 or value == 300 or value == 500
+
+    def allowed_medium(value: i64) -> bool:
+        can Abort.Panic:
+            return value == MEDIUM_PICTURE or value == MEDIUM_SOUND
+
+    def allowed_repeat_percent(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 20 or value == 30 or value == 40 or value == 50
+
+    def allowed_lag(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 1 or value == 2 or value == 3 or value == 4 or value == 6 or value == 8 or value == 12 or value == 20 or value == 30 or value == 50 or value == 80
+
+    def allowed_study(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 0 or value == 500 or value == 1000 or value == 1500 or value == 2000 or value == 3000
+
+    def clear_arrays(run: mutable RecognitionRun&):
+        can Abort.Panic:
+            for at in 0..<MAX_TRIALS |at, run|:
+                run.item[at.usize()] <- -1
+                run.repeat[at.usize()] <- 0
+                run.choice[at.usize()] <- 0
+
+    def initialize(run: mutable RecognitionRun&, total_trials: i64, medium: i64,
+                   repeat_percent: i64, min_lag: i64, study_ms: i64,
+                   feedback: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.total_trials <- total_trials
+            run.medium <- medium
+            run.repeat_percent <- repeat_percent
+            run.min_lag <- min_lag
+            run.study_ms <- study_ms
+            run.feedback <- feedback
+            run.trial_count <- 0
+            run.index <- 0
+            run.shown_at_ms <- 0
+            run.deadline_ms <- 0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.last_correct <- -1
+            clear_arrays(run)
+
+    # The reference calls MediaPool.reload(), shuffles its available paths,
+    # then takes from the end of that order. WASM cannot enumerate the user's
+    # dataset here, so use a stable synthetic identity pool of the same maximum
+    # cardinality. This keeps the source's draw order and repeat invariants
+    # live; replacing the identities with the selected media catalog is a host
+    # integration task, not a reason to put answers in JavaScript.
+    def build_run(run: mutable RecognitionRun&):
+        can Memory.Allocate, Abort.Panic:
+            fresh_count: mutable i64 = run.total_trials if run.total_trials > 2 else 2
+            fresh_count <- MAX_ITEMS if fresh_count > MAX_ITEMS
+            pool: mutable darray[i64] = []
+            for at in 0..<fresh_count |pool|:
+                pool.push(at)
+            py_shuffle_i64_prefix(&run.rng, &pool, fresh_count)
+            run.trial_count <- 0
+            next_fresh: mutable i64 = 0
+            position: mutable i64 = 0
+            while position < run.total_trials |position, run, pool, next_fresh|:
+                eligible: mutable darray[i64] = []
+                prior: mutable i64 = 0
+                while prior < run.trial_count |prior, position, run, eligible|:
+                    if position - prior >= run.min_lag and run.repeat[prior.usize()] == 0:
+                        eligible.push(run.item[prior.usize()])
+                    prior <- prior + 1
+                wants_repeat: bool = py_randbelow(&run.rng, 100.u64()).i64() < run.repeat_percent
+                chosen: mutable i64 = -1
+                is_repeat: mutable i64 = 0
+                pick: mutable i64 = 0
+                if wants_repeat and eligible.count > 0:
+                    pick <- py_choice_index(&run.rng, eligible.count.i64())
+                    chosen <- eligible[pick.usize()]
+                    is_repeat <- 1
+                elif next_fresh < fresh_count:
+                    # MediaPool.take() pops the shuffled order from its end.
+                    chosen <- pool[(fresh_count - 1 - next_fresh).usize()]
+                    next_fresh <- next_fresh + 1
+                elif eligible.count > 0:
+                    pick <- py_choice_index(&run.rng, eligible.count.i64())
+                    chosen <- eligible[pick.usize()]
+                    is_repeat <- 1
+                else:
+                    break
+                run.item[run.trial_count.usize()] <- chosen
+                run.repeat[run.trial_count.usize()] <- is_repeat
+                run.choice[run.trial_count.usize()] <- 0
+                run.trial_count <- run.trial_count + 1
+                position <- position + 1
+
+    def present(run: mutable RecognitionRun&, now_ms: i64):
+        can Abort.Panic:
+            if run.index >= run.trial_count:
+                run.phase <- PHASE_DONE
+                run.deadline_ms <- 0
+                return
+            run.phase <- PHASE_SHOWING
+            run.shown_at_ms <- now_ms
+            run.deadline_ms <- now_ms + run.study_ms if run.medium == MEDIUM_PICTURE and run.study_ms > 0 else 0
+            run.verdict <- -1
+            run.last_correct <- -1
+
+    def start(run: mutable RecognitionRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.index <- 0
+            run.trial_count <- 0
+            run.shown_at_ms <- 0
+            run.deadline_ms <- 0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.last_correct <- -1
+            clear_arrays(run)
+            build_run(run)
+            present(run, now_ms)
+
+    def answer(run: mutable RecognitionRun&, selected: i64, now_ms: i64) -> i64:
+        can Abort.Panic:
+            return 2 if selected != ACTION_SEEN and selected != ACTION_NEW
+            return 2 if run.phase != PHASE_SHOWING and run.phase != PHASE_HIDDEN
+            return 2 if run.index < 0 or run.index >= run.trial_count
+            expected: i64 = ACTION_SEEN if run.repeat[run.index.usize()] != 0 else ACTION_NEW
+            run.choice[run.index.usize()] <- selected
+            run.last_correct <- 1 if selected == expected else 0
+            run.verdict <- run.last_correct if run.feedback else -1
+            run.index <- run.index + 1
+            if run.feedback:
+                run.phase <- PHASE_FEEDBACK
+                run.deadline_ms <- now_ms + 350
+            else:
+                present(run, now_ms)
+            return 1
+
+    def apply(run: mutable RecognitionRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                return 2 if run.phase == PHASE_SHOWING or run.phase == PHASE_HIDDEN or run.phase == PHASE_FEEDBACK
+                start(run, now_ms)
+                return 1
+            elif action == ACTION_SEEN or action == ACTION_NEW:
+                return answer(run, action, now_ms)
+            elif action == ACTION_REPLAY:
+                return 2 if run.phase != PHASE_SHOWING and run.phase != PHASE_HIDDEN
+                return 1 if run.medium == MEDIUM_SOUND else 2
+            return -6
+
+    def advance(run: mutable RecognitionRun&, now_ms: i64) -> i64:
+        can Abort.Panic:
+            if run.phase == PHASE_SHOWING and run.medium == MEDIUM_PICTURE and run.study_ms > 0 and now_ms >= run.deadline_ms:
+                run.phase <- PHASE_HIDDEN
+                run.deadline_ms <- 0
+                return 1
+            if run.phase == PHASE_FEEDBACK and now_ms >= run.deadline_ms:
+                present(run, now_ms)
+                return 1
+            return 2
+
+    def score_field(run: RecognitionRun&, field: i64) -> i64:
+        can Abort.Panic:
+            hits: mutable i64 = 0
+            misses: mutable i64 = 0
+            false_alarms: mutable i64 = 0
+            correct_rejections: mutable i64 = 0
+            at: mutable i64 = 0
+            while at < run.index |at, run, hits, misses, false_alarms, correct_rejections|:
+                if run.choice[at.usize()] == ACTION_SEEN:
+                    if run.repeat[at.usize()] != 0:
+                        hits <- hits + 1
+                    else:
+                        false_alarms <- false_alarms + 1
+                elif run.choice[at.usize()] == ACTION_NEW:
+                    if run.repeat[at.usize()] != 0:
+                        misses <- misses + 1
+                    else:
+                        correct_rejections <- correct_rejections + 1
+                at <- at + 1
+            if field == INFO_HITS: return hits
+            if field == INFO_MISSES: return misses
+            if field == INFO_FALSE_ALARMS: return false_alarms
+            if field == INFO_CORRECT_REJECTIONS: return correct_rejections
+            if field == INFO_ANSWERED: return hits + misses + false_alarms + correct_rejections
+            return 0
+
+    def info(run: RecognitionRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_TOTAL_TRIALS: return run.total_trials
+            if field == INFO_INDEX: return run.index
+            if field == INFO_MEDIUM: return run.medium
+            if field == INFO_REPEAT_PERCENT: return run.repeat_percent
+            if field == INFO_MIN_LAG: return run.min_lag
+            if field == INFO_STUDY_MS: return run.study_ms
+            if field == INFO_FEEDBACK: return 1 if run.feedback else 0
+            if field == INFO_ITEM: return run.item[run.index.usize()] if run.index >= 0 and run.index < run.trial_count else -1
+            if field == INFO_REPEAT: return run.repeat[run.index.usize()] if run.index >= 0 and run.index < run.trial_count else -1
+            if field == INFO_LAST_CORRECT: return run.last_correct
+            if field == INFO_SHOWN_AT_MS: return run.shown_at_ms
+            if field == INFO_DEADLINE_MS: return run.deadline_ms
+            if field >= INFO_HITS and field <= INFO_ANSWERED: return score_field(run, field)
+            if field == INFO_ASSET: return 2000 + run.item[run.index.usize()] if run.index >= 0 and run.index < run.trial_count else -1
+            return -1
+
+    def item(run: RecognitionRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return -1 if at < 0 or at >= run.trial_count
+            if field == ITEM_ID: return run.item[at.usize()]
+            if field == ITEM_REPEAT: return run.repeat[at.usize()]
+            if field == ITEM_ANSWERED: return 1 if run.choice[at.usize()] != 0 else 0
+            if field == ITEM_CHOICE: return run.choice[at.usize()]
+            return -1
+
+    def pointer_action(run: RecognitionRun&, x_millionths: i64, y_millionths: i64) -> i64:
+        can Abort.Panic:
+            return -1 if run.phase != PHASE_SHOWING and run.phase != PHASE_HIDDEN
+            width: f64 = 912.0
+            height: f64 = 684.0
+            x: f64 = x_millionths.f64() * width / 1000000.0
+            y: f64 = y_millionths.f64() * height / 1000000.0
+            button_width: f64 = width * 0.24 if width * 0.24 < width / 3.2 else width / 3.2
+            button_height: f64 = height * 0.075 if height * 0.075 > 40.0 else 40.0
+            gap: f64 = width * 0.04
+            bottom: f64 = 90.0 * height / 684.0
+            left: f64 = (width - (button_width * 2.0 + gap)) / 2.0
+            return ACTION_SEEN if x >= left and x <= left + button_width and y >= bottom and y <= bottom + button_height else (ACTION_NEW if x >= left + button_width + gap and x <= left + button_width * 2.0 + gap and y >= bottom and y <= bottom + button_height else -1)
+
+    def append_done_message(out: mutable dstr&, run: RecognitionRun&):
+        can Memory.Allocate, Abort.Panic:
+            answered: i64 = score_field(run, INFO_ANSWERED)
+            correct: i64 = score_field(run, INFO_HITS) + score_field(run, INFO_CORRECT_REJECTIONS)
+            percent: i64 = (100 * correct + answered / 2) / answered if answered > 0 else 0
+            dstr_append_i64(out, percent)
+            dstr_append_cstr(out, "% — caught ")
+            dstr_append_i64(out, score_field(run, INFO_HITS))
+            dstr_append_cstr(out, "/")
+            dstr_append_i64(out, score_field(run, INFO_HITS) + score_field(run, INFO_MISSES))
+            dstr_append_cstr(out, " repeats, ")
+            dstr_append_i64(out, score_field(run, INFO_FALSE_ALARMS))
+            dstr_append_cstr(out, " false alarms")
+
+    def append_message(out: mutable dstr&, run: RecognitionRun&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(out, "Press Space to begin")
+            elif run.phase == PHASE_SHOWING or run.phase == PHASE_HIDDEN:
+                dstr_append_cstr(out, "Seen it, or new?")
+            elif run.phase == PHASE_FEEDBACK:
+                dstr_append_cstr(out, "Yes" if run.last_correct == 1 else "No")
+            else:
+                append_done_message(out, run)
+
+    def render(run: RecognitionRun&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            paint: mutable SceneRecognition::RecognitionPaint = SceneRecognition::paint_of(
+                black_background, width, height,
+                width / Display::REFERENCE_WIDTH,
+                height / Display::REFERENCE_HEIGHT)
+            message: mutable dstr = []
+            append_message(&message, run)
+            verdict_text: mutable dstr = []
+            if run.phase == PHASE_FEEDBACK:
+                dstr_append_cstr(&verdict_text, "Yes" if run.last_correct == 1 else "No")
+            scene_phase: i64 = SceneRecognition::PHASE_DONE if run.phase == PHASE_FEEDBACK or run.phase == PHASE_DONE else run.phase
+            SceneRecognition::render(list, &paint, scene_phase, run.medium,
+                2000 + run.item[run.index.usize()] if run.index >= 0 and run.index < run.trial_count else 2000,
+                64, 64, run.index, run.trial_count, bytes_view(message),
+                run.verdict if run.phase == PHASE_FEEDBACK else -1,
+                bytes_view(verdict_text))

@@ -1,0 +1,472 @@
+# Stateful controller for the source's Freeform Tetris task.
+#
+# This is deliberately not arcade Tetris.  The source presents a hand of
+# pieces cut from the current pile, lets the player choose/rotate one, and
+# scores whether the hard drop leaves a gap.  The kernel in tetris.elisa owns
+# the cut/landing rules; this module owns the persistent run and input.
+
+module TetrisGame:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_PLAYING: i64 = 1
+    const PHASE_DONE: i64 = 2
+
+    const ACTION_SPACE: i64 = 0
+    const ACTION_LEFT: i64 = 1
+    const ACTION_RIGHT: i64 = 2
+    const ACTION_ROTATE: i64 = 3
+    const ACTION_DROP: i64 = 4
+    const ACTION_RESTART: i64 = 5
+    const ACTION_SELECT_BASE: i64 = 6
+
+    const INFO_PHASE: i64 = 0
+    const INFO_RUNG: i64 = 1
+    const INFO_PIECE: i64 = 2
+    const INFO_SCORE: i64 = 3
+    const INFO_SELECTED: i64 = 4
+    const INFO_QUARTER: i64 = 5
+    const INFO_COLUMN: i64 = 6
+    const INFO_ROW: i64 = 7
+    const INFO_REMAINDER: i64 = 8
+
+    const MAX_COLS: i64 = 72
+    const MAX_ROWS: i64 = 32
+    const MAX_BOARD_CELLS: i64 = MAX_COLS * MAX_ROWS
+    const MAX_PIECES: i64 = 6
+    const MAX_PIECE_CELLS: i64 = 64
+
+    struct TetrisRun:
+        rng: mutable MT19937
+        cols: mutable i64
+        rows: mutable i64
+        start_rung: mutable i64
+        rung: mutable i64
+        target: mutable i64
+        queue_size: mutable i64
+        phase: mutable i64
+        piece: mutable i64
+        score: mutable i64
+        selected: mutable i64
+        quarter: mutable i64
+        column: mutable i64
+        row: mutable i64
+        remainder: mutable i64
+        board: mutable i64[MAX_BOARD_CELLS]
+        queue_count: mutable i64[MAX_PIECES]
+        queue_fits: mutable i64[MAX_PIECES]
+        queue_recut: mutable i64[MAX_PIECES]
+        queue_x: mutable i64[MAX_PIECES * MAX_PIECE_CELLS]
+        queue_y: mutable i64[MAX_PIECES * MAX_PIECE_CELLS]
+        active_count: mutable i64
+        active_x: mutable i64[MAX_PIECE_CELLS]
+        active_y: mutable i64[MAX_PIECE_CELLS]
+        clean: mutable i64
+        buried: mutable i64
+        lines: mutable i64
+        streak: mutable i64
+        slips: mutable i64
+        best_rung: mutable i64
+
+    def clamp_rung(value: i64) -> i64:
+        can Abort.Panic:
+            return 1 if value < 1 else (8 if value > 8 else value)
+
+    def clear_arrays(run: mutable TetrisRun&):
+        can Abort.Panic:
+            at: mutable i64 = 0
+            while at < MAX_BOARD_CELLS |at, run|:
+                run.board[at.usize()] <- 0
+                at <- at + 1
+            at <- 0
+            while at < MAX_PIECES |at, run|:
+                run.queue_count[at.usize()] <- 0
+                run.queue_fits[at.usize()] <- 0
+                run.queue_recut[at.usize()] <- 0
+                at <- at + 1
+            at <- 0
+            while at < MAX_PIECES * MAX_PIECE_CELLS |at, run|:
+                run.queue_x[at.usize()] <- 0
+                run.queue_y[at.usize()] <- 0
+                at <- at + 1
+            at <- 0
+            while at < MAX_PIECE_CELLS |at, run|:
+                run.active_x[at.usize()] <- 0
+                run.active_y[at.usize()] <- 0
+                at <- at + 1
+
+    def initialize(run: mutable TetrisRun&, rung: i64, target: i64, queue_size: i64,
+                   seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.cols <- MAX_COLS
+            run.rows <- MAX_ROWS
+            run.start_rung <- clamp_rung(rung)
+            run.rung <- run.start_rung
+            run.target <- 25 if target < 1 else (500 if target > 500 else target)
+            run.queue_size <- 5 if queue_size < 1 else (MAX_PIECES if queue_size > MAX_PIECES else queue_size)
+            run.phase <- PHASE_READY
+            run.piece <- 0
+            run.score <- 0
+            run.selected <- 0
+            run.quarter <- 0
+            run.column <- 0
+            run.row <- 0
+            run.remainder <- 0
+            run.clean <- 0
+            run.buried <- 0
+            run.lines <- 0
+            run.streak <- 0
+            run.slips <- 0
+            run.best_rung <- run.rung
+            run.active_count <- 0
+            clear_arrays(run)
+
+    def copy_piece_to_active(run: mutable TetrisRun&, piece: Tetris::Piece&):
+        can Abort.Panic:
+            run.active_count <- piece.count
+            at: mutable i64 = 0
+            while at < piece.count |at, run, piece|:
+                run.active_x[at.usize()] <- Ints::at(piece.x, at)
+                run.active_y[at.usize()] <- Ints::at(piece.y, at)
+                at <- at + 1
+
+    def active_piece(run: TetrisRun&) -> Tetris::Piece:
+        can Memory.Allocate, Abort.Panic:
+            piece: mutable Tetris::Piece = Tetris::Piece()
+            piece.count <- run.active_count
+            at: mutable i64 = 0
+            while at < run.active_count |at, run, piece|:
+                Ints::put(&piece.x, at, run.active_x[at.usize()])
+                Ints::put(&piece.y, at, run.active_y[at.usize()])
+                at <- at + 1
+            return piece
+
+    def copy_board_back(run: mutable TetrisRun&, board: Tetris::Board&):
+        can Abort.Panic:
+            cell: mutable i64 = 0
+            while cell < run.cols * run.rows |cell, run, board|:
+                run.board[cell.usize()] <- Ints::at(board.cells, cell)
+                cell <- cell + 1
+
+    def make_piece(run: mutable TetrisRun&, board: mutable Tetris::Board&, slot: i64):
+        can Memory.Allocate, Abort.Panic:
+            grade: Tetris::TetrisGrade = Tetris::grade_at(run.rung)
+            piece: mutable Tetris::Piece = Tetris::Piece()
+            Tetris::carve(board, &grade, &run.rng, 32, 8, &piece)
+            run.queue_count[slot.usize()] <- piece.count
+            at: mutable i64 = 0
+            base: i64 = slot * MAX_PIECE_CELLS
+            while at < piece.count |at, run, piece, base, slot|:
+                run.queue_x[(base + at).usize()] <- Ints::at(piece.x, at)
+                run.queue_y[(base + at).usize()] <- Ints::at(piece.y, at)
+                at <- at + 1
+
+    def load_slot(run: mutable TetrisRun&, slot: i64):
+        can Abort.Panic:
+            run.active_count <- run.queue_count[slot.usize()]
+            base: i64 = slot * MAX_PIECE_CELLS
+            at: mutable i64 = 0
+            while at < run.active_count |at, run, base, slot|:
+                run.active_x[at.usize()] <- run.queue_x[(base + at).usize()]
+                run.active_y[at.usize()] <- run.queue_y[(base + at).usize()]
+                at <- at + 1
+
+    def piece_from_slot(run: TetrisRun&, slot: i64) -> Tetris::Piece:
+        can Memory.Allocate, Abort.Panic:
+            piece: mutable Tetris::Piece = Tetris::Piece()
+            piece.count <- run.queue_count[slot.usize()]
+            base: i64 = slot * MAX_PIECE_CELLS
+            at: mutable i64 = 0
+            while at < piece.count |at, piece, run, base, slot|:
+                Ints::put(&piece.x, at, run.queue_x[(base + at).usize()])
+                Ints::put(&piece.y, at, run.queue_y[(base + at).usize()])
+                at <- at + 1
+            return piece
+
+    def save_slot(run: mutable TetrisRun&, slot: i64, piece: Tetris::Piece&):
+        can Abort.Panic:
+            run.queue_count[slot.usize()] <- piece.count
+            base: i64 = slot * MAX_PIECE_CELLS
+            at: mutable i64 = 0
+            while at < piece.count |at, piece, run, base, slot|:
+                run.queue_x[(base + at).usize()] <- Ints::at(piece.x, at)
+                run.queue_y[(base + at).usize()] <- Ints::at(piece.y, at)
+                at <- at + 1
+
+    def board_of(run: TetrisRun&) -> Tetris::Board:
+        can Memory.Allocate, Abort.Panic:
+            board: mutable Tetris::Board = Tetris::Board(run.cols, run.rows)
+            cell: mutable i64 = 0
+            while cell < run.cols * run.rows |cell, run, board|:
+                value: i64 = run.board[cell.usize()]
+                if value != 0:
+                    Tetris::fill_cell(&board, cell % run.cols, cell / run.cols, value)
+                cell <- cell + 1
+            Tetris::skyline(&board)
+            return board
+
+    def revalidate(run: mutable TetrisRun&, board: mutable Tetris::Board&):
+        can Memory.Allocate, Abort.Panic:
+            slot: mutable i64 = 0
+            while slot < run.queue_size |slot, run, board|:
+                piece: mutable Tetris::Piece = piece_from_slot(run, slot)
+                quarters: mutable darray[i64] = []
+                cols: mutable darray[i64] = []
+                rows: mutable darray[i64] = []
+                count: mutable i64 = Tetris::perfect_placements(board, &piece, 0,
+                                                                 &quarters, &cols, &rows)
+                run.queue_recut[slot.usize()] <- 0
+                if count == 0:
+                    grade: Tetris::TetrisGrade = Tetris::grade_at(run.rung)
+                    Tetris::carve(board, &grade, &run.rng, 32, 8, &piece)
+                    save_slot(run, slot, &piece)
+                    quarters <- []
+                    cols <- []
+                    rows <- []
+                    count <- Tetris::perfect_placements(board, &piece, 0,
+                                                        &quarters, &cols, &rows)
+                    run.queue_recut[slot.usize()] <- 1
+                run.queue_fits[slot.usize()] <- count
+                slot <- slot + 1
+
+    def deal(run: mutable TetrisRun&):
+        can Memory.Allocate, Abort.Panic:
+            board: mutable Tetris::Board = board_of(run)
+            slot: mutable i64 = 0
+            while slot < run.queue_size |slot, run, board|:
+                make_piece(run, &board, slot)
+                slot <- slot + 1
+            revalidate(run, &board)
+            load_slot(run, 0)
+            run.selected <- 0
+            run.quarter <- 0
+            run.column <- 0
+            run.row <- 0
+
+    def start(run: mutable TetrisRun&):
+        can Memory.Allocate, Abort.Panic:
+            run.phase <- PHASE_PLAYING
+            run.rung <- run.start_rung
+            run.piece <- 0
+            run.score <- 0
+            run.remainder <- 0
+            run.clean <- 0
+            run.buried <- 0
+            run.lines <- 0
+            run.streak <- 0
+            run.slips <- 0
+            run.best_rung <- run.rung
+            clear_arrays(run)
+            deal(run)
+
+    def rotate(run: mutable TetrisRun&):
+        can Memory.Allocate, Abort.Panic:
+            source: mutable Tetris::Piece = active_piece(run)
+            turned: mutable Tetris::Piece = Tetris::Piece()
+            Tetris::quarter_turn(&source, 1, &turned)
+            copy_piece_to_active(run, &turned)
+            run.quarter <- (run.quarter + 1) % 4
+
+    def drop(run: mutable TetrisRun&):
+        can Memory.Allocate, Abort.Panic:
+            return if run.phase != PHASE_PLAYING
+            board: mutable Tetris::Board = Tetris::Board(run.cols, run.rows)
+            cell: mutable i64 = 0
+            while cell < run.cols * run.rows |cell, run, board|:
+                Tetris::fill_cell(&board, cell % run.cols, cell / run.cols,
+                                  run.board[cell.usize()])
+                cell <- cell + 1
+            piece: mutable Tetris::Piece = active_piece(run)
+            Tetris::skyline(&board)
+            landed: i64 = Tetris::landing(&board, &piece, run.column)
+            return if landed < 0
+            run.row <- landed
+            gaps: i64 = Tetris::gaps_under(&board, &piece, run.column, landed)
+            at: mutable i64 = 0
+            while at < piece.count |at, piece, run, landed|:
+                x: i64 = run.column + Ints::at_ref(&piece.x, at)
+                y: i64 = landed + Ints::at_ref(&piece.y, at)
+                Tetris::fill_cell(&board, x, y, run.piece + 1)
+                at <- at + 1
+            cleared: i64 = Tetris::clear_full_rows(&board)
+            copy_board_back(run, &board)
+            run.score <- run.score + 1 if gaps == 0 else run.score
+            run.clean <- run.clean + 1 if gaps == 0 else run.clean
+            run.buried <- run.buried + gaps
+            run.lines <- run.lines + cleared
+            run.streak <- run.streak + 1 if gaps == 0 else 0
+            run.slips <- run.slips + 1 if gaps != 0 else 0
+            if run.streak >= 6 and run.rung < 8:
+                run.rung <- run.rung + 1
+                run.streak <- 0
+                run.slips <- 0
+            elif run.slips >= 3 and run.rung > 1:
+                run.rung <- run.rung - 1
+                run.slips <- 0
+            run.best_rung <- run.rung if run.rung > run.best_rung else run.best_rung
+            run.piece <- run.piece + 1
+            if run.piece >= run.target:
+                run.phase <- PHASE_DONE
+                return
+            # The chosen slot is replaced; the rest of the hand survives but
+            # is revalidated against the new pile, as in the source.
+            grade: Tetris::TetrisGrade = Tetris::grade_at(run.rung)
+            replacement: mutable Tetris::Piece = Tetris::Piece()
+            Tetris::carve(&board, &grade, &run.rng, 32, 8, &replacement)
+            save_slot(run, run.selected, &replacement)
+            revalidate(run, &board)
+            load_slot(run, run.selected)
+            run.quarter <- 0
+            run.column <- 0
+            run.row <- 0
+
+    def apply(run: mutable TetrisRun&, action: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return -1 if action < ACTION_SPACE or action >= ACTION_SELECT_BASE + MAX_PIECES
+            if action == ACTION_SPACE:
+                start(run) if run.phase == PHASE_READY else drop(run)
+                return 1
+            if action == ACTION_RESTART:
+                run.phase <- PHASE_READY
+                start(run)
+                return 1
+            if action >= ACTION_SELECT_BASE:
+                return 0 if run.phase != PHASE_PLAYING
+                selected: i64 = action - ACTION_SELECT_BASE
+                return 0 if selected >= run.queue_size
+                run.selected <- selected
+                load_slot(run, selected)
+                run.quarter <- 0
+                run.column <- 0
+                run.row <- 0
+                return 1
+            return 0 if run.phase != PHASE_PLAYING
+            if action == ACTION_LEFT:
+                run.column <- run.column - 1 if run.column > 0 else run.column
+            elif action == ACTION_RIGHT:
+                run.column <- run.column + 1 if run.column + 1 < run.cols else run.column
+            elif action == ACTION_ROTATE:
+                rotate(run)
+            elif action == ACTION_DROP:
+                drop(run)
+            return 1
+
+    # Pointer coordinates are normalised by the common ABI.  Map the tray
+    # rectangles using the same 912x684 logical canvas as SceneTetris.  The
+    # browser and native hosts therefore select the same slot, independent of
+    # their physical canvas size.
+    def pointer_slot(run: TetrisRun&, x_millionths: i64, y_millionths: i64) -> i64:
+        can Abort.Panic:
+            x: f64 = x_millionths.f64() * 912.0 / 1000000.0
+            y: f64 = y_millionths.f64() * 684.0 / 1000000.0
+            canvas_bottom: f64 = 52.0
+            canvas_height: f64 = 540.0
+            tray: f64 = 96.0
+            room: f64 = canvas_height - tray - 12.0
+            cell: mutable f64 = (912.0 * 0.94 / run.cols.f64())
+            room_cell: f64 = room / run.rows.f64()
+            cell <- room_cell if room_cell < cell else cell
+            field_width: f64 = cell * run.cols.f64()
+            field_left: f64 = 912.0 * 0.03 + (912.0 * 0.94 - field_width) / 2.0
+            tray_bottom: f64 = canvas_bottom + room
+            return -1 if y < tray_bottom or y > tray_bottom + tray
+            return -1 if x < field_left or x >= field_left + field_width
+            slot: i64 = ((x - field_left) / (field_width / run.queue_size.f64())).i64()
+            return -1 if slot < 0 or slot >= run.queue_size
+            return slot
+
+    def info(run: TetrisRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_RUNG: return run.rung
+            if field == INFO_PIECE: return run.piece
+            if field == INFO_SCORE: return run.score
+            if field == INFO_SELECTED: return run.selected
+            if field == INFO_QUARTER: return run.quarter
+            if field == INFO_COLUMN: return run.column
+            if field == INFO_ROW: return run.row
+            if field == INFO_REMAINDER: return run.target - run.piece
+            return -1
+
+    # Render is a read-only projection of TetrisRun. The scene remains the sole
+    # owner of display ordering, sizing, colors, ghost styling, and text
+    # layout; this adapter only converts the controller's bounded arrays into
+    # the darrays required by SceneTetris.
+    def render(run: TetrisRun&, black_background: bool, width: f64, height: f64,
+               sx: f64, sy: f64, list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            board: mutable darray[i64] = Ints::zeros(run.cols * run.rows)
+            cell: mutable i64 = 0
+            while cell < run.cols * run.rows |cell, run, board|:
+                Ints::put(&board, cell, run.board[cell.usize()])
+                cell <- cell + 1
+
+            queue_cells: mutable darray[SceneTetris::TetrisCell] = []
+            queue_counts: mutable darray[i64] = []
+            slot: mutable i64 = 0
+            while slot < run.queue_size |slot, run, queue_cells, queue_counts|:
+                count: i64 = run.queue_count[slot.usize()]
+                queue_counts.push(count)
+                base: i64 = slot * MAX_PIECE_CELLS
+                at: mutable i64 = 0
+                while at < count |at, count, base, slot, run, queue_cells|:
+                    queue_cells.push(SceneTetris::TetrisCell{
+                        x: run.queue_x[(base + at).usize()],
+                        y: run.queue_y[(base + at).usize()], tint: count})
+                    at <- at + 1
+                slot <- slot + 1
+
+            fits: mutable darray[i64] = []
+            recut: mutable darray[bool] = []
+            slot <- 0
+            while slot < run.queue_size |slot, run, fits, recut|:
+                fits.push(run.queue_fits[slot.usize()])
+                recut.push(run.queue_recut[slot.usize()] != 0)
+                slot <- slot + 1
+
+            ghost: mutable darray[SceneTetris::TetrisBlock] = []
+            flying: mutable darray[SceneTetris::TetrisBlock] = []
+            if run.phase == PHASE_PLAYING and run.active_count > 0:
+                piece: mutable Tetris::Piece = active_piece(run)
+                logic_board: mutable Tetris::Board = Tetris::Board(run.cols, run.rows)
+                cell <- 0
+                while cell < run.cols * run.rows |cell, run, logic_board|:
+                    Tetris::fill_cell(&logic_board, cell % run.cols,
+                                      cell / run.cols, run.board[cell.usize()])
+                    cell <- cell + 1
+                Tetris::skyline(&logic_board)
+                landed: i64 = Tetris::landing(&logic_board, &piece, run.column)
+                if landed >= 0:
+                    gap_count: i64 = Tetris::gaps_under(&logic_board, &piece,
+                                                        run.column, landed)
+                    for at in 0..<piece.count |at, piece, run, landed, ghost|:
+                        ghost.push(SceneTetris::TetrisBlock{
+                            x: run.column.f64() + Ints::at(piece.x, at).f64(),
+                            y: landed.f64() + Ints::at(piece.y, at).f64()})
+                    for at in 0..<piece.count |at, piece, run, flying|:
+                        flying.push(SceneTetris::TetrisBlock{
+                            x: run.column.f64() + Ints::at(piece.x, at).f64(),
+                            y: run.row.f64() + Ints::at(piece.y, at).f64()})
+                    paint: SceneTetris::TetrisPaint = SceneTetris::paint_of(
+                        black_background, width, height, sx, sy)
+                    status: sview = sview("Choose a piece and drop it", 0, -1)
+                    readout: sview = sview("", 0, -1)
+                    SceneTetris::render(list, &paint, run.phase, run.cols,
+                        run.rows, &board, &queue_cells, &queue_counts, &fits,
+                        &recut, run.selected, &ghost, gap_count == 0, &flying,
+                        piece.count, run.quarter.f64() * 90.0, status, readout,
+                        -1, sview("", 0, -1))
+                    return
+
+            paint: SceneTetris::TetrisPaint = SceneTetris::paint_of(
+                black_background, width, height, sx, sy)
+            status: mutable sview = sview("Press SPACE to start", 0, -1)
+            if run.phase == PHASE_DONE:
+                status <- sview("Run complete", 0, -1)
+            readout: sview = sview("", 0, -1)
+            SceneTetris::render(list, &paint, run.phase, run.cols, run.rows,
+                &board, &queue_cells, &queue_counts, &fits, &recut,
+                run.selected, &ghost, true, &flying, 0, 0.0, status, readout,
+                -1, sview("", 0, -1))

@@ -16,15 +16,17 @@
 #   * probing continues past a dummy (an empty slot ends the probe, a dummy does
 #     not), so a key that collided past the discarded one is still findable;
 #   * `used` drops but `fill` does NOT, because
-#   * a later add SKIPS the dummy and inserts at the first EMPTY slot, bumping
-#     `fill` again. Dummies are never refilled.
+#   * a later add remembers the most recently encountered DUMMY in the complete
+#     hybrid probe and reuses it if the key is not already present. CPython's
+#     `freeslot` is overwritten by each later DUMMY; it is not the first dummy.
+#     Only inserting into a genuinely EMPTY slot bumps `fill`. This distinction
+#     controls the resize schedule and therefore iteration order.
 #
-# That last rule is the one worth stating, because the plausible alternative --
-# reuse the dummy, as a hand-written table would -- is wrong in a way nothing
-# local reveals. Reusing it leaves `fill` low, the table misses its
-# `fill * 5 >= mask * 3` resize, and every subsequent iteration order differs.
-# Minimised from `add 8; discard 8; add 24; add 11; add 28; add 23`, where a real
-# set resizes to 32 slots and a reusing model stays at 8.
+# The first implementation incorrectly skipped dummies. That made the table
+# diverge as soon as a key was removed and a later colliding key was added. The
+# minimal witness is covered by `test/pyset_diff.py`: CPython reuses the
+# tombstone, while a never-refill model needlessly resizes. A second witness
+# with multiple tombstones also guards CPython's last-dummy-wins rule.
 #
 # The rules above were derived by validating a model against a real `set` over
 # 8000 randomised add/discard sequences, not from reading them off; see
@@ -174,28 +176,34 @@ module PySet:
             index: mutable i64 = key & mask
             perturb: mutable i64 = key
             vacancy: mutable i64 = -1
+            vacancy_dummy: mutable bool = false
+            empty_found: mutable bool = false
             present: mutable bool = false
-            while vacancy < 0 and not present |vacancy, present, index, perturb, mask, table, key|:
+            while not empty_found and not present |vacancy, vacancy_dummy, empty_found, present, index, perturb, mask, table, key|:
                 probes: i64 = LINEAR_PROBES if index + LINEAR_PROBES <= mask else 0
                 slot: mutable i64 = index
                 step: mutable i64 = 0
-                while step <= probes and vacancy < 0 and not present |step, probes, slot, table, key, vacancy, present|:
+                while step <= probes and not empty_found and not present |step, probes, slot, table, key, vacancy, vacancy_dummy, empty_found, present|:
                     entry: i64 = Ints::at(table.slots, slot)
-                    # ONLY an empty slot is a vacancy. A dummy is skipped and never
-                    # refilled -- see the header; refilling it would hold `fill` down
-                    # and skip the resize that decides every later iteration order.
                     if entry == EMPTY:
-                        vacancy <- slot
+                        if vacancy < 0:
+                            vacancy <- slot
+                            vacancy_dummy <- false
+                        empty_found <- true
                     elif entry == key:
                         present <- true
                     else:
+                        if entry == DUMMY:
+                            vacancy <- slot
+                            vacancy_dummy <- true
                         slot <- slot + 1
                         step <- step + 1
-                if vacancy < 0 and not present:
+                if not empty_found and not present:
                     perturb <- perturb >> PERTURB_SHIFT
                     index <- (index * 5 + 1 + perturb) & mask
             return if present
-            table.fill <- table.fill + 1
+            if not vacancy_dummy:
+                table.fill <- table.fill + 1
             table.used <- table.used + 1
             Ints::put(&table.slots, vacancy, key)
             return if table.fill * 5 < mask * 3
@@ -447,25 +455,34 @@ module PyPoint:
             index: mutable i64 = (hash_value & mask.u64()).i64()
             perturb: mutable u64 = hash_value
             vacancy: mutable i64 = -1
+            vacancy_dummy: mutable bool = false
+            empty_found: mutable bool = false
             present: mutable bool = false
-            while vacancy < 0 and not present |vacancy, present, index, perturb, mask, table, key|:
+            while not empty_found and not present |vacancy, vacancy_dummy, empty_found, present, index, perturb, mask, table, key|:
                 probes: i64 = PySet::LINEAR_PROBES if index + PySet::LINEAR_PROBES <= mask else 0
                 slot: mutable i64 = index
                 step: mutable i64 = 0
-                while step <= probes and vacancy < 0 and not present |step, probes, slot, table, key, vacancy, present|:
+                while step <= probes and not empty_found and not present |step, probes, slot, table, key, vacancy, vacancy_dummy, empty_found, present|:
                     entry: i64 = Ints::at(table.slots, slot)
                     if entry == PySet::EMPTY:
-                        vacancy <- slot
+                        if vacancy < 0:
+                            vacancy <- slot
+                            vacancy_dummy <- false
+                        empty_found <- true
                     elif entry == key:
                         present <- true
                     else:
+                        if entry == PySet::DUMMY:
+                            vacancy <- slot
+                            vacancy_dummy <- true
                         slot <- slot + 1
                         step <- step + 1
-                if vacancy < 0 and not present:
+                if not empty_found and not present:
                     perturb <- perturb >> PySet::PERTURB_SHIFT.u64()
                     index <- ((index * 5 + 1).u64() + perturb).i64() & mask
             return if present
-            table.fill <- table.fill + 1
+            if not vacancy_dummy:
+                table.fill <- table.fill + 1
             table.used <- table.used + 1
             Ints::put(&table.slots, vacancy, key)
             return if table.fill * 5 < mask * 3

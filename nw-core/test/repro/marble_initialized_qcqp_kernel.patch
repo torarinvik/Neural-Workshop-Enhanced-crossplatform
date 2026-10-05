@@ -1,0 +1,227 @@
+diff --git a/src/engine/engine_util_solve.c b/src/engine/engine_util_solve.c
+index 5f72b01..218ea90 100644
+--- a/src/engine/engine_util_solve.c
++++ b/src/engine/engine_util_solve.c
+@@ -1403,6 +1403,9 @@ int mju_QCQP3(mjtNum* res, const mjtNum* Ain, const mjtNum* bin,
+ }
+ 
+ 
++// solve QCQP in n dimensions:
++#include "engine/marble_qcqp_kernel_trace.h"
++
+ // solve QCQP in n dimensions:
+ //  min  0.5*x'*A*x + x'*b  s.t.  sum (xi/di)^2 <= r^2
+ // return 0 if unconstrained, 1 if constrained
+@@ -1435,7 +1438,15 @@ int mju_QCQP(mjtNum* res, const mjtNum* Ain, const mjtNum* bin,
+     }
+ 
+     // factorize, check rank with 1e-10 threshold
+-    if (mju_cholFactor(Ala, n, 1e-10) < n) {
++    mjtNum marble_prefactor[25];
++    mjtNum marble_before = la;
++    if (marble_qcqp_kernel_parent >= 0 && n == 5) {
++      mju_copy(marble_prefactor, Ala, n*n);
++    }
++    int marble_rank = mju_cholFactor(Ala, n, 1e-10);
++    if (marble_rank < n) {
++      marbleRecordQCQPKernel(iter, n, marble_rank, 3, 0, marble_before, la,
++          0, 0, 0, 0, 0, A, b, marble_prefactor, Ala, NULL, NULL);
+       mju_zero(res, n);
+       return 0;
+     }
+@@ -1445,25 +1456,35 @@ int mju_QCQP(mjtNum* res, const mjtNum* Ain, const mjtNum* bin,
+     mju_scl(res, res, -1, n);
+ 
+     // val = b' * Ala^-2 * b - r*r
+-    val = mju_dot(res, res, n) - r*r;
++    mjtNum marble_norm = mju_dot(res, res, n);
++    val = marble_norm - r*r;
+ 
+     // check for convergence, or initial solution inside constraint set
+     if (val < 1e-10) {
++      marbleRecordQCQPKernel(iter, n, marble_rank, 7, 1, marble_before, la,
++          marble_norm, val, 0, 0, 0, A, b, marble_prefactor, Ala, res, NULL);
+       break;
+     }
+ 
+     // deriv = -2 * b' * Ala^-3 * b
+     mju_cholSolve(tmp, Ala, res, n);
+-    deriv = -2.0 * mju_dot(res, tmp, n);
++    mjtNum marble_product = mju_dot(res, tmp, n);
++    deriv = -2.0 * marble_product;
+ 
+     // compute update, exit if too small
+     mjtNum delta = -val/deriv;
+     if (delta < 1e-10) {
++      marbleRecordQCQPKernel(iter, n, marble_rank, 15, 2, marble_before, la,
++          marble_norm, val, marble_product, deriv, delta, A, b,
++          marble_prefactor, Ala, res, tmp);
+       break;
+     }
+ 
+     // update
+     la += delta;
++    marbleRecordQCQPKernel(iter, n, marble_rank, 31, iter == 19 ? 4 : 3,
++        marble_before, la, marble_norm, val, marble_product, deriv, delta,
++        A, b, marble_prefactor, Ala, res, tmp);
+   }
+ 
+   // undo scaling
+diff --git a/src/engine/engine_solver.c b/src/engine/engine_solver.c
+index 629445d..c86f983 100644
+--- a/src/engine/engine_solver.c
++++ b/src/engine/engine_solver.c
+@@ -500,6 +500,11 @@ static void projectEllipsoid(mjtNum* friction, mjtNum normal, const mjtNum* mu,
+ }
+ 
+ 
++// solve QCQP and project onto friction ellipsoid, write to force[i+1..i+dim-1]
++extern void mj_solver_qcqp_kernel_reset(void);
++extern void mj_solver_qcqp_kernel_begin(int);
++extern void mj_solver_qcqp_kernel_end(void);
++
+ // solve QCQP and project onto friction ellipsoid, write to force[i+1..i+dim-1]
+ static void solveQCQP(mjtNum* force, int i, int dim,
+                       mjtNum* Ac, mjtNum* bc, const mjtNum* mu,
+@@ -513,7 +518,9 @@ static void solveQCQP(mjtNum* force, int i, int dim,
+   } else if (dim == 4) {
+     flg_active = mju_QCQP3(v, Ac, bc, mu, force[i]);
+   } else {  // dim == 5
++    if (witness) mj_solver_qcqp_kernel_begin(marble_qcqp_trace_calls);
+     flg_active = mju_QCQP(v, Ac, bc, mu, force[i], dim-1);
++    if (witness) mj_solver_qcqp_kernel_end();
+   }
+ 
+   if (witness) {
+@@ -1644,6 +1651,7 @@ static void marbleRecordSparseInput(const mjPrimalContext* ctx) {
+ }
+ 
+ MJAPI void mj_solver_trace_reset(void) {
++  mj_solver_qcqp_kernel_reset();
+   marble_qcqp_trace_size = 0;
+   marble_qcqp_trace_calls = 0;
+   marble_qcqp_trace_overflow = 0;
+diff --git a/wasm/codegen/generated/bindings.cc b/wasm/codegen/generated/bindings.cc
+index 21592c3..ffc5c60 100644
+--- a/wasm/codegen/generated/bindings.cc
++++ b/wasm/codegen/generated/bindings.cc
+@@ -44,6 +44,12 @@ extern "C" int mj_solver_qcqp_trace_calls();
+ extern "C" int mj_solver_qcqp_trace_overflow();
+ extern "C" int mj_solver_qcqp_trace_invalid();
+ extern "C" void mj_solver_qcqp_trace_copy(mjtNum*);
++extern "C" int mj_solver_qcqp_kernel_schema();
++extern "C" int mj_solver_qcqp_kernel_size();
++extern "C" int mj_solver_qcqp_kernel_calls();
++extern "C" int mj_solver_qcqp_kernel_overflow();
++extern "C" int mj_solver_qcqp_kernel_invalid();
++extern "C" void mj_solver_qcqp_kernel_copy(mjtNum*);
+ extern "C" int mj_noslip_input_trace_size();
+ extern "C" void mj_noslip_input_trace_copy(mjtNum*);
+ extern "C" int mj_solver_sparse_input_size();
+@@ -2208,6 +2214,16 @@ val marble_newton_trace_wrapper(const MjModel& m, MjData& d) {
+   output.set("qcqpTraceCalls", mj_solver_qcqp_trace_calls());
+   output.set("qcqpTraceOverflow", static_cast<bool>(mj_solver_qcqp_trace_overflow()));
+   output.set("qcqpTraceInvalid", static_cast<bool>(mj_solver_qcqp_trace_invalid()));
++  const int qcqp_kernel_size = mj_solver_qcqp_kernel_size();
++  std::vector<mjtNum> qcqp_kernel_trace(qcqp_kernel_size);
++  mj_solver_qcqp_kernel_copy(qcqp_kernel_trace.data());
++  val qcqp_kernel_values = val::array();
++  for (int i = 0; i < qcqp_kernel_size; ++i) qcqp_kernel_values.set(i, qcqp_kernel_trace[i]);
++  output.set("qcqpKernelTrace", qcqp_kernel_values);
++  output.set("qcqpKernelSchema", mj_solver_qcqp_kernel_schema());
++  output.set("qcqpKernelCalls", mj_solver_qcqp_kernel_calls());
++  output.set("qcqpKernelOverflow", static_cast<bool>(mj_solver_qcqp_kernel_overflow()));
++  output.set("qcqpKernelInvalid", static_cast<bool>(mj_solver_qcqp_kernel_invalid()));
+   const int residual_input_size = mj_noslip_input_trace_size();
+   std::vector<mjtNum> residual_input(residual_input_size);
+   mj_noslip_input_trace_copy(residual_input.data());
+diff --git a/src/engine/marble_qcqp_kernel_trace.h b/src/engine/marble_qcqp_kernel_trace.h
+new file mode 100644
+index 0000000..27b3685
+--- /dev/null
++++ b/src/engine/marble_qcqp_kernel_trace.h
+@@ -0,0 +1,84 @@
++// Private initialized generic-five-tangent kernel diagnostics; no arithmetic.
++#ifndef MARBLE_QCQP_KERNEL_TRACE_H_
++#define MARBLE_QCQP_KERNEL_TRACE_H_
++#define MARBLE_QCQP_KERNEL_CAPACITY 300000
++static mjtNum marble_qcqp_kernel_values[MARBLE_QCQP_KERNEL_CAPACITY];
++static int marble_qcqp_kernel_size;
++static int marble_qcqp_kernel_calls;
++static int marble_qcqp_kernel_overflow;
++static int marble_qcqp_kernel_invalid;
++static int marble_qcqp_kernel_parent = -1;
++
++MJAPI void mj_solver_qcqp_kernel_reset(void) {
++  marble_qcqp_kernel_size = 0;
++  marble_qcqp_kernel_calls = 0;
++  marble_qcqp_kernel_overflow = 0;
++  marble_qcqp_kernel_invalid = 0;
++  marble_qcqp_kernel_parent = -1;
++}
++MJAPI void mj_solver_qcqp_kernel_begin(int parent) {
++  if (parent < 0 || marble_qcqp_kernel_parent >= 0) {
++    marble_qcqp_kernel_invalid = 1;
++    return;
++  }
++  marble_qcqp_kernel_parent = parent;
++}
++MJAPI void mj_solver_qcqp_kernel_end(void) { marble_qcqp_kernel_parent = -1; }
++MJAPI int mj_solver_qcqp_kernel_schema(void) { return 1; }
++MJAPI int mj_solver_qcqp_kernel_size(void) { return marble_qcqp_kernel_size; }
++MJAPI int mj_solver_qcqp_kernel_calls(void) { return marble_qcqp_kernel_calls; }
++MJAPI int mj_solver_qcqp_kernel_overflow(void) { return marble_qcqp_kernel_overflow; }
++MJAPI int mj_solver_qcqp_kernel_invalid(void) { return marble_qcqp_kernel_invalid; }
++MJAPI void mj_solver_qcqp_kernel_copy(mjtNum* output) {
++  if (output && marble_qcqp_kernel_size) {
++    memcpy(output, marble_qcqp_kernel_values,
++           (size_t)marble_qcqp_kernel_size * sizeof(mjtNum));
++  }
++}
++static void marbleRecordQCQPKernel(int iteration, int n, int rank, int valid,
++                                  int reason, mjtNum before, mjtNum after,
++                                  mjtNum norm, mjtNum value, mjtNum product,
++                                  mjtNum derivative, mjtNum delta,
++                                  const mjtNum* A, const mjtNum* b,
++                                  const mjtNum* prefactor, const mjtNum* factor,
++                                  const mjtNum* solved, const mjtNum* tmp) {
++  if (marble_qcqp_kernel_parent < 0) return;
++  int ordinal = marble_qcqp_kernel_calls++;
++  if (n != 5 || iteration < 0 || iteration >= 20 || rank < 0 || rank > n ||
++      reason < 0 || reason > 4 ||
++      valid != (reason == 0 ? 3 : reason == 1 ? 7 : reason == 2 ? 15 : 31)) {
++    marble_qcqp_kernel_invalid = 1;
++    return;
++  }
++  int width = 15 + 3*n*n + n + ((valid & 4) ? n : 0) + ((valid & 8) ? n : 0);
++  if (marble_qcqp_kernel_size + width > MARBLE_QCQP_KERNEL_CAPACITY) {
++    marble_qcqp_kernel_overflow = 1;
++    return;
++  }
++  mjtNum* out = marble_qcqp_kernel_values + marble_qcqp_kernel_size;
++  int offset = 0;
++  out[offset++] = 1; out[offset++] = ordinal;
++  out[offset++] = marble_qcqp_kernel_parent;
++  out[offset++] = iteration; out[offset++] = n; out[offset++] = rank;
++  out[offset++] = valid; out[offset++] = reason;
++  out[offset++] = before; out[offset++] = after;
++  out[offset++] = (valid & 4) ? norm : 0;
++  out[offset++] = (valid & 4) ? value : 0;
++  out[offset++] = (valid & 8) ? product : 0;
++  out[offset++] = (valid & 8) ? derivative : 0;
++  out[offset++] = (valid & 8) ? delta : 0;
++  for (int j = 0; j < n*n; ++j) out[offset++] = A[j];
++  for (int j = 0; j < n; ++j) out[offset++] = b[j];
++  for (int j = 0; j < n*n; ++j) out[offset++] = prefactor[j];
++  for (int j = 0; j < n*n; ++j) out[offset++] = factor[j];
++  if (valid & 4) for (int j = 0; j < n; ++j) out[offset++] = solved[j];
++  if (valid & 8) for (int j = 0; j < n; ++j) out[offset++] = tmp[j];
++  for (int j = 0; j < width; ++j) {
++    if (!isfinite(out[j])) {
++      marble_qcqp_kernel_invalid = 1;
++      return;
++    }
++  }
++  marble_qcqp_kernel_size += width;
++}
++#endif

@@ -1,0 +1,580 @@
+# Stateful Sokoban run controller.
+#
+# The Sokoban kernel owns level generation, proof bounds, and deadlock rules.
+# This module owns run lifecycle and semantic input. A host keeps one fixed
+# Run record in native/WASM memory; generation scratch is scoped per trial and
+# only scalar/fixed-array state is retained between exported calls.
+
+extern realloc(ptr: mutable heap void&?, size: usize) -> mutable heap void&? can[Memory.Allocate]
+
+module SokobanGame:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_PUSHING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_LOST: i64 = 3
+    const PHASE_DONE: i64 = 4
+    const PHASE_UNAVAILABLE: i64 = 5
+
+    const ACTION_SPACE: i64 = 0
+    const ACTION_UP: i64 = 1
+    const ACTION_DOWN: i64 = 2
+    const ACTION_LEFT: i64 = 3
+    const ACTION_RIGHT: i64 = 4
+    const ACTION_UNDO: i64 = 5
+    const ACTION_RESTART: i64 = 6
+
+    const INFO_PHASE: i64 = 0
+    const INFO_RUNG: i64 = 1
+    const INFO_TRIAL: i64 = 2
+    const INFO_TOTAL_TRIALS: i64 = 3
+    const INFO_PLAYER: i64 = 4
+    const INFO_PUSHES: i64 = 5
+    const INFO_MOVES: i64 = 6
+    const INFO_VERDICT: i64 = 7
+    const INFO_WIDTH: i64 = 8
+    const INFO_HEIGHT: i64 = 9
+    const INFO_PAR: i64 = 10
+    const INFO_MINIMUM: i64 = 11
+    const INFO_AT_LEAST: i64 = 12
+    const INFO_BOUND: i64 = 13
+    const INFO_SOLVED_COUNT: i64 = 14
+    const INFO_LOST_COUNT: i64 = 15
+    const INFO_BEST_RUNG: i64 = 16
+    const INFO_EFFICIENCY: i64 = 17
+    const INFO_HAS_LEVEL: i64 = 18
+    const INFO_SHOW_TRAPS: i64 = 19
+
+    const CELL_WALL: i64 = 0
+    const CELL_GOAL: i64 = 1
+    const CELL_TRAP: i64 = 2
+    const CELL_BOX: i64 = 3
+
+    const MAX_RUNG: i64 = 16
+    const MOST_CELLS: i64 = 256
+    const INITIAL_HISTORY_CAPACITY: i64 = 64
+    const SEARCH_CAPACITY: i64 = 80000
+    const GENERATION_ATTEMPTS: i64 = 300
+    const CLIMB_TENTHS: i64 = 14
+
+    # A history word packs the previous player cell (8 bits), direction (2),
+    # and whether that move pushed a box (1). History grows on the C heap and
+    # doubles as needed, matching the source's unbounded undo list without
+    # bloating the persistent Run record by half a megabyte for every shell.
+    struct SokobanRun:
+        start_rung: mutable i64
+        total_trials: mutable i64
+        adaptive: mutable bool
+        show_traps: mutable bool
+        seed: mutable i64
+        rng: mutable MT19937
+        walls: mutable i64[256]
+        goals: mutable i64[256]
+        traps: mutable i64[256]
+        boxes: mutable i64[256]
+        start_boxes: mutable i64[256]
+        history_pointer: mutable i64
+        history_capacity: mutable i64
+        history_count: mutable i64
+        width: mutable i64
+        height: mutable i64
+        cells: mutable i64
+        minimum: mutable i64
+        at_least: mutable i64
+        bound: mutable i64
+        rung: mutable i64
+        trial: mutable i64
+        phase: mutable i64
+        verdict: mutable i64
+        player: mutable i64
+        start_player: mutable i64
+        pushes: mutable i64
+        moves: mutable i64
+        par: mutable i64
+        started_at_ms: mutable i64
+        took_seconds: mutable i64
+        solved_count: mutable i64
+        lost_count: mutable i64
+        total_par: mutable i64
+        total_pushes: mutable i64
+        best_rung: mutable i64
+        has_level: mutable bool
+
+    def clamp_rung(rung: i64) -> i64:
+        can Abort.Panic:
+            return 1 if rung < 1 else (MAX_RUNG if rung > MAX_RUNG else rung)
+
+    def new_run(start_rung: i64, total_trials: i64, adaptive: bool,
+                show_traps: bool, seed: i64) -> SokobanRun:
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            return SokobanRun{
+                start_rung: clamp_rung(start_rung), total_trials: total_trials,
+                adaptive: adaptive, show_traps: show_traps, seed: seed, rng: rng,
+                walls: zeroed, goals: zeroed, traps: zeroed, boxes: zeroed,
+                start_boxes: zeroed, history_pointer: 0, history_capacity: 0,
+                history_count: 0,
+                width: 0, height: 0, cells: 0, minimum: -1, at_least: 0,
+                bound: 0, rung: clamp_rung(start_rung), trial: 0,
+                phase: PHASE_READY, verdict: -1, player: 0, start_player: 0,
+                pushes: 0, moves: 0, par: 0, started_at_ms: 0,
+                took_seconds: 0, solved_count: 0, lost_count: 0,
+                total_par: 0, total_pushes: 0, best_rung: 0, has_level: false,
+            }
+
+    # Initialize an already allocated, fixed-layout Run. No arena-backed
+    # containers are stored in this record, so the pointer ABI has no hidden
+    # region lifetime to extend across calls.
+    def initialize(run: mutable SokobanRun&, start_rung: i64, total_trials: i64,
+                   adaptive: bool, show_traps: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.start_rung <- clamp_rung(start_rung)
+            run.total_trials <- 1 if total_trials < 1 else total_trials
+            run.adaptive <- adaptive
+            run.show_traps <- show_traps
+            run.seed <- seed
+            run.rng <- rng
+            run.history_count <- 0
+            run.history_pointer <- 0
+            run.history_capacity <- 0
+            run.width <- 0
+            run.height <- 0
+            run.cells <- 0
+            run.minimum <- -1
+            run.at_least <- 0
+            run.bound <- 0
+            run.rung <- clamp_rung(start_rung)
+            run.trial <- 0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.player <- 0
+            run.start_player <- 0
+            run.pushes <- 0
+            run.moves <- 0
+            run.par <- 0
+            run.started_at_ms <- 0
+            run.took_seconds <- 0
+            run.solved_count <- 0
+            run.lost_count <- 0
+            run.total_par <- 0
+            run.total_pushes <- 0
+            run.best_rung <- 0
+            run.has_level <- false
+            cell: mutable i64 = 0
+            while cell < MOST_CELLS |cell, run|:
+                run.walls[cell.usize()] <- 0
+                run.goals[cell.usize()] <- 0
+                run.traps[cell.usize()] <- 0
+                run.boxes[cell.usize()] <- 0
+                run.start_boxes[cell.usize()] <- 0
+                cell <- cell + 1
+
+    # Generation uses the production kernel and original 300-attempt setting.
+    # The only values copied out of this 64 MiB scratch region are scalars and
+    # the five fixed-size board arrays in Run.
+    def generate_level(run: mutable SokobanRun&, deal_seed: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            generated: mutable bool = false
+            region generation(67108864):
+                in generation:
+                    work: mutable Sokoban::SokobanWork = Sokoban::work_new()
+                    search: mutable Sokoban::Search = Sokoban::Search(SEARCH_CAPACITY)
+                    level: mutable Sokoban::Level = Sokoban::Level()
+                    if Sokoban::generate(&work, &search, run.rung, deal_seed,
+                                         GENERATION_ATTEMPTS, &level):
+                        run.width <- level.width
+                        run.height <- level.height
+                        run.cells <- level.cells
+                        run.minimum <- level.minimum
+                        run.at_least <- level.at_least
+                        run.bound <- level.bound
+                        run.player <- level.player
+                        run.start_player <- level.player
+                        cell: mutable i64 = 0
+                        while cell < level.cells |cell, run, level|:
+                            run.walls[cell.usize()] <- Ints::at(level.walls_in, cell)
+                            run.goals[cell.usize()] <- Ints::at(level.goals_in, cell)
+                            run.traps[cell.usize()] <- Ints::at(level.traps_in, cell)
+                            run.boxes[cell.usize()] <- Ints::at(level.boxes_in, cell)
+                            run.start_boxes[cell.usize()] <- Ints::at(level.boxes_in, cell)
+                            cell <- cell + 1
+                        generated <- true
+                destroy generation
+            return generated
+
+    def reset_level(run: mutable SokobanRun&):
+        can Abort.Panic:
+            run.player <- run.start_player
+            run.pushes <- 0
+            run.moves <- 0
+            run.history_count <- 0
+            cell: mutable i64 = 0
+            while cell < run.cells |cell, run|:
+                run.boxes[cell.usize()] <- run.start_boxes[cell.usize()]
+                cell <- cell + 1
+
+    def reserve_history(run: mutable SokobanRun&, needed: i64) -> bool:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return true if needed <= run.history_capacity
+            return false if needed <= 0 or needed > 1073741823
+            capacity: mutable i64 = INITIAL_HISTORY_CAPACITY if run.history_capacity <= 0 else run.history_capacity
+            while capacity < needed |capacity, needed|:
+                return false if capacity > 536870911
+                capacity <- capacity * 2
+            trusted Unsafe.PointerCast:
+                old: mutable heap void&? = run.history_pointer.uintptr().cast[mutable heap void&?]
+                raw: mutable heap void&? = realloc(old, (capacity * size_of(u16).i64()).usize())
+                if raw == null:
+                    return false
+                run.history_pointer <- raw.uintptr().i64()
+            run.history_capacity <- capacity
+            return true
+
+    def history_get(run: SokobanRun&, index: i64) -> u16:
+        can Unsafe.PointerCast, Abort.Panic:
+            trusted Unsafe.PointerCast:
+                history: heap u16& = run.history_pointer.uintptr().cast[heap u16&]
+                return history[index.usize()]
+
+    def history_put(run: mutable SokobanRun&, index: i64, value: u16):
+        can Unsafe.PointerCast, Abort.Panic:
+            trusted Unsafe.PointerCast:
+                history: mutable heap u16& = run.history_pointer.uintptr().cast[mutable heap u16&]
+                history[index.usize()] <- value
+
+    def dispose(run: mutable SokobanRun&):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            if run.history_pointer != 0:
+                trusted Unsafe.PointerCast:
+                    history: heap void& = run.history_pointer.uintptr().cast[heap void&]
+                    free(history)
+            run.history_pointer <- 0
+            run.history_capacity <- 0
+            run.history_count <- 0
+
+    def next_trial(run: mutable SokobanRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.trial >= run.total_trials:
+                run.phase <- PHASE_DONE
+                run.verdict <- -1
+                run.has_level <- false
+                return
+            run.trial <- run.trial + 1
+            deal_seed: i64 = py_randbelow(&run.rng, 1073741824.u64()).i64()
+            if not generate_level(run, deal_seed):
+                run.phase <- PHASE_UNAVAILABLE
+                run.verdict <- -1
+                run.has_level <- false
+                return
+            run.has_level <- true
+            run.pushes <- 0
+            run.moves <- 0
+            run.history_count <- 0
+            run.started_at_ms <- now_ms
+            run.took_seconds <- 0
+            run.par <- run.minimum if run.minimum >= 0 else run.at_least
+            run.phase <- PHASE_PUSHING
+            run.verdict <- -1
+
+    def start_run(run: mutable SokobanRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.rung <- clamp_rung(run.start_rung)
+            run.trial <- 0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.player <- 0
+            run.start_player <- 0
+            run.pushes <- 0
+            run.moves <- 0
+            run.par <- 0
+            run.started_at_ms <- now_ms
+            run.took_seconds <- 0
+            run.solved_count <- 0
+            run.lost_count <- 0
+            run.total_par <- 0
+            run.total_pushes <- 0
+            run.best_rung <- 0
+            run.history_count <- 0
+            run.has_level <- false
+            next_trial(run, now_ms)
+
+    def is_solved(run: SokobanRun&) -> bool:
+        can Abort.Panic:
+            cell: mutable i64 = 0
+            while cell < run.cells |cell, run|:
+                if run.boxes[cell.usize()] == 1 and run.goals[cell.usize()] == 0:
+                    return false
+                cell <- cell + 1
+            return true
+
+    # Same conservative test as neural_workshop.sokoban.deadlocked: a box off
+    # the reverse-push live set or a box frozen off-goal. Unknown deadlocks
+    # remain playable instead of being mislabeled as lost.
+    def is_deadlocked(run: mutable SokobanRun&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            dead: mutable bool = false
+            region check(1048576):
+                in check:
+                    work: mutable Sokoban::SokobanWork = Sokoban::work_new()
+                    walls: mutable darray[i64] = Ints::zeros(MOST_CELLS)
+                    goals: mutable darray[i64] = Ints::zeros(MOST_CELLS)
+                    boxes: mutable darray[i64] = Ints::zeros(MOST_CELLS)
+                    cell: mutable i64 = 0
+                    while cell < run.cells |cell, run, work, walls, goals, boxes|:
+                        Ints::put(&walls, cell, run.walls[cell.usize()])
+                        Ints::put(&goals, cell, run.goals[cell.usize()])
+                        Ints::put(&boxes, cell, run.boxes[cell.usize()])
+                        cell <- cell + 1
+                    work.width <- run.width
+                    work.height <- run.height
+                    work.cells <- run.cells
+                    Sokoban::floor_flags(&work, &walls)
+                    Sokoban::live_cells(&work, &goals)
+                    Sokoban::mark_dead(&work)
+                    cell <- 0
+                    while cell < run.cells and not dead |cell, run, work, boxes, dead|:
+                        if run.boxes[cell.usize()] == 1:
+                            dead <- true if Ints::at(work.alive_in, cell) == 0
+                        cell <- cell + 1
+                    cell <- 0
+                    while cell < run.cells and not dead |cell, run, work, boxes, dead|:
+                        if run.boxes[cell.usize()] == 1 and run.goals[cell.usize()] == 0:
+                            work.assumed_gen <- work.assumed_gen + 1
+                            dead <- Sokoban::is_stuck(&work, &boxes, cell)
+                        cell <- cell + 1
+                destroy check
+            return dead
+
+    def settle_solved(run: mutable SokobanRun&, now_ms: i64):
+        can Abort.Panic:
+            original_rung: i64 = run.rung
+            run.solved_count <- run.solved_count + 1
+            run.total_par <- run.total_par + run.par
+            run.total_pushes <- run.total_pushes + run.pushes
+            run.best_rung <- original_rung if original_rung > run.best_rung
+            elapsed_ms: mutable i64 = now_ms - run.started_at_ms
+            elapsed_ms <- 0 if elapsed_ms < 0
+            run.took_seconds <- elapsed_ms / 1000
+            run.phase <- PHASE_SOLVED
+            run.verdict <- 1 if run.pushes <= run.par else 0
+            if run.adaptive:
+                if run.pushes * 10 <= run.par * CLIMB_TENTHS:
+                    run.rung <- clamp_rung(run.rung + 1)
+                elif run.pushes > run.par * 2:
+                    run.rung <- clamp_rung(run.rung - 1)
+
+    def settle_lost(run: mutable SokobanRun&):
+        can Abort.Panic:
+            run.lost_count <- run.lost_count + 1
+            if run.adaptive:
+                run.rung <- clamp_rung(run.rung - 1)
+            run.phase <- PHASE_LOST
+            run.verdict <- 0
+
+    def step(run: mutable SokobanRun&, direction: i64, now_ms: i64):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return if run.phase != PHASE_PUSHING or not run.has_level
+            return if direction < 0 or direction >= Sokoban::STEP_COUNT
+            stride: i64 = Sokoban::step_of(run.width, direction)
+            ahead: i64 = run.player + stride
+            return if ahead < 0 or ahead >= run.cells
+            return if run.walls[ahead.usize()] == 1
+            pushed: mutable bool = false
+            beyond: mutable i64 = -1
+            if run.boxes[ahead.usize()] == 1:
+                beyond <- ahead + stride
+                return if beyond < 0 or beyond >= run.cells
+                return if run.walls[beyond.usize()] == 1 or run.boxes[beyond.usize()] == 1
+            return if not reserve_history(run, run.history_count + 1)
+            if run.boxes[ahead.usize()] == 1:
+                run.boxes[ahead.usize()] <- 0
+                run.boxes[beyond.usize()] <- 1
+                run.pushes <- run.pushes + 1
+                pushed <- true
+            record: u16 = ((run.player & 255).u16() |
+                           (direction.u16() << 8.u16()) |
+                           ((1 if pushed else 0).u16() << 10.u16()))
+            history_put(run, run.history_count, record)
+            run.history_count <- run.history_count + 1
+            run.player <- ahead
+            run.moves <- run.moves + 1
+            if is_solved(run):
+                settle_solved(run, now_ms)
+            elif pushed and is_deadlocked(run):
+                settle_lost(run)
+
+    def undo(run: mutable SokobanRun&):
+        can Abort.Panic, Unsafe.PointerCast:
+            return if run.phase != PHASE_PUSHING or run.history_count <= 0
+            at: i64 = run.history_count - 1
+            record: u16 = history_get(run, at)
+            old_player: i64 = (record & 255.u16()).i64()
+            direction: i64 = ((record >> 8.u16()) & 3.u16()).i64()
+            pushed: bool = ((record >> 10.u16()) & 1.u16()) != 0
+            stride: i64 = Sokoban::step_of(run.width, direction)
+            if pushed:
+                near: i64 = old_player + stride
+                beyond: i64 = near + stride
+                run.boxes[near.usize()] <- 1
+                run.boxes[beyond.usize()] <- 0
+                run.pushes <- run.pushes - 1
+            run.player <- old_player
+            run.moves <- 0 if run.moves <= 0 else run.moves - 1
+            run.history_count <- at
+
+    def restart(run: mutable SokobanRun&):
+        can Abort.Panic:
+            return if run.phase != PHASE_PUSHING
+            reset_level(run)
+
+    def apply(run: mutable SokobanRun&, action: i64, now_ms: i64):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            if action == ACTION_SPACE:
+                if run.phase == PHASE_READY or run.phase == PHASE_DONE:
+                    start_run(run, now_ms)
+                elif run.phase == PHASE_SOLVED or run.phase == PHASE_LOST:
+                    next_trial(run, now_ms)
+                return
+            if action >= ACTION_UP and action <= ACTION_RIGHT:
+                step(run, action - ACTION_UP, now_ms)
+            elif action == ACTION_UNDO:
+                undo(run)
+            elif action == ACTION_RESTART:
+                restart(run)
+
+    def efficiency(run: SokobanRun&) -> i64:
+        can Abort.Panic:
+            return 0 if run.total_pushes <= 0
+            scaled: i64 = run.total_par * 100
+            whole: i64 = scaled / run.total_pushes
+            remainder: i64 = scaled % run.total_pushes
+            doubled: i64 = remainder * 2
+            return whole + 1 if doubled > run.total_pushes
+            return whole + 1 if doubled == run.total_pushes and whole % 2 == 1
+            return whole
+
+    def info(run: SokobanRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_RUNG: return run.rung
+            if field == INFO_TRIAL: return run.trial
+            if field == INFO_TOTAL_TRIALS: return run.total_trials
+            if field == INFO_PLAYER: return run.player
+            if field == INFO_PUSHES: return run.pushes
+            if field == INFO_MOVES: return run.moves
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_WIDTH: return run.width
+            if field == INFO_HEIGHT: return run.height
+            if field == INFO_PAR: return run.par
+            if field == INFO_MINIMUM: return run.minimum
+            if field == INFO_AT_LEAST: return run.at_least
+            if field == INFO_BOUND: return run.bound
+            if field == INFO_SOLVED_COUNT: return run.solved_count
+            if field == INFO_LOST_COUNT: return run.lost_count
+            if field == INFO_BEST_RUNG: return run.best_rung
+            if field == INFO_EFFICIENCY: return efficiency(run)
+            if field == INFO_HAS_LEVEL: return 1 if run.has_level else 0
+            if field == INFO_SHOW_TRAPS: return 1 if run.show_traps else 0
+            return -1
+
+    def cell(run: SokobanRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            # The reference keeps the last generated Level attached through
+            # the final summary, although the done scene no longer draws it.
+            return 0 if at < 0 or at >= run.cells
+            if field == CELL_WALL: return run.walls[at.usize()]
+            if field == CELL_GOAL: return run.goals[at.usize()]
+            if field == CELL_TRAP: return run.traps[at.usize()]
+            if field == CELL_BOX: return run.boxes[at.usize()]
+            return 0
+
+    def grade_name(rung: i64) -> sview:
+        return sview("first steps", 0, -1) if rung == 1
+        return sview("one box", 0, -1) if rung == 2
+        return sview("two boxes", 0, -1) if rung == 3
+        return sview("a little room", 0, -1) if rung == 4
+        return sview("three boxes", 0, -1) if rung == 5
+        return sview("tight corners", 0, -1) if rung == 6
+        return sview("four boxes", 0, -1) if rung == 7
+        return sview("five boxes", 0, -1) if rung == 8
+        return sview("the warehouse", 0, -1) if rung == 9
+        return sview("six boxes", 0, -1) if rung == 10
+        return sview("seven boxes", 0, -1) if rung == 11
+        return sview("packed tight", 0, -1) if rung == 12
+        return sview("the labyrinth", 0, -1) if rung == 13
+        return sview("nightmare", 0, -1) if rung == 14
+        return sview("inhuman", 0, -1) if rung == 15
+        return sview("superhuman", 0, -1)
+
+    def render(run: SokobanRun&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            sx: f64 = width / Display::REFERENCE_WIDTH
+            sy: f64 = height / Display::REFERENCE_HEIGHT
+            paint: SceneSokoban::SokobanPaint = SceneSokoban::paint_of(
+                black_background, width, height, sx, sy)
+            walls: mutable darray[bool] = []
+            goals: mutable darray[bool] = []
+            traps: mutable darray[bool] = []
+            boxes: mutable darray[i64] = []
+            message: mutable dstr = []
+            cell_index: mutable i64 = 0
+
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(&message, "Press Space to start")
+            elif run.phase == PHASE_UNAVAILABLE:
+                dstr_append_cstr(&message, "Level unavailable")
+            elif run.phase == PHASE_DONE:
+                dstr_append_i64(&message, run.solved_count)
+                dstr_append_cstr(&message, " puzzles, ")
+                dstr_append_i64(&message, efficiency(run))
+                dstr_append_cstr(&message, "% push efficiency, highest rung ")
+                dstr_append_i64(&message, run.best_rung)
+            elif run.phase == PHASE_LOST:
+                dstr_append_cstr(&message, "Stuck — that box can never reach a goal now")
+            elif run.phase == PHASE_SOLVED:
+                if run.minimum >= 0 and run.pushes <= run.par:
+                    dstr_append_cstr(&message, "Perfect — the minimum ")
+                    dstr_append_i64(&message, run.par)
+                    dstr_append_cstr(&message, " pushes, ")
+                    dstr_append_i64(&message, run.took_seconds)
+                    dstr_append_cstr(&message, "s")
+                elif run.minimum >= 0:
+                    dstr_append_cstr(&message, "Solved in ")
+                    dstr_append_i64(&message, run.pushes)
+                    dstr_append_cstr(&message, " pushes — minimum was ")
+                    dstr_append_i64(&message, run.par)
+                else:
+                    dstr_append_cstr(&message, "Solved in ")
+                    dstr_append_i64(&message, run.pushes)
+                    dstr_append_cstr(&message, " pushes — provably at least ")
+                    dstr_append_i64(&message, run.par)
+            elif run.phase == PHASE_PUSHING:
+                dstr_append_sview(&message, grade_name(run.rung))
+                if run.minimum >= 0:
+                    dstr_append_cstr(&message, " — minimum ")
+                    dstr_append_i64(&message, run.minimum)
+                    dstr_append_cstr(&message, " pushes")
+                else:
+                    dstr_append_cstr(&message, " — between ")
+                    dstr_append_i64(&message, run.at_least)
+                    dstr_append_cstr(&message, " and ")
+                    dstr_append_i64(&message, run.bound)
+                    dstr_append_cstr(&message, " pushes")
+
+            while cell_index < run.cells and run.has_level |cell_index, run|:
+                walls.push(run.walls[cell_index.usize()] != 0)
+                goals.push(run.goals[cell_index.usize()] != 0)
+                traps.push(run.traps[cell_index.usize()] != 0)
+                if run.boxes[cell_index.usize()] != 0:
+                    boxes.push(cell_index)
+                cell_index <- cell_index + 1
+
+            SceneSokoban::render(list, &paint, run.phase, run.has_level,
+                run.width, run.height, &walls, &goals, &traps, &boxes,
+                run.player, run.show_traps, run.pushes, run.trial,
+                run.total_trials, bytes_view(message), run.verdict,
+                bytes_view(message))

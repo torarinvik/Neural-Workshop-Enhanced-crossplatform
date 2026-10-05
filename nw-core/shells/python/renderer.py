@@ -44,6 +44,14 @@ REFERENCE_HEIGHT = 684.0
 # neural_workshop/geometry.py's MAX_FONT_SIZE, and the same reason.
 MAX_FONT_SIZE = 200.0
 
+# Keep the original Neural Workshop UI's fixed-width-first fallback order.
+# The source display-list ABI does not carry a per-command family, so the
+# native shell supplies the same global family preference when building labels.
+SOURCE_FONT_FAMILIES = [
+    "Courier New", "Monospace", "Terminal", "fixed", "Fixed",
+    "Times New Roman", "Helvetica", "Arial",
+]
+
 # Verdict codes, matching matching.elisa's verdict_code.
 VERDICT_NAMES = ["correct", "incorrect", "missed", "unknown"]
 

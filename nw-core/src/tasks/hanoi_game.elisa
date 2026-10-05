@@ -1,0 +1,316 @@
+# Stateful Tower of Hanoi run controller.
+#
+# The source task keeps its pegs as Python lists on the UI object. The common
+# WASM API cannot retain arena-backed darrays between calls, so this adapter
+# stores the same board in fixed arrays and reconstructs a temporary
+# Hanoi::Board whenever it calls the source rule kernel. The rules, optimum,
+# adaptive thresholds, and drawing therefore remain owned by the port rather
+# than by a shell-side approximation.
+
+module HanoiGame:
+
+    const MAX_DISKS: i64 = 12
+    const PEG_COUNT: i64 = 3
+    const MAX_SLOTS: i64 = 36
+    const FEEDBACK_MS: i64 = 1600
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SOLVING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_DONE: i64 = 3
+
+    const ACTION_START: i64 = 0
+    const ACTION_PICK_0: i64 = 1
+    const ACTION_PICK_1: i64 = 2
+    const ACTION_PICK_2: i64 = 3
+
+    const INFO_PHASE: i64 = 0
+    const INFO_START_DISKS: i64 = 1
+    const INFO_DISKS: i64 = 2
+    const INFO_ROUND: i64 = 3
+    const INFO_TOTAL_ROUNDS: i64 = 4
+    const INFO_MOVES: i64 = 5
+    const INFO_PAR: i64 = 6
+    const INFO_PICKED: i64 = 7
+    const INFO_VERDICT: i64 = 8
+    const INFO_ADAPTIVE: i64 = 9
+    const INFO_COMPLETED_ROUNDS: i64 = 10
+    const INFO_EFFICIENCY: i64 = 11
+    const INFO_BEST_DISKS: i64 = 12
+    const INFO_FEEDBACK_UNTIL_MS: i64 = 13
+    const INFO_TAKEN_MS: i64 = 14
+
+    struct Run:
+        start_disks: mutable i64
+        disks: mutable i64
+        trial_disks: mutable i64
+        total_rounds: mutable i64
+        adaptive: mutable bool
+        round: mutable i64
+        moves: mutable i64
+        par: mutable i64
+        picked: mutable i64
+        phase: mutable i64
+        verdict: mutable i64
+        started_at_ms: mutable i64
+        feedback_until_ms: mutable i64
+        taken_ms: mutable i64
+        completed_rounds: mutable i64
+        total_efficiency: mutable f64
+        total_time_ms: mutable i64
+        best_disks: mutable i64
+        heights: mutable i64[3]
+        board: mutable i64[36]
+
+    def clamp_disks(value: i64) -> i64:
+        can Abort.Panic:
+            return Hanoi::SMALLEST_TOWER if value < Hanoi::SMALLEST_TOWER else (Hanoi::LARGEST_TOWER if value > Hanoi::LARGEST_TOWER else value)
+
+    def clamp_rounds(value: i64) -> i64:
+        can Abort.Panic:
+            return 1 if value < 1 else value
+
+    # Copy a source Board into the fixed-layout state that survives the call.
+    def save_board(run: mutable Run&, board: mutable Hanoi::Board&):
+        can Abort.Panic:
+            peg: mutable i64 = 0
+            while peg < PEG_COUNT |peg, run, board|:
+                run.heights[peg.usize()] <- Ints::at_ref(&board.height, peg)
+                peg <- peg + 1
+            slot: mutable i64 = 0
+            while slot < MAX_SLOTS |slot, run, board|:
+                run.board[slot.usize()] <- Ints::at_ref(&board.disk, slot)
+                slot <- slot + 1
+
+    # Rebuild the source representation just long enough to use its exact
+    # legality and solved predicates. The returned darrays are owned by the
+    # current call and are never retained in Run.
+    def load_board(run: Run&) -> Hanoi::Board:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable Hanoi::Board = Hanoi::fresh_pegs(run.trial_disks)
+            peg: mutable i64 = 0
+            while peg < PEG_COUNT |peg, run, out|:
+                Ints::put(&out.height, peg, run.heights[peg.usize()])
+                peg <- peg + 1
+            slot: mutable i64 = 0
+            while slot < MAX_SLOTS |slot, run, out|:
+                Ints::put(&out.disk, slot, run.board[slot.usize()])
+                slot <- slot + 1
+            return out
+
+    def clear_board(run: mutable Run&):
+        can Abort.Panic:
+            peg: mutable i64 = 0
+            while peg < PEG_COUNT |peg, run|:
+                run.heights[peg.usize()] <- 0
+                peg <- peg + 1
+            slot: mutable i64 = 0
+            while slot < MAX_SLOTS |slot, run|:
+                run.board[slot.usize()] <- 0
+                slot <- slot + 1
+
+    def initialize(run: mutable Run&, start_disks: i64, total_rounds: i64,
+                   adaptive: bool, seed: i64):
+        can Abort.Panic:
+            run.start_disks <- clamp_disks(start_disks)
+            run.disks <- clamp_disks(start_disks)
+            run.trial_disks <- 0
+            run.total_rounds <- clamp_rounds(total_rounds)
+            run.adaptive <- adaptive
+            run.round <- 0
+            run.moves <- 0
+            run.par <- 0
+            run.picked <- -1
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.started_at_ms <- 0
+            run.feedback_until_ms <- 0
+            run.taken_ms <- 0
+            run.completed_rounds <- 0
+            run.total_efficiency <- 0.0
+            run.total_time_ms <- 0
+            run.best_disks <- 0
+            clear_board(run)
+
+    def next_round(run: mutable Run&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.round >= run.total_rounds:
+                run.phase <- PHASE_DONE
+                run.picked <- -1
+                run.verdict <- -1
+                clear_board(run)
+                return
+            run.round <- run.round + 1
+            run.trial_disks <- clamp_disks(run.disks)
+            run.moves <- 0
+            run.par <- Hanoi::minimum_moves(run.trial_disks)
+            run.picked <- -1
+            run.verdict <- -1
+            run.started_at_ms <- now_ms
+            run.feedback_until_ms <- 0
+            run.taken_ms <- 0
+            board: mutable Hanoi::Board = Hanoi::fresh_pegs(run.trial_disks)
+            save_board(run, board)
+            run.phase <- PHASE_SOLVING
+
+    def start(run: mutable Run&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.disks <- clamp_disks(run.start_disks)
+            run.round <- 0
+            run.moves <- 0
+            run.par <- 0
+            run.picked <- -1
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.started_at_ms <- now_ms
+            run.feedback_until_ms <- 0
+            run.taken_ms <- 0
+            run.completed_rounds <- 0
+            run.total_efficiency <- 0.0
+            run.total_time_ms <- 0
+            run.best_disks <- 0
+            clear_board(run)
+            next_round(run, now_ms)
+
+    def settle(run: mutable Run&, now_ms: i64):
+        can Abort.Panic:
+            elapsed: mutable i64 = now_ms - run.started_at_ms
+            elapsed <- 0 if elapsed < 0
+            run.taken_ms <- elapsed
+            run.total_time_ms <- run.total_time_ms + elapsed
+            run.completed_rounds <- run.completed_rounds + 1
+            run.total_efficiency <- run.total_efficiency + Hanoi::efficiency(run.par, run.moves)
+            run.best_disks <- run.trial_disks if run.trial_disks > run.best_disks
+            run.verdict <- 1 if run.moves <= run.par else 0
+            if run.adaptive:
+                efficiency: f64 = Hanoi::efficiency(run.par, run.moves)
+                run.disks <- Hanoi::next_disks(run.disks, efficiency)
+            run.phase <- PHASE_SOLVED
+            run.feedback_until_ms <- now_ms + FEEDBACK_MS
+
+    def pick(run: mutable Run&, peg: i64, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            return if run.phase != PHASE_SOLVING
+            return if peg < 0 or peg >= PEG_COUNT
+            if run.picked < 0:
+                if run.heights[peg.usize()] > 0:
+                    run.picked <- peg
+                return
+            if run.picked == peg:
+                run.picked <- -1
+                return
+            board: mutable Hanoi::Board = load_board(run)
+            if Hanoi::can_move(&board, run.picked, peg):
+                Hanoi::apply_move(&board, run.picked, peg)
+                save_board(run, board)
+                run.moves <- run.moves + 1
+                run.picked <- -1
+                if Hanoi::solved(&board):
+                    settle(run, now_ms)
+            else:
+                # Match the source UI: an illegal set-down cancels the picked
+                # disk but is not a move and does not alter the tower.
+                run.picked <- -1
+
+    def apply(run: mutable Run&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                return 2 if run.phase != PHASE_READY and run.phase != PHASE_DONE
+                start(run, now_ms)
+                return 1
+            elif action >= ACTION_PICK_0 and action <= ACTION_PICK_2:
+                return 2 if run.phase != PHASE_SOLVING
+                pick(run, action - ACTION_PICK_0, now_ms)
+                return 1
+            return -6
+
+    def advance(run: mutable Run&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_SOLVED and now_ms >= run.feedback_until_ms:
+                next_round(run, now_ms)
+                return 1
+            return 2
+
+    def efficiency_percent(run: Run&) -> i64:
+        can Abort.Panic:
+            return Hanoi::efficiency_percent(run.total_efficiency,
+                                              run.completed_rounds)
+
+    def mean_seconds(run: Run&) -> i64:
+        can Abort.Panic:
+            return 0 if run.completed_rounds <= 0
+            mean: f64 = run.total_time_ms.f64() / 1000.0 / run.completed_rounds.f64()
+            return py_round_half_even(mean)
+
+    def info(run: Run&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_START_DISKS: return run.start_disks
+            if field == INFO_DISKS: return run.trial_disks
+            if field == INFO_ROUND: return run.round
+            if field == INFO_TOTAL_ROUNDS: return run.total_rounds
+            if field == INFO_MOVES: return run.moves
+            if field == INFO_PAR: return run.par
+            if field == INFO_PICKED: return run.picked
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_COMPLETED_ROUNDS: return run.completed_rounds
+            if field == INFO_EFFICIENCY: return efficiency_percent(run)
+            if field == INFO_BEST_DISKS: return run.best_disks
+            if field == INFO_FEEDBACK_UNTIL_MS: return run.feedback_until_ms
+            if field == INFO_TAKEN_MS: return run.taken_ms
+            return -1
+
+    def append_solved_text(out: mutable dstr&, run: Run&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_cstr(out, "Solved in ")
+            dstr_append_i64(out, run.moves)
+            dstr_append_cstr(out, " moves — the minimum is ")
+            dstr_append_i64(out, run.par)
+            dstr_append_cstr(out, " — in ")
+            dstr_append_i64(out, py_round_half_even(run.taken_ms.f64() / 1000.0))
+            dstr_append_cstr(out, "s")
+
+    def append_done_text(out: mutable dstr&, run: Run&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_i64(out, run.completed_rounds)
+            dstr_append_cstr(out, " towers, ")
+            dstr_append_i64(out, efficiency_percent(run))
+            dstr_append_cstr(out, "% move efficiency, ")
+            dstr_append_i64(out, mean_seconds(run))
+            dstr_append_cstr(out, "s each, largest tower ")
+            dstr_append_i64(out, run.best_disks)
+            dstr_append_cstr(out, " disks")
+
+    def render(run: Run&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            active_disks: i64 = run.trial_disks if run.trial_disks > 0 else run.start_disks
+            board: mutable Hanoi::Board = Hanoi::fresh_pegs(clamp_disks(active_disks))
+            if run.phase == PHASE_SOLVING or run.phase == PHASE_SOLVED:
+                save_board_dummy: i64 = 0
+                peg: mutable i64 = 0
+                while peg < PEG_COUNT |peg, run, board, save_board_dummy|:
+                    Ints::put(&board.height, peg, run.heights[peg.usize()])
+                    peg <- peg + 1
+                slot: mutable i64 = 0
+                while slot < MAX_SLOTS |slot, run, board, save_board_dummy|:
+                    Ints::put(&board.disk, slot, run.board[slot.usize()])
+                    slot <- slot + 1
+
+            sx: f64 = width / Display::REFERENCE_WIDTH
+            sy: f64 = height / Display::REFERENCE_HEIGHT
+            paint: SceneHanoi::Paint = SceneHanoi::paint_of(
+                black_background, width, height, sx, sy)
+            message: mutable dstr = []
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(&message, "Press Space to start")
+            elif run.phase == PHASE_SOLVING:
+                dstr_append_cstr(&message, "Rebuild the tower on another peg")
+            elif run.phase == PHASE_SOLVED:
+                append_solved_text(&message, run)
+            else:
+                append_done_text(&message, run)
+            SceneHanoi::render(list, &paint, &board, run.phase, run.picked,
+                               run.round, run.total_rounds, run.moves, run.par,
+                               active_disks, bytes_view(message))

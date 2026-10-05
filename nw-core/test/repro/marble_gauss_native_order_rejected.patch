@@ -1,0 +1,97 @@
+diff --git a/src/engine/engine_solver.c b/src/engine/engine_solver.c
+index 4cf140a..3e119ef 100644
+--- a/src/engine/engine_solver.c
++++ b/src/engine/engine_solver.c
+@@ -2254,8 +2254,19 @@ static void PrimalUpdateConstraint(mjPrimalContext* ctx, int flg_HessianCone) {
+   mjtNum marble_partial[512];
+   mjtNum marble_constraint_cost = ctx->cost;
+   int marble_record_partial = marble_gauss_enabled && ctx->nv >= 0 && ctx->nv <= 512;
++#if defined(__EMSCRIPTEN__)
++  const int marble_rounded_prefix = nv >= 8 ? (nv/8)*8 : 0;
++#endif
+   for (int i=0; i < nv; i++) {
++#if defined(__EMSCRIPTEN__)
++    mjtNum left = 0.5 * (ctx->Ma[i] - ctx->qfrc_smooth[i]);
++    mjtNum right = ctx->qacc[i] - ctx->qacc_smooth[i];
++    // Exact original private producer: rounded eight-dof blocks, fused tail.
++    Gauss = i < marble_rounded_prefix ? Gauss + left*right
++                                     : mj_marble_wheel_fma(left, right, Gauss);
++#else
+     Gauss += 0.5 * (ctx->Ma[i] - ctx->qfrc_smooth[i]) * (ctx->qacc[i] - ctx->qacc_smooth[i]);
++#endif
+     if (marble_record_partial) marble_partial[i] = Gauss;
+   }
+ 
+@@ -2264,6 +2275,36 @@ static void PrimalUpdateConstraint(mjPrimalContext* ctx, int flg_HessianCone) {
+   marbleRecordGauss(ctx, marble_constraint_cost, Gauss, marble_partial);
+ }
+ 
++// Probe the actual compiled PrimalUpdateConstraint's Gauss producer with
++// zero constraints, owned output storage, and complete validated dof arrays.
++MJAPI int mj_marble_gauss_probe(const mjtNum* packet, int size, mjtNum* output) {
++  if (!packet || !output || size < 2 || size > 2050) return 0;
++  for (int i = 0; i < size; ++i) if (!isfinite(packet[i])) return 0;
++  if (packet[0] != 1 || packet[1] < 0 || packet[1] > 512 ||
++      packet[1] != floor(packet[1])) return 0;
++  const int n = (int)packet[1];
++  if (size != 2 + 4*n) return 0;
++  mjPrimalContext ctx = {0};
++  mjtNum zero = 0, constraint_force[512] = {0};
++  int zero_int = 0;
++  mjContact contact = {0};
++  ctx.nv = n; ctx.island = -1;
++  ctx.contact = &contact;
++  ctx.efc_D = ctx.efc_R = ctx.efc_frictionloss = ctx.efc_aref = &zero;
++  ctx.efc_id = ctx.efc_type = &zero_int; ctx.efc_state = &zero_int;
++  ctx.efc_force = ctx.J = ctx.Jaref = &zero;
++  ctx.Ma = (mjtNum*)(packet+2);
++  ctx.qfrc_smooth = packet+2+n;
++  ctx.qacc = (mjtNum*)(packet+2+2*n);
++  ctx.qacc_smooth = packet+2+3*n;
++  ctx.qfrc_constraint = constraint_force;
++  ctx.marble_trace_valid = MARBLE_VALID_MA;
++  PrimalUpdateConstraint(&ctx, 0);
++  if (!isfinite(ctx.quadGauss[0]) || !isfinite(ctx.cost)) return 0;
++  output[0] = ctx.quadGauss[0]; output[1] = ctx.cost;
++  return 1;
++}
++
+ 
+ // update grad = M*qacc - qfrc_smooth - qfrc_constraint
+ static void PrimalUpdateGrad(mjPrimalContext* ctx) {
+diff --git a/wasm/codegen/generated/bindings.cc b/wasm/codegen/generated/bindings.cc
+index 8480c41..665ae4c 100644
+--- a/wasm/codegen/generated/bindings.cc
++++ b/wasm/codegen/generated/bindings.cc
+@@ -56,6 +56,7 @@ extern "C" int mj_solver_gauss_calls();
+ extern "C" int mj_solver_gauss_overflow();
+ extern "C" int mj_solver_gauss_invalid();
+ extern "C" void mj_solver_gauss_copy(mjtNum*);
++extern "C" int mj_marble_gauss_probe(const mjtNum*, int, mjtNum*);
+ extern "C" int mj_marble_qcqp5_probe(const mjtNum*, int, mjtNum*, int*);
+ extern "C" int mj_noslip_input_trace_size();
+ extern "C" void mj_noslip_input_trace_copy(mjtNum*);
+@@ -6877,6 +6878,23 @@ EMSCRIPTEN_BINDINGS(mujoco_bindings) {
+     if (accepted) result.set("result", output);
+     return result;
+   }));
++  function("marbleGaussProbe", emscripten::optional_override([](val packet) {
++    val result = val::object(); result.set("accepted", false);
++    if (!val::global("Array").call<bool>("isArray", packet)) return result;
++    const double length = packet["length"].as<double>();
++    if (length < 2 || length > 2050) return result;
++    const int n = static_cast<int>(length);
++    std::vector<mjtNum> values(n);
++    for (int i = 0; i < n; ++i) {
++      if (packet[i].typeOf().as<std::string>() != "number") return result;
++      values[i] = packet[i].as<mjtNum>();
++    }
++    mjtNum output[2] = {0};
++    if (!mj_marble_gauss_probe(values.data(), n, output)) return result;
++    result.set("accepted", true);
++    result.set("gauss", output[0]); result.set("cost", output[1]);
++    return result;
++  }));
+   function("marbleQCQP5Probe", emscripten::optional_override([](val packet) {
+     val result = val::object();
+     result.set("accepted", false);

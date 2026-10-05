@@ -1,10 +1,41 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { instantiateElisa } from "../shells/web/elisa-wasm-runtime.js";
-import { decodeMarbleBoard, MARBLE } from "../shells/web/marble-maze.js";
-import { loadMarbleMazeMuJoCo } from "../shells/web/marble-maze-mujoco.js";
+import { clamp, decodeMarbleBoard, MarbleMazeGame, MARBLE } from "../shells/web/marble-maze.js";
+import {
+  buildMarbleMazeMjcf,
+  loadMarbleMazeMuJoCo,
+  makeMarbleMazeMuJoCoGame,
+  MARBLE_MUJOCO_LOAD_TIMEOUT_MS,
+  marbleMazeMuJoCoResourceStats,
+} from "../shells/web/marble-maze-mujoco.js";
 
 const Game = await loadMarbleMazeMuJoCo();
+
+// A rejected optional physics asset must remain observable to the shell so it
+// can select and label the fallback solver. The loader must not convert this
+// into a half-initialized class or swallow the original error.
+{
+  const failure = new Error("simulated MuJoCo WASM load rejection");
+  await assert.rejects(
+    loadMarbleMazeMuJoCo(async () => { throw failure; }),
+    (error) => error === failure,
+  );
+}
+
+// A browser that cannot fetch or instantiate the vendored engine must reach
+// the explicitly labelled fallback instead of leaving the module at its
+// top-level `loading…` state forever. The default is intentionally long
+// enough for a normal local WASM fetch; this short timeout only verifies the
+// bounded failure path without waiting through it in the test process.
+assert.ok(MARBLE_MUJOCO_LOAD_TIMEOUT_MS > 0);
+await assert.rejects(
+  loadMarbleMazeMuJoCo(() => new Promise(() => {}), 5),
+  /MuJoCo WASM load timed out after 5ms/,
+);
+
+assert.equal(clamp(0.1, 0.2, 1), 0.2);
+assert.equal(clamp(1.2, 0.2, 1), 1);
 
 function board(overrides = {}) {
   return {
@@ -13,6 +44,178 @@ function board(overrides = {}) {
     home: { x: 0.8, y: 0.5, radius: 0.08 },
     walls: [], holes: [], starts: [{ x: 0.1, y: 0.5 }], ...overrides,
   };
+}
+
+// Direct stepping is a forward-time API in both browser adapters. Zero and
+// negative/non-finite values must not rewind elapsed time, run a backwards
+// physics solve, or create an unbounded loop from malformed replay data.
+{
+  const game = new Game(board());
+  game.step(1 / 60);
+  const elapsed = game.elapsed;
+  const x = game.marbles[0].x;
+  game.step(0);
+  game.step(-1);
+  game.step(Number.POSITIVE_INFINITY);
+  game.step(Number.NaN);
+  assert.equal(game.elapsed, elapsed);
+  assert.equal(game.marbles[0].x, x);
+  game.disposeEngine();
+}
+
+// Keep the generated floor extent identical to neural_workshop.marblemaze._mjcf:
+// max(tray dimension, 1 metre) multiplied by two.
+{
+  const xml = buildMarbleMazeMjcf(board({ width: 0.305, depth: 0.270 }), 1);
+  assert.ok(xml.includes('size="2.0000 2.0000 0.1"'));
+}
+
+// Repeated create/restart/dispose cycles must release both native MuJoCo
+// objects exactly once; a failed data allocation must release its model too.
+{
+  const counts = { models: 0, modelDeletes: 0, data: 0, dataDeletes: 0 };
+  const resourceBefore = marbleMazeMuJoCoResourceStats();
+  const fakeMujoco = {
+    MjModel: {
+      from_xml_string() {
+        counts.models += 1;
+        return { delete() { counts.modelDeletes += 1; } };
+      },
+    },
+    MjData: class {
+      constructor() { counts.data += 1; }
+      delete() { counts.dataDeletes += 1; }
+    },
+  };
+  const FakeGame = makeMarbleMazeMuJoCoGame(fakeMujoco);
+  for (let cycle = 0; cycle < 100; cycle++) {
+    const game = new FakeGame(board());
+    game.ensureEngine();
+    game.restart();
+    assert.equal(game.model, null);
+    assert.equal(game.data, null);
+    game.ensureEngine();
+    game.disposeEngine();
+    game.disposeEngine();
+    assert.equal(game.model, null);
+    assert.equal(game.data, null);
+  }
+  assert.deepEqual(counts,
+    { models: 200, modelDeletes: 200, data: 200, dataDeletes: 200 });
+  const resourceAfter = marbleMazeMuJoCoResourceStats();
+  assert.equal(resourceAfter.modelsCreated - resourceBefore.modelsCreated, 200);
+  assert.equal(resourceAfter.modelsDeleted - resourceBefore.modelsDeleted, 200);
+  assert.equal(resourceAfter.dataCreated - resourceBefore.dataCreated, 200);
+  assert.equal(resourceAfter.dataDeleted - resourceBefore.dataDeleted, 200);
+  assert.equal(resourceAfter.liveModels, resourceBefore.liveModels);
+  assert.equal(resourceAfter.liveData, resourceBefore.liveData);
+}
+
+{
+  const failure = new Error("simulated MjData allocation failure");
+  let modelDeletes = 0;
+  const fakeMujoco = {
+    MjModel: {
+      from_xml_string() { return { delete() { modelDeletes += 1; } }; },
+    },
+    MjData: class { constructor() { throw failure; } },
+  };
+  const FakeGame = makeMarbleMazeMuJoCoGame(fakeMujoco);
+  const game = new FakeGame(board());
+  assert.throws(() => game.ensureEngine(), (error) => error === failure);
+  assert.equal(modelDeletes, 1);
+  assert.equal(game.model, null);
+  assert.equal(game.data, null);
+}
+
+// If partial construction also encounters a native model-delete failure, the
+// failed handle must remain owned by the game and be retryable. Otherwise a
+// MjData allocation exception would hide a live model behind a thrown error.
+{
+  const allocationFailure = new Error("simulated partial MjData allocation failure");
+  const cleanupFailure = new Error("simulated partial model cleanup failure");
+  let firstDelete = true;
+  let createdModel = null;
+  const fakeMujoco = {
+    MjModel: {
+      from_xml_string() {
+        createdModel = {
+          delete() {
+            if (firstDelete) {
+              firstDelete = false;
+              throw cleanupFailure;
+            }
+          },
+        };
+        return createdModel;
+      },
+    },
+    MjData: class { constructor() { throw allocationFailure; } },
+  };
+  const resourceBefore = marbleMazeMuJoCoResourceStats();
+  const FakeGame = makeMarbleMazeMuJoCoGame(fakeMujoco);
+  const game = new FakeGame(board());
+  assert.throws(() => game.ensureEngine(), (error) => error === allocationFailure);
+  assert.equal(game.model, createdModel,
+    "partial-construction model remains owned after cleanup failure");
+  assert.equal(game.data, null);
+  const resourceAfterFailure = marbleMazeMuJoCoResourceStats();
+  assert.equal(resourceAfterFailure.modelsDeleted - resourceBefore.modelsDeleted, 0);
+  assert.equal(resourceAfterFailure.liveModels - resourceBefore.liveModels, 1);
+  assert.doesNotThrow(() => game.disposeEngine(),
+    "partial-construction model cleanup can be retried");
+  const resourceAfterRetry = marbleMazeMuJoCoResourceStats();
+  assert.equal(resourceAfterRetry.modelsDeleted - resourceBefore.modelsDeleted, 1);
+  assert.equal(resourceAfterRetry.liveModels - resourceBefore.liveModels, 0);
+  assert.equal(game.model, null);
+}
+
+// A native delete failure must remain visible in the live-resource counters;
+// counting before calling the binding would turn this failure into a false
+// leak-free result.
+{
+  const failure = new Error("simulated MjModel delete failure");
+  let firstDelete = true;
+  let createdModel = null;
+  const fakeMujoco = {
+    MjModel: {
+      from_xml_string() {
+        createdModel = {
+          delete() {
+            if (firstDelete) {
+              firstDelete = false;
+              throw failure;
+            }
+          },
+        };
+        return createdModel;
+      },
+    },
+    MjData: class { delete() {} },
+  };
+  const resourceBefore = marbleMazeMuJoCoResourceStats();
+  const FakeGame = makeMarbleMazeMuJoCoGame(fakeMujoco);
+  const game = new FakeGame(board());
+  game.ensureEngine();
+  assert.throws(() => game.disposeEngine(), (error) => error === failure);
+  const resourceAfter = marbleMazeMuJoCoResourceStats();
+  assert.equal(resourceAfter.modelsDeleted - resourceBefore.modelsDeleted, 0);
+  assert.equal(resourceAfter.dataDeleted - resourceBefore.dataDeleted, 1);
+  assert.equal(resourceAfter.liveModels - resourceBefore.liveModels, 1);
+  assert.equal(resourceAfter.liveData - resourceBefore.liveData, 0);
+  assert.equal(game.model, createdModel,
+    "failed native model cleanup remains retryable");
+  assert.equal(game.data, null,
+    "successfully deleted data is released even when model cleanup fails");
+  assert.doesNotThrow(() => game.disposeEngine(),
+    "the model cleanup failure should be retryable");
+  const resourceRetried = marbleMazeMuJoCoResourceStats();
+  assert.equal(resourceRetried.modelsDeleted - resourceBefore.modelsDeleted, 1);
+  assert.equal(resourceRetried.dataDeleted - resourceBefore.dataDeleted, 1);
+  assert.equal(resourceRetried.liveModels - resourceBefore.liveModels, 0);
+  assert.equal(resourceRetried.liveData - resourceBefore.liveData, 0);
+  assert.equal(game.model, null, "successful retry releases the model handle");
+  assert.ok(createdModel);
 }
 
 // The browser adapter must use the same tilt signs and fixed four-substep
@@ -41,8 +244,36 @@ function board(overrides = {}) {
   assert.equal(game.nudgeDue, 0);
 }
 
-// A levelled tray restores the native rest clamp, and restart preserves the
-// elapsed run clock while recreating the physical state.
+// Even with no elapsed time, an idle/release update clears the source UI's
+// fractional held-key accumulator instead of carrying it forward.
+{
+  const game = new Game(board());
+  game.nudgeDue = 1 / 120;
+  game.advance(0, new Set());
+  assert.equal(game.nudgeDue, 0);
+  game.disposeEngine();
+}
+
+// As in the source UI, finish every bite in the capped frame even if the
+// first bite settles the board. Its positive-remainder loop includes the tiny
+// floating-point remainder after three nominal 60 Hz bites.
+{
+  const game = new Game(board());
+  let bites = 0;
+  const step = game.step.bind(game);
+  game.step = (dt) => {
+    step(dt);
+    bites++;
+    if (bites === 1) game.marbles[0].state = "home";
+  };
+  game.advance(0.05);
+  assert.equal(bites, 4);
+  assert.ok(Math.abs(game.elapsed - 0.05) < 1e-9);
+  game.disposeEngine();
+}
+
+// A levelled tray restores the native rest clamp. Replacing the source
+// Simulation on restart resets its elapsed clock and physical state.
 {
   const capped = new Game(board());
   capped.marbles[0].vx = 3;
@@ -56,9 +287,9 @@ function board(overrides = {}) {
   game.level();
   for (let index = 0; index < 30; index++) game.step(1 / 60);
   assert.ok(game.speed < 1e-10);
-  const elapsed = game.elapsed;
+  assert.ok(game.elapsed > 0);
   game.restart();
-  assert.equal(game.elapsed, elapsed);
+  assert.equal(game.elapsed, 0);
   assert.equal(game.marbles[0].x, game.board.starts[0].x);
   assert.equal(game.roll, 0);
   assert.equal(game.pitch, 0);
@@ -107,7 +338,8 @@ function board(overrides = {}) {
 // Compile every certified board through the same MuJoCo model path. This
 // catches malformed wall geometry, pair counts, or ABI data that a one-rung
 // physics smoke test would miss.
-const wasm = fs.readFileSync(new URL("../build/nwcore.wasm", import.meta.url));
+const wasm = fs.readFileSync(process.env.NWCORE_WASM_PATH ??
+  new URL("../build/nwcore.wasm", import.meta.url));
 const { exports, instance } = await instantiateElisa(wasm, { warn: false });
 const capacity = 65536;
 const pointer = Number(exports.nw_frame_alloc(BigInt(capacity)));
@@ -121,6 +353,95 @@ for (let rung = 1; rung <= 16; rung++) {
   assert.equal(game.marbles.length, tray.starts.length);
   assert.ok(game.marbles.every((marble) => Number.isFinite(marble.x)));
   game.disposeEngine();
+}
+
+// A source-compatible run seed of 17 draws this first 30-bit board seed.
+// Replay a complete ordinary held-input solution through the real MuJoCo
+// wrapper, including a level command and coast between each route segment.
+{
+  const solveLength = Number(exports.nw_marble_board_write(
+    BigInt(pointer), BigInt(capacity), 1n, 889418965n));
+  const solveBoard = decodeMarbleBoard(new Uint8Array(
+    instance.exports.memory.buffer, pointer, solveLength));
+  const game = new Game(solveBoard);
+  const route = ["W", "S", "S", "E", "E", "E", "N", "N", "N", "W", "S", "S"];
+  for (const direction of route) {
+    for (let frame = 0; frame < 18 && !game.settled; frame++) {
+      game.advance(1 / 60, new Set([direction]));
+    }
+    game.level();
+    for (let frame = 0; frame < 36 && !game.settled; frame++) {
+      game.advance(1 / 60, new Set());
+    }
+    if (game.settled) break;
+  }
+  assert.equal(game.won, true, "seed-17 held-input route reaches the home cup");
+  assert.equal(game.home, 1);
+  assert.equal(game.lost, 0);
+  game.disposeEngine();
+
+  // The fallback remains a supported bounded-failure path. On a generated
+  // board it must preserve the source-compatible diagonal rail rebound that
+  // lets this canonical route enter the home cup; without the coupled
+  // floor/rail correction it parks at the inner wall corner instead.
+  const fallback = new MarbleMazeGame(solveBoard);
+  for (const direction of route) {
+    for (let frame = 0; frame < 18 && !fallback.settled; frame++) {
+      fallback.advance(1 / 60, new Set([direction]));
+    }
+    fallback.level();
+    for (let frame = 0; frame < 36 && !fallback.settled; frame++) {
+      fallback.advance(1 / 60, new Set());
+    }
+    if (fallback.settled) break;
+  }
+  assert.equal(fallback.won, true,
+    "fallback seed-17 held-input route reaches the home cup");
+  assert.equal(fallback.home, 1);
+  assert.equal(fallback.lost, 0);
+
+  // Exercise the bounded fallback on the complete board transport matrix as
+  // well. This is deliberately a safety sweep rather than a claim that the
+  // approximate solver has MuJoCo-identical trajectories on every offline
+  // board: every state must remain finite and every active marble must finish
+  // outside the decoded wall boxes after wall/pair contact resolution.
+  const fallbackSeeds = [0, 1, 17, 314159, 1073741823];
+  const wallOverlap = (tray, marble) => tray.walls.some((wall) => {
+    const closestX = Math.max(wall.x0, Math.min(marble.x, wall.x1));
+    const closestY = Math.max(wall.y0, Math.min(marble.y, wall.y1));
+    return Math.hypot(marble.x - closestX, marble.y - closestY) <
+      MARBLE.RADIUS - 1e-7;
+  });
+  for (let rung = 1; rung <= 16; rung++) {
+    for (const seed of fallbackSeeds) {
+      const length = Number(exports.nw_marble_board_write(
+        BigInt(pointer), BigInt(capacity), BigInt(rung), BigInt(seed)));
+      const tray = decodeMarbleBoard(new Uint8Array(
+        instance.exports.memory.buffer, pointer, length));
+      const offline = new MarbleMazeGame(tray);
+      for (let frame = 0; frame < 120 && !offline.settled; frame++) {
+        const held = frame < 10 ? ["E"] :
+          frame >= 30 && frame < 42 ? ["W"] :
+            frame >= 70 && frame < 78 ? ["N"] :
+              frame >= 90 && frame < 100 ? ["S"] : [];
+        offline.advance(1 / 60, new Set(held));
+        if (frame === 110) offline.level();
+        for (const [index, marble] of offline.marbles.entries()) {
+          const finite = [marble.x, marble.y, marble.z, marble.vx, marble.vy,
+            marble.vz, marble.qw, marble.qx, marble.qy, marble.qz,
+            marble.wx, marble.wy, marble.wz].every(Number.isFinite);
+          assert.equal(finite, true,
+            `fallback non-finite state at rung ${rung}, seed ${seed}, ` +
+            `frame ${frame}, marble ${index}`);
+          if (marble.state === "rolling") {
+            assert.equal(wallOverlap(tray, marble), false,
+              `fallback wall penetration at rung ${rung}, seed ${seed}, ` +
+              `frame ${frame}, marble ${index}`);
+          }
+        }
+      }
+    }
+  }
 }
 
 console.log("PASS: MuJoCo-backed Marble Maze runtime, contacts, holes, and all 16 boards");

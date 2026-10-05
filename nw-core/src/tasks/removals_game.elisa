@@ -1,0 +1,438 @@
+# Stateful Removals run controller.
+#
+# The reference task is clocked: the learner watches a generated walk of packs
+# and swaps, then answers which van each asked thing ended up in.  The source
+# generator already owns the difficult part (CPython-compatible random stream,
+# designed chains, depth/span floors, and churn); this adapter owns only the
+# cross-call lifetime, clock, answers, and browser-neutral ABI state.
+#
+# Removals::RemovalsRound contains arena-backed darrays.  The controller therefore
+# copies every field needed by the scene into bounded storage before the
+# generation region is destroyed.  No browser answer table or shell-side
+# round is authoritative.
+
+module RemovalsGame:
+
+    const MAX_MOVES: i64 = Removals::MOST_DEPTH
+    const MAX_NODES: i64 = Removals::MOST_NODES
+    const MAX_ITEMS: i64 = Removals::MOST_ITEMS
+    const GRADE_COUNT: i64 = Removals::GRADE_COUNT
+    const VERDICT_MS: i64 = 800
+
+    const PHASE_READY: i64 = 0
+    const PHASE_MOVING: i64 = 1
+    const PHASE_ASKING: i64 = 2
+    const PHASE_SCORED: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const ACTION_START: i64 = 0
+    const ACTION_ANSWER_0: i64 = 1
+    const ACTION_ANSWER_1: i64 = 2
+    const ACTION_ANSWER_2: i64 = 3
+    const ACTION_ANSWER_3: i64 = 4
+    const ACTION_ANSWER_4: i64 = 5
+
+    # The first twelve fields are the task-neutral state envelope.  The
+    # remaining fields are available through the task-specific accessor.
+    const INFO_PHASE: i64 = 0
+    const INFO_RUNG: i64 = 1
+    const INFO_TRIAL: i64 = 2
+    const INFO_TOTAL_TRIALS: i64 = 3
+    const INFO_VANS: i64 = 4
+    const INFO_BOXES: i64 = 5
+    const INFO_ITEMS: i64 = 6
+    const INFO_MOVES: i64 = 7
+    const INFO_CURSOR: i64 = 8
+    const INFO_ASKING_AT: i64 = 9
+    const INFO_VERDICT: i64 = 10
+    const INFO_DEADLINE_MS: i64 = 11
+    const INFO_ADAPTIVE: i64 = 12
+    const INFO_ASKS: i64 = 13
+    const INFO_RIGHT: i64 = 14
+    const INFO_TOTAL_ASKED: i64 = 15
+    const INFO_BEST_RUNG: i64 = 16
+    const INFO_NEEDED: i64 = 17
+    const INFO_NEST: i64 = 18
+    const INFO_CHURN: i64 = 19
+    const INFO_MOVE_MS: i64 = 20
+
+    const MOVE_KIND: i64 = 0
+    const MOVE_THING: i64 = 1
+    const MOVE_OTHER: i64 = 2
+    const ASKED_NODE: i64 = 3
+    const ASKED_ANSWER: i64 = 4
+    const ASKED_GIVEN: i64 = 5
+
+    struct RemovalsRun:
+        rng: mutable MT19937
+        start_rung: mutable i64
+        rung: mutable i64
+        total_trials: mutable i64
+        move_ms: mutable i64
+        adaptive: mutable bool
+        trial: mutable i64
+        vans: mutable i64
+        boxes: mutable i64
+        items: mutable i64
+        node_count: mutable i64
+        move_n: mutable i64
+        cursor: mutable i64
+        asking_at: mutable i64
+        asks: mutable i64
+        verdict: mutable i64
+        phase: mutable i64
+        deadline_ms: mutable i64
+        right: mutable i64
+        total_asked: mutable i64
+        best_rung: mutable i64
+        needed: mutable i64
+        nest: mutable i64
+        churn: mutable i64
+        move_kind: mutable i64[40]
+        move_thing: mutable i64[40]
+        move_other: mutable i64[40]
+        start: mutable i64[25]
+        asked: mutable i64[8]
+        answers: mutable i64[8]
+        given: mutable i64[8]
+
+    def clamp_rung(value: i64) -> i64:
+        can Abort.Panic:
+            return 1 if value < 1 else (GRADE_COUNT if value > GRADE_COUNT else value)
+
+    def allowed_trials(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 1 or value == 2 or value == 3 or value == 5 or value == 8 or value == 10 or value == 15 or value == 20
+
+    def allowed_move_ms(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 500 or value == 800 or value == 1000 or value == 1200 or value == 1500 or value == 2000 or value == 3000
+
+    def clear_round(run: mutable RemovalsRun&):
+        can Abort.Panic:
+            run.vans <- 0
+            run.boxes <- 0
+            run.items <- 0
+            run.node_count <- 0
+            run.move_n <- 0
+            run.cursor <- 0
+            run.asking_at <- 0
+            run.asks <- 0
+            run.verdict <- -1
+            run.deadline_ms <- 0
+            run.needed <- -1
+            run.nest <- -1
+            run.churn <- -1
+            for at in 0..<MAX_MOVES |at, run|:
+                run.move_kind[at.usize()] <- 0
+                run.move_thing[at.usize()] <- 0
+                run.move_other[at.usize()] <- 0
+            for at in 0..<MAX_NODES |at, run|:
+                run.start[at.usize()] <- 0
+            for at in 0..<MAX_ITEMS |at, run|:
+                run.asked[at.usize()] <- 0
+                run.answers[at.usize()] <- 0
+                run.given[at.usize()] <- -1
+
+    # Removals::generate uses one MT stream to choose the attempts.  Keep that
+    # outer draw in the RemovalsRun, exactly as the Python UI keeps self.rng, then let
+    # the source generator seed its own compatible stream for the round.
+    def generate_round(run: mutable RemovalsRun&, deal_seed: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            generated: mutable bool = false
+            region generation(268435456):
+                in generation:
+                    work: mutable Removals::RemovalsWork = Removals::RemovalsWork()
+                    round: mutable Removals::RemovalsRound = Removals::RemovalsRound()
+                    best: mutable Removals::RemovalsRound = Removals::RemovalsRound()
+                    ok: bool = Removals::generate(&work, run.rung, deal_seed,
+                                                  200, &round, &best)
+                    if ok and round.ok:
+                        run.vans <- round.yard.vans
+                        run.boxes <- round.yard.boxes
+                        run.items <- round.yard.items
+                        run.node_count <- round.yard.size
+                        run.move_n <- round.move_n if round.move_n < MAX_MOVES else MAX_MOVES
+                        run.asks <- round.asked_n if round.asked_n < MAX_ITEMS else MAX_ITEMS
+                        run.needed <- round.needed
+                        run.nest <- round.nest
+                        run.churn <- round.churn
+                        at: mutable i64 = 0
+                        while at < MAX_MOVES |at, run, round|:
+                            run.move_kind[at.usize()] <- Ints::at(round.move_kind, at) if at < run.move_n else 0
+                            run.move_thing[at.usize()] <- Ints::at(round.move_thing, at) if at < run.move_n else 0
+                            run.move_other[at.usize()] <- Ints::at(round.move_other, at) if at < run.move_n else 0
+                            at <- at + 1
+                        at <- 0
+                        while at < MAX_NODES |at, run, round|:
+                            run.start[at.usize()] <- Ints::at(round.start, at) if at < run.node_count else 0
+                            at <- at + 1
+                        at <- 0
+                        while at < MAX_ITEMS |at, run, round|:
+                            run.asked[at.usize()] <- Ints::at(round.asked, at) if at < run.asks else 0
+                            run.answers[at.usize()] <- Ints::at(round.answers, at) if at < run.asks else 0
+                            run.given[at.usize()] <- -1
+                            at <- at + 1
+                        generated <- run.move_n > 0 and run.asks > 0 and run.vans > 0
+                destroy generation
+            return generated
+
+    def initialize(run: mutable RemovalsRun&, start_rung: i64, total_trials: i64,
+                   move_ms: i64, adaptive: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.start_rung <- clamp_rung(start_rung)
+            run.rung <- run.start_rung
+            run.total_trials <- total_trials
+            run.move_ms <- move_ms
+            run.adaptive <- adaptive
+            run.trial <- 0
+            run.right <- 0
+            run.total_asked <- 0
+            run.best_rung <- 0
+            run.phase <- PHASE_READY
+            clear_round(run)
+
+    def next_trial(run: mutable RemovalsRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.trial >= run.total_trials:
+                run.phase <- PHASE_DONE
+                run.verdict <- -1
+                run.deadline_ms <- 0
+                return
+            run.trial <- run.trial + 1
+            deal_seed: i64 = py_randbelow(&run.rng, 1073741824.u64()).i64()
+            clear_round(run)
+            if not generate_round(run, deal_seed):
+                # The Python source raises here.  A host-facing controller
+                # cannot throw across the C ABI, so fail closed at DONE rather
+                # than displaying a fabricated answer.
+                run.phase <- PHASE_DONE
+                run.deadline_ms <- 0
+                return
+            run.phase <- PHASE_MOVING
+            run.deadline_ms <- now_ms + run.move_ms
+
+    def start_run(run: mutable RemovalsRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.rung <- clamp_rung(run.start_rung)
+            run.trial <- 0
+            run.right <- 0
+            run.total_asked <- 0
+            run.best_rung <- 0
+            run.verdict <- -1
+            next_trial(run, now_ms)
+
+    def tick(run: mutable RemovalsRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 1 if run.phase != PHASE_MOVING
+            return 2 if now_ms < run.deadline_ms
+            if run.cursor + 1 >= run.move_n:
+                run.phase <- PHASE_ASKING
+                run.asking_at <- 0
+                run.deadline_ms <- 0
+            else:
+                run.cursor <- run.cursor + 1
+                run.deadline_ms <- now_ms + run.move_ms
+            return 1
+
+    def settle(run: mutable RemovalsRun&, now_ms: i64):
+        can Abort.Panic:
+            correct: mutable i64 = 0
+            at: mutable i64 = 0
+            while at < run.asks |at, run, correct|:
+                correct <- correct + 1 if run.given[at.usize()] == run.answers[at.usize()]
+                at <- at + 1
+            run.right <- run.right + correct
+            run.total_asked <- run.total_asked + run.asks
+            run.best_rung <- run.rung if run.rung > run.best_rung
+            run.verdict <- 1 if correct == run.asks else 0
+            if run.adaptive:
+                if correct == run.asks:
+                    run.rung <- clamp_rung(run.rung + 1)
+                elif correct * 2 < run.asks:
+                    run.rung <- clamp_rung(run.rung - 1)
+            run.phase <- PHASE_SCORED
+            run.deadline_ms <- now_ms + VERDICT_MS
+
+    def answer(run: mutable RemovalsRun&, van: i64, now_ms: i64) -> i64:
+        can Abort.Panic:
+            return 2 if run.phase != PHASE_ASKING
+            return 2 if van < 0 or van >= run.vans
+            return 2 if run.asking_at >= run.asks
+            run.given[run.asking_at.usize()] <- van
+            run.asking_at <- run.asking_at + 1
+            if run.asking_at >= run.asks:
+                settle(run, now_ms)
+            return 1
+
+    def apply(run: mutable RemovalsRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                if run.phase == PHASE_READY or run.phase == PHASE_DONE:
+                    start_run(run, now_ms)
+                    return 1
+                if run.phase == PHASE_SCORED:
+                    return 2 if now_ms < run.deadline_ms
+                    next_trial(run, now_ms)
+                    return 1
+                return 2
+            if action >= ACTION_ANSWER_0 and action <= ACTION_ANSWER_4:
+                return answer(run, action - ACTION_ANSWER_0, now_ms)
+            return -6
+
+    def info(run: RemovalsRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_RUNG: return run.rung
+            if field == INFO_TRIAL: return run.trial
+            if field == INFO_TOTAL_TRIALS: return run.total_trials
+            if field == INFO_VANS: return run.vans
+            if field == INFO_BOXES: return run.boxes
+            if field == INFO_ITEMS: return run.items
+            if field == INFO_MOVES: return run.move_n
+            if field == INFO_CURSOR: return run.cursor
+            if field == INFO_ASKING_AT: return run.asking_at
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_DEADLINE_MS: return run.deadline_ms
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_ASKS: return run.asks
+            if field == INFO_RIGHT: return run.right
+            if field == INFO_TOTAL_ASKED: return run.total_asked
+            if field == INFO_BEST_RUNG: return run.best_rung
+            if field == INFO_NEEDED: return run.needed
+            if field == INFO_NEST: return run.nest
+            if field == INFO_CHURN: return run.churn
+            if field == INFO_MOVE_MS: return run.move_ms
+            return -1
+
+    def value(run: RemovalsRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return -1 if at < 0
+            if field == MOVE_KIND: return run.move_kind[at.usize()] if at < run.move_n else -1
+            if field == MOVE_THING: return run.move_thing[at.usize()] if at < run.move_n else -1
+            if field == MOVE_OTHER: return run.move_other[at.usize()] if at < run.move_n else -1
+            if field == ASKED_NODE: return run.asked[at.usize()] if at < run.asks else -1
+            if field == ASKED_ANSWER: return run.answers[at.usize()] if at < run.asks else -1
+            if field == ASKED_GIVEN: return run.given[at.usize()] if at < run.asks else -1
+            return -1
+
+    def pointer_van(run: RemovalsRun&, x_millionths: i64) -> i64:
+        can Abort.Panic:
+            return -1 if run.phase != PHASE_ASKING or run.vans <= 0
+            # The reference keys the answers, but the browser also exposes the
+            # empty van bays as click targets.  The stage occupies x=10%..90%.
+            px: i64 = x_millionths * 912 / 1000000
+            return -1 if px < 91 or px >= 821
+            van: i64 = (px - 91) * run.vans / 730
+            return van if van >= 0 and van < run.vans else -1
+
+    def append_grade_name(out: mutable dstr&, rung: i64):
+        can Memory.Allocate, Abort.Panic:
+            if rung == 1:
+                dstr_append_cstr(out, "first load")
+            elif rung == 2:
+                dstr_append_cstr(out, "two vans")
+            elif rung == 3:
+                dstr_append_cstr(out, "stacking up")
+            elif rung == 4:
+                dstr_append_cstr(out, "a box in a box")
+            elif rung == 5:
+                dstr_append_cstr(out, "three deep")
+            elif rung == 6:
+                dstr_append_cstr(out, "the shuffle")
+            elif rung == 7:
+                dstr_append_cstr(out, "four vans")
+            elif rung == 8:
+                dstr_append_cstr(out, "deep stack")
+            elif rung == 9:
+                dstr_append_cstr(out, "the tangle")
+            elif rung == 10:
+                dstr_append_cstr(out, "nightmare")
+            elif rung == 11:
+                dstr_append_cstr(out, "inhuman")
+            else:
+                dstr_append_cstr(out, "superhuman")
+
+    def append_message(out: mutable dstr&, run: RemovalsRun&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(out, "Press Space to start")
+            elif run.phase == PHASE_MOVING:
+                append_grade_name(out, run.rung)
+                dstr_append_cstr(out, " — ")
+                dstr_append_i64(out, run.vans)
+                dstr_append_cstr(out, " vans, ")
+                dstr_append_i64(out, run.move_n)
+                dstr_append_cstr(out, " moves")
+            elif run.phase == PHASE_ASKING:
+                dstr_append_cstr(out, "The doors close")
+            elif run.phase == PHASE_SCORED:
+                correct: mutable i64 = 0
+                at: mutable i64 = 0
+                while at < run.asks |at, run, correct|:
+                    correct <- correct + 1 if run.given[at.usize()] == run.answers[at.usize()]
+                    at <- at + 1
+                if correct == run.asks:
+                    dstr_append_cstr(out, "All ")
+                    dstr_append_i64(out, run.asks)
+                    dstr_append_cstr(out, " right")
+                else:
+                    dstr_append_i64(out, correct)
+                    dstr_append_cstr(out, " of ")
+                    dstr_append_i64(out, run.asks)
+                    dstr_append_cstr(out, " right")
+            else:
+                dstr_append_i64(out, run.trial)
+                dstr_append_cstr(out, " rounds, ")
+                accuracy: i64 = py_round_half_even(100.0 * run.right.f64() / run.total_asked.f64()) if run.total_asked > 0 else 0
+                dstr_append_i64(out, accuracy)
+                dstr_append_cstr(out, "% of questions right, highest rung ")
+                dstr_append_i64(out, run.best_rung)
+
+    def render(run: RemovalsRun&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY:
+                SceneRemovals::render_ready(list, black_background, width, height)
+                return
+            round: mutable Removals::RemovalsRound = Removals::RemovalsRound()
+            round.ok <- true
+            round.yard <- Removals::RemovalsYard(run.vans, run.boxes, run.items)
+            round.move_n <- run.move_n
+            round.asked_n <- run.asks
+            round.needed <- run.needed
+            round.nest <- run.nest
+            round.churn <- run.churn
+            at: mutable i64 = 0
+            while at < MAX_MOVES |at, run, round|:
+                Ints::put(&round.move_kind, at, run.move_kind[at.usize()])
+                Ints::put(&round.move_thing, at, run.move_thing[at.usize()])
+                Ints::put(&round.move_other, at, run.move_other[at.usize()])
+                at <- at + 1
+            at <- 0
+            while at < MAX_NODES |at, run, round|:
+                Ints::put(&round.start, at, run.start[at.usize()])
+                at <- at + 1
+            at <- 0
+            while at < MAX_ITEMS |at, run, round|:
+                Ints::put(&round.asked, at, run.asked[at.usize()])
+                Ints::put(&round.answers, at, run.answers[at.usize()])
+                at <- at + 1
+            given: mutable darray[i64] = []
+            at <- 0
+            while at < run.asks |at, run, given|:
+                given.push(run.given[at.usize()])
+                at <- at + 1
+            message: mutable dstr = []
+            append_message(&message, run)
+            sx: f64 = width / Display::REFERENCE_WIDTH
+            sy: f64 = height / Display::REFERENCE_HEIGHT
+            paint: SceneRemovals::RemovalsPaint = SceneRemovals::paint_of(
+                black_background, width, height, sx, sy)
+            SceneRemovals::render_with_results(list, &paint, &round,
+                run.phase, run.rung, run.trial, run.total_trials, run.cursor,
+                run.asking_at, &given, run.right, run.total_asked,
+                run.best_rung, bytes_view(message))

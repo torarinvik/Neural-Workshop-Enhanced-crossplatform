@@ -1,0 +1,428 @@
+# Stateful controller for N-Cup Monte.
+#
+# The source task owns the random deal and swap permutation.  This adapter
+# keeps the source's arena-backed NCupMonteTable out of the long-lived ABI record while
+# retaining every fact that matters to the learner: cup identity, visual slot
+# positions, reveal/shuffle clocks, the current swap, and the adaptive ladder.
+# The browser is therefore only a renderer and event transport; it cannot
+# replace the hidden ball with a canned answer.
+
+module NCupMonteGame:
+
+    const MAX_CUPS: i64 = 20
+    const MAX_SWAPS: i64 = 128
+    const REFERENCE_WIDTH: f64 = 912.0
+    const REFERENCE_HEIGHT: f64 = 684.0
+
+    const PHASE_READY: i64 = 0
+    const PHASE_REVEAL: i64 = 1
+    const PHASE_SHUFFLE: i64 = 2
+    const PHASE_GUESS: i64 = 3
+    const PHASE_RESULT: i64 = 4
+
+    const ACTION_START: i64 = 0
+    const ACTION_CHOOSE: i64 = 1
+
+    const INFO_PHASE: i64 = 0
+    const INFO_CUPS: i64 = 1
+    const INFO_MAX_CUPS: i64 = 2
+    const INFO_ADAPTIVE: i64 = 3
+    const INFO_SWAP_COUNT: i64 = 4
+    const INFO_SWAP_MS: i64 = 5
+    const INFO_REVEAL_MS: i64 = 6
+    const INFO_SHOW_NUMBERS: i64 = 7
+    const INFO_BALL: i64 = 8
+    const INFO_GUESS: i64 = 9
+    const INFO_SWAP_N: i64 = 10
+    const INFO_SWAP_AT: i64 = 11
+    const INFO_DEADLINE_MS: i64 = 12
+    const INFO_SWAP_STARTED_MS: i64 = 13
+    const INFO_SWAP_ELAPSED_MS: i64 = 14
+    const INFO_SWAP_A: i64 = 15
+    const INFO_SWAP_B: i64 = 16
+    const INFO_ROUND: i64 = 17
+    const INFO_HITS: i64 = 18
+    const INFO_MISSES: i64 = 19
+    const INFO_LAST_CORRECT: i64 = 20
+
+    const VALUE_ORDER: i64 = 0
+    const VALUE_X: i64 = 1
+    const VALUE_TARGET_X: i64 = 2
+    const VALUE_SWAP: i64 = 3
+
+    struct NCupMonteRun:
+        rng: mutable MT19937
+        start_cups: mutable i64
+        cups: mutable i64
+        max_cups: mutable i64
+        adaptive: mutable bool
+        swap_count: mutable i64
+        swap_ms: mutable i64
+        reveal_ms: mutable i64
+        show_numbers: mutable bool
+        phase: mutable i64
+        ball: mutable i64
+        guess: mutable i64
+        swap_n: mutable i64
+        swap_at: mutable i64
+        round: mutable i64
+        hits: mutable i64
+        misses: mutable i64
+        last_correct: mutable i64
+        deadline_ms: mutable i64
+        swap_started_ms: mutable i64
+        swap_elapsed_ms: mutable i64
+        swap_a: mutable i64
+        swap_b: mutable i64
+        layout_width: mutable f64
+        layout_cups: mutable i64
+        order: mutable i64[20]
+        swaps: mutable i64[128]
+        xs: mutable f64[20]
+        start_xs: mutable f64[20]
+        target_xs: mutable f64[20]
+
+    def allowed_start_cups(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 3 or value == 4 or value == 5 or value == 6 or value == 7 or value == 8 or value == 10 or value == 12 or value == 14 or value == 16
+
+    def allowed_max_cups(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 3 or value == 4 or value == 5 or value == 6 or value == 7 or value == 8 or value == 10 or value == 12 or value == 14 or value == 16 or value == 18 or value == 20
+
+    def allowed_swaps(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 2 or value == 4 or value == 6 or value == 8 or value == 12 or value == 16 or value == 24 or value == 32 or value == 48 or value == 64 or value == 100
+
+    def allowed_swap_ms(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 60 or value == 100 or value == 160 or value == 220 or value == 280 or value == 340 or value == 500 or value == 750 or value == 1000
+
+    def allowed_reveal_ms(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 300 or value == 500 or value == 750 or value == 1150 or value == 1500 or value == 2000 or value == 3000
+
+    def clamp_cups(value: i64, most: i64) -> i64:
+        can Abort.Panic:
+            floor: i64 = 3 if value < 3 else value
+            return most if floor > most else floor
+
+    def clear_arrays(run: mutable NCupMonteRun&):
+        can Abort.Panic:
+            at: mutable i64 = 0
+            while at < MAX_CUPS |at, run|:
+                run.order[at.usize()] <- at
+                run.xs[at.usize()] <- 0.0
+                run.start_xs[at.usize()] <- 0.0
+                run.target_xs[at.usize()] <- 0.0
+                at <- at + 1
+            at <- 0
+            while at < MAX_SWAPS |at, run|:
+                run.swaps[at.usize()] <- 0
+                at <- at + 1
+
+    def slot_x(width: f64, count: i64, index: i64) -> f64:
+        can Abort.Panic:
+            room: f64 = width * 0.78
+            wide: f64 = 120.0 * count.f64()
+            span: f64 = room if room < wide else wide
+            start: f64 = (width - span) / 2.0
+            divisor: i64 = count if count > 1 else 1
+            return start + (index.f64() + 0.5) * span / divisor.f64()
+
+    def layout(run: mutable NCupMonteRun&, width: f64):
+        can Abort.Panic:
+            actual: f64 = REFERENCE_WIDTH if width <= 0.0 else width
+            return if run.layout_width == actual and run.layout_cups == run.cups
+            run.layout_width <- actual
+            run.layout_cups <- run.cups
+            for at in 0..<MAX_CUPS |at, run, actual|:
+                position: f64 = slot_x(actual, run.cups, at) if at < run.cups else 0.0
+                run.xs[at.usize()] <- position
+                run.start_xs[at.usize()] <- position
+                run.target_xs[at.usize()] <- position
+
+    # Call the source generator for the ball draw, then copy its order out of
+    # the temporary arena.  The source UI draws the ball before it plans the
+    # swaps, so the controller intentionally consumes the same RNG draw here.
+    def deal_ball(run: mutable NCupMonteRun&):
+        can Memory.Allocate, Abort.Panic:
+            region generation(67108864):
+                in generation:
+                    table: mutable NCupMonte::NCupMonteTable = NCupMonte::new_table(
+                        run.cups, run.max_cups, run.adaptive, run.swap_count)
+                    NCupMonte::start_round(&table, &run.rng)
+                    run.ball <- table.ball
+                    run.cups <- table.cups
+                    for at in 0..<MAX_CUPS |at, run, table|:
+                        run.order[at.usize()] <- Ints::at(table.order, at) if at < run.cups else at
+                destroy generation
+
+    # The source plans swaps only after the visible reveal has elapsed.  Keep
+    # that boundary, including RNG consumption order, rather than dealing the
+    # hidden permutation up front.
+    def plan_swaps(run: mutable NCupMonteRun&):
+        can Memory.Allocate, Abort.Panic:
+            region generation(67108864):
+                in generation:
+                    table: mutable NCupMonte::NCupMonteTable = NCupMonte::new_table(
+                        run.cups, run.max_cups, run.adaptive, run.swap_count)
+                    NCupMonte::plan_swaps(&table, &run.rng)
+                    run.swap_n <- table.swap_n if table.swap_n < MAX_SWAPS else MAX_SWAPS
+                    for at in 0..<MAX_SWAPS |at, run, table|:
+                        run.swaps[at.usize()] <- Ints::at(table.swaps, at) if at < run.swap_n * 2 else 0
+                destroy generation
+
+    def begin_swap(run: mutable NCupMonteRun&, now_ms: i64):
+        can Abort.Panic:
+            if run.swap_at >= run.swap_n:
+                run.phase <- PHASE_GUESS
+                run.deadline_ms <- 0
+                run.swap_started_ms <- 0
+                run.swap_elapsed_ms <- 0
+                run.swap_a <- -1
+                run.swap_b <- -1
+                return
+            run.swap_a <- run.swaps[(run.swap_at * 2).usize()]
+            run.swap_b <- run.swaps[(run.swap_at * 2 + 1).usize()]
+            for at in 0..<MAX_CUPS |at, run|:
+                run.start_xs[at.usize()] <- run.xs[at.usize()]
+                run.target_xs[at.usize()] <- run.xs[at.usize()]
+            a: i64 = run.swap_a
+            b: i64 = run.swap_b
+            run.target_xs[a.usize()] <- run.start_xs[b.usize()]
+            run.target_xs[b.usize()] <- run.start_xs[a.usize()]
+            run.swap_started_ms <- now_ms
+            run.swap_elapsed_ms <- 0
+            run.deadline_ms <- now_ms + run.swap_ms
+            run.phase <- PHASE_SHUFFLE
+
+    def set_swap_positions(run: mutable NCupMonteRun&, elapsed_ms: i64):
+        can Abort.Panic:
+            bounded: i64 = run.swap_ms if elapsed_ms > run.swap_ms else (0 if elapsed_ms < 0 else elapsed_ms)
+            run.swap_elapsed_ms <- bounded
+            ratio: f64 = bounded.f64() / run.swap_ms.f64()
+            smooth: f64 = ratio * ratio * (3.0 - 2.0 * ratio)
+            for at in 0..<MAX_CUPS |at, run, smooth|:
+                origin: f64 = run.start_xs[at.usize()]
+                target: f64 = run.target_xs[at.usize()]
+                run.xs[at.usize()] <- origin + (target - origin) * smooth
+
+    def settle_swap(run: mutable NCupMonteRun&, now_ms: i64):
+        can Abort.Panic:
+            a: i64 = run.swap_a
+            b: i64 = run.swap_b
+            held: i64 = run.order[a.usize()]
+            run.order[a.usize()] <- run.order[b.usize()]
+            run.order[b.usize()] <- held
+            run.swap_at <- run.swap_at + 1
+            for at in 0..<MAX_CUPS |at, run|:
+                run.xs[at.usize()] <- slot_x(run.layout_width, run.cups, at) if at < run.cups else 0.0
+            begin_swap(run, now_ms)
+
+    def start_round(run: mutable NCupMonteRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.guess <- -1
+            run.swap_n <- 0
+            run.swap_at <- 0
+            run.swap_a <- -1
+            run.swap_b <- -1
+            run.last_correct <- -1
+            deal_ball(run)
+            layout(run, run.layout_width)
+            run.phase <- PHASE_REVEAL
+            run.deadline_ms <- now_ms + run.reveal_ms
+            run.swap_started_ms <- 0
+            run.swap_elapsed_ms <- 0
+
+    def initialize(run: mutable NCupMonteRun&, start_cups: i64, max_cups: i64,
+                   adaptive: bool, swap_count: i64, swap_ms: i64,
+                   reveal_ms: i64, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.start_cups <- clamp_cups(start_cups, max_cups)
+            run.cups <- run.start_cups
+            run.max_cups <- max_cups if max_cups >= run.start_cups else run.start_cups
+            run.adaptive <- adaptive
+            run.swap_count <- swap_count
+            run.swap_ms <- swap_ms
+            run.reveal_ms <- reveal_ms
+            # Six option slots are shared by API v1.  Cup numbering is the
+            # source default and remains enabled until the task-options ABI
+            # grows a task-specific seventh slot.
+            run.show_numbers <- true
+            run.phase <- PHASE_READY
+            run.ball <- 0
+            run.guess <- -1
+            run.swap_n <- 0
+            run.swap_at <- 0
+            run.round <- 0
+            run.hits <- 0
+            run.misses <- 0
+            run.last_correct <- -1
+            run.deadline_ms <- 0
+            run.swap_started_ms <- 0
+            run.swap_elapsed_ms <- 0
+            run.swap_a <- -1
+            run.swap_b <- -1
+            run.layout_width <- -1.0
+            run.layout_cups <- -1
+            clear_arrays(run)
+            layout(run, REFERENCE_WIDTH)
+
+    def advance(run: mutable NCupMonteRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_REVEAL:
+                return 2 if now_ms < run.deadline_ms
+                plan_swaps(run)
+                run.swap_at <- 0
+                begin_swap(run, now_ms)
+                return 1
+            if run.phase != PHASE_SHUFFLE:
+                return 2
+            set_swap_positions(run, now_ms - run.swap_started_ms)
+            return 2 if now_ms < run.deadline_ms
+            settle_swap(run, now_ms)
+            return 1
+
+    def choose_cup(run: mutable NCupMonteRun&, cup: i64) -> i64:
+        can Abort.Panic:
+            return 2 if run.phase != PHASE_GUESS
+            return 2 if cup < 0 or cup >= run.cups
+            run.guess <- cup
+            caught: bool = cup == run.ball
+            run.last_correct <- 1 if caught else 0
+            run.hits <- run.hits + 1 if caught else run.hits
+            run.misses <- run.misses + 1 if not caught else run.misses
+            if run.adaptive:
+                run.cups <- clamp_cups(run.cups + 1, run.max_cups) if caught
+                run.cups <- clamp_cups(run.cups - 1, run.max_cups) if not caught
+            run.phase <- PHASE_RESULT
+            run.swap_n <- 0
+            run.swap_at <- 0
+            run.swap_a <- -1
+            run.swap_b <- -1
+            for at in 0..<MAX_CUPS |at, run|:
+                run.order[at.usize()] <- at
+                run.xs[at.usize()] <- slot_x(run.layout_width, run.cups, at) if at < run.cups else 0.0
+                run.start_xs[at.usize()] <- run.xs[at.usize()]
+                run.target_xs[at.usize()] <- run.xs[at.usize()]
+            run.layout_cups <- run.cups
+            run.deadline_ms <- 0
+            run.swap_started_ms <- 0
+            run.swap_elapsed_ms <- 0
+            return 1
+
+    def apply(run: mutable NCupMonteRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                return 2 if run.phase != PHASE_READY and run.phase != PHASE_RESULT
+                start_round(run, now_ms)
+                run.round <- run.round + 1
+                return 1
+            if action == ACTION_CHOOSE:
+                return choose_cup(run, value)
+            return -6
+
+    def pointer_cup(run: NCupMonteRun&, x_millionths: i64, y_millionths: i64) -> i64:
+        can Abort.Panic:
+            return -1 if run.phase != PHASE_GUESS
+            # Pointer events arrive in the logical 912x684 protocol space,
+            # while render() lays the cups out in physical canvas space. At
+            # DPR 2 those spaces differ by exactly two; compare in one space
+            # or every visible cup becomes unclickable.
+            scale: f64 = run.layout_width / REFERENCE_WIDTH if run.layout_width > 0.0 else 1.0
+            px: f64 = x_millionths.f64() * REFERENCE_WIDTH / 1000000.0 * scale
+            py: f64 = y_millionths.f64() * REFERENCE_HEIGHT / 1000000.0 * scale
+            width: f64 = run.layout_width / (run.cups + 2).f64()
+            cup_width: f64 = 96.0 if width > 96.0 else (48.0 if width < 48.0 else width)
+            cup_height: f64 = cup_width * 1.15
+            base_y: f64 = REFERENCE_HEIGHT * 0.38 * scale
+            return -1 if py < base_y or py > base_y + cup_height
+            for at in 0..<run.cups |at, run, px, cup_width|:
+                centre: f64 = run.xs[at.usize()]
+                if px >= centre - cup_width / 2.0 and px <= centre + cup_width / 2.0:
+                    return run.order[at.usize()]
+            return -1
+
+    def info(run: NCupMonteRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_CUPS: return run.cups
+            if field == INFO_MAX_CUPS: return run.max_cups
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_SWAP_COUNT: return run.swap_count
+            if field == INFO_SWAP_MS: return run.swap_ms
+            if field == INFO_REVEAL_MS: return run.reveal_ms
+            if field == INFO_SHOW_NUMBERS: return 1 if run.show_numbers else 0
+            if field == INFO_BALL: return run.ball
+            if field == INFO_GUESS: return run.guess
+            if field == INFO_SWAP_N: return run.swap_n
+            if field == INFO_SWAP_AT: return run.swap_at
+            if field == INFO_DEADLINE_MS: return run.deadline_ms
+            if field == INFO_SWAP_STARTED_MS: return run.swap_started_ms
+            if field == INFO_SWAP_ELAPSED_MS: return run.swap_elapsed_ms
+            if field == INFO_SWAP_A: return run.swap_a
+            if field == INFO_SWAP_B: return run.swap_b
+            if field == INFO_ROUND: return run.round
+            if field == INFO_HITS: return run.hits
+            if field == INFO_MISSES: return run.misses
+            if field == INFO_LAST_CORRECT: return run.last_correct
+            return -1
+
+    def value(run: NCupMonteRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return -1 if at < 0 or at >= MAX_CUPS
+            if field == VALUE_ORDER: return run.order[at.usize()]
+            if field == VALUE_X: return run.xs[at.usize()].i64()
+            if field == VALUE_TARGET_X: return run.target_xs[at.usize()].i64()
+            if field == VALUE_SWAP: return run.swaps[at.usize()]
+            return -1
+
+    def append_message(out: mutable dstr&, run: NCupMonteRun&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(out, "Press Space to hide the ball")
+            elif run.phase == PHASE_REVEAL or run.phase == PHASE_SHUFFLE:
+                dstr_append_cstr(out, "Watch the ball")
+            elif run.phase == PHASE_GUESS:
+                dstr_append_cstr(out, "Which cup hides the ball?")
+            elif run.last_correct == 1:
+                if run.adaptive:
+                    dstr_append_cstr(out, "Caught it — now ")
+                    dstr_append_i64(out, run.cups)
+                    dstr_append_cstr(out, " cups")
+                else:
+                    dstr_append_cstr(out, "Caught it")
+            else:
+                if run.adaptive:
+                    dstr_append_cstr(out, "Miss — back to ")
+                    dstr_append_i64(out, run.cups)
+                    dstr_append_cstr(out, " cups")
+                else:
+                    dstr_append_cstr(out, "Miss")
+
+    def render(run: mutable NCupMonteRun&, black_background: bool, width: f64,
+               height: f64, list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            layout(run, width)
+            order: mutable darray[i64] = []
+            xs: mutable darray[f64] = []
+            for at in 0..<run.cups |at, run, order, xs|:
+                order.push(run.order[at.usize()])
+                xs.push(run.xs[at.usize()])
+            message: mutable dstr = []
+            append_message(&message, run)
+            scene_phase: mutable i64 = SceneNCupMonte::PHASE_READY
+            if run.phase == PHASE_REVEAL: scene_phase <- SceneNCupMonte::PHASE_REVEAL
+            elif run.phase == PHASE_SHUFFLE: scene_phase <- SceneNCupMonte::PHASE_SHUFFLE
+            elif run.phase == PHASE_GUESS: scene_phase <- SceneNCupMonte::PHASE_GUESS
+            elif run.phase == PHASE_RESULT: scene_phase <- SceneNCupMonte::PHASE_RESULT
+            paint: SceneNCupMonte::NCupMontePaint = SceneNCupMonte::paint_of(
+                black_background, width, height, width / REFERENCE_WIDTH,
+                height / REFERENCE_HEIGHT)
+            SceneNCupMonte::render(list, &paint, &order, &xs, run.cups,
+                scene_phase, run.ball, run.guess, run.show_numbers,
+                bytes_view(message))

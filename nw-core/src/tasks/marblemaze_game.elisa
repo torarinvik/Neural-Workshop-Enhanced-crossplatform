@@ -1,0 +1,448 @@
+# Stateful run controller for Marble Maze.
+#
+# Physics remains a host service (MuJoCo in the web shell); this fixed-layout
+# controller exclusively owns phase, active-time accounting, trial progression,
+# verdict, adaptive rung, board identity, and held semantic input.
+
+module MarbleMazeGame:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_RUNNING: i64 = 1
+    const PHASE_FEEDBACK: i64 = 2
+    const PHASE_PREPARING: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const ACTION_START: i64 = 0
+    const ACTION_RESTART: i64 = 1
+    const ACTION_LEVEL: i64 = 2
+    const ACTION_REPORT: i64 = 3
+    const ACTION_BOARD_READY: i64 = 4
+    const ACTION_NEXT: i64 = 5
+    const ACTION_HOLD_NORTH: i64 = 6
+    const ACTION_HOLD_EAST: i64 = 7
+    const ACTION_HOLD_SOUTH: i64 = 8
+    const ACTION_HOLD_WEST: i64 = 9
+    # ACTION_REPORT carries two result bits in value: bit 0 is the physical
+    # all-home verdict, bit 1 is the source score() result (zero lost). A
+    # timeout reaches feedback without a host report, so ACTION_SCORE commits
+    # that second bit once the host can inspect the physics-owned lost count.
+    const ACTION_SCORE: i64 = 10
+    # Physics advances before the host controller clock on a real browser
+    # frame. Synchronize the measured source elapsed time before REPORT, or
+    # after a timeout has entered feedback and before SCORE/RECORD_RESULT, so
+    # a settle on the final frame cannot be graded against the preceding
+    # millisecond clock. This is host plumbing, not a user-visible action.
+    const ACTION_SYNC_SETTLE_TIME: i64 = 11
+    # The physics host supplies the source result tuple's home/lost counts
+    # after REPORT/SCORE; the controller retains the completed row.
+    const ACTION_RECORD_RESULT: i64 = 12
+
+    const INFO_PHASE: i64 = 0
+    const INFO_RUNG: i64 = 1
+    const INFO_TRIAL: i64 = 2
+    const INFO_TOTAL_TRIALS: i64 = 3
+    const INFO_BOARD_GENERATION: i64 = 4
+    const INFO_BOARD_SEED: i64 = 5
+    const INFO_ELAPSED_MS: i64 = 6
+    const INFO_REMAINING_MS: i64 = 7
+    const INFO_VERDICT: i64 = 8
+    const INFO_WINS: i64 = 9
+    const INFO_LOSSES: i64 = 10
+    const INFO_HELD_MASK: i64 = 11
+    const INFO_RESULT_COUNT: i64 = 12
+
+    const RESULT_RUNG: i64 = 100
+    const RESULT_ELAPSED_MS: i64 = 101
+    const RESULT_HOME: i64 = 102
+    const RESULT_LOST: i64 = 103
+    const RESULT_VERDICT: i64 = 104
+    const RESULT_SCORE_WIN: i64 = 105
+    const RESULT_BOARD_SEED: i64 = 106
+
+    const MAX_RUNG: i64 = 16
+    const MAX_TRIALS: i64 = 1000
+    const MAX_DURATION_MS: i64 = 600000
+    # The source UI clamps one active frame to 50 ms, so a timeout can carry
+    # at most one final 50 ms frame beyond the configured 600000 ms option.
+    const MAX_SETTLE_MS: i64 = MAX_DURATION_MS + 50
+    const MAX_BOARD_GENERATION: i64 = 9223372036854775806
+    const MASK_NORTH: i64 = 1
+    const MASK_EAST: i64 = 2
+    const MASK_SOUTH: i64 = 4
+    const MASK_WEST: i64 = 8
+
+    struct MarbleRun:
+        rng: mutable MT19937
+        start_rung: mutable i64
+        rung: mutable i64
+        next_rung: mutable i64
+        trial: mutable i64
+        total_trials: mutable i64
+        adaptive: mutable bool
+        feedback_ms: mutable i64
+        time_override_ms: mutable i64
+        board_seed: mutable i64
+        grain_seed: mutable f64
+        board_generation: mutable i64
+        phase: mutable i64
+        board_ms: mutable i64
+        elapsed_ms: mutable i64
+        feedback_elapsed_ms: mutable i64
+        verdict: mutable i64
+        wins: mutable i64
+        losses: mutable i64
+        score_recorded: mutable bool
+        current_score_win: mutable bool
+        result_recorded: mutable bool
+        result_count: mutable i64
+        result_rung: mutable i64[MAX_TRIALS]
+        result_elapsed_ms: mutable i64[MAX_TRIALS]
+        result_home: mutable i64[MAX_TRIALS]
+        result_lost: mutable i64[MAX_TRIALS]
+        result_verdict: mutable i64[MAX_TRIALS]
+        result_score_win: mutable i64[MAX_TRIALS]
+        result_board_seed: mutable i64[MAX_TRIALS]
+        held_mask: mutable i64
+
+    def clamp_rung(value: i64) -> i64:
+        can Abort.Panic:
+            return 1 if value < 1 else (MAX_RUNG if value > MAX_RUNG else value)
+
+    def duration_ms(rung: i64) -> i64:
+        can Abort.Panic:
+            return (MarbleMaze::grade_of(rung).seconds * 1000.0).i64()
+
+    def effective_duration_ms(run: MarbleRun&) -> i64:
+        can Abort.Panic:
+            return run.time_override_ms if run.time_override_ms > 0 else duration_ms(run.rung)
+
+    def draw_board_identity(run: mutable MarbleRun&):
+        can Abort.Panic:
+            # MarbleMaze._reset leaves the run's tray undealt. The first
+            # randrange/random pair belongs to _next_trial, which is called
+            # by Space/start_run, not by the constructor or READY screen.
+            # Keeping both draws together preserves the shared CPython RNG
+            # stream while making READY a genuinely undealt state.
+            run.board_seed <- py_randrange(&run.rng, 0, 1073741824)
+            run.grain_seed <- py_random(&run.rng) * 4.0
+
+    def initialize(run: mutable MarbleRun&, start_rung: i64, total_trials: i64,
+                   adaptive: bool, feedback_ms: i64, time_override_ms: i64,
+                   seed: i64):
+        can Abort.Panic:
+            rung: i64 = clamp_rung(start_rung)
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.start_rung <- rung
+            run.rung <- rung
+            run.next_rung <- rung
+            run.total_trials <- total_trials
+            run.adaptive <- adaptive
+            run.feedback_ms <- feedback_ms
+            run.time_override_ms <- time_override_ms
+            # The reference does not deal a tray while its UI is READY. The
+            # first board identity is drawn by begin_board when Space starts
+            # the run, so READY cannot consume RNG or expose a fake trial.
+            run.board_seed <- 0
+            run.grain_seed <- 0.0
+            run.board_generation <- 1
+            run.phase <- PHASE_READY
+            run.trial <- 0
+            run.board_ms <- effective_duration_ms(run)
+            run.elapsed_ms <- 0
+            run.feedback_elapsed_ms <- 0
+            run.verdict <- -1
+            run.wins <- 0
+            run.losses <- 0
+            run.score_recorded <- false
+            run.current_score_win <- false
+            run.result_recorded <- false
+            run.result_count <- 0
+            run.held_mask <- 0
+
+    def apply_options(run: mutable MarbleRun&, start_rung: i64, total_trials: i64,
+                      adaptive: bool, time_override_ms: i64) -> i64:
+        can Abort.Panic:
+            # Native MarbleMaze.apply_options() rereads the settings and calls
+            # _reset() on the same object. Preserve the already-advanced RNG;
+            # replacing the controller would incorrectly replay the first tray.
+            return -3 if start_rung < 1 or start_rung > MAX_RUNG
+            return -3 if total_trials < 1 or total_trials > MAX_TRIALS
+            return -3 if time_override_ms < 0 or time_override_ms > MAX_DURATION_MS
+            return -3 if time_override_ms != 0 and time_override_ms != 15000 and time_override_ms != 30000 and time_override_ms != 45000 and time_override_ms != 60000 and time_override_ms != 90000 and time_override_ms != 120000
+            run.start_rung <- clamp_rung(start_rung)
+            run.rung <- run.start_rung
+            run.next_rung <- run.start_rung
+            run.total_trials <- total_trials
+            run.adaptive <- adaptive
+            run.time_override_ms <- time_override_ms
+            run.trial <- 0
+            run.board_seed <- 0
+            run.grain_seed <- 0.0
+            if run.board_generation < MAX_BOARD_GENERATION:
+                run.board_generation <- run.board_generation + 1
+            else:
+                run.board_generation <- 1
+            run.board_ms <- effective_duration_ms(run)
+            run.elapsed_ms <- 0
+            run.feedback_elapsed_ms <- 0
+            run.verdict <- -1
+            run.wins <- 0
+            run.losses <- 0
+            run.score_recorded <- false
+            run.current_score_win <- false
+            run.result_recorded <- false
+            run.result_count <- 0
+            run.held_mask <- 0
+            run.phase <- PHASE_READY
+            return 1
+
+    def begin_board(run: mutable MarbleRun&) -> i64:
+        can Abort.Panic:
+            seconds_ms: i64 = effective_duration_ms(run)
+            return -6 if seconds_ms <= 0 or seconds_ms > MAX_DURATION_MS
+            if run.phase == PHASE_READY:
+                run.trial <- 1
+                draw_board_identity(run)
+            run.board_ms <- seconds_ms
+            run.elapsed_ms <- 0
+            run.feedback_elapsed_ms <- 0
+            run.verdict <- -1
+            run.score_recorded <- false
+            run.current_score_win <- false
+            run.result_recorded <- false
+            run.held_mask <- 0
+            run.phase <- PHASE_RUNNING
+            return 1
+
+    def finish_board(run: mutable MarbleRun&, won: bool, score_win: bool,
+                     par_ms: i64, score_committed: bool):
+        can Abort.Panic:
+            run.verdict <- 1 if won else 0
+            if score_committed:
+                if score_win:
+                    run.wins <- run.wins + 1
+                else:
+                    run.losses <- run.losses + 1
+                run.current_score_win <- score_win
+            run.score_recorded <- score_committed
+            if won:
+                if run.adaptive and par_ms > 0 and run.elapsed_ms * 10 <= par_ms * 16:
+                    run.next_rung <- clamp_rung(run.rung + 1)
+            elif run.adaptive:
+                run.next_rung <- clamp_rung(run.rung - 1)
+            run.feedback_elapsed_ms <- 0
+            run.held_mask <- 0
+            run.phase <- PHASE_FEEDBACK
+
+    def prepare_next(run: mutable MarbleRun&):
+        can Abort.Panic:
+            if run.trial >= run.total_trials:
+                run.phase <- PHASE_DONE
+                run.held_mask <- 0
+                return
+            run.trial <- run.trial + 1
+            run.rung <- run.next_rung
+            run.next_rung <- run.rung
+            # Match MarbleMaze._next_trial: draw a 30-bit seed from the
+            # persistent run RNG rather than incrementing the previous seed.
+            draw_board_identity(run)
+            if run.board_generation < MAX_BOARD_GENERATION:
+                run.board_generation <- run.board_generation + 1
+            else:
+                run.board_generation <- 1
+            run.board_ms <- effective_duration_ms(run)
+            run.elapsed_ms <- 0
+            run.feedback_elapsed_ms <- 0
+            run.verdict <- -1
+            run.score_recorded <- false
+            run.current_score_win <- false
+            run.result_recorded <- false
+            run.held_mask <- 0
+            run.phase <- PHASE_PREPARING
+
+    def begin_fresh_run(run: mutable MarbleRun&) -> i64:
+        can Abort.Panic:
+            draw_board_identity(run)
+            run.rung <- run.start_rung
+            run.next_rung <- run.start_rung
+            run.trial <- 1
+            run.board_ms <- effective_duration_ms(run)
+            # A new Space-started run must not expose the last tray's active
+            # or feedback clock while the host is preparing its first board.
+            # begin_board() writes the same zeroes again at BOARD_READY, but
+            # the common API can observe PREPARING before that callback.
+            run.elapsed_ms <- 0
+            run.feedback_elapsed_ms <- 0
+            run.wins <- 0
+            run.losses <- 0
+            run.verdict <- -1
+            run.score_recorded <- false
+            run.current_score_win <- false
+            run.result_recorded <- false
+            run.result_count <- 0
+            if run.board_generation < MAX_BOARD_GENERATION:
+                run.board_generation <- run.board_generation + 1
+            else:
+                run.board_generation <- 1
+            run.phase <- PHASE_PREPARING
+            run.held_mask <- 0
+            return 1
+
+    def action(run: mutable MarbleRun&, kind: i64, value: i64, aux: i64) -> i64:
+        can Abort.Panic:
+            if kind == ACTION_START:
+                if run.phase == PHASE_READY:
+                    return begin_board(run)
+                elif run.phase == PHASE_DONE:
+                    return begin_fresh_run(run)
+                return 2
+            elif kind == ACTION_BOARD_READY:
+                return 2 if run.phase != PHASE_PREPARING else begin_board(run)
+            elif kind == ACTION_RESTART:
+                return 2 if run.phase != PHASE_RUNNING
+                # The source UI replaces its Simulation, whose constructor
+                # resets elapsed. Preserve that behavior, and release every
+                # direction held on the abandoned simulation.
+                run.elapsed_ms <- 0
+                run.held_mask <- 0
+                return 1
+            elif kind == ACTION_LEVEL:
+                return 2 if run.phase != PHASE_RUNNING else 1
+            elif kind == ACTION_REPORT:
+                return -6 if value < 0 or value > 3 or aux < 0 or aux > MAX_DURATION_MS
+                return 2 if run.phase != PHASE_RUNNING
+                physical_won: bool = (value & 1) != 0
+                score_win: bool = (value & 2) != 0
+                return -6 if physical_won and not score_win
+                finish_board(run, physical_won, score_win, aux, true)
+                return 1
+            elif kind == ACTION_SYNC_SETTLE_TIME:
+                return -6 if value < 0 or value > MAX_SETTLE_MS or aux != 0
+                # Physical settlement is synchronized before REPORT while
+                # still RUNNING. A timeout is detected by the controller
+                # first; the host may then synchronize the source simulation's
+                # final-frame overshoot while FEEDBACK is waiting for SCORE.
+                if run.phase == PHASE_FEEDBACK:
+                    return 2 if run.score_recorded or run.result_recorded or run.verdict != 0
+                else:
+                    return 2 if run.phase != PHASE_RUNNING
+                return -6 if value < run.elapsed_ms
+                run.elapsed_ms <- value
+                return 1
+            elif kind == ACTION_SCORE:
+                return -6 if (value != 0 and value != 1) or aux != 0
+                return 2 if run.phase != PHASE_FEEDBACK or run.score_recorded
+                if value == 1:
+                    run.wins <- run.wins + 1
+                else:
+                    run.losses <- run.losses + 1
+                run.current_score_win <- value == 1
+                run.score_recorded <- true
+                return 1
+            elif kind == ACTION_RECORD_RESULT:
+                return -6 if value < 0 or value > MAX_TRIALS or aux < 0 or aux > MAX_TRIALS
+                return 2 if run.phase != PHASE_FEEDBACK or run.result_recorded or not run.score_recorded
+                return -6 if run.result_count >= MAX_TRIALS
+                slot: i64 = run.result_count
+                run.result_rung[slot.usize()] <- run.rung
+                run.result_elapsed_ms[slot.usize()] <- run.elapsed_ms
+                run.result_home[slot.usize()] <- value
+                run.result_lost[slot.usize()] <- aux
+                run.result_verdict[slot.usize()] <- run.verdict
+                run.result_score_win[slot.usize()] <- 1 if run.current_score_win else 0
+                run.result_board_seed[slot.usize()] <- run.board_seed
+                run.result_count <- slot + 1
+                run.result_recorded <- true
+                return 1
+            elif kind == ACTION_NEXT:
+                if run.phase != PHASE_FEEDBACK:
+                    return 2
+                # The native task appends its result row inside _settle()
+                # before feedback can be skipped or expire.  The browser
+                # supplies the physics-owned home/lost counts through
+                # ACTION_RECORD_RESULT, so do not let either an explicit
+                # Space-next or the feedback timer discard a tray whose
+                # authoritative row has not reached the controller yet.
+                return 2 if not run.score_recorded or not run.result_recorded
+                prepare_next(run)
+                return 1
+            elif kind == ACTION_HOLD_NORTH or kind == ACTION_HOLD_EAST or kind == ACTION_HOLD_SOUTH or kind == ACTION_HOLD_WEST:
+                return 2 if run.phase != PHASE_RUNNING
+                bit: i64 = MASK_NORTH if kind == ACTION_HOLD_NORTH else (MASK_EAST if kind == ACTION_HOLD_EAST else (MASK_SOUTH if kind == ACTION_HOLD_SOUTH else MASK_WEST))
+                run.held_mask <- run.held_mask | bit
+                return 1
+            return -6
+
+    def direction_bit(key: i64) -> i64:
+        can Abort.Panic:
+            return MASK_NORTH if key == 4 else (MASK_EAST if key == 5 else (MASK_SOUTH if key == 6 else (MASK_WEST if key == 3 else 0)))
+
+    def release_key(run: mutable MarbleRun&, key: i64) -> i64:
+        can Abort.Panic:
+            bit: i64 = direction_bit(key)
+            return 2 if bit == 0
+            run.held_mask <- run.held_mask & (15 - bit)
+            return 1
+
+    def clear_input(run: mutable MarbleRun&):
+        can Abort.Panic:
+            run.held_mask <- 0
+
+    def advance(run: mutable MarbleRun&, elapsed_ms: i64) -> i64:
+        can Abort.Panic:
+            return -10 if elapsed_ms < 0
+            if run.phase == PHASE_RUNNING:
+                remaining: i64 = run.board_ms - run.elapsed_ms
+                step: i64 = elapsed_ms if elapsed_ms < remaining else remaining
+                run.elapsed_ms <- run.elapsed_ms + step
+                if run.elapsed_ms >= run.board_ms:
+                    # A timeout has a physical loss verdict immediately, but
+                    # source score() still depends on the host-owned lost
+                    # count. The shell commits that score through
+                    # ACTION_SCORE after inspecting the settled physics.
+                    finish_board(run, false, false, 0, false)
+                return 1
+            elif run.phase == PHASE_FEEDBACK:
+                remaining_feedback: i64 = run.feedback_ms - run.feedback_elapsed_ms
+                step_feedback: i64 = elapsed_ms if elapsed_ms < remaining_feedback else remaining_feedback
+                run.feedback_elapsed_ms <- run.feedback_elapsed_ms + step_feedback
+                if run.feedback_elapsed_ms >= run.feedback_ms and run.score_recorded and run.result_recorded:
+                    prepare_next(run)
+                return 1
+            return 1
+
+    def info(run: MarbleRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            elif field == INFO_RUNG: return run.rung
+            elif field == INFO_TRIAL: return run.trial
+            elif field == INFO_TOTAL_TRIALS: return run.total_trials
+            elif field == INFO_BOARD_GENERATION: return run.board_generation
+            elif field == INFO_BOARD_SEED: return run.board_seed
+            elif field == INFO_ELAPSED_MS: return run.elapsed_ms
+            elif field == INFO_REMAINING_MS:
+                return run.board_ms - run.elapsed_ms if run.phase == PHASE_RUNNING else (run.feedback_ms - run.feedback_elapsed_ms if run.phase == PHASE_FEEDBACK else (run.board_ms if run.phase == PHASE_READY or run.phase == PHASE_PREPARING else 0))
+            elif field == INFO_VERDICT: return run.verdict
+            elif field == INFO_WINS: return run.wins
+            elif field == INFO_LOSSES: return run.losses
+            elif field == INFO_HELD_MASK: return run.held_mask
+            elif field == INFO_RESULT_COUNT: return run.result_count
+            return -1
+
+    def grain_seed_value(run: MarbleRun&) -> f64:
+        can Abort.Panic:
+            return run.grain_seed
+
+    def value(run: MarbleRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return -1 if at < 0 or at >= run.result_count
+            if field == RESULT_RUNG: return run.result_rung[at.usize()]
+            if field == RESULT_ELAPSED_MS: return run.result_elapsed_ms[at.usize()]
+            if field == RESULT_HOME: return run.result_home[at.usize()]
+            if field == RESULT_LOST: return run.result_lost[at.usize()]
+            if field == RESULT_VERDICT: return run.result_verdict[at.usize()]
+            if field == RESULT_SCORE_WIN: return run.result_score_win[at.usize()]
+            if field == RESULT_BOARD_SEED: return run.result_board_seed[at.usize()]
+            return -1

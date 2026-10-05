@@ -175,9 +175,12 @@ def reference():
 
 
 def main():
+    # The Elisa sweep reads the corpus from CORPUS_PATH during startup; write
+    # this run's source cases before launching it rather than letting the
+    # executable consume missing or stale input from a previous invocation.
+    want = reference()
     got = subprocess.run([sys.argv[1]], capture_output=True, text=True, check=True)
     mine = [line for line in got.stdout.splitlines() if line.strip()]
-    want = reference()
     if len(mine) != len(want):
         print("MISMATCH line count: elisa %d, python %d" % (len(mine), len(want)))
         for index, (a, b) in enumerate(zip(mine, want)):

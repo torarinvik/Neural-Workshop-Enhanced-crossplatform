@@ -17,18 +17,381 @@
 /* The core's C ABI, the same surface the wasm build exports (src/wasm/
  * wasm_exports.elisa). Everything is scalar: aggregates do not cross it. */
 extern int64_t nw_frame_alloc(int64_t size);
-extern int64_t nw_frame_write(int64_t dest, int64_t capacity, int64_t trial,
-                              int64_t nback, int64_t position, int64_t verdict);
-extern int64_t nw_session_frame_write(int64_t dest, int64_t capacity, int64_t trial,
-                                      int64_t nback, int64_t seed, int64_t mode,
-                                      int64_t verdict);
-extern int64_t nw_batch_write(int64_t dest, int64_t capacity, int64_t trial,
-                              int64_t nback, int64_t seed, int64_t mode,
-                              int64_t black, int64_t started, int64_t hide_text,
-                              int64_t paused, int64_t grid_3d, int64_t expanded,
-                              int64_t gridlines, int64_t old_style,
-                              int64_t sharp_corners, int64_t session_number,
-                              int64_t verdict, int64_t input_answer);
+extern int64_t nw_title_write(int64_t dest, int64_t capacity, int64_t banner_code,
+                              int64_t black_background, int64_t jaeggi_mode,
+                              int64_t clinical_mode);
+extern int64_t nw_taskhub_write(int64_t dest, int64_t capacity, int64_t category,
+                                int64_t selected, int64_t black,
+                                int64_t width, int64_t height);
+extern int64_t nw_you_are_here_create(int64_t rung, int64_t trials,
+                                      int64_t adaptive, int64_t show_marks,
+                                      int64_t seed);
+extern int64_t nw_you_are_here_action(int64_t handle, int64_t action,
+                                      int64_t now_ms);
+extern int64_t nw_you_are_here_info(int64_t handle, int64_t field);
+extern int64_t nw_you_are_here_frame_write(int64_t dest, int64_t capacity,
+                                           int64_t handle, int64_t black,
+                                           int64_t width, int64_t height);
+extern int64_t nw_you_are_here_destroy(int64_t handle);
+extern int64_t nw_sokoban_create(int64_t rung, int64_t trials,
+                                 int64_t adaptive, int64_t show_traps,
+                                 int64_t seed);
+extern int64_t nw_sokoban_action(int64_t handle, int64_t action,
+                                 int64_t now_ms);
+extern int64_t nw_sokoban_info(int64_t handle, int64_t field);
+extern int64_t nw_sokoban_frame_write(int64_t dest, int64_t capacity,
+                                      int64_t handle, int64_t black,
+                                      int64_t width, int64_t height);
+extern int64_t nw_sokoban_destroy(int64_t handle);
+extern int64_t nw_monkey_ladder_create(int64_t grid, int64_t start_level,
+                                       int64_t adaptive, int64_t show_ms,
+                                       int64_t per_tile_ms, int64_t reveal,
+                                       int64_t seed);
+extern int64_t nw_monkey_ladder_action(int64_t handle, int64_t action,
+                                       int64_t value, int64_t now_ms);
+extern int64_t nw_monkey_ladder_info(int64_t handle, int64_t field);
+extern int64_t nw_monkey_ladder_frame_write(int64_t dest, int64_t capacity,
+                                            int64_t handle, int64_t black,
+                                            int64_t width, int64_t height);
+extern int64_t nw_monkey_ladder_destroy(int64_t handle);
+extern int64_t nw_nback3d_create(int64_t nback, int64_t cubes, int64_t total_trials,
+                                 int64_t interval_ms, int64_t stimulus_ms,
+                                 int64_t feedback_ms, int64_t seed);
+extern int64_t nw_nback3d_action(int64_t handle, int64_t action,
+                                 int64_t value, int64_t now_ms);
+extern int64_t nw_nback3d_info(int64_t handle, int64_t field);
+extern int64_t nw_nback3d_frame_write(int64_t dest, int64_t capacity,
+                                      int64_t handle, int64_t black,
+                                      int64_t width, int64_t height);
+extern int64_t nw_nback3d_destroy(int64_t handle);
+extern int64_t nw_marble_create(int64_t start_rung, int64_t trials,
+                                int64_t adaptive, int64_t feedback_ms,
+                                int64_t time_override_ms, int64_t seed);
+extern int64_t nw_marble_action(int64_t handle, int64_t action,
+                                int64_t value, int64_t aux);
+extern int64_t nw_marble_release(int64_t handle, int64_t key);
+extern int64_t nw_marble_advance(int64_t handle, int64_t elapsed_ms);
+extern int64_t nw_marble_info(int64_t handle, int64_t field);
+extern int64_t nw_marble_board_write(int64_t dest, int64_t capacity,
+                                     int64_t rung, int64_t seed);
+extern int64_t nw_marble_frame_write(int64_t dest, int64_t capacity,
+                                     int64_t handle, int64_t black,
+                                     int64_t width, int64_t height);
+extern int64_t nw_marble_destroy(int64_t handle);
+static void marble_handle_start_key(int64_t handle, SDL_Keycode key) {
+    if (key != SDLK_SPACE) return;
+    int64_t phase = nw_marble_info(handle, 0);
+    nw_marble_action(handle, phase == 2 ? 5 : 0, 0, 0);
+}
+static void marble_release_all(int64_t handle) {
+    if (!handle) return;
+    nw_marble_release(handle, 3);
+    nw_marble_release(handle, 4);
+    nw_marble_release(handle, 5);
+    nw_marble_release(handle, 6);
+}
+extern int64_t nw_tetris_create(int64_t rung, int64_t pieces,
+                                int64_t queue, int64_t seed);
+extern int64_t nw_tetris_action(int64_t handle, int64_t action);
+extern int64_t nw_tetris_frame_write(int64_t dest, int64_t capacity,
+                                     int64_t handle, int64_t black,
+                                     int64_t width, int64_t height);
+extern int64_t nw_tetris_destroy(int64_t handle);
+extern int64_t nw_count_create(int64_t kind, int64_t start_count,
+                               int64_t trials, int64_t exposure_ms,
+                               int64_t adaptive, int64_t show_answer,
+                               int64_t seed);
+extern int64_t nw_count_action(int64_t handle, int64_t action,
+                               int64_t value, int64_t now_ms);
+extern int64_t nw_count_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_count_info(int64_t handle, int64_t field);
+extern int64_t nw_count_frame_write(int64_t dest, int64_t capacity,
+                                    int64_t handle, int64_t black,
+                                    int64_t width, int64_t height);
+extern int64_t nw_count_destroy(int64_t handle);
+extern int64_t nw_mr_time_create(int64_t mode, int64_t rung, int64_t trials,
+                                  int64_t max_gap_ms, int64_t flash_ms,
+                                  int64_t adaptive, int64_t seed);
+extern int64_t nw_mr_time_action(int64_t handle, int64_t action,
+                                  int64_t value, int64_t now_ms);
+extern int64_t nw_mr_time_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_mr_time_info(int64_t handle, int64_t field);
+extern int64_t nw_mr_time_frame_write(int64_t dest, int64_t capacity,
+                                      int64_t handle, int64_t black,
+                                      int64_t width, int64_t height);
+extern int64_t nw_mr_time_destroy(int64_t handle);
+extern int64_t nw_graph_mapping_create(int64_t nodes, int64_t density,
+                                        int64_t trials, int64_t exposure_ms,
+                                        int64_t adaptive, int64_t subtle,
+                                        int64_t seed);
+extern int64_t nw_graph_mapping_action(int64_t handle, int64_t action,
+                                       int64_t now_ms);
+extern int64_t nw_graph_mapping_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_graph_mapping_info(int64_t handle, int64_t field);
+extern int64_t nw_graph_mapping_frame_write(int64_t dest, int64_t capacity,
+                                            int64_t handle, int64_t black,
+                                            int64_t width, int64_t height);
+extern int64_t nw_graph_mapping_destroy(int64_t handle);
+extern int64_t nw_matrix_reasoning_create(int64_t level, int64_t trials,
+                                          int64_t exposure_ms, int64_t adaptive,
+                                          int64_t flags, int64_t color,
+                                          int64_t seed);
+extern int64_t nw_matrix_reasoning_action(int64_t handle, int64_t action,
+                                          int64_t value, int64_t now_ms);
+extern int64_t nw_matrix_reasoning_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_matrix_reasoning_info(int64_t handle, int64_t field);
+extern int64_t nw_matrix_reasoning_frame_write(int64_t dest, int64_t capacity,
+                                               int64_t handle, int64_t black,
+                                               int64_t width, int64_t height);
+extern int64_t nw_matrix_reasoning_destroy(int64_t handle);
+extern int64_t nw_in_the_dark_create(int64_t rung, int64_t trials,
+                                     int64_t room_ms, int64_t adaptive,
+                                     int64_t seed);
+extern int64_t nw_in_the_dark_action(int64_t handle, int64_t action,
+                                     int64_t value, int64_t now_ms);
+extern int64_t nw_in_the_dark_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_in_the_dark_info(int64_t handle, int64_t field);
+extern int64_t nw_in_the_dark_frame_write(int64_t dest, int64_t capacity,
+                                          int64_t handle, int64_t black,
+                                          int64_t width, int64_t height);
+extern int64_t nw_in_the_dark_destroy(int64_t handle);
+extern int64_t nw_fog_create(int64_t radius, int64_t moves_allowed,
+                             int64_t trials, int64_t persist, int64_t seed);
+extern int64_t nw_fog_action(int64_t handle, int64_t action);
+extern int64_t nw_fog_info(int64_t handle, int64_t field);
+extern int64_t nw_fog_frame_write(int64_t dest, int64_t capacity,
+                                  int64_t handle, int64_t black,
+                                  int64_t width, int64_t height);
+extern int64_t nw_fog_destroy(int64_t handle);
+extern int64_t nw_removals_create(int64_t start_rung, int64_t trials,
+                                  int64_t move_ms, int64_t adaptive,
+                                  int64_t seed);
+extern int64_t nw_removals_action(int64_t handle, int64_t action,
+                                  int64_t value, int64_t now_ms);
+extern int64_t nw_removals_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_removals_info(int64_t handle, int64_t field);
+extern int64_t nw_removals_frame_write(int64_t dest, int64_t capacity,
+                                       int64_t handle, int64_t black,
+                                       int64_t width, int64_t height);
+extern int64_t nw_removals_destroy(int64_t handle);
+extern int64_t nw_custody_create(int64_t start_rung, int64_t trials,
+                                 int64_t belt_ms, int64_t mark_ms,
+                                 int64_t adaptive, int64_t seed);
+extern int64_t nw_custody_action(int64_t handle, int64_t action,
+                                 int64_t value, int64_t now_ms);
+extern int64_t nw_custody_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_custody_info(int64_t handle, int64_t field);
+extern int64_t nw_custody_frame_write(int64_t dest, int64_t capacity,
+                                      int64_t handle, int64_t black,
+                                      int64_t width, int64_t height);
+extern int64_t nw_custody_destroy(int64_t handle);
+extern int64_t nw_concentration_create(int64_t pairs, int64_t medium,
+                                       int64_t peek_ms, int64_t hide_ms,
+                                       int64_t show_turns, int64_t coach,
+                                       int64_t seed);
+extern int64_t nw_concentration_action(int64_t handle, int64_t action,
+                                       int64_t value, int64_t now_ms);
+extern int64_t nw_concentration_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_concentration_info(int64_t handle, int64_t field);
+extern int64_t nw_concentration_frame_write(int64_t dest, int64_t capacity,
+                                            int64_t handle, int64_t black,
+                                            int64_t width, int64_t height);
+extern int64_t nw_concentration_destroy(int64_t handle);
+extern int64_t nw_recognition_create(int64_t total_trials, int64_t medium,
+                                     int64_t repeat_percent, int64_t min_lag,
+                                     int64_t study_ms, int64_t feedback,
+                                     int64_t seed);
+extern int64_t nw_recognition_action(int64_t handle, int64_t action,
+                                     int64_t value, int64_t now_ms);
+extern int64_t nw_recognition_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_recognition_info(int64_t handle, int64_t field);
+extern int64_t nw_recognition_frame_write(int64_t dest, int64_t capacity,
+                                          int64_t handle, int64_t black,
+                                          int64_t width, int64_t height);
+extern int64_t nw_recognition_destroy(int64_t handle);
+extern int64_t nw_trivia_create(int64_t start_rung, int64_t total_trials,
+                                int64_t show_answer, int64_t adaptive,
+                                int64_t seed);
+extern int64_t nw_trivia_action(int64_t handle, int64_t action, int64_t value);
+extern int64_t nw_trivia_info(int64_t handle, int64_t field);
+extern int64_t nw_trivia_frame_write(int64_t dest, int64_t capacity,
+                                     int64_t handle, int64_t black,
+                                     int64_t width, int64_t height);
+extern int64_t nw_trivia_destroy(int64_t handle);
+extern int64_t nw_reflex_create(int64_t total_targets, int64_t lifetime_ms,
+                                int64_t spawn_gap_ms, int64_t max_active,
+                                int64_t start_size, int64_t adaptive,
+                                int64_t seed);
+extern int64_t nw_reflex_action(int64_t handle, int64_t action,
+                                int64_t value, int64_t now_ms);
+extern int64_t nw_reflex_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_reflex_info(int64_t handle, int64_t field);
+extern int64_t nw_reflex_value(int64_t handle, int64_t field, int64_t at);
+extern int64_t nw_reflex_pointer(int64_t handle, int64_t x_millionths,
+                                 int64_t y_millionths, int64_t now_ms);
+extern int64_t nw_reflex_frame_write(int64_t dest, int64_t capacity,
+                                     int64_t handle, int64_t black,
+                                     int64_t width, int64_t height);
+extern int64_t nw_reflex_destroy(int64_t handle);
+extern int64_t nw_algebra_create(int64_t level, int64_t trials, int64_t seed);
+extern int64_t nw_algebra_action(int64_t handle, int64_t action,
+                                 int64_t value, int64_t now_ms);
+extern int64_t nw_algebra_info(int64_t handle, int64_t field);
+extern int64_t nw_algebra_frame_write(int64_t dest, int64_t capacity,
+                                      int64_t handle, int64_t black,
+                                      int64_t width, int64_t height);
+extern int64_t nw_algebra_destroy(int64_t handle);
+extern int64_t nw_numberology_create(int64_t start_level, int64_t trials,
+                                     int64_t adaptive, int64_t seed);
+extern int64_t nw_numberology_action(int64_t handle, int64_t action,
+                                     int64_t value, int64_t now_ms);
+extern int64_t nw_numberology_info(int64_t handle, int64_t field);
+extern int64_t nw_numberology_frame_write(int64_t dest, int64_t capacity,
+                                          int64_t handle, int64_t black,
+                                          int64_t width, int64_t height);
+extern int64_t nw_numberology_destroy(int64_t handle);
+extern int64_t nw_jigsaw_create(int64_t start_side, int64_t puzzles,
+                                int64_t adaptive, int64_t preview, int64_t seed);
+extern int64_t nw_jigsaw_action(int64_t handle, int64_t action,
+                                int64_t value, int64_t now_ms);
+extern int64_t nw_jigsaw_info(int64_t handle, int64_t field);
+extern int64_t nw_jigsaw_value(int64_t handle, int64_t field, int64_t at);
+extern int64_t nw_jigsaw_pointer(int64_t handle, int64_t x_millionths,
+                                 int64_t y_millionths, int64_t width,
+                                 int64_t height, int64_t now_ms);
+extern int64_t nw_jigsaw_frame_write(int64_t dest, int64_t capacity,
+                                     int64_t handle, int64_t black,
+                                     int64_t width, int64_t height);
+extern int64_t nw_jigsaw_destroy(int64_t handle);
+extern int64_t nw_sudoku_create(int64_t start_rung, int64_t trials,
+                                int64_t show_clashes, int64_t adaptive, int64_t seed);
+extern int64_t nw_sudoku_action(int64_t handle, int64_t action,
+                                int64_t value, int64_t now_ms);
+extern int64_t nw_sudoku_info(int64_t handle, int64_t field);
+extern int64_t nw_sudoku_value(int64_t handle, int64_t field, int64_t at);
+extern int64_t nw_sudoku_frame_write(int64_t dest, int64_t capacity,
+                                     int64_t handle, int64_t black,
+                                     int64_t width, int64_t height);
+extern int64_t nw_sudoku_destroy(int64_t handle);
+extern int64_t nw_go_create(int64_t difficulty, int64_t trials, int64_t seed);
+extern int64_t nw_go_action(int64_t handle, int64_t action, int64_t value, int64_t now_ms);
+extern int64_t nw_go_info(int64_t handle, int64_t field);
+extern int64_t nw_go_value(int64_t handle, int64_t field, int64_t at);
+extern int64_t nw_go_pointer(int64_t handle, int64_t x_millionths, int64_t y_millionths,
+                             int64_t width, int64_t height, int64_t now_ms);
+extern int64_t nw_go_frame_write(int64_t dest, int64_t capacity, int64_t handle,
+                                 int64_t black, int64_t width, int64_t height);
+extern int64_t nw_go_destroy(int64_t handle);
+extern int64_t nw_ncup_monte_create(int64_t start_cups, int64_t max_cups,
+                                    int64_t adaptive, int64_t swap_count,
+                                    int64_t swap_ms, int64_t reveal_ms, int64_t seed);
+extern int64_t nw_ncup_monte_action(int64_t handle, int64_t action, int64_t value, int64_t now_ms);
+extern int64_t nw_ncup_monte_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_ncup_monte_info(int64_t handle, int64_t field);
+extern int64_t nw_ncup_monte_value(int64_t handle, int64_t field, int64_t at);
+extern int64_t nw_ncup_monte_pointer(int64_t handle, int64_t x_millionths, int64_t y_millionths, int64_t now_ms);
+extern int64_t nw_ncup_monte_frame_write(int64_t dest, int64_t capacity, int64_t handle,
+                                         int64_t black, int64_t width, int64_t height);
+extern int64_t nw_ncup_monte_destroy(int64_t handle);
+extern int64_t nw_tracking_create(int64_t balls, int64_t targets, int64_t seconds,
+                                  int64_t speed, int64_t rounds, int64_t adaptive, int64_t seed);
+extern int64_t nw_tracking_action(int64_t handle, int64_t action, int64_t value, int64_t now_ms);
+extern int64_t nw_tracking_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_tracking_info(int64_t handle, int64_t field);
+extern int64_t nw_tracking_value(int64_t handle, int64_t field, int64_t at);
+extern int64_t nw_tracking_pointer(int64_t handle, int64_t x_millionths, int64_t y_millionths, int64_t now_ms);
+extern int64_t nw_tracking_frame_write(int64_t dest, int64_t capacity, int64_t handle,
+                                       int64_t black, int64_t width, int64_t height);
+extern int64_t nw_tracking_destroy(int64_t handle);
+extern int64_t nw_lookout_create(int64_t start_count, int64_t watching,
+                                 int64_t speed, int64_t morph_ms,
+                                 int64_t total_cues, int64_t adaptive,
+                                 int64_t seed);
+extern int64_t nw_lookout_action(int64_t handle, int64_t action,
+                                 int64_t value, int64_t now_ms);
+extern int64_t nw_lookout_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_lookout_info(int64_t handle, int64_t field);
+extern int64_t nw_lookout_value(int64_t handle, int64_t field, int64_t at);
+extern int64_t nw_lookout_frame_write(int64_t dest, int64_t capacity,
+                                      int64_t handle, int64_t black,
+                                      int64_t width, int64_t height);
+extern int64_t nw_lookout_destroy(int64_t handle);
+extern int64_t nw_pursuit_create(int64_t speed, int64_t surge, int64_t turn_ms,
+                                 int64_t turn_degrees, int64_t size,
+                                 int64_t packed_extra, int64_t seed);
+extern int64_t nw_pursuit_action(int64_t handle, int64_t action,
+                                 int64_t value, int64_t now_ms);
+extern int64_t nw_pursuit_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_pursuit_info(int64_t handle, int64_t field);
+extern int64_t nw_pursuit_value(int64_t handle, int64_t field, int64_t at);
+extern int64_t nw_pursuit_pointer(int64_t handle, int64_t x_millionths,
+                                  int64_t y_millionths);
+extern int64_t nw_pursuit_frame_write(int64_t dest, int64_t capacity,
+                                      int64_t handle, int64_t black,
+                                      int64_t width, int64_t height);
+extern int64_t nw_pursuit_destroy(int64_t handle);
+extern int64_t nw_out_of_sight_create(int64_t dots, int64_t targets,
+                                      int64_t speed, int64_t cross_ms,
+                                      int64_t blinds, int64_t packed_extra,
+                                      int64_t seed);
+extern int64_t nw_out_of_sight_action(int64_t handle, int64_t action,
+                                      int64_t value, int64_t now_ms);
+extern int64_t nw_out_of_sight_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_out_of_sight_info(int64_t handle, int64_t field);
+extern int64_t nw_out_of_sight_value(int64_t handle, int64_t field, int64_t at);
+extern int64_t nw_out_of_sight_frame_write(int64_t dest, int64_t capacity,
+                                           int64_t handle, int64_t black,
+                                           int64_t width, int64_t height);
+extern int64_t nw_out_of_sight_destroy(int64_t handle);
+extern int64_t nw_buzz_wire_create(int64_t rung, int64_t trials,
+                                   int64_t adaptive, int64_t meter,
+                                   int64_t beads, int64_t sight, int64_t seed);
+extern int64_t nw_buzz_wire_action(int64_t handle, int64_t action,
+                                   int64_t value, int64_t now_ms);
+extern int64_t nw_buzz_wire_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_buzz_wire_info(int64_t handle, int64_t field);
+extern int64_t nw_buzz_wire_value(int64_t handle, int64_t field, int64_t at);
+extern int64_t nw_buzz_wire_frame_write(int64_t dest, int64_t capacity,
+                                        int64_t handle, int64_t black,
+                                        int64_t width, int64_t height);
+extern int64_t nw_buzz_wire_destroy(int64_t handle);
+extern int64_t nw_donkey_create(int64_t rung, int64_t trials, int64_t beat_ms,
+                                int64_t set_ms, int64_t adaptive,
+                                int64_t unused, int64_t seed);
+extern int64_t nw_donkey_action(int64_t handle, int64_t action,
+                                int64_t value, int64_t now_ms);
+extern int64_t nw_donkey_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_donkey_info(int64_t handle, int64_t field);
+extern int64_t nw_donkey_frame_write(int64_t dest, int64_t capacity,
+                                     int64_t handle, int64_t black,
+                                     int64_t width, int64_t height);
+extern int64_t nw_donkey_destroy(int64_t handle);
+extern int64_t nw_two_hands_create(int64_t rung, int64_t trials, int64_t beat_ms,
+                                   int64_t set_ms, int64_t adaptive,
+                                   int64_t unused, int64_t seed);
+extern int64_t nw_two_hands_action(int64_t handle, int64_t action,
+                                   int64_t value, int64_t now_ms);
+extern int64_t nw_two_hands_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_two_hands_info(int64_t handle, int64_t field);
+extern int64_t nw_two_hands_pointer(int64_t handle, int64_t x_millionths,
+                                    int64_t y_millionths, int64_t pressed,
+                                    int64_t now_ms);
+extern int64_t nw_two_hands_frame_write(int64_t dest, int64_t capacity,
+                                        int64_t handle, int64_t black,
+                                        int64_t width, int64_t height);
+extern int64_t nw_two_hands_destroy(int64_t handle);
+extern int64_t nw_overrun_create(int64_t rung, int64_t waves, int64_t adaptive,
+                                 int64_t unused_d, int64_t unused_e,
+                                 int64_t unused_f, int64_t seed);
+extern int64_t nw_overrun_action(int64_t handle, int64_t action,
+                                 int64_t value, int64_t now_ms);
+extern int64_t nw_overrun_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_overrun_info(int64_t handle, int64_t field);
+extern int64_t nw_overrun_value(int64_t handle, int64_t field, int64_t at);
+extern int64_t nw_overrun_frame_write(int64_t dest, int64_t capacity,
+                                      int64_t handle, int64_t black,
+                                      int64_t width, int64_t height);
+extern int64_t nw_overrun_destroy(int64_t handle);
 
 #define FRAME_CAPACITY 65536
 #define MAX_COMMANDS   1024
@@ -324,13 +687,11 @@ static int selftest(int frames) {
 
     nw_cmd scratch[MAX_COMMANDS];
     nw_events events = { -1, 0, { 0 } };
-    int64_t trial = 1, seed = 1, mode = 2, verdict = -1;
+    int64_t trial = 1;
     int bad = 0;
 
     for (int i = 0; i < frames; i++) {
-        int64_t length = nw_batch_write(buffer, FRAME_CAPACITY, trial, 2,
-                                        seed, mode, 0, 1, 0, 0, 0, 0, 1, 0,
-                                        0, 0, verdict, 0);
+        int64_t length = nw_title_write(buffer, FRAME_CAPACITY, trial % 4, 0, 1, 1);
         nw_frame frame;
         if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer, (size_t)length,
                                       scratch, MAX_COMMANDS, &frame)) {
@@ -372,9 +733,1030 @@ static int selftest(int frames) {
     return bad ? 1 : 0;
 }
 
+static int selftest_you_are_here(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int bad = 0;
+    int64_t handle = nw_you_are_here_create(1, 1, 0, 1, 17);
+    if (!buffer || !handle) {
+        printf("3d-maze selftest: allocation failed\n");
+        if (handle) nw_you_are_here_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_events events = { -1, 0, { 0 } };
+    int64_t length = nw_you_are_here_frame_write(buffer, FRAME_CAPACITY,
+                                                  handle, 0, 912, 684);
+    nw_frame frame;
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) {
+        printf("3d-maze selftest: READY frame decode failed\n");
+        bad++;
+    }
+    int64_t phase_ready = nw_you_are_here_info(handle, 0);
+    int64_t start_result = nw_you_are_here_action(handle, 0, 0);
+    int64_t phase_walking = nw_you_are_here_info(handle, 0);
+    int64_t turn_result = nw_you_are_here_action(handle, 3, 10);
+    int64_t steps_after_turn = nw_you_are_here_info(handle, 6);
+    if (phase_ready != 0 || start_result != 1 || phase_walking != 1 ||
+        turn_result != 1 || steps_after_turn != 1) {
+        printf("3d-maze state: ready=%lld start=%lld walking=%lld turn=%lld steps=%lld\n",
+               (long long)phase_ready, (long long)start_result,
+               (long long)phase_walking, (long long)turn_result,
+               (long long)steps_after_turn);
+        bad++;
+    }
+    length = nw_you_are_here_frame_write(buffer, FRAME_CAPACITY, handle,
+                                         0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) {
+        printf("3d-maze selftest: WALKING frame decode failed\n");
+        bad++;
+    }
+    if (nw_you_are_here_destroy(handle) != 0) bad++;
+    (void)events;
+    printf("3d-maze selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_taskhub(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    if (!buffer) {
+        printf("taskhub selftest: allocation failed\n");
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int bad = 0;
+    int64_t length = nw_taskhub_write(buffer, FRAME_CAPACITY, 5, 4,
+                                      0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) {
+        printf("taskhub selftest: frame decode failed\n");
+        bad++;
+    } else {
+        int texts = 0;
+        for (uint32_t c = 0; c < frame.count; c++) {
+            const nw_cmd *cmd = &frame.commands[c];
+            if (cmd->kind != NW_TEXT) continue;
+            texts++;
+            uint32_t n = cmd->len & 0xffffffu;
+            if (cmd->ref + n > frame.pool_len) bad++;
+        }
+        if (texts < 3) bad++;
+    }
+    printf("taskhub selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_sokoban(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_sokoban_create(1, 1, 0, 1, 17);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("sokoban selftest: allocation failed\n");
+        if (handle) nw_sokoban_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_sokoban_frame_write(buffer, FRAME_CAPACITY, handle,
+                                             0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) {
+        printf("sokoban selftest: READY frame decode failed\n");
+        bad++;
+    }
+    nw_sokoban_action(handle, 0, 0);
+    int64_t phase = nw_sokoban_info(handle, 0);
+    int64_t width = nw_sokoban_info(handle, 8);
+    int64_t height = nw_sokoban_info(handle, 9);
+    if (phase != 1 || width < 5 || height < 5) {
+        printf("sokoban selftest: invalid started state phase=%lld size=%lldx%lld\n",
+               (long long)phase, (long long)width, (long long)height);
+        bad++;
+    }
+    nw_sokoban_action(handle, 3, 10);
+    nw_sokoban_action(handle, 5, 20);
+    nw_sokoban_action(handle, 6, 30);
+    length = nw_sokoban_frame_write(buffer, FRAME_CAPACITY, handle,
+                                    0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) {
+        printf("sokoban selftest: PLAYING frame decode failed\n");
+        bad++;
+    }
+    if (nw_sokoban_destroy(handle) != 0) bad++;
+    printf("sokoban selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_monkey_ladder(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_monkey_ladder_create(5, 2, 1, 300, 120, 1, 17);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("monkey ladder selftest: allocation failed\n");
+        if (handle) nw_monkey_ladder_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_monkey_ladder_frame_write(buffer, FRAME_CAPACITY,
+                                                   handle, 0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_monkey_ladder_info(handle, 0) != 0) bad++;
+    nw_monkey_ladder_action(handle, 0, 0, 1000);
+    if (nw_monkey_ladder_info(handle, 0) != 1) bad++;
+    nw_monkey_ladder_action(handle, 1, 0, 2000);
+    if (nw_monkey_ladder_info(handle, 0) != 2) bad++;
+    int64_t answer = nw_monkey_ladder_info(handle, 4);
+    int64_t cell = nw_monkey_ladder_info(handle, 7);
+    (void)cell;
+    if (answer < 2 || answer > 25) bad++;
+    nw_monkey_ladder_action(handle, 2, 0, 2001);
+    length = nw_monkey_ladder_frame_write(buffer, FRAME_CAPACITY, handle,
+                                          0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_monkey_ladder_destroy(handle) != 0) bad++;
+    printf("monkey ladder selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_nback3d(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_nback3d_create(2, 3, 20, 3000, 500, 200, 17);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("3D N-Back selftest: allocation failed\n");
+        if (handle) nw_nback3d_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_nback3d_frame_write(buffer, FRAME_CAPACITY, handle,
+                                             0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_nback3d_info(handle, 0) != 0) bad++;
+    nw_nback3d_action(handle, 0, 0, 0);
+    nw_nback3d_action(handle, 2, 0, 1000);
+    if (nw_nback3d_info(handle, 0) != 1 || nw_nback3d_info(handle, 2) != 1) bad++;
+    length = nw_nback3d_frame_write(buffer, FRAME_CAPACITY, handle, 0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    nw_nback3d_action(handle, 2, 0, 1600);
+    if (nw_nback3d_info(handle, 0) != 2) bad++;
+    nw_nback3d_action(handle, 1, 0, 1700);
+    if (nw_nback3d_info(handle, 8) != 1) bad++;
+    if (nw_nback3d_destroy(handle) != 0) bad++;
+    printf("3D N-Back selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_marble(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_marble_create(1, 1, 0, 2600, 15000, 17);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("Marble Maze selftest: allocation failed\n");
+        if (handle) nw_marble_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_marble_frame_write(buffer, FRAME_CAPACITY, handle,
+                                            0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_marble_info(handle, 0) != 0) bad++;
+    marble_handle_start_key(handle, SDLK_RETURN);
+    if (nw_marble_info(handle, 0) != 0) bad++;
+    marble_handle_start_key(handle, SDLK_SPACE);
+    if (nw_marble_info(handle, 0) != 1) bad++;
+    int64_t board_length = nw_marble_board_write(buffer, FRAME_CAPACITY, 1,
+                                                 889418965);
+    const uint8_t *board = (const uint8_t *)(uintptr_t)buffer;
+    if (board_length < 68 || memcmp(board, "MWC1", 4) != 0 ||
+        board[4] != 1 || board[8] != 1 || board[12] != 1) bad++;
+    if (nw_marble_action(handle, 6, 0, 0) != 1 ||
+        nw_marble_action(handle, 7, 0, 0) != 1 ||
+        nw_marble_info(handle, 11) != 3) bad++;
+    marble_release_all(handle);
+    if (nw_marble_info(handle, 11) != 0) bad++;
+    if (nw_marble_advance(handle, 15000) != 1 || nw_marble_info(handle, 0) != 2) bad++;
+    length = nw_marble_frame_write(buffer, FRAME_CAPACITY, handle, 0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_marble_destroy(handle) != 0) bad++;
+    printf("Marble Maze selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_tetris(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_tetris_create(1, 3, 5, 17);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("tetris selftest: allocation failed\n");
+        if (handle) nw_tetris_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_tetris_frame_write(buffer, FRAME_CAPACITY, handle,
+                                           0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_tetris_action(handle, 0) != 1) bad++;
+    if (nw_tetris_action(handle, 3) != 1) bad++;
+    if (nw_tetris_action(handle, 6) != 1) bad++;
+    if (nw_tetris_action(handle, 4) != 1) bad++;
+    length = nw_tetris_frame_write(buffer, FRAME_CAPACITY, handle,
+                                   0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_tetris_destroy(handle) != 0) bad++;
+    printf("tetris selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_count(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_count_create(0, 8, 5, 200, 1, 1, 23);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("count selftest: allocation failed\n");
+        if (handle) nw_count_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_count_frame_write(buffer, FRAME_CAPACITY, handle,
+                                          0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_count_info(handle, 0) != 0) bad++;
+    if (nw_count_action(handle, 0, 0, 1000) != 1) bad++;
+    if (nw_count_info(handle, 0) != 1 || nw_count_info(handle, 2) != 8) bad++;
+    if (nw_count_advance(handle, 1200) != 1 || nw_count_info(handle, 0) != 2) bad++;
+    if (nw_count_action(handle, 1, 8, 1201) != 1) bad++;
+    if (nw_count_action(handle, 3, 0, 1202) != 1 || nw_count_info(handle, 9) != 1) bad++;
+    length = nw_count_frame_write(buffer, FRAME_CAPACITY, handle,
+                                  0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_count_destroy(handle) != 0) bad++;
+    printf("count selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_mr_time(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_mr_time_create(0, 1, 5, 3000, 400, 1, 17);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("Mr. Time selftest: allocation failed\n");
+        if (handle) nw_mr_time_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_mr_time_frame_write(buffer, FRAME_CAPACITY, handle,
+                                             0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_mr_time_info(handle, 0) != 0) bad++;
+    nw_mr_time_action(handle, 0, 0, 1000);
+    if (nw_mr_time_info(handle, 0) != 1) bad++;
+    nw_mr_time_advance(handle, 11000);
+    if (nw_mr_time_info(handle, 0) != 3) bad++;
+    nw_mr_time_action(handle, 1, 0, 12000);
+    nw_mr_time_action(handle, 4, 0, 12001);
+    if (nw_mr_time_info(handle, 0) != 5) bad++;
+    length = nw_mr_time_frame_write(buffer, FRAME_CAPACITY, handle,
+                                    0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_mr_time_destroy(handle) != 0) bad++;
+    printf("Mr. Time selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_graph_mapping(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_graph_mapping_create(4, 0, 5, 3000, 1, 0, 17);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("Graph Mapping selftest: allocation failed\n");
+        if (handle) nw_graph_mapping_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_graph_mapping_frame_write(buffer, FRAME_CAPACITY,
+                                                   handle, 0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_graph_mapping_info(handle, 0) != 0) bad++;
+    if (nw_graph_mapping_action(handle, 0, 1000) != 1) bad++;
+    if (nw_graph_mapping_info(handle, 0) != 1) bad++;
+    int64_t truth = nw_graph_mapping_info(handle, 21);
+    int64_t choice = truth ? 1 : 2;
+    if (nw_graph_mapping_action(handle, choice, 1200) != 1) bad++;
+    if (nw_graph_mapping_info(handle, 0) != 3) bad++;
+    length = nw_graph_mapping_frame_write(buffer, FRAME_CAPACITY, handle,
+                                          0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_graph_mapping_advance(handle, nw_graph_mapping_info(handle, 16)) != 1) bad++;
+    if (nw_graph_mapping_info(handle, 0) != 1 || nw_graph_mapping_info(handle, 4) != 2) bad++;
+    if (nw_graph_mapping_destroy(handle) != 0) bad++;
+    printf("Graph Mapping selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_matrix_reasoning(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_matrix_reasoning_create(1, 5, 0, 1, 1, 1, 17);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("Matrix Reasoning selftest: allocation failed\n");
+        if (handle) nw_matrix_reasoning_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_matrix_reasoning_frame_write(buffer, FRAME_CAPACITY,
+                                                      handle, 0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_matrix_reasoning_info(handle, 0) != 0) bad++;
+    if (nw_matrix_reasoning_action(handle, 0, 0, 1000) != 1) bad++;
+    if (nw_matrix_reasoning_info(handle, 0) != 1) bad++;
+    int64_t answer = nw_matrix_reasoning_info(handle, 6);
+    if (answer < 0 || answer >= nw_matrix_reasoning_info(handle, 5)) bad++;
+    if (nw_matrix_reasoning_action(handle, 1, answer, 1200) != 1) bad++;
+    if (nw_matrix_reasoning_info(handle, 0) != 3) bad++;
+    int64_t deadline = nw_matrix_reasoning_info(handle, 21);
+    if (nw_matrix_reasoning_advance(handle, deadline) != 1) bad++;
+    length = nw_matrix_reasoning_frame_write(buffer, FRAME_CAPACITY, handle,
+                                             0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_matrix_reasoning_destroy(handle) != 0) bad++;
+    printf("Matrix Reasoning selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_in_the_dark(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_in_the_dark_create(1, 1, 500, 1, 17);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("In the Dark selftest: allocation failed\n");
+        if (handle) nw_in_the_dark_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_in_the_dark_frame_write(buffer, FRAME_CAPACITY,
+                                                 handle, 0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_in_the_dark_info(handle, 0) != 0) bad++;
+    if (nw_in_the_dark_action(handle, 0, 0, 0) != 1) bad++;
+    for (int64_t now = 500; now <= 20000 && nw_in_the_dark_info(handle, 0) == 1; now += 500)
+        nw_in_the_dark_advance(handle, now);
+    if (nw_in_the_dark_info(handle, 0) != 2) bad++;
+    int64_t asks = nw_in_the_dark_info(handle, 22);
+    for (int64_t at = 0; at < asks; at++) {
+        int64_t answer = nw_in_the_dark_info(handle, 16 + at);
+        (void)answer;
+        nw_in_the_dark_action(handle, 1, 0, 21000 + at);
+    }
+    length = nw_in_the_dark_frame_write(buffer, FRAME_CAPACITY, handle,
+                                        0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_in_the_dark_destroy(handle) != 0) bad++;
+    printf("In the Dark selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_fog(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_fog_create(2, 100, 1, 1, 17);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("Fog of War selftest: allocation failed\n");
+        if (handle) nw_fog_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_fog_frame_write(buffer, FRAME_CAPACITY, handle,
+                                        0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_fog_info(handle, 0) != 0) bad++;
+    if (nw_fog_action(handle, 0) != 1 || nw_fog_info(handle, 0) != 1) bad++;
+    if (nw_fog_info(handle, 6) != 25 || nw_fog_info(handle, 7) != 15) bad++;
+    if (nw_fog_action(handle, 2) != 1 || nw_fog_info(handle, 4) != 1) bad++;
+    length = nw_fog_frame_write(buffer, FRAME_CAPACITY, handle, 0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_fog_destroy(handle) != 0) bad++;
+    printf("Fog of War selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_removals(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_removals_create(1, 1, 500, 1, 17);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("Removals selftest: allocation failed\n");
+        if (handle) nw_removals_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_removals_frame_write(buffer, FRAME_CAPACITY, handle,
+                                             0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_removals_info(handle, 0) != 0) bad++;
+    if (nw_removals_action(handle, 0, 0, 0) != 1) bad++;
+    for (int64_t now = 500; now <= 25000 && nw_removals_info(handle, 0) == 1; now += 500)
+        nw_removals_advance(handle, now);
+    if (nw_removals_info(handle, 0) != 2) bad++;
+    int64_t asks = nw_removals_info(handle, 13);
+    int64_t vans = nw_removals_info(handle, 4);
+    for (int64_t at = 0; at < asks; at++)
+        nw_removals_action(handle, 1, 0, 30000 + at);
+    if (vans <= 0) bad++;
+    length = nw_removals_frame_write(buffer, FRAME_CAPACITY, handle,
+                                     0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_removals_destroy(handle) != 0) bad++;
+    printf("Removals selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_custody(void) {
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_custody_create(1, 1, 900, 1200, 0, 17);
+    int bad = 0;
+    if (!buffer || !handle) {
+        printf("Chain of Custody selftest: allocation failed\n");
+        if (handle) nw_custody_destroy(handle);
+        return 1;
+    }
+    nw_cmd scratch[MAX_COMMANDS];
+    nw_frame frame;
+    int64_t length = nw_custody_frame_write(buffer, FRAME_CAPACITY, handle,
+                                            0, 912, 684);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    if (nw_custody_info(handle, 0) != 0) bad++;
+    if (nw_custody_action(handle, 0, 0, 0) != 1) bad++;
+    nw_custody_advance(handle, 1200);
+    if (nw_custody_info(handle, 0) != 2) bad++;
+    length = nw_custody_frame_write(buffer, FRAME_CAPACITY, handle,
+                                    0, 1280, 720);
+    if (length <= 0 || !nw_decode((const uint8_t *)(uintptr_t)buffer,
+                                  (size_t)length, scratch, MAX_COMMANDS, &frame)) bad++;
+    for (int64_t now = 2100; now <= 50000 && nw_custody_info(handle, 0) == 2; now += 900)
+        nw_custody_advance(handle, now);
+    if (nw_custody_info(handle, 0) != 3 && nw_custody_info(handle, 0) != 4) bad++;
+    if (nw_custody_destroy(handle) != 0) bad++;
+    printf("Chain of Custody selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_concentration(void) {
+    int bad = 0;
+    int64_t handle = nw_concentration_create(4, 0, 0, 900, 1, 1, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_concentration_destroy(handle);
+        free(buffer);
+        printf("Concentration selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_concentration_info(handle, 0) != 0) bad++;
+    if (nw_concentration_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_concentration_info(handle, 0) != 2) bad++;
+    if (nw_concentration_action(handle, 2, 3, 0) != 1) bad++;
+    if (nw_concentration_info(handle, 9) != 3) bad++;
+    if (nw_concentration_action(handle, 1, 3, 0) != 1) bad++;
+    if (nw_concentration_info(handle, 6) != 1) bad++;
+    if (nw_concentration_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                                      handle, 0, 912, 684) <= 0) bad++;
+    if (nw_concentration_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Concentration selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_recognition(void) {
+    int bad = 0;
+    int64_t handle = nw_recognition_create(10, 0, 40, 4, 500, 1, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_recognition_destroy(handle);
+        free(buffer);
+        printf("Seen It Before selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_recognition_info(handle, 0) != 0) bad++;
+    if (nw_recognition_action(handle, 0, 0, 100) != 1) bad++;
+    if (nw_recognition_info(handle, 0) != 1) bad++;
+    if (nw_recognition_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                                   handle, 0, 912, 684) <= 0) bad++;
+    if (nw_recognition_action(handle, 2, 0, 200) != 1) bad++;
+    if (nw_recognition_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Seen It Before selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_trivia(void) {
+    int bad = 0;
+    int64_t handle = nw_trivia_create(1, 1, 1, 0, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_trivia_destroy(handle);
+        free(buffer);
+        printf("Trivia selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_trivia_info(handle, 0) != 0) bad++;
+    if (nw_trivia_action(handle, 0, 0) != 1) bad++;
+    if (nw_trivia_info(handle, 0) != 1) bad++;
+    if (nw_trivia_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                              handle, 0, 912, 684) <= 0) bad++;
+    int64_t choice = nw_trivia_info(handle, 6);
+    if (nw_trivia_action(handle, 4 + choice, 0) != 1) bad++;
+    if (nw_trivia_action(handle, 12, 0) != 1) bad++;
+    if (nw_trivia_info(handle, 0) != 3) bad++;
+    if (nw_trivia_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Trivia selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_reflex(void) {
+    int bad = 0;
+    int64_t handle = nw_reflex_create(10, 1200, 400, 3, 100, 1, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_reflex_destroy(handle);
+        free(buffer);
+        printf("Reflex selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_reflex_info(handle, 0) != 0) bad++;
+    if (nw_reflex_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_reflex_info(handle, 0) != 1) bad++;
+    if (nw_reflex_advance(handle, 0) != 1) bad++;
+    if (nw_reflex_info(handle, 3) != 3) bad++;
+    int64_t x = nw_reflex_value(handle, 1, 0);
+    int64_t y = nw_reflex_value(handle, 2, 0);
+    if (nw_reflex_pointer(handle, x, y, 100) < 0) bad++;
+    if (nw_reflex_info(handle, 9) != 1) bad++;
+    if (nw_reflex_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                              handle, 0, 912, 684) <= 0) bad++;
+    if (nw_reflex_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Reflex selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_algebra(void) {
+    int bad = 0;
+    int64_t handle = nw_algebra_create(1, 2, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_algebra_destroy(handle);
+        free(buffer);
+        printf("Algebra selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_algebra_info(handle, 0) != 0) bad++;
+    if (nw_algebra_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_algebra_info(handle, 0) != 1) bad++;
+    if (nw_algebra_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                               handle, 0, 912, 684) <= 0) bad++;
+    if (nw_algebra_action(handle, 2, 0, 0) != 2) bad++;
+    if (nw_algebra_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Algebra selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_numberology(void) {
+    int bad = 0;
+    int64_t handle = nw_numberology_create(1, 2, 1, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_numberology_destroy(handle);
+        free(buffer);
+        printf("Numberology selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_numberology_info(handle, 0) != 0) bad++;
+    if (nw_numberology_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_numberology_info(handle, 0) != 1) bad++;
+    if (nw_numberology_info(handle, 4) < 4) bad++;
+    if (nw_numberology_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                                   handle, 0, 912, 684) <= 0) bad++;
+    if (nw_numberology_action(handle, 1, 45, 0) != 1) bad++;
+    if (nw_numberology_action(handle, 2, 0, 0) != 1) bad++;
+    if (nw_numberology_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Numberology selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_jigsaw(void) {
+    int bad = 0;
+    int64_t handle = nw_jigsaw_create(3, 2, 1, 1, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_jigsaw_destroy(handle);
+        free(buffer);
+        printf("Jigsaw selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_jigsaw_info(handle, 0) != 0) bad++;
+    if (nw_jigsaw_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_jigsaw_info(handle, 0) != 1) bad++;
+    if (nw_jigsaw_info(handle, 1) != 3) bad++;
+    if (nw_jigsaw_value(handle, 0, 0) < 0) bad++;
+    if (nw_jigsaw_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                              handle, 0, 912, 684) <= 0) bad++;
+    if (nw_jigsaw_action(handle, 1, 0, 0) != 1) bad++;
+    if (nw_jigsaw_action(handle, 1, 0, 1) != 1) bad++;
+    if (nw_jigsaw_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Jigsaw selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_sudoku(void) {
+    int bad = 0;
+    int64_t handle = nw_sudoku_create(1, 2, 1, 1, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_sudoku_destroy(handle);
+        free(buffer);
+        printf("Sudoku selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_sudoku_info(handle, 0) != 0) bad++;
+    if (nw_sudoku_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_sudoku_info(handle, 0) != 1) bad++;
+    if (nw_sudoku_info(handle, 5) < 4) bad++;
+    if (nw_sudoku_value(handle, 0, 0) < 0) bad++;
+    if (nw_sudoku_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                              handle, 0, 912, 684) <= 0) bad++;
+    if (nw_sudoku_action(handle, 1, 0, 0) != 1) bad++;
+    if (nw_sudoku_action(handle, 5, 1, 0) < 1) bad++;
+    if (nw_sudoku_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Sudoku selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_go(void) {
+    int bad = 0;
+    int64_t handle = nw_go_create(1, 2, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_go_destroy(handle);
+        free(buffer);
+        printf("Go selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_go_info(handle, 0) != 0) bad++;
+    if (nw_go_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_go_info(handle, 0) != 1) bad++;
+    if (nw_go_info(handle, 4) <= 0) bad++;
+    if (nw_go_value(handle, 0, 0) < 0) bad++;
+    if (nw_go_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                          handle, 0, 912, 684) <= 0) bad++;
+    if (nw_go_action(handle, 3, 0, 0) != 1) bad++;
+    if (nw_go_action(handle, 1, 0, 0) != 1) bad++;
+    if (nw_go_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Go selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_ncup_monte(void) {
+    int bad = 0;
+    int64_t handle = nw_ncup_monte_create(3, 10, 1, 4, 160, 750, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_ncup_monte_destroy(handle);
+        free(buffer);
+        printf("N-Cup Monte selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_ncup_monte_info(handle, 0) != 0) bad++;
+    if (nw_ncup_monte_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_ncup_monte_info(handle, 0) != 1) bad++;
+    if (nw_ncup_monte_advance(handle, 750) < 1) bad++;
+    if (nw_ncup_monte_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                                  handle, 0, 912, 684) <= 0) bad++;
+    if (nw_ncup_monte_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("N-Cup Monte selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_tracking(void) {
+    int bad = 0;
+    int64_t handle = nw_tracking_create(8, 2, 3, 30, 5, 1, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_tracking_destroy(handle);
+        free(buffer);
+        printf("Moving Targets selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_tracking_info(handle, 0) != 0) bad++;
+    if (nw_tracking_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_tracking_info(handle, 0) != 1) bad++;
+    if (nw_tracking_advance(handle, 2000) < 1) bad++;
+    if (nw_tracking_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                                handle, 0, 912, 684) <= 0) bad++;
+    if (nw_tracking_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Moving Targets selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_lookout(void) {
+    int bad = 0;
+    int64_t handle = nw_lookout_create(8, 2, 30, 1200, 10, 1, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_lookout_destroy(handle);
+        free(buffer);
+        printf("Lookout selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_lookout_info(handle, 0) != 0) bad++;
+    if (nw_lookout_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_lookout_info(handle, 0) != 1) bad++;
+    if (nw_lookout_info(handle, 20) != 8) bad++;
+    if (nw_lookout_advance(handle, 100) < 1) bad++;
+    if (nw_lookout_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                               handle, 0, 912, 684) <= 0) bad++;
+    if (nw_lookout_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Lookout selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_pursuit(void) {
+    int bad = 0;
+    int64_t handle = nw_pursuit_create(20, 40, 400, 90, 16, 0, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_pursuit_destroy(handle);
+        free(buffer);
+        printf("Pursuit selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_pursuit_info(handle, 0) != 0) bad++;
+    if (nw_pursuit_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_pursuit_info(handle, 0) != 1) bad++;
+    if (nw_pursuit_advance(handle, 100) != 1) bad++;
+    if (nw_pursuit_pointer(handle, 500000, 500000) != 1) bad++;
+    if (nw_pursuit_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                               handle, 0, 912, 684) <= 0) bad++;
+    if (nw_pursuit_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Pursuit selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_out_of_sight(void) {
+    int bad = 0;
+    int64_t handle = nw_out_of_sight_create(8, 2, 30, 1200, 2, 460, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_out_of_sight_destroy(handle);
+        free(buffer);
+        printf("Out of Sight selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_out_of_sight_info(handle, 0) != 0) bad++;
+    if (nw_out_of_sight_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_out_of_sight_info(handle, 0) != 1) bad++;
+    if (nw_out_of_sight_advance(handle, 100) < 1) bad++;
+    if (nw_out_of_sight_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                                    handle, 0, 912, 684) <= 0) bad++;
+    if (nw_out_of_sight_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Out of Sight selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_buzz_wire(void) {
+    int bad = 0;
+    int64_t handle = nw_buzz_wire_create(1, 1, 1, 1, 1, 1, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_buzz_wire_destroy(handle);
+        free(buffer);
+        printf("Buzz Wire selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_buzz_wire_info(handle, 0) != 0) bad++;
+    if (nw_buzz_wire_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_buzz_wire_info(handle, 0) != 1) bad++;
+    if (nw_buzz_wire_advance(handle, 100) < 1) bad++;
+    if (nw_buzz_wire_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                                 handle, 0, 912, 684) <= 0) bad++;
+    if (nw_buzz_wire_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Buzz Wire selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_donkey(void) {
+    int bad = 0;
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_donkey_create(1, 1, 180, 400, 1, 0, 17);
+    if (!buffer || !handle) {
+        printf("Donkey selftest: allocation failed\n");
+        if (handle) nw_donkey_destroy(handle);
+        return 1;
+    }
+    if (nw_donkey_info(handle, 0) != 0) bad++;
+    if (nw_donkey_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_donkey_info(handle, 0) != 1) bad++;
+    if (nw_donkey_advance(handle, 500) < 1) bad++;
+    if (nw_donkey_info(handle, 0) != 2) bad++;
+    if (nw_donkey_frame_write(buffer, FRAME_CAPACITY, handle, 0, 912, 684) <= 0) bad++;
+    if (nw_donkey_destroy(handle) != 0) bad++;
+    free((void *)(uintptr_t)buffer);
+    printf("Donkey selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_two_hands(void) {
+    int bad = 0;
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_two_hands_create(3, 1, 400, 1200, 1, 0, 17);
+    if (!buffer || !handle) {
+        printf("Two Hands selftest: allocation failed\n");
+        if (handle) nw_two_hands_destroy(handle);
+        return 1;
+    }
+    if (nw_two_hands_info(handle, 0) != 0) bad++;
+    if (nw_two_hands_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_two_hands_info(handle, 0) != 1) bad++;
+    if (nw_two_hands_advance(handle, 1300) < 1) bad++;
+    if (nw_two_hands_info(handle, 0) != 2) bad++;
+    if (nw_two_hands_pointer(handle, 500000, 500000, 1, 1300) < 0) bad++;
+    if (nw_two_hands_frame_write(buffer, FRAME_CAPACITY, handle, 0, 912, 684) <= 0) bad++;
+    if (nw_two_hands_destroy(handle) != 0) bad++;
+    free((void *)(uintptr_t)buffer);
+    printf("Two Hands selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_overrun(void) {
+    int bad = 0;
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    int64_t handle = nw_overrun_create(1, 3, 1, 0, 0, 0, 17);
+    if (!buffer || !handle) {
+        printf("Overrun selftest: allocation failed\n");
+        if (handle) nw_overrun_destroy(handle);
+        return 1;
+    }
+    if (nw_overrun_info(handle, 0) != 0) bad++;
+    if (nw_overrun_action(handle, 0, 0, 0) != 1) bad++;
+    if (nw_overrun_info(handle, 0) != 1) bad++;
+    if (nw_overrun_action(handle, 1, nw_overrun_value(handle, 3, 0), 1) < 0) bad++;
+    if (nw_overrun_advance(handle, 100) < 0) bad++;
+    if (nw_overrun_frame_write(buffer, FRAME_CAPACITY, handle, 0, 912, 684) <= 0) bad++;
+    if (nw_overrun_destroy(handle) != 0) bad++;
+    free((void *)(uintptr_t)buffer);
+    printf("Overrun selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--selftest") == 0) {
         return selftest(argc > 2 ? atoi(argv[2]) : 180);
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-3d-maze") == 0) {
+        return selftest_you_are_here();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-taskhub") == 0) {
+        return selftest_taskhub();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-sokoban") == 0) {
+        return selftest_sokoban();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-monkey-ladder") == 0) {
+        return selftest_monkey_ladder();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-nback3d") == 0) {
+        return selftest_nback3d();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-marble") == 0) {
+        return selftest_marble();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-tetris") == 0) {
+        return selftest_tetris();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-count") == 0) {
+        return selftest_count();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-mr-time") == 0) {
+        return selftest_mr_time();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-graph-mapping") == 0) {
+        return selftest_graph_mapping();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-matrix-reasoning") == 0) {
+        return selftest_matrix_reasoning();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-in-the-dark") == 0) {
+        return selftest_in_the_dark();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-fog") == 0) {
+        return selftest_fog();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-removals") == 0) {
+        return selftest_removals();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-custody") == 0) {
+        return selftest_custody();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-concentration") == 0) {
+        return selftest_concentration();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-recognition") == 0) {
+        return selftest_recognition();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-trivia") == 0) {
+        return selftest_trivia();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-reflex") == 0) {
+        return selftest_reflex();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-algebra") == 0) {
+        return selftest_algebra();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-numberology") == 0) {
+        return selftest_numberology();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-jigsaw") == 0) {
+        return selftest_jigsaw();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-sudoku") == 0) {
+        return selftest_sudoku();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-go") == 0) {
+        return selftest_go();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-ncup-monte") == 0) {
+        return selftest_ncup_monte();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-moving-targets") == 0) {
+        return selftest_tracking();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-lookout") == 0) {
+        return selftest_lookout();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-pursuit") == 0) {
+        return selftest_pursuit();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-out-of-sight") == 0) {
+        return selftest_out_of_sight();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-buzz-wire") == 0) {
+        return selftest_buzz_wire();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-donkey") == 0) {
+        return selftest_donkey();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-two-hands") == 0) {
+        return selftest_two_hands();
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-overrun") == 0) {
+        return selftest_overrun();
     }
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
@@ -394,9 +1776,360 @@ int main(int argc, char **argv) {
     nw_cmd scratch[MAX_COMMANDS];
     nw_events events = { -1, 0, { 0 } };
 
-    /* The same seeded session path used by the web and Python shells. */
-    int64_t trial = 1, seed = 1, mode = 2, verdict = -1;
+    bool taskhub_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                        strcmp(argv[2], "taskhub") == 0;
+    bool maze_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                     strcmp(argv[2], "3d-maze") == 0;
+    bool sokoban_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                        strcmp(argv[2], "sokoban") == 0;
+    bool monkey_ladder_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                              strcmp(argv[2], "monkey-ladder") == 0;
+    bool nback3d_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                        strcmp(argv[2], "nback3d") == 0;
+    bool marble_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                       strcmp(argv[2], "marble") == 0;
+    bool tetris_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                       strcmp(argv[2], "tetris") == 0;
+    bool count_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                      strcmp(argv[2], "count") == 0;
+    bool mr_time_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                        strcmp(argv[2], "mr-time") == 0;
+    bool graph_mapping_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                              strcmp(argv[2], "graph-mapping") == 0;
+    bool matrix_reasoning_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                                 strcmp(argv[2], "matrix-reasoning") == 0;
+    bool in_the_dark_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                            strcmp(argv[2], "in-the-dark") == 0;
+    bool fog_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                    strcmp(argv[2], "fog-of-war") == 0;
+    bool removals_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                         strcmp(argv[2], "removals") == 0;
+    bool custody_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                        strcmp(argv[2], "chain-of-custody") == 0;
+    bool concentration_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                              strcmp(argv[2], "concentration") == 0;
+    bool recognition_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                            strcmp(argv[2], "recognition") == 0;
+    bool trivia_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                       strcmp(argv[2], "trivia") == 0;
+    bool reflex_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                       strcmp(argv[2], "reflex") == 0;
+    bool algebra_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                        strcmp(argv[2], "algebra") == 0;
+    bool numberology_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                            strcmp(argv[2], "numberology") == 0;
+    bool jigsaw_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                       strcmp(argv[2], "jigsaw") == 0;
+    bool sudoku_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                       strcmp(argv[2], "sudoku") == 0;
+    bool go_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                   strcmp(argv[2], "go") == 0;
+    bool ncup_monte_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                           strcmp(argv[2], "ncup-monte") == 0;
+    bool tracking_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                         strcmp(argv[2], "moving-targets") == 0;
+    bool lookout_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                        strcmp(argv[2], "lookout") == 0;
+    bool pursuit_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                        strcmp(argv[2], "pursuit") == 0;
+    bool out_of_sight_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                             strcmp(argv[2], "out-of-sight") == 0;
+    bool buzz_wire_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                          strcmp(argv[2], "buzz-wire") == 0;
+    bool donkey_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                       strcmp(argv[2], "donkey") == 0;
+    bool two_hands_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                          strcmp(argv[2], "two-hands") == 0;
+    bool overrun_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                        strcmp(argv[2], "overrun") == 0;
+    int64_t maze_handle = maze_mode ? nw_you_are_here_create(1, 1, 0, 1, 17) : 0;
+    int64_t sokoban_handle = sokoban_mode ? nw_sokoban_create(1, 1, 0, 1, 17) : 0;
+    int64_t monkey_ladder_handle = monkey_ladder_mode
+        ? nw_monkey_ladder_create(5, 2, 1, 300, 120, 1, 17) : 0;
+    int64_t nback3d_handle = nback3d_mode
+        ? nw_nback3d_create(2, 3, 20, 3000, 500, 200, 17) : 0;
+    int64_t marble_handle = marble_mode
+        ? nw_marble_create(1, 1, 0, 2600, 15000, 17) : 0;
+    int64_t tetris_handle = tetris_mode
+        ? nw_tetris_create(1, 25, 5, 17) : 0;
+    int64_t count_handle = count_mode
+        ? nw_count_create(0, 8, 5, 200, 1, 1, 23) : 0;
+    int64_t mr_time_handle = mr_time_mode
+        ? nw_mr_time_create(0, 1, 5, 3000, 400, 1, 23) : 0;
+    int64_t graph_mapping_handle = graph_mapping_mode
+        ? nw_graph_mapping_create(4, 0, 5, 3000, 1, 0, 23) : 0;
+    int64_t matrix_reasoning_handle = matrix_reasoning_mode
+        ? nw_matrix_reasoning_create(1, 5, 0, 1, 1, 1, 23) : 0;
+    int64_t in_the_dark_handle = in_the_dark_mode
+        ? nw_in_the_dark_create(1, 1, 1000, 1, 23) : 0;
+    int64_t fog_handle = fog_mode ? nw_fog_create(2, 100, 1, 1, 23) : 0;
+    int64_t removals_handle = removals_mode
+        ? nw_removals_create(1, 1, 1000, 1, 23) : 0;
+    int64_t custody_handle = custody_mode
+        ? nw_custody_create(1, 1, 900, 1200, 1, 23) : 0;
+    int64_t concentration_handle = concentration_mode
+        ? nw_concentration_create(4, 0, 0, 900, 1, 1, 23) : 0;
+    int64_t recognition_handle = recognition_mode
+        ? nw_recognition_create(10, 0, 40, 4, 500, 1, 23) : 0;
+    int64_t trivia_handle = trivia_mode
+        ? nw_trivia_create(1, 1, 1, 1, 23) : 0;
+    int64_t reflex_handle = reflex_mode
+        ? nw_reflex_create(10, 1200, 400, 3, 100, 1, 23) : 0;
+    int64_t algebra_handle = algebra_mode
+        ? nw_algebra_create(1, 5, 23) : 0;
+    int64_t numberology_handle = numberology_mode
+        ? nw_numberology_create(1, 5, 1, 23) : 0;
+    int64_t jigsaw_handle = jigsaw_mode
+        ? nw_jigsaw_create(3, 5, 1, 1, 23) : 0;
+    int64_t sudoku_handle = sudoku_mode
+        ? nw_sudoku_create(1, 5, 1, 1, 23) : 0;
+    int64_t go_handle = go_mode ? nw_go_create(1, 5, 23) : 0;
+    int64_t ncup_monte_handle = ncup_monte_mode
+        ? nw_ncup_monte_create(3, 10, 1, 4, 160, 750, 23) : 0;
+    int64_t tracking_handle = tracking_mode
+        ? nw_tracking_create(8, 2, 3, 30, 5, 1, 23) : 0;
+    int64_t lookout_handle = lookout_mode
+        ? nw_lookout_create(8, 2, 30, 1200, 10, 1, 23) : 0;
+    int64_t pursuit_handle = pursuit_mode
+        ? nw_pursuit_create(20, 40, 400, 90, 16, 0, 23) : 0;
+    int64_t out_of_sight_handle = out_of_sight_mode
+        ? nw_out_of_sight_create(8, 2, 30, 1200, 2, 460, 23) : 0;
+    int64_t buzz_wire_handle = buzz_wire_mode
+        ? nw_buzz_wire_create(1, 1, 1, 1, 1, 1, 23) : 0;
+    int64_t donkey_handle = donkey_mode
+        ? nw_donkey_create(1, 1, 180, 400, 1, 0, 23) : 0;
+    int64_t two_hands_handle = two_hands_mode
+        ? nw_two_hands_create(3, 1, 400, 1200, 1, 0, 23) : 0;
+    int64_t overrun_handle = overrun_mode
+        ? nw_overrun_create(1, 3, 1, 0, 0, 0, 23) : 0;
+    if (maze_mode && !maze_handle) {
+        SDL_Log("3D Maze controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (sokoban_mode && !sokoban_handle) {
+        SDL_Log("Sokoban controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (lookout_mode && !lookout_handle) {
+        SDL_Log("Lookout controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (pursuit_mode && !pursuit_handle) {
+        SDL_Log("Pursuit controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (out_of_sight_mode && !out_of_sight_handle) {
+        SDL_Log("Out of Sight controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (buzz_wire_mode && !buzz_wire_handle) {
+        SDL_Log("Buzz Wire controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (donkey_mode && !donkey_handle) {
+        SDL_Log("Donkey controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (two_hands_mode && !two_hands_handle) {
+        SDL_Log("Two Hands controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (overrun_mode && !overrun_handle) {
+        SDL_Log("Overrun controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (monkey_ladder_mode && !monkey_ladder_handle) {
+        SDL_Log("Monkey Ladder controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (mr_time_mode && !mr_time_handle) {
+        SDL_Log("Mr. Time controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (graph_mapping_mode && !graph_mapping_handle) {
+        SDL_Log("Graph Mapping controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (matrix_reasoning_mode && !matrix_reasoning_handle) {
+        SDL_Log("Matrix Reasoning controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (in_the_dark_mode && !in_the_dark_handle) {
+        SDL_Log("In the Dark controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (fog_mode && !fog_handle) {
+        SDL_Log("Fog of War controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (removals_mode && !removals_handle) {
+        SDL_Log("Removals controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (custody_mode && !custody_handle) {
+        SDL_Log("Chain of Custody controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (concentration_mode && !concentration_handle) {
+        SDL_Log("Concentration controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (recognition_mode && !recognition_handle) {
+        SDL_Log("Seen It Before controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (trivia_mode && !trivia_handle) {
+        SDL_Log("Trivia controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (reflex_mode && !reflex_handle) {
+        SDL_Log("Reflex controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (algebra_mode && !algebra_handle) {
+        SDL_Log("Algebra controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (numberology_mode && !numberology_handle) {
+        SDL_Log("Numberology controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (jigsaw_mode && !jigsaw_handle) {
+        SDL_Log("Jigsaw controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (sudoku_mode && !sudoku_handle) {
+        SDL_Log("Sudoku controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (go_mode && !go_handle) {
+        SDL_Log("Go controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (ncup_monte_mode && !ncup_monte_handle) {
+        SDL_Log("N-Cup Monte controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (tracking_mode && !tracking_handle) {
+        SDL_Log("Moving Targets controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (nback3d_mode && !nback3d_handle) {
+        SDL_Log("3D N-Back controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (marble_mode && !marble_handle) {
+        SDL_Log("Marble Maze controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (tetris_mode && !tetris_handle) {
+        SDL_Log("Freeform Tetris controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (count_mode && !count_handle) {
+        SDL_Log("Count controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    int64_t trial = 1;
+    int64_t category = 0, selected = 0;
     Uint64 last_step = SDL_GetTicks();
+    Uint64 last_marble_tick = SDL_GetTicks();
     bool playing = false, running = true;
 
     while (running) {
@@ -404,23 +2137,884 @@ int main(int argc, char **argv) {
         bool step = false;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT) running = false;
+            if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST && marble_mode)
+                marble_release_all(marble_handle);
             if (event.type == SDL_EVENT_KEY_DOWN) {
-                if (event.key.key == SDLK_ESCAPE || event.key.key == SDLK_Q) running = false;
-                if (event.key.key == SDLK_SPACE) playing = !playing;
-                if (event.key.key == SDLK_RIGHT) step = true;
+                if (event.key.key == SDLK_ESCAPE || event.key.key == SDLK_Q) {
+                    if (taskhub_mode && maze_mode) {
+                        nw_you_are_here_destroy(maze_handle);
+                        maze_handle = 0;
+                        maze_mode = false;
+                    } else if (taskhub_mode && sokoban_mode) {
+                        nw_sokoban_destroy(sokoban_handle);
+                        sokoban_handle = 0;
+                        sokoban_mode = false;
+                    } else if (taskhub_mode && monkey_ladder_mode) {
+                        nw_monkey_ladder_destroy(monkey_ladder_handle);
+                        monkey_ladder_handle = 0;
+                        monkey_ladder_mode = false;
+                    } else if (taskhub_mode && nback3d_mode) {
+                        nw_nback3d_destroy(nback3d_handle);
+                        nback3d_handle = 0;
+                        nback3d_mode = false;
+                    } else if (taskhub_mode && marble_mode) {
+                        nw_marble_destroy(marble_handle);
+                        marble_handle = 0;
+                        marble_mode = false;
+                    } else if (taskhub_mode && tetris_mode) {
+                        nw_tetris_destroy(tetris_handle);
+                        tetris_handle = 0;
+                        tetris_mode = false;
+                    } else if (taskhub_mode && count_mode) {
+                        nw_count_destroy(count_handle);
+                        count_handle = 0;
+                        count_mode = false;
+                    } else if (taskhub_mode && mr_time_mode) {
+                        nw_mr_time_destroy(mr_time_handle);
+                        mr_time_handle = 0;
+                        mr_time_mode = false;
+                    } else if (taskhub_mode && graph_mapping_mode) {
+                        nw_graph_mapping_destroy(graph_mapping_handle);
+                        graph_mapping_handle = 0;
+                        graph_mapping_mode = false;
+                    } else if (taskhub_mode && matrix_reasoning_mode) {
+                        nw_matrix_reasoning_destroy(matrix_reasoning_handle);
+                        matrix_reasoning_handle = 0;
+                        matrix_reasoning_mode = false;
+                    } else if (taskhub_mode && in_the_dark_mode) {
+                        nw_in_the_dark_destroy(in_the_dark_handle);
+                        in_the_dark_handle = 0;
+                        in_the_dark_mode = false;
+                    } else if (taskhub_mode && fog_mode) {
+                        nw_fog_destroy(fog_handle);
+                        fog_handle = 0;
+                        fog_mode = false;
+                    } else if (taskhub_mode && removals_mode) {
+                        nw_removals_destroy(removals_handle);
+                        removals_handle = 0;
+                        removals_mode = false;
+                    } else if (taskhub_mode && custody_mode) {
+                        nw_custody_destroy(custody_handle);
+                        custody_handle = 0;
+                        custody_mode = false;
+                    } else if (taskhub_mode && concentration_mode) {
+                        nw_concentration_destroy(concentration_handle);
+                        concentration_handle = 0;
+                        concentration_mode = false;
+                    } else if (taskhub_mode && recognition_mode) {
+                        nw_recognition_destroy(recognition_handle);
+                        recognition_handle = 0;
+                        recognition_mode = false;
+                    } else if (taskhub_mode && trivia_mode) {
+                        nw_trivia_destroy(trivia_handle);
+                        trivia_handle = 0;
+                        trivia_mode = false;
+                    } else if (taskhub_mode && reflex_mode) {
+                        nw_reflex_destroy(reflex_handle);
+                        reflex_handle = 0;
+                        reflex_mode = false;
+                    } else if (taskhub_mode && algebra_mode) {
+                        nw_algebra_destroy(algebra_handle);
+                        algebra_handle = 0;
+                        algebra_mode = false;
+                    } else if (taskhub_mode && numberology_mode) {
+                        nw_numberology_destroy(numberology_handle);
+                        numberology_handle = 0;
+                        numberology_mode = false;
+                    } else if (taskhub_mode && jigsaw_mode) {
+                        nw_jigsaw_destroy(jigsaw_handle);
+                        jigsaw_handle = 0;
+                        jigsaw_mode = false;
+                    } else if (taskhub_mode && sudoku_mode) {
+                        nw_sudoku_destroy(sudoku_handle);
+                        sudoku_handle = 0;
+                        sudoku_mode = false;
+                    } else if (taskhub_mode && go_mode) {
+                        nw_go_destroy(go_handle);
+                        go_handle = 0;
+                        go_mode = false;
+                    } else if (taskhub_mode && ncup_monte_mode) {
+                        nw_ncup_monte_destroy(ncup_monte_handle);
+                        ncup_monte_handle = 0;
+                        ncup_monte_mode = false;
+                    } else if (taskhub_mode && tracking_mode) {
+                        nw_tracking_destroy(tracking_handle);
+                        tracking_handle = 0;
+                        tracking_mode = false;
+                    } else if (taskhub_mode && lookout_mode) {
+                        nw_lookout_destroy(lookout_handle);
+                        lookout_handle = 0;
+                        lookout_mode = false;
+                    } else if (taskhub_mode && pursuit_mode) {
+                        nw_pursuit_destroy(pursuit_handle);
+                        pursuit_handle = 0;
+                        pursuit_mode = false;
+                    } else if (taskhub_mode && out_of_sight_mode) {
+                        nw_out_of_sight_destroy(out_of_sight_handle);
+                        out_of_sight_handle = 0;
+                        out_of_sight_mode = false;
+                    } else if (taskhub_mode && buzz_wire_mode) {
+                        nw_buzz_wire_destroy(buzz_wire_handle);
+                        buzz_wire_handle = 0;
+                        buzz_wire_mode = false;
+                    } else if (taskhub_mode && donkey_mode) {
+                        nw_donkey_destroy(donkey_handle);
+                        donkey_handle = 0;
+                        donkey_mode = false;
+                    } else if (taskhub_mode && two_hands_mode) {
+                        nw_two_hands_destroy(two_hands_handle);
+                        two_hands_handle = 0;
+                        two_hands_mode = false;
+                    } else if (taskhub_mode && overrun_mode) {
+                        nw_overrun_destroy(overrun_handle);
+                        overrun_handle = 0;
+                        overrun_mode = false;
+                    } else {
+                        running = false;
+                    }
+                }
+                if (taskhub_mode && !maze_mode && !sokoban_mode && !nback3d_mode &&
+                    !marble_mode &&
+                    !monkey_ladder_mode && !tetris_mode && !count_mode && !mr_time_mode &&
+                    !graph_mapping_mode && !matrix_reasoning_mode && !in_the_dark_mode && !fog_mode && !removals_mode && !custody_mode && !concentration_mode && !recognition_mode && !trivia_mode && !reflex_mode && !algebra_mode && !numberology_mode && !jigsaw_mode && !sudoku_mode && !go_mode && !ncup_monte_mode && !tracking_mode && !lookout_mode && !pursuit_mode && !out_of_sight_mode && !buzz_wire_mode && !donkey_mode && !two_hands_mode && !overrun_mode) {
+                    if (event.key.key == SDLK_LEFT) category = (category + 6) % 7, selected = 0;
+                    if (event.key.key == SDLK_RIGHT) category = (category + 1) % 7, selected = 0;
+                    if (event.key.key == SDLK_UP) selected = selected > 0 ? selected - 1 : 0;
+                    if (event.key.key == SDLK_DOWN) selected += 1;
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) {
+                        if (category == 5 && selected == 4) {
+                            maze_handle = nw_you_are_here_create(1, 1, 0, 1, 17);
+                            maze_mode = maze_handle != 0;
+                        } else if (category == 5 && selected == 2) {
+                            sokoban_handle = nw_sokoban_create(1, 1, 0, 1, 17);
+                            sokoban_mode = sokoban_handle != 0;
+                        } else if (category == 0 && selected == 1) {
+                            monkey_ladder_handle = nw_monkey_ladder_create(5, 2, 1, 300, 120, 1, 17);
+                            monkey_ladder_mode = monkey_ladder_handle != 0;
+                        } else if (category == 0 && selected == 0) {
+                            nback3d_handle = nw_nback3d_create(2, 3, 20, 3000, 500, 200, 17);
+                            nback3d_mode = nback3d_handle != 0;
+                        } else if (category == 2 && selected == 10) {
+                            marble_handle = nw_marble_create(1, 1, 0, 2600, 15000, 17);
+                            marble_mode = marble_handle != 0;
+                        } else if (category == 5 && selected == 6) {
+                            tetris_handle = nw_tetris_create(1, 25, 5, 17);
+                            tetris_mode = tetris_handle != 0;
+                        } else if (category == 3 && selected == 0) {
+                            count_handle = nw_count_create(0, 8, 5, 200, 1, 1, 23);
+                            count_mode = count_handle != 0;
+                        } else if (category == 3 && selected == 1) {
+                            mr_time_handle = nw_mr_time_create(0, 1, 5, 3000, 400, 1, 23);
+                            mr_time_mode = mr_time_handle != 0;
+                        } else if (category == 4 && selected == 0) {
+                            graph_mapping_handle = nw_graph_mapping_create(4, 0, 5, 3000, 1, 0, 23);
+                            graph_mapping_mode = graph_mapping_handle != 0;
+                        } else if (category == 4 && selected == 1) {
+                            matrix_reasoning_handle = nw_matrix_reasoning_create(1, 5, 0, 1, 1, 1, 23);
+                            matrix_reasoning_mode = matrix_reasoning_handle != 0;
+                        } else if (category == 0 && selected == 2) {
+                            in_the_dark_handle = nw_in_the_dark_create(1, 1, 1000, 1, 23);
+                            in_the_dark_mode = in_the_dark_handle != 0;
+                        } else if (category == 0 && selected == 3) {
+                            fog_handle = nw_fog_create(2, 100, 1, 1, 23);
+                            fog_mode = fog_handle != 0;
+                        } else if (category == 0 && selected == 4) {
+                            removals_handle = nw_removals_create(1, 1, 1000, 1, 23);
+                            removals_mode = removals_handle != 0;
+                        } else if (category == 0 && selected == 5) {
+                            custody_handle = nw_custody_create(1, 1, 900, 1200, 1, 23);
+                            custody_mode = custody_handle != 0;
+                        } else if (category == 1 && selected == 0) {
+                            concentration_handle = nw_concentration_create(4, 0, 0, 900, 1, 1, 23);
+                            concentration_mode = concentration_handle != 0;
+                        } else if (category == 1 && selected == 1) {
+                            recognition_handle = nw_recognition_create(10, 0, 40, 4, 500, 1, 23);
+                            recognition_mode = recognition_handle != 0;
+                        } else if (category == 1 && selected == 2) {
+                            trivia_handle = nw_trivia_create(1, 1, 1, 1, 23);
+                            trivia_mode = trivia_handle != 0;
+                        } else if (category == 2 && selected == 0) {
+                            reflex_handle = nw_reflex_create(10, 1200, 400, 3, 100, 1, 23);
+                            reflex_mode = reflex_handle != 0;
+                        } else if (category == 4 && selected == 9) {
+                            algebra_handle = nw_algebra_create(1, 5, 23);
+                            algebra_mode = algebra_handle != 0;
+                        } else if (category == 4 && selected == 10) {
+                            numberology_handle = nw_numberology_create(1, 5, 1, 23);
+                            numberology_mode = numberology_handle != 0;
+                        } else if (category == 4 && selected == 2) {
+                            jigsaw_handle = nw_jigsaw_create(3, 5, 1, 1, 23);
+                            jigsaw_mode = jigsaw_handle != 0;
+                        } else if (category == 4 && selected == 3) {
+                            sudoku_handle = nw_sudoku_create(1, 5, 1, 1, 23);
+                            sudoku_mode = sudoku_handle != 0;
+                        } else if (category == 4 && selected == 4) {
+                            go_handle = nw_go_create(1, 5, 23);
+                            go_mode = go_handle != 0;
+                        } else if (category == 2 && selected == 1) {
+                            ncup_monte_handle = nw_ncup_monte_create(3, 10, 1, 4, 160, 750, 23);
+                            ncup_monte_mode = ncup_monte_handle != 0;
+                        } else if (category == 2 && selected == 2) {
+                            tracking_handle = nw_tracking_create(8, 2, 3, 30, 5, 1, 23);
+                            tracking_mode = tracking_handle != 0;
+                        } else if (category == 2 && selected == 3) {
+                            lookout_handle = nw_lookout_create(8, 2, 30, 1200, 10, 1, 23);
+                            lookout_mode = lookout_handle != 0;
+                        } else if (category == 2 && selected == 4) {
+                            pursuit_handle = nw_pursuit_create(20, 40, 400, 90, 16, 0, 23);
+                            pursuit_mode = pursuit_handle != 0;
+                        } else if (category == 2 && selected == 6) {
+                            out_of_sight_handle = nw_out_of_sight_create(8, 2, 30, 1200, 2, 460, 23);
+                            out_of_sight_mode = out_of_sight_handle != 0;
+                        } else if (category == 2 && selected == 5) {
+                            buzz_wire_handle = nw_buzz_wire_create(1, 1, 1, 1, 1, 1, 23);
+                            buzz_wire_mode = buzz_wire_handle != 0;
+                        } else if (category == 2 && selected == 7) {
+                            donkey_handle = nw_donkey_create(1, 1, 180, 400, 1, 0, 23);
+                            donkey_mode = donkey_handle != 0;
+                        } else if (category == 2 && selected == 8) {
+                            two_hands_handle = nw_two_hands_create(3, 1, 400, 1200, 1, 0, 23);
+                            two_hands_mode = two_hands_handle != 0;
+                        } else if (category == 2 && selected == 9) {
+                            overrun_handle = nw_overrun_create(1, 3, 1, 0, 0, 0, 23);
+                            overrun_mode = overrun_handle != 0;
+                        }
+                    }
+                } else if (maze_mode) {
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN)
+                        nw_you_are_here_action(maze_handle, 0, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_UP)
+                        nw_you_are_here_action(maze_handle, 1, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_DOWN)
+                        nw_you_are_here_action(maze_handle, 2, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_LEFT)
+                        nw_you_are_here_action(maze_handle, 3, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_RIGHT)
+                        nw_you_are_here_action(maze_handle, 4, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_R)
+                        nw_you_are_here_action(maze_handle, 5, (int64_t)SDL_GetTicks());
+                } else if (sokoban_mode) {
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN)
+                        nw_sokoban_action(sokoban_handle, 0, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_UP)
+                        nw_sokoban_action(sokoban_handle, 1, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_DOWN)
+                        nw_sokoban_action(sokoban_handle, 2, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_LEFT)
+                        nw_sokoban_action(sokoban_handle, 3, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_RIGHT)
+                        nw_sokoban_action(sokoban_handle, 4, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_U)
+                        nw_sokoban_action(sokoban_handle, 5, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_R)
+                        nw_sokoban_action(sokoban_handle, 6, (int64_t)SDL_GetTicks());
+                } else if (monkey_ladder_mode) {
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) {
+                        int64_t phase = nw_monkey_ladder_info(monkey_ladder_handle, 0);
+                        nw_monkey_ladder_action(monkey_ladder_handle,
+                            phase == 2 ? 7 : 0, 0, (int64_t)SDL_GetTicks());
+                    }
+                    if (event.key.key == SDLK_UP)
+                        nw_monkey_ladder_action(monkey_ladder_handle, 3, 0, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_DOWN)
+                        nw_monkey_ladder_action(monkey_ladder_handle, 4, 0, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_LEFT)
+                        nw_monkey_ladder_action(monkey_ladder_handle, 5, 0, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_RIGHT)
+                        nw_monkey_ladder_action(monkey_ladder_handle, 6, 0, (int64_t)SDL_GetTicks());
+                } else if (nback3d_mode) {
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN)
+                        nw_nback3d_action(nback3d_handle, 0, 0, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_A)
+                        nw_nback3d_action(nback3d_handle, 1, 0, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_P)
+                        nw_nback3d_action(nback3d_handle, 3, 0, (int64_t)SDL_GetTicks());
+                    if (event.key.key == SDLK_R)
+                        nw_nback3d_action(nback3d_handle, 4, 0, (int64_t)SDL_GetTicks());
+                } else if (marble_mode) {
+                    marble_handle_start_key(marble_handle, event.key.key);
+                    if (event.key.key == SDLK_UP)
+                        nw_marble_action(marble_handle, 6, 0, 0);
+                    if (event.key.key == SDLK_RIGHT)
+                        nw_marble_action(marble_handle, 7, 0, 0);
+                    if (event.key.key == SDLK_DOWN)
+                        nw_marble_action(marble_handle, 8, 0, 0);
+                    if (event.key.key == SDLK_LEFT)
+                        nw_marble_action(marble_handle, 9, 0, 0);
+                    if (event.key.key == SDLK_L)
+                        nw_marble_action(marble_handle, 2, 0, 0);
+                    if (event.key.key == SDLK_R)
+                        nw_marble_action(marble_handle, 1, 0, 0);
+                } else if (tetris_mode) {
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN)
+                        nw_tetris_action(tetris_handle, 0);
+                    if (event.key.key == SDLK_LEFT)
+                        nw_tetris_action(tetris_handle, 1);
+                    if (event.key.key == SDLK_RIGHT)
+                        nw_tetris_action(tetris_handle, 2);
+                    if (event.key.key == SDLK_UP)
+                        nw_tetris_action(tetris_handle, 3);
+                    if (event.key.key == SDLK_DOWN)
+                        nw_tetris_action(tetris_handle, 4);
+                    if (event.key.key == SDLK_R)
+                        nw_tetris_action(tetris_handle, 5);
+                    if (event.key.key >= SDLK_1 && event.key.key <= SDLK_6)
+                        nw_tetris_action(tetris_handle, 6 + event.key.key - SDLK_1);
+                } else if (count_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) {
+                        int64_t phase = nw_count_info(count_handle, 0);
+                        nw_count_action(count_handle, phase == 0 || phase == 4 ? 0 : 3,
+                                        0, now_ms);
+                    }
+                    if (event.key.key == SDLK_BACKSPACE)
+                        nw_count_action(count_handle, 2, 0, now_ms);
+                    if (event.key.key >= SDLK_0 && event.key.key <= SDLK_9)
+                        nw_count_action(count_handle, 1,
+                                        event.key.key - SDLK_0, now_ms);
+                } else if (mr_time_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) {
+                        int64_t phase = nw_mr_time_info(mr_time_handle, 0);
+                        nw_mr_time_action(mr_time_handle,
+                            phase == 3 ? 4 : 0, 0, now_ms);
+                    }
+                    if (event.key.key == SDLK_BACKSPACE)
+                        nw_mr_time_action(mr_time_handle, 3, 0, now_ms);
+                    if (event.key.key == SDLK_PERIOD || event.key.key == SDLK_KP_PERIOD)
+                        nw_mr_time_action(mr_time_handle, 2, 0, now_ms);
+                    if (event.key.key >= SDLK_0 && event.key.key <= SDLK_9)
+                        nw_mr_time_action(mr_time_handle, 1,
+                                          event.key.key - SDLK_0, now_ms);
+                } else if (graph_mapping_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) {
+                        int64_t phase = nw_graph_mapping_info(graph_mapping_handle, 0);
+                        nw_graph_mapping_action(graph_mapping_handle,
+                            phase == 0 ? 0 : 2, now_ms);
+                    }
+                    if (event.key.key == SDLK_Y || event.key.key == SDLK_S ||
+                        event.key.key == SDLK_LEFT)
+                        nw_graph_mapping_action(graph_mapping_handle, 1, now_ms);
+                    if (event.key.key == SDLK_N || event.key.key == SDLK_D ||
+                        event.key.key == SDLK_RIGHT)
+                        nw_graph_mapping_action(graph_mapping_handle, 2, now_ms);
+                } else if (matrix_reasoning_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) {
+                        int64_t phase = nw_matrix_reasoning_info(matrix_reasoning_handle, 0);
+                        if (phase == 0 || phase == 4)
+                            nw_matrix_reasoning_action(matrix_reasoning_handle, 0, 0, now_ms);
+                    }
+                    if (event.key.key >= SDLK_1 && event.key.key <= SDLK_8)
+                        nw_matrix_reasoning_action(matrix_reasoning_handle, 1,
+                                                  event.key.key - SDLK_1, now_ms);
+                } else if (in_the_dark_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN)
+                        nw_in_the_dark_action(in_the_dark_handle, 0, 0, now_ms);
+                    if (event.key.key >= SDLK_1 && event.key.key <= SDLK_5)
+                        nw_in_the_dark_action(in_the_dark_handle, 1 + event.key.key - SDLK_1,
+                                              event.key.key - SDLK_1, now_ms);
+                } else if (fog_mode) {
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN)
+                        nw_fog_action(fog_handle, 0);
+                    if (event.key.key == SDLK_UP) nw_fog_action(fog_handle, 2);
+                    if (event.key.key == SDLK_DOWN) nw_fog_action(fog_handle, 3);
+                    if (event.key.key == SDLK_LEFT) nw_fog_action(fog_handle, 4);
+                    if (event.key.key == SDLK_RIGHT) nw_fog_action(fog_handle, 5);
+                } else if (removals_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN)
+                        nw_removals_action(removals_handle, 0, 0, now_ms);
+                    if (event.key.key >= SDLK_1 && event.key.key <= SDLK_5)
+                        nw_removals_action(removals_handle, 1 + event.key.key - SDLK_1,
+                                           event.key.key - SDLK_1, now_ms);
+                } else if (custody_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN)
+                        nw_custody_action(custody_handle, 0, 0, now_ms);
+                    if (event.key.key == SDLK_LEFT)
+                        nw_custody_action(custody_handle, 1, 0, now_ms);
+                    if (event.key.key == SDLK_RIGHT)
+                        nw_custody_action(custody_handle, 2, 0, now_ms);
+                    if (event.key.key == SDLK_Z)
+                        nw_custody_action(custody_handle, 3, 0, now_ms);
+                } else if (concentration_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t cursor = nw_concentration_info(concentration_handle, 9);
+                    int64_t count = nw_concentration_info(concentration_handle, 2);
+                    if ((event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) &&
+                        nw_concentration_info(concentration_handle, 0) != 2)
+                        nw_concentration_action(concentration_handle, 0, 0, now_ms);
+                    else if (event.key.key == SDLK_RETURN)
+                        nw_concentration_action(concentration_handle, 1, cursor, now_ms);
+                    else if (event.key.key == SDLK_LEFT)
+                        nw_concentration_action(concentration_handle, 2, cursor > 0 ? cursor - 1 : 0, now_ms);
+                    else if (event.key.key == SDLK_RIGHT)
+                        nw_concentration_action(concentration_handle, 2, cursor + 1 < count ? cursor + 1 : count - 1, now_ms);
+                    else if (event.key.key == SDLK_UP)
+                        nw_concentration_action(concentration_handle, 2, cursor >= 4 ? cursor - 4 : 0, now_ms);
+                    else if (event.key.key == SDLK_DOWN)
+                        nw_concentration_action(concentration_handle, 2, cursor + 4 < count ? cursor + 4 : count - 1, now_ms);
+                } else if (recognition_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_recognition_info(recognition_handle, 0);
+                    if ((event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) &&
+                        (phase == 0 || phase == 4))
+                        nw_recognition_action(recognition_handle, 0, 0, now_ms);
+                    else if (event.key.key == SDLK_LEFT && (phase == 1 || phase == 2))
+                        nw_recognition_action(recognition_handle, 1, 0, now_ms);
+                    else if (event.key.key == SDLK_RIGHT && (phase == 1 || phase == 2))
+                        nw_recognition_action(recognition_handle, 2, 0, now_ms);
+                } else if (trivia_mode) {
+                    int64_t phase = nw_trivia_info(trivia_handle, 0);
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) {
+                        if (phase == 0 || phase == 3) nw_trivia_action(trivia_handle, 0, 0);
+                        else if (phase == 1) nw_trivia_action(trivia_handle, 3, 0);
+                        else if (phase == 2) nw_trivia_action(trivia_handle, 12, 0);
+                    } else if (event.key.key == SDLK_UP && phase == 1) {
+                        nw_trivia_action(trivia_handle, 1, 0);
+                    } else if (event.key.key == SDLK_DOWN && phase == 1) {
+                        nw_trivia_action(trivia_handle, 2, 0);
+                    } else if (event.key.key >= SDLK_1 && event.key.key <= SDLK_8 && phase == 1) {
+                        nw_trivia_action(trivia_handle, 4 + event.key.key - SDLK_1, 0);
+                    }
+                } else if (reflex_mode) {
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN)
+                        nw_reflex_action(reflex_handle, 0, 0, (int64_t)SDL_GetTicks());
+                } else if (algebra_mode) {
+                    if (event.key.key == SDLK_SPACE)
+                        nw_algebra_action(algebra_handle, 0, 0, (int64_t)SDL_GetTicks());
+                    else if (event.key.key == SDLK_RETURN) {
+                        int64_t phase = nw_algebra_info(algebra_handle, 0);
+                        nw_algebra_action(algebra_handle, phase == 1 ? 3 : 0,
+                                          0, (int64_t)SDL_GetTicks());
+                    } else if (event.key.key == SDLK_BACKSPACE) {
+                        nw_algebra_action(algebra_handle, 2, 0, (int64_t)SDL_GetTicks());
+                    } else if (event.key.key == SDLK_MINUS) {
+                        nw_algebra_action(algebra_handle, 1, 45, (int64_t)SDL_GetTicks());
+                    } else if (event.key.key >= SDLK_0 && event.key.key <= SDLK_9) {
+                        nw_algebra_action(algebra_handle, 1,
+                                          48 + event.key.key - SDLK_0,
+                                          (int64_t)SDL_GetTicks());
+                    }
+                } else if (numberology_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_numberology_info(numberology_handle, 0);
+                    if (event.key.key == SDLK_SPACE)
+                        nw_numberology_action(numberology_handle, 0, 0, now_ms);
+                    else if (event.key.key == SDLK_RETURN)
+                        nw_numberology_action(numberology_handle, phase == 1 ? 3 : 0, 0, now_ms);
+                    else if (event.key.key == SDLK_BACKSPACE)
+                        nw_numberology_action(numberology_handle, 2, 0, now_ms);
+                    else if (event.key.key == SDLK_MINUS)
+                        nw_numberology_action(numberology_handle, 1, 45, now_ms);
+                    else if (event.key.key >= SDLK_0 && event.key.key <= SDLK_9)
+                        nw_numberology_action(numberology_handle, 1,
+                                              48 + event.key.key - SDLK_0, now_ms);
+                } else if (jigsaw_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_jigsaw_info(jigsaw_handle, 0);
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN)
+                        nw_jigsaw_action(jigsaw_handle, phase == 1 ? 2 : 0, 0, now_ms);
+                    else if (event.key.key >= SDLK_0 && event.key.key <= SDLK_9 && phase == 1)
+                        nw_jigsaw_action(jigsaw_handle, 1,
+                                         event.key.key - SDLK_0, now_ms);
+                } else if (sudoku_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_sudoku_info(sudoku_handle, 0);
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN)
+                        nw_sudoku_action(sudoku_handle, 0, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_UP)
+                        nw_sudoku_action(sudoku_handle, 1, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_DOWN)
+                        nw_sudoku_action(sudoku_handle, 2, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_LEFT)
+                        nw_sudoku_action(sudoku_handle, 3, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_RIGHT)
+                        nw_sudoku_action(sudoku_handle, 4, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_BACKSPACE)
+                        nw_sudoku_action(sudoku_handle, 6, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_P)
+                        nw_sudoku_action(sudoku_handle, 7, 0, now_ms);
+                    else if (phase == 1 && event.key.key >= SDLK_1 && event.key.key <= SDLK_9)
+                        nw_sudoku_action(sudoku_handle, 5,
+                                         event.key.key - SDLK_0, now_ms);
+                } else if (go_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_go_info(go_handle, 0);
+                    if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) {
+                        if (phase == 0 || phase == 3) nw_go_action(go_handle, 0, 0, now_ms);
+                        else if (phase == 1) {
+                            int64_t size = nw_go_info(go_handle, 4);
+                            int64_t x = nw_go_info(go_handle, 5);
+                            int64_t y = nw_go_info(go_handle, 6);
+                            nw_go_action(go_handle, 1, y * size + x, now_ms);
+                        } else if (phase == 2) nw_go_action(go_handle, 2, 0, now_ms);
+                    } else if (phase == 1 && event.key.key == SDLK_UP) nw_go_action(go_handle, 3, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_DOWN) nw_go_action(go_handle, 4, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_LEFT) nw_go_action(go_handle, 5, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_RIGHT) nw_go_action(go_handle, 6, 0, now_ms);
+                } else if (ncup_monte_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_ncup_monte_info(ncup_monte_handle, 0);
+                    if ((event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) &&
+                        (phase == 0 || phase == 4))
+                        nw_ncup_monte_action(ncup_monte_handle, 0, 0, now_ms);
+                } else if (tracking_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_tracking_info(tracking_handle, 0);
+                    if ((event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) &&
+                        (phase == 0 || phase == 5))
+                        nw_tracking_action(tracking_handle, 0, 0, now_ms);
+                } else if (lookout_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_lookout_info(lookout_handle, 0);
+                    if ((event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) &&
+                        (phase == 0 || phase == 3))
+                        nw_lookout_action(lookout_handle, 0, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_J)
+                        nw_lookout_action(lookout_handle, 1, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_F)
+                        nw_lookout_action(lookout_handle, 2, 0, now_ms);
+                } else if (pursuit_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_pursuit_info(pursuit_handle, 0);
+                    if ((event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) &&
+                        (phase == 0 || phase == 3))
+                        nw_pursuit_action(pursuit_handle, 0, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_UP)
+                        nw_pursuit_action(pursuit_handle, 1, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_DOWN)
+                        nw_pursuit_action(pursuit_handle, 2, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_LEFT)
+                        nw_pursuit_action(pursuit_handle, 3, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_RIGHT)
+                        nw_pursuit_action(pursuit_handle, 4, 0, now_ms);
+                } else if (out_of_sight_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_out_of_sight_info(out_of_sight_handle, 0);
+                    if ((event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) &&
+                        (phase == 0 || phase == 4))
+                        nw_out_of_sight_action(out_of_sight_handle, 0, 0, now_ms);
+                    else if (phase == 2 && event.key.key == SDLK_J)
+                        nw_out_of_sight_action(out_of_sight_handle, 1, 0, now_ms);
+                    else if (phase == 2 && event.key.key == SDLK_F)
+                        nw_out_of_sight_action(out_of_sight_handle, 2, 0, now_ms);
+                } else if (buzz_wire_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_buzz_wire_info(buzz_wire_handle, 0);
+                    if ((event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) &&
+                        (phase == 0 || phase == 2 || phase == 3))
+                        nw_buzz_wire_action(buzz_wire_handle, 0, 0, now_ms);
+                    else if (phase == 1) {
+                        int64_t port = -1;
+                        if (event.key.key == SDLK_UP) port = 0;
+                        if (event.key.key == SDLK_DOWN) port = 1;
+                        if (event.key.key == SDLK_LEFT) port = 2;
+                        if (event.key.key == SDLK_RIGHT) port = 3;
+                        if (event.key.key == SDLK_W) port = 4;
+                        if (event.key.key == SDLK_S) port = 5;
+                        if (event.key.key == SDLK_I) port = 6;
+                        if (event.key.key == SDLK_K) port = 7;
+                        if (event.key.key == SDLK_J) port = 8;
+                        if (event.key.key == SDLK_L) port = 9;
+                        if (event.key.key == SDLK_LSHIFT || event.key.key == SDLK_RSHIFT) port = 10;
+                        if (port >= 0) nw_buzz_wire_action(buzz_wire_handle, 1, port, now_ms);
+                    }
+                } else if (donkey_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_donkey_info(donkey_handle, 0);
+                    if ((event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) &&
+                        (phase == 0 || phase == 3 || phase == 4))
+                        nw_donkey_action(donkey_handle, 0, 0, now_ms);
+                    else if (phase == 2 && (event.key.key == SDLK_LEFT ||
+                                            event.key.key == SDLK_RIGHT ||
+                                            event.key.key == SDLK_SPACE))
+                        nw_donkey_action(donkey_handle, 1, 0, now_ms);
+                } else if (two_hands_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_two_hands_info(two_hands_handle, 0);
+                    if ((event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) &&
+                        (phase == 0 || phase == 3 || phase == 4))
+                        nw_two_hands_action(two_hands_handle, 0, 0, now_ms);
+                    else if (phase == 2) {
+                        int64_t port = -1;
+                        if (event.key.key == SDLK_LEFT || event.key.key == SDLK_A) port = 1;
+                        if (event.key.key == SDLK_RIGHT || event.key.key == SDLK_D) port = 2;
+                        if (event.key.key == SDLK_UP || event.key.key == SDLK_W) port = 4;
+                        if (event.key.key == SDLK_DOWN || event.key.key == SDLK_S) port = 5;
+                        if (event.key.key == SDLK_I) port = 6;
+                        if (event.key.key == SDLK_L) port = 7;
+                        if (event.key.key == SDLK_O) port = 8;
+                        if (event.key.key == SDLK_K) port = 9;
+                        if (event.key.key == SDLK_SPACE) port = 10;
+                        if (port >= 0) nw_two_hands_action(two_hands_handle, 1, port, now_ms);
+                    }
+                } else if (overrun_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_overrun_info(overrun_handle, 0);
+                    if ((event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) &&
+                        (phase == 0 || phase == 3))
+                        nw_overrun_action(overrun_handle, 0, 0, now_ms);
+                    else if (phase == 1 && event.key.key == SDLK_BACKSPACE)
+                        nw_overrun_action(overrun_handle, 2, 0, now_ms);
+                    else if (phase == 1 && event.key.key >= SDLK_A && event.key.key <= SDLK_Z)
+                        nw_overrun_action(overrun_handle, 1,
+                                          event.key.key - SDLK_A, now_ms);
+                } else {
+                    if (event.key.key == SDLK_SPACE) playing = !playing;
+                    if (event.key.key == SDLK_RIGHT) step = true;
+                }
+            }
+            if (event.type == SDL_EVENT_KEY_UP && marble_mode) {
+                if (event.key.key == SDLK_UP)
+                    nw_marble_release(marble_handle, 4);
+                if (event.key.key == SDLK_RIGHT)
+                    nw_marble_release(marble_handle, 5);
+                if (event.key.key == SDLK_DOWN)
+                    nw_marble_release(marble_handle, 6);
+                if (event.key.key == SDLK_LEFT)
+                    nw_marble_release(marble_handle, 3);
+            }
+            if (event.type == SDL_EVENT_KEY_UP && buzz_wire_mode) {
+                int64_t port = -1;
+                if (event.key.key == SDLK_UP) port = 0;
+                if (event.key.key == SDLK_DOWN) port = 1;
+                if (event.key.key == SDLK_LEFT) port = 2;
+                if (event.key.key == SDLK_RIGHT) port = 3;
+                if (event.key.key == SDLK_W) port = 4;
+                if (event.key.key == SDLK_S) port = 5;
+                if (event.key.key == SDLK_I) port = 6;
+                if (event.key.key == SDLK_K) port = 7;
+                if (event.key.key == SDLK_J) port = 8;
+                if (event.key.key == SDLK_L) port = 9;
+                if (event.key.key == SDLK_LSHIFT || event.key.key == SDLK_RSHIFT) port = 10;
+                if (port >= 0)
+                    nw_buzz_wire_action(buzz_wire_handle, 2, port, (int64_t)SDL_GetTicks());
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && reflex_mode) {
+                int px = 0, py = 0;
+                SDL_GetWindowSizeInPixels(window, &px, &py);
+                if (px > 0 && py > 0) {
+                    int64_t x = (int64_t)(event.button.x * 1000000.0f / (float)px);
+                    int64_t y = (int64_t)((py - event.button.y) * 1000000.0f / (float)py);
+                    nw_reflex_pointer(reflex_handle, x, y, (int64_t)SDL_GetTicks());
+                }
+            }
+            if (event.type == SDL_EVENT_MOUSE_MOTION && pursuit_mode) {
+                int px = 0, py = 0;
+                SDL_GetWindowSizeInPixels(window, &px, &py);
+                if (px > 0 && py > 0)
+                    nw_pursuit_pointer(pursuit_handle,
+                                       (int64_t)(event.motion.x * 1000000.0f / px),
+                                       (int64_t)((py - event.motion.y) * 1000000.0f / py));
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && jigsaw_mode) {
+                int px = 0, py = 0;
+                SDL_GetWindowSizeInPixels(window, &px, &py);
+                if (px > 0 && py > 0)
+                    nw_jigsaw_pointer(jigsaw_handle,
+                        (int64_t)(event.button.x * 1000000.0f / (float)px),
+                        (int64_t)((py - event.button.y) * 1000000.0f / (float)py),
+                        px, py, (int64_t)SDL_GetTicks());
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && go_mode) {
+                int px = 0, py = 0;
+                SDL_GetWindowSizeInPixels(window, &px, &py);
+                if (px > 0 && py > 0)
+                    nw_go_pointer(go_handle,
+                        (int64_t)(event.button.x * 1000000.0f / (float)px),
+                        (int64_t)((py - event.button.y) * 1000000.0f / (float)py),
+                        px, py, (int64_t)SDL_GetTicks());
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ncup_monte_mode) {
+                int px = 0, py = 0;
+                SDL_GetWindowSizeInPixels(window, &px, &py);
+                if (px > 0 && py > 0)
+                    nw_ncup_monte_pointer(ncup_monte_handle,
+                        (int64_t)(event.button.x * 1000000.0f / (float)px),
+                        (int64_t)((py - event.button.y) * 1000000.0f / (float)py),
+                        (int64_t)SDL_GetTicks());
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && tracking_mode) {
+                int px = 0, py = 0;
+                SDL_GetWindowSizeInPixels(window, &px, &py);
+                if (px > 0 && py > 0)
+                    nw_tracking_pointer(tracking_handle,
+                        (int64_t)(event.button.x * 1000000.0f / (float)px),
+                        (int64_t)((py - event.button.y) * 1000000.0f / (float)py),
+                        (int64_t)SDL_GetTicks());
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && two_hands_mode) {
+                int px = 0, py = 0;
+                SDL_GetWindowSizeInPixels(window, &px, &py);
+                if (px > 0 && py > 0)
+                    nw_two_hands_pointer(two_hands_handle,
+                        (int64_t)(event.button.x * 1000000.0f / (float)px),
+                        (int64_t)((py - event.button.y) * 1000000.0f / (float)py),
+                        1, (int64_t)SDL_GetTicks());
             }
         }
-        if (playing && SDL_GetTicks() - last_step > 700) { step = true; last_step = SDL_GetTicks(); }
+        if (!maze_mode && playing && SDL_GetTicks() - last_step > 700) { step = true; last_step = SDL_GetTicks(); }
+        if (monkey_ladder_mode)
+            nw_monkey_ladder_action(monkey_ladder_handle, 1, 0, (int64_t)SDL_GetTicks());
+        if (nback3d_mode)
+            nw_nback3d_action(nback3d_handle, 2, 0, (int64_t)SDL_GetTicks());
+        if (marble_mode) {
+            Uint64 now = SDL_GetTicks();
+            nw_marble_advance(marble_handle, (int64_t)(now - last_marble_tick));
+            last_marble_tick = now;
+        }
+        if (count_mode)
+            nw_count_advance(count_handle, (int64_t)SDL_GetTicks());
+        if (mr_time_mode)
+            nw_mr_time_advance(mr_time_handle, (int64_t)SDL_GetTicks());
+        if (graph_mapping_mode)
+            nw_graph_mapping_advance(graph_mapping_handle, (int64_t)SDL_GetTicks());
+        if (matrix_reasoning_mode)
+            nw_matrix_reasoning_advance(matrix_reasoning_handle, (int64_t)SDL_GetTicks());
+        if (in_the_dark_mode)
+            nw_in_the_dark_advance(in_the_dark_handle, (int64_t)SDL_GetTicks());
+        if (removals_mode)
+            nw_removals_advance(removals_handle, (int64_t)SDL_GetTicks());
+        if (custody_mode)
+            nw_custody_advance(custody_handle, (int64_t)SDL_GetTicks());
+        if (concentration_mode)
+            nw_concentration_advance(concentration_handle, (int64_t)SDL_GetTicks());
+            if (recognition_mode)
+                nw_recognition_advance(recognition_handle, (int64_t)SDL_GetTicks());
+            if (reflex_mode)
+                nw_reflex_advance(reflex_handle, (int64_t)SDL_GetTicks());
+        if (ncup_monte_mode)
+            nw_ncup_monte_advance(ncup_monte_handle, (int64_t)SDL_GetTicks());
+        if (tracking_mode)
+            nw_tracking_advance(tracking_handle, (int64_t)SDL_GetTicks());
+        if (lookout_mode)
+            nw_lookout_advance(lookout_handle, (int64_t)SDL_GetTicks());
+        if (pursuit_mode)
+            nw_pursuit_advance(pursuit_handle, (int64_t)SDL_GetTicks());
+        if (out_of_sight_mode)
+            nw_out_of_sight_advance(out_of_sight_handle, (int64_t)SDL_GetTicks());
+        if (buzz_wire_mode)
+            nw_buzz_wire_advance(buzz_wire_handle, (int64_t)SDL_GetTicks());
+        if (donkey_mode)
+            nw_donkey_advance(donkey_handle, (int64_t)SDL_GetTicks());
+        if (two_hands_mode)
+            nw_two_hands_advance(two_hands_handle, (int64_t)SDL_GetTicks());
+        if (overrun_mode)
+            nw_overrun_advance(overrun_handle, (int64_t)SDL_GetTicks());
         if (step) {
             trial += 1;
         }
 
-        int64_t length = nw_batch_write(buffer, FRAME_CAPACITY, trial, 2,
-                                        seed, mode, 0, 1, 0, 0, 0, 0, 1, 0,
-                                        0, 0, verdict, 0);
         int width = 0, height = 0;
         SDL_GetWindowSizeInPixels(window, &width, &height);
         nw_view v = view_for(width, height);
+
+        int64_t length = maze_mode
+            ? nw_you_are_here_frame_write(buffer, FRAME_CAPACITY, maze_handle,
+                                          0, width, height)
+            : (sokoban_mode
+                ? nw_sokoban_frame_write(buffer, FRAME_CAPACITY, sokoban_handle,
+                                         0, width, height)
+            : (monkey_ladder_mode
+                ? nw_monkey_ladder_frame_write(buffer, FRAME_CAPACITY,
+                                               monkey_ladder_handle, 0,
+                                               width, height)
+            : (nback3d_mode
+                ? nw_nback3d_frame_write(buffer, FRAME_CAPACITY,
+                                         nback3d_handle, 0, width, height)
+            : (marble_mode
+                ? nw_marble_frame_write(buffer, FRAME_CAPACITY,
+                                        marble_handle, 0, width, height)
+            : (tetris_mode
+                ? nw_tetris_frame_write(buffer, FRAME_CAPACITY, tetris_handle,
+                                        0, width, height)
+            : (count_mode
+                ? nw_count_frame_write(buffer, FRAME_CAPACITY, count_handle,
+                                       0, width, height)
+            : (mr_time_mode
+                ? nw_mr_time_frame_write(buffer, FRAME_CAPACITY, mr_time_handle,
+                                         0, width, height)
+            : (graph_mapping_mode
+                ? nw_graph_mapping_frame_write(buffer, FRAME_CAPACITY,
+                                               graph_mapping_handle, 0,
+                                               width, height)
+            : (matrix_reasoning_mode
+                ? nw_matrix_reasoning_frame_write(buffer, FRAME_CAPACITY,
+                                                  matrix_reasoning_handle, 0,
+                                                  width, height)
+            : (in_the_dark_mode
+                ? nw_in_the_dark_frame_write(buffer, FRAME_CAPACITY,
+                                             in_the_dark_handle, 0, width, height)
+            : (fog_mode
+                ? nw_fog_frame_write(buffer, FRAME_CAPACITY,
+                                     fog_handle, 0, width, height)
+            : (removals_mode
+                ? nw_removals_frame_write(buffer, FRAME_CAPACITY,
+                                          removals_handle, 0, width, height)
+            : (custody_mode
+                ? nw_custody_frame_write(buffer, FRAME_CAPACITY,
+                                         custody_handle, 0, width, height)
+            : (concentration_mode
+                ? nw_concentration_frame_write(buffer, FRAME_CAPACITY,
+                                               concentration_handle, 0, width, height)
+            : (recognition_mode
+                ? nw_recognition_frame_write(buffer, FRAME_CAPACITY,
+                                             recognition_handle, 0, width, height)
+            : (trivia_mode
+                ? nw_trivia_frame_write(buffer, FRAME_CAPACITY,
+                                        trivia_handle, 0, width, height)
+            : (reflex_mode
+                ? nw_reflex_frame_write(buffer, FRAME_CAPACITY,
+                                        reflex_handle, 0, width, height)
+            : (algebra_mode
+                ? nw_algebra_frame_write(buffer, FRAME_CAPACITY,
+                                         algebra_handle, 0, width, height)
+            : (numberology_mode
+                ? nw_numberology_frame_write(buffer, FRAME_CAPACITY,
+                                             numberology_handle, 0, width, height)
+            : (jigsaw_mode
+                ? nw_jigsaw_frame_write(buffer, FRAME_CAPACITY,
+                                        jigsaw_handle, 0, width, height)
+            : (sudoku_mode
+                ? nw_sudoku_frame_write(buffer, FRAME_CAPACITY,
+                                        sudoku_handle, 0, width, height)
+            : (go_mode
+                ? nw_go_frame_write(buffer, FRAME_CAPACITY, go_handle, 0, width, height)
+            : (ncup_monte_mode
+                ? nw_ncup_monte_frame_write(buffer, FRAME_CAPACITY,
+                                            ncup_monte_handle, 0, width, height)
+            : (tracking_mode
+                ? nw_tracking_frame_write(buffer, FRAME_CAPACITY,
+                                          tracking_handle, 0, width, height)
+            : (lookout_mode
+                ? nw_lookout_frame_write(buffer, FRAME_CAPACITY,
+                                         lookout_handle, 0, width, height)
+            : (pursuit_mode
+                ? nw_pursuit_frame_write(buffer, FRAME_CAPACITY,
+                                         pursuit_handle, 0, width, height)
+            : (out_of_sight_mode
+                ? nw_out_of_sight_frame_write(buffer, FRAME_CAPACITY,
+                                              out_of_sight_handle, 0, width, height)
+            : (buzz_wire_mode
+                ? nw_buzz_wire_frame_write(buffer, FRAME_CAPACITY,
+                                           buzz_wire_handle, 0, width, height)
+            : (donkey_mode
+                ? nw_donkey_frame_write(buffer, FRAME_CAPACITY,
+                                        donkey_handle, 0, width, height)
+            : (two_hands_mode
+                ? nw_two_hands_frame_write(buffer, FRAME_CAPACITY,
+                                           two_hands_handle, 0, width, height)
+            : (overrun_mode
+                ? nw_overrun_frame_write(buffer, FRAME_CAPACITY,
+                                         overrun_handle, 0, width, height)
+            : (taskhub_mode
+                ? nw_taskhub_write(buffer, FRAME_CAPACITY, category, selected,
+                                   0, width, height)
+                : nw_title_write(buffer, FRAME_CAPACITY, trial % 4, 0, 1, 1)))))))))))))))))))))))))))))))));
 
         SDL_SetRenderDrawColor(renderer, 20, 22, 26, 255);
         SDL_RenderClear(renderer);
@@ -438,6 +3032,38 @@ int main(int argc, char **argv) {
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
+    if (maze_handle) nw_you_are_here_destroy(maze_handle);
+    if (sokoban_handle) nw_sokoban_destroy(sokoban_handle);
+    if (monkey_ladder_handle) nw_monkey_ladder_destroy(monkey_ladder_handle);
+    if (nback3d_handle) nw_nback3d_destroy(nback3d_handle);
+    if (marble_handle) nw_marble_destroy(marble_handle);
+    if (tetris_handle) nw_tetris_destroy(tetris_handle);
+    if (count_handle) nw_count_destroy(count_handle);
+    if (mr_time_handle) nw_mr_time_destroy(mr_time_handle);
+    if (graph_mapping_handle) nw_graph_mapping_destroy(graph_mapping_handle);
+    if (matrix_reasoning_handle) nw_matrix_reasoning_destroy(matrix_reasoning_handle);
+    if (in_the_dark_handle) nw_in_the_dark_destroy(in_the_dark_handle);
+    if (fog_handle) nw_fog_destroy(fog_handle);
+    if (removals_handle) nw_removals_destroy(removals_handle);
+    if (custody_handle) nw_custody_destroy(custody_handle);
+    if (concentration_handle) nw_concentration_destroy(concentration_handle);
+    if (recognition_handle) nw_recognition_destroy(recognition_handle);
+        if (trivia_handle) nw_trivia_destroy(trivia_handle);
+    if (reflex_handle) nw_reflex_destroy(reflex_handle);
+    if (algebra_handle) nw_algebra_destroy(algebra_handle);
+    if (numberology_handle) nw_numberology_destroy(numberology_handle);
+    if (jigsaw_handle) nw_jigsaw_destroy(jigsaw_handle);
+    if (sudoku_handle) nw_sudoku_destroy(sudoku_handle);
+    if (go_handle) nw_go_destroy(go_handle);
+    if (ncup_monte_handle) nw_ncup_monte_destroy(ncup_monte_handle);
+    if (tracking_handle) nw_tracking_destroy(tracking_handle);
+    if (lookout_handle) nw_lookout_destroy(lookout_handle);
+    if (pursuit_handle) nw_pursuit_destroy(pursuit_handle);
+    if (out_of_sight_handle) nw_out_of_sight_destroy(out_of_sight_handle);
+    if (buzz_wire_handle) nw_buzz_wire_destroy(buzz_wire_handle);
+    if (donkey_handle) nw_donkey_destroy(donkey_handle);
+    if (two_hands_handle) nw_two_hands_destroy(two_hands_handle);
+    if (overrun_handle) nw_overrun_destroy(overrun_handle);
     SDL_Quit();
     return 0;
 }

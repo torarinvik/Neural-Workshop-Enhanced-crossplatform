@@ -1,0 +1,380 @@
+# Stateful In the Dark run controller.
+#
+# The source task deals a walk of rooms that mutate an unseen row of lamps.
+# The scene deliberately draws only the operation and empty sockets; the
+# controller therefore owns the hidden starting colours and generated answers,
+# while the shell owns only physical key-to-event translation and the clock.
+# Generated darrays are copied into fixed storage before the temporary deal
+# region is destroyed so no answer or room ever points at a dead arena.
+
+module InTheDarkGame:
+
+    const MAX_ROOMS: i64 = 40
+    const MAX_LAMPS: i64 = 6
+    const MAX_ASKS: i64 = 6
+    const MAX_COLOURS: i64 = 5
+    const GRADE_COUNT: i64 = 12
+    const VERDICT_MS: i64 = 800
+
+    const PHASE_READY: i64 = 0
+    const PHASE_WALKING: i64 = 1
+    const PHASE_ASKING: i64 = 2
+    const PHASE_SCORED: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const ACTION_START: i64 = 0
+    const ACTION_ANSWER_0: i64 = 1
+    const ACTION_ANSWER_1: i64 = 2
+    const ACTION_ANSWER_2: i64 = 3
+    const ACTION_ANSWER_3: i64 = 4
+    const ACTION_ANSWER_4: i64 = 5
+
+    const INFO_PHASE: i64 = 0
+    const INFO_RUNG: i64 = 1
+    const INFO_TRIAL: i64 = 2
+    const INFO_TOTAL_TRIALS: i64 = 3
+    const INFO_LAMPS: i64 = 4
+    const INFO_COLOURS: i64 = 5
+    const INFO_CURSOR: i64 = 6
+    const INFO_ASKING_AT: i64 = 7
+    const INFO_VERDICT: i64 = 8
+    const INFO_ADAPTIVE: i64 = 9
+    const INFO_RIGHT: i64 = 10
+    const INFO_ROOMS: i64 = 11
+    const INFO_ROOM_KIND: i64 = 12
+    const INFO_ROOM_LAMP: i64 = 13
+    const INFO_ROOM_OTHER: i64 = 14
+    const INFO_ASKED_LAMP: i64 = 15
+    const INFO_ANSWER_COLOUR: i64 = 16
+    const INFO_GIVEN_COLOUR: i64 = 17
+    const INFO_DEADLINE_MS: i64 = 18
+    const INFO_TOTAL_ASKED: i64 = 19
+    const INFO_BEST_RUNG: i64 = 20
+    const INFO_ROOM_MS: i64 = 21
+    const INFO_ASKS: i64 = 22
+
+    struct InTheDarkRun:
+        rng: mutable MT19937
+        start_rung: mutable i64
+        rung: mutable i64
+        total_trials: mutable i64
+        room_ms: mutable i64
+        adaptive: mutable bool
+        trial: mutable i64
+        lamps: mutable i64
+        colours: mutable i64
+        rooms: mutable i64
+        cursor: mutable i64
+        asking_at: mutable i64
+        asks: mutable i64
+        verdict: mutable i64
+        phase: mutable i64
+        deadline_ms: mutable i64
+        right: mutable i64
+        total_asked: mutable i64
+        best_rung: mutable i64
+        room_kind: mutable i64[40]
+        room_lamp: mutable i64[40]
+        room_other: mutable i64[40]
+        asked: mutable i64[6]
+        answers: mutable i64[6]
+        given: mutable i64[6]
+
+    def clamp_rung(value: i64) -> i64:
+        can Abort.Panic:
+            return 1 if value < 1 else (GRADE_COUNT if value > GRADE_COUNT else value)
+
+    def allowed_trials(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 1 or value == 2 or value == 3 or value == 5 or value == 8 or value == 10 or value == 15 or value == 20
+
+    def allowed_room_ms(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 500 or value == 800 or value == 1000 or value == 1200 or value == 1500 or value == 2000 or value == 3000
+
+    def clear_round(run: mutable InTheDarkRun&):
+        can Abort.Panic:
+            run.lamps <- 0
+            run.colours <- 0
+            run.rooms <- 0
+            run.cursor <- 0
+            run.asking_at <- 0
+            run.asks <- 0
+            run.verdict <- -1
+            run.deadline_ms <- 0
+            for at in 0..<MAX_ROOMS |at, run|:
+                run.room_kind[at.usize()] <- 0
+                run.room_lamp[at.usize()] <- 0
+                run.room_other[at.usize()] <- 0
+            for at in 0..<MAX_ASKS |at, run|:
+                run.asked[at.usize()] <- 0
+                run.answers[at.usize()] <- 0
+                run.given[at.usize()] <- -1
+
+    # InTheDark::generate owns all returned darrays in the temporary deal
+    # region. Copy every visible field and every answer before destroying it.
+    def generate_round(run: mutable InTheDarkRun&, deal_seed: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            generated: mutable bool = false
+            region generation(134217728):
+                in generation:
+                    scratch: mutable darray[i64] = Ints::zeros(128)
+                    live: mutable darray[i64] = Ints::zeros(16)
+                    allowed: mutable darray[i64] = Ints::zeros(128)
+                    round: InTheDark::InTheDarkRound = InTheDark::generate(
+                        run.rung, deal_seed, 1, scratch, live, allowed)
+                    run.lamps <- round.lamps
+                    run.colours <- round.colours
+                    run.rooms <- round.walk.count if round.walk.count < MAX_ROOMS else MAX_ROOMS
+                    run.asks <- round.asks if round.asks < MAX_ASKS else MAX_ASKS
+                    run.cursor <- 0
+                    run.asking_at <- 0
+                    at: mutable i64 = 0
+                    while at < MAX_ROOMS |at, run, round|:
+                        run.room_kind[at.usize()] <- Ints::at(round.walk.kind, at) if at < run.rooms else 0
+                        run.room_lamp[at.usize()] <- Ints::at(round.walk.lamp, at) if at < run.rooms else 0
+                        run.room_other[at.usize()] <- Ints::at(round.walk.other, at) if at < run.rooms else 0
+                        at <- at + 1
+                    at <- 0
+                    while at < MAX_ASKS |at, run, round|:
+                        run.asked[at.usize()] <- Ints::at(round.asked, at) if at < run.asks else 0
+                        run.answers[at.usize()] <- Ints::at(round.answers, at) if at < run.asks else 0
+                        run.given[at.usize()] <- -1
+                        at <- at + 1
+                    generated <- run.rooms > 0 and run.asks > 0 and run.lamps > 0 and run.colours > 0
+                destroy generation
+            return generated
+
+    def initialize(run: mutable InTheDarkRun&, start_rung: i64, total_trials: i64,
+                   room_ms: i64, adaptive: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.start_rung <- clamp_rung(start_rung)
+            run.rung <- run.start_rung
+            run.total_trials <- total_trials
+            run.room_ms <- room_ms
+            run.adaptive <- adaptive
+            run.trial <- 0
+            run.right <- 0
+            run.total_asked <- 0
+            run.best_rung <- 0
+            run.phase <- PHASE_READY
+            clear_round(run)
+
+    def next_trial(run: mutable InTheDarkRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.trial >= run.total_trials:
+                run.phase <- PHASE_DONE
+                run.verdict <- -1
+                run.deadline_ms <- 0
+                return
+            run.trial <- run.trial + 1
+            seed: i64 = py_randbelow(&run.rng, 1073741824.u64()).i64()
+            clear_round(run)
+            if not generate_round(run, seed):
+                run.phase <- PHASE_DONE
+                return
+            run.phase <- PHASE_WALKING
+            run.deadline_ms <- now_ms + run.room_ms
+
+    def start_run(run: mutable InTheDarkRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.rung <- clamp_rung(run.start_rung)
+            run.trial <- 0
+            run.right <- 0
+            run.total_asked <- 0
+            run.best_rung <- 0
+            run.verdict <- -1
+            next_trial(run, now_ms)
+
+    def tick(run: mutable InTheDarkRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 1 if run.phase != PHASE_WALKING
+            return 2 if now_ms < run.deadline_ms
+            if run.cursor + 1 >= run.rooms:
+                run.phase <- PHASE_ASKING
+                run.asking_at <- 0
+                run.deadline_ms <- 0
+            else:
+                run.cursor <- run.cursor + 1
+                run.deadline_ms <- now_ms + run.room_ms
+            return 1
+
+    def settle(run: mutable InTheDarkRun&, now_ms: i64):
+        can Abort.Panic:
+            correct: mutable i64 = 0
+            at: mutable i64 = 0
+            while at < run.asks |at, run, correct|:
+                correct <- correct + 1 if run.given[at.usize()] == run.answers[at.usize()]
+                at <- at + 1
+            run.right <- run.right + correct
+            run.total_asked <- run.total_asked + run.asks
+            run.best_rung <- run.rung if run.rung > run.best_rung
+            run.verdict <- 1 if correct == run.asks else 0
+            if run.adaptive:
+                if correct == run.asks:
+                    run.rung <- clamp_rung(run.rung + 1)
+                elif correct * 2 < run.asks:
+                    run.rung <- clamp_rung(run.rung - 1)
+            run.phase <- PHASE_SCORED
+            run.deadline_ms <- now_ms + VERDICT_MS
+
+    def answer(run: mutable InTheDarkRun&, colour: i64, now_ms: i64) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            return 2 if run.phase != PHASE_ASKING
+            return 2 if colour < 0 or colour >= run.colours
+            return 2 if run.asking_at >= run.asks
+            run.given[run.asking_at.usize()] <- colour
+            run.asking_at <- run.asking_at + 1
+            if run.asking_at >= run.asks:
+                settle(run, now_ms)
+            return 1
+
+    def apply(run: mutable InTheDarkRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                if run.phase == PHASE_READY or run.phase == PHASE_DONE:
+                    start_run(run, now_ms)
+                    return 1
+                if run.phase == PHASE_SCORED:
+                    return 2 if now_ms < run.deadline_ms
+                    next_trial(run, now_ms)
+                    return 1
+                return 2
+            return -6
+
+    def info(run: InTheDarkRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_RUNG: return run.rung
+            if field == INFO_TRIAL: return run.trial
+            if field == INFO_TOTAL_TRIALS: return run.total_trials
+            if field == INFO_LAMPS: return run.lamps
+            if field == INFO_COLOURS: return run.colours
+            if field == INFO_CURSOR: return run.cursor
+            if field == INFO_ASKING_AT: return run.asking_at
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_RIGHT: return run.right
+            if field == INFO_ROOMS: return run.rooms
+            if field == INFO_ROOM_KIND: return run.room_kind[run.cursor.usize()] if run.cursor >= 0 and run.cursor < run.rooms else -1
+            if field == INFO_ROOM_LAMP: return run.room_lamp[run.cursor.usize()] if run.cursor >= 0 and run.cursor < run.rooms else -1
+            if field == INFO_ROOM_OTHER: return run.room_other[run.cursor.usize()] if run.cursor >= 0 and run.cursor < run.rooms else -1
+            if field == INFO_ASKED_LAMP: return run.asked[run.asking_at.usize()] if run.asking_at >= 0 and run.asking_at < run.asks else -1
+            if field == INFO_ANSWER_COLOUR: return run.answers[run.asking_at.usize()] if run.asking_at >= 0 and run.asking_at < run.asks else -1
+            if field == INFO_GIVEN_COLOUR: return run.given[run.asking_at.usize()] if run.asking_at >= 0 and run.asking_at < run.asks else -1
+            if field == INFO_DEADLINE_MS: return run.deadline_ms
+            if field == INFO_TOTAL_ASKED: return run.total_asked
+            if field == INFO_BEST_RUNG: return run.best_rung
+            if field == INFO_ROOM_MS: return run.room_ms
+            if field == INFO_ASKS: return run.asks
+            return -1
+
+    def room(run: InTheDarkRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return -1 if at < 0 or at >= run.rooms
+            if field == 0: return run.room_kind[at.usize()]
+            if field == 1: return run.room_lamp[at.usize()]
+            if field == 2: return run.room_other[at.usize()]
+            return -1
+
+    def asked(run: InTheDarkRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return -1 if at < 0 or at >= run.asks
+            if field == 0: return run.asked[at.usize()]
+            if field == 1: return run.answers[at.usize()]
+            if field == 2: return run.given[at.usize()]
+            return -1
+
+    def append_grade_name(out: mutable dstr&, rung: i64):
+        can Memory.Allocate, Abort.Panic:
+            if rung == 1:
+                dstr_append_cstr(out, "first light")
+            elif rung == 2:
+                dstr_append_cstr(out, "two lamps")
+            elif rung == 3:
+                dstr_append_cstr(out, "three lamps")
+            elif rung == 4:
+                dstr_append_cstr(out, "the swap")
+            elif rung == 5:
+                dstr_append_cstr(out, "four lamps")
+            elif rung == 6:
+                dstr_append_cstr(out, "the shuffle")
+            elif rung == 7:
+                dstr_append_cstr(out, "five lamps")
+            elif rung == 8:
+                dstr_append_cstr(out, "the tangle")
+            elif rung == 9:
+                dstr_append_cstr(out, "six lamps")
+            elif rung == 10:
+                dstr_append_cstr(out, "nightmare")
+            elif rung == 11:
+                dstr_append_cstr(out, "inhuman")
+            else:
+                dstr_append_cstr(out, "superhuman")
+
+    def append_message(out: mutable dstr&, run: InTheDarkRun&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(out, "Press Space to start")
+            elif run.phase == PHASE_WALKING:
+                append_grade_name(out, run.rung)
+                dstr_append_cstr(out, " — ")
+                dstr_append_i64(out, run.lamps)
+                dstr_append_cstr(out, " lamps, ")
+                dstr_append_i64(out, run.rooms)
+                dstr_append_cstr(out, " rooms")
+            elif run.phase == PHASE_ASKING:
+                dstr_append_cstr(out, "The lights come up")
+            elif run.phase == PHASE_SCORED:
+                correct: mutable i64 = 0
+                at: mutable i64 = 0
+                while at < run.asks |at, run, correct|:
+                    correct <- correct + 1 if run.given[at.usize()] == run.answers[at.usize()]
+                    at <- at + 1
+                if correct == run.asks:
+                    dstr_append_cstr(out, "All ")
+                    dstr_append_i64(out, run.asks)
+                    dstr_append_cstr(out, " right")
+                else:
+                    dstr_append_i64(out, correct)
+                    dstr_append_cstr(out, " of ")
+                    dstr_append_i64(out, run.asks)
+                    dstr_append_cstr(out, " right")
+            else:
+                dstr_append_i64(out, run.trial)
+                dstr_append_cstr(out, " rounds, ")
+                accuracy: i64 = py_round_half_even(100.0 * run.right.f64() / run.total_asked.f64()) if run.total_asked > 0 else 0
+                dstr_append_i64(out, accuracy)
+                dstr_append_cstr(out, "% of questions right, highest rung ")
+                dstr_append_i64(out, run.best_rung)
+
+    def render(run: InTheDarkRun&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            asked_values: mutable darray[i64] = []
+            answer_values: mutable darray[i64] = []
+            given_values: mutable darray[i64] = []
+            for at in 0..<run.asks |at, run, asked_values, answer_values, given_values|:
+                asked_values.push(run.asked[at.usize()])
+                answer_values.push(run.answers[at.usize()])
+                given_values.push(run.given[at.usize()])
+            message: mutable dstr = []
+            append_message(&message, run)
+            verdict_text: mutable dstr = []
+            if run.phase == PHASE_SCORED:
+                dstr_append_cstr(&verdict_text, "Right" if run.verdict == 1 else "No")
+            sx: f64 = width / Display::REFERENCE_WIDTH
+            sy: f64 = height / Display::REFERENCE_HEIGHT
+            paint: SceneInTheDark::InTheDarkPaint = SceneInTheDark::paint_of(
+                black_background, width, height, sx, sy)
+            SceneInTheDark::render(list, &paint, run.phase, run.rooms > 0,
+                run.lamps, run.colours,
+                run.room_kind[run.cursor.usize()] if run.cursor >= 0 and run.cursor < run.rooms else 0,
+                run.room_lamp[run.cursor.usize()] if run.cursor >= 0 and run.cursor < run.rooms else 0,
+                run.room_other[run.cursor.usize()] if run.cursor >= 0 and run.cursor < run.rooms else 0,
+                run.cursor, run.rooms, asked_values, answer_values,
+                given_values, run.asking_at, run.trial, run.total_trials,
+                bytes_view(message), run.verdict, bytes_view(verdict_text))

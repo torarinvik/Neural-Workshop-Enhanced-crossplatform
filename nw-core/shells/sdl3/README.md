@@ -1,78 +1,59 @@
-# Native desktop shell (SDL3) — roadmap item 16
+# Native desktop shell (SDL3)
 
     brew install sdl3 pkg-config      # or the platform equivalent
     scripts/build_sdl3.sh             # builds AND runs the headless selftest
     build/nw-sdl3                     # the window
-    build/nw-sdl3 --selftest 180      # headless, no SDL_Init, no display
+    build/nw-sdl3 --selftest 180      # headless title/display-list smoke
+    build/nw-sdl3 --selftest-tetris   # headless Freeform Tetris lifecycle smoke
 
-## Verified
+## Current boundary
 
-Built against SDL3 3.4.14 and RUN: 180 frames decoded, 0 bad, with the pooled
-strings intact ("Dual N-Back", "N =", "Trial") on the first and last frame.
+The SDL shell exposes the shared title/task-hub display-list contract plus the
+native task adapters listed by `scripts/build_sdl3.sh`. It does not manufacture
+a preview or placeholder task session. Additional desktop task adapters are
+added only when they can drive a real controller and preserve the same
+state/action/clock contract.
 
-The selftest checks the STRINGS, not just the command count. The wasm build
-corrupted exactly those while geometry stayed correct -- the board rendered fine
-and only the text was wrong -- so a check that counted commands would have
-passed straight through that bug.
+Marble Maze currently has its shared controller and a 2D display-list fallback.
+The SDL ABI exposes the controller's canonical generated-board bytes via
+`nw_marble_board_write`, the transport boundary needed by a native MuJoCo/3D
+host; it is not yet a native physics or 3D-render implementation.
+
+The title call uses the source renderer's presentation flags that suppress
+the original-only accelerator block. Consequently every visible SDL control
+describes an action this port actually implements.
 
 ## What it is
 
-The third renderer for one display list. shells/web draws it on a canvas,
-shells/python draws it with pyglet, this draws it with SDL3 — and none of them
-contain game logic. The core decides what a frame contains; a shell only turns
-commands into pixels. A verdict is a COMMAND here too, not a colour the shell
-chose.
+This is the SDL3 consumer for the same encoded display list used by the other
+host shells. The Elisa core decides what a frame contains; this shell turns
+commands into pixels and owns only the window, clock, and event loop.
 
-It reuses `src/wasm/wasm_exports.elisa` unchanged rather than adding a native
-export file: every entry point there is already scalar C ABI, which is what a C
-host wants. `nw_frame_alloc` returns a real pointer natively (it is a `malloc`
-result cast to i64), so the shell casts it straight back.
+The title, task hub, and current native task adapters have scalar C ABIs in
+src/native/sdl_exports.elisa. `nw_frame_alloc` returns a real native pointer
+(malloc cast to i64), so the shell casts it back before decoding. Freeform
+Tetris uses the same controller kernel and display scene as the browser and
+Python adapters.
 
 ## Coverage
 
-Full: RECT, BORDERED_RECT, BOX, CIRCLE, ARC, LINE, TRIANGLE, POLYGON/POLY_POINT,
-TEXT, VERDICT, MARKER. Circles/triangles/polygons go through SDL_RenderGeometry;
-arcs are polylines, since SDL3 has no arc primitive.
+The decoder handles RECT, BORDERED_RECT, BOX, CIRCLE, ARC, LINE, TRIANGLE,
+POLYGON/POLY_POINT, TEXT, VERDICT, and MARKER. Circles, triangles, and
+polygons use SDL_RenderGeometry; arcs are polylines because SDL3 has no arc
+primitive.
 
-Deliberately not yet: SPRITE (needs an atlas) and SOUND (counted, not played) —
-both are later phases, and the core emits neither in an n-back frame.
-
-TEXT uses `SDL_RenderDebugText`, whose 8x8 cell is scaled to the command's font
-size via `SDL_SetRenderScale`. That keeps the shell dependency-free (no SDL_ttf).
-It honours all nine anchors. If the desktop build later wants real typography,
-this is the one function to replace.
-
-## Verified
-
-  * COMPILES clean against SDL3 3.4.14 (`cc -O2 -std=c11`).
-  * LINKS and RUNS against a real Elisa core object. nw-core was unreachable, so
-    a stand-in was built exporting the SAME C ABI (`nw_frame_alloc`,
-    `nw_frame_write`) over the same encoder and 40-byte record. Run headless
-    (`SDL_VIDEODRIVER=dummy`) for 3 seconds: SDL init, window, renderer, ~180
-    frames written, decoded and rendered, clean exit, NO output.
-  * That silence is meaningful, because the failure path was proven loud first:
-    rebuilt with `FRAME_CAPACITY 8` so every frame is too big to write, the same
-    run logs `frame 1: decode failed (0 bytes)` 70 times in 2 seconds. So an
-    empty log means every frame really did decode and render.
-  * `display_list.h` DECODES A REAL ELISA-ENCODED FRAME (324 bytes, 7 commands,
-    28 pool bytes) with floats and pooled strings round-tripping:
-
-        [ 0] RECT   a=0.0  b=0.0  c=100.0
-        [ 2] TEXT   a=1.0  b=2.0  c=22.0   text="Dual N-Back" anchor=0
-        [ 3] TEXT   ...                    text="N ="
-        [ 4] TEXT   ...                    text="Trial"
-        [ 6] TEXT   ...                    text="frame-end"
+SPRITE and SOUND remain separate renderer work. The title selftest still
+checks pooled text and the frame-end marker instead of treating a command
+count as proof of a valid frame.
 
 ## Still to check
 
-  1. `scripts/build_sdl3.sh` against the REAL core (`src/wasm/wasm_exports.elisa`)
-     rather than the stand-in. The ABI is identical, so this should be a
-     formality, but it has not been done.
-  2. Compare a frame against the web shell at the same trial/position/verdict.
-     Geometry should match modulo the text font.
-  3. `test/display_decode.py` stays the reference decoder; `display_list.h` is a
-     transliteration of it and the two must stay line-comparable.
+1. Build against the real latest Stage1 core object on each supported desktop
+   platform.
+2. Compare title frames against the browser at the same banner and theme.
+3. Keep test/display_decode.py and display_list.h line-comparable as the
+   display-list protocol evolves.
 
-Nothing has been seen on a real display -- it was only ever run headless, so
-"renders" here means "every command was executed without error", not "looks
-right".
+The headless selftests prove ABI decoding, the Tetris lifecycle, and
+resource-free rendering paths; they are not evidence that full visual parity
+or every task's desktop adapter is done.

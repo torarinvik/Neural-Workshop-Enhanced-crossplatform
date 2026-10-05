@@ -1,0 +1,787 @@
+diff --git a/src/backend/codegen_abi_facts.elisa b/src/backend/codegen_abi_facts.elisa
+index 1b444e8..32170ef 100644
+--- a/src/backend/codegen_abi_facts.elisa
++++ b/src/backend/codegen_abi_facts.elisa
+@@ -256,7 +256,11 @@ extend Backend:
+                         position: i64 = field_index_of(structs, inner_slot, darray_field)
+                         null return if position < 0
+                         if struct_chain_address(darray_inner, local_scope, fns, structs, generics, runtime, m, ctx, builder) is inner_address:
+-                            return LLVMBuildStructGEP2(builder, llvm_type_of(inner_type, structs, ctx), inner_address, position.u32(), "darray.field.ptr")
++                            field_type: ValueType = copied_type(structs.field_types[structs.field_start[inner_slot] + position.usize()])
++                            field_address: LLVMValueRef = LLVMBuildStructGEP2(builder, llvm_type_of(inner_type, structs, ctx), inner_address, position.u32(), "darray.field.ptr")
++                            if field_type.kind == TypeKind.Ref and ref_target_of(field_type, structs).kind == TypeKind.DArray:
++                                return LLVMBuildLoad2(builder, LLVMPointerTypeInContext(ctx, 0), field_address, "darray.field.ref")
++                            return field_address if field_type.kind == TypeKind.DArray
+                         return null
+                     _:
+                         pass
+diff --git a/src/backend/codegen_aggregate_copies.elisa b/src/backend/codegen_aggregate_copies.elisa
+index bcaaefd..c09d293 100644
+--- a/src/backend/codegen_aggregate_copies.elisa
++++ b/src/backend/codegen_aggregate_copies.elisa
+@@ -55,9 +55,9 @@ extend Backend:
+         # An alloca or a global: two different ones never overlap.
+         def aggregate_copy_root_identified(root: LLVMValueRef) -> bool:
+             return true if is_instruction_with_opcode(root, OPCODE_ALLOCA)
+-            if LLVMIsAInstruction(root) is _:
++            if LLVMIsAInstruction(root) != null:
+                 return false
+-            LLVMIsAGlobalVariable(root) is _
++            LLVMIsAGlobalVariable(root) != null
+ 
+         # May anything strictly between `first` and `last` (same block) write the memory
+         # behind `source`? Only non-memory instructions and stores into a DIFFERENT
+@@ -97,7 +97,7 @@ extend Backend:
+ 
+         def erase_if_unused(value: LLVMValueRef) -> void:
+             if LLVMIsAInstruction(value) is instruction:
+-                if LLVMGetFirstUse(instruction) is _:
++                if LLVMGetFirstUse(instruction) != null:
+                     return
+                 LLVMInstructionEraseFromParent(instruction)
+ 
+@@ -110,7 +110,7 @@ extend Backend:
+             return false if not is_large_aggregate_type(value_type, target_data)
+             size: LLVMValueRef = LLVMConstInt(LLVMInt64TypeInContext(ctx), LLVMABISizeOfType(target_data, value_type), 0)
+             store_align: u32 = LLVMGetAlignment(store)
+-            if LLVMIsAConstant(value) is _:
++            if LLVMIsAConstant(value) != null:
+                 return false if LLVMIsNull(value) == 0
+                 LLVMPositionBuilderBefore(builder, store)
+                 _ = LLVMBuildMemSet(builder, destination, LLVMConstInt(LLVMInt8TypeInContext(ctx), 0, 0), size, store_align)
+diff --git a/src/backend/codegen_call_receiver.elisa b/src/backend/codegen_call_receiver.elisa
+index 4e7996a..eb7e2ce 100644
+--- a/src/backend/codegen_call_receiver.elisa
++++ b/src/backend/codegen_call_receiver.elisa
+@@ -93,7 +93,11 @@ extend Backend:
+                             ufcs_chosen_args <- ufcs_cand_args
+                     if ufcs_chosen_slot >= 0:
+                         return emit_generic_ufcs_call(ufcs_chosen_slot.usize(), ufcs_chosen_args, receiver, arguments, local_scope, fns, structs, generics, runtime, m, ctx, builder)
+-                    return null
++                    # A generic with this name is not necessarily the receiver's method. For
++                    # example, the stdlib has generic `push` helpers for InlineVec while a user
++                    # may define `impl Stack: def push(self: Stack, ...)`. If inference rejects
++                    # every generic candidate, keep resolving the monomorphic UFCS rows below;
++                    # returning here made the unrelated generic name shadow a valid impl member.
+                 # `items.push(7)` where `extern push[T](box: mutable MethodBox[T]&, item: T)`.
+                 # A generic extern cannot be declared at DECLARATION time — its parameter types
+                 # mention `T` — so it is instantiated HERE, per call, from the receiver's
+diff --git a/src/backend/codegen_convert.elisa b/src/backend/codegen_convert.elisa
+index 8459f12..20e7d2a 100644
+--- a/src/backend/codegen_convert.elisa
++++ b/src/backend/codegen_convert.elisa
+@@ -148,6 +148,25 @@ extend Backend:
+                 if emit_expression(expression, actual, local_scope, fns, structs, generics, runtime, m, ctx, builder) is tuple_value:
+                     return emit_tuple_structural_conversion(tuple_value, actual, expected, structs, ctx, builder)
+                 return null
++            # A reference-valued PLACE is also read through when the surrounding value
++            # context expects its pointee. Identifier expressions already do this in
++            # codegen_expr_idents_binary, but indexed elements and aggregate fields reach
++            # this shared coercion path instead. Asking their emitter for the declared Ref
++            # type preserves the address/reference value; load exactly once here, then apply
++            # the same numeric conversion as any other scalar expression. Keep the Ref
++            # context untouched above so passing/returning/storing the reference itself
++            # retains its original pointer semantics.
++            if actual.kind == TypeKind.Ref and expected.kind != TypeKind.Ref and expected.kind != TypeKind.Unmodeled:
++                coerced_ref_target: ValueType = ref_target_of(actual, structs)
++                if coerced_ref_target.kind == expected.kind and coerced_ref_target.bits == expected.bits:
++                    if emit_expression(expression, actual, local_scope, fns, structs, generics, runtime, m, ctx, builder) is coerced_ref_pointer:
++                        return LLVMBuildLoad2(builder, llvm_type_of(coerced_ref_target, structs, ctx), coerced_ref_pointer, "ref.value")
++                    return null
++                if is_numeric_type(coerced_ref_target) and is_numeric_type(expected):
++                    if emit_expression(expression, actual, local_scope, fns, structs, generics, runtime, m, ctx, builder) is coerced_ref_numeric_pointer:
++                        coerced_ref_loaded: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(coerced_ref_target, structs, ctx), coerced_ref_numeric_pointer, "ref.value")
++                        return emit_conversion(coerced_ref_loaded, coerced_ref_target, expected, structs, ctx, builder)
++                    return null
+             # Reference-valued calls and locals have their own auto-dereference rules
+             # in the expression emitter. Let that path see the destination type rather
+             # than treating a pointer-shaped value as a scalar here.
+diff --git a/src/backend/codegen_expr_aggregates.elisa b/src/backend/codegen_expr_aggregates.elisa
+index b2696ad..f5f19c5 100644
+--- a/src/backend/codegen_expr_aggregates.elisa
++++ b/src/backend/codegen_expr_aggregates.elisa
+@@ -85,9 +85,25 @@ extend Backend:
+                                 Expr.Unary(spread_operator, spread_operand, spread_line):
+                                     if spread_operator == TokenKind.Ellipsis:
+                                         spread_type: ValueType = expression_type(spread_operand, local_scope, fns, structs, generics)
+-                                        if spread_type.kind != TypeKind.DArray:
++                                        if spread_type.kind != TypeKind.DArray and spread_type.kind != TypeKind.Array:
+                                             declined <- true
+                                         elif emit_expression(spread_operand, spread_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is spread_value:
++                                            # Fixed arrays are plain values, not darray headers. Stage0
++                                            # permits `[..fixed]` in a darray literal and copies its
++                                            # elements. Spill the source once so a call or other effect
++                                            # in the expression is not repeated for each element.
++                                            if spread_type.kind == TypeKind.Array:
++                                                fixed_spread_llvm: LLVMTypeRef = llvm_type_of(spread_type, structs, ctx)
++                                                fixed_spread_source: LLVMValueRef = build_entry_alloca(builder, fixed_spread_llvm, "spread.array.src")
++                                                _ = LLVMBuildStore(builder, spread_value, fixed_spread_source)
++                                                declare_local(local_scope, "__spread_array_src", fixed_spread_source, spread_type)
++                                                fixed_spread_slot: usize = spread_type.bits.usize()
++                                                fixed_spread_extent: usize = structs.array_extents[fixed_spread_slot].usize()
++                                                for fixed_spread_index in 0..<fixed_spread_extent |declined, fixed_spread_index, temporary, expected, element_type, local_scope, fns, structs, generics, runtime, m, ctx, builder|:
++                                                    continue if declined
++                                                    fixed_spread_item: Expr = Expr.Index(Expr.Ident("__spread_array_src", spread_line), Expr.IntLit(fixed_spread_index.i64(), spread_line), spread_line)
++                                                    declined <- true if not emit_darray_push(temporary, expected, fixed_spread_item, local_scope, fns, structs, generics, runtime, m, ctx, builder)
++                                                continue
+                                             spread_header: LLVMTypeRef = darray_llvm_type(structs, ctx)
+                                             spread_i64: LLVMTypeRef = LLVMInt64TypeInContext(ctx)
+                                             spread_source: LLVMValueRef = build_entry_alloca(builder, spread_header, "spread.src")
+diff --git a/src/backend/codegen_expr_index_read.elisa b/src/backend/codegen_expr_index_read.elisa
+index f085b82..d000fea 100644
+--- a/src/backend/codegen_expr_index_read.elisa
++++ b/src/backend/codegen_expr_index_read.elisa
+@@ -466,6 +466,18 @@ extend Backend:
+                     rvalue_ref_type: ValueType = expression_type(indexed_object, local_scope, fns, structs, generics)
+                     if rvalue_ref_type.kind == TypeKind.Ref:
+                         rvalue_ref_element: ValueType = ref_target_of(rvalue_ref_type, structs)
++                        # A field declared as `darray[T]&` is a reference to the darray
++                        # HEADER, not a pointer directly to element T. Handle the header first;
++                        # the generic ref indexing path below would load the header aggregate
++                        # and then try to convert it to the requested scalar element.
++                        if rvalue_ref_element.kind == TypeKind.DArray:
++                            if darray_address_of_expr(indexed_object, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rvalue_ref_darray_slot:
++                                if emit_darray_index_address(rvalue_ref_darray_slot, rvalue_ref_element, index_expression, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rvalue_ref_darray_pointer:
++                                    rvalue_ref_darray_element: ValueType = darray_element_of(rvalue_ref_element, structs)
++                                    rvalue_ref_darray_value: LLVMValueRef = LLVMBuildLoad2(builder, llvm_type_of(rvalue_ref_darray_element, structs, ctx), rvalue_ref_darray_pointer, "rvalue.ref.darray.elem")
++                                    tag_disjoint_darray_access(rvalue_ref_darray_value, rvalue_ref_darray_pointer, runtime, ctx)
++                                    return emit_conversion(rvalue_ref_darray_value, rvalue_ref_darray_element, expected, structs, ctx, builder) if expected.kind != TypeKind.Unmodeled and (expected.kind != rvalue_ref_darray_element.kind or expected.bits != rvalue_ref_darray_element.bits) else rvalue_ref_darray_value
++                            return null
+                         if rvalue_ref_element.kind != TypeKind.Unmodeled:
+                             if emit_expression(indexed_object, rvalue_ref_type, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rvalue_ref_base:
+                                 if emit_expression(index_expression, ValueType{kind: TypeKind.Signed, bits: 64}, local_scope, fns, structs, generics, runtime, m, ctx, builder) is rvalue_ref_index:
+diff --git a/src/backend/codegen_type_sizes.elisa b/src/backend/codegen_type_sizes.elisa
+index 6fcb3e4..e176f7a 100644
+--- a/src/backend/codegen_type_sizes.elisa
++++ b/src/backend/codegen_type_sizes.elisa
+@@ -135,6 +135,9 @@ extend Backend:
+                         unmodeled_type() return if position < 0
+                         field_type: ValueType = copied_type(structs.field_types[structs.field_start[inner_slot] + position.usize()])
+                         field_type return if field_type.kind == TypeKind.DArray
++                        if field_type.kind == TypeKind.Ref:
++                            field_target: ValueType = ref_target_of(field_type, structs)
++                            field_target return if field_target.kind == TypeKind.DArray
+                     _:
+                         pass
+                 # `m[i]` where `m: darray[darray[T]]` — the indexed element is itself a darray.
+diff --git a/src/driver/elisac_pymodule_c_report.elisa b/src/driver/elisac_pymodule_c_report.elisa
+index 3063aac..5686f12 100644
+--- a/src/driver/elisac_pymodule_c_report.elisa
++++ b/src/driver/elisac_pymodule_c_report.elisa
+@@ -165,7 +165,9 @@ def emit_pymodule_c_report(file: mutable Ast::File&) -> i64 can[Abort.Panic, Mem
+     emit_tokens_push_sview(&buffer, "\n")
+     # First pass: declarations for the stable native symbols.
+     emitted_error_payload_names: mutable darray[sview] = []
+-    emitted_error_nested_payload_suffixes: mutable darray[sview] = []
++    emitted_error_nested_payload_suffix_bytes: mutable darray[u8] = []
++    emitted_error_nested_payload_suffix_starts: mutable darray[usize] = []
++    emitted_error_nested_payload_suffix_lengths: mutable darray[usize] = []
+     for annotation in file.enum_annotations |buffer, file, module_name|:
+         continue if annotation.name != "__pymodule_fn"
+         target_name: mutable sview = ""
+@@ -236,7 +238,7 @@ def emit_pymodule_c_report(file: mutable Ast::File&) -> i64 can[Abort.Panic, Mem
+                         emit_pymodule_error_payload_struct_typedef(&buffer, file, file.top_decls, error_family)
+                         emitted_error_payload_names.push(error_family)
+                 if has_payload_error:
+-                    emit_pymodule_error_nested_darray_helpers(&buffer, file, file.top_decls, error_family, emitted_error_nested_payload_suffixes)
++                    emit_pymodule_error_nested_darray_helpers(&buffer, file, file.top_decls, error_family, emitted_error_nested_payload_suffix_bytes, emitted_error_nested_payload_suffix_starts, emitted_error_nested_payload_suffix_lengths)
+                 return_type_name: mutable sview = "void"
+                 if target_return is declared_return:
+                     return_type_name <- pymodule_alias_type_name(file, declared_return)
+diff --git a/src/driver/elisac_pymodule_error_helpers.elisa b/src/driver/elisac_pymodule_error_helpers.elisa
+index 62cd926..af10bb5 100644
+--- a/src/driver/elisac_pymodule_error_helpers.elisa
++++ b/src/driver/elisac_pymodule_error_helpers.elisa
+@@ -1,50 +1,67 @@
+ # `-emit pymodule` — the generated helpers for nested error payloads. Their names carry a stable
+-# suffix, because a view pushed into the dedup list must not borrow per-iteration storage.
++# suffix. Dedup keys are stored as owned bytes plus scalar offsets, never as views into a loop's
++# temporary name buffers.
+ 
+ 
+-def emit_pymodule_error_nested_darray_helpers(buffer: mutable darray[u8]&, file: Ast::File&, declarations: darray[Ast::Decl]&, wanted: sview, emitted: mutable darray[sview]&) -> void can[Abort.Panic, Memory.Allocate]:
+-    for declaration in declarations |buffer, file, wanted, emitted|:
++def pymodule_error_suffix_emitted(emitted_bytes: darray[u8]&, emitted_starts: darray[usize]&, emitted_lengths: darray[usize]&, suffix: sview) -> bool can[Abort.Panic]:
++    suffix_length: usize = sview_len(suffix)
++    for key_index in 0..<emitted_starts.count |emitted_bytes, emitted_starts, emitted_lengths, suffix, suffix_length, key_index|:
++        continue if emitted_lengths[key_index] != suffix_length
++        same: mutable bool = true
++        for byte_index in 0..<suffix_length |same, emitted_bytes, emitted_starts, suffix, key_index, byte_index|:
++            same <- false if emitted_bytes[emitted_starts[key_index] + byte_index] != sview_at(suffix, byte_index)
++        true return if same
++    return false
++
++
++
++
++def pymodule_error_record_suffix(emitted_bytes: mutable darray[u8]&, emitted_starts: mutable darray[usize]&, emitted_lengths: mutable darray[usize]&, suffix: sview) -> void can[Abort.Panic, Memory.Allocate]:
++    start: usize = emitted_bytes.count
++    suffix_length: usize = sview_len(suffix)
++    for byte_index in 0..<suffix_length |emitted_bytes, suffix, byte_index|:
++        emitted_bytes.push(sview_at(suffix, byte_index))
++    emitted_starts.push(start)
++    emitted_lengths.push(suffix_length)
++
++
++
++
++def emit_pymodule_error_nested_darray_helpers(buffer: mutable darray[u8]&, file: Ast::File&, declarations: darray[Ast::Decl]&, wanted: sview, emitted_bytes: mutable darray[u8]&, emitted_starts: mutable darray[usize]&, emitted_lengths: mutable darray[usize]&) -> void can[Abort.Panic, Memory.Allocate]:
++    for declaration in declarations |buffer, file, wanted, emitted_bytes, emitted_starts, emitted_lengths|:
+         if declaration is Decl.Enum(error_name, error_variants, error_const, error_storage, error_pos):
+             continue if error_name != wanted
+-            for variant in error_variants |buffer, file, emitted|:
+-                for field in variant.fields |buffer, file, emitted|:
++            for variant in error_variants |buffer, file, emitted_bytes, emitted_starts, emitted_lengths|:
++                for field in variant.fields |buffer, file, emitted_bytes, emitted_starts, emitted_lengths|:
+                     field_type_name: sview = pymodule_alias_type_name(file, field)
+                     if pymodule_is_darray_type(field_type_name) and pymodule_is_set_type(pymodule_darray_element_name(field_type_name)):
+                         set_helper_storage: mutable darray[u8] = []
+                         set_helper: sview = pymodule_error_named_aggregate_helper_name(field_type_name, &set_helper_storage)
+-                        already_emitted_set: mutable bool = false
+-                        for emitted_suffix in emitted |field_type_name|:
+-                            already_emitted_set <- true if emitted_suffix == field_type_name
++                        already_emitted_set: bool = pymodule_error_suffix_emitted(emitted_bytes, emitted_starts, emitted_lengths, field_type_name)
+                         if not already_emitted_set:
+                             emit_pymodule_darray_set_output_helper(buffer, set_helper, pymodule_darray_element_name(field_type_name))
+-                            emitted.push(pymodule_stable_suffix(field_type_name))
++                            pymodule_error_record_suffix(emitted_bytes, emitted_starts, emitted_lengths, field_type_name)
+                     elif pymodule_is_darray_type(field_type_name) and pymodule_darray_nesting_depth(field_type_name) == 1.usize() and pymodule_struct_return_supported(file, pymodule_darray_element_name(field_type_name)):
+                         named_helper_storage: mutable darray[u8] = []
+                         named_helper: sview = pymodule_error_named_aggregate_helper_name(field_type_name, &named_helper_storage)
+-                        already_emitted_named: mutable bool = false
+-                        for emitted_suffix in emitted |field_type_name|:
+-                            already_emitted_named <- true if emitted_suffix == field_type_name
++                        already_emitted_named: bool = pymodule_error_suffix_emitted(emitted_bytes, emitted_starts, emitted_lengths, field_type_name)
+                         if not already_emitted_named:
+                             emit_pymodule_darray_struct_output_helper(buffer, file, named_helper, pymodule_darray_element_name(field_type_name))
+-                            emitted.push(pymodule_stable_suffix(field_type_name))
++                            pymodule_error_record_suffix(emitted_bytes, emitted_starts, emitted_lengths, field_type_name)
+                     elif pymodule_is_view_type(field_type_name) and pymodule_struct_return_supported(file, pymodule_view_element_name(field_type_name)):
+                         named_helper_storage: mutable darray[u8] = []
+                         named_helper: sview = pymodule_error_named_aggregate_helper_name(field_type_name, &named_helper_storage)
+-                        already_emitted_named: mutable bool = false
+-                        for emitted_suffix in emitted |field_type_name|:
+-                            already_emitted_named <- true if emitted_suffix == field_type_name
++                        already_emitted_named: bool = pymodule_error_suffix_emitted(emitted_bytes, emitted_starts, emitted_lengths, field_type_name)
+                         if not already_emitted_named:
+                             emit_pymodule_view_struct_output_helper(buffer, file, named_helper, pymodule_view_element_name(field_type_name))
+-                            emitted.push(pymodule_stable_suffix(field_type_name))
++                            pymodule_error_record_suffix(emitted_bytes, emitted_starts, emitted_lengths, field_type_name)
+                     elif pymodule_is_darray_type(field_type_name) and pymodule_is_dict_type(pymodule_darray_element_name(field_type_name)):
+                         darray_dict_suffix_storage: mutable darray[u8] = []
+                         darray_dict_suffix: sview = pymodule_error_darray_dict_helper_name(field_type_name, &darray_dict_suffix_storage, false)
+-                        already_emitted_darray_dict: mutable bool = false
+-                        for emitted_suffix in emitted |darray_dict_suffix|:
+-                            already_emitted_darray_dict <- true if emitted_suffix == darray_dict_suffix
++                        already_emitted_darray_dict: bool = pymodule_error_suffix_emitted(emitted_bytes, emitted_starts, emitted_lengths, darray_dict_suffix)
+                         if not already_emitted_darray_dict:
+                             emit_pymodule_error_darray_dict_output_helper(buffer, file, field_type_name)
+-                            emitted.push(pymodule_stable_suffix(darray_dict_suffix))
++                            pymodule_error_record_suffix(emitted_bytes, emitted_starts, emitted_lengths, darray_dict_suffix)
+                     elif pymodule_is_dict_type(field_type_name):
+                         dict_helper_suffix_storage: mutable darray[u8] = []
+                         dict_helper_suffix: sview = pymodule_error_nested_dict_helper_suffix(field_type_name, &dict_helper_suffix_storage)
+@@ -53,9 +70,7 @@ def emit_pymodule_error_nested_darray_helpers(buffer: mutable darray[u8]&, file:
+                             emit_tokens_push_sview(&emitted_dict_suffix, "dict_")
+                             emit_tokens_push_sview(&emitted_dict_suffix, dict_helper_suffix)
+                             emitted_dict_suffix_view: sview = bytes_view_range(emitted_dict_suffix, 0, emitted_dict_suffix.count)
+-                            already_emitted_dict: mutable bool = false
+-                            for emitted_suffix in emitted |emitted_dict_suffix_view|:
+-                                already_emitted_dict <- true if emitted_suffix == emitted_dict_suffix_view
++                            already_emitted_dict: bool = pymodule_error_suffix_emitted(emitted_bytes, emitted_starts, emitted_lengths, emitted_dict_suffix_view)
+                             if not already_emitted_dict:
+                                 dict_helper_name_storage: mutable darray[u8] = []
+                                 dict_helper_name: sview = pymodule_error_nested_dict_helper_name(field_type_name, &dict_helper_name_storage)
+@@ -69,14 +84,12 @@ def emit_pymodule_error_nested_darray_helpers(buffer: mutable darray[u8]&, file:
+                                     emit_pymodule_view_struct_output_helper(buffer, file, dict_helper_name, pymodule_view_element_name(pymodule_dict_value_name(field_type_name)))
+                                 else:
+                                     emit_pymodule_composed_nested_darray_output_helper(buffer, file, dict_helper_name, pymodule_dict_value_name(field_type_name))
+-                                emitted.push(pymodule_stable_suffix(emitted_dict_suffix_view))
++                                pymodule_error_record_suffix(emitted_bytes, emitted_starts, emitted_lengths, emitted_dict_suffix_view)
+                     continue if not pymodule_error_nested_darray_supported(field_type_name)
+                     helper_suffix_storage: mutable darray[u8] = []
+                     helper_suffix: sview = pymodule_error_nested_darray_helper_suffix(field_type_name, &helper_suffix_storage)
+                     continue if helper_suffix == ""
+-                    already_emitted: mutable bool = false
+-                    for emitted_suffix in emitted |helper_suffix|:
+-                        already_emitted <- true if emitted_suffix == helper_suffix
++                    already_emitted: bool = pymodule_error_suffix_emitted(emitted_bytes, emitted_starts, emitted_lengths, helper_suffix)
+                     continue if already_emitted
+                     helper_name_storage: mutable darray[u8] = []
+                     emit_tokens_push_sview(&helper_name_storage, "elisa_pymodule_error_nested_")
+@@ -84,8 +97,8 @@ def emit_pymodule_error_nested_darray_helpers(buffer: mutable darray[u8]&, file:
+                     emit_tokens_push_sview(&helper_name_storage, "_to_py")
+                     helper_name: sview = bytes_view_range(helper_name_storage, 0, helper_name_storage.count)
+                     emit_pymodule_composed_nested_darray_output_helper(buffer, file, helper_name, field_type_name)
+-                    emitted.push(pymodule_stable_suffix(helper_suffix))
++                    pymodule_error_record_suffix(emitted_bytes, emitted_starts, emitted_lengths, helper_suffix)
+         if declaration is Decl.Module(error_module_name, error_module_body, error_module_pos):
+-            emit_pymodule_error_nested_darray_helpers(buffer, file, error_module_body, wanted, emitted)
++            emit_pymodule_error_nested_darray_helpers(buffer, file, error_module_body, wanted, emitted_bytes, emitted_starts, emitted_lengths)
+         if declaration is Decl.Scoped(error_scope_body, error_scope_pos):
+-            emit_pymodule_error_nested_darray_helpers(buffer, file, error_scope_body, wanted, emitted)
++            emit_pymodule_error_nested_darray_helpers(buffer, file, error_scope_body, wanted, emitted_bytes, emitted_starts, emitted_lengths)
+diff --git a/src/parser/ast_side_tables.elisa b/src/parser/ast_side_tables.elisa
+index 634c281..c3323dc 100644
+--- a/src/parser/ast_side_tables.elisa
++++ b/src/parser/ast_side_tables.elisa
+@@ -22,6 +22,9 @@ extend Ast:
+         # signature from it silently widened the parameter. stage0 carries it as a ref
+         # typestate; here it is one bit. Defaulted, so existing constructions are unchanged.
+         is_affine: bool = false
++        # Exact physical source token for a parsed parameter name. Generated
++        # parameters may leave this at the all-zero absent-position sentinel.
++        name_pos: Pos = Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
+ 
+ 
+ 
+diff --git a/src/parser/parser_expr_fstring.elisa b/src/parser/parser_expr_fstring.elisa
+index 9e734c0..99d741f 100644
+--- a/src/parser/parser_expr_fstring.elisa
++++ b/src/parser/parser_expr_fstring.elisa
+@@ -80,10 +80,11 @@ extend Parser:
+                 fs_text: i64 = 0
+                 fs_expr: i64 = 1
+                 fs_string: i64 = 2
++                fs_char: i64 = 3
+                 fs_state: mutable i64 = fs_text
+                 expr_start: mutable usize = start_offset
+                 depth: mutable usize = 0
+-                while scan_index < end_offset |parser, scan_index, chunk_start, arguments, fs_state, expr_start, depth, token, end_offset, fs_text, fs_expr, fs_string|:
++                while scan_index < end_offset |parser, scan_index, chunk_start, arguments, fs_state, expr_start, depth, token, end_offset, fs_text, fs_expr, fs_string, fs_char|:
+                     ch: i64 = parser.source[scan_index].char()
+                     if fs_state == fs_text:
+                         # `{{`/`}}` are ONE literal brace each (stage0's parser_fstring.go
+@@ -127,9 +128,15 @@ extend Parser:
+                         elif ch == '"':
+                             scan_index <- scan_index + 1
+                             fs_state <- fs_string
++                        elif ch == '\'':
++                            # A brace inside a character literal is data, not f-string
++                            # structure. Keep the expression scanner in its own state
++                            # until the escaped or closing single quote is consumed.
++                            scan_index <- scan_index + 1
++                            fs_state <- fs_char
+                         else:
+                             scan_index <- scan_index + 1
+-                    else:
++                    elif fs_state == fs_string:
+                         # A `"..."` embedded in the interpolation — never count braces.
+                         if ch == '\\':
+                             scan_index <- scan_index + 2
+@@ -138,6 +145,15 @@ extend Parser:
+                             fs_state <- fs_expr
+                         else:
+                             scan_index <- scan_index + 1
++                    else:
++                        # A `'...'` character literal in the interpolation.
++                        if ch == '\\':
++                            scan_index <- scan_index + 2
++                        elif ch == '\'':
++                            scan_index <- scan_index + 1
++                            fs_state <- fs_expr
++                        else:
++                            scan_index <- scan_index + 1
+                 # Flush the trailing literal chunk (chunk_start tracks the last reopened position).
+                 parser.fstring_flush_chunk(token, chunk_start, end_offset, arguments)
+                 # docs/119 gap #3: every f-string lowers through __fstr, so `f"…"` has one
+diff --git a/src/parser/parser_func_params.elisa b/src/parser/parser_func_params.elisa
+index a6f68ec..661e8f9 100644
+--- a/src/parser/parser_func_params.elisa
++++ b/src/parser/parser_func_params.elisa
+@@ -329,7 +329,7 @@ extend Parser:
+                 param_default_value <- parsed_default if default_expression is parsed_default
+ 
+             if type_expression is param_type:
+-                param: Ast::ParamDecl = Ast::ParamDecl{name: Lexer::text_or_empty(param_name, parser.source), type_expression: param_type, is_mutable: leading_mutable, has_default: param_has_default, default_value: param_default_value, is_affine: consumed_affine_marker}
++                param: Ast::ParamDecl = Ast::ParamDecl{name: Lexer::text_or_empty(param_name, parser.source), name_pos: Ast::pos_of_token(param_name), type_expression: param_type, is_mutable: leading_mutable, has_default: param_has_default, default_value: param_default_value, is_affine: consumed_affine_marker}
+                 parser <- parser.record_tuple_type(param_type)
+                 param_items.push(param)
+ 
+diff --git a/src/parser/parser_machine_laws.elisa b/src/parser/parser_machine_laws.elisa
+index 18db2b4..543186f 100644
+--- a/src/parser/parser_machine_laws.elisa
++++ b/src/parser/parser_machine_laws.elisa
+@@ -59,7 +59,9 @@ extend Parser:
+             while outer < order.count |order, outer|:
+                 inner: mutable usize = outer + 1
+                 while inner < order.count |order, inner|:
+-                    if machine_root_name_before(roots[order[inner]], roots[order[outer]]):
++                    inner_name: sview = roots[order[inner]]
++                    outer_name: sview = roots[order[outer]]
++                    if machine_root_name_before(inner_name, outer_name):
+                         keep: usize = order[outer]
+                         order[outer] <- order[inner]
+                         order[inner] <- keep
+diff --git a/src/semantic/check_local_view_return_escape.elisa b/src/semantic/check_local_view_return_escape.elisa
+index 94b27eb..74b9ff9 100644
+--- a/src/semantic/check_local_view_return_escape.elisa
++++ b/src/semantic/check_local_view_return_escape.elisa
+@@ -62,11 +62,11 @@ extend Semantic:
+                     _:
+                         return false
+ 
+-        # A by-value `darray[T]` / `dstr` annotation (optionally `mutable`). A ref, a region
+-        # qualifier or any other shape is not one (rvc_value_type answers Absent).
++        # A by-value `darray[T]` / `dstr` annotation (optionally `mutable`). The direct head
++        # parser strips `mutable` and parentheses while leaving reference/region-qualified
++        # shapes unresolved, which is exactly the root classification this pass needs.
+         def lvre_container_value(type_expression: Ast::Expr) -> bool:
+             can Memory.Allocate, Abort.Panic:
+-                false return if rvc_is_absent(rvc_value_type(type_expression))
+                 head: sview = dd_type_head_arg(type_expression).head
+                 return head == "darray" or head == "dstr"
+ 
+@@ -176,6 +176,11 @@ extend Semantic:
+                 match value:
+                     Expr.Paren(inner, paren_pos):
+                         return lvre_escaping_name(inner, arrays, containers, array_views, container_views, sroots, sfields)
++                    # `return move local_container` has the same backing storage as a bare
++                    # return; moving the header does not move the auto-region allocation. The
++                    # old walker stopped at Expr.Move, so the local root was invisible here.
++                    Expr.Move(inner, move_pos):
++                        return lvre_escaping_name(inner, arrays, containers, array_views, container_views, sroots, sfields)
+                     Expr.Slice(slice_object, slice_low, slice_high, slice_pos):
+                         match slice_object:
+                             Expr.Field(field_object, field_name, field_pos):
+@@ -193,6 +198,11 @@ extend Semantic:
+                         return (sview("", 0, 0), call_pos, false, false)
+                     Expr.Ident(name, ident_pos):
+                         (name, ident_pos, true, false) return if lvre_has(array_views, name)
++                        # Returning the container value itself is also an escape: moving or
++                        # copying its header does not move the backing allocation out of the
++                        # function's inferred auto-region. Parameters are not in `containers`,
++                        # so caller-owned by-value/ref containers remain valid here.
++                        (name, ident_pos, true, true) return if lvre_has(containers, name)
+                         return (name, ident_pos, lvre_has(container_views, name), true)
+                     Expr.If(condition, then_value, else_value, if_pos):
+                         then_arm: (name: sview, pos: Ast::Pos, found: bool, container: bool) = lvre_escaping_name(then_value, arrays, containers, array_views, container_views, sroots, sfields)
+@@ -222,6 +232,17 @@ extend Semantic:
+                         return false
+                     Expr.Ident(name, ident_pos):
+                         return lvre_has(containers, name)
++                    # A move of a local darray must not make the function adopt the caller's
++                    # region: its backing buffer is still owned by this call's inferred region.
++                    # Moves of parameters and non-container values retain the existing adoption
++                    # behavior because they are not in `containers`.
++                    Expr.Move(inner, move_pos):
++                        match inner:
++                            Expr.Ident(name, ident_pos):
++                                return false if lvre_has(containers, name)
++                                return true
++                            _:
++                                return lvre_adopting_value(inner, containers)
+                     Expr.IntLit(int_text, int_pos):
+                         return false
+                     Expr.FloatLit(float_text, float_pos):
+diff --git a/src/semantic/region_escape_provenance.elisa b/src/semantic/region_escape_provenance.elisa
+index 6dc8599..54c168f 100644
+--- a/src/semantic/region_escape_provenance.elisa
++++ b/src/semantic/region_escape_provenance.elisa
+@@ -42,13 +42,16 @@ extend Semantic:
+ 
+ 
+ 
+-        # The @region of a stored VALUE expression: a plain ident's region, or — for a list
+-        # literal `[v, …]` — the (single) inner region shared by its element idents. Returns
+-        # "" when no region-annotated value is found. Sound: only explicitly-annotated
+-        # idents contribute, so a region-less element yields no false region.
++        # The @region of a stored VALUE expression: a plain ident, an explicit `new[r]`
++        # allocation, or reference-preserving `+`/`-` arithmetic over region-backed operands.
++        # Comparisons and other scalar-producing operators deliberately do not inherit a region.
++        # Returns "" when no region-backed value is found.
+         def stored_value_region(value: Ast::Expr, annotations: darray[Ast::LocalRegionAnnotation]&, view_fns: darray[sview]&, nesting: darray[sview]&, line: u32) -> sview:
+             can Memory.Allocate, Abort.Panic:
+                 match value:
++                    Expr.RegionNew(_, region, _):
++                        return region if region != ""
++                        return nesting[nesting.count - 1] if nesting.count > 0 else ""
+                     Expr.Ident(name, ident_line):
+                         return local_region_name(annotations, name, line)
+                     Expr.Paren(inner, paren_line):
+@@ -81,6 +84,12 @@ extend Semantic:
+                         return return_region
+                     Expr.Move(inner, move_line):
+                         return stored_value_region(inner, annotations, view_fns, nesting, line)
++                    Expr.Binary(left, operator, right, binary_line):
++                        if operator == TokenKind.Plus or operator == TokenKind.Minus:
++                            left_region: sview = stored_value_region(left, annotations, view_fns, nesting, line)
++                            right_region: sview = stored_value_region(right, annotations, view_fns, nesting, line)
++                            return region_escape_deeper_region(left_region, right_region, nesting)
++                        return ""
+                     Expr.Array(elements, array_line):
+                         element_region: mutable sview = sview("", 0, 0)
+                         for element in elements |element_region|:
+@@ -230,6 +239,12 @@ extend Semantic:
+                             candidate: sview = effective_value_region(field.value, annotations, view_fns, nesting, taint_names, taint_regions, line)
+                             nested_region <- region_escape_deeper_region(nested_region, candidate, nesting)
+                         return nested_region
++                    Expr.Binary(left, operator, right, binary_line):
++                        if operator == TokenKind.Plus or operator == TokenKind.Minus:
++                            left_region: sview = effective_value_region(left, annotations, view_fns, nesting, taint_names, taint_regions, line)
++                            right_region: sview = effective_value_region(right, annotations, view_fns, nesting, taint_names, taint_regions, line)
++                            return region_escape_deeper_region(left_region, right_region, nesting)
++                        return ""
+                     Expr.If(condition, then_value, else_value, if_line):
+                         then_region: sview = effective_value_region(then_value, annotations, view_fns, nesting, taint_names, taint_regions, line)
+                         else_region: sview = effective_value_region(else_value, annotations, view_fns, nesting, taint_names, taint_regions, line)
+@@ -357,6 +372,14 @@ extend Semantic:
+                         then_region: sview = region_escape_stored_or_call_region(then_value, annotations, view_fns, container_fns, nesting, taint_names, taint_regions, line)
+                         else_region: sview = region_escape_stored_or_call_region(else_value, annotations, view_fns, container_fns, nesting, taint_names, taint_regions, line)
+                         return region_escape_deeper_region(then_region, else_region, nesting)
++                    Expr.Binary(left, operator, right, _):
++                        # Pointer-preserving arithmetic retains the allocation's region on
++                        # return/store; comparisons produce scalars and must not inherit it.
++                        if operator == TokenKind.Plus or operator == TokenKind.Minus:
++                            left_region: sview = region_escape_stored_or_call_region(left, annotations, view_fns, container_fns, nesting, taint_names, taint_regions, line)
++                            right_region: sview = region_escape_stored_or_call_region(right, annotations, view_fns, container_fns, nesting, taint_names, taint_regions, line)
++                            return region_escape_deeper_region(left_region, right_region, nesting)
++                        return ""
+                     Expr.Call(callee, arguments, argument_names, call_line):
+                         direct: sview = effective_value_region(value, annotations, view_fns, nesting, taint_names, taint_regions, line)
+                         callee_name: sview = ident_name_of(callee)
+diff --git a/src/semantic/resolve.elisa b/src/semantic/resolve.elisa
+index ca15e4f..4f2932b 100644
+--- a/src/semantic/resolve.elisa
++++ b/src/semantic/resolve.elisa
+@@ -250,7 +250,7 @@ extend Semantic:
+                             table.current_loop_depth <- 0
+                             parameter_index: mutable usize = 0
+                             for parameter in parameters |table, parameter_index| -> table:
+-                                table <- record_reference(table, line.line, parameter.name, true, bound_ids[parameter_index])
++                                table <- record_reference(table, line.line, parameter.name, true, bound_ids[parameter_index], parameter.name_pos)
+                                 parameter_index <- parameter_index + 1
+                             table <- resolve_body(body, table, bound, bound_mutability, bound_ids)
+                             table <- check_function(parameters, body, mutable_ref_return_fns, table, line.line)
+diff --git a/src/semantic/resolve_expr_walk.elisa b/src/semantic/resolve_expr_walk.elisa
+index a9cd833..9e4b7ed 100644
+--- a/src/semantic/resolve_expr_walk.elisa
++++ b/src/semantic/resolve_expr_walk.elisa
+@@ -175,7 +175,7 @@ extend Semantic:
+                         # A resolved reference to a param/local: log it for
+                         # tooling (globals are left to the symbol table).
+                         reference_index: int = bound_last_index(bound, name) if known and not module_only else -1
+-                        table <- record_reference(table, line.line, name, reference_index.usize() < table.current_param_count, bound_ids[reference_index.usize()]) if reference_index >= 0
++                        table <- record_reference(table, line.line, name, reference_index.usize() < table.current_param_count, bound_ids[reference_index.usize()], line) if reference_index >= 0
+                         if known and not module_only and reference_index < 0 and line.end_offset > line.offset:
+                             target_index: i64 = unique_top_level_function_index(table, name)
+                             table.definition_references <- table.definition_references.push(DefinitionReference{pos: line, declaration_id: table.symbols[target_index.usize()].id}) if target_index >= 0
+diff --git a/src/semantic/resolve_flow.elisa b/src/semantic/resolve_flow.elisa
+index d2f9f95..664e5bc 100644
+--- a/src/semantic/resolve_flow.elisa
++++ b/src/semantic/resolve_flow.elisa
+@@ -115,7 +115,7 @@ extend Semantic:
+         # operator requires an EXISTING target, reported as a specific diagnostic. Modelled as a
+         # split on the operator plus ordered guarded early-exits (name_known / const_is_immutable
+         # are pure, so re-testing them in the return guards is behaviour-identical).
+-        def resolve_ident_assign_target(operator: TokenKind, target: Ast::Expr, target_name: sview, target_line: u32, line: u32, bound: mutable darray[sview]&, bound_mutability: mutable darray[bool]&, bound_ids: mutable darray[BindingId]&, table: lmut SymbolTable) -> void:
++        def resolve_ident_assign_target(operator: TokenKind, target: Ast::Expr, target_name: sview, target_position: Ast::Pos, line: u32, bound: mutable darray[sview]&, bound_mutability: mutable darray[bool]&, bound_ids: mutable darray[BindingId]&, table: lmut SymbolTable) -> void:
+             can Memory.Allocate, Abort.Panic:
+                 match operator:
+                     TokenKind.Assign:
+@@ -123,7 +123,7 @@ extend Semantic:
+                         bound_mutability.push(false)
+                         binding_id: BindingId = fresh_binding_id(table.current_function_decl_id, table.next_binding_serial)
+                         bound_ids.push(binding_id)
+-                        table <- record_reference(table, target_line, target_name, false, binding_id)
++                        table <- record_reference(table, target_position.line, target_name, false, binding_id, target_position)
+                     _:
+                         # A NON-`=` assign (`<-` or a compound `+=`/…) requires an EXISTING
+                         # target; a bare undeclared name is a distinct error from a plain
+@@ -170,7 +170,7 @@ extend Semantic:
+                             bound_mutability.push(local_binding_is_mutable(name, line.line, line.offset, type_expression, table))
+                             binding_id: BindingId = fresh_binding_id(table.current_function_decl_id, table.next_binding_serial)
+                             bound_ids.push(binding_id)
+-                            table <- record_reference(table, line.line, name, false, binding_id)
++                            table <- record_reference(table, line.line, name, false, binding_id, line)
+                         Stmt.Assign(target, operator, value, line):
+                             table <- walk_expression(value, table, bound, bound_mutability, bound_ids)
+                             gather_expression_bindings(value, bound)
+@@ -205,13 +205,13 @@ extend Semantic:
+                                                         bound.push(element_name)
+                                                         bound_mutability.push(rebound_mutability)
+                                                         bound_ids.push(binding_id)
+-                                                        table <- record_reference(table, ident_line.line, element_name, false, binding_id)
++                                                        table <- record_reference(table, ident_line.line, element_name, false, binding_id, ident_line)
+                                                     _:
+                                                         table <- walk_expression(element, table, bound, bound_mutability, bound_ids)
+                                             _:
+                                                 table <- walk_expression(element, table, bound, bound_mutability, bound_ids)
+                                 Expr.Ident(target_name, target_line):
+-                                    table <- resolve_ident_assign_target(operator, target, target_name, target_line.line, line.line, bound, bound_mutability, bound_ids, table)
++                                    table <- resolve_ident_assign_target(operator, target, target_name, target_line, line.line, bound, bound_mutability, bound_ids, table)
+                                 Expr.Call(callee, call_arguments, call_argument_names, call_line):
+                                     # Assigning to a call result is never valid (stage0:
+                                     # `invalid assignment target`). Still walk the call so
+@@ -279,12 +279,15 @@ extend Semantic:
+                             for_mark: usize = bound.count
+                             for_mutability_mark: usize = bound_mutability.count
+                             for_binding_id_mark: usize = bound_ids.count
+-                            for variable in variables |table, bound, bound_mutability, bound_ids|:
++                            variable_ordinal: mutable usize = 0
++                            for variable in variables |table, bound, bound_mutability, bound_ids, variable_ordinal|:
+                                 bound.push(variable)
+                                 bound_mutability.push(bind == "mutable")
+                                 binding_id: BindingId = fresh_binding_id(table.current_function_decl_id, table.next_binding_serial)
+                                 bound_ids.push(binding_id)
+-                                table <- record_reference(table, line.line, variable, false, binding_id)
++                                variable_position: Ast::Pos = for_binder_position(line.offset, variable_ordinal, table)
++                                table <- record_reference(table, line.line, variable, false, binding_id, variable_position)
++                                variable_ordinal <- variable_ordinal + 1
+                             # A `where` filter may refine a loop variable with an `is`-pattern
+                             # (`for item in xs where item is Expr.Int(value):`) — its payload
+                             # bindings (`value`) are in scope for the loop body. Walk the filter,
+@@ -330,7 +333,7 @@ extend Semantic:
+                             # binding identity is consumed only when the declaration is named.
+                             block_binding_id: BindingId = fresh_binding_id(table.current_function_decl_id, table.next_binding_serial)
+                             bound_ids.push(block_binding_id) if binding != ""
+-                            table <- record_reference(table, line.line, binding, false, block_binding_id) if binding != ""
++                            table <- record_reference(table, line.line, binding, false, block_binding_id, Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}) if binding != ""
+                             for consumed_name in clause |table| -> table:
+                                 table <- walk_expression((Ast::Expr.Ident(consumed_name, line)), table, bound, bound_mutability, bound_ids) if kind == "destroy"
+                             table <- resolve_body(body, table, bound, bound_mutability, bound_ids)
+diff --git a/src/semantic/resolve_scope.elisa b/src/semantic/resolve_scope.elisa
+index 9133880..31d0e40 100644
+--- a/src/semantic/resolve_scope.elisa
++++ b/src/semantic/resolve_scope.elisa
+@@ -214,13 +214,19 @@ extend Semantic:
+         # Record one param/local occurrence for tooling (the LSP's semantic-token
+         # highlighter reads these). `is_param` selects kind 1 (parameter) over 2
+         # (local); the ID links each use back to the resolved lexical declaration.
+-        def record_reference(table: lmut SymbolTable, line: u32, name: sview, is_param: bool, binding_id: BindingId) -> void:
++        def record_reference(table: lmut SymbolTable, line: u32, name: sview, is_param: bool, binding_id: BindingId, position: Ast::Pos) -> void:
+             can Memory.Allocate, Abort.Panic:
+                 reference_index: usize = table.ref_binding_ids.count
++                source_position: mutable Ast::Pos = position
++                # Generated references often retain only an owning statement line.
++                # Normalize those to an explicit absent span instead of exposing a
++                # plausible-looking but incorrect location to tooling.
++                source_position <- Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0} if position.end_offset <= position.offset
+                 table.ref_line <- table.ref_line.push(line)
+                 table.ref_name <- table.ref_name.push(name)
+                 table.ref_kind <- table.ref_kind.push(1 if is_param else 2)
+                 table.ref_binding_ids <- table.ref_binding_ids.push(binding_id)
++                table.ref_pos <- table.ref_pos.push(source_position)
+                 table.ref_owner_next <- table.ref_owner_next.push(SYMBOL_INDEX_ROW_NONE)
+                 owner_index: usize = binding_id.owner.value.usize()
+                 if reference_index >= SYMBOL_INDEX_ROW_NONE.usize():
+@@ -237,6 +243,19 @@ extend Semantic:
+                     table.ref_owner_index_valid <- false
+ 
+ 
++        # The AST stores plain loop-binder names in `Stmt.For.variables`; the parser
++        # retains their source tokens in order, keyed by the owning `for` keyword.
++        # Use the binder ordinal so repeated names on the same header remain distinct.
++        def for_binder_position(owner_offset: u32, ordinal: usize, table: SymbolTable&) -> Ast::Pos:
++            can Abort.Panic:
++                binder_ordinal: mutable usize = 0
++                for binder_index in 0..<table.binder_pos_offsets.count |binder_ordinal, owner_offset, ordinal, table|:
++                    if table.binder_pos_offsets[binder_index] == owner_offset:
++                        table.binder_pos_values[binder_index] return if binder_ordinal == ordinal
++                        binder_ordinal <- binder_ordinal + 1
++                return Ast::Pos{line: 0, column: 0, offset: 0, end_line: 0, end_column: 0, end_offset: 0}
++
++
+         # Return a source-function row only when an unqualified name has one exact
+         # file-level function candidate. The semantic resolver's flat global index does
+         # not choose among overloads or module members, so those cases are declined.
+diff --git a/src/semantic/semantic_types.elisa b/src/semantic/semantic_types.elisa
+index d24839a..cd030c8 100644
+--- a/src/semantic/semantic_types.elisa
++++ b/src/semantic/semantic_types.elisa
+@@ -195,7 +195,7 @@ module Semantic:
+             can Memory.Allocate, Abort.Panic:
+                 text_storage: mutable darray[u8] = []
+                 text_storage.reserve(65536)
+-                return SymbolTable{symbols: [], definition_references: [], catch_match_lines: [], new_construct_lines: [], forward_arg_lines: [], block_if_lines: [], region_names: [], query_binder_lines: [], query_binder_names: [], duplicates: 0, statements: 0, diagnostics: [], name_primary: {}, name_overflow: [], symbol_name_head: {}, symbol_name_tail: {}, symbol_name_next: [], member_name_head: {}, member_name_tail: {}, member_name_next: [], imported_modules: [], imported_members: [], current_module: "", enum_variant_owner: [], enum_variant_name: [], enum_hierarchy_child: [], enum_hierarchy_parent: [], enum_variant_arity: [], enum_payload_owner: [], enum_payload_variant: [], enum_payload_name: [], enum_payload_type: [], enum_payload_type_id: [], enum_payload_position: [], enum_common_owners: [], enum_common_modules: [], enum_common_counts: [], struct_field_owner: [], struct_field_private: [], private_field_types: [], struct_field_name: [], struct_field_required: [], struct_field_type: [], struct_field_mutable: [], struct_field_type_id: [], qualified_type_module: [], qualified_type_name: [], lmut_param_owner: [], lmut_param_pos: [], function_param_owner: [], function_param_name: [], function_param_has_default: [], function_param_type: [], function_param_type_id: [], function_param_state_code: [], function_param_mutable_ref: [], function_param_name_head: {}, function_param_name_tail: {}, function_param_name_next: [], function_effect_owner: [], function_effect_name: [], function_effect_source_owner: [], function_effect_source_ref: [], generic_param_lines: [], generic_param_names: [], packed_enum_names: [], declared_packed_names: [], ast_refinement_names: [], region_tied_param_names: [], fn_alias_names: [], struct_affine_owner: [], struct_affine_container_owner: [], immutable_const_names: [], const_int_names: [], const_int_values: [], ref_line: [], ref_name: [], ref_kind: [], ref_binding_ids: [], next_binding_serial: 0, current_function_decl_id: DeclId{value: 4294967295}, type_row_kind: [], type_row_name: [], type_row_elem_start: [], type_row_elem_count: [], type_elem_pool: [], tuple_binding_names: [], tuple_binding_l1: [], tuple_binding_t1: [], tuple_binding_l2: [], tuple_binding_t2: [], local_type_names: [], local_type_ids: [], current_param_count: 0, current_loop_depth: 0, walk_depth: 0, text_storage: text_storage, extern_bounds_owner: [], extern_bounds_length: [], generic_extern_names: []}
++                return SymbolTable{symbols: [], definition_references: [], catch_match_lines: [], new_construct_lines: [], forward_arg_lines: [], block_if_lines: [], region_names: [], query_binder_lines: [], query_binder_names: [], duplicates: 0, statements: 0, diagnostics: [], name_primary: {}, name_overflow: [], symbol_name_head: {}, symbol_name_tail: {}, symbol_name_next: [], member_name_head: {}, member_name_tail: {}, member_name_next: [], imported_modules: [], imported_members: [], current_module: "", enum_variant_owner: [], enum_variant_name: [], enum_hierarchy_child: [], enum_hierarchy_parent: [], enum_variant_arity: [], enum_payload_owner: [], enum_payload_variant: [], enum_payload_name: [], enum_payload_type: [], enum_payload_type_id: [], enum_payload_position: [], enum_common_owners: [], enum_common_modules: [], enum_common_counts: [], struct_field_owner: [], struct_field_private: [], private_field_types: [], struct_field_name: [], struct_field_required: [], struct_field_type: [], struct_field_mutable: [], struct_field_type_id: [], qualified_type_module: [], qualified_type_name: [], lmut_param_owner: [], lmut_param_pos: [], function_param_owner: [], function_param_name: [], function_param_has_default: [], function_param_type: [], function_param_type_id: [], function_param_state_code: [], function_param_mutable_ref: [], function_param_name_head: {}, function_param_name_tail: {}, function_param_name_next: [], function_effect_owner: [], function_effect_name: [], function_effect_source_owner: [], function_effect_source_ref: [], generic_param_lines: [], generic_param_names: [], packed_enum_names: [], declared_packed_names: [], ast_refinement_names: [], region_tied_param_names: [], fn_alias_names: [], struct_affine_owner: [], struct_affine_container_owner: [], immutable_const_names: [], const_int_names: [], const_int_values: [], ref_line: [], ref_name: [], ref_kind: [], ref_binding_ids: [], ref_pos: [], next_binding_serial: 0, current_function_decl_id: DeclId{value: 4294967295}, type_row_kind: [], type_row_name: [], type_row_elem_start: [], type_row_elem_count: [], type_elem_pool: [], tuple_binding_names: [], tuple_binding_l1: [], tuple_binding_t1: [], tuple_binding_l2: [], tuple_binding_t2: [], local_type_names: [], local_type_ids: [], current_param_count: 0, current_loop_depth: 0, walk_depth: 0, text_storage: text_storage, extern_bounds_owner: [], extern_bounds_length: [], generic_extern_names: []}
+ 
+ 
+         struct SymbolTable:
+@@ -617,6 +617,9 @@ module Semantic:
+             # occurrences and resolved reads share the same BindingId; equal spellings in
+             # nested scopes do not. `owner` is the enclosing function DeclId.
+             ref_binding_ids: mutable darray[BindingId]
++            # Physical source spans parallel to the resolver's compact occurrence rows.
++            # Generated bindings with no identifier token use the all-zero absent sentinel.
++            ref_pos: mutable darray[Ast::Pos] = []
+             # Owner-keyed linked index into the parallel reference arrays above. Each head
+             # is a Symbol row; each next entry is keyed by reference row. `valid` stays false
+             # only if a reference row cannot be represented by the index's u32 links, so
+diff --git a/test/fixtures/diagnostics/affine_container_return.neg.elisa b/test/fixtures/diagnostics/affine_container_return.neg.elisa
+index 5e08068..bbfcc81 100644
+--- a/test/fixtures/diagnostics/affine_container_return.neg.elisa
++++ b/test/fixtures/diagnostics/affine_container_return.neg.elisa
+@@ -1,8 +1,7 @@
+-# `return move c` hands a container of handles to the caller; nothing leaks.
+-# stage0 rejects `return move made` (L14) as an `in auto:` region escape, but it accepts a
+-# bare `return made` of a darray[i64]. stage1 allocates a returned local in the caller's
+-# arena in both spellings (checked in IR and at run time), so the stage0 line is its own
+-# over-rejection and stage1 stays silent here.
++# `return move c` must not let a by-value local darray escape the function's inferred
++# `in auto:` region. Stage0 rejects `return move made` (L18), and Stage1 must reject the
++# same spelling; a move transfers the container value but does not transfer the backing
++# region. The parameter-forwarding form remains valid.
+ affine struct Handle:
+     v: i64
+ 
+diff --git a/test/fixtures/diagnostics/local_view_escape_view_call.pos.elisa b/test/fixtures/diagnostics/local_view_escape_view_call.pos.elisa
+index 79f4274..59a50e3 100644
+--- a/test/fixtures/diagnostics/local_view_escape_view_call.pos.elisa
++++ b/test/fixtures/diagnostics/local_view_escape_view_call.pos.elisa
+@@ -1,3 +1,4 @@
++# corpus: deliberate-decline
+ # DELIBERATE DEVIATION: stage0 accepts this (hidden arena keeps the dstr alive); stage1 gives a
+ # view-typed return no hidden arena, so the local dstr is freed and the view reads freed memory
+ # (measured: returns 0 instead of 65). Stage1 rejects it on purpose.
+diff --git a/test/parity/backend_smoke_behavior.sh b/test/parity/backend_smoke_behavior.sh
+index de7ec67..67806f2 100644
+--- a/test/parity/backend_smoke_behavior.sh
++++ b/test/parity/backend_smoke_behavior.sh
+@@ -66,6 +66,7 @@ run_case if_else_both_ret 'def main() -> i64:\n    x: i64 = 1\n    if x > 3:\n
+ # A real loop: sums 1..9 == 45, so an off-by-one or a mis-wired backedge shows up.
+ run_case while_sum        'def main() -> i64:\n    i: mutable i64 = 0\n    total: mutable i64 = 0\n    while i < 9:\n        i <- i + 1\n        total <- total + i\n    return total\n'  45
+ run_case call             'def double(n: i64) -> i64:\n    return n * 2\n\ndef main() -> i64:\n    return double(21)\n'  42
++run_case reference_value_context 'struct Holder:\n    value: i64&\n\ndef from_container() -> i64:\n    can Memory.Allocate, Abort.Panic:\n        local: i64 = 5\n        refs: mutable darray[i64&] = []\n        refs.push(&local)\n        return refs[0]\n\ndef from_field() -> i64:\n    local: i64 = 6\n    holder: Holder = Holder{value: &local}\n    return holder.value\n\ndef main() -> i64:\n    can Memory.Allocate, Abort.Panic:\n        return from_container() + from_field() - 11\n' 0
+ run_case named_call       'def subtract(left: i64, right: i64) -> i64:\n    return left - right\n\ndef main() -> i64:\n    return subtract(right: 2, left: 40)\n'  38
+ run_case named_generic    'def first[A, B](left: A, right: B) -> A:\n    return left\n\ndef main() -> i64:\n    return first(right: 2, left: 40)\n'  40
+ # Forward reference: `main` calls a function declared LATER. Passes only because
+@@ -253,7 +254,10 @@ run_case array_write_loop 'def main() -> i64:\n    xs: mutable i64[5] = [0, 0, 0
+ # 256 initial capacity and the grow rule are all stage0's, read out of its own `-emit llvm`
+ # output — they are dictated by the shared runtime, not chosen here.
+ run_case darray_push      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(40)\n    xs.push(2)\n    return xs[0] + xs[1]\n'  42
++run_case impl_push_named_like_generic 'struct Stack:\n    total: i64\n\nimpl Stack:\n    def push(self: Stack, a: i64, b: i64) -> i64:\n        return self.total + a + b\n\ndef main() -> i64:\n    s: Stack = Stack{total: 39}\n    return s.push(1, 2)\n' 42
+ run_case darray_literal   'def main() -> i64:\n    xs: darray[i64] = [40, 2, 99]\n    return xs[0] + xs[1]\n'  42
++run_case darray_ref_field 'struct Holder:\n    w: mutable darray[i64]&\n\ndef main() -> i64:\n    xs: mutable darray[i64] = []\n    h: Holder = Holder{w: &xs}\n    h.w.push(42)\n    return h.w[0]\n' 42
++run_case darray_spread_fixed_array 'def main() -> i64:\n    source: i64[2] = [7, 35]\n    xs: darray[i64] = [...source, 0]\n    return xs[0] + xs[1]\n'  42
+ run_case darray_count     'def main() -> i64:\n    xs: mutable darray[i64] = []\n    xs.push(7)\n    xs.push(7)\n    xs.push(7)\n    return xs.count * 14\n'  42
+ run_case darray_loop      'def main() -> i64:\n    xs: mutable darray[i64] = []\n    for i in 0..<10:\n        xs.push(i)\n    total: mutable i64 = 0\n    for j in 0..<10:\n        total <- total + xs[j]\n    return total - 3\n'  42
+ run_case darray_u8        'def main() -> i64:\n    xs: mutable darray[u8] = []\n    xs.push(200)\n    xs.push(100)\n    return xs[0].i64() - xs[1].i64() - 58\n'  42
+diff --git a/test/parity/diagnostics_smoke.sh b/test/parity/diagnostics_smoke.sh
+index 916deba..0a044a9 100755
+--- a/test/parity/diagnostics_smoke.sh
++++ b/test/parity/diagnostics_smoke.sh
+@@ -802,6 +802,7 @@ for acr_name in xs made t ps; do
+ done
+ run_case affine_container_return neg "$acr_neg" "must be moved explicitly before return"
+ run_case affine_container_return neg "$acr_neg" "must be consumed before scope exit"
++run_case local_auto_region_return pos "$acr_neg" 'value escapes its `in auto:` scope via return'
+ 
+ echo "-- affine_bulk_copy --"
+ abc_pos="$FIXTURES/affine_bulk_copy.pos.elisa"
+diff --git a/test/parity/region_scope_smoke.sh b/test/parity/region_scope_smoke.sh
+index 0fe39db..f51d230 100755
+--- a/test/parity/region_scope_smoke.sh
++++ b/test/parity/region_scope_smoke.sh
+@@ -60,6 +60,11 @@ out=$(printf 'def bad() -> i32&:\n    region scratch(64)\n    value: i32& = new[
+ grep -q 'cannot return reference: region dependency facts include local region "scratch"' <<< "$out" || fail "local-region return escape was not flagged: $out"
+ out=$(printf 'def bad() -> i32&:\n    region scratch(64)\n    value: i32& = new[scratch] 1\n    return value.cast[i32&]\n' | "$RPT")
+ grep -q 'cannot return reference: region dependency facts include local region "scratch"' <<< "$out" || fail "cast local-region return escape was not flagged: $out"
++# Pointer-preserving arithmetic retains its local allocation region; a scalar comparison
++# does not. Keep both the positive escape and the structurally similar safe case covered.
++out=$(printf 'def bad() -> i64:\n    region scratch(64):\n        value: i64& @scratch = new[scratch] 1\n        return value + 0\n' | "$RPT")
++grep -q 'value allocated in region "scratch" escapes via return' <<< "$out" || fail "pointer arithmetic lost local-region return provenance: $out"
++clean $'def scalar() -> bool:\n    region scratch(64):\n        value: i64& @scratch = new[scratch] 1\n        return value > 0\n'
+ clean $'def id[T, @r](value: T& @r) -> T& @r:\n    alias: T& @r = value\n    return alias\n'
+ 
+ out="$(printf '%s' $'def f() -> void:\n    destroy missing\n' | "$RPT")"

@@ -1,0 +1,14 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+const source = fs.readFileSync(fileURLToPath(new URL("../shells/web/index.html", import.meta.url)), "utf8");
+assert.match(source, /nw_api_v1_task_go_winning_move/);
+assert.match(source, /return isTaskId\("go_winning_move"\)/);
+assert.match(source, /function ensureGoWinningMoveRun\(\)/);
+assert.match(source, /\[1n, 5n, 0n, 0n, 0n, 0n\]/);
+assert.match(source, /function goWinningMoveFrame\(black\)/);
+assert.match(source, /apiDispatchPointer\(ensureGoWinningMoveRun\(\), API_EVENT\.pointerDown/);
+assert.match(source, /GO_ACTION\.answer/);
+assert.match(source, /if \(isGoWinningMoveTask\(\)\) destroyGoWinningMoveRun\(\)/);
+assert.match(source, /bytes = goWinningMoveFrame\(dark\(\)\)/);
+console.log("go_browser_contract_test: PASS (export, source position, lifecycle, keyboard, pointer, render, cleanup)");

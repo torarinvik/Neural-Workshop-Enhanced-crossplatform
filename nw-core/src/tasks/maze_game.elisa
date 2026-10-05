@@ -1,0 +1,462 @@
+# Stateful Maze run controller.
+#
+# The Maze source module owns the exact CPython-compatible generator, locks,
+# shortest-path certificate, and greedy comparison. This adapter owns the
+# state that has to survive a common-API call: the generated grid, the walk,
+# keys, lifecycle, adaptive rung, and score. The temporary Maze::Work and
+# Layout values are deliberately confined to one generation call; retaining
+# one of their darrays in Run would make the next WASM call read dead arena
+# memory.
+
+module MazeGame:
+
+    const MAX_ROOMS: i64 = 18
+    const MAX_CELLS: i64 = 1369
+    const MAX_DOORS: i64 = 6
+    const GENERATION_ATTEMPTS: i64 = 150
+
+    const PHASE_READY: i64 = 0
+    const PHASE_WALKING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_DONE: i64 = 3
+    const PHASE_UNAVAILABLE: i64 = 4
+
+    # Space/Enter is also the source screen's next-trial key while feedback is
+    # visible. Direction order is the source DIRECTIONS order: up, down, left,
+    # right. R restarts the current maze and is not an undo.
+    const ACTION_START: i64 = 0
+    const ACTION_UP: i64 = 1
+    const ACTION_DOWN: i64 = 2
+    const ACTION_LEFT: i64 = 3
+    const ACTION_RIGHT: i64 = 4
+    const ACTION_RESTART: i64 = 5
+
+    const INFO_PHASE: i64 = 0
+    const INFO_RUNG: i64 = 1
+    const INFO_TRIAL: i64 = 2
+    const INFO_TOTAL_TRIALS: i64 = 3
+    const INFO_WALKER: i64 = 4
+    const INFO_STEPS: i64 = 5
+    const INFO_VERDICT: i64 = 6
+    const INFO_WIDTH: i64 = 7
+    const INFO_HEIGHT: i64 = 8
+    const INFO_START: i64 = 9
+    const INFO_WAY_OUT: i64 = 10
+    const INFO_DOOR_COUNT: i64 = 11
+    const INFO_HELD: i64 = 12
+    const INFO_MINIMUM: i64 = 13
+    const INFO_GREEDY: i64 = 14
+    const INFO_ADAPTIVE: i64 = 15
+    const INFO_SHOW_TRAIL: i64 = 16
+    const INFO_SOLVED_COUNT: i64 = 17
+    const INFO_TOTAL_PAR: i64 = 18
+    const INFO_TOTAL_STEPS: i64 = 19
+    const INFO_BEST_RUNG: i64 = 20
+    const INFO_TAKEN_SECONDS: i64 = 21
+    const INFO_MESSAGE: i64 = 22
+
+    const CELL_WALL: i64 = 0
+    const CELL_WALKED: i64 = 1
+    const CELL_DOOR: i64 = 2
+    const CELL_KEY: i64 = 3
+
+    # message_kind is only the small amount of mutable chrome the source UI
+    # keeps after an attempted walk.  0 is the generated grade headline, 1 is
+    # a locked-door notice, and 2 is the restart notice.
+    const MESSAGE_GRADE: i64 = 0
+    const MESSAGE_LOCKED: i64 = 1
+    const MESSAGE_RESTART: i64 = 2
+
+    struct Run:
+        start_rung: mutable i64
+        total_trials: mutable i64
+        adaptive: mutable bool
+        show_trail: mutable bool
+        rng: mutable MT19937
+        walls: mutable i64[1369]
+        walked: mutable i64[1369]
+        doors: mutable i64[6]
+        keys: mutable i64[6]
+        width: mutable i64
+        height: mutable i64
+        cells: mutable i64
+        start: mutable i64
+        way_out: mutable i64
+        door_count: mutable i64
+        minimum: mutable i64
+        greedy: mutable i64
+        rung: mutable i64
+        trial: mutable i64
+        walker: mutable i64
+        held: mutable i64
+        steps: mutable i64
+        phase: mutable i64
+        verdict: mutable i64
+        started_at_ms: mutable i64
+        taken_seconds: mutable i64
+        solved_count: mutable i64
+        total_par: mutable i64
+        total_steps: mutable i64
+        best_rung: mutable i64
+        message_kind: mutable i64
+
+    def clamp_rung(value: i64) -> i64:
+        can Abort.Panic:
+            return 1 if value < 1 else (Maze::GRADE_COUNT if value > Maze::GRADE_COUNT else value)
+
+    def clear_arrays(run: mutable Run&):
+        can Abort.Panic:
+            cell: mutable i64 = 0
+            while cell < MAX_CELLS |cell, run|:
+                run.walls[cell.usize()] <- 0
+                run.walked[cell.usize()] <- 0
+                cell <- cell + 1
+            door: mutable i64 = 0
+            while door < MAX_DOORS |door, run|:
+                run.doors[door.usize()] <- 0
+                run.keys[door.usize()] <- 0
+                door <- door + 1
+
+    def initialize(run: mutable Run&, start_rung: i64, total_trials: i64,
+                   adaptive: bool, show_trail: bool, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.start_rung <- clamp_rung(start_rung)
+            run.total_trials <- 1 if total_trials < 1 else total_trials
+            run.adaptive <- adaptive
+            run.show_trail <- show_trail
+            run.rng <- rng
+            run.width <- 0
+            run.height <- 0
+            run.cells <- 0
+            run.start <- 0
+            run.way_out <- 0
+            run.door_count <- 0
+            run.minimum <- 0
+            run.greedy <- 0
+            run.rung <- clamp_rung(start_rung)
+            run.trial <- 0
+            run.walker <- 0
+            run.held <- 0
+            run.steps <- 0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.started_at_ms <- 0
+            run.taken_seconds <- 0
+            run.solved_count <- 0
+            run.total_par <- 0
+            run.total_steps <- 0
+            run.best_rung <- 0
+            run.message_kind <- MESSAGE_GRADE
+            clear_arrays(run)
+
+    # Generate with the exact source generator and copy only stable values out
+    # of the 64 MiB temporary arena. Maze::realise leaves open_flag holding the
+    # selected winning attempt, so the wall mask is copied from that final
+    # workspace rather than regenerated in a second random stream.
+    def generate_level(run: mutable Run&, deal_seed: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            generated: mutable bool = false
+            region generation(67108864):
+                in generation:
+                    work: mutable Maze::Work = Maze::work_new(MAX_ROOMS, MAX_DOORS)
+                    layout: mutable Maze::Layout = Maze::generate(
+                        &work, run.rung, deal_seed, GENERATION_ATTEMPTS)
+                    if layout.ok:
+                        run.width <- layout.width
+                        run.height <- layout.height
+                        run.cells <- layout.width * layout.height
+                        run.start <- layout.start
+                        run.way_out <- layout.way_out
+                        run.door_count <- layout.door_count
+                        run.minimum <- layout.minimum
+                        run.greedy <- layout.greedy
+
+                        cell: mutable i64 = 0
+                        while cell < MAX_CELLS |cell, run, work, layout|:
+                            if cell < run.cells:
+                                run.walls[cell.usize()] <- 0 if Ints::at(work.open_flag, cell) == 1 else 1
+                            else:
+                                run.walls[cell.usize()] <- 0
+                            run.walked[cell.usize()] <- 0
+                            cell <- cell + 1
+
+                        door: mutable i64 = 0
+                        while door < MAX_DOORS |door, run, layout|:
+                            run.doors[door.usize()] <- layout.doors[door.usize()] if door < layout.door_count else 0
+                            run.keys[door.usize()] <- layout.keys[door.usize()] if door < layout.door_count else 0
+                            door <- door + 1
+                        generated <- true
+                destroy generation
+            return generated
+
+    def take_key(run: mutable Run&):
+        can Abort.Panic:
+            colour: mutable i64 = 0
+            while colour < run.door_count and colour < MAX_DOORS |colour, run|:
+                if run.keys[colour.usize()] == run.walker:
+                    run.held <- run.held | (1 << colour)
+                colour <- colour + 1
+
+    def door_at(run: Run&, cell: i64) -> i64:
+        can Abort.Panic:
+            colour: mutable i64 = 0
+            while colour < run.door_count and colour < MAX_DOORS |colour, run, cell|:
+                return colour if run.doors[colour.usize()] == cell
+                colour <- colour + 1
+            return -1
+
+    def reset_walk(run: mutable Run&):
+        can Abort.Panic:
+            run.walker <- run.start
+            run.held <- 0
+            run.steps <- 0
+            cell: mutable i64 = 0
+            while cell < run.cells |cell, run|:
+                run.walked[cell.usize()] <- 0
+                cell <- cell + 1
+            run.walked[run.start.usize()] <- 1
+            take_key(run)
+
+    def next_trial(run: mutable Run&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.trial >= run.total_trials:
+                run.phase <- PHASE_DONE
+                run.verdict <- -1
+                return
+            run.trial <- run.trial + 1
+            deal_seed: i64 = py_randbelow(&run.rng, 1073741824.u64()).i64()
+            if not generate_level(run, deal_seed):
+                run.phase <- PHASE_UNAVAILABLE
+                run.verdict <- -1
+                return
+            reset_walk(run)
+            run.started_at_ms <- now_ms
+            run.taken_seconds <- 0
+            run.verdict <- -1
+            run.message_kind <- MESSAGE_GRADE
+            run.phase <- PHASE_WALKING
+
+    def start_run(run: mutable Run&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            run.rung <- clamp_rung(run.start_rung)
+            run.trial <- 0
+            run.walker <- 0
+            run.held <- 0
+            run.steps <- 0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.started_at_ms <- now_ms
+            run.taken_seconds <- 0
+            run.solved_count <- 0
+            run.total_par <- 0
+            run.total_steps <- 0
+            run.best_rung <- 0
+            run.message_kind <- MESSAGE_GRADE
+            clear_arrays(run)
+            next_trial(run, now_ms)
+
+    def settle(run: mutable Run&, now_ms: i64):
+        can Abort.Panic:
+            original_rung: i64 = run.rung
+            elapsed: mutable i64 = now_ms - run.started_at_ms
+            elapsed <- 0 if elapsed < 0
+            run.taken_seconds <- elapsed / 1000
+            run.solved_count <- run.solved_count + 1
+            run.total_par <- run.total_par + run.minimum
+            run.total_steps <- run.total_steps + run.steps
+            run.best_rung <- original_rung if original_rung > run.best_rung
+            run.verdict <- 1 if run.steps <= run.minimum else 0
+            if run.adaptive:
+                if run.steps * 4 <= run.minimum * 5:
+                    run.rung <- clamp_rung(run.rung + 1)
+                elif run.steps > run.minimum * 2:
+                    run.rung <- clamp_rung(run.rung - 1)
+            run.phase <- PHASE_SOLVED
+
+    def step(run: mutable Run&, action: i64, now_ms: i64):
+        can Abort.Panic:
+            return if run.phase != PHASE_WALKING
+            direction: i64 = action - ACTION_UP
+            dx: i64 = 0 if direction < 2 else (-1 if direction == 2 else 1)
+            dy: i64 = -1 if direction == 0 else (1 if direction == 1 else 0)
+            x: i64 = run.walker % run.width
+            y: i64 = run.walker / run.width
+            nx: i64 = x + dx
+            ny: i64 = y + dy
+            return if nx < 0 or nx >= run.width or ny < 0 or ny >= run.height
+            ahead: i64 = ny * run.width + nx
+            return if run.walls[ahead.usize()] == 1
+            colour: i64 = door_at(run, ahead)
+            if colour >= 0 and ((run.held >> colour) & 1) == 0:
+                run.message_kind <- MESSAGE_LOCKED
+                return
+            run.walker <- ahead
+            run.steps <- run.steps + 1
+            run.walked[ahead.usize()] <- 1
+            take_key(run)
+            if run.walker == run.way_out:
+                settle(run, now_ms)
+
+    def restart(run: mutable Run&):
+        can Abort.Panic:
+            return if run.phase != PHASE_WALKING
+            reset_walk(run)
+            run.message_kind <- MESSAGE_RESTART
+
+    def apply(run: mutable Run&, action: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                if run.phase == PHASE_READY or run.phase == PHASE_DONE:
+                    start_run(run, now_ms)
+                    return 1
+                elif run.phase == PHASE_SOLVED:
+                    next_trial(run, now_ms)
+                    return 1
+                return 2
+            if action >= ACTION_UP and action <= ACTION_RIGHT:
+                return 2 if run.phase != PHASE_WALKING
+                step(run, action, now_ms)
+                return 1
+            if action == ACTION_RESTART:
+                return 2 if run.phase != PHASE_WALKING
+                restart(run)
+                return 1
+            return -6
+
+    def efficiency(run: Run&) -> i64:
+        can Abort.Panic:
+            return 0 if run.total_steps <= 0
+            return py_round_half_even(100.0 * run.total_par.f64() / run.total_steps.f64())
+
+    def info(run: Run&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_RUNG: return run.rung
+            if field == INFO_TRIAL: return run.trial
+            if field == INFO_TOTAL_TRIALS: return run.total_trials
+            if field == INFO_WALKER: return run.walker
+            if field == INFO_STEPS: return run.steps
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_WIDTH: return run.width
+            if field == INFO_HEIGHT: return run.height
+            if field == INFO_START: return run.start
+            if field == INFO_WAY_OUT: return run.way_out
+            if field == INFO_DOOR_COUNT: return run.door_count
+            if field == INFO_HELD: return run.held
+            if field == INFO_MINIMUM: return run.minimum
+            if field == INFO_GREEDY: return run.greedy
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_SHOW_TRAIL: return 1 if run.show_trail else 0
+            if field == INFO_SOLVED_COUNT: return run.solved_count
+            if field == INFO_TOTAL_PAR: return run.total_par
+            if field == INFO_TOTAL_STEPS: return run.total_steps
+            if field == INFO_BEST_RUNG: return run.best_rung
+            if field == INFO_TAKEN_SECONDS: return run.taken_seconds
+            if field == INFO_MESSAGE: return run.message_kind
+            return -1
+
+    def cell(run: Run&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return 0 if at < 0 or at >= run.cells
+            if field == CELL_WALL: return run.walls[at.usize()]
+            if field == CELL_WALKED: return run.walked[at.usize()]
+            if field == CELL_DOOR:
+                colour: i64 = door_at(run, at)
+                return 0 if colour < 0 else colour + 1
+            colour: mutable i64 = 0
+            while colour < run.door_count and colour < MAX_DOORS |colour, run, at|:
+                return colour + 1 if run.keys[colour.usize()] == at
+                colour <- colour + 1
+            return 0
+
+    def grade_name(rung: i64) -> sview:
+        return sview("first steps", 0, -1) if rung == 1
+        return sview("the long way", 0, -1) if rung == 2
+        return sview("one door", 0, -1) if rung == 3
+        return sview("two doors", 0, -1) if rung == 4
+        return sview("crossroads", 0, -1) if rung == 5
+        return sview("three doors", 0, -1) if rung == 6
+        return sview("the warren", 0, -1) if rung == 7
+        return sview("four doors", 0, -1) if rung == 8
+        return sview("the gauntlet", 0, -1) if rung == 9
+        return sview("five doors", 0, -1) if rung == 10
+        return sview("the labyrinth", 0, -1) if rung == 11
+        return sview("six doors", 0, -1) if rung == 12
+        return sview("nightmare", 0, -1) if rung == 13
+        return sview("inhuman", 0, -1) if rung == 14
+        return sview("superhuman", 0, -1)
+
+    def append_grade_text(out: mutable dstr&, run: Run&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_sview(out, grade_name(run.rung))
+            if run.door_count > 0:
+                dstr_append_cstr(out, " — ")
+                dstr_append_i64(out, run.door_count)
+                dstr_append_cstr(out, " doors, ")
+                dstr_append_i64(out, run.minimum)
+                dstr_append_cstr(out, " steps at best")
+            else:
+                dstr_append_cstr(out, " — ")
+                dstr_append_i64(out, run.minimum)
+                dstr_append_cstr(out, " steps at best")
+
+    def render(run: Run&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            walls: mutable darray[i64] = []
+            walked: mutable darray[i64] = []
+            doors: mutable darray[i64] = []
+            keys: mutable darray[i64] = []
+            cell_index: mutable i64 = 0
+            while cell_index < run.cells |cell_index, run, walls, walked|:
+                if run.walls[cell_index.usize()] != 0:
+                    walls.push(cell_index)
+                if run.walked[cell_index.usize()] != 0:
+                    walked.push(cell_index)
+                cell_index <- cell_index + 1
+            colour: mutable i64 = 0
+            while colour < run.door_count and colour < MAX_DOORS |colour, run, doors, keys|:
+                doors.push(run.doors[colour.usize()])
+                keys.push(run.keys[colour.usize()])
+                colour <- colour + 1
+
+            sx: f64 = width / Display::REFERENCE_WIDTH
+            sy: f64 = height / Display::REFERENCE_HEIGHT
+            paint: SceneMaze::Paint = SceneMaze::paint_of(
+                black_background, width, height, sx, sy)
+            message: mutable dstr = []
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(&message, "Press Space to start")
+            elif run.phase == PHASE_UNAVAILABLE:
+                dstr_append_cstr(&message, "Maze unavailable")
+            elif run.phase == PHASE_DONE:
+                dstr_append_i64(&message, run.solved_count)
+                dstr_append_cstr(&message, " mazes, ")
+                dstr_append_i64(&message, efficiency(run))
+                dstr_append_cstr(&message, "% step efficiency, highest rung ")
+                dstr_append_i64(&message, run.best_rung)
+            elif run.phase == PHASE_SOLVED:
+                if run.steps <= run.minimum:
+                    dstr_append_cstr(&message, "Perfect — the minimum ")
+                    dstr_append_i64(&message, run.minimum)
+                    dstr_append_cstr(&message, " steps, ")
+                    dstr_append_i64(&message, run.taken_seconds)
+                    dstr_append_cstr(&message, "s")
+                else:
+                    dstr_append_cstr(&message, "Out in ")
+                    dstr_append_i64(&message, run.steps)
+                    dstr_append_cstr(&message, " steps — the minimum was ")
+                    dstr_append_i64(&message, run.minimum)
+            elif run.message_kind == MESSAGE_LOCKED:
+                dstr_append_cstr(&message, "Locked — that door needs its key")
+            elif run.message_kind == MESSAGE_RESTART:
+                dstr_append_cstr(&message, "Back to the start")
+            else:
+                append_grade_text(&message, run)
+
+            SceneMaze::render(list, &paint, run.phase, run.phase == PHASE_WALKING or run.phase == PHASE_SOLVED,
+                run.width, run.height, &walls, &walked, run.show_trail, run.way_out,
+                &doors, &keys, run.held, run.walker, run.steps, run.trial,
+                run.total_trials, bytes_view(message), run.verdict, bytes_view(message))

@@ -156,7 +156,7 @@ module Go:
         return x >= 0 and x < size and y >= 0 and y < size
 
     # Scratch for one problem run, sized once from the largest board.
-    struct Work:
+    struct GoWork:
         size: mutable i64
         cells: mutable i64
         board: mutable darray[i64]
@@ -185,9 +185,9 @@ module Go:
         move_count: mutable darray[i64]
         move_n: mutable i64
 
-    def Work() -> Work:
+    def GoWork() -> GoWork:
         can Memory.Allocate, Abort.Panic:
-            work: mutable Work = zeroed
+            work: mutable GoWork = zeroed
             work.board <- Ints::zeros(MOST_CELLS)
             work.scratch_board <- Ints::zeros(MOST_CELLS)
             work.seen <- Ints::zeros(MOST_CELLS)
@@ -216,7 +216,7 @@ module Go:
     # `work.group_cells` as encoded points. The reference uses a STACK (`todo.pop()`),
     # but the result is a set that is only counted or written through uniformly, so
     # the visit order is not observable and neither is this one's.
-    def group(work: mutable Work&, board: mutable darray[i64]&, x: i64, y: i64) -> i64:
+    def group(work: mutable GoWork&, board: mutable darray[i64]&, x: i64, y: i64) -> i64:
         can Abort.Panic:
             work.group_n <- 0
             0 return if not on_board(work.size, x, y)
@@ -249,7 +249,7 @@ module Go:
 
     # Does the group currently in `work.group_cells` have a liberty? The reference
     # builds the whole set and tests it for emptiness, so only the answer matters.
-    def group_has_liberty(work: Work&, board: mutable darray[i64]&) -> bool:
+    def group_has_liberty(work: GoWork&, board: mutable darray[i64]&) -> bool:
         can Abort.Panic:
             index: mutable i64 = 0
             found: mutable bool = false
@@ -272,7 +272,7 @@ module Go:
     # Ko is irrelevant to these static one-move positions; occupancy, captures and
     # suicide use normal rules. Captured stones are cleared in whatever order the
     # group walk found them -- every one becomes 0, so the order cannot show.
-    def play(work: mutable Work&, board: mutable darray[i64]&, x: i64, y: i64, colour: i64, out: mutable darray[i64]&) -> bool:
+    def play(work: mutable GoWork&, board: mutable darray[i64]&, x: i64, y: i64, colour: i64, out: mutable darray[i64]&) -> bool:
         can Abort.Panic:
             false return if colour != 1 and colour != 2
             false return if not on_board(work.size, x, y)
@@ -304,7 +304,7 @@ module Go:
             _ = group(work, out, x, y)
             return group_has_liberty(work, out)
 
-    def stone_count(work: Work&, board: mutable darray[i64]&, colour: i64) -> i64:
+    def stone_count(work: GoWork&, board: mutable darray[i64]&, colour: i64) -> i64:
         can Abort.Panic:
             total: mutable i64 = 0
             cell: mutable i64 = 0
@@ -316,7 +316,7 @@ module Go:
     # Every legal capturing move, with how many stones it removes, in ROW-MAJOR
     # order -- the reference walks `enumerate(board)` and its dict keeps that
     # insertion order, which `best_moves` below then compares as a list.
-    def capture_moves(work: mutable Work&, board: mutable darray[i64]&, colour: i64) -> i64:
+    def capture_moves(work: mutable GoWork&, board: mutable darray[i64]&, colour: i64) -> i64:
         can Memory.Allocate, Abort.Panic:
             before: i64 = stone_count(work, board, 3 - colour)
             work.move_n <- 0
@@ -338,7 +338,7 @@ module Go:
             return work.move_n
 
     # Whether every stone belongs to a group with at least one liberty.
-    def legal_position(work: mutable Work&, board: mutable darray[i64]&) -> bool:
+    def legal_position(work: mutable GoWork&, board: mutable darray[i64]&) -> bool:
         can Abort.Panic:
             work.seen_gen <- work.seen_gen + 1
             outer: i64 = work.seen_gen
@@ -353,6 +353,134 @@ module Go:
                 scan <- scan + 1
             return legal
 
+    # These board-bound variants deliberately do not accept a separate `board`
+    # reference. The caller owns `work.board`, so passing both `&work` and
+    # `&work.board` to a mutable function would be an overlapping borrow. The
+    # newest Stage1 compiler correctly rejects that shape; keeping the board
+    # access inside the helper preserves the same algorithm without weakening
+    # the alias rule.
+    def group_work_board(work: mutable GoWork&, x: i64, y: i64) -> i64:
+        can Abort.Panic:
+            work.group_n <- 0
+            0 return if not on_board(work.size, x, y)
+            colour: i64 = Ints::at(work.board, y * work.size + x)
+            0 return if colour != 1 and colour != 2
+            work.seen_gen <- work.seen_gen + 1
+            stamp: i64 = work.seen_gen
+            Ints::put(&work.seen, y * work.size + x, stamp)
+            Ints::put(&work.visit_stack, 0, y * work.size + x)
+            depth: mutable i64 = 1
+            while depth > 0 |depth, work, colour, stamp|:
+                depth <- depth - 1
+                cell: i64 = Ints::at(work.visit_stack, depth)
+                Ints::put(&work.group_cells, work.group_n, cell)
+                work.group_n <- work.group_n + 1
+                cx: i64 = cell % work.size
+                cy: i64 = cell / work.size
+                probe: mutable i64 = 0
+                while probe < 4 |probe, cx, cy, work, colour, stamp, depth|:
+                    nx: i64 = neighbour_x(cx, probe)
+                    ny: i64 = neighbour_y(cy, probe)
+                    if on_board(work.size, nx, ny):
+                        slot: i64 = ny * work.size + nx
+                        if Ints::at(work.seen, slot) != stamp and Ints::at(work.board, ny * work.size + nx) == colour:
+                            Ints::put(&work.seen, slot, stamp)
+                            Ints::put(&work.visit_stack, depth, slot)
+                            depth <- depth + 1
+                    probe <- probe + 1
+            return work.group_n
+
+    def group_has_liberty_work_board(work: GoWork&) -> bool:
+        can Abort.Panic:
+            index: mutable i64 = 0
+            found: mutable bool = false
+            while index < work.group_n and not found |index, work, found|:
+                cell: i64 = Ints::at(work.group_cells, index)
+                cx: i64 = cell % work.size
+                cy: i64 = cell / work.size
+                probe: mutable i64 = 0
+                while probe < 4 and not found |probe, cx, cy, work, found|:
+                    nx: i64 = neighbour_x(cx, probe)
+                    ny: i64 = neighbour_y(cy, probe)
+                    if on_board(work.size, nx, ny):
+                        found <- true if Ints::at(work.board, ny * work.size + nx) == 0
+                    probe <- probe + 1
+                index <- index + 1
+            return found
+
+    def play_work_board(work: mutable GoWork&, x: i64, y: i64,
+                        colour: i64, out: mutable darray[i64]&) -> bool:
+        can Abort.Panic:
+            false return if colour != 1 and colour != 2
+            false return if not on_board(work.size, x, y)
+            false return if Ints::at(work.board, y * work.size + x) != 0
+            copy: mutable i64 = 0
+            while copy < work.cells |copy, work, out|:
+                Ints::put(out, copy, Ints::at(work.board, copy))
+                copy <- copy + 1
+            stone_set(out, work.size, x, y, colour)
+            opponent: i64 = 3 - colour
+            probe: mutable i64 = 0
+            while probe < 4 |probe, x, y, work, out, opponent|:
+                nx: i64 = neighbour_x(x, probe)
+                ny: i64 = neighbour_y(y, probe)
+                if on_board(work.size, nx, ny) and stone_at(out, work.size, nx, ny) == opponent:
+                    _ = group(work, out, nx, ny)
+                    if not group_has_liberty(work, out):
+                        index: mutable i64 = 0
+                        while index < work.group_n |index, work, out|:
+                            cell: i64 = Ints::at(work.group_cells, index)
+                            Ints::put(out, cell, 0)
+                            index <- index + 1
+                probe <- probe + 1
+            _ = group(work, out, x, y)
+            return group_has_liberty(work, out)
+
+    def stone_count_work_board(work: GoWork&, colour: i64) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            cell: mutable i64 = 0
+            while cell < work.cells |cell, work, colour, total|:
+                total <- total + 1 if Ints::at(work.board, cell) == colour
+                cell <- cell + 1
+            return total
+
+    def capture_moves_work_board(work: mutable GoWork&, colour: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            before: i64 = stone_count_work_board(work, 3 - colour)
+            work.move_n <- 0
+            after: mutable darray[i64] = Ints::zeros(MOST_CELLS)
+            y: mutable i64 = 0
+            while y < work.size |y, work, colour, before, after|:
+                x: mutable i64 = 0
+                while x < work.size |x, y, work, colour, before, after|:
+                    if Ints::at(work.board, y * work.size + x) == 0:
+                        if play_work_board(work, x, y, colour, &after):
+                            captured: i64 = before - stone_count(work, &after, 3 - colour)
+                            if captured > 0:
+                                Ints::put(&work.move_x, work.move_n, x)
+                                Ints::put(&work.move_y, work.move_n, y)
+                                Ints::put(&work.move_count, work.move_n, captured)
+                                work.move_n <- work.move_n + 1
+                    x <- x + 1
+                y <- y + 1
+            return work.move_n
+
+    def legal_position_work_board(work: mutable GoWork&) -> bool:
+        can Abort.Panic:
+            work.seen_gen <- work.seen_gen + 1
+            outer: i64 = work.seen_gen
+            scan: mutable i64 = 0
+            legal: mutable bool = true
+            while scan < work.cells and legal |scan, work, outer, legal|:
+                if Ints::at(work.board, scan) != 0:
+                    sx: i64 = scan % work.size
+                    sy: i64 = scan / work.size
+                    _ = group_work_board(work, sx, sy)
+                    legal <- group_has_liberty_work_board(work)
+                scan <- scan + 1
+            return legal
+
     # A compact but irregular connected polyomino, grown from a random seed point.
     #
     # Each step scores every frontier point by how many of its neighbours are
@@ -364,7 +492,7 @@ module Go:
     # `max(scored)` compares (score, point) TUPLES, so an exact score tie falls
     # through to comparing the points -- effectively impossible with the noise, but
     # the tie-break is `(x, y)` ascending if it ever happens.
-    def grown_shape(work: mutable Work&, amount: i64, rng: mutable MT19937&) -> i64:
+    def grown_shape(work: mutable GoWork&, amount: i64, rng: mutable MT19937&) -> i64:
         can Memory.Allocate, Abort.Panic:
             size: i64 = work.size
             start_x: i64 = py_randrange(rng, 0, size)
@@ -453,7 +581,7 @@ module Go:
     # there is no ascending shortcut -- hence PyPoint.
     #
     # Returns the liberty's cell, or -1 when 700 tries found no room.
-    def place_atari_group(work: mutable Work&, amount: i64, rng: mutable MT19937&, target_out: mutable darray[i64]&) -> i64:
+    def place_atari_group(work: mutable GoWork&, amount: i64, rng: mutable MT19937&, target_out: mutable darray[i64]&) -> i64:
         can Memory.Allocate, Abort.Panic:
             size: i64 = work.size
             boundary: mutable PyPoint::PointTable = PyPoint::new(MOST_CELLS)
@@ -542,7 +670,7 @@ module Go:
 
     # Scatter isolated stones, so the board is busy without merging two sized
     # candidates. `choices` is a list comprehension over the grid, shuffled.
-    def add_clutter(work: mutable Work&, density: f64, rng: mutable MT19937&):
+    def add_clutter(work: mutable GoWork&, density: f64, rng: mutable MT19937&):
         can Memory.Allocate, Abort.Panic:
             size: i64 = work.size
             wanted: i64 = (size.f64() * size.f64() * density).i64()
@@ -578,7 +706,7 @@ module Go:
 
     # One fully validated problem. `found` is false only when 300 attempts all
     # failed, which is the reference's RuntimeError.
-    struct Problem:
+    struct GoProblem:
         size: mutable i64
         board: mutable darray[i64]
         target: mutable darray[i64]
@@ -590,7 +718,7 @@ module Go:
         show_move: mutable bool
         found: mutable bool
 
-    def generate_problem(seed: i64, difficulty: i64) -> Problem:
+    def generate_problem(seed: i64, difficulty: i64) -> GoProblem:
         can Memory.Allocate, Abort.Panic:
             level: mutable i64 = difficulty
             level <- 1 if level < 1
@@ -598,10 +726,10 @@ module Go:
             profile: Difficulty = difficulty_of(level)
             rng: mutable MT19937 = mt19937_new()
             mt_seed_int(&rng, seed.u64())
-            work: mutable Work = Work()
+            work: mutable GoWork = GoWork()
             work.size <- profile.size
             work.cells <- profile.size * profile.size
-            problem: mutable Problem = zeroed
+            problem: mutable GoProblem = zeroed
             problem.board <- Ints::zeros(MOST_CELLS)
             problem.target <- Ints::zeros(MOST_CELLS)
             problem.size <- profile.size
@@ -634,8 +762,8 @@ module Go:
                     candidate <- candidate + 1
                 if complete:
                     add_clutter(&work, profile.clutter, &rng)
-                    if legal_position(&work, &work.board):
-                        _ = capture_moves(&work, &work.board, 1)
+                    if legal_position_work_board(&work):
+                        _ = capture_moves_work_board(&work, 1)
                         # `captures.get(winning)`, the single best, and how many
                         # points reach it -- the reference's four accept tests.
                         at_winning: mutable i64 = -1

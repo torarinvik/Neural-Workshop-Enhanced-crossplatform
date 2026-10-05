@@ -1,0 +1,272 @@
+diff --git a/src/engine/engine_solver.c b/src/engine/engine_solver.c
+index 6de5970..629445d 100644
+--- a/src/engine/engine_solver.c
++++ b/src/engine/engine_solver.c
+@@ -310,10 +310,13 @@ static void residual(const mjModel* m, const mjData* d, mjtNum* res, int i, int
+ }
+ 
+ 
++#include "engine/marble_qcqp_trace.h"
++
+ // compute cost change
+ static mjtNum costChange(const mjtNum* A, mjtNum* force, const mjtNum* oldforce,
+-                         const mjtNum* res, int dim) {
++                         const mjtNum* res, int dim, int* restored) {
+   mjtNum change;
++  if (restored) *restored = 0;
+ 
+   // compute change
+   if (dim == 1) {
+@@ -327,6 +330,7 @@ static mjtNum costChange(const mjtNum* A, mjtNum* force, const mjtNum* oldforce,
+ 
+   // positive change: restore force
+   if (change > 1e-10) {
++    if (restored) *restored = 1;
+     mju_copy(force, oldforce, dim);
+     change = 0;
+   }
+@@ -498,7 +502,8 @@ static void projectEllipsoid(mjtNum* friction, mjtNum normal, const mjtNum* mu,
+ 
+ // solve QCQP and project onto friction ellipsoid, write to force[i+1..i+dim-1]
+ static void solveQCQP(mjtNum* force, int i, int dim,
+-                      mjtNum* Ac, mjtNum* bc, const mjtNum* mu) {
++                      mjtNum* Ac, mjtNum* bc, const mjtNum* mu,
++                      marbleQCQPWitness* witness) {
+   int flg_active;
+   mjtNum v[6];
+ 
+@@ -511,12 +516,21 @@ static void solveQCQP(mjtNum* force, int i, int dim,
+     flg_active = mju_QCQP(v, Ac, bc, mu, force[i], dim-1);
+   }
+ 
++  if (witness) {
++    witness->active = flg_active;
++    mju_copy(witness->raw, v, dim-1);
++  }
++
+   // on constraint: put v on ellipsoid, in case QCQP is approximate
+   if (flg_active) {
+     projectEllipsoid(v, force[i], mu, dim, /*feasible=*/0);
+   }
+ 
+   // assign
++  if (witness) {
++    mju_copy(witness->projected, v, dim-1);
++    witness->valid = 3;
++  }
+   mju_copy(force+i+1, v, dim-1);
+ }
+ 
+@@ -770,7 +784,7 @@ static void solPGS(const mjModel* m, mjData* d, int island,
+ 
+         // QCQP
+         else {
+-          solveQCQP(force, i, dim, Ac, bc, mu);
++          solveQCQP(force, i, dim, Ac, bc, mu, NULL);
+         }
+       }
+ 
+@@ -778,7 +792,7 @@ static void solPGS(const mjModel* m, mjData* d, int island,
+       if (dim == 1) {
+         Athis[0] = 1/ARinv[c];
+       }
+-      improvement -= costChange(Athis, force+i, oldforce, res, dim);
++      improvement -= costChange(Athis, force+i, oldforce, res, dim, NULL);
+     }
+ 
+     // update constraint state
+@@ -1046,7 +1060,7 @@ static void solNoSlip(const mjModel* m, mjData* d, int island,
+           }
+ 
+           // accumulate improvement
+-          improvement -= costChange(Ac, force+j, oldforce, res, 2);
++          improvement -= costChange(Ac, force+j, oldforce, res, 2, NULL);
+         }
+ 
+         // skip the rest of this contact
+@@ -1073,6 +1087,9 @@ static void solNoSlip(const mjModel* m, mjData* d, int island,
+           bc[j] -= mju_dot(Ac+j*(dim-1), oldforce, dim-1);
+         }
+ 
++        marbleQCQPWitness qcqp_witness = {0};
++        int force_restored = 0;
++
+         // guard for f_normal==0
+         if (force[i] < mjMINVAL) {
+           mju_zero(force+i+1, dim-1);
+@@ -1080,13 +1097,17 @@ static void solNoSlip(const mjModel* m, mjData* d, int island,
+ 
+         // QCQP
+         else {
+-          solveQCQP(force, i, dim, Ac, bc, mu);
++          solveQCQP(force, i, dim, Ac, bc, mu,
++                    marble_qcqp_trace_enabled ? &qcqp_witness : NULL);
+         }
+ 
+         // accumulate improvement and retain the actual per-contact return
+         // value so it can be compared independently of iteration reduction.
+-        mjtNum contact_change = costChange(Ac, force+i+1, oldforce, res, dim-1);
++        mjtNum contact_change = costChange(Ac, force+i+1, oldforce, res, dim-1,
++            marble_qcqp_trace_enabled ? &force_restored : NULL);
+         improvement -= contact_change;
++        marbleRecordQCQP(d, island, iter, i, dim, mu, Ac, bc, oldforce, res,
++                         &qcqp_witness, force_restored, contact_change);
+         marbleRecordNoSlipContact(d, island, iter, i, dim, force[i],
+                                   mu, res, oldforce, Ac, bc, contact_change);
+ 
+@@ -1623,6 +1644,10 @@ static void marbleRecordSparseInput(const mjPrimalContext* ctx) {
+ }
+ 
+ MJAPI void mj_solver_trace_reset(void) {
++  marble_qcqp_trace_size = 0;
++  marble_qcqp_trace_calls = 0;
++  marble_qcqp_trace_overflow = 0;
++  marble_qcqp_trace_invalid = 0;
+   marble_newton_trace_count = 0;
+   marble_newton_trace_value_count = 0;
+   marble_newton_eval_count = 0;
+@@ -1841,6 +1866,7 @@ MJAPI void mj_solver_trace_copy(mjtNum* output) {
+ 
+ MJAPI void mj_solver_trace_run(const mjModel* model, mjData* data) {
+   mj_solver_trace_reset();
++  marble_qcqp_trace_enabled = 1;
+   mj_solver_prepare_trace_begin();
+   mj_solver_eval_trace_begin();
+   extern void mj_constraint_update_trace_begin(void);
+@@ -1855,6 +1881,7 @@ MJAPI void mj_solver_trace_run(const mjModel* model, mjData* data) {
+   mj_constraint_update_trace_end();
+   mj_solver_prepare_trace_end();
+   mj_solver_eval_trace_end();
++  marble_qcqp_trace_enabled = 0;
+ }
+ 
+ static void marbleRecordNewtonState(const mjPrimalContext* ctx, int label,
+diff --git a/wasm/codegen/generated/bindings.cc b/wasm/codegen/generated/bindings.cc
+index 2a50bc1..21592c3 100644
+--- a/wasm/codegen/generated/bindings.cc
++++ b/wasm/codegen/generated/bindings.cc
+@@ -38,6 +38,12 @@ extern "C" int mj_noslip_step_trace_size();
+ extern "C" void mj_noslip_step_trace_copy(mjtNum*);
+ extern "C" int mj_noslip_contact_trace_size();
+ extern "C" void mj_noslip_contact_trace_copy(mjtNum*);
++extern "C" int mj_solver_qcqp_trace_schema();
++extern "C" int mj_solver_qcqp_trace_size();
++extern "C" int mj_solver_qcqp_trace_calls();
++extern "C" int mj_solver_qcqp_trace_overflow();
++extern "C" int mj_solver_qcqp_trace_invalid();
++extern "C" void mj_solver_qcqp_trace_copy(mjtNum*);
+ extern "C" int mj_noslip_input_trace_size();
+ extern "C" void mj_noslip_input_trace_copy(mjtNum*);
+ extern "C" int mj_solver_sparse_input_size();
+@@ -2192,6 +2198,16 @@ val marble_newton_trace_wrapper(const MjModel& m, MjData& d) {
+     noslip_contact_values.set(i, noslip_contact_trace[i]);
+   }
+   output.set("noSlipContactTrace", noslip_contact_values);
++  const int qcqp_size = mj_solver_qcqp_trace_size();
++  std::vector<mjtNum> qcqp_trace(qcqp_size);
++  mj_solver_qcqp_trace_copy(qcqp_trace.data());
++  val qcqp_values = val::array();
++  for (int i = 0; i < qcqp_size; ++i) qcqp_values.set(i, qcqp_trace[i]);
++  output.set("qcqpTrace", qcqp_values);
++  output.set("qcqpTraceSchema", mj_solver_qcqp_trace_schema());
++  output.set("qcqpTraceCalls", mj_solver_qcqp_trace_calls());
++  output.set("qcqpTraceOverflow", static_cast<bool>(mj_solver_qcqp_trace_overflow()));
++  output.set("qcqpTraceInvalid", static_cast<bool>(mj_solver_qcqp_trace_invalid()));
+   const int residual_input_size = mj_noslip_input_trace_size();
+   std::vector<mjtNum> residual_input(residual_input_size);
+   mj_noslip_input_trace_copy(residual_input.data());
+diff --git a/src/engine/marble_qcqp_trace.h b/src/engine/marble_qcqp_trace.h
+new file mode 100644
+index 0000000..27e668a
+--- /dev/null
++++ b/src/engine/marble_qcqp_trace.h
+@@ -0,0 +1,89 @@
++// Private initialized no-slip diagnostics. Never a production arithmetic patch.
++#ifndef MARBLE_QCQP_TRACE_H_
++#define MARBLE_QCQP_TRACE_H_
++
++#define MARBLE_QCQP_TRACE_CAPACITY 300000
++typedef struct {
++  int valid;
++  int active;
++  mjtNum raw[5];
++  mjtNum projected[5];
++} marbleQCQPWitness;
++
++static mjtNum marble_qcqp_trace[MARBLE_QCQP_TRACE_CAPACITY];
++static int marble_qcqp_trace_size;
++static int marble_qcqp_trace_calls;
++static int marble_qcqp_trace_overflow;
++static int marble_qcqp_trace_invalid;
++static int marble_qcqp_trace_enabled;
++
++MJAPI int mj_solver_qcqp_trace_schema(void) { return 1; }
++MJAPI int mj_solver_qcqp_trace_size(void) { return marble_qcqp_trace_size; }
++MJAPI int mj_solver_qcqp_trace_calls(void) { return marble_qcqp_trace_calls; }
++MJAPI int mj_solver_qcqp_trace_overflow(void) { return marble_qcqp_trace_overflow; }
++MJAPI int mj_solver_qcqp_trace_invalid(void) { return marble_qcqp_trace_invalid; }
++MJAPI void mj_solver_qcqp_trace_copy(mjtNum* output) {
++  if (output && marble_qcqp_trace_size) {
++    memcpy(output, marble_qcqp_trace,
++           (size_t)marble_qcqp_trace_size * sizeof(mjtNum));
++  }
++}
++
++static void marbleRecordQCQP(const mjData* d, int island, int iteration,
++                            int row, int dim, const mjtNum* mu,
++                            const mjtNum* Ac, const mjtNum* bc,
++                            const mjtNum* oldforce, const mjtNum* residual,
++                            const marbleQCQPWitness* witness,
++                            int restored, mjtNum costchange) {
++  if (!marble_qcqp_trace_enabled) return;
++  int ordinal = marble_qcqp_trace_calls++;
++  if ((dim != 3 && dim != 4 && dim != 6) || row < 0 ||
++      row + dim > d->nefc || d->efc_id[row] < 0 ||
++      d->efc_id[row] >= d->ncon || (witness->valid != 0 && witness->valid != 3)) {
++    marble_qcqp_trace_invalid = 1;
++    return;
++  }
++  int n = dim - 1;
++  int valid = witness->valid | 4;  // raw=1, post-projection=2, retained=4
++  int width = 14 + n*n + (valid == 7 ? 7 : 5)*n;
++  if (marble_qcqp_trace_size + width > MARBLE_QCQP_TRACE_CAPACITY) {
++    marble_qcqp_trace_overflow = 1;
++    return;
++  }
++  mjtNum* out = marble_qcqp_trace + marble_qcqp_trace_size;
++  int offset = 0;
++  out[offset++] = 1;
++  out[offset++] = ordinal;
++  out[offset++] = island;
++  out[offset++] = iteration;
++  out[offset++] = row;
++  out[offset++] = d->efc_id[row];
++  out[offset++] = dim;
++  out[offset++] = witness->valid ? n : 0;
++  out[offset++] = valid;
++  out[offset++] = witness->valid ? witness->active : -1;
++  out[offset++] = witness->valid ? !!witness->active : 0;
++  out[offset++] = restored;
++  out[offset++] = costchange;
++  out[offset++] = d->efc_force[row];
++  for (int j = 0; j < n; ++j) out[offset++] = mu[j];
++  for (int j = 0; j < n*n; ++j) out[offset++] = Ac[j];
++  for (int j = 0; j < n; ++j) out[offset++] = bc[j];
++  for (int j = 0; j < n; ++j) out[offset++] = oldforce[j];
++  for (int j = 0; j < n; ++j) out[offset++] = residual[j];
++  if (valid & 1) {
++    for (int j = 0; j < n; ++j) out[offset++] = witness->raw[j];
++  }
++  if (valid & 2) {
++    for (int j = 0; j < n; ++j) out[offset++] = witness->projected[j];
++  }
++  for (int j = 0; j < n; ++j) out[offset++] = d->efc_force[row+1+j];
++  for (int j = 0; j < width; ++j) {
++    if (!isfinite(out[j])) {
++      marble_qcqp_trace_invalid = 1;
++      return;
++    }
++  }
++  marble_qcqp_trace_size += width;
++}
++#endif

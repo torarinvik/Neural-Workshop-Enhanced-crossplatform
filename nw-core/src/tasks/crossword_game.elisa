@@ -1,0 +1,221 @@
+# Stateful common-v1 Crossword controller. The deal and slot topology come
+# from Crossword::deal_one; the ABI record stores only fixed-size display and
+# input state so no arena-backed source darray crosses a call boundary.
+module CrosswordGame:
+    const TASK_ID: i64 = 1085963879
+    const MAX_CELLS: i64 = 169
+    const MAX_SLOTS: i64 = 192
+    const MAX_SLOT_CELLS: i64 = 338
+    const READY: i64 = 0
+    const SOLVING: i64 = 1
+    const SOLVED: i64 = 2
+    const DONE: i64 = 3
+    const START: i64 = 0
+    const SUBMIT: i64 = 1
+    const LEFT: i64 = 2
+    const RIGHT: i64 = 3
+    const UP: i64 = 4
+    const DOWN: i64 = 5
+    const TOGGLE: i64 = 6
+    const WRITE: i64 = 7
+    const BACKSPACE: i64 = 8
+
+    struct Run:
+        rng: mutable MT19937
+        rung: mutable i64
+        trials: mutable i64
+        trial: mutable i64
+        right: mutable i64
+        phase: mutable i64
+        verdict: mutable i64
+        size: mutable i64
+        cursor: mutable i64
+        down: mutable bool
+        slots: mutable i64
+        solution: mutable i64[MAX_CELLS]
+        filled: mutable i64[MAX_CELLS]
+        givens: mutable bool[MAX_CELLS]
+        slot_number: mutable i64[MAX_SLOTS]
+        slot_down: mutable bool[MAX_SLOTS]
+        slot_first: mutable i64[MAX_SLOTS]
+        slot_length: mutable i64[MAX_SLOTS]
+
+    def allowed_rung(value: i64) -> bool:
+        return value >= 1 and value <= Crossword::GRADE_COUNT
+    def allowed_trials(value: i64) -> bool:
+        return value >= 1 and value <= 100
+
+    def clear(run: mutable Run&):
+        can Abort.Panic:
+            run.size <- 0
+            run.cursor <- 0
+            run.down <- false
+            run.slots <- 0
+            for cell in 0..<MAX_CELLS |cell, run|:
+                run.solution[cell.usize()] <- 0
+                run.filled[cell.usize()] <- 0
+                run.givens[cell.usize()] <- false
+            for slot in 0..<MAX_SLOTS |slot, run|:
+                run.slot_number[slot.usize()] <- 0
+                run.slot_down[slot.usize()] <- false
+                run.slot_first[slot.usize()] <- 0
+                run.slot_length[slot.usize()] <- 0
+
+    def build_lexicon(lex: mutable Crossword::Lexicon&):
+        can Abort.Panic:
+            # A minimal source-compatible corpus that can fill the junior
+            # four-square rung. The controller deliberately exercises the
+            # production index/fill/deal path; the full ranked corpus remains
+            # a separate data-integration requirement.
+            lex.count <- 2
+            words: mutable darray[i64] = [0, 0, 0, 0, 0, 0, 0]
+            lengths: mutable darray[i64] = [3, 4]
+            at: mutable i64 = 0
+            for word in 0..<2 |word, lex, words, lengths, at|:
+                Ints::put(&lex.start, word, at)
+                Ints::put(&lex.length, word, Ints::at_ref(&lengths, word))
+                Ints::put(&lex.rank, word, word + 1)
+                Ints::put(&lex.clue, word, 0)
+                for letter in 0..<Ints::at_ref(&lengths, word) |letter, lex, words, at, word|:
+                    Ints::put(&lex.letter, at + letter, Ints::at_ref(&words, at + letter))
+                at <- at + Ints::at_ref(&lengths, word)
+            Crossword::index_lexicon(lex)
+
+    def deal(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            region work(67108864):
+                in work:
+                    puzzle: mutable Crossword::Puzzle = Crossword::new_puzzle()
+                    filler: mutable Crossword::Filler = Crossword::new_filler()
+                    lex: mutable Crossword::Lexicon = Crossword::new_lexicon()
+                    shaper: mutable Crossword::Shaper = Crossword::new_shaper()
+                    numbers: mutable darray[i64] = Ints::zeros(Crossword::MOST_CELLS)
+                    word: mutable darray[i64] = Ints::zeros(Crossword::MAX_ENTRY)
+                    build_lexicon(&lex)
+                    grade: Crossword::Grade = Crossword::grade_of(run.rung)
+                    Crossword::deal_one(&puzzle, grade, &filler, &lex, &shaper, &numbers, &word, &run.rng)
+                    run.size <- puzzle.size
+                    run.slots <- puzzle.slots
+                    for cell in 0..<(puzzle.size * puzzle.size) |cell, puzzle, run|:
+                        source: i64 = Ints::at_ref(&puzzle.solution, cell)
+                        run.solution[cell.usize()] <- 97 + source if source >= 0 else 0
+                        run.filled[cell.usize()] <- 97 + source if Ints::at_ref(&puzzle.givens, cell) != 0 and source >= 0 else 0
+                        run.givens[cell.usize()] <- Ints::at_ref(&puzzle.givens, cell) != 0
+                    for slot in 0..<puzzle.slots |slot, puzzle, run|:
+                        run.slot_number[slot.usize()] <- Ints::at_ref(&puzzle.slot_number, slot)
+                        run.slot_down[slot.usize()] <- Ints::at_ref(&puzzle.slot_down, slot) != 0
+                        first_at: i64 = Ints::at_ref(&puzzle.slot_at, slot)
+                        run.slot_first[slot.usize()] <- Ints::at_ref(&puzzle.slot_cell, first_at)
+                        run.slot_length[slot.usize()] <- Ints::at_ref(&puzzle.slot_n, slot)
+                destroy work
+
+    def initialize(run: mutable Run&, rung: i64, trials: i64, seed: i64):
+        can Abort.Panic:
+            run.rng <- mt19937_new()
+            mt_seed_int(&run.rng, seed.u64())
+            run.rung <- rung
+            run.trials <- trials
+            run.trial <- 0
+            run.right <- 0
+            run.phase <- READY
+            run.verdict <- -1
+            clear(run)
+
+    def apply(run: mutable Run&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            _ = now_ms
+            if action == START:
+                if run.phase == SOLVING: return 2
+                if run.trial >= run.trials:
+                    run.phase <- DONE
+                    return 2
+                run.trial <- run.trial + 1
+                clear(run)
+                deal(run)
+                run.phase <- SOLVING
+                run.verdict <- -1
+                return 1
+            if run.phase != SOLVING: return 2
+            if action == LEFT:
+                run.cursor <- run.cursor - 1 if run.cursor % run.size != 0
+                return 1
+            if action == RIGHT:
+                run.cursor <- run.cursor + 1 if run.cursor % run.size + 1 < run.size
+                return 1
+            if action == UP:
+                run.cursor <- run.cursor - run.size if run.cursor >= run.size
+                return 1
+            if action == DOWN:
+                run.cursor <- run.cursor + run.size if run.cursor + run.size < run.size * run.size
+                return 1
+            if action == TOGGLE:
+                run.down <- not run.down
+                return 1
+            if action == BACKSPACE:
+                if not run.givens[run.cursor.usize()]: run.filled[run.cursor.usize()] <- 0
+                return 1
+            if action == WRITE:
+                if value >= 0 and value < 26 and not run.givens[run.cursor.usize()]:
+                    run.filled[run.cursor.usize()] <- value + 97
+                    if run.cursor + 1 < run.size * run.size: run.cursor <- run.cursor + 1
+                return 1
+            if action == SUBMIT:
+                run.verdict <- 1
+                for cell in 0..<(run.size * run.size) |cell, run|:
+                    if run.solution[cell.usize()] != run.filled[cell.usize()]: run.verdict <- 0
+                run.phase <- SOLVED
+                if run.verdict == 1: run.right <- run.right + 1
+                return 1
+            return 2
+
+    def info(run: Run&, field: i64) -> i64:
+        if field == 0: return run.phase
+        if field == 1: return run.rung
+        if field == 2: return run.trial
+        if field == 3: return run.trials
+        if field == 4: return run.size
+        if field == 5: return run.slots
+        if field == 6: return run.cursor
+        if field == 7: return 1 if run.down else 0
+        if field == 8: return run.verdict
+        if field == 9: return run.right
+        return -1
+
+    def value(run: Run&, field: i64, at: i64) -> i64:
+        return -1 if at < 0 or at >= MAX_CELLS
+        if field == 0: return run.solution[at.usize()]
+        if field == 1: return run.filled[at.usize()]
+        if field == 2: return 1 if run.givens[at.usize()] == true else 0
+        return -1
+
+    def render(run: Run&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            region frame(67108864):
+                in frame:
+                    solution: mutable darray[i64] = Ints::zeros(MAX_CELLS)
+                    filled: mutable darray[i64] = Ints::zeros(MAX_CELLS)
+                    givens: mutable darray[bool] = []
+                    slot_number: mutable darray[i64] = Ints::zeros(MAX_SLOTS)
+                    slot_down: mutable darray[bool] = []
+                    slot_first: mutable darray[i64] = Ints::zeros(MAX_SLOTS)
+                    slot_length: mutable darray[i64] = Ints::zeros(MAX_SLOTS)
+                    clues: mutable darray[sview] = []
+                    for cell in 0..<MAX_CELLS |cell, solution, filled, givens, run|:
+                        Ints::put(&solution, cell, run.solution[cell.usize()])
+                        Ints::put(&filled, cell, run.filled[cell.usize()])
+                        givens.push(run.givens[cell.usize()])
+                    for slot in 0..<run.slots |slot, slot_number, slot_down, slot_first, slot_length, clues, run|:
+                        Ints::put(&slot_number, slot, run.slot_number[slot.usize()])
+                        slot_down.push(run.slot_down[slot.usize()])
+                        Ints::put(&slot_first, slot, run.slot_first[slot.usize()])
+                        Ints::put(&slot_length, slot, run.slot_length[slot.usize()])
+                        clues.push(sview("", 0, -1))
+                    message: sview = sview("Press Space to start", 0, -1) if run.phase == READY else sview("Fill the grid", 0, -1)
+                    sx: f64 = width / Display::REFERENCE_WIDTH
+                    sy: f64 = height / Display::REFERENCE_HEIGHT
+                    paint: SceneCrossword::Paint = SceneCrossword::paint_of(black, width, height, sx, sy)
+                    SceneCrossword::render(list, &paint, run.phase, run.size > 0, run.size, solution,
+                        filled, givens, slot_number, slot_down, slot_first, slot_length, clues,
+                        run.cursor, run.down, -1, run.phase == SOLVED, run.trial, run.trials,
+                        message, run.verdict, sview("", 0, -1))
+                destroy frame

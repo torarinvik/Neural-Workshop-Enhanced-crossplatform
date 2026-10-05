@@ -1,0 +1,196 @@
+diff --git a/src/engine/engine_derivative.c b/src/engine/engine_derivative.c
+index e164b7f..e54f697 100644
+--- a/src/engine/engine_derivative.c
++++ b/src/engine/engine_derivative.c
+@@ -720,12 +720,72 @@ static void mjd_rne_vel(const mjModel* m, mjData* d) {
+ // w.r.t. the rotational dofs (through w = R*qvel[rot]), with K = [w x s]_x + [w]_x [s]_x:
+ //   d f / d w   = -mass * K            =>  lin = K * R
+ //   d tau / d w = [w]_x Iw - [Iw*w]_x  =>  rot = R' * (-mass*[s]_x K + d tau/d w) * R
++#ifdef __EMSCRIPTEN__
++extern mjtNum mj_marble_wheel_fma(mjtNum, mjtNum, mjtNum);
++static mjtNum marble_bias_dot(const mjtNum a[3], const mjtNum b[3]) {
++  return mj_marble_wheel_fma(a[2], b[2], mj_marble_wheel_fma(a[0], b[0], a[1]*b[1]));
++}
++static void marble_bias_cross(mjtNum out[3], const mjtNum a[3], const mjtNum b[3]) {
++  out[0] = mj_marble_wheel_fma(a[1], b[2], -(a[2]*b[1]));
++  out[1] = mj_marble_wheel_fma(a[2], b[0], -(a[0]*b[2]));
++  out[2] = mj_marble_wheel_fma(a[0], b[1], -(a[1]*b[0]));
++}
++static void marble_bias_matmul(mjtNum out[9], const mjtNum a[9], const mjtNum b[9]) {
++  for (int r=0; r<3; r++) for (int c=0; c<3; c++) {
++    mjtNum column[3] = {b[c], b[3+c], b[6+c]};
++    out[3*r+c] = marble_bias_dot(a+3*r, column);
++  }
++}
++#endif
+ static void freeBias_vel_blocks(mjtNum mass, const mjtNum R[9], const mjtNum Xi[9],
+                                 const mjtNum inertia[3], const mjtNum s[3],
+-                                const mjtNum qvel_rot[3], mjtNum lin[9], mjtNum rot[9]) {
++                                const mjtNum qvel_rot[3], mjtNum lin[9], mjtNum rot[9],
++                                mjtNum* trace) {
++  int traceadr = 0;
++#define TRACE_VALUES(values, count) do { \
++  if (trace) mju_copy(trace + traceadr, values, count); \
++  traceadr += count; \
++} while (0)
++  TRACE_VALUES(R, 9);
++  TRACE_VALUES(Xi, 9);
++  TRACE_VALUES(inertia, 3);
++  TRACE_VALUES(s, 3);
++  TRACE_VALUES(qvel_rot, 3);
++#ifdef __EMSCRIPTEN__
++  // Private local ordering qualified against complete original public bias calls.
++  mjtNum w[3], Xi_I[9], Iw[9], ws[3], Iww[3], K[9], C[9], Rt[9], tmp[9];
++  for (int r=0; r<3; r++) w[r] = marble_bias_dot(R+3*r, qvel_rot);
++  TRACE_VALUES(w, 3);
++  for (int r=0; r<3; r++) for (int c=0; c<3; c++) Xi_I[3*r+c] = Xi[3*r+c]*inertia[c];
++  TRACE_VALUES(Xi_I, 9);
++  for (int r=0; r<3; r++) for (int c=r; c<3; c++) {
++    Iw[3*r+c] = Iw[3*c+r] = marble_bias_dot(Xi_I+3*r, Xi+3*c);
++  }
++  TRACE_VALUES(Iw, 9);
++  marble_bias_cross(ws, w, s);
++  for (int r=0; r<3; r++) Iww[r] = marble_bias_dot(Iw+3*r, w);
++  TRACE_VALUES(ws, 3); TRACE_VALUES(Iww, 3);
++  mjtNum w_dot_s = marble_bias_dot(w, s);
++  TRACE_VALUES(&w_dot_s, 1);
++  mjtNum add[9] = {-w_dot_s, -ws[2], ws[1], ws[2], -w_dot_s, -ws[0], -ws[1], ws[0], -w_dot_s};
++  for (int r=0; r<3; r++) for (int c=0; c<3; c++) K[3*r+c] = mj_marble_wheel_fma(s[r], w[c], add[3*r+c]);
++  TRACE_VALUES(K, 9);
++  marble_bias_matmul(lin, K, R); TRACE_VALUES(lin, 9);
++  mjtNum offset[9] = {0, Iww[2], -Iww[1], -Iww[2], 0, Iww[0], Iww[1], -Iww[0], 0};
++  for (int c=0; c<3; c++) {
++    mjtNum kc[3] = {K[c],K[3+c],K[6+c]}, ic[3] = {Iw[c],Iw[3+c],Iw[6+c]}, sx[3], wx[3];
++    marble_bias_cross(sx, s, kc); marble_bias_cross(wx, w, ic);
++    for (int r=0; r<3; r++) C[3*r+c] = mj_marble_wheel_fma(-mass, sx[r], wx[r])+offset[3*r+c];
++  }
++  TRACE_VALUES(C, 9);
++  for (int r=0; r<3; r++) for (int c=0; c<3; c++) Rt[3*r+c] = R[3*c+r];
++  marble_bias_matmul(tmp, Rt, C); TRACE_VALUES(tmp, 9);
++  marble_bias_matmul(rot, tmp, R); TRACE_VALUES(rot, 9);
++#else
+   // world-frame angular velocity
+   mjtNum w[3];
+   mji_mulMatVec3(w, R, qvel_rot);
++  TRACE_VALUES(w, 3);
+ 
+   // world-frame inertia about CoM: Iw = Xi * diag(inertia) * Xi^T
+   mjtNum Xi_I[9];
+@@ -734,6 +794,7 @@ static void freeBias_vel_blocks(mjtNum mass, const mjtNum R[9], const mjtNum Xi[
+     Xi_I[3*i+1] = Xi[3*i+1] * inertia[1];
+     Xi_I[3*i+2] = Xi[3*i+2] * inertia[2];
+   }
++  TRACE_VALUES(Xi_I, 9);
+   mjtNum Iw[9];
+   Iw[0] = Xi_I[0]*Xi[0] + Xi_I[1]*Xi[1] + Xi_I[2]*Xi[2];
+   Iw[4] = Xi_I[3]*Xi[3] + Xi_I[4]*Xi[4] + Xi_I[5]*Xi[5];
+@@ -741,14 +802,18 @@ static void freeBias_vel_blocks(mjtNum mass, const mjtNum R[9], const mjtNum Xi[
+   Iw[1] = Iw[3] = Xi_I[0]*Xi[3] + Xi_I[1]*Xi[4] + Xi_I[2]*Xi[5];
+   Iw[2] = Iw[6] = Xi_I[0]*Xi[6] + Xi_I[1]*Xi[7] + Xi_I[2]*Xi[8];
+   Iw[5] = Iw[7] = Xi_I[3]*Xi[6] + Xi_I[4]*Xi[7] + Xi_I[5]*Xi[8];
++  TRACE_VALUES(Iw, 9);
+ 
+   // intermediate vectors: ws = w x s  (CoM offset velocity),  Iww = Iw * w  (angular momentum)
+   mjtNum ws[3], Iww[3];
+   mji_cross(ws, w, s);
+   mji_mulMatVec3(Iww, Iw, w);
++  TRACE_VALUES(ws, 3);
++  TRACE_VALUES(Iww, 3);
+ 
+   // K = [w x s]_x + [w]_x [s]_x = s w^T - (w . s) I + [ws]_x
+   mjtNum w_dot_s = w[0]*s[0] + w[1]*s[1] + w[2]*s[2];
++  TRACE_VALUES(&w_dot_s, 1);
+   mjtNum K[9];
+   K[0] = s[0]*w[0] - w_dot_s;
+   K[1] = s[0]*w[1] - ws[2];
+@@ -761,9 +826,11 @@ static void freeBias_vel_blocks(mjtNum mass, const mjtNum R[9], const mjtNum Xi[
+   K[6] = s[2]*w[0] - ws[1];
+   K[7] = s[2]*w[1] + ws[0];
+   K[8] = s[2]*w[2] - w_dot_s;
++  TRACE_VALUES(K, 9);
+ 
+   // lin = K * R
+   mji_mulMatMat3(lin, K, R);
++  TRACE_VALUES(lin, 9);
+ 
+   // C = -mass * [s]_x K + [w]_x Iw - [Iww]_x,  column by column
+   // the last term (-[Iww]_x) is the negated cross-product matrix, added via ternaries
+@@ -781,11 +848,16 @@ static void freeBias_vel_blocks(mjtNum mass, const mjtNum R[9], const mjtNum Xi[
+     C[3 + c] = -mass * s_x_K_row1 + w_x_Iw_row1 + (c == 0 ? -Iww[2] : (c == 2 ? Iww[0] : 0));
+     C[6 + c] = -mass * s_x_K_row2 + w_x_Iw_row2 + (c == 0 ? Iww[1] : (c == 1 ? -Iww[0] : 0));
+   }
++  TRACE_VALUES(C, 9);
+ 
+   // rot = R^T * C * R
+   mjtNum tmp[9];
+   mji_mulMatTMat3(tmp, R, C);
++  TRACE_VALUES(tmp, 9);
+   mji_mulMatMat3(rot, tmp, R);
++  TRACE_VALUES(rot, 9);
++#endif
++#undef TRACE_VALUES
+ }
+ 
+ 
+@@ -806,7 +878,7 @@ void mjd_freeBias_vel(const mjModel* m, const mjData* d, int jnt, mjtNum B[36])
+   mji_sub3(s, d->xipos + 3*body, d->xpos + 3*body);
+ 
+   mjtNum lin[9], rot[9];
+-  freeBias_vel_blocks(mass, R, Xi, inertia, s, d->qvel + adr + 3, lin, rot);
++  freeBias_vel_blocks(mass, R, Xi, inertia, s, d->qvel + adr + 3, lin, rot, NULL);
+ 
+   mju_zero(B, 36);
+   for (int r=0; r < 3; r++) {
+@@ -817,6 +889,18 @@ void mjd_freeBias_vel(const mjModel* m, const mjData* d, int jnt, mjtNum B[36])
+   }
+ }
+ 
++void mjd_freeBias_vel_trace(const mjModel* m, const mjData* d, int jnt,
++                            mjtNum trace[100]) {
++  int body = m->jnt_bodyid[jnt];
++  int adr = m->jnt_dofadr[jnt];
++  mjtNum lin[9], rot[9];
++  mjtNum s[3];
++  mji_sub3(s, d->xipos + 3*body, d->xpos + 3*body);
++  freeBias_vel_blocks(m->body_mass[body], d->xmat + 9*body,
++                      d->ximat + 9*body, m->body_inertia + 3*body,
++                      s, d->qvel + adr + 3, lin, rot, trace);
++}
++
+ 
+ // return 1 if body is a standalone free body (single free joint, no children)
+ mjtBool mj_isFreeBody(const mjModel* m, int body) {
+@@ -879,7 +963,7 @@ int mjd_freeMhat(const mjModel* m, const mjData* d, int jnt, mjtNum h, mjtNum A[
+   mjtNum mass = m->body_mass[body];
+   mjtNum lin[9], rot[9];
+   freeBias_vel_blocks(mass, d->xmat + 9*body, d->ximat + 9*body,
+-                      m->body_inertia + 3*body, s, d->qvel + adr + 3, lin, rot);
++                      m->body_inertia + 3*body, s, d->qvel + adr + 3, lin, rot, NULL);
+ 
+   mjtNum h_mass = -h * mass;
+   for (int r=0; r < 3; r++) {
+@@ -3164,6 +3248,24 @@ void mjd_smooth_vel(const mjModel* m, mjData* d, int flg_bias) {
+   }
+ }
+ 
++void mjd_freeJoint_qDeriv_probe(const mjModel* m, const mjData* d, int jnt,
++                                mjtNum block[36]) {
++  mjData* copy = mj_copyData(NULL, m, d);
++  mjd_smooth_vel(m, copy, /*flg_bias=*/0);
++  mju_zero(block, 36);
++  int dof = m->jnt_dofadr[jnt];
++  for (int row = 0; row < 6; ++row) {
++    int global_row = dof + row;
++    int rowadr = m->D_rowadr[global_row];
++    for (int k = 0; k < m->D_rownnz[global_row]; ++k) {
++      int offset = rowadr + k;
++      int col = m->D_colind[offset] - dof;
++      if (col >= 0 && col < 6) block[6*row + col] = copy->qDeriv[offset];
++    }
++  }
++  mj_deleteData(copy);
++}
++
+ 
+ //------------------------- implicit effective metric Mtilde = M + K -------------------------------
+ // K = (h^2 + h*damping) * (K_bend + K_stretch), the PSD implicit flex stiffness. Built once per step on the arena by

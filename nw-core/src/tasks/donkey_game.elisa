@@ -1,0 +1,445 @@
+# Stateful common-v1 controller for the source Donkey task.
+#
+# Donkey's source road owns arena-backed arrays, while the common ABI needs a
+# durable fixed-size record.  The controller therefore keeps the generated
+# road and car in bounded scalar arrays and materialises a source Road only for
+# the operations that use the source kernel.  The road itself is never
+# regenerated during a trial, so a browser frame cannot silently change the
+# answer by crossing an arena boundary.
+
+module DonkeyGame:
+
+    const MAX_LENGTH: i64 = 225       # max grade is 56 rows * SUB + sentinel
+    const MAX_BEASTS: i64 = 32
+    const MAX_RESULTS: i64 = 64
+    const VERDICT_MS: i64 = 1000
+    const REFERENCE_WIDTH: f64 = 912.0
+    const REFERENCE_HEIGHT: f64 = 684.0
+
+    const PHASE_READY: i64 = 0
+    const PHASE_SETTING: i64 = 1
+    const PHASE_RUNNING: i64 = 2
+    const PHASE_SCORED: i64 = 3
+    const PHASE_DONE: i64 = 4
+
+    const ACTION_START: i64 = 0
+    const ACTION_SWITCH: i64 = 1
+
+    const INFO_PHASE: i64 = 0
+    const INFO_RUNG: i64 = 1
+    const INFO_TRIAL: i64 = 2
+    const INFO_TOTAL_TRIALS: i64 = 3
+    const INFO_ROAD_ROWS: i64 = 4
+    const INFO_ROAD_LENGTH: i64 = 5
+    const INFO_DONKEYS: i64 = 6
+    const INFO_CAR_AT: i64 = 7
+    const INFO_CAR_LANE: i64 = 8
+    const INFO_CAR_CROSSING: i64 = 9
+    const INFO_CAR_SPAN: i64 = 10
+    const INFO_CAR_PASSED: i64 = 11
+    const INFO_HIT: i64 = 12
+    const INFO_VERDICT: i64 = 13
+    const INFO_UNTIL_MS: i64 = 14
+    const INFO_BEAT_AT_MS: i64 = 15
+    const INFO_CLOCK_MS: i64 = 16
+    const INFO_RESULT_COUNT: i64 = 17
+    const INFO_CLEAN: i64 = 18
+    const INFO_PASSED_TOTAL: i64 = 19
+    const INFO_BEST_RUNG: i64 = 20
+    const INFO_START_RUNG: i64 = 21
+    const INFO_BEAT_MS: i64 = 22
+    const INFO_SET_MS: i64 = 23
+    const INFO_ADAPTIVE: i64 = 24
+    const INFO_ROAD_START: i64 = 25
+    const INFO_SWERVE: i64 = 26
+
+    const VALUE_BLOCKED: i64 = 0
+    const VALUE_BEAST_AT: i64 = 1
+    const VALUE_BEAST_LANE: i64 = 2
+    const RESULT_RUNG: i64 = 100
+    const RESULT_CLEARED: i64 = 101
+    const RESULT_PASSED: i64 = 102
+
+    struct DonkeyRun:
+        rng: mutable MT19937
+        start_rung: mutable i64
+        rung: mutable i64
+        total_trials: mutable i64
+        beat_ms: mutable i64
+        set_ms: mutable i64
+        adaptive: mutable bool
+        trial: mutable i64
+        phase: mutable i64
+        verdict: mutable i64
+        clock_ms: mutable i64
+        until_ms: mutable i64
+        beat_at_ms: mutable i64
+        road_rows: mutable i64
+        road_swerve: mutable i64
+        road_crossing: mutable i64
+        road_length: mutable i64
+        road_start: mutable i64
+        road_beast_n: mutable i64
+        blocked: mutable i64[MAX_LENGTH]
+        beast_at: mutable i64[MAX_BEASTS]
+        beast_lane: mutable i64[MAX_BEASTS]
+        car_lane: mutable i64
+        car_crossing: mutable i64
+        car_at: mutable i64
+        car_passed: mutable i64
+        car_hit: mutable bool
+        car_span: mutable i64
+        result_count: mutable i64
+        result_rung: mutable i64[MAX_RESULTS]
+        result_cleared: mutable i64[MAX_RESULTS]
+        result_passed: mutable i64[MAX_RESULTS]
+        clean: mutable i64
+        passed_total: mutable i64
+        best_rung: mutable i64
+
+    def allowed_rung(value: i64) -> bool:
+        can Abort.Panic:
+            return value >= 1 and value <= Donkey::GRADE_COUNT
+
+    def allowed_trials(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 1 or value == 2 or value == 3 or value == 5 or value == 8 or value == 10 or value == 15 or value == 20
+
+    def allowed_beat_ms(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 80 or value == 120 or value == 180 or value == 250 or value == 400 or value == 600
+
+    def allowed_set_ms(value: i64) -> bool:
+        can Abort.Panic:
+            return value == 0 or value == 400 or value == 800 or value == 1500 or value == 2500
+
+    def clear_road(run: mutable DonkeyRun&):
+        can Abort.Panic:
+            run.road_rows <- 0
+            run.road_swerve <- 0
+            run.road_crossing <- 0
+            run.road_length <- 0
+            run.road_start <- 0
+            run.road_beast_n <- 0
+            run.car_lane <- 0
+            run.car_crossing <- 0
+            run.car_at <- 0
+            run.car_passed <- 0
+            run.car_hit <- false
+            run.car_span <- 0
+            for at in 0..<MAX_LENGTH |at, run|:
+                run.blocked[at.usize()] <- Donkey::CLEAR
+            for at in 0..<MAX_BEASTS |at, run|:
+                run.beast_at[at.usize()] <- 0
+                run.beast_lane[at.usize()] <- 0
+
+    def clear_results(run: mutable DonkeyRun&):
+        can Abort.Panic:
+            run.result_count <- 0
+            run.clean <- 0
+            run.passed_total <- 0
+            run.best_rung <- 0
+            for at in 0..<MAX_RESULTS |at, run|:
+                run.result_rung[at.usize()] <- 0
+                run.result_cleared[at.usize()] <- 0
+                run.result_passed[at.usize()] <- 0
+
+    def reset(run: mutable DonkeyRun&):
+        can Abort.Panic:
+            run.rung <- run.start_rung
+            run.trial <- 0
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            run.clock_ms <- 0
+            run.until_ms <- 0
+            run.beat_at_ms <- 0
+            clear_road(run)
+            clear_results(run)
+
+    def copy_road(run: mutable DonkeyRun&, road: Donkey::DonkeyRoad&):
+        can Abort.Panic:
+            run.road_rows <- road.rows
+            run.road_swerve <- road.swerve
+            run.road_crossing <- road.crossing
+            run.road_length <- road.length
+            run.road_start <- road.start
+            run.road_beast_n <- road.beast_n
+            for at in 0..<MAX_LENGTH |at, run, road|:
+                run.blocked[at.usize()] <- Donkey::CLEAR
+            for at in 0..<road.length |at, run, road|:
+                run.blocked[at.usize()] <- Ints::at(road.blocked, at)
+            for at in 0..<MAX_BEASTS |at, run, road|:
+                run.beast_at[at.usize()] <- 0
+                run.beast_lane[at.usize()] <- 0
+            for at in 0..<road.beast_n |at, run, road|:
+                run.beast_at[at.usize()] <- Ints::at(road.beast_at, at)
+                run.beast_lane[at.usize()] <- Ints::at(road.beast_lane, at)
+
+    def source_road(run: DonkeyRun&) -> Donkey::DonkeyRoad:
+        can Memory.Allocate, Abort.Panic:
+            road: mutable Donkey::DonkeyRoad = zeroed
+            road.rows <- run.road_rows
+            road.swerve <- run.road_swerve
+            road.crossing <- run.road_crossing
+            road.length <- run.road_length
+            road.start <- run.road_start
+            road.blocked <- Ints::zeros(run.road_length + 1)
+            road.beast_at <- Ints::zeros(MAX_BEASTS)
+            road.beast_lane <- Ints::zeros(MAX_BEASTS)
+            road.beast_n <- run.road_beast_n
+            for at in 0..<run.road_length |at, run, road|:
+                Ints::put(&road.blocked, at, run.blocked[at.usize()])
+            for at in 0..<run.road_beast_n |at, run, road|:
+                Ints::put(&road.beast_at, at, run.beast_at[at.usize()])
+                Ints::put(&road.beast_lane, at, run.beast_lane[at.usize()])
+            return road
+
+    def copy_car(run: mutable DonkeyRun&, car: Donkey::DonkeyCar&):
+        can Abort.Panic:
+            run.car_lane <- car.lane
+            run.car_crossing <- car.crossing
+            run.car_at <- car.at
+            run.car_passed <- car.passed
+            run.car_hit <- car.hit
+            run.car_span <- car.span
+
+    def source_car(run: DonkeyRun&) -> Donkey::DonkeyCar:
+        can Abort.Panic:
+            car: mutable Donkey::DonkeyCar = Donkey::DonkeyCar(run.road_start, run.road_swerve)
+            car.lane <- run.car_lane
+            car.crossing <- run.car_crossing
+            car.at <- run.car_at
+            car.passed <- run.car_passed
+            car.hit <- run.car_hit
+            car.span <- run.car_span
+            return car
+
+    def deal_trial(run: mutable DonkeyRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            seed: i64 = py_randrange(&run.rng, 0, 1073741824)
+            region scratch(268435456):
+                in scratch:
+                    road: mutable Donkey::DonkeyRoad = Donkey::generate(run.rung, seed)
+                    copy_road(run, &road)
+                destroy scratch
+            run.trial <- run.trial + 1
+            run.car_lane <- run.road_start
+            run.car_crossing <- 0
+            run.car_at <- 0
+            run.car_passed <- 0
+            run.car_hit <- false
+            run.car_span <- run.road_swerve * Donkey::SUB
+            run.verdict <- -1
+            run.clock_ms <- now_ms
+            run.until_ms <- now_ms + run.set_ms
+            run.beat_at_ms <- now_ms + run.set_ms
+            run.phase <- PHASE_SETTING
+
+    def next_trial(run: mutable DonkeyRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.trial >= run.total_trials:
+                run.phase <- PHASE_DONE
+                run.verdict <- -1
+                clear_road(run)
+                return
+            deal_trial(run, now_ms)
+
+    def start(run: mutable DonkeyRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            reset(run)
+            next_trial(run, now_ms)
+
+    def settle(run: mutable DonkeyRun&, now_ms: i64):
+        can Abort.Panic:
+            cleared: i64 = 1 if not run.car_hit and run.car_at >= run.road_length else 0
+            slot: i64 = run.result_count
+            if slot < MAX_RESULTS:
+                run.result_rung[slot.usize()] <- run.rung
+                run.result_cleared[slot.usize()] <- cleared
+                run.result_passed[slot.usize()] <- run.car_passed
+                run.result_count <- slot + 1
+            run.clean <- run.clean + 1 if cleared != 0 else run.clean
+            run.passed_total <- run.passed_total + run.car_passed
+            run.best_rung <- run.rung if run.rung > run.best_rung else run.best_rung
+            if run.adaptive:
+                window: i64 = 4 if run.result_count >= 4 else run.result_count
+                first: i64 = run.result_count - window
+                wins: mutable i64 = 0
+                for at in first..<run.result_count |at, run, wins|:
+                    wins <- wins + 1 if run.result_cleared[at.usize()] != 0 else wins
+                share: i64 = wins * 100 / window if window > 0 else 0
+                run.rung <- Donkey::GRADE_COUNT if run.rung >= Donkey::GRADE_COUNT and share >= 75 else (run.rung + 1 if share >= 75 else (run.rung - 1 if share < 40 and run.rung > 1 else run.rung))
+            run.verdict <- cleared
+            run.phase <- PHASE_SCORED
+            run.clock_ms <- now_ms
+            run.until_ms <- now_ms + VERDICT_MS
+
+    def advance(run: mutable DonkeyRun&, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 2 if now_ms < run.clock_ms
+            if run.phase == PHASE_READY or run.phase == PHASE_DONE or run.phase == PHASE_SCORED:
+                run.clock_ms <- now_ms
+                return 2
+            run.clock_ms <- now_ms
+            if run.phase == PHASE_SETTING:
+                if now_ms >= run.until_ms:
+                    run.phase <- PHASE_RUNNING
+                    return 1
+                return 2
+            if run.phase != PHASE_RUNNING or now_ms < run.beat_at_ms:
+                return 2
+            run.beat_at_ms <- now_ms + (run.beat_ms / Donkey::SUB)
+            region scratch(268435456):
+                in scratch:
+                    road: mutable Donkey::DonkeyRoad = source_road(run)
+                    car: mutable Donkey::DonkeyCar = source_car(run)
+                    Donkey::beat(&car, &road)
+                    copy_car(run, &car)
+                destroy scratch
+            # The scalar predicate is authoritative after the source Car has
+            # been copied back; no arena-backed Road or temporary Car escapes
+            # the region above.
+            if run.car_hit or run.car_at >= run.road_length:
+                settle(run, now_ms)
+                return 1
+            return 1
+
+    def info(run: DonkeyRun&, field: i64) -> i64:
+        can Abort.Panic:
+            if field == INFO_PHASE: return run.phase
+            if field == INFO_RUNG: return run.rung
+            if field == INFO_TRIAL: return run.trial
+            if field == INFO_TOTAL_TRIALS: return run.total_trials
+            if field == INFO_ROAD_ROWS: return run.road_rows
+            if field == INFO_ROAD_LENGTH: return run.road_length
+            if field == INFO_DONKEYS: return run.road_beast_n
+            if field == INFO_CAR_AT: return run.car_at
+            if field == INFO_CAR_LANE: return run.car_lane
+            if field == INFO_CAR_CROSSING: return run.car_crossing
+            if field == INFO_CAR_SPAN: return run.car_span
+            if field == INFO_CAR_PASSED: return run.car_passed
+            if field == INFO_HIT: return 1 if run.car_hit else 0
+            if field == INFO_VERDICT: return run.verdict
+            if field == INFO_UNTIL_MS: return run.until_ms
+            if field == INFO_BEAT_AT_MS: return run.beat_at_ms
+            if field == INFO_CLOCK_MS: return run.clock_ms
+            if field == INFO_RESULT_COUNT: return run.result_count
+            if field == INFO_CLEAN: return run.clean
+            if field == INFO_PASSED_TOTAL: return run.passed_total
+            if field == INFO_BEST_RUNG: return run.best_rung
+            if field == INFO_START_RUNG: return run.start_rung
+            if field == INFO_BEAT_MS: return run.beat_ms
+            if field == INFO_SET_MS: return run.set_ms
+            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
+            if field == INFO_ROAD_START: return run.road_start
+            if field == INFO_SWERVE: return run.road_swerve
+            return -1
+
+    def value(run: DonkeyRun&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            if field == VALUE_BLOCKED:
+                return -1 if at < 0 or at >= run.road_length else run.blocked[at.usize()]
+            if field == VALUE_BEAST_AT or field == VALUE_BEAST_LANE:
+                return -1 if at < 0 or at >= run.road_beast_n else (run.beast_at[at.usize()] if field == VALUE_BEAST_AT else run.beast_lane[at.usize()])
+            if field == RESULT_RUNG or field == RESULT_CLEARED or field == RESULT_PASSED:
+                return -1 if at < 0 or at >= run.result_count else (run.result_rung[at.usize()] if field == RESULT_RUNG else (run.result_cleared[at.usize()] if field == RESULT_CLEARED else run.result_passed[at.usize()]))
+            return -1
+
+    def append_message(out: mutable dstr&, run: DonkeyRun&):
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(out, "Press Space to start")
+            elif run.phase == PHASE_SETTING:
+                dstr_append_cstr(out, "Road ahead")
+            elif run.phase == PHASE_RUNNING:
+                dstr_append_cstr(out, "Go")
+            elif run.phase == PHASE_SCORED:
+                if run.verdict == 1:
+                    dstr_append_cstr(out, "Home, ")
+                    dstr_append_i64(out, run.car_passed)
+                    dstr_append_cstr(out, " donkeys behind you")
+                else:
+                    dstr_append_cstr(out, "Hit one after ")
+                    dstr_append_i64(out, run.car_at / Donkey::SUB)
+                    dstr_append_cstr(out, " rows, ")
+                    dstr_append_i64(out, run.car_passed)
+                    dstr_append_cstr(out, " behind you")
+            else:
+                dstr_append_i64(out, run.clean)
+                dstr_append_cstr(out, " of ")
+                dstr_append_i64(out, run.total_trials)
+                dstr_append_cstr(out, " roads cleared, ")
+                dstr_append_i64(out, run.passed_total)
+                dstr_append_cstr(out, " donkeys behind you, highest rung ")
+                dstr_append_i64(out, run.best_rung)
+
+    def append_asked(out: mutable dstr&, run: DonkeyRun&):
+        can Memory.Allocate, Abort.Panic:
+            return if run.road_length <= 0
+            dstr_append_cstr(out, "Rung ")
+            dstr_append_i64(out, run.rung)
+            dstr_append_cstr(out, ", ")
+            dstr_append_i64(out, run.road_rows)
+            dstr_append_cstr(out, " rows of road, ")
+            dstr_append_i64(out, run.road_beast_n)
+            dstr_append_cstr(out, " donkeys in it. The swerve takes ")
+            dstr_append_i64(out, run.road_swerve)
+            dstr_append_cstr(out, " row")
+            if run.road_swerve != 1:
+                dstr_append_cstr(out, "s and cannot be called off.")
+            else:
+                dstr_append_cstr(out, ".")
+
+    def render(run: DonkeyRun&, black_background: bool, width: f64,
+               height: f64, list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            beasts: mutable darray[SceneDonkey::DonkeyBeast] = []
+            for at in 0..<run.road_beast_n |at, run, beasts|:
+                beasts.push(SceneDonkey::DonkeyBeast{at: run.beast_at[at.usize()], lane: run.beast_lane[at.usize()]})
+            sx: f64 = width / REFERENCE_WIDTH
+            sy: f64 = height / REFERENCE_HEIGHT
+            paint: SceneDonkey::DonkeyPaint = SceneDonkey::paint_of(black_background, width, height, sx, sy)
+            message: mutable dstr = []
+            append_message(&message, run)
+            asked: mutable dstr = []
+            append_asked(&asked, run)
+            verdict_text: mutable dstr = []
+            if run.phase == PHASE_SCORED:
+                dstr_append_sview(&verdict_text, bytes_view(message))
+            SceneDonkey::render(list, &paint, run.phase, run.road_length > 0,
+                &beasts, run.road_length, run.road_rows, run.road_beast_n,
+                run.car_at, run.car_lane, run.car_crossing, run.car_span,
+                run.car_passed, bytes_view(asked), run.trial, run.total_trials,
+                bytes_view(message), run.verdict, bytes_view(verdict_text))
+
+    def initialize(run: mutable DonkeyRun&, rung: i64, trials: i64, beat_ms: i64,
+                   set_ms: i64, adaptive: bool, unused: i64, seed: i64):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.start_rung <- rung
+            run.total_trials <- trials
+            run.beat_ms <- beat_ms
+            run.set_ms <- set_ms
+            run.adaptive <- adaptive
+            reset(run)
+
+    def apply(run: mutable DonkeyRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                if run.phase == PHASE_READY or run.phase == PHASE_DONE:
+                    start(run, now_ms)
+                    return 1
+                if run.phase == PHASE_SCORED:
+                    return 2 if now_ms < run.until_ms
+                    next_trial(run, now_ms)
+                    return 1
+                return 2
+            if action == ACTION_SWITCH:
+                return 2 if run.phase != PHASE_RUNNING
+                car: mutable Donkey::DonkeyCar = source_car(run)
+                changed: bool = Donkey::steer(&car, Donkey::SWITCH)
+                copy_car(run, &car)
+                return 1 if changed else 2
+            return -6

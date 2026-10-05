@@ -1,0 +1,193 @@
+diff --git a/src/engine/engine_solver.c b/src/engine/engine_solver.c
+--- a/src/engine/engine_solver.c
++++ b/src/engine/engine_solver.c
+@@ -1242,6 +1242,8 @@
+   mjtNum LSslope;         // linesearch slope at solution
+   unsigned int marble_trace_valid;  // reset by PrimalPointers; diagnostic only
+ } mjPrimalContext;
++
++#include "engine/marble_primal_prepare_trace.h"
+ 
+ // Diagnostic-only trace used by the Marble native/WASM parity investigation.
+ // Records Newton state at the first constraint update, line-search decisions,
+@@ -1802,6 +1804,7 @@
+ 
+ MJAPI void mj_solver_trace_run(const mjModel* model, mjData* data) {
+   mj_solver_trace_reset();
++  mj_solver_prepare_trace_begin();
+   extern void mj_constraint_update_trace_begin(void);
+   extern void mj_constraint_update_trace_end(void);
+   mj_constraint_update_trace_begin();
+@@ -1812,6 +1815,7 @@
+   mj_fwdConstraint(model, data);
+   data->threadpool = threadpool;
+   mj_constraint_update_trace_end();
++  mj_solver_prepare_trace_end();
+ }
+ 
+ static void marbleRecordNewtonState(const mjPrimalContext* ctx, int label,
+@@ -2766,6 +2770,7 @@
+ 
+   // prepare quadratics and cones
+   PrimalPrepare(ctx);
++  marbleRecordPrepared(ctx);
+ 
+   // init at alpha = 0, save
+   p0.alpha = 0;
+diff --git a/wasm/codegen/generated/bindings.cc b/wasm/codegen/generated/bindings.cc
+--- a/wasm/codegen/generated/bindings.cc
++++ b/wasm/codegen/generated/bindings.cc
+@@ -46,6 +46,12 @@
+ extern "C" void mj_solver_constraint_input_copy(mjtNum*);
+ extern "C" int mj_solver_constraint_iteration_trace_size();
+ extern "C" int mj_solver_constraint_iteration_trace_schema();
++extern "C" int mj_solver_prepare_trace_schema();
++extern "C" int mj_solver_prepare_trace_size();
++extern "C" int mj_solver_prepare_trace_calls();
++extern "C" int mj_solver_prepare_trace_overflow();
++extern "C" int mj_solver_prepare_trace_invalid();
++extern "C" void mj_solver_prepare_trace_copy(mjtNum*);
+ extern "C" int mj_solver_constraint_iteration_trace_overflow();
+ extern "C" void mj_solver_constraint_iteration_trace_copy(mjtNum*);
+ extern "C" int mj_solver_chol_solve_size();
+@@ -2241,6 +2247,16 @@
+   }
+   output.set("constraintIterationTrace", constraint_iteration_values);
+   output.set("constraintIterationTraceSchema", mj_solver_constraint_iteration_trace_schema());
++  const int prepare_size = mj_solver_prepare_trace_size();
++  std::vector<mjtNum> prepare_trace(prepare_size);
++  mj_solver_prepare_trace_copy(prepare_trace.data());
++  val prepare_values = val::array();
++  for (int i = 0; i < prepare_size; ++i) prepare_values.set(i, prepare_trace[i]);
++  output.set("prepareTrace", prepare_values);
++  output.set("prepareTraceSchema", mj_solver_prepare_trace_schema());
++  output.set("prepareTraceCalls", mj_solver_prepare_trace_calls());
++  output.set("prepareTraceOverflow", mj_solver_prepare_trace_overflow() != 0);
++  output.set("prepareTraceInvalid", mj_solver_prepare_trace_invalid() != 0);
+   output.set("constraintIterationTraceOverflow", mj_solver_constraint_iteration_trace_overflow() != 0);
+   const int chol_size = mj_solver_chol_solve_size();
+   std::vector<mjtNum> chol_input(chol_size);
+diff --git a/src/engine/marble_primal_prepare_trace.h b/src/engine/marble_primal_prepare_trace.h
+new file mode 100644
+--- /dev/null
++++ b/src/engine/marble_primal_prepare_trace.h
+@@ -0,0 +1,119 @@
++// Diagnostic-only initialized PrimalPrepare capture; no solver arithmetic.
++#ifndef MARBLE_PRIMAL_PREPARE_TRACE_H_
++#define MARBLE_PRIMAL_PREPARE_TRACE_H_
++
++#define MARBLE_PREPARE_TRACE_CAPACITY 300000
++static mjtNum marble_prepare_trace[MARBLE_PREPARE_TRACE_CAPACITY];
++static int marble_prepare_size, marble_prepare_calls;
++static int marble_prepare_enabled, marble_prepare_overflow, marble_prepare_invalid;
++
++MJAPI void mj_solver_prepare_trace_begin(void) {
++  marble_prepare_size = marble_prepare_calls = 0;
++  marble_prepare_overflow = marble_prepare_invalid = 0;
++  marble_prepare_enabled = 1;
++}
++MJAPI void mj_solver_prepare_trace_end(void) { marble_prepare_enabled = 0; }
++MJAPI int mj_solver_prepare_trace_schema(void) { return 1; }
++MJAPI int mj_solver_prepare_trace_size(void) { return marble_prepare_size; }
++MJAPI int mj_solver_prepare_trace_calls(void) { return marble_prepare_calls; }
++MJAPI int mj_solver_prepare_trace_overflow(void) { return marble_prepare_overflow; }
++MJAPI int mj_solver_prepare_trace_invalid(void) { return marble_prepare_invalid; }
++MJAPI void mj_solver_prepare_trace_copy(mjtNum* out) {
++  if (out && marble_prepare_size) {
++    memcpy(out, marble_prepare_trace, (size_t)marble_prepare_size*sizeof(mjtNum));
++  }
++}
++
++// Called only AFTER PrimalSearch produces Mv/Jv and PrimalPrepare writes outputs.
++// quad[3..8] is copied only for elliptic groups, never unused trailing storage.
++static void marbleRecordPrepared(const mjPrimalContext* ctx) {
++  if (!marble_prepare_enabled) return;
++  const int ordinal = marble_prepare_calls++;
++  const int nv = ctx->nv, nefc = ctx->nefc;
++  const unsigned int required = MARBLE_VALID_COST | MARBLE_VALID_JV |
++      MARBLE_VALID_SEARCH | MARBLE_VALID_MA | MARBLE_VALID_JAREF;
++  if ((ctx->marble_trace_valid & required) != required ||
++      nv < 1 || nv > 512 || nefc < 0 || nefc > 65536) {
++    marble_prepare_invalid = 1;
++    return;
++  }
++  int blocks = 0, width = 13 + 4*nv + 5*nefc;
++  for (int row = 0; row < nefc;) {
++    int dim = 1;
++    if (ctx->efc_type[row] == mjCNSTR_CONTACT_ELLIPTIC) {
++      dim = ctx->contact[ctx->efc_id[row]].dim;
++      if ((dim != 3 && dim != 4 && dim != 6) || row+dim > nefc) {
++        marble_prepare_invalid = 1;
++        return;
++      }
++      for (int k = row; k < row+dim; ++k) {
++        if (ctx->efc_type[k] != mjCNSTR_CONTACT_ELLIPTIC ||
++            ctx->efc_id[k] != ctx->efc_id[row]) {
++          marble_prepare_invalid = 1;
++          return;
++        }
++      }
++    }
++    ++blocks;
++    width += 5 + (dim == 1 ? 3 : 15);
++    row += dim;
++  }
++  if (marble_prepare_size + width > MARBLE_PREPARE_TRACE_CAPACITY) {
++    marble_prepare_overflow = 1;
++    return;
++  }
++  mjtNum* out = marble_prepare_trace + marble_prepare_size;
++  int offset = 0;
++  out[offset++] = 1;
++  out[offset++] = ordinal;
++  out[offset++] = ctx->island;
++  out[offset++] = nv;
++  out[offset++] = nefc;
++  out[offset++] = ctx->ne;
++  out[offset++] = ctx->nf;
++  out[offset++] = ctx->is_sparse;
++  out[offset++] = blocks;
++  out[offset++] = ctx->marble_trace_valid & required;
++#define PREPARE_COPY(values, count) do { \
++    memcpy(out+offset, values, (size_t)(count)*sizeof(mjtNum)); \
++    offset += (count); \
++  } while (0)
++#define PREPARE_COPY_INTS(values, count) do { \
++    for (int k = 0; k < (count); ++k) out[offset++] = (values)[k]; \
++  } while (0)
++  PREPARE_COPY(ctx->search, nv);
++  PREPARE_COPY(ctx->Ma, nv);
++  PREPARE_COPY(ctx->Mv, nv);
++  PREPARE_COPY(ctx->qfrc_smooth, nv);
++  PREPARE_COPY(ctx->Jaref, nefc);
++  PREPARE_COPY(ctx->Jv, nefc);
++  PREPARE_COPY(ctx->efc_D, nefc);
++  PREPARE_COPY_INTS(ctx->efc_type, nefc);
++  PREPARE_COPY_INTS(ctx->efc_id, nefc);
++  PREPARE_COPY(ctx->quadGauss, 3);
++  for (int row = 0; row < nefc;) {
++    const int kind = ctx->efc_type[row];
++    const int elliptic = kind == mjCNSTR_CONTACT_ELLIPTIC;
++    const mjContact* con = elliptic ? ctx->contact+ctx->efc_id[row] : NULL;
++    const int dim = elliptic ? con->dim : 1;
++    out[offset++] = row;
++    out[offset++] = dim;
++    out[offset++] = ctx->efc_id[row];
++    out[offset++] = kind;
++    out[offset++] = elliptic ? 9 : 3;
++    if (elliptic) {
++      out[offset++] = con->mu;
++      PREPARE_COPY(con->friction, 5);
++    }
++    PREPARE_COPY(ctx->quad+3*row, elliptic ? 9 : 3);
++    row += dim;
++  }
++#undef PREPARE_COPY
++#undef PREPARE_COPY_INTS
++  if (offset != width) {
++    marble_prepare_invalid = 1;
++    return;
++  }
++  marble_prepare_size += offset;
++}
++#endif

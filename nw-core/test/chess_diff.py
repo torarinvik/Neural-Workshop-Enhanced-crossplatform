@@ -310,9 +310,14 @@ def reference():
 
 
 def main():
+    # The Elisa sweep consumes the transcript at startup, so derive and write
+    # this run's oracle before launching it. Running the binary first let it
+    # see a missing or stale /tmp/nw_chess_oracle.txt; the first affected
+    # candidate then appeared to disagree even though the board and RNG state
+    # were identical.
+    want = reference()
     got = subprocess.run([sys.argv[1]], capture_output=True, text=True, check=True)
     mine = [line for line in got.stdout.splitlines() if line.strip()]
-    want = reference()
     if len(mine) != len(want):
         print("MISMATCH line count: elisa %d, python %d" % (len(mine), len(want)))
         for index, (a, b) in enumerate(zip(mine, want)):

@@ -20,7 +20,8 @@ import scenediff
 scenediff.reexec()
 
 from neural_workshop import display, geometry, state                # noqa: E402
-from neural_workshop.ui.taskhub import CATEGORIES, TaskHub          # noqa: E402
+from neural_workshop.ui import taskhub as taskhub_ui                       # noqa: E402
+from neural_workshop.ui.taskhub import CATEGORIES, TaskHub                   # noqa: E402
 
 
 def build(spec):
@@ -33,6 +34,12 @@ def build(spec):
     framerec.set_scale(geometry._width() / 912.0,
                        geometry._height() / (spec["tall"] / 2.0))
     state.cfg.BLACK_BACKGROUND = bool(spec["black"])
+    # The port deliberately exposes only the 3D N-Back controller.  Keep the
+    # pinned original task id (`nback`) for catalog auditing, but compare this
+    # screen against the port's explicit label instead of treating that
+    # intentional capability narrowing as a rendering regression.
+    original = taskhub_ui.TASKS["working_memory"][0]
+    taskhub_ui.TASKS["working_memory"][0] = (original[0], "3D N-Back")
     screen = TaskHub(category=CATEGORIES[spec["category"]][0])
     screen.category = CATEGORIES[spec["category"]][0]
     screen.selected = spec["selected"]

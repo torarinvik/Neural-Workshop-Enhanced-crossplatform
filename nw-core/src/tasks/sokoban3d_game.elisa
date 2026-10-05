@@ -1,0 +1,320 @@
+# Stateful 3D Sokoban controller.
+#
+# The domain and scene are deliberately kept in their source-backed modules:
+# Sokoban3D owns pose/box physics and ray-cast preparation, while this adapter
+# owns the persistent lifecycle, undo history, and common-API-facing fields.
+# Flat Sokoban remains the level generator so the 3D task uses the same source
+# warehouse stream and difficulty ladder.
+
+module Sokoban3DGame:
+
+    const PHASE_READY: i64 = 0
+    const PHASE_PUSHING: i64 = 1
+    const PHASE_SOLVED: i64 = 2
+    const PHASE_LOST: i64 = 3
+    const PHASE_DONE: i64 = 4
+    const PHASE_UNAVAILABLE: i64 = 5
+
+    const ACTION_START: i64 = 0
+    const ACTION_AHEAD: i64 = 1
+    const ACTION_BACK: i64 = 2
+    const ACTION_LEFT: i64 = 3
+    const ACTION_RIGHT: i64 = 4
+    const ACTION_UNDO: i64 = 5
+    const ACTION_RESTART: i64 = 6
+
+    const INFO_PHASE: i64 = 0
+    const INFO_RUNG: i64 = 1
+    const INFO_TRIAL: i64 = 2
+    const INFO_TOTAL_TRIALS: i64 = 3
+    const INFO_PLAYER: i64 = 4
+    const INFO_FACING: i64 = 5
+    const INFO_STEPS: i64 = 6
+    const INFO_PUSHES: i64 = 7
+    const INFO_VERDICT: i64 = 8
+    const INFO_WIDTH: i64 = 9
+    const INFO_HEIGHT: i64 = 10
+    const INFO_PAR: i64 = 11
+    const INFO_MINIMUM: i64 = 12
+    const INFO_AT_LEAST: i64 = 13
+    const INFO_BOUND: i64 = 14
+    const INFO_SOLVED_COUNT: i64 = 15
+    const INFO_LOST_COUNT: i64 = 16
+    const INFO_HAS_LEVEL: i64 = 17
+
+    const CELL_WALL: i64 = 0
+    const CELL_GOAL: i64 = 1
+    const CELL_TRAP: i64 = 2
+    const CELL_BOX: i64 = 3
+
+    const HISTORY_CAPACITY: i64 = 4096
+    const COLUMNS: i64 = 180
+
+    struct Run:
+        flat: mutable SokobanGame::SokobanRun
+        facing: mutable i64
+        start_facing: mutable i64
+        history_count: mutable i64
+        old_player: mutable i64[4096]
+        old_facing: mutable i64[4096]
+        pushed: mutable i64[4096]
+        pushed_from: mutable i64[4096]
+        pushed_to: mutable i64[4096]
+
+    def clear_history(run: mutable Run&):
+        can Abort.Panic:
+            run.history_count <- 0
+
+    def initialize(run: mutable Run&, start_rung: i64, total_trials: i64,
+                   adaptive: bool, show_traps: bool, seed: i64):
+        can Memory.Allocate, Abort.Panic:
+            SokobanGame::initialize(&run.flat, start_rung, total_trials,
+                                    adaptive, show_traps, seed)
+            run.facing <- 0
+            run.start_facing <- 0
+            clear_history(run)
+
+    def level_for(run: Run&, boxes: mutable darray[i64]&) -> Sokoban::Level:
+        can Memory.Allocate, Abort.Panic:
+            level: mutable Sokoban::Level = Sokoban::Level()
+            level.ok <- run.flat.has_level
+            level.width <- run.flat.width
+            level.height <- run.flat.height
+            level.cells <- run.flat.cells
+            level.player <- run.flat.player
+            level.minimum <- run.flat.minimum
+            level.at_least <- run.flat.at_least
+            level.bound <- run.flat.bound
+            level.traps_n <- 0
+            cell: mutable i64 = 0
+            while cell < run.flat.cells |cell, run, level, boxes|:
+                Ints::put(&level.walls_in, cell, run.flat.walls[cell.usize()])
+                Ints::put(&level.goals_in, cell, run.flat.goals[cell.usize()])
+                Ints::put(&level.traps_in, cell, run.flat.traps[cell.usize()])
+                Ints::put(&level.boxes_in, cell, Ints::at_ref(boxes, cell))
+                cell <- cell + 1
+            return level
+
+    def copy_boxes(run: Run&, out: mutable darray[i64]&):
+        can Abort.Panic:
+            cell: mutable i64 = 0
+            while cell < run.flat.cells |cell, run, out|:
+                Ints::put(out, cell, run.flat.boxes[cell.usize()])
+                cell <- cell + 1
+
+    def next_trial(run: mutable Run&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            SokobanGame::next_trial(&run.flat, now_ms)
+            if run.flat.has_level:
+                orient(run)
+            clear_history(run)
+
+    def orient(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            if run.flat.has_level:
+                region pose(1048576):
+                    in pose:
+                        boxes: mutable darray[i64] = Ints::zeros(Sokoban::MOST_CELLS)
+                        copy_boxes(run, &boxes)
+                        level: mutable Sokoban::Level = level_for(run, &boxes)
+                        run.facing <- Sokoban3D::facing_at(&level)
+                        run.start_facing <- run.facing
+                    destroy pose
+
+    def start_run(run: mutable Run&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic:
+            SokobanGame::start_run(&run.flat, now_ms)
+            orient(run)
+            clear_history(run)
+
+    def restart(run: mutable Run&):
+        can Abort.Panic:
+            SokobanGame::reset_level(&run.flat)
+            run.facing <- run.start_facing
+            clear_history(run)
+            run.flat.phase <- PHASE_PUSHING
+            run.flat.verdict <- -1
+
+    def solved(run: Run&) -> bool:
+        can Abort.Panic:
+            cell: mutable i64 = 0
+            while cell < run.flat.cells |cell, run|:
+                return false if run.flat.boxes[cell.usize()] == 1 and run.flat.goals[cell.usize()] == 0
+                cell <- cell + 1
+            return true
+
+    def remember(run: mutable Run&, old_player: i64, old_facing: i64,
+                 did_push: bool, from_cell: i64, to_cell: i64):
+        can Abort.Panic:
+            return if run.history_count >= HISTORY_CAPACITY
+            at: i64 = run.history_count
+            run.old_player[at.usize()] <- old_player
+            run.old_facing[at.usize()] <- old_facing
+            run.pushed[at.usize()] <- 1 if did_push else 0
+            run.pushed_from[at.usize()] <- from_cell
+            run.pushed_to[at.usize()] <- to_cell
+            run.history_count <- at + 1
+
+    def undo(run: mutable Run&):
+        can Abort.Panic:
+            return if run.flat.phase != PHASE_PUSHING or run.history_count <= 0
+            at: i64 = run.history_count - 1
+            if run.pushed[at.usize()] == 1:
+                from_cell: i64 = run.pushed_from[at.usize()]
+                to_cell: i64 = run.pushed_to[at.usize()]
+                run.flat.boxes[from_cell.usize()] <- 1
+                run.flat.boxes[to_cell.usize()] <- 0
+                run.flat.pushes <- run.flat.pushes - 1 if run.flat.pushes > 0
+            run.flat.player <- run.old_player[at.usize()]
+            run.facing <- run.old_facing[at.usize()]
+            run.flat.moves <- run.flat.moves - 1 if run.flat.moves > 0
+            run.history_count <- at
+
+    def apply(run: mutable Run&, action: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if action == ACTION_START:
+                if run.flat.phase == PHASE_READY or run.flat.phase == PHASE_DONE or run.flat.phase == PHASE_SOLVED or run.flat.phase == PHASE_LOST:
+                    if run.flat.phase == PHASE_SOLVED or run.flat.phase == PHASE_LOST:
+                        next_trial(run, now_ms)
+                    else:
+                        start_run(run, now_ms)
+                    return 1
+                return 2
+            if action == ACTION_RESTART:
+                restart(run)
+                return 1
+            if action == ACTION_UNDO:
+                before: i64 = run.history_count
+                undo(run)
+                return 1 if run.history_count != before else 2
+            return 2 if run.flat.phase != PHASE_PUSHING or not run.flat.has_level else apply_move(run, action, now_ms)
+
+    def apply_move(run: mutable Run&, action: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 2 if action < ACTION_AHEAD or action > ACTION_RIGHT
+            region motion(1048576):
+                in motion:
+                    boxes: mutable darray[i64] = Ints::zeros(Sokoban::MOST_CELLS)
+                    copy_boxes(run, &boxes)
+                    level: mutable Sokoban::Level = level_for(run, &boxes)
+                    old_player: i64 = run.flat.player
+                    old_facing: i64 = run.facing
+                    doing: i64 = action - ACTION_AHEAD
+                    moved: Sokoban3D::Step = Sokoban3D::after(&level, &boxes,
+                                                              old_player, old_facing, doing)
+                    return 2 if not moved.moved and not moved.pushed and moved.facing == old_facing
+                    remember(run, old_player, old_facing, moved.pushed,
+                             moved.from_cell, moved.to_cell)
+                    run.flat.player <- moved.cell
+                    run.facing <- moved.facing
+                    run.flat.moves <- run.flat.moves + Sokoban3D::costs(doing, moved.moved)
+                    if moved.pushed:
+                        run.flat.boxes[moved.from_cell.usize()] <- 0
+                        run.flat.boxes[moved.to_cell.usize()] <- 1
+                        run.flat.pushes <- run.flat.pushes + 1
+                    if solved(run):
+                        SokobanGame::settle_solved(&run.flat, now_ms)
+                    elif moved.pushed and SokobanGame::is_deadlocked(&run.flat):
+                        SokobanGame::settle_lost(&run.flat)
+                destroy motion
+            return 1
+
+    def info(run: Run&, field: i64) -> i64:
+        can Abort.Panic:
+            return run.flat.phase if field == INFO_PHASE
+            return run.flat.rung if field == INFO_RUNG
+            return run.flat.trial if field == INFO_TRIAL
+            return run.flat.total_trials if field == INFO_TOTAL_TRIALS
+            return run.flat.player if field == INFO_PLAYER
+            return run.facing if field == INFO_FACING
+            return run.flat.moves if field == INFO_STEPS
+            return run.flat.pushes if field == INFO_PUSHES
+            return run.flat.verdict if field == INFO_VERDICT
+            return run.flat.width if field == INFO_WIDTH
+            return run.flat.height if field == INFO_HEIGHT
+            return run.flat.par if field == INFO_PAR
+            return run.flat.minimum if field == INFO_MINIMUM
+            return run.flat.at_least if field == INFO_AT_LEAST
+            return run.flat.bound if field == INFO_BOUND
+            return run.flat.solved_count if field == INFO_SOLVED_COUNT
+            return run.flat.lost_count if field == INFO_LOST_COUNT
+            return 1 if run.flat.has_level and field == INFO_HAS_LEVEL else 0
+
+    def value(run: Run&, field: i64, at: i64) -> i64:
+        can Abort.Panic:
+            return -1 if at < 0 or at >= run.flat.cells
+            return run.flat.walls[at.usize()] if field == CELL_WALL
+            return run.flat.goals[at.usize()] if field == CELL_GOAL
+            return run.flat.traps[at.usize()] if field == CELL_TRAP
+            return run.flat.boxes[at.usize()] if field == CELL_BOX
+            return -1
+
+    def dispose(run: mutable Run&):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            SokobanGame::dispose(&run.flat)
+            clear_history(run)
+
+    def render(run: Run&, black_background: bool, width: f64, height: f64,
+               list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            region frame(2097152):
+                in frame:
+                    if not run.flat.has_level:
+                        empty_bool: mutable darray[bool] = []
+                        empty_i64: mutable darray[i64] = []
+                        empty_sights: mutable darray[SceneSokoban3D::Sight] = []
+                        empty_marks: mutable darray[SceneSokoban3D::Mark] = []
+                        paint: SceneSokoban3D::Paint = SceneSokoban3D::paint_of(black_background, width, height, width / 912.0, height / 684.0)
+                        SceneSokoban3D::render(list, &paint, run.flat.phase,
+                                               false, 1, 1, &empty_bool, &empty_bool,
+                                               &empty_bool, &empty_i64, 0, &empty_bool,
+                                               false, false, &empty_sights, &empty_marks,
+                                               0, 0, run.flat.trial, run.flat.total_trials,
+                                               sview("Push the boxes home", 0, -1),
+                                               run.flat.verdict, sview("", 0, -1))
+                        return
+                    boxes: mutable darray[i64] = Ints::zeros(Sokoban::MOST_CELLS)
+                    copy_boxes(run, &boxes)
+                    level: mutable Sokoban::Level = level_for(run, &boxes)
+                    walls: mutable darray[bool] = []
+                    goals: mutable darray[bool] = []
+                    traps: mutable darray[bool] = []
+                    live: mutable darray[bool] = []
+                    plan_boxes: mutable darray[i64] = []
+                    for cell in 0..<run.flat.cells |walls, goals, traps, live, plan_boxes, run, boxes|:
+                        walls.push(run.flat.walls[cell.usize()] == 1)
+                        goals.push(run.flat.goals[cell.usize()] == 1)
+                        traps.push(run.flat.traps[cell.usize()] == 1)
+                        live.push(Ints::at_ref(boxes, cell) == 1)
+                        plan_boxes.push(cell) if run.flat.start_boxes[cell.usize()] == 1
+                    eye: mutable Sokoban3D::Eye = Sokoban3D::new_eye()
+                    marks: mutable Sokoban3D::Marks = Sokoban3D::new_marks()
+                    Sokoban3D::marks(&eye, &level, &boxes, run.flat.player,
+                                     run.facing, 1.5707963267948966, &marks)
+                    distances: mutable darray[f64] = Floats::zeros(COLUMNS)
+                    cells: mutable darray[i64] = Ints::zeros(COLUMNS)
+                    sides: mutable darray[i64] = Ints::zeros(COLUMNS)
+                    pose: YouAreHere::Pose = YouAreHere::Pose{cell: run.flat.player, facing: run.facing}
+                    YouAreHere::look(&eye.work, &eye.maze, pose, COLUMNS,
+                                     1.5707963267948966, &distances, &cells, &sides)
+                    sights: mutable darray[SceneSokoban3D::Sight] = []
+                    for column in 0..<COLUMNS |column, sights, distances, cells, sides|:
+                        sights.push(SceneSokoban3D::Sight{distance: Floats::at_ref(&distances, column),
+                                                         cell: Ints::at_ref(&cells, column),
+                                                         side: Ints::at_ref(&sides, column)})
+                    scene_marks: mutable darray[SceneSokoban3D::Mark] = []
+                    for mark in 0..<marks.count |mark, scene_marks, marks|:
+                        scene_marks.push(SceneSokoban3D::Mark{across: Floats::at_ref(&marks.across, mark),
+                                                              distance: Floats::at_ref(&marks.distance, mark)})
+                    paint: SceneSokoban3D::Paint = SceneSokoban3D::paint_of(black_background, width, height, width / 912.0, height / 684.0)
+                    SceneSokoban3D::render(list, &paint, run.flat.phase,
+                                           run.flat.has_level, run.flat.width,
+                                           run.flat.height, &walls, &goals, &traps,
+                                           &plan_boxes, run.flat.start_player,
+                                           &live, run.flat.show_traps, true,
+                                           &sights, &scene_marks, run.flat.moves,
+                                           run.flat.pushes, run.flat.trial,
+                                           run.flat.total_trials,
+                                           sview("Push the boxes home", 0, -1),
+                                           run.flat.verdict, sview("", 0, -1))
+                destroy frame

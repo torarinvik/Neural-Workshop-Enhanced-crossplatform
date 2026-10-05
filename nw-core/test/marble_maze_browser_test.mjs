@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { MarbleMazeGame, MARBLE } from "../shells/web/marble-maze.js";
+import {
+  MarbleMazeGame, MARBLE, marbleBoardBudgetSeconds, marbleFeedbackKind,
+  marbleSourceRound,
+} from "../shells/web/marble-maze.js";
 
 function board(overrides = {}) {
   return {
@@ -8,6 +11,62 @@ function board(overrides = {}) {
     home: { x: 0.8, y: 0.5, radius: 0.08 },
     walls: [], holes: [], starts: [{ x: 0.1, y: 0.5 }], ...overrides,
   };
+}
+
+assert.equal(marbleBoardBudgetSeconds(board(), 0), 45);
+assert.equal(marbleBoardBudgetSeconds(board(), 15), 15);
+assert.equal(marbleBoardBudgetSeconds(board(), 120), 120);
+
+// The native UI uses Python's ties-to-even round() when it prints tilt. JS
+// Math.round() would turn the negative half tie -1.5 into -1 instead of -2.
+assert.equal(marbleSourceRound(1.5), 2);
+assert.equal(marbleSourceRound(2.5), 2);
+assert.equal(marbleSourceRound(-1.5), -2);
+assert.equal(marbleSourceRound(-2.5), -2);
+assert.equal(marbleSourceRound(1.5000000000000004), 2);
+
+// MarbleMaze.update() checks physical settlement before the deadline. A
+// marble that falls into a hole on the boundary frame is therefore a physical
+// loss, not a timeout; only an unsettled tray at the deadline is timed out.
+{
+  const game = new MarbleMazeGame(board());
+  game.marbles[0].state = "lost";
+  game.elapsed = game.board.seconds;
+  assert.equal(marbleFeedbackKind(game, 0, game.board.seconds), "lost-single");
+  assert.equal(marbleFeedbackKind(game, 1, game.board.seconds), "won");
+
+  const timeout = new MarbleMazeGame(board());
+  timeout.elapsed = timeout.board.seconds;
+  assert.equal(marbleFeedbackKind(timeout, 0, timeout.board.seconds), "timeout");
+}
+
+// The native Simulation scales rolling spin together with a speed-capped
+// marble. The fallback must not leave a stale wy that the next floor contact
+// can feed back into motion.
+{
+  const game = new MarbleMazeGame(board());
+  game.marbles[0].vx = 3;
+  game.marbles[0].wy = 400;
+  game.step(1 / 60);
+  assert.ok(game.speed <= MARBLE.SPEED_CAP + 1e-9);
+  assert.ok(game.marbles[0].wy < 380,
+    "speed cap must scale the fallback's rolling spin");
+}
+
+// Direct stepping is a forward-time API in both browser adapters. Zero and
+// negative/non-finite values must not rewind elapsed time, run a backwards
+// physics solve, or create an unbounded loop from malformed replay data.
+{
+  const game = new MarbleMazeGame(board());
+  game.step(1 / 60);
+  const elapsed = game.elapsed;
+  const x = game.marbles[0].x;
+  game.step(0);
+  game.step(-1);
+  game.step(Number.POSITIVE_INFINITY);
+  game.step(Number.NaN);
+  assert.equal(game.elapsed, elapsed);
+  assert.equal(game.marbles[0].x, x);
 }
 
 // Arrow names must have the same compass signs as the original
@@ -27,23 +86,63 @@ function board(overrides = {}) {
   game.step(0.5);
   assert.ok(game.marbles[0].vx > 0.05);
   game.level();
-  game.step(5);
+  // The source clamp uses REST_SPEED, not the fallback's former 1.5x band;
+  // with the exact source threshold this trajectory crosses the band just
+  // after five seconds. Use the UI's 60 Hz advance partition rather than
+  // asking the direct four-substep API to integrate a multi-second frame.
+  for (let index = 0; index < 306; index++) game.advance(1 / 60);
   assert.ok(Math.hypot(game.marbles[0].vx, game.marbles[0].vy) < MARBLE.REST_SPEED);
 }
 
-// Restart returns the marble and levels the tray without refunding elapsed
-// time, matching MarbleMaze.restart() in the native UI.
+// The source UI constructs a fresh Simulation on restart, resetting elapsed;
+// its UI-owned fractional held-key accumulator survives until an idle update.
 {
   const game = new MarbleMazeGame(board());
   game.tilt("E");
   game.step(0.75);
-  const elapsed = game.elapsed;
+  assert.ok(game.elapsed > 0);
+  game.nudgeDue = 1 / 120;
   game.restart();
-  assert.equal(game.elapsed, elapsed);
+  assert.equal(game.elapsed, 0);
+  assert.equal(game.nudgeDue, 1 / 120);
   assert.equal(game.roll, 0);
   assert.equal(game.pitch, 0);
   assert.equal(game.marbles[0].x, game.board.starts[0].x);
   assert.equal(game.marbles[0].y, game.board.starts[0].y);
+  game.advance(1 / 120, new Set());
+  assert.equal(game.nudgeDue, 0);
+}
+
+// The native UI clears a released held-key accumulator even on an idle
+// update. A zero-delta blur/release callback must not carry a stale fraction
+// into the next non-zero frame.
+{
+  const game = new MarbleMazeGame(board());
+  game.nudgeDue = 1 / 120;
+  game.advance(0, new Set());
+  assert.equal(game.nudgeDue, 0);
+}
+
+// Positive frame-time remainders below the old 1 ns cutoff still advance the
+// source clock and simulation; the final bite is the remainder itself.
+{
+  const game = new MarbleMazeGame(board());
+  const dt = 5e-10;
+  game.advance(dt);
+  assert.equal(game.elapsed, dt);
+}
+
+// Simulation.step itself is exactly four equal substeps. The UI-level 50 ms
+// clamp and 60 Hz remainder partition belong to advance(), not to this
+// direct deterministic API. Keep the fallback's public contract identical to
+// the native source even when a replay supplies a long step.
+{
+  const game = new MarbleMazeGame(board());
+  const bites = [];
+  game.substep = (dt) => bites.push(dt);
+  game.step(0.05);
+  assert.deepEqual(bites, [0.0125, 0.0125, 0.0125, 0.0125]);
+  assert.equal(game.elapsed, 0.05);
 }
 
 // Held controls accumulate wall-clock time: a half-tick does not nudge yet,
@@ -57,6 +156,23 @@ function board(overrides = {}) {
   game.advance(1 / 240, new Set(["E"]));
   game.advance(1 / 240, new Set());
   assert.equal(game.nudgeDue, 0);
+}
+
+// The native UI finishes the complete capped frame before checking whether
+// the simulation settled. Its positive-remainder loop also executes the tiny
+// floating-point remainder after the three nominal 60 Hz bites.
+{
+  const game = new MarbleMazeGame(board());
+  let bites = 0;
+  const step = game.step.bind(game);
+  game.step = (dt) => {
+    step(dt);
+    bites++;
+    if (bites === 1) game.marbles[0].state = "home";
+  };
+  game.advance(0.05);
+  assert.equal(bites, 4);
+  assert.ok(Math.abs(game.elapsed - 0.05) < 1e-9);
 }
 
 // A clean roll spends two sevenths of the contact impulse on angular

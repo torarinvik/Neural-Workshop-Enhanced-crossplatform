@@ -49,8 +49,8 @@ def main() -> int:
     parser.add_argument("--stderr", type=Path, required=True)
     parser.add_argument("--compile-log", type=Path, required=True)
     parser.add_argument("--link-log", type=Path, required=True)
-    parser.add_argument("--compile-exit", type=int, default=0)
-    parser.add_argument("--link-exit", type=int, default=0)
+    parser.add_argument("--compile-exit", type=int, required=True)
+    parser.add_argument("--link-exit", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 

@@ -33,30 +33,88 @@ def py_gauss(rng: mutable MT19937&, cache: mutable GaussCache&, mu: f64, sigma: 
         return mu + z * sigma
 
 
-# `math.hypot`, which is NOT the platform's `hypot` and not the correctly
-# rounded value either. Measured against this CPython (3.9.6, Apple's) it is
-# the classic `max * sqrt(1 + (min/max)^2)`: 0 mismatches over 300,000 random
-# doubles across the range this port uses, plus the whole 60x60 integer grid.
-# Both alternatives were ruled out by the same measurement -- the correctly
-# rounded value differs on about a third of arguments, and clang's own libm
-# `hypot` differs on 1208 of those 3600 integer pairs.
-#
-# It matters where a hypot's VALUE is kept rather than compared. marblemaze's
-# Dijkstra sweep seeds its field with `hypot(di, dj) * pitch`, so a last-ulp
-# difference is stored and propagates through every distance downstream; a
-# naive `sqrt(a*a + b*b)` there moved cells in all 64 trays measured.
+# CPython 3.13's `math.hypot` is a compensated two-term Euclidean norm, not
+# the older `max * sqrt(1 + (min/max)^2)` approximation. The one-ulp change is
+# observable in Marble's stored Dijkstra distances and in the orientation of
+# tied salesman tours. Keep the reference algorithm here instead of calling a
+# host libm function so native and WASM use the same rounding steps.
+struct HypotDouble:
+    hi: f64
+    lo: f64
+
+def hypot_split(value: f64) -> HypotDouble:
+    # Dekker's Veltkamp split for a binary64 value. 2**27 + 1 is the smallest
+    # constant that separates the high and low 27-bit halves.
+    can Abort.Panic:
+        scaled: f64 = value * 134217729.0
+        high: f64 = scaled - (scaled - value)
+        return HypotDouble{hi: high, lo: value - high}
+
+def hypot_mul(one: f64, two: f64) -> HypotDouble:
+    # Error-free product transformation used by CPython when fma is not the
+    # selected primitive. All inputs here are finite and scaled below one.
+    can Abort.Panic:
+        left: HypotDouble = hypot_split(one)
+        right: HypotDouble = hypot_split(two)
+        product: f64 = left.hi * right.hi
+        low_product: f64 = left.hi * right.lo + left.lo * right.hi
+        high: f64 = product + low_product
+        return HypotDouble{hi: high, lo: product - high + low_product + left.lo * right.lo}
+
+def hypot_fast_sum(one: f64, two: f64) -> HypotDouble:
+    # Error-free compensated sum when |one| >= |two|. The norm accumulator
+    # maintains that invariant because it starts at one and only adds squares
+    # no larger than one.
+    can Abort.Panic:
+        high: f64 = one + two
+        return HypotDouble{hi: high, lo: (one - high) + two}
+
 def py_hypot(x: f64, y: f64) -> f64:
     can Abort.Panic:
-        big: mutable f64 = -x if x < 0.0 else x
-        small: mutable f64 = -y if y < 0.0 else y
-        if big < small:
-            swap: f64 = big
-            big <- small
-            small <- swap
-        if big == 0.0:
+        first: mutable f64 = -x if x < 0.0 else x
+        second: mutable f64 = -y if y < 0.0 else y
+        biggest: mutable f64 = first if first >= second else second
+        if biggest == 0.0:
             return 0.0
-        t: f64 = small / big
-        return big * sqrt(1.0 + t * t)
+
+        # Scale the maximum into [0.5, 1.0), matching frexp/ldexp for the
+        # bounded finite values used by the task kernels without requiring a
+        # platform-specific exponent primitive.
+        scale: mutable f64 = 1.0
+        while biggest >= 1.0 |biggest, scale|:
+            biggest <- biggest * 0.5
+            scale <- scale * 0.5
+        while biggest < 0.5 |biggest, scale|:
+            biggest <- biggest * 2.0
+            scale <- scale * 2.0
+        first <- first * scale
+        second <- second * scale
+
+        sum: mutable f64 = 1.0
+        fraction_one: mutable f64 = 0.0
+        fraction_two: mutable f64 = 0.0
+        product: mutable HypotDouble = hypot_mul(first, first)
+        addition: mutable HypotDouble = hypot_fast_sum(sum, product.hi)
+        sum <- addition.hi
+        fraction_one <- fraction_one + product.lo
+        fraction_two <- fraction_two + addition.lo
+        product <- hypot_mul(second, second)
+        addition <- hypot_fast_sum(sum, product.hi)
+        sum <- addition.hi
+        fraction_one <- fraction_one + product.lo
+        fraction_two <- fraction_two + addition.lo
+
+        result: mutable f64 = sqrt(sum - 1.0 + (fraction_one + fraction_two))
+        # One Newton-style differential correction gives the same correctly
+        # rounded result as CPython's vector_norm for ordinary finite inputs.
+        product <- hypot_mul(-result, result)
+        addition <- hypot_fast_sum(sum, product.hi)
+        sum <- addition.hi
+        fraction_one <- fraction_one + product.lo
+        fraction_two <- fraction_two + addition.lo
+        residual: f64 = sum - 1.0 + (fraction_one + fraction_two)
+        result <- result + residual / (2.0 * result)
+        return result / scale
 
 
 # Python's `round` is half-to-EVEN, not half-away-from-zero, and `int(round(x))`

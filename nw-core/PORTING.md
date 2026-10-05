@@ -10,6 +10,7 @@ writing Elisa in this repo; every item below cost a compile-fail cycle to find.
 source nw-core/scripts/env.sh          # pins them; gate ON
 ./nw-core/scripts/check.sh             # every differential suite, both stages
 ./nw-core/scripts/check.sh stage0      # fast inner loop
+./nw-core/scripts/build_latest_stage1_wasm.sh  # production browser artifact
 ```
 
 **The compilers are ours, and they live in `nw-core/toolchain/`.** Three
@@ -33,18 +34,29 @@ from. The directory is gitignored — rebuild it, don't commit it.
   to a downstream script's own `${ELISAC:-$HOME/.elisac/elisac}` default —
   which is how a suite once compared the other agent's compiler against itself
   and passed.
-- **Do not build the toolchain from the compilers' `work` branch.** `nw-port`
-  carries compiler fixes that `work` does not, and the port depends on one of
-  them: without `-fstrict-fp`, stage0 contracts `a + b * c` into an fma and
-  twohands, buzzwire and marblemaze stop matching CPython. Check with
-  `git log --oneline work..nw-port` before assuming the branches agree.
+- **Verify the selected compiler checkout before building.** The current
+  default Stage0 source is the clean `Go projects/Elisa-core` checkout and the
+  production Stage1 source is the clean sibling `Elisa-compiler` checkout at
+  the revision recorded in `docs/port-status.md`; both remain overridable via
+  `ELISA_CORE` and `ELISA_STAGE1_ROOT`. Keep strict floating-point mode enabled:
+  without it, stage0 may contract `a + b * c` into an FMA and twohands,
+  buzzwire, and marblemaze stop matching CPython.
 - Stage0 (`$ELISACORE_BIN`) has **no `-emit exe`** — use `-emit obj` then
   `clang -o out out.o`. Stage1 (`elisac_stage1`) does have `-emit exe`.
 - Always compile with `ELISA_STAGE1_SEMANTIC_GATE=1` (env.sh sets it). With the
   gate off, stage1 emits code **without semantic analysis** and accepts
   programs stage0 rejects.
+- `build_wasm.sh` is the Stage0 oracle build. The production browser artifact
+  must be built with `build_latest_stage1_wasm.sh`, which resolves the sibling
+  `Elisa-compiler` checkout (or `ELISA_LATEST_STAGE1_ROOT` and
+  `ELISA_LATEST_STAGE1_BIN`), refuses a stale Stage1 product, records its
+  revision/fingerprint, and runs the full artifact gate. Keep Stage0 for
+  differential diagnosis; do not let it silently replace the latest Stage1
+  browser artifact.
 - Verify on **both** stages. A divergence is by definition a compiler bug:
-  minimise it, save it under `worktrees/elisa-core-nw/repro/`, and report it.
+  minimise it, save it under the selected Elisa compiler checkout's `test/repro/`
+  directory (or a port-local `nw-core/test/repro/` fixture), and report the
+  exact source root and binary hashes.
 
 ## Language gotchas
 
@@ -463,7 +475,7 @@ its whole API is `mutable DisplayList&`, which is what a module block could not
 carry until the region fix below.
 
 Of the four things that blocked converting the rest, three are fixed. Repros are
-in `worktrees/elisa-core-nw/repro/`.
+in the selected Elisa compiler checkout's `test/repro/` directory.
 
   1. **Constants were not namespaced** -- FIXED. Two modules each declaring
      `SIZE` collapsed onto one table row and the second silently overwrote the

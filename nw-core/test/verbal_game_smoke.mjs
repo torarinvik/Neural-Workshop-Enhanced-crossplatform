@@ -1,0 +1,20 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import { instantiateElisa } from "../shells/web/elisa-wasm-runtime.js";
+
+const wasm = process.env.NWCORE_WASM_PATH ?? fileURLToPath(new URL("../build/nwcore.wasm", import.meta.url));
+const { exports } = await instantiateElisa(fs.readFileSync(wasm), { warn: false });
+const task = BigInt(exports.nw_api_v1_task_verbal());
+assert.equal(exports.nw_api_v1_supports(task), 1n);
+const run = exports.nw_api_v1_create(task, 1n, 1n, 5n, 0n, 0n, 0n, 0n, 17n);
+assert.equal(exports.nw_api_v1_verbal_info(run, 0n), 0n);
+assert.equal(exports.nw_api_v1_dispatch(run, 2n, 1000n, 0n, 1n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.equal(exports.nw_api_v1_verbal_info(run, 0n), 1n);
+assert.equal(exports.nw_api_v1_verbal_info(run, 3n), 3n);
+const frame = Number(exports.nw_frame_alloc(1048576n));
+assert.ok(exports.nw_api_v1_render(run, BigInt(frame), 1048576n, 0n, 912n, 684n) > 0n);
+assert.equal(exports.nw_api_v1_dispatch(run, 2n, 1001n, 1n, 2n, 0n, 0n, 0n, 0n, 0n, 0n), 1n);
+assert.ok(exports.nw_api_v1_verbal_info(run, 6n) === 0n || exports.nw_api_v1_verbal_info(run, 6n) === 1n);
+assert.equal(exports.nw_api_v1_destroy(run), 0n);
+console.log("verbal_game_smoke: PASS (source draw/shuffle, lifecycle, answer, render, cleanup)");

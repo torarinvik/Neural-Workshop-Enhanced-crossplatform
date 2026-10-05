@@ -1,0 +1,183 @@
+diff --git a/src/engine/engine_solver.c b/src/engine/engine_solver.c
+index 09c8751..a2e3731 100644
+--- a/src/engine/engine_solver.c
++++ b/src/engine/engine_solver.c
+@@ -1241,9 +1241,11 @@ typedef struct {
+   int LSresult;           // linesearch result
+   mjtNum LSslope;         // linesearch slope at solution
+   unsigned int marble_trace_valid;  // reset by PrimalPointers; diagnostic only
++  int marble_prepare_trace_ordinal;  // diagnostic association, never a solver operand
+ } mjPrimalContext;
+ 
+ #include "engine/marble_primal_prepare_trace.h"
++#include "engine/marble_primal_eval_trace.h"
+ 
+ // Diagnostic-only trace used by the Marble native/WASM parity investigation.
+ // Records Newton state at the first constraint update, line-search decisions,
+@@ -1805,6 +1807,7 @@ MJAPI void mj_solver_trace_copy(mjtNum* output) {
+ MJAPI void mj_solver_trace_run(const mjModel* model, mjData* data) {
+   mj_solver_trace_reset();
+   mj_solver_prepare_trace_begin();
++  mj_solver_eval_trace_begin();
+   extern void mj_constraint_update_trace_begin(void);
+   extern void mj_constraint_update_trace_end(void);
+   mj_constraint_update_trace_begin();
+@@ -1816,6 +1819,7 @@ MJAPI void mj_solver_trace_run(const mjModel* model, mjData* data) {
+   data->threadpool = threadpool;
+   mj_constraint_update_trace_end();
+   mj_solver_prepare_trace_end();
++  mj_solver_eval_trace_end();
+ }
+ 
+ static void marbleRecordNewtonState(const mjPrimalContext* ctx, int label,
+@@ -1868,6 +1872,7 @@ static void marbleRecordNewtonState(const mjPrimalContext* ctx, int label,
+ static void PrimalPointers(const mjModel* m, const mjData* d, mjPrimalContext* ctx, int island) {
+   // clear everything
+   memset(ctx, 0, sizeof(mjPrimalContext));
++  ctx->marble_prepare_trace_ordinal = -1;
+ 
+   // globals
+   ctx->is_sparse = mj_isSparse(m);
+@@ -2682,6 +2687,7 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+   deriv[0] += 2*alpha*quadTotal[2] + quadTotal[1];
+   deriv[1] += 2*quadTotal[2];
+ 
++  const mjtNum marble_unclamped_second = deriv[1];
+   // check for convexity; SHOULD NOT OCCUR
+   if (deriv[1] <= 0) {
+     mju_warning("Linesearch objective is not convex");
+@@ -2693,6 +2699,7 @@ static void PrimalEval(mjPrimalContext* ctx, mjPrimalPnt* p) {
+   p->deriv[0] = deriv[0];
+   p->deriv[1] = deriv[1];
+   ctx->LSiter++;
++  marbleRecordEvaluated(ctx, alpha, cost, deriv[0], deriv[1], marble_unclamped_second);
+   marbleRecordNewtonState(ctx, 3000 + marble_newton_eval_count++, alpha,
+                           cost, deriv[0], deriv[1]);
+ }
+diff --git a/src/engine/marble_primal_prepare_trace.h b/src/engine/marble_primal_prepare_trace.h
+index 4b89004..ccc7a61 100644
+--- a/src/engine/marble_primal_prepare_trace.h
++++ b/src/engine/marble_primal_prepare_trace.h
+@@ -26,7 +26,7 @@ MJAPI void mj_solver_prepare_trace_copy(mjtNum* out) {
+ 
+ // Called only AFTER PrimalSearch produces Mv/Jv and PrimalPrepare writes outputs.
+ // quad[3..8] is copied only for elliptic groups, never unused trailing storage.
+-static void marbleRecordPrepared(const mjPrimalContext* ctx) {
++static void marbleRecordPrepared(mjPrimalContext* ctx) {
+   if (!marble_prepare_enabled) return;
+   const int ordinal = marble_prepare_calls++;
+   const int nv = ctx->nv, nefc = ctx->nefc;
+@@ -115,5 +115,6 @@ static void marbleRecordPrepared(const mjPrimalContext* ctx) {
+     return;
+   }
+   marble_prepare_size += offset;
++  ctx->marble_prepare_trace_ordinal = ordinal;
+ }
+ #endif
+diff --git a/wasm/codegen/generated/bindings.cc b/wasm/codegen/generated/bindings.cc
+index 28f7c5a..ea004b2 100644
+--- a/wasm/codegen/generated/bindings.cc
++++ b/wasm/codegen/generated/bindings.cc
+@@ -52,6 +52,12 @@ extern "C" int mj_solver_prepare_trace_calls();
+ extern "C" int mj_solver_prepare_trace_overflow();
+ extern "C" int mj_solver_prepare_trace_invalid();
+ extern "C" void mj_solver_prepare_trace_copy(mjtNum*);
++extern "C" int mj_solver_eval_trace_schema();
++extern "C" int mj_solver_eval_trace_size();
++extern "C" int mj_solver_eval_trace_calls();
++extern "C" int mj_solver_eval_trace_overflow();
++extern "C" int mj_solver_eval_trace_invalid();
++extern "C" void mj_solver_eval_trace_copy(mjtNum*);
+ extern "C" int mj_solver_constraint_iteration_trace_overflow();
+ extern "C" void mj_solver_constraint_iteration_trace_copy(mjtNum*);
+ extern "C" int mj_solver_chol_solve_size();
+@@ -2257,6 +2263,16 @@ val marble_newton_trace_wrapper(const MjModel& m, MjData& d) {
+   output.set("prepareTraceCalls", mj_solver_prepare_trace_calls());
+   output.set("prepareTraceOverflow", mj_solver_prepare_trace_overflow() != 0);
+   output.set("prepareTraceInvalid", mj_solver_prepare_trace_invalid() != 0);
++  const int eval_size = mj_solver_eval_trace_size();
++  std::vector<mjtNum> eval_trace(eval_size);
++  mj_solver_eval_trace_copy(eval_trace.data());
++  val eval_values = val::array();
++  for (int i = 0; i < eval_size; ++i) eval_values.set(i, eval_trace[i]);
++  output.set("evalTrace", eval_values);
++  output.set("evalTraceSchema", mj_solver_eval_trace_schema());
++  output.set("evalTraceCalls", mj_solver_eval_trace_calls());
++  output.set("evalTraceOverflow", mj_solver_eval_trace_overflow() != 0);
++  output.set("evalTraceInvalid", mj_solver_eval_trace_invalid() != 0);
+   output.set("constraintIterationTraceOverflow", mj_solver_constraint_iteration_trace_overflow() != 0);
+   const int chol_size = mj_solver_chol_solve_size();
+   std::vector<mjtNum> chol_input(chol_size);
+diff --git a/src/engine/marble_primal_eval_trace.h b/src/engine/marble_primal_eval_trace.h
+new file mode 100644
+index 0000000..e896119
+--- /dev/null
++++ b/src/engine/marble_primal_eval_trace.h
+@@ -0,0 +1,66 @@
++// Diagnostic-only completed PrimalEval capture, paired to initialized preparation.
++#ifndef MARBLE_PRIMAL_EVAL_TRACE_H_
++#define MARBLE_PRIMAL_EVAL_TRACE_H_
++
++#define MARBLE_EVAL_TRACE_CAPACITY 300000
++static mjtNum marble_eval_trace[MARBLE_EVAL_TRACE_CAPACITY];
++static int marble_eval_size, marble_eval_calls;
++static int marble_eval_enabled, marble_eval_overflow, marble_eval_invalid;
++
++MJAPI void mj_solver_eval_trace_begin(void) {
++  marble_eval_size = marble_eval_calls = 0;
++  marble_eval_overflow = marble_eval_invalid = 0;
++  marble_eval_enabled = 1;
++}
++MJAPI void mj_solver_eval_trace_end(void) { marble_eval_enabled = 0; }
++MJAPI int mj_solver_eval_trace_schema(void) { return 1; }
++MJAPI int mj_solver_eval_trace_size(void) { return marble_eval_size; }
++MJAPI int mj_solver_eval_trace_calls(void) { return marble_eval_calls; }
++MJAPI int mj_solver_eval_trace_overflow(void) { return marble_eval_overflow; }
++MJAPI int mj_solver_eval_trace_invalid(void) { return marble_eval_invalid; }
++MJAPI void mj_solver_eval_trace_copy(mjtNum* out) {
++  if (out && marble_eval_size) {
++    memcpy(out, marble_eval_trace, (size_t)marble_eval_size*sizeof(mjtNum));
++  }
++}
++
++// quad/Jaref/Jv/D/type/id/contact/Gauss are in the associated preparation.
++// Only still-missing friction bounds plus fully assigned outputs are copied.
++static void marbleRecordEvaluated(const mjPrimalContext* ctx, mjtNum alpha,
++                                  mjtNum cost, mjtNum d0, mjtNum d1, mjtNum raw_d1) {
++  if (!marble_eval_enabled) return;
++  const int ordinal = marble_eval_calls++;
++  const unsigned int required = MARBLE_VALID_COST | MARBLE_VALID_JV |
++      MARBLE_VALID_SEARCH | MARBLE_VALID_MA | MARBLE_VALID_JAREF;
++  if ((ctx->marble_trace_valid & required) != required ||
++      ctx->marble_prepare_trace_ordinal < 0 || ctx->nv < 1 || ctx->nv > 512 ||
++      ctx->nefc < 0 || ctx->nefc > 65536 || ctx->ne < 0 || ctx->nf < 0 ||
++      ctx->ne+ctx->nf > ctx->nefc) {
++    marble_eval_invalid = 1;
++    return;
++  }
++  const int width = 13 + ctx->nefc + ctx->nf;
++  if (marble_eval_size + width > MARBLE_EVAL_TRACE_CAPACITY) {
++    marble_eval_overflow = 1;
++    return;
++  }
++  mjtNum* out = marble_eval_trace + marble_eval_size;
++  out[0] = 1;
++  out[1] = ordinal;
++  out[2] = ctx->marble_prepare_trace_ordinal;
++  out[3] = ctx->island;
++  out[4] = ctx->nv;
++  out[5] = ctx->nefc;
++  out[6] = ctx->ne;
++  out[7] = ctx->nf;
++  out[8] = alpha;
++  out[9] = cost;
++  out[10] = d0;
++  out[11] = d1;
++  out[12] = raw_d1;
++  if (ctx->nefc) memcpy(out+13, ctx->efc_R, (size_t)ctx->nefc*sizeof(mjtNum));
++  if (ctx->nf) memcpy(out+13+ctx->nefc, ctx->efc_frictionloss+ctx->ne,
++                      (size_t)ctx->nf*sizeof(mjtNum));
++  marble_eval_size += width;
++}
++#endif
+
