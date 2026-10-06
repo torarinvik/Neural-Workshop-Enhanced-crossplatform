@@ -57,8 +57,8 @@ export const MARBLE_GRADES = Object.freeze([
   "the gauntlet", "inhuman",
 ]);
 export const MARBLE_CORRIDOR_MM = Object.freeze([
-  51, 52, 51, 49, 50, 46, 47, 44,
-  45, 42, 43, 40, 42, 39, 38, 36,
+  51, 55, 54, 52, 52, 50, 50, 47,
+  48, 45, 46, 44, 45, 45, 44, 44,
 ]);
 export const MARBLE_GRADE_HOLES = Object.freeze([
   0, 1, 3, 5, 4, 7, 8, 11,

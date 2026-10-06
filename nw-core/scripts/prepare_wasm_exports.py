@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve the selected Elisa checkout in the browser export's runtime includes."""
+"""Resolve selected Elisa checkout markers in export-source runtime includes."""
 
 from __future__ import annotations
 

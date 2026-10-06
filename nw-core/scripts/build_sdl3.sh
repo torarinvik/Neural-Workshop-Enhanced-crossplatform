@@ -11,7 +11,7 @@ source "$ROOT/scripts/env.sh"
 mkdir -p "$ROOT/build"
 
 PROJECTS_ROOT="$(cd -- "$ROOT/../.." && pwd)"
-LATEST_ROOT="${ELISA_LATEST_STAGE1_ROOT:-$PROJECTS_ROOT/Elisa-compiler-latest-protocol-bound-fix}"
+LATEST_ROOT="${ELISA_LATEST_STAGE1_ROOT:-$PROJECTS_ROOT/Elisa-compiler-port-current-5417885}"
 LATEST_BIN="${ELISA_LATEST_STAGE1_BIN:-$LATEST_ROOT/bin/elisac-stage1}"
 
 SDL_CFLAGS="$(pkg-config --cflags sdl3 2>/dev/null || echo "-I/opt/homebrew/include")"
@@ -19,6 +19,7 @@ SDL_LIBS="$(pkg-config --libs sdl3 2>/dev/null || echo "-L/opt/homebrew/lib -lSD
 
 if [[ -n "${ELISA_SDL_COMPILER:-}" ]]; then
     NATIVE_COMPILER="$ELISA_SDL_COMPILER"
+    RUNTIME_ROOT="${ELISA_SDL_RUNTIME_ROOT:-$ELISA_STAGE1_ROOT}"
 else
     if [[ ! -x "$LATEST_ROOT/scripts/elisac_stage1.sh" || ! -x "$LATEST_BIN" ]]; then
         echo "build_sdl3.sh: latest Elisa Stage1 checkout/product missing" >&2
@@ -45,12 +46,19 @@ else
         fi
     fi
     NATIVE_COMPILER="$LATEST_BIN"
+    RUNTIME_ROOT="${ELISA_SDL_RUNTIME_ROOT:-$LATEST_ROOT}"
 fi
 
 printf 'Elisa Stage1 compiler: %s\n' "$NATIVE_COMPILER"
 
+SOURCE_TREE_PARENT="$(mktemp -d "$ROOT/build/sdl3-sources.XXXXXX")"
+SOURCE_TREE="$SOURCE_TREE_PARENT/source"
+trap 'rm -rf -- "$SOURCE_TREE_PARENT"' EXIT INT TERM HUP
+python3 "$ROOT/scripts/prepare_runtime_sources.py" \
+    "$ROOT" "$SOURCE_TREE" "$RUNTIME_ROOT"
+
 "$NATIVE_COMPILER" -emit obj -O2 -o "$ROOT/build/nwcore_native.o" \
-    "$ROOT/src/native/sdl_exports.elisa"
+    "$SOURCE_TREE/src/native/sdl_exports.elisa"
 
 SHIM_OBJ="$ROOT/build/sdl_runtime_shim.o"
 cc -c -fPIC -fno-builtin -O2 -o "$SHIM_OBJ" \

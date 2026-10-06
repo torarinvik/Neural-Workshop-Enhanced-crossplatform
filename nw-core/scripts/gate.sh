@@ -20,7 +20,7 @@ if ! source "$ROOT/scripts/env.sh"; then
 fi
 
 PROJECTS_ROOT="$(cd -- "$ROOT/../.." && pwd)"
-LATEST_STAGE1_ROOT="${ELISA_LATEST_STAGE1_ROOT:-$PROJECTS_ROOT/Elisa-compiler-latest-protocol-bound-fix}"
+LATEST_STAGE1_ROOT="${ELISA_LATEST_STAGE1_ROOT:-$PROJECTS_ROOT/Elisa-compiler-port-current-5417885}"
 LATEST_STAGE1_BIN="${ELISA_LATEST_STAGE1_BIN:-$LATEST_STAGE1_ROOT/bin/elisac-stage1}"
 if [[ ! -x "$LATEST_STAGE1_ROOT/scripts/elisac_stage1.sh" || ! -x "$LATEST_STAGE1_BIN" ]]; then
     echo "gate.sh: latest Elisa Stage1 checkout/product missing" >&2
@@ -87,6 +87,9 @@ step "generated web task registry matches reviewed manifest" \
 step "web menu stable-ID registry/order matches reviewed task catalog" \
     node "$ROOT/test/task_registry_test.mjs"
 
+step "web shell requires the complete common runtime v1 lifecycle" \
+    node "$ROOT/test/runtime_protocol_shell_contract_test.mjs"
+
 step "generic browser submit does not restore canned task grading" \
     node "$ROOT/test/task_submit_no_canned_answers_test.mjs"
 
@@ -105,6 +108,9 @@ step "stage1 freshness tests" \
 step "Elisa runtime include provenance" \
     env ELISA_STAGE1_ROOT="$LATEST_STAGE1_ROOT" \
         python3 -m unittest discover -s "$ROOT/test" -p runtime_include_provenance_test.py
+
+step "selected compiler runtime source materialization" \
+    python3 -m unittest discover -s "$ROOT/test" -p prepare_runtime_sources_test.py
 
 step "Marble Newton trace label-aware scalar semantics" \
     python3 -m unittest discover -s "$ROOT/test" -p marble_trace_test.py
@@ -144,6 +150,7 @@ for marble_oracle_test in marble_constraint_update_oracle_test.py \
         marble_capture_elapsed_test.py \
         marble_physical_capture_test.py \
         marble_visual_evidence_audit_test.py \
+        marble_physics_manifest_test.py \
         marble_speed_cap_hypot_test.py \
         marble_candidate_build_contract_test.py \
         marble_native_dot_oracle_test.py; do
@@ -205,6 +212,7 @@ smokes() {
         local script="$LATEST_STAGE1_ROOT/test/parity/${smoke}_smoke.sh"
         [[ -f "$script" ]] || continue
         if ELISA_CORE="$ELISA_CORE" \
+           ELISACORE_BIN="$ELISACORE_BIN" \
            ELISA_STAGE1_ROOT="$LATEST_STAGE1_ROOT" \
            ELISA_STAGE1_BIN="$LATEST_STAGE1_BIN" \
            bash "$script" >/dev/null 2>&1; then

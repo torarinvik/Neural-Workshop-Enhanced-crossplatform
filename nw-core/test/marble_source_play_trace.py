@@ -81,6 +81,28 @@ def sha256_path(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def current_promoted_artifact(manifest: dict[str, object]) -> dict[str, object]:
+    """Resolve current promotion by the live alias, not a date-specific key."""
+    current = manifest.get("currentArtifact", {}).get("artifact", {})
+    current_hash = current.get("wasmSha256")
+    matches = [record["promotedArtifact"]
+               for name, record in manifest.items()
+               if name.startswith("holeWallVisualClearanceCurrent")
+               and isinstance(record, dict)
+               and isinstance(record.get("promotedArtifact"), dict)
+               and record["promotedArtifact"].get("sha256") == current_hash]
+    if len(matches) != 1:
+        raise ValueError(
+            "physics manifest currentArtifact alias must match exactly one "
+            "current Marble clearance record")
+    promoted = matches[0]
+    if current.get("wasmBytes") != promoted.get("bytes"):
+        raise ValueError(
+            "physics manifest currentArtifact byte count disagrees with its "
+            "promoted Marble artifact")
+    return promoted
+
+
 def wheel_record_matches(distribution, path: Path) -> bool:
     """Check an installed wheel file against its distribution RECORD digest."""
     distribution_root = Path(distribution.locate_file("")).resolve()
@@ -3710,11 +3732,14 @@ def main() -> int:
             manifest_path = Path(__file__).resolve().parents[1] / "docs" / "marble-physics-manifest.json"
             manifest = json.loads(manifest_path.read_text())
             project_root = manifest_path.parents[2]
+            try:
+                promoted_artifact = current_promoted_artifact(manifest)
+            except ValueError as error:
+                raise SystemExit(str(error)) from error
             current_artifact = manifest["currentArtifact"]["artifact"]
             core_identity = browser_runtime.get("coreWasm", {})
             mujoco_identity = browser_runtime.get("mujoco", {})
-            expected_core_path = (manifest_path.parents[1] /
-                                  current_artifact["wasm"]).resolve()
+            expected_core_path = (project_root / promoted_artifact["path"]).resolve()
             expected_js = next((item for item in manifest["browser"]["runtimeFiles"]
                                 if item["path"].endswith("/mujoco.js")), None)
             expected_wasm = next((item for item in manifest["browser"]["runtimeFiles"]
@@ -3725,7 +3750,7 @@ def main() -> int:
             expected_wasm_path = (project_root / expected_wasm["path"]).resolve()
             expected_browser_files = (
                 (core_identity, "path", expected_core_path),
-                (core_identity, "sha256", current_artifact["wasmSha256"]),
+                (core_identity, "sha256", promoted_artifact["sha256"]),
                 (mujoco_identity, "jsPath", expected_js_path),
                 (mujoco_identity, "jsSha256", expected_js["sha256"]),
                 (mujoco_identity, "wasmPath", expected_wasm_path),
@@ -3743,7 +3768,7 @@ def main() -> int:
                 raise SystemExit(
                     "browser trace did not use the maintained MuJoCo JS/WASM pair")
             for path, expected_hash in (
-                    (expected_core_path, current_artifact["wasmSha256"]),
+                    (expected_core_path, promoted_artifact["sha256"]),
                     (expected_js_path, expected_js["sha256"]),
                     (expected_wasm_path, expected_wasm["sha256"])):
                 if sha256_path(path) != expected_hash:

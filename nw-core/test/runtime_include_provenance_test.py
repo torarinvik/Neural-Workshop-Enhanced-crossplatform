@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 INCLUDE_RE = re.compile(r"^\s*include\s+\"([^\"]*elisacore_std/[^\"]+)\"")
-OLD_RUNTIME_MARKER = "Go projects/Elisa-core/compiler/runtime/elisacore_std"
+ROOT_MARKER = "@ELISA_STAGE1_ROOT@"
 
 
 class RuntimeIncludeProvenanceTests(unittest.TestCase):
@@ -43,10 +43,14 @@ class RuntimeIncludeProvenanceTests(unittest.TestCase):
                 if match is None:
                     continue
                 include = match.group(1)
-                if OLD_RUNTIME_MARKER in include:
-                    failures.append(f"{source}:{line_number}: old runtime path: {include}")
+                expected_prefix = f"{ROOT_MARKER}/elisacore_std/"
+                if not include.startswith(expected_prefix):
+                    failures.append(
+                        f"{source}:{line_number}: runtime include must use the selected-root marker: {include}"
+                    )
                     continue
-                target = (source.parent / include).resolve()
+                relative = include[len(f"{ROOT_MARKER}/"):]
+                target = (self.stage1_root / relative).resolve()
                 try:
                     target.relative_to(self.stage1_root / "elisacore_std")
                 except ValueError:

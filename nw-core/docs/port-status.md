@@ -2,37 +2,89 @@
 
 ## Current deployed artifact state — 2026-10-05
 
-The 3D-only N-back cleanup and Marble hole/wall clearance fix remain installed
-in the production browser core, now rebuilt with Elisa-compiler upstream main
-`2691a64c7522c94eee0d5b0b930d1995c7376a3c` plus the inferred-generic-bound
-correction. Current assets and verification:
-
-- Stage1 `build/nwcore.wasm`: SHA-256
-  `4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`
-  (1,783,900 bytes; deterministic WASM module name `nwcore.wasm`);
-  Stage1 object SHA-256 `c8b332ab1d31e31ecd123319511602a4b34f21f9f9f63dc4681931a75f723319`.
-- Compiler pair: Elisa-core Stage0 upstream main
-  `6a0628cc48a7e019ed023c835b379fb55522ff1e` (binary SHA-256
-  `c0f5d0436730c017a4edc1a977f575fcce3f986043383826c477ee15d3f6667d`) and
-  Elisa-compiler Stage1 upstream main
-  `2691a64c7522c94eee0d5b0b930d1995c7376a3c` plus the local inferred-bound
-  correction (product SHA-256
-  `c1c1c7343d3cc544e1bcdb4f54a5e85a3c156e18c85874dc7c83e71aaa80ca7b`, source
-  fingerprint `a899d51329f24b78c12990a726c9dc5a506a56e192dedc15122ce2ddb3ed03f8`).
-  The durable clean clone is
-  `/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler-upstream-inferred-bound-fix`;
-  the separate dirty shared compiler checkouts were not modified. The matching
-  runtime object SHA-256 is
+- Production browser `build/nwcore.wasm` is now rebuilt and promoted from the
+  verified newer Elisa-compiler Stage1 snapshot `541788548651d43dd466d0b5210955eb966eb18e`,
+  which is eight commits ahead of live `main` `72a752820ab581d46bb17b3fb7158ba3879a16e`.
+  The WASM SHA-256 is
+  `292800bf992e1cc61bce540ad53c0fa1f89f18de0ae35641166f5bd6d92e73c0`
+  (1,783,900 bytes; deterministic module name `nwcore.wasm`); its Stage1 object
+  SHA-256 is `a8e8d596ad07afa2005b266c66e5770e31d2f102ba781e71a62b7908bd8bab01`.
+  The HTTP 200 response from `http://127.0.0.1:8000/build/nwcore.wasm` was
+  independently hashed and is byte-identical to that promoted artifact.
+- Exact build inputs: Stage1 product SHA-256
+  `5459f03e7efbaa228936223931bfca61a96e6b4ad0558aeb8bf495b861cab81a`
+  (source-tree SHA `e48688ca4edb0874d1f063844ec2e54e8faead200879aa4bbe5dd06fa7d65d5c`;
+  Stage1 provenance passes), Stage0 from Elisa-core
+  `f84b9c1034f708f69d048bd6cafb813e88c8210f` (SHA-256
+  `5f2c14780bb91b25feeef3e4dce685ba9199d264ab75f335b064741a138ea84e`), and
+  Stage1 runtime object SHA-256
   `b51e6114f0576681e432e1162a3dbdcdac46c140d3b7e7256c0069be0bd11897`.
-- The native CPython module remains the separately qualified prior Stage1
-  build (Python 3.13.12, extension SHA-256
-  `773fc16a4d1bc7b88e4504435d3acd00daa0f7d124f1807ee5141f0412990ffa`). It
-  was not rebuilt as part of this browser-WASM compiler refresh; do not describe
-  that extension as built by the Stage1 product above.
+  Runtime differences were accepted only by the content-addressed provenance
+  allowlist. The final-name candidate was kept separate until the complete
+  artifact gate passed, then atomically promoted.
+- Full latest-Stage1 artifact gate passes: configured task/browser contracts
+  (including only the 3D N-back task), Marble renderer/controller/physics and
+  lifecycle checks, 320 pit/cup/collar-to-wall boards, 80 board/MJCF cases, 80
+  generated plays, 3 adaptive sessions, and 275 trajectory scenarios / 33,982
+  frame states. Tolerances were not changed. The hole/collar minima are each
+  at least 3.000 mm; the independent source sweep remains 8,000 boards and
+  3,830,639 hole/wall pairs with a measured minimum of 3.000038215 mm.
+- A strict original-Python Marble play matrix was rerun against the exact
+  `292800bf…` production core: 80/80 traces pass; all scheduled inputs,
+  per-frame numeric values, contacts, discrete states, and terminal results
+  match, with zero numeric deltas and unchanged tolerances. Runtime files were
+  verified. Evidence is in
+  `output/verification/marble-source-play-current-5417885-20261005/`; replay
+  log SHA-256 is
+  `3d590945a1a6070d57fa39e9348b46d75a610ed90c900f88a5e14d5f25681059`.
+  This matrix is separate from the fixed canonical 7,601-event schedule.
+- The fixed canonical rung-16/run-seed-0/board-seed-827307999 schedule has also
+  been replayed separately on `292800bf…`: all 7,601 events pass, all public
+  numeric deltas are zero, contacts/discrete state/result are exact, and the
+  outcome is timeout at 120,017 ms (`home=0`, `lost=0`). Current trace SHA-256
+  is `72aae2daf18fb2b4d0a93278247d08773a7f6fb768e962c4ccc95550aebe0642`;
+  provenance SHA-256 is
+  `c94cd5892ad93be81bacdf95dbf304b0afface4326e614c354df896eda384003`.
+  The similarly named old replay receipt is still historical evidence for
+  `6b1751a5…`, not for this result.
+- The latest source/native Python extension is also built with this Stage1
+  product: Python 3.13.12 module SHA-256
+  `c4575aec550dff1fc21308a57ce7f284e90322c78b25d7a2972f4c54668ca5f8`
+  (2,925,888 bytes). Its 80-case MJCF oracle applies the shared Float32 board
+  ABI conversion, so all models match original source exactly; this corrects
+  the test's transport-boundary expectation, not physics or tolerance. Native
+  mesh parity covers 560 meshes over 80 boards, and strict synchronized
+  800x600/DPR1 source/native scene state passes. The extension links the port's
+  shim object (`d35099210e8afeaf75cd1e0e08acdb3674cbb2a7a2c8115fd55141c5f91e9c77`),
+  not the standalone compiler runtime archive.
+- The original 42 synchronized source/browser pairs were captured against the
+  prior 2691 Stage1 artifact
+  `4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`; those
+  images are historical, not exact-byte captures of the newly promoted
+  `292800bf…` build. One exact-current synchronized pair has now been captured
+  for rung 15/run seed 17/board seed `889418965`, whose closest pit-to-wall
+  clearance is `3.000605385750532 mm`. Source and browser naturally reach a
+  one-home/one-lost state at 2,933 ms; board geometry, camera and complete scene
+  state pass strict synchronization with zero failures. The 800x600/DPR1 light
+  stage is 99.2489% exact (MAE `0.226525`, RMSE `2.927396`), diagnostic only.
+  The combined inventory is now 43 pairs with zero synchronization failures;
+  pixel policy remains diagnostic-only (`accepted:false`). Exact pair hashes
+  and paths are in `marble-physics-manifest.json` under
+  `latestStage1HoleWallVisualPair`. The 43-pair zero-failure audit receipt is
+  `output/verification/marble-visual-inventory-audit-20261005-stage1-current-hole-wall/receipt.json`
+  (SHA-256 `6540c96f87baa14fcbebf268bd6364dfba33b0dbd75fad9036ce5d0e480292a5`).
+- The separately versioned port-owned toolchain cache
+  `nw-core/toolchain/` still needs an official Stage1/runtime stamp refresh.
+  Its Stage0 binary is already the exact `f84b9c1` product above. The selected
+  Stage1 product/runtime were used explicitly for this fully gated WASM build;
+  do not label the old port-owned Stage1 binary or the existing PROVENANCE
+  stamp as 5417885 outputs. Compiler-driver reject triage and shipping checks
+  remain open.
 - MuJoCo 3.12.0 JS/WASM: `e08297d7…` / `e5a36e90…`; reproducible through
   `scripts/build_marble_mujoco_wasm.sh`, pinned patch SHA
   `e2c0eaf4566f4ca3a8510bfa1178cc29ee25c9cff2d9b9eb85d9be810ff12362`.
-- Full latest-Stage1 artifact gate against the exact promoted bytes: pass; 320
+- Historical 2691 Stage1 source-play evidence: its then-promoted exact bytes
+  `4bd7b421…` passed 320
   3 mm hole/wall-clearance boards, 80 board/MJCF comparisons, 80 generated
   sessions, 3 adaptive sessions, and 275 trajectory scenarios / 33,982 frame
   states within existing tolerances. The strict 80-case generated
@@ -42,13 +94,13 @@ correction. Current assets and verification:
   `output/verification/marble-source-play-stage1-main2691-20261005/`; the
   source comparison log SHA-256 is
   `17407bf9127c82cad00d3029866365de732be97b976f8dda9c1a95a6425d7dcc`.
-  The retained 7,601-event rung16/run-seed0 hard trace was rerun against this
-  exact 3 mm geometry artifact: 7,601 scheduled inputs match structurally,
-  all per-frame source values/contacts/discrete states/result match exactly,
-  and no comparison tolerance was relaxed. Its outcome changed from one
-  physical loss on predecessor geometry to a 120,017 ms timeout with
-  home=0/lost=0 on the new geometry; this is recorded as an outcome change,
-  not hidden as a parity failure. October 4 receipts remain historical.
+  The legacy 7,601-event replay receipt described in a dated note was actually
+  run on predecessor core `6b1751a5…`, despite its historical filename and
+  manifest alias saying “current”; it is not evidence for `4bd7…` or the
+  present `292800bf…` bytes. Preserve it as predecessor evidence only. The
+  exact-current 80-case comparison and the separate canonical schedule replay
+  are both now independently verified on `292800bf…`. October 4 receipts
+  remain historical.
 - A fresh source-vs-browser-adapter trajectory run now passes 275 scenarios /
   33,982 frame states, including exact 60 Hz/50 ms boundaries, 16 generated-
   board variable-partition cases, 16 arbitrary-initial-state cases, and 80
@@ -58,17 +110,19 @@ correction. Current assets and verification:
   linear/angular velocity; the hole paths assert intended hole identity and
   terminal outcome. No tolerances were relaxed.
   Peak angular-velocity difference is `8.414e-10 rad/s` against the existing
-  `1e-7` limit. The complete current-artifact suite was rerun on the exact
-  current WASM without rebuilding. Test SHA-256:
+  `1e-7` limit. This detailed trajectory receipt was rerun on the then-promoted
+  predecessor Stage1 WASM `4bd7b421…` without rebuilding. The newer `292800bf…`
+  artifact independently passed the same 275-scenario / 33,982-state suite in
+  its complete promotion gate. Historical trajectory-test SHA-256:
   `d485e3fbd14a399018e80c97265de0b3a60062530249312b87812980cd70d574`.
   Detailed arbitrary-state receipt:
   `output/verification/marble-initial-state-parity-20261004/receipt.json`.
-- Latest-Stage1 packaging uses a uniquely named scratch directory but links
+- The 2691 Stage1 packaging used a uniquely named scratch directory but links
   the candidate with the final artifact basename. This avoids leaking a random
   temporary name into the WASM `name` section; the exact resulting bytes were
   fully gated before promotion. The prior browser artifact is recoverable at
   `/private/tmp/nw-upstream-latest-20261005.wN6wg8/nwcore-before-stage1-promotion-6b1751a5.wasm`.
-- Hole/wall geometry on the current promoted bytes: every pit and home-cup
+- Hole/wall geometry on the newly promoted `5417885` bytes: every pit and home-cup
   collar is at least 3.000 mm clear of all actual wall rectangles across 320
   ABI boards (up to 62 walls, 39 holes; 220 collars trimmed). The original
   Python source suite passes 47 tests and its UI/render suite passes 35 tests.
@@ -76,35 +130,55 @@ correction. Current assets and verification:
   3,830,639 hole/wall pairs and measured a 3.000038215 mm minimum. Browser and
   native mesh geometry continues to match the original Builder for 560 meshes
   across 80 boards. The promoted WASM is
-  `4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`.
-- The 32-pair visual-evidence audit below was captured against predecessor
-  compiler artifact `6b1751a591d2782629e2ad2c988bf89841635740650a630ba3c2dfd2839508a9`;
-  its synchronization results remain useful, but those screenshots are not
-  exact-byte evidence for the newly promoted artifact and need recapture before
-  making a current-build pixel claim. Its receipt is
-  `output/verification/marble-visual-inventory-audit-20261005-physical-win-two-roots/receipt.json`
+  `292800bf992e1cc61bce540ad53c0fa1f89f18de0ae35641166f5bd6d92e73c0`. The
+  independent source sweep and mesh parity remain source-level checks of the
+  same 3.0 mm rule.
+- The six earlier synchronized 3.0 mm source/browser pairs were captured
+  against predecessor compiler
+  artifact `6b1751a591d2782629e2ad2c988bf89841635740650a630ba3c2dfd2839508a9`;
+  their synchronization results remain useful, but those screenshots are not
+  exact-byte evidence for the intermediate `4bd7b421…` artifact. The original
+  42-pair inventory and its 2026-10-05 receipt remain historical for the newly
+  promoted `292800bf…` bytes. The added 43rd pair is exact-current evidence for
+  its closest-clearance partial-loss case; broader phase/viewport/theme
+  coverage remains outstanding. No human-reviewed pixel policy exists
+  (`accepted:false`).
+- One live 2691-artifact capture verified the ordinary Games → Attention
+  → Marble Maze → Enter → Space route and the served production bytes (HTTP 200,
+  exact SHA match for the then-current `4bd7…` build). At 1600x900 in a running tray, the home opening is visibly
+  separated from neighboring wall strips, though the gap is narrow at this
+  scale. PNG: `output/playwright/marble-maze-live-current-stage1-main2691-20261005.png`
   (SHA-256
-  `9c2bff894111cb9fd7943244dadcdfaed47270f4326f59a995b84e006b2a3e58`).
-  It remains diagnostic-only (`accepted:false`) until a pixel policy is
-  reviewed; further current-build phase/lifecycle and shipping-build checks
-  remain open.
+  `88cc549a7f836d931f8fcfa8e15a6795f0f3c0a063256ca6c7f5693adc686e91`). This
+  screenshot is not an exact-byte capture of current `292800bf…`, nor a
+  synchronized source pair or a pixel-acceptance result.
 - The 26 older retained source/browser visual pairs were captured against the
   predecessor WASM (`0e7aef1d…cdded3d`) before the 3.0 mm clearance update.
   They remain useful historical renderer/lifecycle diagnostics but are not
-  exact-current-artifact visual evidence. Six synchronized exact-current
-  pairs cover the minimum-clearance rung-15 board in a natural two-marble
-  partial-loss state at DPR2/light, plus a rung-16 rolling/DPR1/dark state at
-  800x600, matching light/dark rolling states at 1280x720, and a light-theme
-  no-board READY state at 1280x720, plus a naturally replayed rung-1 win at
-  67.1 seconds. They are corroborating evidence, not visual acceptance or
-  current-byte evidence for the new Stage1 compiler build.
+  evidence for the repaired geometry. Six later synchronized pairs cover the
+  minimum-clearance rung-15 board in a natural two-marble partial-loss state at
+  DPR2/light, a rung-16 rolling/DPR1/dark state at 800x600, matching light/dark
+  rolling states at 1280x720, a light-theme no-board READY state, and a natural
+  rung-1 win at 67.1 seconds. Those pairs were captured against the 3.0 mm
+  geometry on predecessor compiler artifact `6b1751a5…`; they are not exact-
+  byte visual evidence for either later artifact. Of the original inventory,
+  the newest synchronized evidence is exact for `4bd7…`; the separate 43rd
+  pair now covers the closest-clearance partial-loss case on `2928…`. Continue
+  refreshing source/browser phases and lifecycle pairs against the latter
+  before claiming broad exact-current visual coverage.
 - Only 3D N-back remains in the task catalog and WASM root; legacy 2D N-back
   scenes and exports are excluded. The 3D-only browser/controller checks pass.
-- The targeted Stage1 inferred-protocol-bound bug has positive/negative
-  regressions and passes on both compiler stages. Driver-acceptance comparison
-  on this exact patched Stage1 has 2 bare disagreements (0 accept-gaps, 2
-  reject-gaps; existing ratchet 6) and 0 with-stdlib disagreements. This is
-  not a claim that every Stage0/Stage1 diagnostic difference is resolved.
+- Historical Stage1 inferred-protocol-bound fix and its positive/negative
+  tests remain recorded in the 2691 checkpoint; the associated 2 bare / 0
+  with-stdlib driver disagreement result is not attributed to Stage1 `5417885`.
+  On the exact current Stage0 `f84b9c1` / Stage1 `5417885` pair, the focused
+  `test/parity/field_access_type_param_scope_smoke.sh` now passes: both stages
+  reject primitive-reference field access and invalid generic field accesses,
+  while accepting legitimate ref/value parameter shadowing in nested scopes.
+  The original `literal_init_out_of_range.pos.elisa` driver regression was
+  separately verified to exit 1 on both compilers. The complete current
+  driver-acceptance matrix is still open; these targeted checks do not claim
+  all Stage0/Stage1 diagnostic differences are resolved.
 - The WASM export now resolves runtime include placeholders from the selected
   `ELISA_STAGE1_ROOT`; the previous hard-coded `Elisa-compiler-latest` path
   mixed the latest checker with an older runtime that lacked required
@@ -115,9 +189,10 @@ The detailed source/browser loss, win, and DONE capture narratives immediately
 below, including their numeric `0e7aef1d…cdded3d` fetch receipts, are
 historical captures of the predecessor geometry. Within those dated capture
 notes, “current” means current on the capture date, not the present promoted
-WASM. Separate exact-current close-gap and rolling-tilt pairs are recorded at
-the end of this status file; the historical comparisons below do not supersede
-them. Broader visual acceptance remains open.
+WASM. Separate exact-current close-gap, rolling-tilt, READY, and natural-win
+pairs are recorded after the historical notes; those older comparisons do
+not supersede the exact-current evidence. Broader visual acceptance remains
+open.
 
 The historical physical-loss pair below exercised the predecessor WASM
 through the real browser menu and fixed-frame test input path. At rung 2 / run
@@ -6008,6 +6083,404 @@ The combined audit now has22 pairs, zero synchronization failures, and
 Broader DPR1 coverage, lifecycle/viewports, reviewed pixel policy, and shipping
 qualification remain open.
 
+#### Exact promoted Stage1 close-clearance visual pair — 2026-10-05
+
+Captured an additional synchronized source/browser pair on the exact promoted
+Stage1 artifact, closing the specific visual-evidence gap for holes closest to
+wall strips. The fixture is rung 15, run seed 17, board seed `889418965`; hole
+2 is closest to wall 22 with 3.000605385750532 mm physical circle-to-rectangle
+clearance. The original-source trace has 188 ordinary events: 178 fixed 60 Hz
+frames and 10 level actions. Both source and browser naturally reach physical
+loss at 2,933 ms with one of two marbles home and one lost. The trace contains
+no injected board, pose, phase, or outcome.
+
+The original Python source capture and browser replay use a light-theme
+800x600 logical surface at DPR2 (1600x1200 framebuffer). Browser navigation
+uses the normal Games → Attention → Marble Maze → Enter → Space route; the
+recorded directional/level actions are replayed as keyboard events with only
+the test clock and deterministic frame stepping controlled. The browser runs
+MuJoCo/WebGL2 with settled materials. It fetched HTTP 200 for the promoted
+1,783,900-byte `nw-core/build/nwcore.wasm`; response SHA-256 is exactly
+`4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`.
+
+The metadata and `marble_render_pair_test.py --require-synchronized
+--require-scene-state` checks pass with zero failures. Board geometry and
+captured scene states match; maximum camera-matrix absolute delta is
+`5.6434717343734064e-8`. Visual inspection shows the near-minimum-clearance
+opening visibly separated from its neighboring wall. The 1504x737 stage is
+99.6395% exact (MAE `0.1113024727`, RMSE `2.0639207744`); full-frame exactness
+is 98.4049% (MAE `1.5603260994`, RMSE `16.5943541336`). These are diagnostic
+measurements only; no pixel acceptance limits have been approved.
+
+Artifacts are under
+`output/playwright/current-stage1-clearance-20261005/`:
+
+- Source image: `source-close-gap-partial-loss-dpr2.png` (SHA-256
+  `11e1d8c0886367a12e9a130d224df72ed8d19f032ba9257fc80417b1afafc1d7`);
+  metadata JSON SHA-256
+  `3d7b02be2e10783648acee7140b24890ec6a1eb181beae4ab216d1444c016ed4`.
+- Browser image: `browser-close-gap-partial-loss-stage1-current.png` (SHA-256
+  `5c884978163614820c775e88978f4f14e8614b9063b7c0db051ffaa732027244`);
+  metadata JSON SHA-256
+  `97cb0662286ea7ddee88f9c524de442974b73fae4055c5f752e85f006fb4c879`;
+  debug JSON SHA-256
+  `0637677f69304ad4acf8ab507c99712e24f8a74bcaad6a92b211278f8f541ae4`.
+- Source trace:
+  `output/verification/marble-source-play-clearance-20261005/traces/15-17.json`
+  (SHA-256 `5d8206710f7a13dc0ffe5f2ca41f4f515aa62145badc5eaead3f05a791432f8d`).
+
+The refreshed two-root inventory lists 33 pairs, has zero synchronization
+failures, and remains `accepted:false`. Receipt:
+`output/verification/marble-visual-inventory-audit-20261005-stage1-current-close-gap/receipt.json`
+(SHA-256 `b5ffebe9533943c4703d7968b594f67b5a2db2e06915a55c8948aedfc6886b45`).
+This is exact-current-build evidence for the closest-clearance visual case,
+not overall Marble visual acceptance or shipping qualification. Recapture
+remaining phases and lifecycle transitions on the promoted bytes, then seek a
+human-reviewed regional pixel policy.
+
+#### Exact promoted Stage1 rung-16 rolling/tilt pair — 2026-10-05
+
+Captured another synchronized pair on the exact Stage1 browser core. Original
+Python Marble and browser both use rung16, run seed17, board seed `889418965`,
+and the same 800x600 logical surface at DPR2 (1600x1200 framebuffer). Both
+receive 30 ordinary eastward held-key frames at 60 Hz, then release; they end
+at 500 ms with roll0.14 radians, pitch0, and the same three rolling marbles.
+The theme is dark, the run has five trays, and the level-derived budget is
+140 seconds. The browser reached the task through Games → Attention → Marble
+Maze, set Level16 in the in-game options, applied with Enter, and started with
+Space. Only test-clock/frame stepping is controlled; no board, pose, or phase
+is injected.
+
+The browser's served WASM fetch returned HTTP200/1,783,900 bytes, with SHA-256
+`4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`, exactly
+the promoted core. MuJoCo/WebGL2 and settled materials are confirmed. Browser
+metadata validation and strict
+`marble_render_pair_test.py --require-synchronized --require-scene-state`
+both pass with zero failures, exact board/scene state, and maximum camera
+delta `5.6434716899644854e-8`. The 1504x737 stage is 99.7237% exact (MAE
+`0.0376400`, RMSE `0.878894`); the full 1600x1200 frame is 98.8155% exact
+(MAE `1.201673`, RMSE `14.82503`). These remain diagnostic pixel statistics,
+not approved thresholds.
+
+Source image and metadata are
+`output/playwright/current-stage1-rolling-20261005/source-r16-seed17-east30-dpr2-dark.{png,json}`;
+SHA-256 values are `b6045fbd4846bc0234c09bc95828c318a1e7d842fabfc73a4b0e3b97fae3be36`
+and `b560c9141ee78c6c556383cd49cb3a411cb4c404ca983f44dd263ca8051e5c95`.
+Browser image, metadata, and debug snapshot share the same prefix; SHA-256
+values are `b2379dbcb22dee12d97a2cf1c763381884e23ffe8a4adeb17c7036a8a34bc2f9`,
+`e9c6cc85efc2960ade9ca18d14bb116f8466284424079cd5b73b7d50bd4a391f`, and
+`afb91d330fc89e6d412e04cad51d3a610804462977bf90b83fa0b782ab2d7f9a`.
+
+At this rolling-pair checkpoint, the two-root visual inventory listed 34 pairs
+with zero synchronization failures and remained `accepted:false`. Receipt:
+`output/verification/marble-visual-inventory-audit-20261005-stage1-current-rolling/receipt.json`
+(SHA-256 `74c493f8cc0d4666a624af01bb388dbe902841a35ae8244ff5e2ba18ed46ff24`).
+This adds exact-current evidence for one rolling high-rung dark/DPR2 case; it
+does not close the other phase/viewport/theme, lifecycle, pixel-policy, or
+shipping gates.
+
+#### Exact-current-Stage1 rung-16 READY source/browser pair — 2026-10-05
+
+Captured before board creation at rung16, run-seed17, zero elapsed time, five
+trays, adaptive leveling disabled, and the source's By-level (zero override)
+time setting. Both use an 800x600 logical view at DPR2 (1600x1200 framebuffer)
+in dark theme. The browser reached the READY prompt through the real Games →
+Attention → Marble Maze route, applied these options through the ordinary `C`
+options screen, and stopped before pressing Space; no board, pose, phase, or
+time was injected. Its served 1,783,900-byte WASM returned HTTP200 and matched
+promoted artifact `4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`.
+
+`marble_browser_pair_metadata.py` and strict
+`marble_render_pair_test.py --require-synchronized --require-scene-state` pass
+with zero failures: both scenes are READY with no board or marbles, camera
+delta0, and the full 1504x737 task stage is pixel-identical. The full frame is
+99.1524% exact (MAE `1.094473`, RMSE `14.546481`), diagnostic only because no
+pixel acceptance thresholds have been reviewed. The browser renderer remains
+pending because no board has been created, as expected. Source/browser files
+are under `nw-core/output/playwright/current-stage1-ready-20261005/`; all PNG,
+metadata, debug, and artifact hashes are in
+`nw-core/docs/marble-physics-manifest.json`. At this READY-capture checkpoint,
+the refreshed 35-pair inventory
+has zero synchronization/state failures and remains `accepted:false`; receipt
+`nw-core/output/verification/marble-visual-inventory-audit-20261005-stage1-current-ready/receipt.json`
+(SHA-256 `98b6638e88313922685ff08b63c5149b2fcda8099f5116a74043c1fb4681cf2b`).
+
+#### Exact-current-Stage1 natural physical win source/browser pair — 2026-10-05
+
+Captured a naturally earned rung-1 win against the exact promoted Stage1
+artifact `4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`
+(1,783,900 bytes). The fixture uses run seed 1, generated board seed
+`288545018`, a 120-second limit, light theme, and a 1280x720 CSS viewport at
+DPR1. The retained trace has 4,179 events (4,026 fixed 60 Hz frames and 153
+level actions). Source and browser both naturally reach `won` at 67,100 ms
+with one marble home and none lost. The source follows the original task
+update path; the browser follows title → Games → Attention → Marble Maze →
+Space and replays ordinary keyboard input. Neither side receives an injected
+board, pose, phase, or result.
+
+The browser served the exact promoted WASM bytes with HTTP 200. Its renderer is
+WebGL2/MuJoCo, all three material maps settled, and console errors/warnings are
+zero. Strict `marble_render_pair_test.py --require-synchronized
+--require-scene-state` passes with exact Float32 board geometry and all trace
+states synchronized; maximum camera delta is `5.643471734e-8`. At the
+1203x439 task stage, exact pixels are 99.9716% (MAE `0.007519798`, RMSE
+`0.536298`); the complete 1280x720 frame is 98.3460% exact (MAE `1.338255`,
+RMSE `14.340943`). These measurements are diagnostic only; no pixel threshold
+has been approved.
+
+Images, metadata, and browser debug data are under
+`output/playwright/current-stage1-win-20261005/`; their hashes, along with the
+trace hash, are indexed in `docs/marble-physics-manifest.json`. The refreshed
+two-root inventory lists 36 pairs, has zero synchronization/state failures,
+and remains `accepted:false`. Receipt:
+`output/verification/marble-visual-inventory-audit-20261005-stage1-current-win/receipt.json`
+(SHA-256 `23a207c014651ab8ebf482acf721554771916ff824df7c7dc141d7d4a0cb1b21`).
+This closes the exact-current natural-win capture gap only; timeout,
+cleanup/restart, broader viewport/theme coverage, reviewed pixel policy, and
+shipping qualification remain open.
+
+#### Exact-current-Stage1 natural timeout source/browser pair — 2026-10-05
+
+The rung-1/run-seed-17 board (board seed `889418965`) is captured at its
+natural 15,000 ms timeout against promoted Stage1 WASM
+`4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`
+(1,783,900 bytes). It uses one tray, adaptive leveling off, shadows on, a
+light 1280x720 CSS view, and DPR2. The original source and browser each advance
+900 neutral fixed 60 Hz frames from an ordinary run start. The browser reaches
+Marble Maze through title → Games → Attention → Marble Maze → Enter → Space;
+no board, pose, elapsed-time snapshot, result, or terminal phase is injected.
+The marble stays rolling at the start location as the time limit expires and
+both sides display `Out of time — 0 of 1 home`.
+
+The browser served the exact promoted WASM over HTTP 200; MuJoCo and WebGL2
+were active, all three material maps settled, and the final browser console
+had zero errors/warnings. Strict synchronized metadata and scene-state
+comparison pass with zero failures, including exact board geometry and marble
+state; maximum camera delta is `5.6434717343734064e-8`. The 2406x886 stage is
+99.9845% exact (MAE `0.003515321`, RMSE `0.358317`); the full 2560x1440 image is
+99.0850% exact (MAE `1.059005`, RMSE `14.143707`). Pixel metrics remain
+diagnostic only; no acceptance limit has been approved.
+
+The source/browser PNGs, metadata, and browser debug JSON are under
+`output/playwright/` with prefix
+`current-stage1-timeout-r1-seed17-15s-20261005-`; file and artifact hashes are
+in `docs/marble-physics-manifest.json`. The refreshed two-root inventory has
+37 pairs, zero synchronization/state failures, and remains `accepted:false`.
+Receipt:
+`output/verification/marble-visual-inventory-audit-20261005-stage1-current-timeout/receipt.json`
+(SHA-256 `64c22ce9d1702640d14069258f8814c59ca75e1e40acb624f61e64824af16954`).
+This closes the exact-current timeout screenshot pair.
+
+#### Exact-current-Stage1 R-key restart source/browser pair — 2026-10-05
+
+This rung16/run-seed17, board-seed-`889418965` capture uses one tray, the
+level-derived 140-second budget, light theme, and a 1280x720 CSS view at DPR2.
+On exact promoted Stage1 WASM
+`4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`, source
+and browser both start normally, tilt east for 30 fixed 60 Hz frames, release
+for 12, restart using the original source method and the browser's ordinary
+`R` key, then run 12 neutral frames. The board seed is preserved; 0.14-radian
+pre-restart tilt resets to zero, the timer resets, and the three marbles
+return to the exact source start positions before the final 200 ms state.
+Nothing in the board, pose, or controller is injected.
+
+The served 1,783,900-byte WASM matches the promoted hash with HTTP 200. MuJoCo
+and WebGL2 are live, all material maps settled, and browser console errors and
+warnings are zero. Resource counters show two model/data instances created,
+one disposed, and one live after restart. Strict source/browser state and
+render synchronization passes with zero failures; geometry and all marble
+poses match, with maximum camera delta `5.6434716899644854e-8`. The 2406x886
+stage is 99.8288% exact (MAE `0.0535361`, RMSE `1.443811`); the whole
+2560x1440 frame is 98.8710% exact (MAE `1.220513`, RMSE `14.966181`). These
+remain diagnostic pixel statistics, not accepted thresholds.
+
+PNG, metadata, and browser debug hashes are in
+`docs/marble-physics-manifest.json` under prefix
+`current-stage1-restart-r16-seed17-20261005-`. The two-root inventory lists
+38 pairs, zero synchronization/state failures, and remains `accepted:false`;
+receipt:
+`output/verification/marble-visual-inventory-audit-20261005-stage1-current-restart/receipt.json`
+(SHA-256 `1c3a442b084450a410def7d260a0d6c57c4b0a4c59cedc50de0196adab276740`).
+This closes the same-page leave/re-entry lifecycle case as well; renderer/physics
+recovery, additional theme/viewport pairs, reviewed pixel policy, and shipping
+qualification remain open.
+
+#### Exact-current-Stage1 same-page Marble Maze re-entry source/browser pair — 2026-10-05
+
+Captured rung16/run-seed17/board-seed `889418965` on the exact promoted
+1,783,900-byte Stage1 WASM, SHA-256
+`4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`. In one
+browser page, the run starts through the ordinary menus, exits to Games with
+Escape, re-enters the selected Marble Maze with Enter and Space, and advances
+12 neutral fixed 60 Hz frames. Source and browser reach the same rolling state
+at 200 ms with three marbles and identical board geometry, camera, and scene
+state. No board, pose, controller state, or phase is injected. The run uses one
+trial, adaptive leveling disabled, the level-derived 140-second budget, light
+theme, 1280x720 CSS viewport, and DPR2 (2560x1440 framebuffer).
+
+Lifecycle counters prove disposal and recreation: the first MuJoCo model/data
+pair is gone after exit (`created 1 / deleted 1 / live 0`); immediately after
+re-entry and before its first frame the live count remains zero; after 12
+frames a fresh pair exists (`created 2 / deleted 1 / live 1`). WebGL2/MuJoCo
+are active, materials are settled 3-of-3, the served WASM is HTTP200 and hash
+identical to the promoted bytes, and final browser console errors/warnings are
+zero.
+
+`marble_browser_pair_metadata.py` and strict
+`marble_render_pair_test.py --require-synchronized --require-scene-state`
+pass with zero failures; maximum camera delta is `5.6434716899644854e-8`. The
+2406x886 stage is 99.8288% exact (MAE `0.0535361`, RMSE `1.443811`); full-frame
+exactness is 98.9564% (MAE `1.130569`, RMSE `14.446705`). Pixel results remain
+diagnostic only. PNG, metadata, and debug JSON hashes are indexed under
+`latestStage1ReentryVisualPair` in `docs/marble-physics-manifest.json`. The
+two-root audit now lists 39 pairs, zero synchronization/state failures, and
+`accepted:false`; receipt
+`output/verification/marble-visual-inventory-audit-20261005-stage1-current-reentry/receipt.json`
+(SHA-256 `3ca8cf835e2016d1475e9df7f8af9b900ba22a98be607ad20fe48e3535a35770`).
+
+#### Exact-current-Stage1 live WebGL context-loss recovery — 2026-10-05
+
+On the exact promoted Stage1 WASM
+`4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`, started
+a normal rung16/run-seed17/board-seed-`889418965` run and advanced it 12
+neutral 60 Hz frames. The headed browser then exercised the real
+`WEBGL_lose_context` extension on the task's WebGL2 canvas, waited for the
+shell to report `recovering`, and restored the context. This is an actual GL
+context-loss event, not a mocked renderer callback.
+
+During loss, the old renderer remains the recovery owner while renderer state
+is `recovering`; the controller remains rolling at 200 ms with all three
+marbles unchanged, and the MuJoCo model/data counts remain one live instance.
+On restoration, the application creates a replacement WebGL2 renderer, fully
+disposes the old renderer and clears its callbacks, restores the 3D stage, and
+settles all 3 material maps. Exactly one task canvas remains. The exact WASM
+was served with HTTP200 and matching SHA; browser console errors and warnings
+are both zero. The retained receipt is
+`output/playwright/current-stage1-context-recovery-r16-seed17-20261005.json`
+(SHA-256 `58d564c6fccfbe559ea546f645ac468813d74c1117d10156ca29ca00776d5cce`);
+its Playwright harness path and hash are also recorded in the physics manifest.
+
+This closes the real renderer context-loss/restoration scenario for the
+current browser artifact only. It is not a source/browser pixel pair and does
+not cover every renderer-construction fault or MuJoCo initialization/retry
+failure. Existing `node test/marble_renderer_contract_test.mjs` also passes.
+
+#### Exact-current-Stage1 physics fallback and retry recovery — 2026-10-05
+
+Exercised a complete fallback/retry lifecycle on the exact promoted Stage1
+WASM `4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`
+(1,783,900 bytes). Test-only query hooks deliberately force initial MuJoCo
+load failure, then one failed retry. The UI continues to identify the fallback
+engine, marks the retry as failed, and leaves the retry control visible and
+enabled while the controller is board-less READY. The test removes only the
+retry-failure flag from the current URL and retries again; this loads the real
+MuJoCo module successfully in READY and hides the retry control before play.
+
+After ordinary Space start and 12 fixed 60 Hz frames, the game is running on
+MuJoCo/WebGL2 at rung16, run-seed17, board-seed `889418965`, elapsed200ms, with
+three marbles, settled 3-of-3 material maps, and exactly one live MuJoCo
+model/data pair. The served core is HTTP200 and byte-identical to the promoted
+WASM. There are zero browser errors; the two recorded console warnings are
+the expected, deliberately injected initial-load and first-retry failures.
+The full browser receipt is
+`output/playwright/current-stage1-physics-retry-recovery-r16-seed17-20261005.json`
+(SHA-256 `fa1c70c4bb412ed2ac8be55e9438c9d71b786eb2ea0e5c29d6a23082f5f4eed1`),
+and its headed driver hash/path are in the physics manifest.
+
+This proves the opt-in injected fallback/retry flow and subsequent real
+recovery, not every network failure mode or a source/browser visual pair.
+
+#### Exact-current-Stage1 rung-16 rolling DPR1/light source/browser pair — 2026-10-05
+
+Captured the same rung16/run-seed17/board-seed `889418965` east-tilted rolling
+fixture at 1280x720 logical pixels and DPR1, light theme. The source and real
+browser each receive 30 east-held 60 Hz frames: both are at 500 ms, roll
+`0.14` radians (8 degrees), pitch zero, and three rolling marbles. The browser
+uses the real title → Games → Attention → Marble Maze → Enter → Space route,
+followed by 30 actual ArrowRight-held fixed frames. No board, pose, result,
+phase, or marble state is injected. It uses WebGL2/MuJoCo and reaches
+`settled:3-of-3` material state; its served HTTP200 WASM is byte-identical to
+the promoted 1,783,900-byte Stage1 artifact
+`4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`.
+Browser console errors/warnings are zero.
+
+`marble_browser_pair_metadata.py` and strict
+`marble_render_pair_test.py --require-synchronized --require-scene-state`
+pass with zero failures; Float32 board geometry, full scene state, camera, and
+frame dimensions match, with maximum camera delta
+`5.6434716899644854e-8`. The 1203x439 stage is 99.6559% exact (MAE
+`0.1092119`, RMSE `2.080275`); full-frame exactness is 98.5171% (MAE
+`1.043279`, RMSE `12.355948`). These measurements are diagnostic only. Visual
+inspection confirms holes remain clearly separated from adjacent wall strips
+in this DPR1/light frame too.
+
+Images and JSON metadata/debug evidence are under
+`output/playwright/current-stage1-rolling-dpr1-light-20261005/`; individual
+hashes and provenance are recorded in the physics manifest. The refreshed
+two-root inventory lists 40 pairs, zero synchronization failures, and remains
+`accepted:false`; receipt
+`output/verification/marble-visual-inventory-audit-20261005-stage1-current-rolling-dpr1-light/receipt.json`
+(SHA-256 `78d8798df590cda3f50de65946642da2f01db908bdfb2dbdcf36c6d1a5092d3d`).
+
+#### Exact-current-Stage1 rung-16 rolling DPR1/dark source/browser pair — 2026-10-05
+
+Captured the dark-theme counterpart to the DPR1/light pair at 1280x720 CSS and
+framebuffer. Both replay the same rung16/run-seed17/board-seed `889418965`
+state after 30 east-held 60 Hz frames: rolling at 500 ms, roll `0.14`, pitch0,
+three marbles. The browser uses the ordinary game route and the theme checkbox;
+it serves promoted WASM `4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`
+byte-for-byte (HTTP200, 1,783,900 bytes), with WebGL2/MuJoCo, 3-of-3 materials
+settled, and zero console errors/warnings. No board or pose is injected.
+
+Strict metadata and scene-state comparison pass without failures; geometry,
+marble/controller state, time, and camera synchronize (camera max delta
+`5.6434716899644854e-8`). The 1203x439 stage is 99.6559% exact (MAE
+`0.0468589`, RMSE `0.978129`); whole-frame exactness is 98.7939% (MAE
+`0.951299`, RMSE `12.145638`). All pixels remain diagnostic-only. The dark
+frame also visibly preserves separation between hole rims and nearby wall
+strips.
+
+Artifacts and hashes are in
+`output/playwright/current-stage1-rolling-dpr1-dark-20261005/` and the
+`latestStage1RollingDpr1DarkVisualPair` manifest entry. The refreshed two-root
+inventory lists 41 pairs with zero synchronization failures and
+`accepted:false`; receipt
+`output/verification/marble-visual-inventory-audit-20261005-stage1-current-rolling-dpr1-dark/receipt.json`
+(SHA-256 `1258c5f5c932f42c6ec7ae162fc198bf18306a45734b230d4e027f97a36436fc`).
+
+#### Exact-current-Stage1 rung-16 rolling 800x600/DPR1 light source/browser pair — 2026-10-05
+
+Captured the same physical rung16/run-seed17/board-seed `889418965` rolling
+fixture at the alternate 800x600 viewport, DPR1, light theme. Original source
+and real browser each receive 30 east-held fixed 60 Hz frames, reaching 500 ms,
+roll `0.14`, pitch0, and three marbles. The browser follows the ordinary
+title → Games → Attention → Marble Maze → Enter → Space route and actual
+ArrowRight input; no board, pose, result, or phase is injected. The browser
+serves the promoted Stage1 WASM byte-for-byte (HTTP200, 1,783,900 bytes,
+SHA-256 `4bd7b4217c2fd57b88ee19db62d9ccd6f1f4717414f5500692ef5fefcf9b79c5`),
+uses WebGL2/MuJoCo, and settles all three material maps. Console errors and
+warnings are zero. Visual inspection confirms the hole/cup openings remain
+separated from neighboring wall strips at this viewport too.
+
+Strict metadata and synchronized scene-state comparison pass with no failures;
+camera maximum delta is `5.6434716899644854e-8`. The 752x364 stage is 99.4502%
+exact (MAE `0.1739866`, RMSE `2.617171`); the complete 800x600 frame is 97.9925%
+exact (MAE `0.6846604`, RMSE `6.565277`). Pixel metrics remain diagnostic, not
+accepted limits. The two-root inventory now lists 42 pairs with zero
+synchronization failures and `accepted:false`; audit, metadata, and render-pair
+contract tests pass. Receipt
+`output/verification/marble-visual-inventory-audit-20261005-stage1-current-rolling-800x600-light/receipt.json`
+(SHA-256 `61246c39823393684d3283eb5926e9f119fa41ef3876f19e740fb41207268da1`).
+Capture evidence and hashes are in `output/playwright/current-stage1-rolling-800x600-light-20261005/`
+and `latestStage1Rolling800x600LightVisualPair` in the physics manifest.
+
+**Remaining Marble-first work:** current Stage1 now has this second viewport
+shape and 10 synchronized visual pairs; broaden matched phase/theme/DPR and
+viewport coverage, then obtain human review of a regional pixel policy.
+Rebuild/verify the standalone native CPython extension from the latest Stage1
+compiler. Shipping qualification and remaining compiler-driver rejects remain
+open. Keep the 3.0 mm clearance and strict source/trajectory gates.
+
 #### Exact current-build DPR1 dark-theme counterpart — 2026-10-04
 
 Captured the same rung16/seed17/board889418965 physical tilt at DPR1 in dark
@@ -6174,7 +6647,7 @@ visual inventory now covers 31 pairs with zero synchronization failures and
 Further current-build run/feedback/terminal lifecycle phases, pixel-policy
 review, compiler driver triage, and shipping-build qualification remain open.
 
-#### Exact-current-WASM natural physical win and trace-timed source capture — 2026-10-05
+#### Predecessor-WASM natural physical win and trace-timed source capture — 2026-10-05
 
 Added a synchronized, naturally reached win capture on the exact promoted
 3.0 mm-clearance artifact. The fixture is rung1/run-seed1/board-seed

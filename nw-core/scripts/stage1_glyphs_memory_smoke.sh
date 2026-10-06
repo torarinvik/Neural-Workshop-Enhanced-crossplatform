@@ -12,7 +12,10 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM HUP
 
-SOURCE="$ROOT/test/repro/stage1_glyphs_compile_memory.elisa"
+SOURCE_ROOT="$WORK/source"
+python3 "$ROOT/scripts/prepare_runtime_sources.py" \
+    "$ROOT" "$SOURCE_ROOT" "$ELISA_STAGE1_ROOT"
+SOURCE="$SOURCE_ROOT/test/repro/stage1_glyphs_compile_memory.elisa"
 for optimization in O1 O2; do
     OUTPUT="$WORK/glyphs-$optimization.ll"
     "$ELISA_STAGE1_ROOT/scripts/elisac_stage1.sh" \

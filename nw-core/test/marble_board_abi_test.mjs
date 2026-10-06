@@ -17,7 +17,7 @@ let minimumCollarWallClearance = Number.POSITIVE_INFINITY;
 let adjustedHomeCollars = 0;
 const expectedMarbles = [1, 1, 1, 1, 2, 1, 2, 1,
   3, 1, 2, 1, 4, 1, 2, 3];
-const holeWallClearance = 0.0075 * 0.40;
+const holeWallClearance = 0.0075 * 0.80;
 const geometrySeeds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
   10, 11, 12, 13, 14, 15, 16, 17, 314159, 1073741823];
 

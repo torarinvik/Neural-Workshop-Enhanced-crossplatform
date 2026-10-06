@@ -20,7 +20,7 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 CORE="${ELISA_CORE:-$ROOT/../../../Go projects/Elisa-core}"
-STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$ROOT/../../Elisa-compiler-latest-protocol-bound-fix}"
+STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$ROOT/../../Elisa-compiler-port-current-5417885}"
 CANONICAL="$CORE/compiler/runtime/elisacore_std"
 VENDORED="$STAGE1_ROOT/elisacore_std"
 

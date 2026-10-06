@@ -137,6 +137,9 @@ RUN_DIR="$(mktemp -d "$BUILD/check.XXXXXX")" || {
     echo "check.sh: could not create an isolated run directory under $BUILD" >&2
     exit 1
 }
+SOURCE_ROOT="$RUN_DIR/source"
+python3 "$ROOT/scripts/prepare_runtime_sources.py" \
+    "$ROOT" "$SOURCE_ROOT" "$ELISA_STAGE1_ROOT"
 
 SUITES=(pyset scheduling timing board grid nback pyrandom stimulus stats sessionscore readouttext trialuitext matching display config gamemode decimal session sessionapp maze fogworld numberology ninarow inthedark crossedwires cookiethief custody donkey tetris removals sokoban sokoban_game go twohands buzzwire marblemaze syllogism title menu menurow sudoku youarehere hanoi monkeyladder ncupmonte reflex salesman counting tracking concentration recognition lookout pursuit outofsight overrun mrtime jigsaw sokoban3d verbal scramble scrabble trivia crossword graphmapping ravens chess bigfrac expressions algebra glyphs scene_removals scene_monkeyladder scene_hanoi scene_go scene_ninarow scene_crossedwires scene_ncupmonte scene_sudoku scene_chess scene_algebra scene_numberology scene_verbal scene_scramble scene_trivia scene_tracking scene_sokoban scene_salesman scene_counting scene_syllogism scene_maze scene_inthedark scene_overrun scene_crossword scene_lookout scene_pursuit scene_reflex scene_recognition scene_concentration scene_jigsaw scene_donkey scene_custody scene_cookiethief scene_youarehere scene_sokoban3d scene_scrabble scene_mrtime scene_graphmapping scene_outofsight scene_tetris scene_twohands scene_ravens scene_marblemaze scene_buzzwire scene_taskhub scene_fogofwar scene_trialui scene_notice scene_hud scene_readouts scene_graph scene_field scene_menuchrome trialphase textmetrics screen hudtext)
 
@@ -172,7 +175,7 @@ run_suite() {
 
     if [[ "$stage" == "stage0" ]]; then
         if "$ELISACORE_BIN" -emit obj -O2 -o "$RUN_DIR/${suite}_${stage}.o" \
-                "$ROOT/test/${suite}_sweep.elisa" >"$compile_log" 2>&1; then
+                "$SOURCE_ROOT/test/${suite}_sweep.elisa" >"$compile_log" 2>&1; then
             compile_exit=0
         else
             compile_exit=$?
@@ -191,7 +194,7 @@ run_suite() {
         fi
     else
         if ELISA_ALLOW_STALE_STAGE1=1 "$ELISA_STAGE1_ROOT/scripts/elisac_stage1.sh" -emit exe -O2 -o "$binary" \
-                "$ROOT/test/${suite}_sweep.elisa" >"$compile_log" 2>&1; then
+                "$SOURCE_ROOT/test/${suite}_sweep.elisa" >"$compile_log" 2>&1; then
             compile_exit=0
             link_exit=0
         else

@@ -723,7 +723,7 @@ function advance(handle, elapsedMs) {
 const selectedCases = [
   { rung: 1, runSeed: 17, expected: "won" },
   { rung: 1, runSeed: 1073741823, expected: "won" },
-  { rung: 2, runSeed: 1, expected: "won" },
+  { rung: 2, runSeed: 1, expected: "lost" },
   { rung: 2, runSeed: 17, expected: "lost" },
   { rung: 2, runSeed: 1073741823, expected: "lost" },
   { rung: 3, runSeed: 0, expected: "lost" },
@@ -1732,7 +1732,10 @@ for (const testCase of cases) {
     assert.equal(resultValue(handle, RESULT.scoreWin), BigInt(scoreWin));
     assert.equal(resultValue(handle, RESULT.boardSeed), state[INFO.seed]);
     if (testCase.expected !== null) {
-      assert.equal(testCase.expected, game.won ? "won" : "lost");
+      const outcome = game.won ? "won" : "lost";
+      const message = `rung ${testCase.rung}, run seed ${testCase.runSeed}, ` +
+        `board seed ${boardSeed} changed its expected outcome`;
+      assert.equal(testCase.expected, outcome, message);
     } else {
       assert.ok(game.won || game.lost > 0 || timedOut,
         `exhaustive generated play did not produce a terminal outcome ` +

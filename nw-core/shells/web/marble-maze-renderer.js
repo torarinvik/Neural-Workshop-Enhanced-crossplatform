@@ -17,7 +17,7 @@ const WALNUT = [0.29, 0.18, 0.11];
 const STEEL = [0.86, 0.88, 0.93];
 const SAWN = [0.58, 0.44, 0.31];
 const GREEN = [0.16, 0.55, 0.30];
-const HOLE_WALL_CLEARANCE = MARBLE.RADIUS * 0.40;
+const HOLE_WALL_CLEARANCE = MARBLE.RADIUS * 0.80;
 const CUP_COLLAR_SCALE = 1.34;
 
 // The generated opening clears walls, but the decorative green annulus is

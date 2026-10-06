@@ -13,6 +13,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "build" / "pymod"))
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(ROOT / "test"))
 
 import mujoco  # noqa: E402
 import nwcore  # noqa: E402
@@ -21,6 +22,7 @@ from marble_mujoco import (  # noqa: E402
     build_mjcf,
     decode_board,
 )
+from marble_source_capture import float32_abi_tray  # noqa: E402
 
 
 def load_reference():
@@ -56,7 +58,12 @@ def main() -> int:
     cases = 0
     for rung in range(1, 17):
         for seed in seeds:
-            source_tray = reference.deal(rung, seed)
+            # Native and browser controllers consume the same Float32 board
+            # ABI. Compare their model description against the original board
+            # after exactly that transport conversion, not against unrounded
+            # source-only Float64 coordinates (which can cross a six-decimal
+            # MJCF formatting boundary).
+            source_tray = float32_abi_tray(reference.deal(rung, seed))
             board = decode_board(nwcore.marble_board(rung, seed))
             count = len(source_tray.starts)
             assert build_mjcf(board, count) == reference._mjcf(source_tray, count), (

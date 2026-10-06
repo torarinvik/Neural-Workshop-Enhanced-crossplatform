@@ -11,6 +11,7 @@ const wasm = process.env.NWCORE_WASM_PATH ??
 const { exports, instance } = await instantiateElisa(fs.readFileSync(wasm), { warn: false });
 
 const TASK = Object.freeze({
+  nback3d: BigInt(exports.nw_api_v1_task_nback_3d()),
   monkey: BigInt(exports.nw_api_v1_task_monkey_ladder()),
   sokoban: BigInt(exports.nw_api_v1_task_sokoban()),
   count: BigInt(exports.nw_api_v1_task_count()),
@@ -29,7 +30,8 @@ const KEY = Object.freeze({ space: 1, enter: 2, left: 3, up: 4, right: 5,
 const ACTION = Object.freeze({ monkeyStart: 0, monkeyTick: 1,
   monkeySelect: 2, sokobanSpace: 0, marbleStart: 0, marbleRestart: 1,
   marbleReport: 3, marbleBoardReady: 4, marbleNext: 5, marbleScore: 10,
-  marbleSyncSettleTime: 11, marbleRecordResult: 12 });
+  marbleSyncSettleTime: 11, marbleRecordResult: 12,
+  nbackStart: 0, nbackMatch: 1 });
 const MARBLE_RESULT = Object.freeze({ rung: 100, elapsedMs: 101,
   home: 102, lost: 103, verdict: 104, scoreWin: 105, boardSeed: 106 });
 const STATE = Object.freeze({ bytes: 112, magic: 0x3152574e,
@@ -44,6 +46,9 @@ const STATE = Object.freeze({ bytes: 112, magic: 0x3152574e,
     verdict: 8, wins: 9, losses: 10, heldMask: 11 },
   tetris: { phase: 0, rung: 1, piece: 2, score: 3, selected: 4,
     quarter: 5, column: 6, row: 7, remainder: 8 },
+  nback3d: { phase: 0, nback: 1, trial: 2, totalTrials: 3, cubes: 4,
+    position: 5, color: 6, verdict: 7, answered: 8, hits: 9,
+    misses: 10, falseAlarms: 11 },
 });
 // Freeform Tetris renders a deliberately wide 72x32 field and its ordered
 // display list can exceed the legacy 64 KiB diagnostic buffer. The production
@@ -88,8 +93,11 @@ function render(handle, capacity = BigInt(FRAME_BYTES)) {
 
 assert.equal(Number(exports.nw_api_v1_abi_version()), 1);
 assert.ok(TASK.monkey > 0n && TASK.sokoban > 0n && TASK.count > 0n &&
-  TASK.tetris > 0n && TASK.monkey !== TASK.sokoban &&
-  TASK.count !== TASK.sokoban && TASK.tetris !== TASK.sokoban);
+  TASK.tetris > 0n && TASK.nback3d > 0n && TASK.monkey !== TASK.sokoban &&
+  TASK.count !== TASK.sokoban && TASK.tetris !== TASK.sokoban &&
+  TASK.nback3d !== TASK.sokoban && TASK.nback3d !== TASK.monkey);
+assert.equal(Number(exports.nw_api_v1_supports(TASK.nback3d)), 1,
+  "the port exposes only the intended 3D N-Back lifecycle identity");
 assert.equal(Number(exports.nw_api_v1_supports(TASK.monkey)), 1);
 assert.equal(Number(exports.nw_api_v1_supports(TASK.sokoban)), 1);
 assert.equal(Number(exports.nw_api_v1_supports(TASK.count)), 1);
@@ -152,6 +160,64 @@ assert.equal(event(tetrisPointer, EVENT.pointerDown, 1001n, 1n, 0n, 0n, 0n,
   "tray pointer selection reaches the controller");
 assert.equal(state(tetrisPointer)[STATE.tetris.selected], 1n);
 assert.equal(exports.nw_api_v1_destroy(tetrisPointer), 0n);
+
+// The port-scoped 3D N-Back controller has a fixed-layout record: its options,
+// phase/deadlines, dealt position/color history, and score are inline fields.
+// Snapshot mid-run after multiple trials, then prove restored state produces
+// the same later stimulus and verdict path as the original handle.
+const nback3d = create(TASK.nback3d,
+  [1n, 2n, 4n, 1000n, 500n, 200n], 17n);
+assert.ok(nback3d > 0n);
+assert.deepEqual(state(nback3d),
+  [0n, 1n, 0n, 4n, 2n, 0n, 0n, -1n, 0n, 0n, 0n, 0n]);
+assert.equal(event(nback3d, EVENT.action, 1000n, 0n, ACTION.nbackStart),
+  STATUS.accepted);
+assert.equal(exports.nw_api_v1_advance(nback3d, 2000n, 1000n, 1n),
+  STATUS.accepted);
+assert.equal(state(nback3d)[STATE.nback3d.trial], 1n);
+assert.equal(exports.nw_api_v1_advance(nback3d, 2500n, 500n, 2n),
+  STATUS.accepted);
+assert.equal(state(nback3d)[STATE.nback3d.phase], 2n,
+  "the first stimulus transitions to the response phase");
+assert.equal(exports.nw_api_v1_advance(nback3d, 2800n, 300n, 3n),
+  STATUS.accepted);
+assert.equal(state(nback3d)[STATE.nback3d.phase], 3n,
+  "trial one enters its source-timed feedback phase");
+assert.equal(exports.nw_api_v1_advance(nback3d, 3000n, 200n, 4n),
+  STATUS.accepted);
+assert.equal(state(nback3d)[STATE.nback3d.trial], 2n,
+  "the second trial is dealt before snapshotting");
+assert.equal(state(nback3d)[STATE.nback3d.phase], 1n);
+const nback3dSavedState = state(nback3d);
+const nback3dSavedFrame = render(nback3d);
+const nback3dSnapshotBytes = exports.nw_api_v1_snapshot(
+  nback3d, BigInt(SNAPSHOT_BUFFER), BigInt(FRAME_BYTES));
+assert.ok(nback3dSnapshotBytes > 16n,
+  "3D N-Back fixed-layout controller supports a versioned snapshot");
+const nback3dRestored = exports.nw_api_v1_restore(
+  BigInt(SNAPSHOT_BUFFER), nback3dSnapshotBytes);
+assert.ok(nback3dRestored > nback3d,
+  "3D N-Back restore allocates a fresh opaque handle");
+assert.deepEqual(state(nback3dRestored), nback3dSavedState,
+  "restored 3D N-Back state includes the active trial and score");
+assert.deepEqual(render(nback3dRestored), nback3dSavedFrame,
+  "restored 3D N-Back scene matches the saved active stimulus");
+for (const handle of [nback3d, nback3dRestored]) {
+  assert.equal(exports.nw_api_v1_advance(handle, 3500n, 500n, 5n),
+    STATUS.accepted);
+  assert.equal(event(handle, EVENT.action, 3501n, 6n, ACTION.nbackMatch),
+    STATUS.accepted);
+  assert.equal(exports.nw_api_v1_advance(handle, 3800n, 300n, 7n),
+    STATUS.accepted);
+  assert.equal(exports.nw_api_v1_advance(handle, 4000n, 200n, 8n),
+    STATUS.accepted);
+}
+assert.deepEqual(state(nback3dRestored), state(nback3d),
+  "restored N-Back history yields identical later trial and verdict counts");
+assert.deepEqual(render(nback3dRestored), render(nback3d),
+  "restored N-Back history yields the same next-trial frame");
+assert.equal(exports.nw_api_v1_destroy(nback3dRestored), 0n);
+assert.equal(exports.nw_api_v1_destroy(nback3d), 0n);
 
 // Count is a real lifecycle controller, not only the existing stateless
 // counting scene: the same common key/text/advance events own the answer.
@@ -235,6 +301,9 @@ assert.equal(exports.nw_api_v1_marble_grain_seed(monkey), -1,
 const sokoban = create(TASK.sokoban, [2n, 1n, 0n, 0n, 0n, 0n], 17n);
 assert.ok(sokoban > monkey);
 assert.deepEqual(state(sokoban), [0n, 2n, 0n, 1n, 0n, 0n, 0n, -1n, 0n, 0n, 0n, 0n]);
+assert.equal(exports.nw_api_v1_snapshot(
+  sokoban, BigInt(SNAPSHOT_BUFFER), BigInt(FRAME_BYTES)), STATUS.unsupported,
+  "pointer-backed Sokoban fails closed until it has a field serializer");
 assert.equal(event(sokoban, EVENT.keyDown, 1000n, 0n, KEY.space, 32n), STATUS.accepted);
 const started = state(sokoban);
 assert.equal(started[STATE.sokoban.phase], 1n, "Space starts a generated level");
@@ -586,4 +655,4 @@ assert.equal(state(handles[0]), STATUS.invalidHandle,
   "a stale handle is rejected after its tombstone slot is reused");
 assert.equal(exports.nw_api_v1_destroy(replacement), 0n);
 
-console.log("PASS: common WASM runtime API v1 handles, options, events, state, frames, errors, and cleanup");
+console.log("PASS: common WASM runtime API v1 handles, options, events, state, frames, snapshots, errors, and cleanup");

@@ -7,7 +7,7 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECTS_ROOT="$(cd -- "$ROOT/../.." && pwd)"
-UPSTREAM="${ELISA_PYMODULE_COMPILER:-$PROJECTS_ROOT/Elisa-compiler-latest-protocol-bound-fix}"
+UPSTREAM="${ELISA_PYMODULE_COMPILER:-$PROJECTS_ROOT/Elisa-compiler-port-current-5417885}"
 STAGE1_BIN="${ELISA_PYMODULE_STAGE1:-$UPSTREAM/bin/elisac-stage1}"
 OUT="$ROOT/build/pymod"
 mkdir -p "$OUT"
@@ -57,9 +57,15 @@ SHIM_OBJ="$OUT/pymodule_runtime_shim.o"
 cc -c -fPIC -fno-builtin -O2 -o "$SHIM_OBJ" "$ROOT/scripts/pymodule_runtime_shim.c"
 
 cd "$OUT"
+PYMODULE_SOURCE_TMP="$(mktemp "$ROOT/src/pymodule_exports_stage1.XXXXXX")"
+PYMODULE_SOURCE="${PYMODULE_SOURCE_TMP}.elisa"
+mv -- "$PYMODULE_SOURCE_TMP" "$PYMODULE_SOURCE"
+trap 'rm -f -- "$PYMODULE_SOURCE"' EXIT INT TERM HUP
+"$PYTHON_CHECK_BIN" "$ROOT/scripts/prepare_wasm_exports.py" \
+    "$ROOT/src/pymodule_exports.elisa" "$PYMODULE_SOURCE" "$UPSTREAM"
 ELISA_RUNTIME_OBJ="$SHIM_OBJ" ELISA_STAGE1_SEMANTIC_GATE=1 \
     "$UPSTREAM/scripts/elisac_stage1.sh" \
-    -emit pymodule-so "$ROOT/src/pymodule_exports.elisa"
+    -emit pymodule-so "$PYMODULE_SOURCE"
 PYTHON_TEST_BIN="${PYTHON_BIN:-python3}"
 "$PYTHON_TEST_BIN" "$ROOT/shells/python/test_marble.py"
 echo "built in $OUT"

@@ -1,6 +1,6 @@
 # Neural Workshop runtime protocol
 
-**Status (2026-09-20):** common WASM v1 remains partial. The reviewed
+**Status (2026-10-06):** common WASM v1 remains partial. The reviewed
 capability manifest records 43 stateful web controllers, one web stateless
 entry, and the host-owned Marble physics prototype; Python and SDL each record
 23 stateful controllers and 22 not-yet-integrated entries. The web menu is now
@@ -9,23 +9,31 @@ stable task IDs. Python and SDL task hubs expose only their explicitly
 implemented controllers; unintegrated entries remain inert. No generic or
 non-3D N-Back mode is part of the port.
 
-The current production artifact was emitted by
-`scripts/build_latest_stage1_wasm.sh` from source-fresh Elisa-compiler
-`main@66b8ed02cd5075ec4d3e7559187e32937699a985`, with fetched `origin/main` at
-`8534daae0f5f52ee88f7874a7a8203134499c352` (local is not behind). The selected
-Stage1 product SHA-256 is
-`d9c49e683d6c456249b6c504bb2eee0bf760fb890a1dc6342053cd5b96226f9a`; source
-fingerprint is
-`091ff986c50d1cab44e0a8bebc92ec7385d6be9053b9f41a8b01abcef104a2a3`. The
-active `-O2` `build/nwcore.wasm` SHA-256 is
-`26c6230f593d1a98161658c98b6106ef90384add624b514fa05a0c1551b5de5b`, with
-linked object SHA-256
-`596306adec5b8bec69dc666a89634b38ee6ffbb5e3a365870231639c8fbd063b`. The
-full artifact suite and post-build provenance guard passed. Stage0 remains
-the oracle build for source parity. The manifest still lacks complete
-per-task services/input/options and native-export declarations; snapshots,
-effects, full text/IME transport, and exact all-shell acceptance also remain
-open. Task-specific exports alone are not evidence of common-v1 support.
+The deployed production artifact was promoted on 2026-10-05 by
+`scripts/build_latest_stage1_wasm.sh` from Elisa-compiler Stage1 commit
+`541788548651d43dd466d0b5210955eb966eb18e` and Elisa-core Stage0 commit
+`f84b9c1034f708f69d048bd6cafb813e88c8210f`. Its exact build products were
+Stage1 SHA-256
+`5459f03e7efbaa228936223931bfca61a96e6b4ad0558aeb8bf495b861cab81a`, Stage0
+SHA-256 `5f2c14780bb91b25feeef3e4dce685ba9199d264ab75f335b064741a138ea84e`,
+and runtime-object SHA-256
+`b51e6114f0576681e432e1162a3dbdcdac46c140d3b7e7256c0069be0bd11897`. The
+deployed `build/nwcore.wasm` SHA-256 is
+`292800bf992e1cc61bce540ad53c0fa1f89f18de0ae35641166f5bd6d92e73c0`; its
+linked object is
+`a8e8d596ad07afa2005b266c66e5770e31d2f102ba781e71a62b7908bd8bab01`. The
+artifact gate, provenance guard, and served-byte comparison passed. On
+2026-10-06, the separate Stage1 checkout received the initializer-shadowing
+compiler correction and was rebuilt to product SHA-256
+`7da8c73a339457f81e8274ef8a4def07cd6c30545818dd84a7e7c55f1daf2c3f`; the
+deployed WASM has not been rebuilt from that correction, so its artifact
+identity remains the 2026-10-05 pair above. Stage0 remains the oracle build
+for source parity. The manifest still lacks complete
+per-task services/input/options and native-export declarations. Snapshots are
+partially implemented for three fixed-layout controllers; task-neutral effect
+production, snapshots for the other tasks, full text/IME transport, and exact
+all-shell acceptance remain open. Task-specific exports alone are not evidence
+of common-v1 support.
 
 ## 1. Ownership boundaries
 
@@ -871,16 +879,22 @@ Marble Maze returns
 `ERR_UNSUPPORTED` for that operation because the physics-aware renderer is a
 host service; the browser currently projects the live MuJoCo state through its
 custom 3D canvas renderer, and original-source visual parity is still a fidelity
-gap. `drain_effects`
-returns zero because the current controllers do not emit host effects. `snapshot`
-and `restore(snapshot_pointer, snapshot_bytes)` support the fixed-layout Monkey
-Ladder controller. A snapshot is a little-endian 16-byte header (`NWR1`,
-snapshot version, task ID, payload byte count) followed by the exact
-content-addressed `MonkeyLadderRun` payload. Restore allocates a fresh opaque
-handle and copies that payload; pointer-backed controllers remain explicitly
-unsupported until they have field-level serializers. `destroy` disposes Sokoban's heap-backed undo history,
-frees the controller record, and is safe to repeat for a retained tombstone.
-The module is single-threaded; the registry is not a concurrent API.
+gap. `drain_effects` returns zero because the current controllers do not emit
+host effects. `snapshot` and `restore(snapshot_pointer, snapshot_bytes)
+support the fixed-layout 3D N-Back, Monkey Ladder, and Freeform Tetris
+controllers. A snapshot is a little-endian 16-byte header (`NWR1`, snapshot
+version, task ID, payload byte count) followed by that task's fixed-layout run
+record. Restore allocates a fresh opaque handle and copies the payload. The
+conformance smoke snapshots 3D N-Back during its second active stimulus,
+compares the restored public state and frame, then applies the same advances
+and match action to both handles and compares the resulting next-trial
+state/frame. Pointer-backed controllers remain explicitly unsupported until
+they have field-level serializers. Because the current payload is the
+compiler's in-memory record layout, these snapshots are same-build
+checkpoints, not a durable format to carry across compiler/layout upgrades.
+`destroy` disposes Sokoban's heap-backed undo history, frees the controller
+record, and is safe to repeat for a retained tombstone. The module is
+single-threaded; the registry is not a concurrent API.
 
 The lifecycle must distinguish controller states as each game requires; do
 not constrain every game to a shared three-state enum. A semantic action may

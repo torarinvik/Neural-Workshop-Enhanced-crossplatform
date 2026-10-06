@@ -53,6 +53,34 @@ class WasmRuntimeIncludeTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "runtime include is missing"):
                 prepare(source, base / "out.elisa", compiler)
 
+    def test_native_pymodule_uses_selected_stage1_runtime(self):
+        with tempfile.TemporaryDirectory(prefix="pymodule selected stage1 ") as temporary:
+            base = Path(temporary)
+            compiler = base / "selected Elisa compiler"
+            runtime = compiler / "elisacore_std"
+            runtime.mkdir(parents=True)
+            for module in (
+                "elisacore_runtime.elisa",
+                "elisacore_rng.elisa",
+                "elisacore_math.elisa",
+            ):
+                (runtime / module).write_text("# selected runtime\n", encoding="utf-8")
+
+            output = base / "pymodule_exports.generated.elisa"
+            prepare(ROOT / "src" / "pymodule_exports.elisa", output, compiler)
+
+            rendered = output.read_text(encoding="utf-8")
+            for module in (
+                "elisacore_runtime.elisa",
+                "elisacore_rng.elisa",
+                "elisacore_math.elisa",
+            ):
+                self.assertIn(
+                    f'include "{compiler.resolve()}/elisacore_std/{module}"', rendered
+                )
+            self.assertNotIn("Elisa-compiler-latest", rendered)
+            self.assertIn('include "scheduling.elisa"', rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

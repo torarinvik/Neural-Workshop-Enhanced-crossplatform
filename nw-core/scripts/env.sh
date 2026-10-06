@@ -47,7 +47,7 @@ fi
 # inspect the same sources used by build_latest_stage1_wasm.sh. Both variables
 # remain overridable for isolated candidate checkouts.
 export ELISA_CORE="${ELISA_CORE:-$NW_ROOT/../../Go projects/Elisa-core}"
-export ELISA_STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$NW_ROOT/../Elisa-compiler-latest-protocol-bound-fix}"
+export ELISA_STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$NW_ROOT/../Elisa-compiler-port-current-5417885}"
 
 export ELISACORE_BIN="${ELISACORE_BIN:-$NW_CORE/toolchain/elisac-stage0}"
 export ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$NW_CORE/toolchain/elisac-stage1}"
