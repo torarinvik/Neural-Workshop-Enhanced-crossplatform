@@ -40,14 +40,20 @@ if [[ -x "$NW_REFERENCE_PYTHON_DIR/python3" ]]; then
     export PATH
 fi
 
-# Overridable so a scratch INTEGRATION checkout can be verified with the same
-# suites without editing this file: set either variable before sourcing.
-# The old repo-local worktrees were removed. Keep both defaults on the actual
-# current checkouts so the gate, runtime-drift guard, and toolchain builder all
-# inspect the same sources used by build_latest_stage1_wasm.sh. Both variables
-# remain overridable for isolated candidate checkouts.
-export ELISA_CORE="${ELISA_CORE:-$NW_ROOT/../../Go projects/Elisa-core}"
-export ELISA_STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$NW_ROOT/../Elisa-compiler-port-current-5417885}"
+# Keep the driver, runtime audit, and toolchain builder on the pinned port
+# worktrees when they are available. Fall back to the conventional checkouts
+# for machines that do not have those worktrees. Both selections are overridable
+# for isolated candidate builds.
+DEFAULT_ELISA_CORE="$NW_ROOT/../../Go projects/Elisa-core"
+if [[ ! -d "$DEFAULT_ELISA_CORE/compiler" && -d "$NW_ROOT/stage0-elisa-compiler/compiler" ]]; then
+    DEFAULT_ELISA_CORE="$NW_ROOT/stage0-elisa-compiler"
+fi
+DEFAULT_ELISA_STAGE1_ROOT="$NW_ROOT/../Elisa-compiler-port-current-23a0"
+if [[ ! -d "$DEFAULT_ELISA_STAGE1_ROOT" && -d "$NW_ROOT/stage1-elisa-compiler" ]]; then
+    DEFAULT_ELISA_STAGE1_ROOT="$NW_ROOT/stage1-elisa-compiler"
+fi
+export ELISA_CORE="${ELISA_CORE:-$DEFAULT_ELISA_CORE}"
+export ELISA_STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$DEFAULT_ELISA_STAGE1_ROOT}"
 
 export ELISACORE_BIN="${ELISACORE_BIN:-$NW_CORE/toolchain/elisac-stage0}"
 export ELISA_STAGE1_BIN="${ELISA_STAGE1_BIN:-$NW_CORE/toolchain/elisac-stage1}"

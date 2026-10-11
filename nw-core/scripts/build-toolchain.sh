@@ -23,8 +23,16 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NW_ROOT="$(cd -- "$HERE/../.." && pwd)"
-CORE="${ELISA_CORE:-$NW_ROOT/../../Go projects/Elisa-core}"
-STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$NW_ROOT/../Elisa-compiler-port-current-5417885}"
+DEFAULT_CORE="$NW_ROOT/../../Go projects/Elisa-core"
+if [[ ! -d "$DEFAULT_CORE/compiler" && -d "$NW_ROOT/stage0-elisa-compiler/compiler" ]]; then
+    DEFAULT_CORE="$NW_ROOT/stage0-elisa-compiler"
+fi
+DEFAULT_STAGE1_ROOT="$NW_ROOT/../Elisa-compiler-port-current-23a0"
+if [[ ! -d "$DEFAULT_STAGE1_ROOT" && -d "$NW_ROOT/stage1-elisa-compiler" ]]; then
+    DEFAULT_STAGE1_ROOT="$NW_ROOT/stage1-elisa-compiler"
+fi
+CORE="${ELISA_CORE:-$DEFAULT_CORE}"
+STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$DEFAULT_STAGE1_ROOT}"
 export ELISA_CORE="$CORE"
 export ELISA_STAGE1_ROOT="$STAGE1_ROOT"
 export ELISACORE_STRICT_FP=1

@@ -7,8 +7,8 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECTS_ROOT="$(cd -- "$ROOT/../.." && pwd)"
-UPSTREAM="${ELISA_PYMODULE_COMPILER:-$PROJECTS_ROOT/Elisa-compiler-port-current-5417885}"
-STAGE1_BIN="${ELISA_PYMODULE_STAGE1:-$UPSTREAM/bin/elisac-stage1}"
+UPSTREAM="${ELISA_PYMODULE_COMPILER:-${ELISA_STAGE1_ROOT:-$PROJECTS_ROOT/Elisa-compiler-port-current-23a0}}"
+STAGE1_BIN="${ELISA_PYMODULE_STAGE1:-${ELISA_STAGE1_BIN:-$UPSTREAM/bin/elisac-stage1}}"
 OUT="$ROOT/build/pymod"
 mkdir -p "$OUT"
 

@@ -1,6 +1,44 @@
 # Neural Workshop port status snapshot
 
-## Current deployed artifact state — 2026-10-05
+## Current deployed artifact state — 2026-10-07
+
+- Production browser `build/nwcore.wasm` was rebuilt and promoted from
+  Elisa-compiler Stage1 commit `23a0e16a854cddec3016746a0cb9480db0c4db22`.
+  The Stage1 source fingerprint is
+  `0e17e6c92e8a03735d46be9eec69953336395d909c4121fbe83414d060589f57`, and
+  the selected product SHA-256 is
+  `f1d15c7713b8583c0ec3d5b617599f7208786b374eb291dab9c86892ca0d8b56`. The
+  promoted WASM is 1,685,170 bytes, SHA-256
+  `4e4b6e90f58257883672da6309793db175f5a1f501c6042a1ef2dccaa6eec897`; its
+  Stage1 object SHA-256 is
+  `bd71fdd5aa54123c8e87d90794e100967353d9d7c581069077f868d726fe0233`.
+- The complete latest-Stage1 artifact suite passed. It covers the common
+  runtime API contract (including Count v6, N-Back v4, Monkey Ladder v5,
+  Sokoban v2, and Tetris v3 field serialization, malformed-state rejection,
+  restored frame/state checks, and deterministic continuation), browser and
+  controller contracts, Marble options and
+  physics, 320 board-clearance cases, 80 board/MJCF comparisons, 80 generated
+  sessions, 80 held-input sessions, and 275 trajectory scenarios / 33,982
+  frame states. Pixel acceptance remains diagnostic-only (`accepted:false`).
+  The prior artifact/object, served response, and promotion receipt are
+  preserved under
+  `output/verification/count-v6-snapshot-promotion-20261007/`.
+- The live response at `http://127.0.0.1:8000/build/nwcore.wasm` was fetched
+  after promotion and is byte-identical to the promoted WASM; its saved copy
+  is included with the receipt.
+- The Stage0 `make test-full` post-fix rerun passes. The integrated
+  `scripts/gate.sh --full` completed on 2026-10-07 and failed: 232 of 569
+  Stage1 parity checks failed and three top-level gate steps failed. The
+  detailed logs are under
+  `build/verification/full-gate-20261007/`, diagnose differences, and rerun
+  before claiming the full gate passes.
+- The reviewed catalog now records 43 web stateful controllers, 24 stateful
+  Python controllers, and 24 stateful SDL controllers. Sokoban is included in
+  both native counts because its direct and task-hub routes have source-backed
+  controller lifecycle smokes. Each native host has 21 catalog entries still
+  marked not integrated.
+
+## Historical deployed artifact state — 2026-10-05
 
 - Production browser `build/nwcore.wasm` is now rebuilt and promoted from the
   verified newer Elisa-compiler Stage1 snapshot `541788548651d43dd466d0b5210955eb966eb18e`,

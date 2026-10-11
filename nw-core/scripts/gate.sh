@@ -20,8 +20,8 @@ if ! source "$ROOT/scripts/env.sh"; then
 fi
 
 PROJECTS_ROOT="$(cd -- "$ROOT/../.." && pwd)"
-LATEST_STAGE1_ROOT="${ELISA_LATEST_STAGE1_ROOT:-$PROJECTS_ROOT/Elisa-compiler-port-current-5417885}"
-LATEST_STAGE1_BIN="${ELISA_LATEST_STAGE1_BIN:-$LATEST_STAGE1_ROOT/bin/elisac-stage1}"
+LATEST_STAGE1_ROOT="${ELISA_LATEST_STAGE1_ROOT:-$ELISA_STAGE1_ROOT}"
+LATEST_STAGE1_BIN="${ELISA_LATEST_STAGE1_BIN:-${ELISA_STAGE1_BIN:-$LATEST_STAGE1_ROOT/bin/elisac-stage1}}"
 if [[ ! -x "$LATEST_STAGE1_ROOT/scripts/elisac_stage1.sh" || ! -x "$LATEST_STAGE1_BIN" ]]; then
     echo "gate.sh: latest Elisa Stage1 checkout/product missing" >&2
     echo "  checkout: $LATEST_STAGE1_ROOT" >&2
@@ -201,8 +201,11 @@ smokes() {
     local ok=0
     for smoke in try_fallible catch_exhaustive match_expr match_pattern \
                  match_exhaustive enum_constructor enum_tail_payload \
+                 hierarchical_optional_enum_payload \
+                 type_annotation_unknown \
                  atomic_payload scalar_match_arm legacy_error_syntax \
                  wasm32_checked_index wasm32_darray_abi wasm32_sview_strlen \
+                 wasm_integer_width \
                  wasm32_debug_referee wasm32_for_bounds_width \
                  qualified_generic_scope module_struct_field_type_collision \
                  module_struct_field_mutable module_struct_return_type \

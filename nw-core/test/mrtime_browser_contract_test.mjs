@@ -15,6 +15,18 @@ assert.match(source, /function isMrTimeTask\(\)/,
   "Mr. Time must have an explicit catalog predicate");
 assert.match(source, /function ensureMrTimeRun\(\)/,
   "Mr. Time must own a persistent browser-side run handle");
+assert.match(source, /MR_TIME_OPTIONS_STORAGE = "neural-workshop\.mr-time\.options\.v1"/,
+  "Mr. Time settings must have a versioned persistent key");
+assert.match(source, /function readMrTimeOptions\(\)[\s\S]*MR_TIME_GAP_OPTIONS\.includes\(saved\.maxGapMs\)[\s\S]*MR_TIME_FLASH_OPTIONS\.includes\(saved\.flashMs\)/,
+  "saved Mr. Time settings must be validated against source-supported choices");
+assert.match(source, /function openMrTimeOptions\(returnTo\)[\s\S]*function applyMrTimeOptions\(\)[\s\S]*function cancelMrTimeOptions\(\)/,
+  "Mr. Time must expose editable, applicable, cancellable browser options");
+assert.match(source, /function mrTimeOptionRows\(\)[\s\S]*Which half to play[\s\S]*Adapt precision to performance/,
+  "the browser options screen must expose all six source settings");
+assert.match(source, /event\.key\.toLowerCase\(\) === "c" && isMrTimeTask\(\)\) openMrTimeOptions\("taskhub"\)/,
+  "the real task menu must expose Mr. Time options");
+assert.match(source, /if \(phase === MR_TIME_PHASE\.ready \|\| phase === MR_TIME_PHASE\.done\) \{\s*openMrTimeOptions\("task"\)/,
+  "the task screen must expose options only at source-supported phases");
 assert.match(source, /function scheduleMrTimeAdvance\(/,
   "Mr. Time deadlines must be driven by the browser monotonic clock");
 assert.match(source, /MR_TIME_INFO\.appearedAtMs\)[\s\S]*MR_TIME_INFO\.flashMs/,

@@ -1,15 +1,48 @@
 # Neural Workshop runtime protocol
 
-**Status (2026-10-06):** common WASM v1 remains partial. The reviewed
+**Status (2026-10-07):** common WASM v1 remains partial. The reviewed
 capability manifest records 43 stateful web controllers, one web stateless
 entry, and the host-owned Marble physics prototype; Python and SDL each record
-23 stateful controllers and 22 not-yet-integrated entries. The web menu is now
-generated from the schema-v4 reviewed catalog, and controller dispatch uses
-stable task IDs. Python and SDL task hubs expose only their explicitly
-implemented controllers; unintegrated entries remain inert. No generic or
+24 stateful controllers and 21 not-yet-integrated entries. The web menu is now
+generated from the schema-v5 reviewed catalog, and controller dispatch uses
+stable task IDs. The catalog audit attributes every common-v1 export to a task
+or the two global exports; native and non-v1 export inventories remain open.
+Python and SDL task hubs expose only their explicitly implemented controllers;
+unintegrated entries remain inert. No generic or
 non-3D N-Back mode is part of the port.
 
-The deployed production artifact was promoted on 2026-10-05 by
+The current Stage1 artifact was promoted on 2026-10-07 from Elisa-compiler
+Stage1 commit `23a0e16a854cddec3016746a0cb9480db0c4db22`, source fingerprint
+`0e17e6c92e8a03735d46be9eec69953336395d909c4121fbe83414d060589f57`, and
+product SHA-256
+`f1d15c7713b8583c0ec3d5b617599f7208786b374eb291dab9c86892ca0d8b56`. The
+linked Stage1 object SHA-256 is
+`bd71fdd5aa54123c8e87d90794e100967353d9d7c581069077f868d726fe0233`, and
+`build/nwcore.wasm` is 1,685,170 bytes with SHA-256
+`4e4b6e90f58257883672da6309793db175f5a1f501c6042a1ef2dccaa6eec897`. The
+complete WASM artifact suite passed, including Count v6, N-Back v4, Monkey
+Ladder v5, Sokoban v2, and Tetris v3 field snapshot roundtrips/continuations
+and malformed-state checks, browser contracts, and 275 Marble trajectory
+scenarios (33,982 per-frame states). The Count v6 promotion receipt and prior
+artifact copy are in
+`output/verification/count-v6-snapshot-promotion-20261007/`. The full
+compiler gate completed on 2026-10-07 and failed: 232 of 569 Stage1 parity
+checks failed, with three top-level gate steps failing. The live response at
+`http://127.0.0.1:8000/build/nwcore.wasm` was fetched and matches the promoted
+artifact byte-for-byte.
+
+The immediately previous 2026-10-07 artifact was the Tetris v3-only product
+with WASM SHA-256
+`a43f716d4607c6b1311ee2d53ece0d70a3b10b330cedb8f11e8f27d930ebc960` and
+Stage1 object SHA-256
+`1a72c08372e63168fb68d21035ab0ce2e5d8159de8321718ffa19c6b3350ce26`; its
+previous files are preserved in the current promotion receipt directory. The
+preceding 2026-10-07 artifact was
+`125d831827b15c94366aef3bfdc33ed052ad9d99e03da52fc2d2292bc53133b3`
+(1,652,353 bytes, Stage1 object
+`3ee4f8ee193b84ca1b487d44677d1e875a281bceedef7ebb0eb288aabf47a8d8`). Its
+Tetris snapshots used the legacy raw v1 format. The older production artifact
+was promoted on 2026-10-05 by
 `scripts/build_latest_stage1_wasm.sh` from Elisa-compiler Stage1 commit
 `541788548651d43dd466d0b5210955eb966eb18e` and Elisa-core Stage0 commit
 `f84b9c1034f708f69d048bd6cafb813e88c8210f`. Its exact build products were
@@ -25,15 +58,19 @@ linked object is
 artifact gate, provenance guard, and served-byte comparison passed. On
 2026-10-06, the separate Stage1 checkout received the initializer-shadowing
 compiler correction and was rebuilt to product SHA-256
-`7da8c73a339457f81e8274ef8a4def07cd6c30545818dd84a7e7c55f1daf2c3f`; the
-deployed WASM has not been rebuilt from that correction, so its artifact
-identity remains the 2026-10-05 pair above. Stage0 remains the oracle build
-for source parity. The manifest still lacks complete
-per-task services/input/options and native-export declarations. Snapshots are
-partially implemented for three fixed-layout controllers; task-neutral effect
-production, snapshots for the other tasks, full text/IME transport, and exact
-all-shell acceptance remain open. Task-specific exports alone are not evidence
-of common-v1 support.
+`7da8c73a339457f81e8274ef8a4def07cd6c30545818dd84a7e7c55f1daf2c3f`; this
+identity was superseded by the 2026-10-07 build above. Stage0 remains the
+oracle build for source parity. Schema v5 now records source-derived option contracts for all 45 task IDs.
+Complete per-task service/input and native-export declarations remain open, and
+the browser does not yet apply or persist every catalogued option. Monkey
+Ladder v5, 3D N-Back v4, and Count v6 snapshots use little-endian field
+serializers for controller state, RNG/history, geometry, and protocol ordering metadata.
+Legacy raw v1 snapshots for Monkey Ladder, 3D N-Back, and Tetris remain
+restore-only same-build compatibility. Sokoban v2, Tetris v3, and Count v6
+snapshots also use little-endian field serializers. Cross-version migration,
+task-neutral effect production, snapshots for the other tasks, full text/IME
+transport, and exact all-shell acceptance remain open. Task-specific exports
+alone are not evidence of common-v1 support.
 
 ## 1. Ownership boundaries
 
@@ -168,7 +205,11 @@ it. `f=1` enables the source-default shadows setting. Count accepts
 these source defaults without a Count-specific options screen or persistence.
 Mr. Time accepts `?mrtime-seed=<nonnegative-i64>` for deterministic
 recall/produce replays; the browser defaults recall mode, rung 1, 15 trials,
-a 3-second hidden gap, 400 ms flash, and adaptive difficulty.
+a 3-second hidden gap, 400 ms flash, and adaptive difficulty. The real task
+menu opens Mr. Time options with `C`; its six source-defined settings are
+validated, saved under `neural-workshop.mr-time.options.v1`, and applied to a
+fresh controller when accepted. Escape cancels the draft. The task screen also
+opens options with `C` while READY or DONE, matching the reference UI.
 Overrun uses `(4, 3, 1, 0, 0, 0)` with seed 17 in the browser route. Its
 fallback sentence pool is the original offline seed bank filtered by the
 source 24–44 character lane band; the fetched corpus remains a planned host
@@ -880,21 +921,79 @@ Marble Maze returns
 host service; the browser currently projects the live MuJoCo state through its
 custom 3D canvas renderer, and original-source visual parity is still a fidelity
 gap. `drain_effects` returns zero because the current controllers do not emit
-host effects. `snapshot` and `restore(snapshot_pointer, snapshot_bytes)
-support the fixed-layout 3D N-Back, Monkey Ladder, and Freeform Tetris
-controllers. A snapshot is a little-endian 16-byte header (`NWR1`, snapshot
-version, task ID, payload byte count) followed by that task's fixed-layout run
-record. Restore allocates a fresh opaque handle and copies the payload. The
-conformance smoke snapshots 3D N-Back during its second active stimulus,
-compares the restored public state and frame, then applies the same advances
-and match action to both handles and compares the resulting next-trial
-state/frame. Pointer-backed controllers remain explicitly unsupported until
-they have field-level serializers. Because the current payload is the
-compiler's in-memory record layout, these snapshots are same-build
-checkpoints, not a durable format to carry across compiler/layout upgrades.
-`destroy` disposes Sokoban's heap-backed undo history, frees the controller
-record, and is safe to repeat for a retained tombstone. The module is
-single-threaded; the registry is not a concurrent API.
+host effects. `snapshot` and `restore(snapshot_pointer, snapshot_bytes)`
+support Sokoban v2, Freeform Tetris v3, 3D N-Back v4, Monkey Ladder v5, and
+Count v6.
+New snapshots use little-endian fields, and restore allocates a fresh opaque
+handle. Every snapshot begins with a little-endian 16-byte header (`NWR1`,
+snapshot version, task ID, payload byte count). Sokoban v2 serializes options,
+seed, MT19937 state, board arrays, run state, event ordering, and undo history.
+Tetris v3 serializes its RNG, options, board/hand, placement/scoring state, and
+event clock/order. N-Back v4, Monkey Ladder v5, and Count v6 payload layouts
+are specified below. Legacy raw v1 remains restore-only same-build
+compatibility. A future schema change must preserve its version meaning or
+add a migration path before changing the format.
+Tetris v3's payload is exactly 28,436 bytes. In order it contains the 624
+little-endian u32 MT words and u32 cursor; i64 `cols`, `rows`, `start_rung`,
+`rung`, `target`, `queue_size`, `phase`, `piece`, `score`, `selected`,
+`quarter`, `column`, `row`, and `remainder`; the 2,304 row-major board cells;
+the six-entry `queue_count`, `queue_fits`, and `queue_recut` arrays; the
+384-entry slot-major `queue_x` and `queue_y` arrays; `active_count`; the
+64-entry `active_x` and `active_y` arrays; `clean`, `buried`, `lines`,
+`streak`, `slips`, and `best_rung`; then `slot_last_time`,
+`slot_last_sequence`, and `slot_elapsed`. All array elements and scalar i64s
+are little-endian i64 values. The 16-byte envelope is not included in that
+payload size.
+N-Back v4 has a fixed 1,800-byte payload of 225 little-endian i64 values.
+In order: seed, N-back value, cube count, total trials, interval/stimulus/
+feedback durations, trial index, trial start/deadline and current deadline,
+paused remaining time, resume phase; 100 position-history values; 100
+color-history values; phase, verdict, answered/paused/failed flags, hits,
+misses, false alarms, correct rejections; then last event time, last event
+sequence, and elapsed time. Restore validates option ranges, phase and flag
+relationships, score bounds, history domains, and protocol clock/order.
+
+Monkey Ladder v5 has a fixed 4,252-byte payload. It begins with all 624
+little-endian u32 MT19937 words and the u32 cursor, followed by 100 sequence
+cells and 100 clicked cells as little-endian i64 values. The remaining 19 i64
+values are grid, start level, adaptive level, round level, reveal and per-tile
+durations, sequence length, next and clicked indices, wrong cell, cursor cell,
+deadline, phase, adaptive/reveal/cursor-enabled flags, then last event time,
+last event sequence, and elapsed time. Restore validates RNG cursor, options,
+booleans, array/cell bounds, unique dealt cells, phase/index consistency, and
+protocol clock/order.
+
+Count v6 has a variable payload: a 2,668-byte fixed portion plus 72 bytes per
+active shape, up to 6,988 bytes. It begins with 624 little-endian u32 MT19937
+words and the u32 cursor, followed by the shape-count i64. Each active shape
+stores its kind and point count as i64, three x coordinates and three y
+coordinates as f64, and its radius as f64. The fixed controller tail stores
+the 17 i64 fields `kind`, `start_count`, `total_trials`, `exposure_ms`,
+`adaptive`, `show_answer`, `count`, `shown_count`, `trial`, `correct`,
+`total_error`, `answer`, `answer_length`, `phase`, `verdict`, `shown_at_ms`,
+and `deadline_ms`; the final three i64 values are `slot_last_time`,
+`slot_last_sequence`, and `slot_elapsed`. Floats are serialized by their
+little-endian IEEE-754 bits. Restore validates exact size, RNG cursor, shape
+count and geometry, options, answer/controller bounds, phase relationships,
+and protocol clock/order.
+
+The conformance smoke restores a live Sokoban move, compares public state and
+frame, rejects mismatched history length, malformed booleans, an out-of-board
+undo record, and a pushing phase without a board, then applies the same undo
+action to both handles. It also restores a live Tetris hand, checks the schema
+size and header, rejects an invalid MT cursor and phase, preserves event-order
+metadata, and compares the next RNG-driven hand after a matching drop. It also
+snapshots 3D N-Back
+during its second active stimulus, compares restored state/frame, and
+continues both handles through the same match, deadline, and next-trial path.
+It checks exact payload versions/sizes, rejects invalid N-Back flags, and
+continues both Monkey Ladder handles through the saved RNG-dealt answer after a
+live pointer selection. Count checks exact dynamic size, malformed shape count
+and non-finite geometry, restored state/frame, and identical RNG/adaptive
+continuation. Other pointer-backed controllers remain explicitly
+unsupported until they have field-level serializers. `destroy` disposes Sokoban's heap-backed undo
+history and frees the controller record; it is safe to repeat for a retained
+tombstone. The module is single-threaded; the registry is not a concurrent API.
 
 The lifecycle must distinguish controller states as each game requires; do
 not constrain every game to a shared three-state enum. A semantic action may

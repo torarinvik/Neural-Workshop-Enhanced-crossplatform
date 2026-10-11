@@ -128,6 +128,10 @@ let values = state(recall);
 assert.equal(values[FIELD.phase], PHASE.showing);
 assert.equal(values[FIELD.trial], 1n);
 assert.equal(values[FIELD.trialMode], MODE.recall);
+assert.equal(action(recall, ACTION.start, 1001, sequence++), STATUS.ignored,
+  "a repeated start while a trial is active is ignored");
+assert.equal(state(recall)[FIELD.trial], 1n,
+  "a repeated start cannot replace the active trial");
 assert.equal(info(recall, INFO.appearedAt), 1000n);
 assert.ok(info(recall, INFO.askAt) > 1400n);
 assert.ok(frame(recall).some(({ kind }) => kind === Kind.ARC || kind === Kind.MULTILINE),
@@ -145,6 +149,20 @@ values = state(recall);
 assert.equal(values[FIELD.phase], PHASE.asking);
 const intervalMs = Number(values[FIELD.intervalMs]);
 assert.ok(intervalMs >= 400);
+const emptyAnswerCount = values[FIELD.answerCount];
+assert.equal(text(recall, "x", Number(info(recall, INFO.askAt)) + 2, sequence++),
+  STATUS.ignored, "malformed text is ignored by the source input adapter");
+assert.equal(state(recall)[FIELD.answerCount], emptyAnswerCount);
+assert.equal(text(recall, "1", Number(info(recall, INFO.askAt)) + 2, sequence++), STATUS.accepted);
+assert.equal(text(recall, "2", Number(info(recall, INFO.askAt)) + 2, sequence++), STATUS.accepted);
+assert.equal(text(recall, "2", Number(info(recall, INFO.askAt)) + 2, sequence++), STATUS.accepted,
+  "repeated key text is recorded as repeated input");
+assert.equal(state(recall)[FIELD.answerCount], 3n);
+for (let index = 0; index < 3; index++) {
+  assert.equal(action(recall, ACTION.backspace,
+    Number(info(recall, INFO.askAt)) + 2, sequence++), STATUS.accepted);
+}
+assert.equal(state(recall)[FIELD.answerCount], 0n);
 const answerText = (intervalMs / 1000).toFixed(3);
 for (const character of answerText) {
   assert.equal(text(recall, character, Number(info(recall, INFO.askAt)) + 2, sequence++),
@@ -166,6 +184,9 @@ assert.equal(values[FIELD.correct], 1n,
   "a millisecond-rounded answer remains inside the rung-one band");
 assert.equal(values[FIELD.verdict], 1n);
 assert.ok(info(recall, INFO.feedbackUntil) > 0n);
+assert.equal(action(recall, ACTION.submit, Number(info(recall, INFO.feedbackUntil)) + 1,
+  sequence++), STATUS.ignored, "a repeated submit cannot score a second result");
+assert.equal(state(recall)[FIELD.resultCount], 1n);
 assert.equal(advance(recall, Number(info(recall, INFO.feedbackUntil)) + 1, sequence++),
   STATUS.accepted);
 assert.equal(state(recall)[FIELD.phase], PHASE.showing,
@@ -194,6 +215,9 @@ assert.equal(values[FIELD.phase], PHASE.feedback);
 assert.equal(values[FIELD.correct], 1n);
 assert.equal(values[FIELD.verdict], 1n);
 assert.ok(texts(produce).some((value) => value.includes("Exactly")));
+assert.equal(action(produce, ACTION.act, 5000 + Number(values[FIELD.targetMs]) + 1,
+  sequence++), STATUS.ignored, "a repeated ACT cannot settle twice");
+assert.equal(state(produce)[FIELD.resultCount], 1n);
 assert.equal(exports.nw_api_v1_destroy(produce), 0n);
 
 // Pointer coordinates are normalized by the common protocol. A centre hit
@@ -216,7 +240,11 @@ const timeout = create([1n, 1n, 5n, 3000n, 400n, 0n], 13n);
 sequence = 0;
 assert.equal(action(timeout, ACTION.start, 9000, sequence++), STATUS.accepted);
 const timeoutDeadline = Number(info(timeout, INFO.deadline));
-assert.equal(advance(timeout, timeoutDeadline + 1, sequence++), STATUS.accepted);
+assert.equal(advance(timeout, timeoutDeadline - 1, sequence++), STATUS.ignored,
+  "produce remains open one millisecond before late-grace expiry");
+assert.equal(state(timeout)[FIELD.phase], PHASE.counting);
+assert.equal(advance(timeout, timeoutDeadline, sequence++), STATUS.accepted,
+  "late-grace expiry settles at the inclusive source deadline");
 values = state(timeout);
 assert.equal(values[FIELD.phase], PHASE.feedback);
 assert.equal(values[FIELD.resultCount], 1n);
@@ -225,4 +253,4 @@ assert.equal(values[FIELD.verdict], 0n);
 assert.ok(texts(timeout).some((value) => value.includes("Never answered")));
 assert.equal(exports.nw_api_v1_destroy(timeout), 0n);
 
-console.log("mrtime_game_smoke: PASS (common lifecycle, recall timing/input, produce timing, pointer hit, timeout, render, disposal)");
+console.log("mrtime_game_smoke: PASS (common lifecycle, source options, duplicate/repeated input, malformed text, recall/produce timing, deadline edge, pointer, render, disposal)");

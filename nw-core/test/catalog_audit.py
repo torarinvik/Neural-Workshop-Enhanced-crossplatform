@@ -21,6 +21,174 @@ SDL_SHELL = ROOT / "nw-core/shells/sdl3/main.c"
 IMPLEMENTATION_PLAN = ROOT / "IMPLEMENTATION_PLAN.md"
 PYMODULE_EXPORTS = ROOT / "nw-core/src/pymodule_exports.elisa"
 WASM_EXPORTS = ROOT / "nw-core/src/wasm/wasm_exports.elisa"
+TASKOPTIONS_SOURCE = ORIGINAL / "neural_workshop/ui/taskoptions.py"
+GAMESELECT_SOURCE = ORIGINAL / "neural_workshop/ui/gameselect.py"
+CONFIGDEFAULTS_SOURCE = ORIGINAL / "neural_workshop/configdefaults.py"
+
+
+def source_option_value(node: ast.expr, symbols: dict[str, object]):
+    """Evaluate the small, data-only expression language used by TaskOptions."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in symbols:
+        return symbols[node.id]
+    if isinstance(node, (ast.Tuple, ast.List)):
+        return [source_option_value(item, symbols) for item in node.elts]
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        value = source_option_value(node.operand, symbols)
+        return -value if isinstance(node.op, ast.USub) else value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+        left = source_option_value(node.left, symbols)
+        right = source_option_value(node.right, symbols)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        return left * right
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        name = node.func.id
+        if name == "_" and len(node.args) == 1:
+            return source_option_value(node.args[0], symbols)
+        args = [source_option_value(arg, symbols) for arg in node.args]
+        if name == "range":
+            return list(range(*args))
+        if name == "tuple" and len(args) == 1:
+            return list(args[0])
+        if name == "len" and len(args) == 1:
+            return len(args[0])
+    raise ValueError(f"unsupported source option expression: {ast.dump(node)}")
+
+
+def source_task_options() -> dict[str, dict[str, dict[str, object]]]:
+    """Read the pinned UI's declarative option lists without importing pyglet."""
+    source = ast.parse(TASKOPTIONS_SOURCE.read_text())
+    specs = {
+        statement.targets[0].id: statement.value
+        for statement in source.body
+        if isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and isinstance(statement.value, ast.Call)
+        and isinstance(statement.value.func, ast.Name)
+        and statement.value.func.id == "TaskSpec"
+    }
+
+    symbols: dict[str, object] = {}
+    for module_name, constant_name, imported_name in (
+        ("marblemaze.py", "GRADES", "_MARBLE_GRADES"),
+        ("go.py", "DIFFICULTIES", "_GO_LADDER"),
+    ):
+        module = ast.parse((ORIGINAL / "neural_workshop" / module_name).read_text())
+        values = assignment(module, constant_name)
+        if not isinstance(values, (ast.Tuple, ast.List)):
+            raise ValueError(f"{module_name}.{constant_name} must remain a literal sequence")
+        symbols[imported_name] = list(range(1, len(values.elts) + 1))
+
+    task_specs = assignment(source, "TASK_SPECS")
+    if not isinstance(task_specs, ast.Dict):
+        raise ValueError("original TASK_SPECS must remain a literal mapping")
+
+    result: dict[str, dict[str, dict[str, object]]] = {}
+    for task_node, spec_node in zip(task_specs.keys, task_specs.values):
+        task_id = source_option_value(task_node, symbols)
+        if not isinstance(spec_node, ast.Name) or spec_node.id not in specs:
+            raise ValueError(f"TASK_SPECS[{task_id!r}] does not reference a TaskSpec")
+        spec = specs[spec_node.id]
+        option_nodes = next((item.value for item in spec.keywords if item.arg == "options"), None)
+        if not isinstance(option_nodes, (ast.Tuple, ast.List)):
+            raise ValueError(f"TaskSpec {spec_node.id} must declare a literal option list")
+
+        task_options: dict[str, dict[str, object]] = {}
+        for option_node in option_nodes.elts:
+            if not isinstance(option_node, ast.Call) or not isinstance(option_node.func, ast.Name) or option_node.func.id != "Option":
+                raise ValueError(f"TaskSpec {spec_node.id} contains a non-Option entry")
+            if len(option_node.args) < 3:
+                raise ValueError(f"TaskSpec {spec_node.id} has an Option without a default")
+            key = source_option_value(option_node.args[0], symbols)
+            default = source_option_value(option_node.args[2], symbols)
+            values_node = next((keyword.value for keyword in option_node.keywords if keyword.arg == "values"), None)
+            suffix_node = next((keyword.value for keyword in option_node.keywords if keyword.arg == "suffix"), None)
+            if key in task_options:
+                raise ValueError(f"TaskSpec {spec_node.id} repeats option {key}")
+
+            if key == "NUMBEROLOGY_LEVEL":
+                # current_value() and _build_row() intentionally make this one
+                # option an unbounded positive integer despite the placeholder
+                # values=(1,) passed to Option.
+                schema: dict[str, object] = {
+                    "type": "integer", "default": default, "minimum": 1, "maximum": None,
+                }
+            elif values_node is None:
+                if not isinstance(default, bool):
+                    raise ValueError(f"Option {key} needs explicit values or a boolean default")
+                schema = {"type": "boolean", "default": default}
+            else:
+                values = source_option_value(values_node, symbols)
+                if not isinstance(values, list) or not values or default not in values:
+                    raise ValueError(f"Option {key} has invalid values or a missing default")
+                sample = values[0]
+                if isinstance(sample, bool):
+                    value_type = "boolean"
+                elif isinstance(sample, int):
+                    value_type = "integer"
+                elif isinstance(sample, float):
+                    value_type = "number"
+                elif isinstance(sample, str):
+                    value_type = "string"
+                else:
+                    raise ValueError(f"Option {key} uses an unsupported value type")
+                schema = {
+                    "type": "enum", "value_type": value_type,
+                    "default": default, "values": values,
+                }
+            if suffix_node is not None:
+                schema["suffix"] = source_option_value(suffix_node, symbols)
+            task_options[key] = schema
+        result[task_id] = task_options
+    return result
+
+
+def source_nback_options() -> dict[str, dict[str, object]]:
+    """Describe the port-scoped 3D N-Back controls from GameSelect."""
+    game_select = ast.parse(GAMESELECT_SOURCE.read_text())
+    trial_values = literal(assignment(game_select, "_TRIAL_MS_VALUES"))
+    config_text = CONFIGDEFAULTS_SOURCE.read_text()
+    cube_default_match = re.search(r"^GRID_3D_CUBES = (\d+)\s*$", config_text, re.M)
+    if cube_default_match is None:
+        raise ValueError("config defaults must retain GRID_3D_CUBES")
+    cube_default = int(cube_default_match.group(1))
+    cube_values = None
+    for node in ast.walk(game_select):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        if not isinstance(node.value.func, ast.Name) or node.value.func.id != "Cycler":
+            continue
+        if not any(
+            isinstance(target, ast.Subscript)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "values"
+            and isinstance(target.slice, ast.Constant)
+            and target.slice.value == "grid_3d_cubes"
+            for target in node.targets
+        ):
+            continue
+        values = next((keyword.value for keyword in node.value.keywords if keyword.arg == "values"), None)
+        if values is not None:
+            cube_values = literal(values)
+            break
+    if not isinstance(trial_values, list) or not isinstance(cube_values, list):
+        raise ValueError("GameSelect must retain literal trial and 3D cube option values")
+    return {
+        "grid_3d_cubes": {
+            "type": "enum", "value_type": "integer",
+            "default": cube_default, "values": cube_values,
+        },
+        "trial_ms": {
+            "type": "enum", "value_type": "integer",
+            "default": None, "default_policy": "current_mode",
+            "values": trial_values,
+        },
+    }
 
 
 def assignment(tree: ast.Module, name: str) -> ast.expr:
@@ -176,6 +344,46 @@ def audit_runtime_coverage(fixture, task_ids):
 
     export_source = WASM_EXPORTS.read_text()
     exports = set(re.findall(r"^export fn ([A-Za-z_][A-Za-z0-9_]*)\(", export_source, re.M))
+    selector_exports = {name for name in exports if name.startswith("nw_api_v1_task_")}
+    mapped_selectors: set[str] = set()
+    for task_id in task_ids:
+        row = overrides.get(task_id, default)
+        row_exports = row.get("wasm_exports") if isinstance(row, dict) else None
+        if not isinstance(row_exports, list):
+            continue
+        if len(row_exports) != len(set(row_exports)):
+            raise ValueError(f"duplicate WASM export mapping for {task_id}")
+        mapped_selectors.update(
+            name for name in row_exports if isinstance(name, str) and name.startswith("nw_api_v1_task_")
+        )
+        if row.get("hosts", {}).get("web") in {"stateful_controller", "physics_prototype"}:
+            has_task_selector = any(
+                name.startswith("nw_api_v1_task_") or name == "nw_api_v1_tetris_task_id"
+                for name in row_exports
+            )
+            if not has_task_selector:
+                raise ValueError(f"web runtime capability for {task_id} lacks its task selector export")
+    if mapped_selectors != selector_exports:
+        raise ValueError(
+            "reviewed task-to-WASM selector map is not exact: "
+            f"unmapped={sorted(selector_exports - mapped_selectors)}, "
+            f"unknown={sorted(mapped_selectors - selector_exports)}"
+        )
+    mapped_v1_exports = set(default.get("wasm_exports", []))
+    for row in overrides.values():
+        mapped_v1_exports.update(
+            name for name in row.get("wasm_exports", [])
+            if isinstance(name, str) and name.startswith("nw_api_v1_")
+        )
+    mapped_v1_exports = {name for name in mapped_v1_exports if name.startswith("nw_api_v1_")}
+    global_v1_exports = {"nw_api_v1_abi_version", "nw_api_v1_drain_effects"}
+    task_v1_exports = {name for name in exports if name.startswith("nw_api_v1_")} - global_v1_exports
+    if mapped_v1_exports != task_v1_exports:
+        raise ValueError(
+            "reviewed task-to-WASM v1 export map is not exact: "
+            f"unmapped={sorted(task_v1_exports - mapped_v1_exports)}, "
+            f"unknown={sorted(mapped_v1_exports - task_v1_exports)}"
+        )
     required_nback3d_exports = {
         "nw_api_v1_task_nback_3d",
         "nw_api_v1_nback3d_info",
@@ -236,6 +444,19 @@ def audit_task_capabilities(fixture, task_ids):
     unknown = set(capabilities) - set(task_ids)
     if unknown:
         raise ValueError(f"capabilities contain unknown task IDs: {sorted(unknown)}")
+    missing = set(task_ids) - set(capabilities)
+    if missing:
+        raise ValueError(f"capabilities are missing task IDs: {sorted(missing)}")
+
+    expected_options = source_task_options()
+    expected_options["nback"] = source_nback_options()
+    if set(expected_options) != set(task_ids):
+        raise ValueError(
+            "source option contracts do not match the reviewed catalog: "
+            f"missing={sorted(set(task_ids) - set(expected_options))}, "
+            f"unknown={sorted(set(expected_options) - set(task_ids))}"
+        )
+
     allowed_inputs = {"keyboard", "pointer", "text", "audio", "gamepad", "touch"}
     for task_id, record in capabilities.items():
         if not isinstance(record, dict) or set(record) != {
@@ -251,25 +472,61 @@ def audit_task_capabilities(fixture, task_ids):
             raise ValueError(f"supported_input is missing or invalid for {task_id}")
         if not isinstance(options, dict):
             raise ValueError(f"options_schema must be an object for {task_id}")
+        if options != expected_options[task_id]:
+            raise ValueError(
+                f"options_schema for {task_id} differs from the pinned source; "
+                "review the source changes and update the catalog deliberately"
+            )
         for name, option in options.items():
             if not isinstance(name, str) or not isinstance(option, dict):
                 raise ValueError(f"invalid option schema for {task_id}.{name}")
-            if option.get("type") != "integer":
+            option_type = option.get("type")
+            if option_type == "boolean":
+                if set(option) != {"type", "default"} or not isinstance(option.get("default"), bool):
+                    raise ValueError(f"invalid boolean option for {task_id}.{name}")
+            elif option_type == "integer":
+                if set(option) != {"type", "default", "minimum", "maximum"}:
+                    raise ValueError(f"invalid integer option for {task_id}.{name}")
+                default, minimum, maximum = option["default"], option["minimum"], option["maximum"]
+                if any(not isinstance(value, int) or isinstance(value, bool)
+                       for value in (default, minimum)):
+                    raise ValueError(f"integer option bounds/default missing for {task_id}.{name}")
+                if maximum is not None and (not isinstance(maximum, int) or isinstance(maximum, bool)):
+                    raise ValueError(f"integer option maximum is invalid for {task_id}.{name}")
+                if minimum > default or (maximum is not None and default > maximum):
+                    raise ValueError(f"option default outside bounds for {task_id}.{name}")
+            elif option_type == "enum":
+                allowed_fields = {"type", "value_type", "default", "values", "suffix", "default_policy"}
+                if set(option) - allowed_fields or not {"type", "value_type", "default", "values"} <= set(option):
+                    raise ValueError(f"invalid enum option fields for {task_id}.{name}")
+                values = option["values"]
+                value_type = option["value_type"]
+                if value_type not in {"boolean", "integer", "number", "string"} or not isinstance(values, list) or not values:
+                    raise ValueError(f"invalid enum values for {task_id}.{name}")
+                if option.get("default_policy") == "current_mode":
+                    if option["default"] is not None:
+                        raise ValueError(f"dynamic default must be null for {task_id}.{name}")
+                elif option.get("default_policy") is not None or option["default"] not in values:
+                    raise ValueError(f"enum default is invalid for {task_id}.{name}")
+                for value in values:
+                    valid = (
+                        isinstance(value, bool) if value_type == "boolean" else
+                        isinstance(value, int) and not isinstance(value, bool) if value_type == "integer" else
+                        isinstance(value, (int, float)) and not isinstance(value, bool) if value_type == "number" else
+                        isinstance(value, str)
+                    )
+                    if not valid:
+                        raise ValueError(f"enum value has the wrong type for {task_id}.{name}")
+                if "suffix" in option and not isinstance(option["suffix"], str):
+                    raise ValueError(f"enum suffix must be text for {task_id}.{name}")
+            else:
                 raise ValueError(f"unsupported option type for {task_id}.{name}")
-            default = option.get("default")
-            minimum = option.get("minimum")
-            maximum = option.get("maximum")
-            if any(not isinstance(value, int) or isinstance(value, bool)
-                   for value in (default, minimum, maximum)):
-                raise ValueError(f"integer option bounds/default missing for {task_id}.{name}")
-            if minimum > default or default > maximum:
-                raise ValueError(f"option default outside bounds for {task_id}.{name}")
 
 
 def main() -> int:
     fixture = json.loads(FIXTURE.read_text())
-    if fixture.get("schema_version") != 4:
-        raise ValueError("task fixture schema version must be 4")
+    if fixture.get("schema_version") != 5:
+        raise ValueError("task fixture schema version must be 5")
     revision = subprocess.check_output(
         ["git", "-C", str(ORIGINAL), "-c", "core.hooksPath=/dev/null", "rev-parse", "HEAD"],
         text=True,
@@ -385,7 +642,7 @@ def main() -> int:
 
     print(
         f"PASS: {len(rows)} stable task IDs; original, Elisa, and browser menus, "
-        "kernel/scene anchors, controller/export map, and host capabilities match"
+        "controller/export map, host capabilities, and 224 source option records match"
     )
     return 0
 

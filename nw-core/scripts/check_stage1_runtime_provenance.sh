@@ -19,8 +19,16 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-CORE="${ELISA_CORE:-$ROOT/../../../Go projects/Elisa-core}"
-STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$ROOT/../../Elisa-compiler-port-current-5417885}"
+DEFAULT_CORE="$ROOT/../../../Go projects/Elisa-core"
+if [[ ! -d "$DEFAULT_CORE/compiler" && -d "$ROOT/../stage0-elisa-compiler/compiler" ]]; then
+    DEFAULT_CORE="$ROOT/../stage0-elisa-compiler"
+fi
+DEFAULT_STAGE1_ROOT="$ROOT/../../Elisa-compiler-port-current-23a0"
+if [[ ! -d "$DEFAULT_STAGE1_ROOT" && -d "$ROOT/../stage1-elisa-compiler" ]]; then
+    DEFAULT_STAGE1_ROOT="$ROOT/../stage1-elisa-compiler"
+fi
+CORE="${ELISA_CORE:-$DEFAULT_CORE}"
+STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$DEFAULT_STAGE1_ROOT}"
 CANONICAL="$CORE/compiler/runtime/elisacore_std"
 VENDORED="$STAGE1_ROOT/elisacore_std"
 

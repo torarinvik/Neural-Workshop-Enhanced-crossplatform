@@ -19,8 +19,8 @@ def quoted(value: str) -> str:
 
 
 def render(manifest: dict) -> str:
-    if manifest.get("schema_version") != 4:
-        raise ValueError("task catalog schema_version must be 4")
+    if manifest.get("schema_version") != 5:
+        raise ValueError("task catalog schema_version must be 5")
     categories = manifest.get("categories")
     tasks = manifest.get("tasks")
     overrides = manifest.get("port_overrides")

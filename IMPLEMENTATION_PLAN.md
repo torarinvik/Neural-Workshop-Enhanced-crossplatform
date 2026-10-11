@@ -1,8 +1,143 @@
 # Neural Workshop cross-platform implementation plan
 
-Document version: 3.73
-Prepared: 2026-09-13; updated: 2026-10-06
+Document version: 3.80
+Prepared: 2026-09-13; updated: 2026-10-07
 Status: implementation backlog; no completion claim is implied by this document.
+
+**Source-derived capability catalog (2026-10-07; partial CAT-001 / APP-001
+evidence):** `task_catalog.json` is schema v5 and now contains capability
+records for all 45 reviewed IDs. Its 224 option records are extracted from the
+pinned source `TaskOptions` declarations and the port-scoped 3D N-Back
+`GameSelect` controls. `catalog_audit.py` validates types, defaults, allowed
+values, suffixes, and dynamic N-Back timing against the reference source, and
+accounts for every declared v1 export as global or task-specific. This completes
+the source option metadata and v1 export inventory slices; it does not implement
+the remaining browser options screens, persistence, or runtime application for
+every task.
+
+**Sokoban snapshot v2 and artifact promotion (2026-10-07; partial API-001 /
+GAME-039 evidence):** `nw-core/src/wasm/runtime_protocol.elisa` now emits a
+little-endian, field-serialized Sokoban snapshot that includes options, seed,
+MT19937 state, board arrays, run state, event ordering metadata, and the
+variable-length undo history. Restore allocates fresh controller/history
+storage, validates payload sizes, booleans, board/phase consistency, and
+backwards-replays undo records to reject invalid board writes. The contract
+smoke restores a generated board after a real move, verifies state and frame,
+rejects malformed history/phase data, and checks matching undo continuation.
+
+**Tetris snapshot v3 field serializer and artifact promotion (2026-10-07;
+partial API-001 / GAME-039 evidence):** `runtime_protocol.elisa` now emits a fixed
+little-endian payload for Freeform Tetris containing the MT19937 state,
+options, phase, fixed board and piece-hand arrays, placement/scoring counters,
+and event ordering metadata. Restore validates the MT cursor, controller
+fields, array indices/counts, and payload size before registering a fresh
+handle. The legacy raw v1 Tetris restore path remains for same-build
+checkpoints, while new saves use v3. The common API smoke now checks schema
+size/header, malformed cursor and phase rejection, event-clock restoration,
+and deterministic continuation through a newly dealt hand. The complete
+`test_wasm_artifact.sh` suite passed on the exact candidate before promotion,
+including 275 Marble trajectory scenarios / 33,982 frame states. The promoted
+WASM is 1,660,122 bytes, SHA-256
+`a43f716d4607c6b1311ee2d53ece0d70a3b10b330cedb8f11e8f27d930ebc960`; its
+Stage1 object SHA-256 is
+`1a72c08372e63168fb68d21035ab0ce2e5d8159de8321718ffa19c6b3350ce26`. The prior
+artifact and a provenance/test receipt are preserved in
+`nw-core/output/verification/tetris-v3-promotion-20261007/`. The current
+`127.0.0.1:8000/build/nwcore.wasm` response was fetched and compared byte for
+byte with the promoted file. This does not complete API-001 or GAME-039; native
+adapters, remaining source-fidelity coverage, and future schema migration
+remain open.
+
+**3D N-Back v4 and Monkey Ladder v5 snapshots and artifact promotion
+(2026-10-07; partial API-001 / GAME-039 evidence):** new saves use portable
+little-endian field serializers instead of compiler run-record bytes. N-Back v4
+stores its options, active timing/phase, 100-entry position/color histories,
+grading state, and event clock/order in a fixed 1,800-byte payload. Monkey
+Ladder v5 stores its full MT19937 state, dealt/clicked arrays, options, phase,
+cursor, and event clock/order in a fixed 4,252-byte payload. Restore allocates a
+fresh record and validates sizes, options, booleans, phase relationships,
+history bounds, and RNG cursor. The smoke rejects malformed N-Back flags and
+checks event-clock restoration; it restores Monkey Ladder after a live correct
+pointer selection, checks event ordering, and continues the RNG-dealt sequence
+identically. Legacy raw v1 snapshots for these tasks remain restore-only for
+same-build compatibility. The exact candidate passed the complete
+`test_wasm_artifact.sh` suite before promotion. The promoted WASM is 1,673,600
+bytes, SHA-256
+`1b224d94180acddb4c1572df162a2ebca41fa87ea6a1779147d9a433d0248502`; its
+Stage1 object SHA-256 is
+`c91102f01cffc390c92108eccdc891d68e3af04ca909ef0f25191e95e7d777c3`. The prior
+artifact/object, served-response copy, and receipt are saved in
+`nw-core/output/verification/nback-monkey-snapshot-promotion-20261007/`. The
+served response matches the promoted WASM byte-for-byte. API-001 and GAME-039
+remain partial; native adapters, remaining source-fidelity coverage, and
+cross-version migration remain open.
+
+**Mr. Time default multi-trial replay (2026-10-07; GAME-022 evidence):** a
+headed Playwright run entered Perception → Mr. Time from the real task menu,
+started with Space, typed `0`, and submitted with Enter through all 15 default
+recall trials. Seed 17 completed at 0% accuracy, 0/15 correct, 100.0% typical
+error, and best rung 1, matching the original-source reference summary. The
+complete screen is
+`nw-core/output/playwright/mrtime-multitrial-seed17.png`. The source/WASM
+differential now includes this exact seeded default run and passes 1,886 cases
+on both Stage0 and Stage1, including the too-short/exact/too-long recall and
+produce boundary matrix at every rung. The browser now exposes all six
+original task options from the real task menu and READY/DONE task screen, validates saved
+values, persists accepted settings under
+`neural-workshop.mr-time.options.v1`, and recreates the controller with the
+accepted configuration. Headed Playwright verified all six values survive a
+reload, a cancelled draft does not overwrite them, and launch starts in the
+saved Produce mode with 20 trials. Capture:
+`nw-core/output/playwright/mrtime-options-persistence-seed17.png`. The common
+API smoke also covers duplicate start/submit/ACT, malformed and repeated text,
+and the inclusive late-grace deadline. OS-held-key repeat equivalence and the
+source scene differential remain open.
+
+**Count v6 portable snapshot and artifact promotion (2026-10-07; partial
+API-001 / GAME-039 evidence):** Count snapshots use a variable-length,
+little-endian field format containing MT19937 state, active shapes and
+geometry, controller/adaptation/answer/timing fields, and protocol clock/order.
+The payload is 2,668 fixed bytes plus 72 bytes per active shape, up to 6,988
+bytes. Restore rejects inconsistent shape counts, invalid shape geometry,
+controller state, options, and RNG cursor. The common runtime smoke verifies
+exact size, rejects a corrupted shape count and non-finite geometry, compares
+restored state/frame, and checks matching RNG/adaptive continuation. The full
+latest-Stage1 artifact suite passed before promotion. The promoted WASM is
+1,685,170 bytes, SHA-256
+`4e4b6e90f58257883672da6309793db175f5a1f501c6042a1ef2dccaa6eec897`; its
+Stage1 object SHA-256 is
+`bd71fdd5aa54123c8e87d90794e100967353d9d7c581069077f868d726fe0233`. The
+previous artifact/object, served response, candidate files, and receipt are
+preserved under
+`nw-core/output/verification/count-v6-snapshot-promotion-20261007/`. The served
+response matches the promoted WASM byte-for-byte. This is partial evidence;
+API-001, GAME-039, native adapters, and cross-version migration remain open.
+
+The latest Stage1 artifact passed `scripts/build_latest_stage1_wasm.sh` and the
+full `test_wasm_artifact.sh` suite. Stage1 compiler commit is
+`23a0e16a854cddec3016746a0cb9480db0c4db22`, source fingerprint
+`0e17e6c92e8a03735d46be9eec69953336395d909c4121fbe83414d060589f57`, and
+product SHA-256
+`f1d15c7713b8583c0ec3d5b617599f7208786b374eb291dab9c86892ca0d8b56`. The
+promoted `nw-core/build/nwcore.wasm` is 1,685,170 bytes, SHA-256
+`4e4b6e90f58257883672da6309793db175f5a1f501c6042a1ef2dccaa6eec897`; its
+Stage1 object SHA-256 is
+`bd71fdd5aa54123c8e87d90794e100967353d9d7c581069077f868d726fe0233`. The
+artifact suite includes Count v6, N-Back v4, Monkey Ladder v5, Sokoban v2,
+and Tetris v3 snapshot contracts and 275 Marble trajectory scenarios (33,982
+per-frame states).
+The post-fix Stage0 `make test-full` rerun also passes.
+
+The integrated `gate.sh --full` completed on 2026-10-07 and failed. The Stage1
+parity sweep reports 232 failures among 569 checks, including a self-host
+stage-B timeout, Stage0 provenance/harness failures, 38 diagnostic-breadth
+changes, one diagnostic-line defect, 63 interface-emission differences, and
+parser/semantic acceptance differences. The final gate reports three failed
+steps. Detailed logs are preserved under
+`nw-core/build/verification/full-gate-20261007/`; diagnose the differences and
+fix harness wiring before changing baselines. The snapshot slice does not
+complete API-001 or GAME-039: all-shell/native adapters, remaining source-
+fidelity traces, and cross-version save migration remain open.
 
 **Stage1 wasm32 checked-growth multiplication fix (2026-10-06; verification in
 progress):** The fast/medium gate exposed a real backend/runtime defect in the
@@ -4115,8 +4250,10 @@ broader all-shell/resource acceptance—not another JavaScript-side game state.
   isolated current-source stage1 browser check
   now confirms Games → Perception → Count and Mr. Time, Space start, typed
   input, timing, grading, and trial progression. Count's options UI and complete
-  run/result/replay acceptance remain open; Mr. Time's source differential
-  replay and options persistence also remain open. The default WASM artifact has now
+  run/result/replay acceptance remain open. Mr. Time's real-menu 15-trial run
+  and 1,886-case Stage0/Stage1 source differential now pass, including the
+  all-rung recall/produce boundary matrix. Its six browser options persist and
+  reapply from the real task menu. The default WASM artifact has now
   been rebuilt from current source and exports the current common-v1 tasks.
   The required-export guard remains as protection against a stale build being
   served later.
@@ -4558,12 +4695,12 @@ Dependency order: M0 precedes confidence in M1; M1 provides the protocol for M2;
 - [x] TEST-001: correct command/byte comparison in `task_game_input_smoke.mjs`; prove deliberate identical frames fail. The generic smoke retains raw bytes separately from decoded commands and self-tests the identical-frame rejection branch; the live Sokoban replay asserts a reached playing frame differs from its actual ready frame. Monkey Ladder and Sokoban controller replays cover ignored inputs and real verdict transitions.
 - [x] TEST-002: make checker exit codes and expected counts mandatory; prove a process printing PASS then exiting nonzero fails. `check_result.py` requires compile/link/checker statuses, rejects missing/zero case counts and nonzero exits, and the unit test launches a real child process that prints `PASS: 12 cases identical` before exiting 7.
 - [x] TEST-003: isolate oracle files and output directories; test interruption and concurrency handling. `check.sh` gives each run a private output directory and serializes official checker runs with a per-user lock in `TMPDIR`, shared across worktrees. `check_harness_test.sh` covers ownerless and stale/reused-PID locks, SIGTERM while waiting behind a live owner, and two builds concurrently running a fixed-oracle expressions suite with distinct results.
-- [x] CAT-001: map original catalog IDs to kernels, scenes, controllers, exports, and host support. Schema-v4 `nw-core/test/fixtures/task_catalog.json` joins the pinned 45-ID menu to category labels/order, the explicit 3D-only N-Back override, plan anchors, audited runtime/export/host mapping, and an initial source-derived task-capability record for Freeform Tetris. `catalog_audit.py` checks the generated browser registry, stale paths, unknown WASM exports, requires an explicit controller for every stateful host, and validates capability-record shape. Capability metadata remains incomplete for the other tasks; recheck each row when a host/controller is added.
-- [ ] API-001: complete the stateful protocol and ownership design described below. The reviewed catalog currently records 43 web stateful controllers, one stateless web-only task, one Marble physics prototype, and 23 stateful Python/SDL controllers each; 22 entries remain unintegrated on each native host. Common v1 now verifies same-build snapshots for fixed-layout 3D N-Back, Monkey Ladder, and Tetris, and explicitly rejects pointer-backed Sokoban snapshots; durable/cross-build snapshot schemas, task-neutral effect production, Marble render (host-owned/unsupported), source-derived options persistence, text/IME ownership, full all-shell acceptance, and exact capability-to-export mapping remain open.
-- [ ] GAME-039: use Sokoban as the first discrete state/action/win/undo slice.
+- [x] CAT-001: map original catalog IDs to kernels, scenes, controllers, exports, and host support. Schema-v5 `nw-core/test/fixtures/task_catalog.json` joins all 45 pinned IDs to category labels/order, the explicit 3D-only N-Back override, plan anchors, audited runtime/export/host mapping, and source-derived capability/options records. `catalog_audit.py` checks the generated browser registry, stale paths, unknown WASM exports, explicit controllers for stateful hosts, exact per-task option defaults and allowed values against the pinned source, and exhaustive attribution of every common-v1 export. Native host capability integration and non-v1 export correspondence remain open under API-001/APP-001.
+- [ ] API-001: complete the stateful protocol and ownership design described below. The reviewed catalog currently records 43 web stateful controllers, one stateless web-only task, one Marble physics prototype, and 24 stateful Python/SDL controllers each; 21 entries remain unintegrated on each native host. New Monkey Ladder v5 and 3D N-Back v4 saves use field-serialized formats; legacy raw v1 for those tasks and Tetris remains restore-only. Sokoban uses field-serialized v2, Tetris uses field-serialized v3, and Count uses field-serialized v6. Future-version migration, task-neutral effect production, Marble render (host-owned/unsupported), source-derived options persistence, text/IME ownership, full all-shell acceptance, and native/non-v1 capability-to-export mapping remain open.
+- [ ] GAME-039: use Sokoban as the first discrete state/action/win/undo slice. The common WASM lifecycle now round-trips a generated board and undo history; the full source-fidelity trace set and Python/SDL integration remain open.
 - [ ] GAME-002: use Monkey Ladder as the reveal/timer/hidden-state slice.
 - [ ] GAME-020: complete Marble lifecycle, physics evidence, rendering, and disposal.
-- [ ] APP-001: complete registry-backed application routing. The browser now consumes generated category labels/order and stable IDs from the reviewed schema-v4 catalog; `task_registry_test.mjs` checks all 45 rows and `catalog_audit.py` independently compares the catalog against original, core, browser, export, and host mappings. Remaining: generate/validate mappings across native shells and exports, complete per-task capability metadata beyond the initial Tetris record, and close navigation/options/results integration.
+- [ ] APP-001: complete registry-backed application routing. The browser consumes generated category labels/order and stable IDs from the reviewed schema-v5 catalog; `task_registry_test.mjs` checks all 45 rows and `catalog_audit.py` independently compares original, core, browser, export, host, and source-derived option mappings. Remaining: generate/validate mappings across native shells and exports, implement options screens and persistence using the source catalog, and close navigation/results integration.
 
 ## 5. Baseline, catalog, and trace infrastructure
 
@@ -4643,18 +4780,22 @@ These are responsibilities, not existing function names. Specify handle width, n
 
 States must distinguish ready, preview/reveal, active response, feedback, summary, paused, loading, and error as needed by each task. Not every game needs every state; do not force source behavior into three generic phase numbers.
 
-**Implemented slice (2026-09-13 through 2026-10-06, partial):** `nw-core/src/wasm/runtime_protocol.elisa` exports common WASM v1 functions for create, typed dispatch, logical/elapsed advance, public state, render, effects, snapshot/restore, and destroy. Its 64-slot registry returns opaque monotonic integer handles, retains a bounded tombstone for idempotent destroy, frees controller records, validates options and output ranges, and rejects stale handles. The browser startup guard now rejects a core missing any common lifecycle export (including effects drain and snapshot/restore) or reporting the wrong ABI version; `runtime_protocol_shell_contract_test.mjs` protects this fail-fast contract in the fast gate. Browser/WASM controllers now cover the source-backed task slices identified in the catalog; the contract and task smokes cover their current controller behavior. Same-build versioned snapshot/restore is now tested for fixed-layout 3D N-Back, Monkey Ladder, and Tetris, including identical post-restore N-Back continuation; pointer-backed Sokoban is tested to return explicit unsupported until it has a field-level serializer. These raw-copy checkpoints are not a durable cross-build format. The common API still lacks task-neutral effect production, Python/native and SDL adapters, full text/IME ownership, and complete source-derived options for every task. Marble physics and 3D drawing remain host-owned, and Marble's common render operation is explicitly unsupported.
+**Implemented slice (2026-09-13 through 2026-10-07, partial):** `nw-core/src/wasm/runtime_protocol.elisa` exports common WASM v1 functions for create, typed dispatch, logical/elapsed advance, public state, render, effects, snapshot/restore, and destroy. Its 64-slot registry returns opaque monotonic integer handles, retains a bounded tombstone for idempotent destroy, frees controller records, validates options and output ranges, and rejects stale handles. The browser startup guard now rejects a core missing any common lifecycle export (including effects drain and snapshot/restore) or reporting the wrong ABI version; `runtime_protocol_shell_contract_test.mjs` protects this fail-fast contract in the fast gate. Browser/WASM controllers now cover the source-backed task slices identified in the catalog; the contract and task smokes cover their current controller behavior. New Monkey Ladder v5 and 3D N-Back v4 saves use little-endian field serializers for RNG/history, controller, and protocol state; legacy same-build raw v1 remains restore-compatible. Sokoban uses a v2 little-endian field serializer for options, RNG, board, controller/protocol state, and undo history, with malformed-state rejection and equal post-restore undo continuation. New Tetris saves use a v3 little-endian field serializer for RNG, options, board/hand state, scoring, and event ordering; the former same-build raw v1 format remains restore-compatible. The common API still lacks task-neutral effect production, Python/native and SDL adapters, full text/IME ownership, and controller application/persistence for the complete source-derived option set. Marble physics and 3D drawing remain host-owned, and Marble's common render operation is explicitly unsupported.
 
 Snapshot evidence: `runtime_protocol_v1_smoke.mjs` saves Monkey Ladder after a
 live pointer event, Freeform Tetris after a real hand selection/drop, and the
 port-scoped 3D N-Back during its second active stimulus. It restores each into
 a fresh handle, compares public state (and task frames where applicable), and
-continues both original/restored N-Back runs through the same match, deadline,
-and next-stimulus path. It also verifies that pointer-backed Sokoban returns
-`ERR_UNSUPPORTED`, as well as truncated snapshots and output-buffer failures.
-Only fixed-layout inline run records are currently admitted; the raw payload is
-same-build only and must not be treated as a durable version-independent save
-format. The current `nwcore.wasm` contract smoke passes on the deployed artifact.
+continues both original/restored Tetris and N-Back runs through matching
+post-restore actions. Tetris v3 additionally checks its exact payload size,
+rejects an invalid RNG cursor and phase, and preserves event-order metadata.
+For Sokoban, it snapshots a generated board after a
+real move, restores to a fresh handle, compares state and frame, checks undo
+continuation, and rejects mismatched payload length, invalid booleans, an
+out-of-board undo record, and a pushing phase without a board. The v1 raw
+payloads remain same-build only; the v2 Sokoban fields are independent of
+compiler record layout and pointer width, while future-version migration is
+still open. The full artifact suite passed on the promoted `nwcore.wasm`.
 
 ### 6.3 Input normalization
 
@@ -5582,9 +5723,13 @@ controller export.
 
 **Reference discovery and recorded contract:** the port records recall SHOWING/WAITING/ASKING timing, produce COUNTING/FEEDBACK timing, target/late-grace deadlines, decimal response parsing, source tolerance, adaptive rung, feedback, and action mapping in `nw-core/docs/runtime-protocol.md`. The common-v1 action vocabulary is START, DIGIT, POINT, BACKSPACE, SUBMIT, and ACT; all grading remains controller-owned.
 
-**Implementation completed for the current browser/WASM slice:** `src/tasks/mrtime.elisa` owns the persistent MT19937 stream, fixed arrays, phase/deadline transitions, decimal buffer, recall/produce verdicts, timeout, feedback, adaptive rung, and result counters. `runtime_protocol.elisa` exposes task ID `337138730`, common lifecycle, additive info, action/text/pointer dispatch, display-list render, and idempotent destroy. `shells/web/index.html` maps the real menu route and browser events to that ABI, schedules `advance` from monotonic time, and cancels the timer on replacement/exit.
+**Implementation completed for the current browser/WASM slice:** `src/tasks/mrtime.elisa` owns the persistent MT19937 stream, fixed arrays, phase/deadline transitions, decimal buffer, recall/produce verdicts, timeout, feedback, adaptive rung, and result counters. `runtime_protocol.elisa` exposes task ID `337138730`, common lifecycle, additive info, action/text/pointer dispatch, display-list render, and idempotent destroy. `shells/web/index.html` maps the real menu route and browser events to that ABI, schedules `advance` from monotonic time, cancels the timer on replacement/exit, and exposes validated, persistent options that recreate the controller when accepted.
 
-**Verified task-specific replays:** `test/mrtime_game_smoke.mjs` covers recall flash/ask timing, frozen interval, digit/decimal/backspace input, correct grading, feedback expiry, produce ACT at the target, timeout miss, pointer center hit-testing, display-list render, and idempotent disposal. The headed Playwright route additionally covers Games → Perception → Mr. Time, Space start, timed recall, decimal entry, Enter grading, trial progression, console cleanliness, and browser scheduler behavior. Still required for source parity: too-short/exact/too-long boundary matrix, duplicate start/submit/ACT, held/repeated keys, malformed text, late-grace edges, adaptive promotion/demotion, and multi-trial replay against the original UI/environment.
+**Verified task-specific replays:** `test/mrtime_game_smoke.mjs` covers recall flash/ask timing, frozen interval, digit/decimal/backspace input, correct grading, feedback expiry, produce ACT at the target, timeout miss, pointer center hit-testing, display-list render, duplicate start/submit/ACT, malformed/repeated text, the late-grace boundary, and idempotent disposal. The headed Playwright replay entered Games → Perception → Mr. Time, completed all 15 default trials with ordinary Space/0/Enter input, reached DONE, and recorded the displayed score summary at `nw-core/output/playwright/mrtime-multitrial-seed17.png`. The browser options replay changed all six source settings, applied them from the menu, reloaded, verified persistence, cancelled a modified draft, then launched a 20-trial Produce run; its options capture is `nw-core/output/playwright/mrtime-options-persistence-seed17.png`. The source differential now covers 1,886 cases under Stage0 and Stage1, including each result, the exact 15-trial default summary, and all-rung recall/produce answer boundaries. OS-held-key repeat behavior and the source scene differential remain open; the latter requires a Cocoa display for the original pyglet renderer.
+
+**Mr. Time verification receipt:** source results and a concise browser/smoke
+summary are preserved in
+`nw-core/output/verification/mrtime-options-boundaries-20261007/`.
 
 **Native host adapter evidence (2026-09-19):** Mr. Time is now exposed
 through the Python pymodule (`mr_time_create/action/advance/info/frame/
@@ -5593,7 +5738,8 @@ routes plus SDL task-hub and `--screen mr-time` routes. Both native focused
 smokes exercise READY → SHOWING → ASKING → FEEDBACK, typed input,
 display-list rendering, and disposal; the SDL build gate runs
 `--selftest-mr-time`. The Stage0 and newest Stage1 `mrtime` differentials
-both pass all 1,785 cases. The source scene differential remains unrerun in
+both pass all 1,886 cases, including the seeded default 15-trial run and the
+all-rung recall/produce boundary matrix. The source scene differential remains unrerun in
 this headless environment because the original pyglet reference requires a
 Cocoa display; that is an environment limitation, not a passing claim.
 
@@ -5601,9 +5747,9 @@ Cocoa display; that is an environment limitation, not a passing claim.
 
 - [x] Record source-derived phases, options, action vocabulary, generation, timing, and grading in the runtime protocol and controller comments.
 - [x] Connect the controller to exports and all three shells using the shared protocol; browser/WASM, Python pymodule, and SDL native adapters and routes are covered by focused lifecycle/render smokes.
-- [ ] Drive a complete multi-trial run from the real menu with ordinary input and capture the source-comparable result summary.
-- [ ] Compare generated state, action outcomes, feedback, timing tolerances, adaptive changes, and score against the original UI/environment.
-- [x] Add browser/WASM and native rendering, pointer/timer, focus/cleanup, timeout, and resource-lifecycle checkpoints; the broader source timing matrix remains open.
+- [x] Drive a complete multi-trial run from the real menu with ordinary input and capture the source-comparable result summary. The headed seed-17 run completed all 15 default recall trials and matched the source summary: 0% accuracy, 0/15 correct, 100.0% typical error, best rung 1; screenshot: `nw-core/output/playwright/mrtime-multitrial-seed17.png`.
+- [x] Compare generated state, action outcomes, feedback, timing tolerances, adaptive changes, and score against the original UI/environment. The lifted source reference and both Stage0/Stage1 implementations match across 1,886 cases, including every result, the exact 15-trial default summary, and all-rung recall/produce answer boundaries.
+- [x] Add browser/WASM and native rendering, pointer/timer, focus/cleanup, timeout, and resource-lifecycle checkpoints; OS-held-key repeat behavior and the original pyglet source scene differential remain open.
 - [x] Link current evidence and remaining platform gaps in the runtime protocol, artifact gate, focused smoke, browser contract, and this task section.
 
 **Done when:** the task-specific replays and section 18.1 pass, with no production fixture standing in for this game's state or verdict.

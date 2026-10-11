@@ -50,6 +50,7 @@ const STATE = Object.freeze({ bytes: 112, magic: 0x3152574e,
     position: 5, color: 6, verdict: 7, answered: 8, hits: 9,
     misses: 10, falseAlarms: 11 },
 });
+const SOKOBAN_SNAPSHOT_FIXED_BYTES = 12992;
 // Freeform Tetris renders a deliberately wide 72x32 field and its ordered
 // display list can exceed the legacy 64 KiB diagnostic buffer. The production
 // web shell already reserves this 1 MiB frame capacity.
@@ -57,6 +58,11 @@ const FRAME_BYTES = 1048576;
 const STATE_BUFFER = Number(exports.nw_frame_alloc(BigInt(STATE.bytes + 16)));
 const FRAME_BUFFER = Number(exports.nw_frame_alloc(BigInt(FRAME_BYTES)));
 const SNAPSHOT_BUFFER = Number(exports.nw_frame_alloc(BigInt(FRAME_BYTES)));
+const TETRIS_SNAPSHOT_FIXED_BYTES = 28436;
+const NBACK3D_SNAPSHOT_FIXED_BYTES = 1800;
+const MONKEY_LADDER_SNAPSHOT_FIXED_BYTES = 4252;
+const COUNT_SNAPSHOT_FIXED_BYTES = 2668;
+const COUNT_SHAPE_SNAPSHOT_BYTES = 72;
 assert.ok(STATE_BUFFER > 0 && FRAME_BUFFER > 0 && SNAPSHOT_BUFFER > 0);
 
 function create(task, options, seed = 1n, version = 1n) {
@@ -82,6 +88,17 @@ function eventAux(handle, kind, timestamp, sequence, code, value = 0n,
                   aux = 0n, flags = 0n) {
   return exports.nw_api_v1_dispatch(...[handle, kind, timestamp, sequence,
     code, value, 0, flags, 0, 0, aux].map(BigInt));
+}
+function monkeyPointerToCell(handle, timestamp, sequence, cell, grid = 5) {
+  const row = Math.floor(cell / grid);
+  const column = cell % grid;
+  const board = 684 * 62 / 100;
+  const originX = (912 - board) / 2;
+  const originY = (684 - board) / 2 - 10;
+  const x = Math.floor((originX + (column + 0.5) * board / grid) * 1000000 / 912);
+  const y = Math.floor((originY + (row + 0.5) * board / grid) * 1000000 / 684);
+  return event(handle, EVENT.pointerDown, BigInt(timestamp), BigInt(sequence),
+    0n, 0n, 0n, BigInt(x), BigInt(y));
 }
 function render(handle, capacity = BigInt(FRAME_BYTES)) {
   const length = exports.nw_api_v1_render(handle, BigInt(FRAME_BUFFER),
@@ -140,15 +157,46 @@ assert.deepEqual(render(tetris), tetrisFrame, "Tetris render is observational");
 const tetrisBeforeSnapshot = state(tetris);
 const tetrisSnapshotBytes = exports.nw_api_v1_snapshot(
   tetris, BigInt(SNAPSHOT_BUFFER), BigInt(FRAME_BYTES));
-assert.ok(tetrisSnapshotBytes > 16n,
-  "Tetris fixed-layout controller supports a versioned snapshot");
+assert.equal(tetrisSnapshotBytes, BigInt(16 + TETRIS_SNAPSHOT_FIXED_BYTES),
+  "Tetris v3 snapshot serializes the complete controller in a fixed portable payload");
+let tetrisSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(tetrisSnapshotBytes));
+assert.equal(tetrisSnapshotView.getUint32(4, true), 3,
+  "Tetris uses the field-serialized snapshot schema");
+assert.equal(tetrisSnapshotView.getUint32(8, true), Number(TASK.tetris));
+assert.equal(tetrisSnapshotView.getUint32(12, true), TETRIS_SNAPSHOT_FIXED_BYTES);
+const tetrisMtiOffset = 16 + 624 * 4;
+const savedTetrisMti = tetrisSnapshotView.getUint32(tetrisMtiOffset, true);
+tetrisSnapshotView.setUint32(tetrisMtiOffset, 625, true);
+assert.equal(exports.nw_api_v1_restore(BigInt(SNAPSHOT_BUFFER), tetrisSnapshotBytes),
+  STATUS.unsupported, "Tetris rejects an invalid MT19937 cursor");
+tetrisSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(tetrisSnapshotBytes));
+tetrisSnapshotView.setUint32(tetrisMtiOffset, savedTetrisMti, true);
+const tetrisPhaseOffset = 16 + 2500 + 6 * 8;
+const savedTetrisPhase = tetrisSnapshotView.getBigInt64(tetrisPhaseOffset, true);
+tetrisSnapshotView.setBigInt64(tetrisPhaseOffset, 99n, true);
+assert.equal(exports.nw_api_v1_restore(BigInt(SNAPSHOT_BUFFER), tetrisSnapshotBytes),
+  STATUS.unsupported, "Tetris rejects an invalid controller phase");
+tetrisSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(tetrisSnapshotBytes));
+tetrisSnapshotView.setBigInt64(tetrisPhaseOffset, savedTetrisPhase, true);
 const tetrisRestored = exports.nw_api_v1_restore(
   BigInt(SNAPSHOT_BUFFER), tetrisSnapshotBytes);
-assert.ok(tetrisRestored > tetris, "Tetris restore returns a fresh handle");
+assert.ok(tetrisRestored > tetris,
+  `Tetris restore returns a fresh handle (restore returned ${tetrisRestored})`);
 assert.deepEqual(state(tetrisRestored), tetrisBeforeSnapshot,
   "restored Tetris state matches the saved hand and board state");
 assert.deepEqual(render(tetrisRestored), tetrisFrame,
   "restored Tetris render matches the saved display state");
+assert.equal(event(tetrisRestored, EVENT.action, 1002n, 4n, 4n), STATUS.eventOrder,
+  "Tetris v3 preserves the shared event clock and sequence");
+assert.equal(event(tetris, EVENT.action, 1004n, 4n, 4n), STATUS.accepted);
+assert.equal(event(tetrisRestored, EVENT.action, 1004n, 4n, 4n), STATUS.accepted);
+assert.deepEqual(state(tetrisRestored), state(tetris),
+  "Tetris restore preserves RNG state through the next dealt hand");
+assert.deepEqual(render(tetrisRestored), render(tetris),
+  "Tetris render remains identical after matching post-restore actions");
 assert.equal(exports.nw_api_v1_destroy(tetrisRestored), 0n);
 assert.equal(exports.nw_api_v1_destroy(tetris), 0n);
 
@@ -192,8 +240,21 @@ const nback3dSavedState = state(nback3d);
 const nback3dSavedFrame = render(nback3d);
 const nback3dSnapshotBytes = exports.nw_api_v1_snapshot(
   nback3d, BigInt(SNAPSHOT_BUFFER), BigInt(FRAME_BYTES));
-assert.ok(nback3dSnapshotBytes > 16n,
-  "3D N-Back fixed-layout controller supports a versioned snapshot");
+assert.equal(nback3dSnapshotBytes, BigInt(16 + NBACK3D_SNAPSHOT_FIXED_BYTES),
+  "3D N-Back v4 serializes its controller into a fixed portable payload");
+let nback3dSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(nback3dSnapshotBytes));
+assert.equal(nback3dSnapshotView.getUint32(4, true), 4,
+  "3D N-Back uses its field-serialized snapshot schema");
+assert.equal(nback3dSnapshotView.getUint32(8, true), Number(TASK.nback3d));
+assert.equal(nback3dSnapshotView.getUint32(12, true), NBACK3D_SNAPSHOT_FIXED_BYTES);
+const nback3dAnsweredOffset = 16 + 213 * 8 + 2 * 8;
+nback3dSnapshotView.setBigInt64(nback3dAnsweredOffset, 2n, true);
+assert.equal(exports.nw_api_v1_restore(BigInt(SNAPSHOT_BUFFER), nback3dSnapshotBytes),
+  STATUS.unsupported, "3D N-Back rejects non-boolean snapshot flags");
+nback3dSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(nback3dSnapshotBytes));
+nback3dSnapshotView.setBigInt64(nback3dAnsweredOffset, 0n, true);
 const nback3dRestored = exports.nw_api_v1_restore(
   BigInt(SNAPSHOT_BUFFER), nback3dSnapshotBytes);
 assert.ok(nback3dRestored > nback3d,
@@ -202,6 +263,8 @@ assert.deepEqual(state(nback3dRestored), nback3dSavedState,
   "restored 3D N-Back state includes the active trial and score");
 assert.deepEqual(render(nback3dRestored), nback3dSavedFrame,
   "restored 3D N-Back scene matches the saved active stimulus");
+assert.equal(exports.nw_api_v1_advance(nback3dRestored, 3000n, 0n, 4n),
+  STATUS.eventOrder, "3D N-Back v4 preserves the shared event clock and sequence");
 for (const handle of [nback3d, nback3dRestored]) {
   assert.equal(exports.nw_api_v1_advance(handle, 3500n, 500n, 5n),
     STATUS.accepted);
@@ -228,10 +291,57 @@ assert.deepEqual(state(count).slice(0, 5), [1n, 0n, 8n, 1n, 15n]);
 assert.equal(event(count, EVENT.text, 1001n, 1n, 0n, 56n), STATUS.accepted,
   "ASCII text input reaches Count's numeric answer buffer");
 assert.equal(state(count)[6], 8n);
-assert.equal(event(count, EVENT.keyDown, 1002n, 2n, KEY.enter, 13n), STATUS.accepted);
+const countBeforeSnapshot = state(count);
+const countFrame = render(count);
+const countSnapshotBytes = exports.nw_api_v1_snapshot(
+  count, BigInt(SNAPSHOT_BUFFER), BigInt(FRAME_BYTES));
+let countSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(countSnapshotBytes));
+assert.equal(countSnapshotView.getUint32(4, true), 6,
+  "Count uses the portable field-serialized snapshot schema");
+assert.equal(countSnapshotView.getUint32(8, true), Number(TASK.count));
+const countShapeCountOffset = 16 + 2500;
+const countShapeCount = Number(countSnapshotView.getBigInt64(countShapeCountOffset, true));
+assert.equal(countSnapshotBytes, BigInt(16 + COUNT_SNAPSHOT_FIXED_BYTES +
+  countShapeCount * COUNT_SHAPE_SNAPSHOT_BYTES),
+  "Count v6 uses an exact payload size for the active shape list");
+const savedCountShapeCount = countSnapshotView.getBigInt64(countShapeCountOffset, true);
+countSnapshotView.setBigInt64(countShapeCountOffset, savedCountShapeCount + 1n, true);
+assert.equal(exports.nw_api_v1_restore(BigInt(SNAPSHOT_BUFFER), countSnapshotBytes),
+  STATUS.buffer, "Count rejects a shape count inconsistent with payload size");
+countSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(countSnapshotBytes));
+countSnapshotView.setBigInt64(countShapeCountOffset, savedCountShapeCount, true);
+const firstCountShapeXOffset = countShapeCountOffset + 8 + 16;
+const savedCountShapeX = countSnapshotView.getBigUint64(firstCountShapeXOffset, true);
+countSnapshotView.setBigUint64(firstCountShapeXOffset, 0x7ff8000000000000n, true);
+assert.equal(exports.nw_api_v1_restore(BigInt(SNAPSHOT_BUFFER), countSnapshotBytes),
+  STATUS.unsupported, "Count rejects non-finite saved geometry");
+countSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(countSnapshotBytes));
+countSnapshotView.setBigUint64(firstCountShapeXOffset, savedCountShapeX, true);
+const countRestored = exports.nw_api_v1_restore(
+  BigInt(SNAPSHOT_BUFFER), countSnapshotBytes);
+assert.ok(countRestored > count, "Count restore allocates a fresh opaque handle");
+assert.deepEqual(state(countRestored), countBeforeSnapshot,
+  "Count restores its answer buffer, active shapes, and controller state");
+assert.deepEqual(render(countRestored), countFrame,
+  "Count restored frame matches the saved tangle");
+for (const handle of [count, countRestored]) {
+  assert.equal(event(handle, EVENT.keyDown, 1002n, 2n, KEY.enter, 13n), STATUS.accepted);
+}
 assert.deepEqual(state(count).slice(0, 6), [3n, 0n, 9n, 1n, 15n, 1n]);
-assert.equal(exports.nw_api_v1_advance(count, 1803n, 0n, 3n), STATUS.accepted);
+assert.deepEqual(state(countRestored), state(count),
+  "Count v6 preserves RNG, adaptive scoring, and matching submit continuation");
+for (const handle of [count, countRestored]) {
+  assert.equal(exports.nw_api_v1_advance(handle, 1803n, 0n, 3n), STATUS.accepted);
+}
 assert.deepEqual(state(count).slice(0, 6), [1n, 0n, 9n, 2n, 15n, 1n]);
+assert.deepEqual(state(countRestored), state(count),
+  "Count v6 preserves the feedback deadline and next generated round");
+assert.deepEqual(render(countRestored), render(count),
+  "Count v6 restores the same next RNG-generated display frame");
+assert.equal(exports.nw_api_v1_destroy(countRestored), 0n);
 assert.equal(exports.nw_api_v1_destroy(count), 0n);
 
 // Monkey Ladder: options, reveal timing, input-order contract, pointer mapping,
@@ -263,9 +373,13 @@ assert.equal(state(monkey)[STATE.monkey.phase], 2n, "deadline enters INPUT");
 assert.equal(event(monkey, EVENT.pointerDown, 1641n, 4n, 0n, 1n,
   0n, 1000001n, 250000n), STATUS.badEvent,
   "malformed normalized coordinates fail without consuming event order");
-assert.equal(event(monkey, EVENT.pointerDown, 1641n, 4n, 0n, 1n,
-  0n, 315000n, 240000n), STATUS.accepted,
-  "a valid primary pointer event at the same sequence is accepted");
+const monkeyInputSnapshotBytes = exports.nw_api_v1_snapshot(
+  monkey, BigInt(SNAPSHOT_BUFFER), BigInt(FRAME_BYTES));
+const monkeyInputSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(monkeyInputSnapshotBytes));
+const monkeyFirstCell = Number(monkeyInputSnapshotView.getBigInt64(16 + 2500, true));
+assert.equal(monkeyPointerToCell(monkey, 1641n, 4n, monkeyFirstCell), STATUS.accepted,
+  "a pointer on the RNG-dealt first cell is accepted");
 const unchangedMonkeyFrame = render(monkey);
 assert.ok(unchangedMonkeyFrame instanceof Uint8Array && unchangedMonkeyFrame.length > 0);
 assert.deepEqual(render(monkey), unchangedMonkeyFrame,
@@ -275,7 +389,14 @@ assert.equal(exports.nw_api_v1_drain_effects(monkey, 0n, 0n), 0n,
 const monkeyBeforeSnapshot = state(monkey);
 const monkeySnapshotBytes = exports.nw_api_v1_snapshot(
   monkey, BigInt(SNAPSHOT_BUFFER), BigInt(FRAME_BYTES));
-assert.ok(monkeySnapshotBytes > 16n, "Monkey Ladder snapshot contains a versioned payload");
+assert.equal(monkeySnapshotBytes, BigInt(16 + MONKEY_LADDER_SNAPSHOT_FIXED_BYTES),
+  "Monkey Ladder v5 serializes RNG and controller fields into a fixed portable payload");
+let monkeySnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(monkeySnapshotBytes));
+assert.equal(monkeySnapshotView.getUint32(4, true), 5,
+  "Monkey Ladder uses its field-serialized snapshot schema");
+assert.equal(monkeySnapshotView.getUint32(8, true), Number(TASK.monkey));
+assert.equal(monkeySnapshotView.getUint32(12, true), MONKEY_LADDER_SNAPSHOT_FIXED_BYTES);
 assert.equal(exports.nw_api_v1_snapshot(monkey, 0n, 0n), STATUS.buffer,
   "snapshot validates output capacity and pointer before copying");
 assert.equal(exports.nw_api_v1_restore(BigInt(STATE_BUFFER), 8n), STATUS.buffer,
@@ -285,11 +406,30 @@ const monkeyRestored = exports.nw_api_v1_restore(
 assert.ok(monkeyRestored > monkey, "restore returns a fresh opaque handle");
 assert.deepEqual(state(monkeyRestored), monkeyBeforeSnapshot,
   "restored Monkey Ladder state matches the saved controller state");
-assert.equal(exports.nw_api_v1_destroy(monkeyRestored), 0n);
+assert.equal(event(monkeyRestored, EVENT.action, 1642n, 4n,
+  ACTION.monkeySelect, 0n), STATUS.eventOrder,
+  "Monkey Ladder v5 preserves the shared event clock and sequence");
 assert.equal(event(monkey, EVENT.action, 1642n, 4n, ACTION.monkeySelect, 0n),
   STATUS.eventOrder, "sequence numbers must be strictly increasing");
 assert.equal(exports.nw_api_v1_advance(monkey, 1640n, 0n, 5n), STATUS.eventOrder,
   "logical time cannot move backwards");
+// Continue both runs through the saved, RNG-dealt answer sequence. Derive
+// normalized pointer positions from each saved cell so this exercises the
+// actual pointer path, rather than restoring a synthetic action.
+const monkeySequenceStart = 16 + 2500;
+const monkeySnapshotGridOffset = monkeySequenceStart + 200 * 8;
+assert.equal(monkeySnapshotView.getBigInt64(monkeySnapshotGridOffset, true), 5n);
+for (let at = 1; at < 3; at += 1) {
+  const cell = Number(monkeySnapshotView.getBigInt64(monkeySequenceStart + at * 8, true));
+  const originalResult = monkeyPointerToCell(monkey, 1641 + at, 4 + at, cell);
+  const restoredResult = monkeyPointerToCell(monkeyRestored, 1641 + at, 4 + at, cell);
+  assert.equal(restoredResult, originalResult,
+    "Monkey Ladder v5 restores RNG-dealt sequence and matching continuation");
+  assert.ok(originalResult === STATUS.accepted || originalResult === STATUS.ignored);
+  assert.deepEqual(state(monkeyRestored), state(monkey),
+    "original and restored Monkey Ladder controllers remain equivalent");
+}
+assert.equal(exports.nw_api_v1_destroy(monkeyRestored), 0n);
 assert.equal(exports.nw_api_v1_destroy(monkey), 0n);
 assert.equal(exports.nw_api_v1_destroy(monkey), 0n, "destroy is idempotent for a retained tombstone");
 assert.equal(state(monkey), STATUS.invalidHandle, "destroyed handles cannot be read");
@@ -301,22 +441,97 @@ assert.equal(exports.nw_api_v1_marble_grain_seed(monkey), -1,
 const sokoban = create(TASK.sokoban, [2n, 1n, 0n, 0n, 0n, 0n], 17n);
 assert.ok(sokoban > monkey);
 assert.deepEqual(state(sokoban), [0n, 2n, 0n, 1n, 0n, 0n, 0n, -1n, 0n, 0n, 0n, 0n]);
-assert.equal(exports.nw_api_v1_snapshot(
-  sokoban, BigInt(SNAPSHOT_BUFFER), BigInt(FRAME_BYTES)), STATUS.unsupported,
-  "pointer-backed Sokoban fails closed until it has a field serializer");
 assert.equal(event(sokoban, EVENT.keyDown, 1000n, 0n, KEY.space, 32n), STATUS.accepted);
 const started = state(sokoban);
 assert.equal(started[STATE.sokoban.phase], 1n, "Space starts a generated level");
 assert.ok(started[STATE.sokoban.width] > 0n && started[STATE.sokoban.height] > 0n);
+let sokobanSequence = 1n;
+let sokobanMoved = false;
+for (const [index, key] of [KEY.up, KEY.down, KEY.left, KEY.right].entries()) {
+  assert.equal(event(sokoban, EVENT.keyDown, 1001n + BigInt(index),
+    sokobanSequence, key, BigInt(key)), STATUS.accepted);
+  sokobanSequence += 1n;
+  sokobanMoved ||= state(sokoban)[STATE.sokoban.moves] > 0n;
+  if (sokobanMoved) break;
+}
+assert.ok(sokobanMoved, "the generated Sokoban board admits a real player move");
+const sokobanBeforeSnapshot = state(sokoban);
 const sokobanFrame = render(sokoban);
 assert.deepEqual(render(sokoban), sokobanFrame, "Sokoban render is observational");
 assert.ok(decode(sokobanFrame).some((command) => command.kind === Kind.TEXT &&
   command.text.includes("Sokoban")));
-assert.equal(event(sokoban, EVENT.keyDown, 1001n, 1n, KEY.up, 38n), STATUS.accepted);
-assert.equal(event(sokoban, EVENT.keyDown, 1001n, 2n, KEY.undo, 85n), STATUS.accepted);
-assert.equal(exports.nw_api_v1_advance(sokoban, 1002n, 1n, 3n), STATUS.accepted);
+const sokobanSnapshotBytes = exports.nw_api_v1_snapshot(
+  sokoban, BigInt(SNAPSHOT_BUFFER), BigInt(FRAME_BYTES));
+assert.ok(sokobanSnapshotBytes > BigInt(16 + SOKOBAN_SNAPSHOT_FIXED_BYTES),
+  "Sokoban v2 snapshot includes its live undo history");
+let sokobanSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(sokobanSnapshotBytes));
+assert.equal(sokobanSnapshotView.getUint32(4, true), 2,
+  "pointer-backed Sokoban uses the field-serialized snapshot schema");
+assert.equal(sokobanSnapshotView.getUint32(8, true), Number(TASK.sokoban));
+assert.equal(sokobanSnapshotView.getUint32(12, true),
+  Number(sokobanSnapshotBytes) - 16);
+const sokobanRestored = exports.nw_api_v1_restore(
+  BigInt(SNAPSHOT_BUFFER), sokobanSnapshotBytes);
+assert.ok(sokobanRestored > sokoban, "Sokoban restore allocates a fresh handle");
+assert.deepEqual(state(sokobanRestored), sokobanBeforeSnapshot,
+  "restored Sokoban retains its board, counters, and phase");
+assert.deepEqual(render(sokobanRestored), sokobanFrame,
+  "restored Sokoban render matches its field-serialized snapshot");
+
+// The variable-length history count is part of the payload schema and must
+// match the exact snapshot size before restore allocates a run record.
+sokobanSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(sokobanSnapshotBytes));
+const historyCountOffset = 16 + SOKOBAN_SNAPSHOT_FIXED_BYTES - 4;
+const savedHistoryCount = sokobanSnapshotView.getUint32(historyCountOffset, true);
+sokobanSnapshotView.setUint32(historyCountOffset, savedHistoryCount + 1, true);
+assert.equal(exports.nw_api_v1_restore(BigInt(SNAPSHOT_BUFFER), sokobanSnapshotBytes),
+  STATUS.buffer, "Sokoban rejects a history length that exceeds its payload");
+sokobanSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(sokobanSnapshotBytes));
+sokobanSnapshotView.setUint32(historyCountOffset, savedHistoryCount, true);
+const historyEntryOffset = 16 + SOKOBAN_SNAPSHOT_FIXED_BYTES;
+const savedHistoryEntry = sokobanSnapshotView.getUint16(historyEntryOffset, true);
+sokobanSnapshotView.setUint16(historyEntryOffset, 255, true);
+assert.equal(exports.nw_api_v1_restore(BigInt(SNAPSHOT_BUFFER), sokobanSnapshotBytes),
+  STATUS.unsupported, "Sokoban rejects an undo record outside the board");
+sokobanSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(sokobanSnapshotBytes));
+sokobanSnapshotView.setUint16(historyEntryOffset, savedHistoryEntry, true);
+const hasLevelOffset = 16 + SOKOBAN_SNAPSHOT_FIXED_BYTES - 4 - 24 - 8;
+const savedHasLevel = sokobanSnapshotView.getBigInt64(hasLevelOffset, true);
+sokobanSnapshotView.setBigInt64(hasLevelOffset, 0n, true);
+assert.equal(exports.nw_api_v1_restore(BigInt(SNAPSHOT_BUFFER), sokobanSnapshotBytes),
+  STATUS.unsupported, "Sokoban rejects a pushing phase without a board");
+sokobanSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(sokobanSnapshotBytes));
+sokobanSnapshotView.setBigInt64(hasLevelOffset, savedHasLevel, true);
+const adaptiveOffset = 16 + 2 * 8;
+const savedAdaptive = sokobanSnapshotView.getBigInt64(adaptiveOffset, true);
+sokobanSnapshotView.setBigInt64(adaptiveOffset, 2n, true);
+assert.equal(exports.nw_api_v1_restore(BigInt(SNAPSHOT_BUFFER), sokobanSnapshotBytes),
+  STATUS.unsupported, "Sokoban rejects malformed boolean fields");
+sokobanSnapshotView = new DataView(instance.exports.memory.buffer,
+  SNAPSHOT_BUFFER, Number(sokobanSnapshotBytes));
+sokobanSnapshotView.setBigInt64(adaptiveOffset, savedAdaptive, true);
+
+const undoSequence = sokobanSequence;
+const undoTimestamp = 1010n;
+const originalUndo = event(sokoban, EVENT.keyDown, undoTimestamp, undoSequence,
+  KEY.undo, 85n);
+const restoredUndo = event(sokobanRestored, EVENT.keyDown, undoTimestamp, undoSequence,
+  KEY.undo, 85n);
+assert.equal(restoredUndo, originalUndo);
+assert.ok(originalUndo === STATUS.accepted || originalUndo === STATUS.ignored);
+assert.deepEqual(state(sokobanRestored), state(sokoban),
+  "original and restored Sokoban runs take the same undo transition");
+assert.deepEqual(render(sokobanRestored), render(sokoban),
+  "undo after restore produces the same display list");
 assert.equal(exports.nw_api_v1_destroy(sokoban), 0n);
 assert.equal(exports.nw_api_v1_destroy(sokoban), 0n);
+assert.equal(exports.nw_api_v1_destroy(sokobanRestored), 0n);
+assert.equal(exports.nw_api_v1_destroy(sokobanRestored), 0n);
 
 // Marble Maze shares the same authoritative lifecycle. The host continues to
 // own the physics engine, but the controller owns phase, elapsed time, board

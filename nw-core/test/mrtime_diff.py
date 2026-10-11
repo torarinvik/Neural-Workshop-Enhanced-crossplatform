@@ -385,6 +385,43 @@ def reference():
         row.append(scaled(0.0 if given is None else given))
         out.append(row)
 
+    # Compare answer and production ACT behavior at the source's interval
+    # bands: clearly short/long, exact interval, exact tolerance edges, and
+    # values just beyond each edge. Exercise both controller paths at every
+    # rung, including their adaptive rung changes.
+    for rung in range(MIN_RUNG, MAX_RUNG + 1):
+        interval = 2.0
+        band = tolerance(interval, rung)
+        answers = (1.0, interval - band,
+                   interval - band - 2.0 * EPSILON, interval,
+                   interval + band, interval + band + 2.0 * EPSILON, 3.0)
+        for case, answered in enumerate(answers):
+            recall = MrTime(random.Random(0))
+            recall.phase = "asking"
+            recall.interval = interval
+            recall.rung = rung
+            recall.adaptive = True
+            recall.trial = 1
+            recall.total_trials = 1
+            recall.trial_mode = RECALL
+            recall._settle(answered, 5.0)
+            out.append(["boundary", 0, rung, case, scaled(answered),
+                        scaled(band), recall.verdict, recall.rung])
+
+            produce = MrTime(random.Random(0))
+            produce.phase = "counting"
+            produce.appeared_at = 0.0
+            produce.interval = interval
+            produce.target = interval
+            produce.rung = rung
+            produce.adaptive = True
+            produce.trial = 1
+            produce.total_trials = 1
+            produce.trial_mode = PRODUCE
+            produce.act_now(answered)
+            out.append(["boundary", 1, rung, case, scaled(answered),
+                        scaled(band), produce.verdict, produce.rung])
+
     for cfg in range(9):
         task = MrTime(random.Random(400 + cfg))
         task.mode = MODE_BY_INDEX[cfg % 3]
@@ -440,6 +477,41 @@ def reference():
                         scaled(0.0 if answered is None else answered),
                         scaled(band), rung))
         out.append(row)
+
+    # This is the default browser-menu route's complete 15-trial run. The
+    # browser replay types zero and submits once the source has entered ASKING;
+    # keep the generated stream and displayed summary comparable to the same
+    # seeded run from the original MrTime controller.
+    task = MrTime(random.Random(17))
+    task.total_trials = 15
+    task.max_gap_ms = 3000
+    task.flash_ms = 400
+    task.adaptive = True
+    task.start_run(0.0)
+    out.append(["default15-start", PHASE[task.phase], task.trial,
+                MODE_INDEX[task.trial_mode], task.rung,
+                KINDS.index(task.mark.kind), scaled(task.mark.x),
+                scaled(task.mark.y), scaled(task.mark.radius),
+                scaled(task.mark.turn), scaled(task.ask_at)])
+    while task.phase != "done":
+        if task.phase in ("showing", "waiting"):
+            task.update(task.ask_at)
+        elif task.phase == "asking":
+            task.type_digit("0")
+            task.submit(task.ask_at)
+            mode, interval, answered, band, result_rung = task.results[-1]
+            out.append(["default15-trial", task.trial, MODE_INDEX[mode],
+                        scaled(interval), 0 if answered is None else 1,
+                        scaled(0.0 if answered is None else answered),
+                        scaled(band), result_rung, PHASE[task.phase],
+                        task.rung, task.correct, len(task.results)])
+        elif task.phase == "feedback":
+            task.update(task.feedback_until)
+    tally = task.score()
+    out.append(["default15-summary", PHASE[task.phase], task.total_trials,
+                tally["trials"], tally["correct"], tally["accuracy"],
+                scaled(tally["weber"]), scaled(tally["mean_error_ms"]),
+                tally["best_rung"]])
     return [",".join(str(one) for one in row) for row in out]
 
 

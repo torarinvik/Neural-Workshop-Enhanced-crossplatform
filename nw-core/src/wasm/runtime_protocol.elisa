@@ -108,13 +108,39 @@ module ApiV1:
 
     const STATE_MAGIC: u32 = 0x3152574e
     const STATE_BYTES: i64 = 112
-    # Snapshots are admitted only for fixed-layout controller records whose
-    # complete state is inline: 3D N-Back, Monkey Ladder, and Tetris. Their
-    # run records contain scalars/fixed arrays (and, for Tetris, fixed RNG
-    # state), not heap/darray pointers. Pointer-backed controllers require an
-    # explicit field serializer rather than being admitted by raw copy.
+# Legacy raw v1 restore remains available only for same-build checkpoints
+# of inline 3D N-Back, Monkey Ladder, and Tetris records. New snapshots use
+# field serializers: Sokoban v2, Tetris v3, N-Back v4, Monkey Ladder v5, and
+# Count v6.
     const SNAPSHOT_HEADER_BYTES: i64 = 16
     const SNAPSHOT_VERSION: u32 = 1
+    const SOKOBAN_SNAPSHOT_VERSION: u32 = 2
+    const TETRIS_SNAPSHOT_VERSION: u32 = 3
+    const NBACK3D_SNAPSHOT_VERSION: u32 = 4
+    const MONKEY_LADDER_SNAPSHOT_VERSION: u32 = 5
+    const COUNT_SNAPSHOT_VERSION: u32 = 6
+    # Stable v2 Sokoban payload: five option/seed i64s, 624 MT words plus the
+    # MT cursor, five 256-entry i64 board arrays, 23 run-state i64s, three
+    # common event-clock/order i64s, and a trailing u32 undo count. Each
+    # history entry is a little-endian u16. No host pointers or compiler record
+    # padding are present.
+    const SOKOBAN_SNAPSHOT_FIXED_BYTES: i64 = 12992
+    # Tetris v3: 624 MT words + cursor; 3,239 i64 controller/board/hand
+    # fields; and three i64 protocol clock/order fields. All values are
+    # serialized explicitly, with no compiler record padding or pointers.
+    const TETRIS_SNAPSHOT_FIXED_BYTES: i64 = 28436
+    # 3D N-Back v4 stores 225 i64 fields: all controller scalars, both
+    # 100-entry stimulus arrays, booleans, counters, and protocol clocks.
+    const NBACK3D_SNAPSHOT_FIXED_BYTES: i64 = 1800
+    # Monkey Ladder v5 stores its 624-word MT state, two 100-entry i64 arrays,
+    # controller/options scalars, booleans, and protocol clocks.
+    const MONKEY_LADDER_SNAPSHOT_FIXED_BYTES: i64 = 4252
+    # Count v6 contains 2,500 bytes of MT state, a shape-count i64, up to 60
+    # 72-byte field-serialized shapes, 17 controller i64s, and three protocol
+    # clock/order i64s. The minimum excludes active shapes.
+    const COUNT_SNAPSHOT_FIXED_BYTES: i64 = 2668
+    const COUNT_SHAPE_SNAPSHOT_BYTES: i64 = 72
+    const COUNT_SNAPSHOT_MAX_BYTES: i64 = 6988
     const I64_MAX_VALUE: i64 = 9223372036854775807
 
     # A zero task code denotes a free slot. On destroy the handle is retained
@@ -2070,6 +2096,11 @@ module ApiV1:
             out.push(((value >> 16.u32()) & 255.u32()).u8())
             out.push(((value >> 24.u32()) & 255.u32()).u8())
 
+    def append_u16(out: mutable darray[u8]&, value: u16):
+        can Memory.Allocate, Abort.Panic:
+            out.push((value & 255.u16()).u8())
+            out.push(((value >> 8.u16()) & 255.u16()).u8())
+
     def append_i64(out: mutable darray[u8]&, value: i64):
         can Memory.Allocate, Abort.Panic:
             bits: u64 = value.u64()
@@ -2078,6 +2109,371 @@ module ApiV1:
                 shift: u64 = at.u64() * 8.u64()
                 out.push(((bits >> shift) & 255.u64()).u8())
                 at <- at + 1
+
+    def append_u64(out: mutable darray[u8]&, value: u64):
+        can Memory.Allocate, Abort.Panic:
+            at: mutable i64 = 0
+            while at < 8 |out, value, at|:
+                shift: u64 = at.u64() * 8.u64()
+                out.push(((value >> shift) & 255.u64()).u8())
+                at <- at + 1
+
+    def append_f64(out: mutable darray[u8]&, value: f64):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                bits: mutable u64 = 0
+                memcpy((&bits).cast[mutable void&], (&value).cast[void&], 8.usize())
+                append_u64(out, bits)
+
+    def sokoban_snapshot_payload(index: i64, pointer: i64) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            out: mutable darray[u8] = []
+            trusted Unsafe.PointerCast:
+                run: heap SokobanGame::SokobanRun& = pointer.uintptr().cast[heap SokobanGame::SokobanRun&]
+                append_i64(&out, run.start_rung)
+                append_i64(&out, run.total_trials)
+                append_i64(&out, 1 if run.adaptive else 0)
+                append_i64(&out, 1 if run.show_traps else 0)
+                append_i64(&out, run.seed)
+                at: mutable i64 = 0
+                while at < 624 |at, run, out|:
+                    append_u32(&out, run.rng.mt[at.usize()])
+                    at <- at + 1
+                append_u32(&out, run.rng.mti.u32())
+                at <- 0
+                while at < 256 |at, run, out|:
+                    append_i64(&out, run.walls[at.usize()])
+                    append_i64(&out, run.goals[at.usize()])
+                    append_i64(&out, run.traps[at.usize()])
+                    append_i64(&out, run.boxes[at.usize()])
+                    append_i64(&out, run.start_boxes[at.usize()])
+                    at <- at + 1
+                append_i64(&out, run.width)
+                append_i64(&out, run.height)
+                append_i64(&out, run.cells)
+                append_i64(&out, run.minimum)
+                append_i64(&out, run.at_least)
+                append_i64(&out, run.bound)
+                append_i64(&out, run.rung)
+                append_i64(&out, run.trial)
+                append_i64(&out, run.phase)
+                append_i64(&out, run.verdict)
+                append_i64(&out, run.player)
+                append_i64(&out, run.start_player)
+                append_i64(&out, run.pushes)
+                append_i64(&out, run.moves)
+                append_i64(&out, run.par)
+                append_i64(&out, run.started_at_ms)
+                append_i64(&out, run.took_seconds)
+                append_i64(&out, run.solved_count)
+                append_i64(&out, run.lost_count)
+                append_i64(&out, run.total_par)
+                append_i64(&out, run.total_pushes)
+                append_i64(&out, run.best_rung)
+                append_i64(&out, 1 if run.has_level else 0)
+                append_i64(&out, slot_last_time[index.usize()])
+                append_i64(&out, slot_last_sequence[index.usize()])
+                append_i64(&out, slot_elapsed[index.usize()])
+                append_u32(&out, run.history_count.u32())
+                at <- 0
+                while at < run.history_count |at, run, out|:
+                    append_u16(&out, SokobanGame::history_get(run, at))
+                    at <- at + 1
+            return out
+
+    def snapshot_sokoban(index: i64, dest: i64, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            pointer: i64 = slot_pointers[index.usize()]
+            trusted Unsafe.PointerCast:
+                run: heap SokobanGame::SokobanRun& = pointer.uintptr().cast[heap SokobanGame::SokobanRun&]
+                return ERR_UNSUPPORTED if run.history_count < 0 or run.history_count > 2147483000
+                payload_bytes: i64 = SOKOBAN_SNAPSHOT_FIXED_BYTES + run.history_count * 2
+                total: i64 = SNAPSHOT_HEADER_BYTES + payload_bytes
+                return ERR_BUFFER if capacity < total or not valid_memory_range(dest, total, 1)
+                header: mutable darray[u8] = []
+                append_u32(&header, STATE_MAGIC)
+                append_u32(&header, SOKOBAN_SNAPSHOT_VERSION)
+                append_u32(&header, TASK_SOKOBAN.u32())
+                append_u32(&header, payload_bytes.u32())
+                payload: darray[u8] = sokoban_snapshot_payload(index, pointer)
+                return ERR_UNSUPPORTED if payload.count.i64() != payload_bytes
+                target: mutable u8& = dest.uintptr().cast[mutable u8&]
+                memcpy(target.cast[mutable void&], (&header[0]).cast[void&], SNAPSHOT_HEADER_BYTES.usize())
+                payload_target: mutable u8& = (dest + SNAPSHOT_HEADER_BYTES).uintptr().cast[mutable u8&]
+                memcpy(payload_target.cast[mutable void&], (&payload[0]).cast[void&], payload_bytes.usize())
+                return total
+
+    def tetris_snapshot_payload(index: i64, pointer: i64) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            out: mutable darray[u8] = []
+            trusted Unsafe.PointerCast:
+                run: heap TetrisGame::TetrisRun& = pointer.uintptr().cast[heap TetrisGame::TetrisRun&]
+                at: mutable i64 = 0
+                while at < 624 |at, run, out|:
+                    append_u32(&out, run.rng.mt[at.usize()])
+                    at <- at + 1
+                append_u32(&out, run.rng.mti.u32())
+                append_i64(&out, run.cols)
+                append_i64(&out, run.rows)
+                append_i64(&out, run.start_rung)
+                append_i64(&out, run.rung)
+                append_i64(&out, run.target)
+                append_i64(&out, run.queue_size)
+                append_i64(&out, run.phase)
+                append_i64(&out, run.piece)
+                append_i64(&out, run.score)
+                append_i64(&out, run.selected)
+                append_i64(&out, run.quarter)
+                append_i64(&out, run.column)
+                append_i64(&out, run.row)
+                append_i64(&out, run.remainder)
+                at <- 0
+                while at < TetrisGame::MAX_BOARD_CELLS |at, run, out|:
+                    append_i64(&out, run.board[at.usize()])
+                    at <- at + 1
+                at <- 0
+                while at < TetrisGame::MAX_PIECES |at, run, out|:
+                    append_i64(&out, run.queue_count[at.usize()])
+                    at <- at + 1
+                at <- 0
+                while at < TetrisGame::MAX_PIECES |at, run, out|:
+                    append_i64(&out, run.queue_fits[at.usize()])
+                    at <- at + 1
+                at <- 0
+                while at < TetrisGame::MAX_PIECES |at, run, out|:
+                    append_i64(&out, run.queue_recut[at.usize()])
+                    at <- at + 1
+                at <- 0
+                while at < TetrisGame::MAX_PIECES * TetrisGame::MAX_PIECE_CELLS |at, run, out|:
+                    append_i64(&out, run.queue_x[at.usize()])
+                    at <- at + 1
+                at <- 0
+                while at < TetrisGame::MAX_PIECES * TetrisGame::MAX_PIECE_CELLS |at, run, out|:
+                    append_i64(&out, run.queue_y[at.usize()])
+                    at <- at + 1
+                append_i64(&out, run.active_count)
+                at <- 0
+                while at < TetrisGame::MAX_PIECE_CELLS |at, run, out|:
+                    append_i64(&out, run.active_x[at.usize()])
+                    at <- at + 1
+                at <- 0
+                while at < TetrisGame::MAX_PIECE_CELLS |at, run, out|:
+                    append_i64(&out, run.active_y[at.usize()])
+                    at <- at + 1
+                append_i64(&out, run.clean)
+                append_i64(&out, run.buried)
+                append_i64(&out, run.lines)
+                append_i64(&out, run.streak)
+                append_i64(&out, run.slips)
+                append_i64(&out, run.best_rung)
+                append_i64(&out, slot_last_time[index.usize()])
+                append_i64(&out, slot_last_sequence[index.usize()])
+                append_i64(&out, slot_elapsed[index.usize()])
+            return out
+
+    def snapshot_tetris(index: i64, dest: i64, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            total: i64 = SNAPSHOT_HEADER_BYTES + TETRIS_SNAPSHOT_FIXED_BYTES
+            return ERR_BUFFER if capacity < total or not valid_memory_range(dest, total, 1)
+            header: mutable darray[u8] = []
+            append_u32(&header, STATE_MAGIC)
+            append_u32(&header, TETRIS_SNAPSHOT_VERSION)
+            append_u32(&header, TASK_TETRIS.u32())
+            append_u32(&header, TETRIS_SNAPSHOT_FIXED_BYTES.u32())
+            payload: darray[u8] = tetris_snapshot_payload(index, slot_pointers[index.usize()])
+            return ERR_UNSUPPORTED if payload.count.i64() != TETRIS_SNAPSHOT_FIXED_BYTES
+            target: mutable u8& = dest.uintptr().cast[mutable u8&]
+            memcpy(target.cast[mutable void&], (&header[0]).cast[void&], SNAPSHOT_HEADER_BYTES.usize())
+            payload_target: mutable u8& = (dest + SNAPSHOT_HEADER_BYTES).uintptr().cast[mutable u8&]
+            memcpy(payload_target.cast[mutable void&], (&payload[0]).cast[void&], TETRIS_SNAPSHOT_FIXED_BYTES.usize())
+            return total
+
+    def nback3d_snapshot_payload(index: i64, pointer: i64) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            out: mutable darray[u8] = []
+            trusted Unsafe.PointerCast:
+                run: heap NBack3DGame::NBack3DRun& = pointer.uintptr().cast[heap NBack3DGame::NBack3DRun&]
+                append_i64(&out, run.seed)
+                append_i64(&out, run.nback)
+                append_i64(&out, run.cubes)
+                append_i64(&out, run.total_trials)
+                append_i64(&out, run.interval_ms)
+                append_i64(&out, run.stimulus_ms)
+                append_i64(&out, run.feedback_ms)
+                append_i64(&out, run.trial)
+                append_i64(&out, run.trial_started_ms)
+                append_i64(&out, run.trial_deadline_ms)
+                append_i64(&out, run.deadline_ms)
+                append_i64(&out, run.paused_remaining_ms)
+                append_i64(&out, run.resume_phase)
+                at: mutable i64 = 0
+                while at < NBack3DGame::MAX_TRIALS |at, run, out|:
+                    append_i64(&out, run.position[at.usize()])
+                    at <- at + 1
+                at <- 0
+                while at < NBack3DGame::MAX_TRIALS |at, run, out|:
+                    append_i64(&out, run.color[at.usize()])
+                    at <- at + 1
+                append_i64(&out, run.phase)
+                append_i64(&out, run.verdict)
+                append_i64(&out, 1 if run.answered else 0)
+                append_i64(&out, 1 if run.paused else 0)
+                append_i64(&out, 1 if run.failed else 0)
+                append_i64(&out, run.hits)
+                append_i64(&out, run.misses)
+                append_i64(&out, run.false_alarms)
+                append_i64(&out, run.correct_rejections)
+                append_i64(&out, slot_last_time[index.usize()])
+                append_i64(&out, slot_last_sequence[index.usize()])
+                append_i64(&out, slot_elapsed[index.usize()])
+            return out
+
+    def snapshot_nback3d(index: i64, dest: i64, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            total: i64 = SNAPSHOT_HEADER_BYTES + NBACK3D_SNAPSHOT_FIXED_BYTES
+            return ERR_BUFFER if capacity < total or not valid_memory_range(dest, total, 1)
+            header: mutable darray[u8] = []
+            append_u32(&header, STATE_MAGIC)
+            append_u32(&header, NBACK3D_SNAPSHOT_VERSION)
+            append_u32(&header, TASK_NBACK_3D.u32())
+            append_u32(&header, NBACK3D_SNAPSHOT_FIXED_BYTES.u32())
+            payload: darray[u8] = nback3d_snapshot_payload(index, slot_pointers[index.usize()])
+            return ERR_UNSUPPORTED if payload.count.i64() != NBACK3D_SNAPSHOT_FIXED_BYTES
+            target: mutable u8& = dest.uintptr().cast[mutable u8&]
+            memcpy(target.cast[mutable void&], (&header[0]).cast[void&], SNAPSHOT_HEADER_BYTES.usize())
+            payload_target: mutable u8& = (dest + SNAPSHOT_HEADER_BYTES).uintptr().cast[mutable u8&]
+            memcpy(payload_target.cast[mutable void&], (&payload[0]).cast[void&], NBACK3D_SNAPSHOT_FIXED_BYTES.usize())
+            return total
+
+    def monkey_ladder_snapshot_payload(index: i64, pointer: i64) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            out: mutable darray[u8] = []
+            trusted Unsafe.PointerCast:
+                run: heap MonkeyLadderGame::MonkeyLadderRun& = pointer.uintptr().cast[heap MonkeyLadderGame::MonkeyLadderRun&]
+                at: mutable i64 = 0
+                while at < 624 |at, run, out|:
+                    append_u32(&out, run.rng.mt[at.usize()])
+                    at <- at + 1
+                append_u32(&out, run.rng.mti.u32())
+                at <- 0
+                while at < MonkeyLadderGame::MAX_CELLS |at, run, out|:
+                    append_i64(&out, run.sequence[at.usize()])
+                    at <- at + 1
+                at <- 0
+                while at < MonkeyLadderGame::MAX_CELLS |at, run, out|:
+                    append_i64(&out, run.clicked[at.usize()])
+                    at <- at + 1
+                append_i64(&out, run.grid)
+                append_i64(&out, run.start_level)
+                append_i64(&out, run.level)
+                append_i64(&out, run.round_level)
+                append_i64(&out, run.show_ms)
+                append_i64(&out, run.per_tile_ms)
+                append_i64(&out, run.length)
+                append_i64(&out, run.next_index)
+                append_i64(&out, run.clicked_n)
+                append_i64(&out, run.wrong)
+                append_i64(&out, run.cursor_cell)
+                append_i64(&out, run.deadline_ms)
+                append_i64(&out, run.phase)
+                append_i64(&out, 1 if run.adaptive else 0)
+                append_i64(&out, 1 if run.reveal_answer else 0)
+                append_i64(&out, 1 if run.cursor_enabled else 0)
+                append_i64(&out, slot_last_time[index.usize()])
+                append_i64(&out, slot_last_sequence[index.usize()])
+                append_i64(&out, slot_elapsed[index.usize()])
+            return out
+
+    def snapshot_monkey_ladder(index: i64, dest: i64, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            total: i64 = SNAPSHOT_HEADER_BYTES + MONKEY_LADDER_SNAPSHOT_FIXED_BYTES
+            return ERR_BUFFER if capacity < total or not valid_memory_range(dest, total, 1)
+            header: mutable darray[u8] = []
+            append_u32(&header, STATE_MAGIC)
+            append_u32(&header, MONKEY_LADDER_SNAPSHOT_VERSION)
+            append_u32(&header, TASK_MONKEY_LADDER.u32())
+            append_u32(&header, MONKEY_LADDER_SNAPSHOT_FIXED_BYTES.u32())
+            payload: darray[u8] = monkey_ladder_snapshot_payload(index, slot_pointers[index.usize()])
+            return ERR_UNSUPPORTED if payload.count.i64() != MONKEY_LADDER_SNAPSHOT_FIXED_BYTES
+            target: mutable u8& = dest.uintptr().cast[mutable u8&]
+            memcpy(target.cast[mutable void&], (&header[0]).cast[void&], SNAPSHOT_HEADER_BYTES.usize())
+            payload_target: mutable u8& = (dest + SNAPSHOT_HEADER_BYTES).uintptr().cast[mutable u8&]
+            memcpy(payload_target.cast[mutable void&], (&payload[0]).cast[void&], MONKEY_LADDER_SNAPSHOT_FIXED_BYTES.usize())
+            return total
+
+    def count_snapshot_payload(index: i64, pointer: i64) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            out: mutable darray[u8] = []
+            trusted Unsafe.PointerCast:
+                run: heap CountingGame::CountingRun& = pointer.uintptr().cast[heap CountingGame::CountingRun&]
+                at: mutable i64 = 0
+                while at < 624 |at, run, out|:
+                    append_u32(&out, run.rng.mt[at.usize()])
+                    at <- at + 1
+                append_u32(&out, run.rng.mti.u32())
+                append_i64(&out, run.shape_count)
+                at <- 0
+                while at < run.shape_count |at, run, out|:
+                    append_i64(&out, run.shapes[at.usize()].kind)
+                    append_i64(&out, run.shapes[at.usize()].points)
+                    point: mutable i64 = 0
+                    while point < 3 |point, run, at, out|:
+                        append_f64(&out, run.shapes[at.usize()].x[point.usize()])
+                        point <- point + 1
+                    point <- 0
+                    while point < 3 |point, run, at, out|:
+                        append_f64(&out, run.shapes[at.usize()].y[point.usize()])
+                        point <- point + 1
+                    append_f64(&out, run.shapes[at.usize()].radius)
+                    at <- at + 1
+                append_i64(&out, run.kind)
+                append_i64(&out, run.start_count)
+                append_i64(&out, run.total_trials)
+                append_i64(&out, run.exposure_ms)
+                append_i64(&out, 1 if run.adaptive else 0)
+                append_i64(&out, 1 if run.show_answer else 0)
+                append_i64(&out, run.count)
+                append_i64(&out, run.shown_count)
+                append_i64(&out, run.trial)
+                append_i64(&out, run.correct)
+                append_i64(&out, run.total_error)
+                append_i64(&out, run.answer)
+                append_i64(&out, run.answer_length)
+                append_i64(&out, run.phase)
+                append_i64(&out, run.verdict)
+                append_i64(&out, run.shown_at_ms)
+                append_i64(&out, run.deadline_ms)
+                append_i64(&out, slot_last_time[index.usize()])
+                append_i64(&out, slot_last_sequence[index.usize()])
+                append_i64(&out, slot_elapsed[index.usize()])
+            return out
+
+    def snapshot_count(index: i64, dest: i64, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            pointer: i64 = slot_pointers[index.usize()]
+            payload: darray[u8] = count_snapshot_payload(index, pointer)
+            payload_bytes: i64 = payload.count.i64()
+            total: i64 = SNAPSHOT_HEADER_BYTES + payload_bytes
+            return ERR_BUFFER if payload_bytes < COUNT_SNAPSHOT_FIXED_BYTES or payload_bytes > COUNT_SNAPSHOT_MAX_BYTES
+            return ERR_BUFFER if capacity < total or not valid_memory_range(dest, total, 1)
+            header: mutable darray[u8] = []
+            append_u32(&header, STATE_MAGIC)
+            append_u32(&header, COUNT_SNAPSHOT_VERSION)
+            append_u32(&header, TASK_COUNT.u32())
+            append_u32(&header, payload_bytes.u32())
+            target: mutable u8& = dest.uintptr().cast[mutable u8&]
+            memcpy(target.cast[mutable void&], (&header[0]).cast[void&], SNAPSHOT_HEADER_BYTES.usize())
+            payload_target: mutable u8& = (dest + SNAPSHOT_HEADER_BYTES).uintptr().cast[mutable u8&]
+            memcpy(payload_target.cast[mutable void&], (&payload[0]).cast[void&], payload_bytes.usize())
+            return total
+
+    def snapshot_supported_v1(task: i64) -> bool:
+        can Abort.Panic:
+            return task == TASK_MONKEY_LADDER or task == TASK_TETRIS or task == TASK_NBACK_3D
+
+    def snapshot_supported(task: i64) -> bool:
+        can Abort.Panic:
+            return task == TASK_SOKOBAN or task == TASK_COUNT or snapshot_supported_v1(task)
 
     def read_state(handle: i64, dest: i64, capacity: i64) -> i64:
         can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
@@ -3749,21 +4145,17 @@ module ApiV1:
             # v1's first conformance controllers have no host effects.
             return 0
 
-    def snapshot_supported(task: i64) -> bool:
-        can Abort.Panic:
-            # These three run records contain only inline fixed-layout state:
-            # NBack3DRun's dealt position/color history, MonkeyLadderRun's
-            # fixed RNG/history, and TetrisRun's board/hand/piece/RNG. Do not
-            # add pointer-backed controllers here without an explicit field
-            # serializer.
-            return task == TASK_MONKEY_LADDER or task == TASK_TETRIS or task == TASK_NBACK_3D
-
     def snapshot(handle: i64, dest: i64, capacity: i64) -> i64:
-        can Abort.Panic, Unsafe.PointerCast:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
             index: i64 = slot_for(handle)
             return ERR_INVALID_HANDLE if index < 0
             task: i64 = slot_tasks[index.usize()]
             return ERR_UNSUPPORTED if not snapshot_supported(task)
+            return snapshot_sokoban(index, dest, capacity) if task == TASK_SOKOBAN
+            return snapshot_tetris(index, dest, capacity) if task == TASK_TETRIS
+            return snapshot_nback3d(index, dest, capacity) if task == TASK_NBACK_3D
+            return snapshot_monkey_ladder(index, dest, capacity) if task == TASK_MONKEY_LADDER
+            return snapshot_count(index, dest, capacity) if task == TASK_COUNT
             payload: i64 = run_bytes(task)
             total: i64 = SNAPSHOT_HEADER_BYTES + payload
             return ERR_BUFFER if capacity < total or not valid_memory_range(dest, total, 8)
@@ -3788,8 +4180,936 @@ module ApiV1:
             value <- value | (source[(offset + 3).usize()].u32() << 24.u32())
             return value
 
+    def snapshot_u16(source: u8&, offset: i64) -> u16:
+        can Abort.Panic:
+            value: mutable u16 = source[offset.usize()].u16()
+            value <- value | (source[(offset + 1).usize()].u16() << 8.u16())
+            return value
+
+    def snapshot_i64(source: u8&, offset: i64) -> i64:
+        can Abort.Panic:
+            value: mutable i64 = 0
+            at: mutable i64 = 0
+            while at < 8 |source, offset, value, at|:
+                value <- value | (source[(offset + at).usize()].i64() << (at * 8).u32())
+                at <- at + 1
+            return value
+
+    def snapshot_u64(source: u8&, offset: i64) -> u64:
+        can Abort.Panic:
+            value: mutable u64 = 0
+            at: mutable i64 = 0
+            while at < 8 |source, offset, value, at|:
+                value <- value | (source[(offset + at).usize()].u64() << (at * 8).u32())
+                at <- at + 1
+            return value
+
+    def snapshot_f64(source: u8&, offset: i64) -> f64:
+        can Abort.Panic, Unsafe.PointerCast:
+            bits: u64 = snapshot_u64(source, offset)
+            value: mutable f64 = 0.0
+            trusted Unsafe.PointerCast:
+                memcpy((&value).cast[mutable void&], (&bits).cast[void&], 8.usize())
+                return value
+
+    def valid_tetris_snapshot_fields(run: TetrisGame::TetrisRun&,
+                                      restored_last_time: i64,
+                                      restored_last_sequence: i64,
+                                      restored_elapsed: i64) -> bool:
+        can Abort.Panic:
+            return false if run.rng.mti > 624.usize()
+            return false if run.cols != TetrisGame::MAX_COLS or run.rows != TetrisGame::MAX_ROWS
+            return false if run.start_rung < 1 or run.start_rung > Tetris::GRADE_COUNT
+            return false if run.rung < 1 or run.rung > Tetris::GRADE_COUNT
+            return false if run.target < 1 or run.target > 500
+            return false if run.queue_size < 1 or run.queue_size > TetrisGame::MAX_PIECES
+            return false if run.phase < TetrisGame::PHASE_READY or run.phase > TetrisGame::PHASE_DONE
+            return false if run.piece < 0 or run.piece > run.target
+            return false if run.score < 0 or run.score > run.piece or run.clean != run.score
+            return false if run.selected < 0 or run.selected >= run.queue_size
+            return false if run.quarter < 0 or run.quarter > 3
+            return false if run.column < 0 or run.column >= run.cols
+            return false if run.row < 0 or run.row >= run.rows
+            return false if run.remainder != 0
+            return false if run.buried < 0 or run.buried > run.target * TetrisGame::MAX_BOARD_CELLS
+            return false if run.lines < 0 or run.lines > run.target * run.rows
+            return false if run.streak < 0 or run.streak > run.piece
+            return false if run.slips < 0 or run.slips > run.piece
+            return false if run.best_rung < run.start_rung or run.best_rung < run.rung or run.best_rung > Tetris::GRADE_COUNT
+            return false if run.active_count < 0 or run.active_count > TetrisGame::MAX_PIECE_CELLS
+            return false if restored_last_time < 0 or restored_last_sequence < -1 or restored_elapsed < 0
+            if run.phase == TetrisGame::PHASE_READY:
+                return false if run.piece != 0 or run.score != 0 or run.active_count != 0
+            elif run.phase == TetrisGame::PHASE_PLAYING:
+                return false if run.piece >= run.target or run.active_count <= 0
+            elif run.phase == TetrisGame::PHASE_DONE:
+                return false if run.piece != run.target or run.active_count <= 0
+            at: mutable i64 = 0
+            while at < TetrisGame::MAX_BOARD_CELLS |at, run|:
+                value: i64 = run.board[at.usize()]
+                return false if value < 0 or value > 255
+                at <- at + 1
+            at <- 0
+            while at < TetrisGame::MAX_PIECES |at, run|:
+                count: i64 = run.queue_count[at.usize()]
+                fits: i64 = run.queue_fits[at.usize()]
+                recut: i64 = run.queue_recut[at.usize()]
+                return false if count < 0 or count > TetrisGame::MAX_PIECE_CELLS
+                return false if fits < 0 or fits > TetrisGame::MAX_COLS * 4
+                return false if recut < 0 or recut > 1
+                if at < run.queue_size:
+                    return false if run.phase != TetrisGame::PHASE_READY and count == 0
+                else:
+                    return false if count != 0 or fits != 0 or recut != 0
+                at <- at + 1
+            return false if run.phase != TetrisGame::PHASE_READY and run.active_count != run.queue_count[run.selected.usize()]
+            at <- 0
+            while at < TetrisGame::MAX_PIECES * TetrisGame::MAX_PIECE_CELLS |at, run|:
+                x: i64 = run.queue_x[at.usize()]
+                y: i64 = run.queue_y[at.usize()]
+                return false if x < 0 or x >= TetrisGame::MAX_PIECE_CELLS
+                return false if y < 0 or y >= TetrisGame::MAX_PIECE_CELLS
+                at <- at + 1
+            at <- 0
+            while at < TetrisGame::MAX_PIECE_CELLS |at, run|:
+                x: i64 = run.active_x[at.usize()]
+                y: i64 = run.active_y[at.usize()]
+                return false if x < 0 or x >= TetrisGame::MAX_PIECE_CELLS
+                return false if y < 0 or y >= TetrisGame::MAX_PIECE_CELLS
+                at <- at + 1
+            return true
+
+    def cleanup_bad_tetris_restore(pointer: mutable heap void&) -> i64:
+        can Memory.Release, Abort.Panic:
+            free(pointer)
+            return ERR_UNSUPPORTED
+
+    def restore_tetris(snapshot_pointer: i64, snapshot_bytes: i64,
+                       payload_bytes: i64) -> i64:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return ERR_BUFFER if payload_bytes != TETRIS_SNAPSHOT_FIXED_BYTES
+            return ERR_BUFFER if snapshot_bytes != SNAPSHOT_HEADER_BYTES + payload_bytes
+            index: i64 = free_slot()
+            return ERR_TABLE_FULL if index < 0 or next_handle <= 0 or next_handle == I64_MAX_VALUE
+            raw: mutable heap void&? = malloc(size_of(TetrisGame::TetrisRun).usize())
+            return ERR_NO_MEMORY if raw == null
+            pointer: mutable heap void& = raw
+            trusted Unsafe.PointerCast:
+                source: u8& = snapshot_pointer.uintptr().cast[u8&]
+                run: mutable heap TetrisGame::TetrisRun& = pointer.cast[mutable heap TetrisGame::TetrisRun&]
+                TetrisGame::initialize(run, 1, 25, 1, 0)
+                offset: mutable i64 = SNAPSHOT_HEADER_BYTES
+                at: mutable i64 = 0
+                while at < 624 |at, run, source, offset|:
+                    run.rng.mt[at.usize()] <- snapshot_u32(source, offset)
+                    offset <- offset + 4
+                    at <- at + 1
+                run.rng.mti <- snapshot_u32(source, offset).usize()
+                offset <- offset + 4
+                run.cols <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.rows <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.start_rung <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.rung <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.target <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.queue_size <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.phase <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.piece <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.score <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.selected <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.quarter <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.column <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.row <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.remainder <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                at <- 0
+                while at < TetrisGame::MAX_BOARD_CELLS |at, run, source, offset|:
+                    run.board[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                at <- 0
+                while at < TetrisGame::MAX_PIECES |at, run, source, offset|:
+                    run.queue_count[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                at <- 0
+                while at < TetrisGame::MAX_PIECES |at, run, source, offset|:
+                    run.queue_fits[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                at <- 0
+                while at < TetrisGame::MAX_PIECES |at, run, source, offset|:
+                    run.queue_recut[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                at <- 0
+                while at < TetrisGame::MAX_PIECES * TetrisGame::MAX_PIECE_CELLS |at, run, source, offset|:
+                    run.queue_x[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                at <- 0
+                while at < TetrisGame::MAX_PIECES * TetrisGame::MAX_PIECE_CELLS |at, run, source, offset|:
+                    run.queue_y[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                run.active_count <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                at <- 0
+                while at < TetrisGame::MAX_PIECE_CELLS |at, run, source, offset|:
+                    run.active_x[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                at <- 0
+                while at < TetrisGame::MAX_PIECE_CELLS |at, run, source, offset|:
+                    run.active_y[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                run.clean <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.buried <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.lines <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.streak <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.slips <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.best_rung <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_last_time: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_last_sequence: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_elapsed: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                return cleanup_bad_tetris_restore(pointer) if offset != SNAPSHOT_HEADER_BYTES + TETRIS_SNAPSHOT_FIXED_BYTES
+                return cleanup_bad_tetris_restore(pointer) if not valid_tetris_snapshot_fields(run, restored_last_time, restored_last_sequence, restored_elapsed)
+                handle: i64 = next_handle
+                next_handle <- next_handle + 1
+                slot_handles[index.usize()] <- handle
+                slot_tasks[index.usize()] <- TASK_TETRIS
+                slot_pointers[index.usize()] <- pointer.cast[u8&].uintptr().i64()
+                slot_last_time[index.usize()] <- restored_last_time
+                slot_last_sequence[index.usize()] <- restored_last_sequence
+                slot_elapsed[index.usize()] <- restored_elapsed
+                return handle
+
+    def valid_nback3d_snapshot_fields(run: NBack3DGame::NBack3DRun&,
+                                       answered_value: i64, paused_value: i64,
+                                       failed_value: i64, restored_last_time: i64,
+                                       restored_last_sequence: i64,
+                                       restored_elapsed: i64) -> bool:
+        can Abort.Panic:
+            return false if valid_options(TASK_NBACK_3D, 1, run.nback, run.cubes,
+                run.total_trials, run.interval_ms, run.stimulus_ms, run.feedback_ms) != OK
+            return false if run.trial < 0 or run.trial > run.total_trials
+            return false if run.trial_started_ms < 0 or run.trial_deadline_ms < 0 or run.deadline_ms < 0
+            return false if run.paused_remaining_ms < 0
+            return false if run.resume_phase != NBack3DGame::PHASE_READY and run.resume_phase != NBack3DGame::PHASE_STARTUP and run.resume_phase != NBack3DGame::PHASE_STIMULUS and run.resume_phase != NBack3DGame::PHASE_RESPONSE and run.resume_phase != NBack3DGame::PHASE_FEEDBACK
+            return false if run.phase < NBack3DGame::PHASE_READY or run.phase > NBack3DGame::PHASE_STARTUP
+            return false if run.verdict < NBack3DGame::VERDICT_NONE or run.verdict > NBack3DGame::VERDICT_CORRECT_REJECTION
+            return false if answered_value < 0 or answered_value > 1
+            return false if paused_value < 0 or paused_value > 1
+            return false if failed_value < 0 or failed_value > 1
+            return false if run.paused != (paused_value != 0) or run.failed != (failed_value != 0)
+            return false if run.paused != (run.phase == NBack3DGame::PHASE_PAUSED)
+            return false if run.failed != (run.phase == NBack3DGame::PHASE_ERROR)
+            return false if run.paused and run.resume_phase != NBack3DGame::PHASE_STARTUP and run.resume_phase != NBack3DGame::PHASE_STIMULUS and run.resume_phase != NBack3DGame::PHASE_RESPONSE and run.resume_phase != NBack3DGame::PHASE_FEEDBACK
+            return false if run.hits < 0 or run.misses < 0 or run.false_alarms < 0 or run.correct_rejections < 0
+            return false if run.hits > run.trial or run.misses > run.trial or run.false_alarms > run.trial or run.correct_rejections > run.trial
+            return false if run.hits + run.misses + run.false_alarms + run.correct_rejections > run.trial
+            return false if restored_last_time < 0 or restored_last_sequence < -1 or restored_elapsed < 0
+            return false if run.answered and run.verdict == NBack3DGame::VERDICT_NONE
+            if run.phase == NBack3DGame::PHASE_READY or run.phase == NBack3DGame::PHASE_STARTUP:
+                return false if run.trial != 0
+            if run.phase == NBack3DGame::PHASE_DONE:
+                return false if run.trial != run.total_trials
+            position_limit: mutable i64 = 1
+            color_limit: mutable i64 = 1
+            at: mutable i64 = 0
+            while at < run.cubes |at, run, position_limit, color_limit|:
+                position_limit <- position_limit * 6
+                color_limit <- color_limit * 8
+                at <- at + 1
+            at <- 0
+            while at < NBack3DGame::MAX_TRIALS |at, run, position_limit|:
+                return false if run.position[at.usize()] < 0 or run.position[at.usize()] > position_limit
+                return false if run.color[at.usize()] < 0 or run.color[at.usize()] > color_limit
+                at <- at + 1
+            return true
+
+    def valid_monkey_ladder_snapshot_fields(run: MonkeyLadderGame::MonkeyLadderRun&,
+                                             adaptive_value: i64,
+                                             reveal_answer_value: i64,
+                                             cursor_enabled_value: i64,
+                                             restored_last_time: i64,
+                                             restored_last_sequence: i64,
+                                             restored_elapsed: i64) -> bool:
+        can Abort.Panic:
+            return false if valid_options(TASK_MONKEY_LADDER, 1, run.grid,
+                run.start_level, 1 if run.adaptive else 0, run.show_ms,
+                run.per_tile_ms, 1 if run.reveal_answer else 0) != OK
+            return false if run.rng.mti > 624.usize()
+            return false if run.grid < 3 or run.grid > MonkeyLadderGame::MAX_GRID
+            cells: i64 = run.grid * run.grid
+            return false if run.start_level < 2 or run.start_level > cells
+            return false if run.level < 2 or run.level > cells
+            return false if run.round_level < 2 or run.round_level > cells
+            return false if run.show_ms < 0 or run.show_ms > 600000
+            return false if run.per_tile_ms < 0 or run.per_tile_ms > 600000
+            return false if run.length < 0 or run.length > cells
+            return false if run.next_index < 0 or run.next_index > run.length
+            return false if run.clicked_n < 0 or run.clicked_n > run.length
+            return false if run.wrong < -1 or run.wrong >= cells
+            return false if run.cursor_cell < 0 or run.cursor_cell >= cells
+            return false if run.deadline_ms < 0
+            return false if run.phase < MonkeyLadderGame::PHASE_READY or run.phase > MonkeyLadderGame::PHASE_RESULT
+            return false if adaptive_value < 0 or adaptive_value > 1
+            return false if reveal_answer_value < 0 or reveal_answer_value > 1
+            return false if cursor_enabled_value < 0 or cursor_enabled_value > 1
+            return false if run.adaptive != (adaptive_value != 0)
+            return false if run.reveal_answer != (reveal_answer_value != 0)
+            return false if run.cursor_enabled != (cursor_enabled_value != 0)
+            return false if restored_last_time < 0 or restored_last_sequence < -1 or restored_elapsed < 0
+            if run.phase == MonkeyLadderGame::PHASE_READY:
+                return false if run.length != 0 or run.clicked_n != 0 or run.next_index != 0
+            else:
+                return false if run.length == 0 or run.length != run.round_level
+            if run.phase == MonkeyLadderGame::PHASE_INPUT:
+                return false if run.next_index >= run.length or run.wrong != -1
+                return false if run.next_index != run.clicked_n
+            if run.phase == MonkeyLadderGame::PHASE_SHOW:
+                return false if run.next_index != 0 or run.clicked_n != 0 or run.wrong != -1
+            if run.phase == MonkeyLadderGame::PHASE_RESULT:
+                return false if run.wrong == -1 and run.next_index < run.length
+                return false if run.wrong >= 0 and run.next_index >= run.length
+                return false if run.next_index != run.clicked_n
+            if run.phase != MonkeyLadderGame::PHASE_RESULT:
+                return false if run.wrong != -1
+            at: mutable i64 = 0
+            while at < MonkeyLadderGame::MAX_CELLS |at, run, cells|:
+                return false if run.sequence[at.usize()] < 0 or run.sequence[at.usize()] >= cells
+                return false if run.clicked[at.usize()] < 0 or run.clicked[at.usize()] >= cells
+                if at < run.clicked_n:
+                    return false if run.clicked[at.usize()] != run.sequence[at.usize()]
+                if at < run.length:
+                    prior: mutable i64 = 0
+                    while prior < at |prior, at, run|:
+                        return false if run.sequence[prior.usize()] == run.sequence[at.usize()]
+                        prior <- prior + 1
+                at <- at + 1
+            return true
+
+    def cleanup_bad_nback3d_restore(pointer: mutable heap void&) -> i64:
+        can Memory.Release, Abort.Panic:
+            free(pointer)
+            return ERR_UNSUPPORTED
+
+    def cleanup_bad_monkey_ladder_restore(pointer: mutable heap void&) -> i64:
+        can Memory.Release, Abort.Panic:
+            free(pointer)
+            return ERR_UNSUPPORTED
+
+    def restore_nback3d(snapshot_pointer: i64, snapshot_bytes: i64,
+                        payload_bytes: i64) -> i64:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return ERR_BUFFER if payload_bytes != NBACK3D_SNAPSHOT_FIXED_BYTES
+            return ERR_BUFFER if snapshot_bytes != SNAPSHOT_HEADER_BYTES + payload_bytes
+            index: i64 = free_slot()
+            return ERR_TABLE_FULL if index < 0 or next_handle <= 0 or next_handle == I64_MAX_VALUE
+            raw: mutable heap void&? = malloc(size_of(NBack3DGame::NBack3DRun).usize())
+            return ERR_NO_MEMORY if raw == null
+            pointer: mutable heap void& = raw
+            trusted Unsafe.PointerCast:
+                source: u8& = snapshot_pointer.uintptr().cast[u8&]
+                run: mutable heap NBack3DGame::NBack3DRun& = pointer.cast[mutable heap NBack3DGame::NBack3DRun&]
+                NBack3DGame::initialize(run, 1, 1, 4, 3000, 500, 200, 1)
+                offset: mutable i64 = SNAPSHOT_HEADER_BYTES
+                run.seed <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.nback <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.cubes <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.total_trials <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.interval_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.stimulus_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.feedback_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.trial <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.trial_started_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.trial_deadline_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.deadline_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.paused_remaining_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.resume_phase <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                at: mutable i64 = 0
+                while at < NBack3DGame::MAX_TRIALS |at, run, source, offset|:
+                    run.position[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                at <- 0
+                while at < NBack3DGame::MAX_TRIALS |at, run, source, offset|:
+                    run.color[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                run.phase <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.verdict <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                answered_value: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                paused_value: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                failed_value: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.answered <- answered_value != 0
+                run.paused <- paused_value != 0
+                run.failed <- failed_value != 0
+                run.hits <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.misses <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.false_alarms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.correct_rejections <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_last_time: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_last_sequence: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_elapsed: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                return cleanup_bad_nback3d_restore(pointer) if offset != SNAPSHOT_HEADER_BYTES + NBACK3D_SNAPSHOT_FIXED_BYTES
+                return cleanup_bad_nback3d_restore(pointer) if not valid_nback3d_snapshot_fields(run, answered_value, paused_value, failed_value, restored_last_time, restored_last_sequence, restored_elapsed)
+                handle: i64 = next_handle
+                next_handle <- next_handle + 1
+                slot_handles[index.usize()] <- handle
+                slot_tasks[index.usize()] <- TASK_NBACK_3D
+                slot_pointers[index.usize()] <- pointer.cast[u8&].uintptr().i64()
+                slot_last_time[index.usize()] <- restored_last_time
+                slot_last_sequence[index.usize()] <- restored_last_sequence
+                slot_elapsed[index.usize()] <- restored_elapsed
+                return handle
+
+    def restore_monkey_ladder(snapshot_pointer: i64, snapshot_bytes: i64,
+                              payload_bytes: i64) -> i64:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return ERR_BUFFER if payload_bytes != MONKEY_LADDER_SNAPSHOT_FIXED_BYTES
+            return ERR_BUFFER if snapshot_bytes != SNAPSHOT_HEADER_BYTES + payload_bytes
+            index: i64 = free_slot()
+            return ERR_TABLE_FULL if index < 0 or next_handle <= 0 or next_handle == I64_MAX_VALUE
+            raw: mutable heap void&? = malloc(size_of(MonkeyLadderGame::MonkeyLadderRun).usize())
+            return ERR_NO_MEMORY if raw == null
+            pointer: mutable heap void& = raw
+            trusted Unsafe.PointerCast:
+                source: u8& = snapshot_pointer.uintptr().cast[u8&]
+                run: mutable heap MonkeyLadderGame::MonkeyLadderRun& = pointer.cast[mutable heap MonkeyLadderGame::MonkeyLadderRun&]
+                MonkeyLadderGame::initialize(run, 5, 3, false, 700, 280, true, 1)
+                offset: mutable i64 = SNAPSHOT_HEADER_BYTES
+                at: mutable i64 = 0
+                while at < 624 |at, run, source, offset|:
+                    run.rng.mt[at.usize()] <- snapshot_u32(source, offset)
+                    offset <- offset + 4
+                    at <- at + 1
+                run.rng.mti <- snapshot_u32(source, offset).usize()
+                offset <- offset + 4
+                at <- 0
+                while at < MonkeyLadderGame::MAX_CELLS |at, run, source, offset|:
+                    run.sequence[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                at <- 0
+                while at < MonkeyLadderGame::MAX_CELLS |at, run, source, offset|:
+                    run.clicked[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                run.grid <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.start_level <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.level <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.round_level <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.show_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.per_tile_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.length <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.next_index <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.clicked_n <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.wrong <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.cursor_cell <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.deadline_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.phase <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                adaptive_value: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                reveal_answer_value: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                cursor_enabled_value: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.adaptive <- adaptive_value != 0
+                run.reveal_answer <- reveal_answer_value != 0
+                run.cursor_enabled <- cursor_enabled_value != 0
+                restored_last_time: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_last_sequence: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_elapsed: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                return cleanup_bad_monkey_ladder_restore(pointer) if offset != SNAPSHOT_HEADER_BYTES + MONKEY_LADDER_SNAPSHOT_FIXED_BYTES
+                return cleanup_bad_monkey_ladder_restore(pointer) if not valid_monkey_ladder_snapshot_fields(run, adaptive_value, reveal_answer_value, cursor_enabled_value, restored_last_time, restored_last_sequence, restored_elapsed)
+                handle: i64 = next_handle
+                next_handle <- next_handle + 1
+                slot_handles[index.usize()] <- handle
+                slot_tasks[index.usize()] <- TASK_MONKEY_LADDER
+                slot_pointers[index.usize()] <- pointer.cast[u8&].uintptr().i64()
+                slot_last_time[index.usize()] <- restored_last_time
+                slot_last_sequence[index.usize()] <- restored_last_sequence
+                slot_elapsed[index.usize()] <- restored_elapsed
+                return handle
+
+    def valid_count_snapshot_shape(shape: Counting::CountShape) -> bool:
+        can Abort.Panic:
+            return false if shape.kind < Counting::LINES or shape.kind >= Counting::MIXED
+            wanted_points: i64 = 1 if shape.kind == Counting::CIRCLES else (3 if shape.kind == Counting::TRIANGLES else 2)
+            return false if shape.points != wanted_points
+            point: mutable i64 = 0
+            while point < 3 |point, shape|:
+                x: f64 = shape.x[point.usize()]
+                y: f64 = shape.y[point.usize()]
+                return false if x != x or y != y or x < 0.0 or x > 1.0 or y < 0.0 or y > 1.0
+                point <- point + 1
+            return false if shape.radius != shape.radius
+            if shape.kind == Counting::CIRCLES:
+                return false if shape.radius < 0.06 or shape.radius > 0.18
+            else:
+                return false if shape.radius != 0.0
+            return true
+
+    def valid_count_snapshot_fields(run: CountingGame::CountingRun&,
+                                    adaptive_value: i64,
+                                    show_answer_value: i64,
+                                    restored_last_time: i64,
+                                    restored_last_sequence: i64,
+                                    restored_elapsed: i64) -> bool:
+        can Abort.Panic:
+            return false if valid_options(TASK_COUNT, 1, run.kind, run.start_count,
+                run.total_trials, run.exposure_ms, adaptive_value,
+                show_answer_value) != OK
+            return false if run.rng.mti > 624.usize()
+            return false if adaptive_value < 0 or adaptive_value > 1
+            return false if show_answer_value < 0 or show_answer_value > 1
+            return false if run.adaptive != (adaptive_value != 0) or run.show_answer != (show_answer_value != 0)
+            return false if run.shape_count < 0 or run.shape_count > Counting::MAX_SHAPES
+            return false if run.count < Counting::MIN_SHAPES or run.count > Counting::MAX_SHAPES
+            return false if run.shown_count < 0 or run.shown_count > Counting::MAX_SHAPES
+            return false if run.trial < 0 or run.trial > run.total_trials
+            return false if run.correct < 0 or run.correct > run.trial
+            return false if run.total_error < 0 or run.total_error > run.total_trials * 999
+            return false if run.answer < 0 or run.answer > 999
+            return false if run.answer_length < 0 or run.answer_length > 3
+            return false if run.answer_length == 0 and run.answer != 0
+            return false if run.answer_length == 1 and run.answer > 9
+            return false if run.answer_length == 2 and run.answer > 99
+            return false if run.phase < CountingGame::PHASE_READY or run.phase > CountingGame::PHASE_DONE
+            return false if run.verdict < -1 or run.verdict > 1
+            return false if run.shown_at_ms < 0 or run.deadline_ms < 0
+            return false if restored_last_time < 0 or restored_last_sequence < -1 or restored_elapsed < 0
+            if run.phase == CountingGame::PHASE_READY:
+                return false if run.trial != 0 or run.shape_count != 0 or run.shown_count != 0
+            elif run.phase == CountingGame::PHASE_DONE:
+                return false if run.trial != run.total_trials or run.shape_count != 0
+            else:
+                return false if run.trial == 0 or run.shape_count != run.shown_count
+                return false if run.shown_count < Counting::MIN_SHAPES
+                return false if run.count - run.shown_count > 1 or run.shown_count - run.count > 1
+            if run.phase == CountingGame::PHASE_SHOWING or run.phase == CountingGame::PHASE_HIDDEN:
+                return false if run.verdict != -1
+            if run.phase == CountingGame::PHASE_FEEDBACK:
+                return false if run.verdict < 0
+                return false if not run.show_answer
+            if not run.show_answer:
+                return false if run.phase == CountingGame::PHASE_FEEDBACK
+            at: mutable i64 = 0
+            while at < run.shape_count |at, run|:
+                shape: Counting::CountShape = run.shapes[at.usize()]
+                return false if not valid_count_snapshot_shape(shape)
+                at <- at + 1
+            return true
+
+    def cleanup_bad_count_restore(pointer: mutable heap void&) -> i64:
+        can Memory.Release, Abort.Panic:
+            free(pointer)
+            return ERR_UNSUPPORTED
+
+    def restore_count(snapshot_pointer: i64, snapshot_bytes: i64,
+                      payload_bytes: i64) -> i64:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return ERR_BUFFER if payload_bytes < COUNT_SNAPSHOT_FIXED_BYTES or payload_bytes > COUNT_SNAPSHOT_MAX_BYTES
+            return ERR_BUFFER if snapshot_bytes != SNAPSHOT_HEADER_BYTES + payload_bytes
+            trusted Unsafe.PointerCast:
+                source: u8& = snapshot_pointer.uintptr().cast[u8&]
+                shape_count: i64 = snapshot_i64(source, SNAPSHOT_HEADER_BYTES + 2500)
+                return ERR_BUFFER if shape_count < 0 or shape_count > Counting::MAX_SHAPES
+                return ERR_BUFFER if payload_bytes != COUNT_SNAPSHOT_FIXED_BYTES + shape_count * COUNT_SHAPE_SNAPSHOT_BYTES
+                index: i64 = free_slot()
+                return ERR_TABLE_FULL if index < 0 or next_handle <= 0 or next_handle == I64_MAX_VALUE
+                raw: mutable heap void&? = malloc(size_of(CountingGame::CountingRun).usize())
+                return ERR_NO_MEMORY if raw == null
+                pointer: mutable heap void& = raw
+                run: mutable heap CountingGame::CountingRun& = pointer.cast[mutable heap CountingGame::CountingRun&]
+                CountingGame::initialize(run, Counting::LINES, 8, 15, 0, true, true, 1)
+                offset: mutable i64 = SNAPSHOT_HEADER_BYTES
+                at: mutable i64 = 0
+                while at < 624 |at, run, source, offset|:
+                    run.rng.mt[at.usize()] <- snapshot_u32(source, offset)
+                    offset <- offset + 4
+                    at <- at + 1
+                run.rng.mti <- snapshot_u32(source, offset).usize()
+                offset <- offset + 4
+                run.shape_count <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                at <- 0
+                while at < run.shape_count |at, run, source, offset|:
+                    run.shapes[at.usize()].kind <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    run.shapes[at.usize()].points <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    point: mutable i64 = 0
+                    while point < 3 |point, run, at, source, offset|:
+                        run.shapes[at.usize()].x[point.usize()] <- snapshot_f64(source, offset)
+                        offset <- offset + 8
+                        point <- point + 1
+                    point <- 0
+                    while point < 3 |point, run, at, source, offset|:
+                        run.shapes[at.usize()].y[point.usize()] <- snapshot_f64(source, offset)
+                        offset <- offset + 8
+                        point <- point + 1
+                    run.shapes[at.usize()].radius <- snapshot_f64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                run.kind <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.start_count <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.total_trials <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.exposure_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                adaptive_value: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                show_answer_value: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.adaptive <- adaptive_value != 0
+                run.show_answer <- show_answer_value != 0
+                run.count <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.shown_count <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.trial <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.correct <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.total_error <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.answer <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.answer_length <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.phase <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.verdict <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.shown_at_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.deadline_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_last_time: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_last_sequence: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_elapsed: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                return cleanup_bad_count_restore(pointer) if offset != snapshot_bytes
+                return cleanup_bad_count_restore(pointer) if not valid_count_snapshot_fields(run, adaptive_value, show_answer_value, restored_last_time, restored_last_sequence, restored_elapsed)
+                handle: i64 = next_handle
+                next_handle <- next_handle + 1
+                slot_handles[index.usize()] <- handle
+                slot_tasks[index.usize()] <- TASK_COUNT
+                slot_pointers[index.usize()] <- pointer.cast[u8&].uintptr().i64()
+                slot_last_time[index.usize()] <- restored_last_time
+                slot_last_sequence[index.usize()] <- restored_last_sequence
+                slot_elapsed[index.usize()] <- restored_elapsed
+                return handle
+
+    def valid_sokoban_snapshot_fields(run: SokobanGame::SokobanRun&,
+                                       history_count: i64) -> bool:
+        can Abort.Panic:
+            return false if run.start_rung < 1 or run.start_rung > SokobanGame::MAX_RUNG
+            return false if run.total_trials < 1 or run.total_trials > 1000
+            return false if run.rung < 1 or run.rung > SokobanGame::MAX_RUNG
+            return false if run.trial < 0 or run.trial > run.total_trials
+            return false if run.phase < SokobanGame::PHASE_READY or run.phase > SokobanGame::PHASE_UNAVAILABLE
+            return false if run.verdict < -1 or run.verdict > 1
+            return false if run.minimum < -1 or run.minimum > SokobanGame::MOST_CELLS
+            return false if run.at_least < 0 or run.at_least > SokobanGame::MOST_CELLS
+            return false if run.bound < 0 or run.bound > SokobanGame::MOST_CELLS
+            return false if run.width < 0 or run.width > SokobanGame::MOST_CELLS
+            return false if run.height < 0 or run.height > SokobanGame::MOST_CELLS
+            return false if run.cells < 0 or run.cells > SokobanGame::MOST_CELLS
+            return false if run.cells != run.width * run.height and run.cells != 0
+            return false if run.player < 0 or run.start_player < 0
+            return false if run.cells > 0 and (run.player >= run.cells or run.start_player >= run.cells)
+            return false if run.has_level and run.cells <= 0
+            return false if (run.phase == SokobanGame::PHASE_PUSHING or run.phase == SokobanGame::PHASE_SOLVED or run.phase == SokobanGame::PHASE_LOST) and not run.has_level
+            return false if run.phase == SokobanGame::PHASE_READY and run.has_level
+            return false if run.pushes < 0 or run.moves < 0 or run.pushes > run.moves
+            return false if run.par < 0 or run.par > SokobanGame::MOST_CELLS
+            return false if run.started_at_ms < 0 or run.took_seconds < 0
+            return false if run.solved_count < 0 or run.lost_count < 0
+            return false if run.total_par < 0 or run.total_pushes < 0
+            return false if run.best_rung < 0 or run.best_rung > SokobanGame::MAX_RUNG
+            return false if run.rng.mti > 624.usize()
+            return false if history_count < 0 or history_count > 1073741823
+            return false if history_count != run.moves
+            cell: mutable i64 = 0
+            while cell < SokobanGame::MOST_CELLS |cell, run|:
+                return false if run.walls[cell.usize()] < 0 or run.walls[cell.usize()] > 1
+                return false if run.goals[cell.usize()] < 0 or run.goals[cell.usize()] > 1
+                return false if run.traps[cell.usize()] < 0 or run.traps[cell.usize()] > 1
+                return false if run.boxes[cell.usize()] < 0 or run.boxes[cell.usize()] > 1
+                return false if run.start_boxes[cell.usize()] < 0 or run.start_boxes[cell.usize()] > 1
+                cell <- cell + 1
+            return true
+
+    # Undo records are executable state: an out-of-range saved cell could make
+    # the next Undo write beyond the fixed board arrays. Replay the log
+    # backwards from the saved board and prove that it returns to the recorded
+    # starting board before admitting the restored handle.
+    def valid_sokoban_snapshot_history(run: SokobanGame::SokobanRun&,
+                                       history_count: i64) -> bool:
+        can Abort.Panic, Unsafe.PointerCast:
+            board: mutable i64[256] = zeroed
+            cell: mutable i64 = 0
+            while cell < run.cells |cell, run, board|:
+                board[cell.usize()] <- run.boxes[cell.usize()]
+                cell <- cell + 1
+            player: mutable i64 = run.player
+            pushes: mutable i64 = run.pushes
+            at: mutable i64 = history_count - 1
+            while at >= 0 |at, run, board, player, pushes|:
+                record: u16 = SokobanGame::history_get(run, at)
+                old_player: i64 = (record & 255.u16()).i64()
+                direction: i64 = ((record >> 8.u16()) & 3.u16()).i64()
+                pushed: bool = ((record >> 10.u16()) & 1.u16()) != 0
+                return false if (record & 63488.u16()) != 0
+                return false if run.cells <= 0 or old_player < 0 or old_player >= run.cells
+                return false if run.walls[old_player.usize()] != 0 or board[old_player.usize()] != 0
+                stride: i64 = Sokoban::step_of(run.width, direction)
+                ahead: i64 = old_player + stride
+                return false if ahead < 0 or ahead >= run.cells or run.walls[ahead.usize()] != 0
+                return false if player != ahead
+                if pushed:
+                    beyond: i64 = ahead + stride
+                    return false if beyond < 0 or beyond >= run.cells or run.walls[beyond.usize()] != 0
+                    return false if board[ahead.usize()] != 0 or board[beyond.usize()] != 1 or pushes <= 0
+                    board[ahead.usize()] <- 1
+                    board[beyond.usize()] <- 0
+                    pushes <- pushes - 1
+                else:
+                    return false if board[ahead.usize()] != 0
+                player <- old_player
+                at <- at - 1
+            return false if player != run.start_player or pushes != 0
+            cell <- 0
+            while cell < run.cells |cell, run, board|:
+                return false if board[cell.usize()] != run.start_boxes[cell.usize()]
+                cell <- cell + 1
+            return true
+
+    def cleanup_bad_sokoban_restore(pointer: mutable heap void&) -> i64:
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            run: mutable heap SokobanGame::SokobanRun& = pointer.cast[mutable heap SokobanGame::SokobanRun&]
+            SokobanGame::dispose(run)
+            free(pointer)
+            return ERR_UNSUPPORTED
+
+    def restore_sokoban(snapshot_pointer: i64, snapshot_bytes: i64,
+                        payload_bytes: i64) -> i64:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return ERR_BUFFER if payload_bytes < SOKOBAN_SNAPSHOT_FIXED_BYTES
+            return ERR_BUFFER if snapshot_bytes != SNAPSHOT_HEADER_BYTES + payload_bytes
+            index: i64 = free_slot()
+            return ERR_TABLE_FULL if index < 0 or next_handle <= 0 or next_handle == I64_MAX_VALUE
+            trusted Unsafe.PointerCast:
+                source: u8& = snapshot_pointer.uintptr().cast[u8&]
+                history_count: i64 = snapshot_u32(source,
+                    SNAPSHOT_HEADER_BYTES + SOKOBAN_SNAPSHOT_FIXED_BYTES - 4).i64()
+                return ERR_BUFFER if payload_bytes != SOKOBAN_SNAPSHOT_FIXED_BYTES + history_count * 2
+                raw: mutable heap void&? = malloc(size_of(SokobanGame::SokobanRun).usize())
+                return ERR_NO_MEMORY if raw == null
+                pointer: mutable heap void& = raw
+                run: mutable heap SokobanGame::SokobanRun& = pointer.cast[mutable heap SokobanGame::SokobanRun&]
+                SokobanGame::initialize(run, 1, 1, false, false, 0)
+                offset: mutable i64 = SNAPSHOT_HEADER_BYTES
+                run.start_rung <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.total_trials <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                adaptive_value: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                show_traps_value: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.seed <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                return cleanup_bad_sokoban_restore(pointer) if adaptive_value < 0 or adaptive_value > 1
+                return cleanup_bad_sokoban_restore(pointer) if show_traps_value < 0 or show_traps_value > 1
+                run.adaptive <- adaptive_value != 0
+                run.show_traps <- show_traps_value != 0
+                at: mutable i64 = 0
+                while at < 624 |at, run, source, offset|:
+                    run.rng.mt[at.usize()] <- snapshot_u32(source, offset)
+                    offset <- offset + 4
+                    at <- at + 1
+                run.rng.mti <- snapshot_u32(source, offset).usize()
+                offset <- offset + 4
+                at <- 0
+                while at < 256 |at, run, source, offset|:
+                    run.walls[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    run.goals[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    run.traps[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    run.boxes[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    run.start_boxes[at.usize()] <- snapshot_i64(source, offset)
+                    offset <- offset + 8
+                    at <- at + 1
+                run.width <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.height <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.cells <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.minimum <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.at_least <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.bound <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.rung <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.trial <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.phase <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.verdict <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.player <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.start_player <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.pushes <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.moves <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.par <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.started_at_ms <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.took_seconds <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.solved_count <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.lost_count <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.total_par <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.total_pushes <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.best_rung <- snapshot_i64(source, offset)
+                offset <- offset + 8
+                has_level_value: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_last_time: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_last_sequence: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                restored_elapsed: i64 = snapshot_i64(source, offset)
+                offset <- offset + 8
+                run.has_level <- has_level_value != 0
+                return cleanup_bad_sokoban_restore(pointer) if has_level_value < 0 or has_level_value > 1
+                return cleanup_bad_sokoban_restore(pointer) if restored_last_time < 0 or restored_last_sequence < -1 or restored_elapsed < 0
+                return cleanup_bad_sokoban_restore(pointer) if offset != SNAPSHOT_HEADER_BYTES + SOKOBAN_SNAPSHOT_FIXED_BYTES - 4
+                return cleanup_bad_sokoban_restore(pointer) if not valid_sokoban_snapshot_fields(run, history_count)
+                offset <- offset + 4
+                if history_count > 0:
+                    history_raw: mutable heap void&? = malloc((history_count * size_of(u16).i64()).usize())
+                    if history_raw == null:
+                        free(pointer)
+                        return ERR_NO_MEMORY
+                    history_block: mutable heap void& = history_raw
+                    history: mutable u16& = history_block.cast[mutable u16&]
+                    run.history_pointer <- history_block.cast[u8&].uintptr().i64()
+                    run.history_capacity <- history_count
+                    at <- 0
+                    invalid_history: mutable bool = false
+                    while at < history_count and not invalid_history |at, history, source, offset, run, invalid_history|:
+                        record: u16 = snapshot_u16(source, offset)
+                        old_player: i64 = (record & 255.u16()).i64()
+                        invalid_history <- true if old_player >= run.cells or (record & 63488.u16()) != 0
+                        if not invalid_history:
+                            history[at.usize()] <- record
+                        offset <- offset + 2
+                        at <- at + 1
+                    if invalid_history:
+                        SokobanGame::dispose(run)
+                        free(pointer)
+                        return ERR_UNSUPPORTED
+                run.history_count <- history_count
+                return cleanup_bad_sokoban_restore(pointer) if not valid_sokoban_snapshot_history(run, history_count)
+                handle: i64 = next_handle
+                next_handle <- next_handle + 1
+                slot_handles[index.usize()] <- handle
+                slot_tasks[index.usize()] <- TASK_SOKOBAN
+                slot_pointers[index.usize()] <- pointer.cast[u8&].uintptr().i64()
+                slot_last_time[index.usize()] <- restored_last_time
+                slot_last_sequence[index.usize()] <- restored_last_sequence
+                slot_elapsed[index.usize()] <- restored_elapsed
+                return handle
+
     def restore(snapshot_pointer: i64, snapshot_bytes: i64) -> i64:
-        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
             return ERR_BUFFER if snapshot_bytes < SNAPSHOT_HEADER_BYTES or not valid_memory_range(snapshot_pointer, snapshot_bytes, 1)
             trusted Unsafe.PointerCast:
                 source: u8& = snapshot_pointer.uintptr().cast[u8&]
@@ -3797,8 +5117,24 @@ module ApiV1:
                 version: u32 = snapshot_u32(source, 4)
                 task: i64 = snapshot_u32(source, 8).i64()
                 payload: i64 = snapshot_u32(source, 12).i64()
-                return ERR_UNSUPPORTED if magic != STATE_MAGIC or version != SNAPSHOT_VERSION
-                return ERR_UNSUPPORTED if not snapshot_supported(task)
+                return ERR_UNSUPPORTED if magic != STATE_MAGIC
+                if version == SOKOBAN_SNAPSHOT_VERSION:
+                    return ERR_UNSUPPORTED if task != TASK_SOKOBAN
+                    return restore_sokoban(snapshot_pointer, snapshot_bytes, payload)
+                if version == TETRIS_SNAPSHOT_VERSION:
+                    return ERR_UNSUPPORTED if task != TASK_TETRIS
+                    return restore_tetris(snapshot_pointer, snapshot_bytes, payload)
+                if version == NBACK3D_SNAPSHOT_VERSION:
+                    return ERR_UNSUPPORTED if task != TASK_NBACK_3D
+                    return restore_nback3d(snapshot_pointer, snapshot_bytes, payload)
+                if version == MONKEY_LADDER_SNAPSHOT_VERSION:
+                    return ERR_UNSUPPORTED if task != TASK_MONKEY_LADDER
+                    return restore_monkey_ladder(snapshot_pointer, snapshot_bytes, payload)
+                if version == COUNT_SNAPSHOT_VERSION:
+                    return ERR_UNSUPPORTED if task != TASK_COUNT
+                    return restore_count(snapshot_pointer, snapshot_bytes, payload)
+                return ERR_UNSUPPORTED if version != SNAPSHOT_VERSION
+                return ERR_UNSUPPORTED if not snapshot_supported_v1(task)
                 return ERR_BUFFER if payload != run_bytes(task) or snapshot_bytes != SNAPSHOT_HEADER_BYTES + payload
                 index: i64 = free_slot()
                 return ERR_TABLE_FULL if index < 0 or next_handle <= 0 or next_handle == I64_MAX_VALUE

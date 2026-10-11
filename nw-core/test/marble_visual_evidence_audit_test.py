@@ -12,6 +12,27 @@ import marble_visual_evidence_audit as audit
 
 
 class EvidenceAuditTest(unittest.TestCase):
+    def test_current_23a0_visual_matrix_covers_requested_states_and_scales(self):
+        expected = {
+            'rolling-r16-dpr1-light-1280x720',
+            'rolling-r16-dpr2-dark-800x600',
+            'tilt-r16-dpr1-dark-800x600',
+            'nudge-r16-dpr1-dark-1280x720',
+            'win-r1-dpr1-light-1280x720',
+            'loss-r10-dpr2-dark-800x600',
+            'loss-r10-dpr1-dark-800x600',
+            'done-r1-dpr1-dark-800x600',
+            'ready-r16-dpr2-light-800x600',
+            'ready-r16-dpr1-light-800x600',
+        }
+        current_pairs = {
+            reference.split('/')[-2]
+            for reference, _ in audit.PAIRS
+            if reference.startswith('current-stage1-23a0-20261007/')
+        }
+        self.assertEqual(current_pairs, expected)
+        self.assertEqual(len(current_pairs), 10)
+
     def test_current_dark_tilt_and_restart_pairs_are_in_inventory(self):
         self.assertIn((
             'marble-current-pair-20261004/dark-tilt/source-r16-seed17-east30',

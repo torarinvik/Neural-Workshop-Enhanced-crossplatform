@@ -11,8 +11,8 @@ source "$ROOT/scripts/env.sh"
 mkdir -p "$ROOT/build"
 
 PROJECTS_ROOT="$(cd -- "$ROOT/../.." && pwd)"
-LATEST_ROOT="${ELISA_LATEST_STAGE1_ROOT:-$PROJECTS_ROOT/Elisa-compiler-port-current-5417885}"
-LATEST_BIN="${ELISA_LATEST_STAGE1_BIN:-$LATEST_ROOT/bin/elisac-stage1}"
+LATEST_ROOT="${ELISA_LATEST_STAGE1_ROOT:-$ELISA_STAGE1_ROOT}"
+LATEST_BIN="${ELISA_LATEST_STAGE1_BIN:-$ELISA_STAGE1_BIN}"
 
 SDL_CFLAGS="$(pkg-config --cflags sdl3 2>/dev/null || echo "-I/opt/homebrew/include")"
 SDL_LIBS="$(pkg-config --libs sdl3 2>/dev/null || echo "-L/opt/homebrew/lib -lSDL3")"

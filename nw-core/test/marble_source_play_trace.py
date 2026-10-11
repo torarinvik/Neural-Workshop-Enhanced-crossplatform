@@ -103,6 +103,19 @@ def current_promoted_artifact(manifest: dict[str, object]) -> dict[str, object]:
     return promoted
 
 
+def maintained_core_identity(
+        manifest: dict[str, object], project_root: Path,
+        candidate_wasm: Path | None = None) -> tuple[Path, str]:
+    """Resolve the promoted core or an exact isolated candidate without promotion."""
+    if candidate_wasm is not None:
+        candidate = candidate_wasm.resolve()
+        if not candidate.is_file():
+            raise ValueError(f"candidate WASM is missing: {candidate}")
+        return candidate, sha256_path(candidate)
+    promoted = current_promoted_artifact(manifest)
+    return (project_root / promoted["path"]).resolve(), promoted["sha256"]
+
+
 def wheel_record_matches(distribution, path: Path) -> bool:
     """Check an installed wheel file against its distribution RECORD digest."""
     distribution_root = Path(distribution.locate_file("")).resolve()
@@ -3492,7 +3505,9 @@ def main() -> int:
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--trace", required=True, type=Path)
     parser.add_argument("--require-maintained-browser-runtime", action="store_true",
-                        help="require the trace's core and MuJoCo files to match the current physics manifest")
+                        help="require exact core identity (promoted alias or --candidate-wasm) and maintained MuJoCo files")
+    parser.add_argument("--candidate-wasm", type=Path,
+                        help="qualify this exact isolated core WASM before promotion; requires --require-maintained-browser-runtime")
     parser.add_argument("--provenance-json", type=Path,
                         help="write the browser artifacts and active native MuJoCo wheel identity")
     parser.add_argument("--native-rne-trace-lib", type=Path,
@@ -3546,6 +3561,8 @@ def main() -> int:
     parser.add_argument("--diagnostic-contact-event", type=int, action="append",
                         default=[], help="also print full contact geometry for this event; repeatable")
     args = parser.parse_args()
+    if args.candidate_wasm is not None and not args.require_maintained_browser_runtime:
+        parser.error("--candidate-wasm requires --require-maintained-browser-runtime")
     if args.diagnostic_preparation_jsonl and not args.diagnostic_validate_solver_trace_lib:
         parser.error("preparation captures require exact active-wheel solver-library validation")
     if ((args.diagnostic_solver_output_event is None) !=
@@ -3733,13 +3750,12 @@ def main() -> int:
             manifest = json.loads(manifest_path.read_text())
             project_root = manifest_path.parents[2]
             try:
-                promoted_artifact = current_promoted_artifact(manifest)
+                expected_core_path, expected_core_sha256 = maintained_core_identity(
+                    manifest, project_root, args.candidate_wasm)
             except ValueError as error:
                 raise SystemExit(str(error)) from error
-            current_artifact = manifest["currentArtifact"]["artifact"]
             core_identity = browser_runtime.get("coreWasm", {})
             mujoco_identity = browser_runtime.get("mujoco", {})
-            expected_core_path = (project_root / promoted_artifact["path"]).resolve()
             expected_js = next((item for item in manifest["browser"]["runtimeFiles"]
                                 if item["path"].endswith("/mujoco.js")), None)
             expected_wasm = next((item for item in manifest["browser"]["runtimeFiles"]
@@ -3750,7 +3766,7 @@ def main() -> int:
             expected_wasm_path = (project_root / expected_wasm["path"]).resolve()
             expected_browser_files = (
                 (core_identity, "path", expected_core_path),
-                (core_identity, "sha256", promoted_artifact["sha256"]),
+                (core_identity, "sha256", expected_core_sha256),
                 (mujoco_identity, "jsPath", expected_js_path),
                 (mujoco_identity, "jsSha256", expected_js["sha256"]),
                 (mujoco_identity, "wasmPath", expected_wasm_path),
@@ -3768,7 +3784,7 @@ def main() -> int:
                 raise SystemExit(
                     "browser trace did not use the maintained MuJoCo JS/WASM pair")
             for path, expected_hash in (
-                    (expected_core_path, promoted_artifact["sha256"]),
+                    (expected_core_path, expected_core_sha256),
                     (expected_js_path, expected_js["sha256"]),
                     (expected_wasm_path, expected_wasm["sha256"])):
                 if sha256_path(path) != expected_hash:

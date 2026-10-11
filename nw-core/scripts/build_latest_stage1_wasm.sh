@@ -7,8 +7,8 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECTS_ROOT="$(cd -- "$ROOT/../.." && pwd)"
-LATEST_ROOT="${ELISA_LATEST_STAGE1_ROOT:-$PROJECTS_ROOT/Elisa-compiler-port-current-5417885}"
-LATEST_BIN="${ELISA_LATEST_STAGE1_BIN:-$LATEST_ROOT/bin/elisac-stage1}"
+LATEST_ROOT="${ELISA_LATEST_STAGE1_ROOT:-${ELISA_STAGE1_ROOT:-$PROJECTS_ROOT/Elisa-compiler-port-current-23a0}}"
+LATEST_BIN="${ELISA_LATEST_STAGE1_BIN:-${ELISA_STAGE1_BIN:-$LATEST_ROOT/bin/elisac-stage1}}"
 
 if [[ ! -x "$LATEST_ROOT/scripts/elisac_stage1.sh" || ! -x "$LATEST_BIN" ]]; then
     echo "build_latest_stage1_wasm.sh: latest Elisa Stage1 checkout/product missing" >&2

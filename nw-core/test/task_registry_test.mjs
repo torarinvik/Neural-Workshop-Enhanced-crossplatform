@@ -10,21 +10,23 @@ const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
 const registrySource = fs.readFileSync(registryPath, "utf8");
 const registryModule = await import(`data:text/javascript;base64,${Buffer.from(registrySource).toString("base64")}`);
 const { TASK_CATEGORIES: categories, TASK_IDS_BY_CATEGORY: idsByCategory } = registryModule;
-assert.equal(catalog.schema_version, 4,
-  "the reviewed manifest must carry category metadata, port overrides, and task capabilities");
+assert.equal(catalog.schema_version, 5,
+  "the reviewed manifest must carry source-derived option contracts and host capabilities");
 assert.match(web, /import \{ TASK_CATEGORIES, TASK_IDS_BY_CATEGORY \} from "\.\/task-registry\.js";/,
   "the web menu must consume generated manifest data rather than duplicate it inline");
 assert.equal(categories.length, idsByCategory.length,
   "each category's display order must have a corresponding ID row");
-assert.deepEqual(catalog.task_capabilities.tetris, {
-  required_services: [],
-  supported_input: ["keyboard", "pointer"],
-  options_schema: {
-    starting_rung: { type: "integer", default: 1, minimum: 1, maximum: 8 },
-    piece_target: { type: "integer", default: 25, minimum: 1, maximum: 500 },
-    queue_size: { type: "integer", default: 5, minimum: 1, maximum: 6 },
-  },
-}, "Tetris host/input/options capabilities must remain explicit in the manifest");
+assert.equal(Object.keys(catalog.task_capabilities).length, 45,
+  "every reviewed stable task ID must define a capability record");
+assert.equal(Object.values(catalog.task_capabilities)
+  .reduce((count, record) => count + Object.keys(record.options_schema).length, 0), 224,
+"every source-defined task option and both scoped 3D N-Back controls must be represented");
+assert.deepEqual(catalog.task_capabilities.tetris.options_schema.TETRIS_QUEUE, {
+  type: "enum", value_type: "integer", default: 5, values: [2, 3, 4, 5, 6],
+}, "Tetris queue choices must remain tied to the original settings screen");
+assert.deepEqual(catalog.task_capabilities.nback.options_schema.grid_3d_cubes, {
+  type: "enum", value_type: "integer", default: 1, values: [1, 2, 3, 4, 5, 6],
+}, "3D N-Back cube-count choices must remain explicit in the manifest");
 
 const catalogCategories = catalog.categories.map((category) => category.id);
 const expectedIds = catalogCategories.map((category) => catalog.tasks
