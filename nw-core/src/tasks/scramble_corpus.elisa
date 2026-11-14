@@ -1,0 +1,195 @@
+# Ranked vocabulary input for Scramble's downloaded source corpus.
+# Depends on CrosswordLexicon's TSV row parser and Scramble's vocabulary.
+module ScrambleCorpus:
+    struct ScrambleCorpusStats:
+        words: mutable i64
+        letters: mutable i64
+        valid: mutable bool
+
+    def inspect(text: sview, top_rank: i64) -> ScrambleCorpusStats:
+        can Abort.Panic:
+            stats: mutable ScrambleCorpusStats = ScrambleCorpusStats{words: 0, letters: 0, valid: true}
+            total: i64 = sview_len(text).i64()
+            at: mutable i64 = 0
+            while at < total |text, total, at, top_rank, stats|:
+                row: CrosswordLexicon::CrosswordIndexRow = CrosswordLexicon::row_at(text, at, total)
+                stats.valid <- false if not row.valid
+                # Allocate for the full source pool: a later duplicate can
+                # change a word's effective rank even across the cutoff.
+                if row.valid and row.word_length <= 15:
+                    stats.words <- stats.words + 1
+                    stats.letters <- stats.letters + row.word_length
+                at <- row.next
+            return stats
+
+    # Python's vocabulary sorts (rank, word); letter storage remains stable.
+    def before(vocab: mutable Scramble::ScrambleVocab&, left: i64, right: i64) -> bool:
+        can Abort.Panic:
+            a: i64 = Ints::at_ref(&vocab.rank, left)
+            b: i64 = Ints::at_ref(&vocab.rank, right)
+            return a < b if a != b
+            alen: i64 = Ints::at_ref(&vocab.length, left)
+            blen: i64 = Ints::at_ref(&vocab.length, right)
+            size: i64 = alen if alen < blen else blen
+            aa: i64 = Ints::at_ref(&vocab.start, left)
+            bb: i64 = Ints::at_ref(&vocab.start, right)
+            for i in 0..<size |vocab, aa, bb|:
+                ac: i64 = Ints::at_ref(&vocab.letter, aa + i)
+                bc: i64 = Ints::at_ref(&vocab.letter, bb + i)
+                return ac < bc if ac != bc
+            return alen <= blen
+
+    def sort(vocab: mutable Scramble::ScrambleVocab&):
+        can Memory.Allocate, Abort.Panic:
+            order: mutable darray[i64] = Ints::zeros(vocab.count)
+            temp: mutable darray[i64] = Ints::zeros(vocab.count)
+            starts: mutable darray[i64] = Ints::zeros(vocab.count)
+            lengths: mutable darray[i64] = Ints::zeros(vocab.count)
+            ranks: mutable darray[i64] = Ints::zeros(vocab.count)
+            for i in 0..<vocab.count |order|: Ints::put(&order, i, i)
+            width: mutable i64 = 1
+            while width < vocab.count |vocab, order, temp, width|:
+                begin: mutable i64 = 0
+                while begin < vocab.count |vocab, order, temp, width, begin|:
+                    middle: i64 = begin + width if begin + width < vocab.count else vocab.count
+                    end: i64 = middle + width if middle + width < vocab.count else vocab.count
+                    left: mutable i64 = begin
+                    right: mutable i64 = middle
+                    for dest in begin..<end |vocab, order, temp, middle, end, left, right|:
+                        take_left: bool = left < middle and (right >= end or ScrambleCorpus::before(vocab, Ints::at_ref(&order, left), Ints::at_ref(&order, right)))
+                        Ints::put(&temp, dest, Ints::at_ref(&order, left if take_left else right))
+                        left <- left + 1 if take_left
+                        right <- right + 1 if not take_left
+                    begin <- end
+                for i in 0..<vocab.count |order, temp|: Ints::put(&order, i, Ints::at_ref(&temp, i))
+                width <- width * 2
+            for i in 0..<vocab.count |vocab, order, starts, lengths, ranks|:
+                source: i64 = Ints::at_ref(&order, i)
+                Ints::put(&starts, i, Ints::at_ref(&vocab.start, source))
+                Ints::put(&lengths, i, Ints::at_ref(&vocab.length, source))
+                Ints::put(&ranks, i, Ints::at_ref(&vocab.rank, source))
+            for i in 0..<vocab.count |vocab, starts, lengths, ranks|:
+                Ints::put(&vocab.start, i, Ints::at_ref(&starts, i))
+                Ints::put(&vocab.length, i, Ints::at_ref(&lengths, i))
+                Ints::put(&vocab.rank, i, Ints::at_ref(&ranks, i))
+
+    # Caller allocates buffers to the inspected word and letter counts.
+    def load(text: sview, top_rank: i64, vocab: mutable Scramble::ScrambleVocab&):
+        can Memory.Allocate, Abort.Panic:
+            total: i64 = sview_len(text).i64()
+            at: mutable i64 = 0
+            letters: mutable i64 = 0
+            vocab.count <- 0
+            while at < total |text, total, at, top_rank, vocab, letters|:
+                row: CrosswordLexicon::CrosswordIndexRow = CrosswordLexicon::row_at(text, at, total)
+                if row.valid and row.word_length <= 15:
+                    index: i64 = vocab.count
+                    Ints::put(&vocab.start, index, letters)
+                    Ints::put(&vocab.length, index, row.word_length)
+                    Ints::put(&vocab.rank, index, row.rank)
+                    for i in 0..<row.word_length |text, row, vocab, letters|:
+                        Ints::put(&vocab.letter, letters + i, sview_at(text, (row.word_at + i).usize()).i64() - 97)
+                    letters <- letters + row.word_length
+                    vocab.count <- index + 1
+                at <- row.next
+            ScrambleCorpus::sort(vocab)
+            Scramble::index_vocab(vocab)
+            # index_vocab keeps one hash-chain representative per spelling,
+            # updating its rank for each later (therefore higher-ranked) row.
+            keep: mutable darray[i64] = Ints::zeros(vocab.count)
+            kept: mutable i64 = 0
+            for i in 0..<vocab.count |vocab, keep, kept, top_rank|:
+                slot: i64 = Scramble::bag_hash(&vocab.bag, i * Scramble::LETTER_COUNT)
+                probe: mutable i64 = Ints::at_ref(&vocab.head, slot) - 1
+                while probe >= 0 and not Scramble::same_word(vocab, probe, i) |vocab, i, probe|:
+                    probe <- Ints::at_ref(&vocab.next, probe) - 1
+                if probe == i and Ints::at_ref(&vocab.rank, i) <= top_rank:
+                    Ints::put(&keep, kept, i)
+                    kept <- kept + 1
+            for i in 0..<kept |vocab, keep|:
+                source: i64 = Ints::at_ref(&keep, i)
+                Ints::put(&vocab.start, i, Ints::at_ref(&vocab.start, source))
+                Ints::put(&vocab.length, i, Ints::at_ref(&vocab.length, source))
+                Ints::put(&vocab.rank, i, Ints::at_ref(&vocab.rank, source))
+            vocab.count <- kept
+            ScrambleCorpus::sort(vocab)
+            Scramble::index_vocab(vocab)
+
+    struct ScrambleBankStats:
+        sentences: mutable i64
+        words: mutable i64
+        letters: mutable i64
+
+    # A sentence word must exist in the already rank-filtered vocabulary.
+    def contains(text: sview, start: i64, length: i64, vocab: mutable Scramble::ScrambleVocab&, scratch: mutable darray[i64]&) -> bool:
+        can Abort.Panic:
+            return false if length <= 0 or length > 15
+            for i in 0..<Scramble::LETTER_COUNT |scratch|: Ints::put(scratch, i, 0)
+            for i in 0..<length |text, start, scratch|:
+                byte: u8 = sview_at(text, (start + i).usize())
+                return false if byte < 97.u8() or byte > 122.u8()
+                letter: i64 = byte.i64() - 97
+                Ints::put(scratch, letter, Ints::at_ref(scratch, letter) + 1)
+            slot: i64 = Scramble::bag_hash(scratch, 0)
+            probe: mutable i64 = Ints::at_ref(&vocab.head, slot) - 1
+            while probe >= 0 |text, start, length, vocab, probe|:
+                same: mutable bool = Ints::at_ref(&vocab.length, probe) == length
+                base: i64 = Ints::at_ref(&vocab.start, probe)
+                for i in 0..<length |text, start, vocab, base, same|:
+                    same <- false if Ints::at_ref(&vocab.letter, base + i) != sview_at(text, (start + i).usize()).i64() - 97
+                return true if same
+                probe <- Ints::at_ref(&vocab.next, probe) - 1
+            return false
+
+    def whitespace(byte: u8) -> bool:
+        return byte == 32.u8() or byte == 9.u8() or byte == 13.u8() or byte == 11.u8() or byte == 12.u8()
+
+    # Two passes: first count exact storage, then fill the same filtered bank.
+    def scan_bank(text: sview, grade: Scramble::ScrambleGrade&, vocab: mutable Scramble::ScrambleVocab&, bank: mutable Scramble::ScrambleBank&, write: bool) -> ScrambleBankStats:
+        can Memory.Allocate, Abort.Panic:
+            stats: mutable ScrambleBankStats = ScrambleBankStats{sentences: 0, words: 0, letters: 0}
+            scratch: mutable darray[i64] = Ints::zeros(Scramble::LETTER_COUNT)
+            total: i64 = sview_len(text).i64()
+            at: mutable i64 = 0
+            while at < total |text, total, at, grade, vocab, bank, write, stats, scratch|:
+                start: i64 = at
+                while at < total and sview_at(text, at.usize()) != 10.u8() |text, total, at|: at <- at + 1
+                end: i64 = at
+                pos: mutable i64 = start
+                count: mutable i64 = 0
+                letters: mutable i64 = 0
+                valid: mutable bool = true
+                while pos < end |text, end, pos, count, letters, valid, vocab, scratch|:
+                    while pos < end and ScrambleCorpus::whitespace(sview_at(text, pos.usize())) |text, end, pos|: pos <- pos + 1
+                    first: i64 = pos
+                    while pos < end and not ScrambleCorpus::whitespace(sview_at(text, pos.usize())) |text, end, pos|: pos <- pos + 1
+                    length: i64 = pos - first
+                    if length > 0:
+                        count <- count + 1
+                        letters <- letters + length
+                        valid <- false if not ScrambleCorpus::contains(text, first, length, vocab, &scratch)
+                if valid and count >= grade.span_low and count <= grade.span_high:
+                    if write:
+                        Ints::put(&bank.words, stats.sentences, count)
+                        Ints::put(&bank.word_at, stats.sentences, stats.words)
+                        pos <- start
+                        word: mutable i64 = stats.words
+                        letter: mutable i64 = stats.letters
+                        while pos < end |text, end, pos, bank, word, letter|:
+                            while pos < end and ScrambleCorpus::whitespace(sview_at(text, pos.usize())) |text, end, pos|: pos <- pos + 1
+                            first: i64 = pos
+                            while pos < end and not ScrambleCorpus::whitespace(sview_at(text, pos.usize())) |text, end, pos|: pos <- pos + 1
+                            length: i64 = pos - first
+                            if length > 0:
+                                Ints::put(&bank.word_length, word, length)
+                                Ints::put(&bank.letter_at, word, letter)
+                                for i in 0..<length |text, first, bank, letter|:
+                                    Ints::put(&bank.letter, letter + i, sview_at(text, (first + i).usize()).i64() - 97)
+                                word <- word + 1
+                                letter <- letter + length
+                    stats.sentences <- stats.sentences + 1
+                    stats.words <- stats.words + count
+                    stats.letters <- stats.letters + letters
+                at <- at + 1
+            bank.count <- stats.sentences if write
+            return stats

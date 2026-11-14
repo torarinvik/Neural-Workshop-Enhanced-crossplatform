@@ -265,6 +265,18 @@ export function createElisaRuntime() {
             view.setBigUint64(out, product & mask, true);
             view.setBigUint64(out + 8, (product >> 64n) & mask, true);
         },
+        // compiler-rt unsigned 128-bit quotient; both operands and the
+        // result use the wasm32 lowered (pointer, low, high) ABI.
+        __udivti3: (out, aLo, aHi, bLo, bHi) => {
+            const mask = (1n << 64n) - 1n;
+            const a = (BigInt.asUintN(64, aHi) << 64n) | BigInt.asUintN(64, aLo);
+            const b = (BigInt.asUintN(64, bHi) << 64n) | BigInt.asUintN(64, bLo);
+            if (b === 0n) throw new RangeError("128-bit division by zero");
+            const quotient = a / b;
+            const view = dv();
+            view.setBigUint64(out, quotient & mask, true);
+            view.setBigUint64(out + 8, (quotient >> 64n) & mask, true);
+        },
     };
 
     function writeFormatted(dest, size, text) {
@@ -362,11 +374,11 @@ function importSignatures(bytes) {
 
 // Adapt one implementation to its declared signature: i64 parameters arrive as
 // BigInt and are handed on as Numbers, and an i64 result goes back as BigInt.
-function adapt(fn, signature) {
+function adapt(fn, signature, preserveI64 = false) {
     if (!signature) return fn;
     const returnsI64 = signature.results[0] === "i64";
     return (...args) => {
-        const result = fn(...args.map((a) => (typeof a === "bigint" ? Number(a) : a)));
+        const result = fn(...args.map((a) => (typeof a === "bigint" && !preserveI64 ? Number(a) : a)));
         if (!returnsI64) return result;
         return BigInt(result === undefined || result === null ? 0 : result);
     };
@@ -387,7 +399,8 @@ function completeImports(module, imports, signatures) {
                 throw new Error(`elisa: unimplemented host call ${entry.name}(${args.length} args)`);
             }, signature);
         } else {
-            table[entry.name] = adapt(table[entry.name], signature);
+            table[entry.name] = adapt(table[entry.name], signature,
+                entry.name === "__multi3" || entry.name === "__udivti3");
         }
     }
     return missing;

@@ -27,7 +27,7 @@ python3 "$ROOT/scripts/prepare_wasm_exports.py" \
     -o "$OBJECT" "$WASM_SOURCE"
 rm -f -- "$WASM_SOURCE"
 trap - EXIT INT TERM HUP
-wasm-ld --no-entry --export-dynamic --allow-undefined --export=__heap_base \
+wasm-ld --no-entry --export-dynamic --allow-undefined --export=__heap_base -z stack-size=8388608 \
     -o "$ARTIFACT" "$OBJECT"
 printf 'stage1 wasm: %s bytes\n' "$(wc -c < "$ARTIFACT" | tr -d ' ')"
 

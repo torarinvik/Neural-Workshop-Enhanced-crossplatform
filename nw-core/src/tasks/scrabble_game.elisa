@@ -1,6 +1,4 @@
-# Stateful source-backed Scrabble slice. The source kernel owns premium layout,
-# lexicon legality, and score calculation; the ABI record owns only fixed board,
-# rack, and current-play storage.
+# Scrabble controller backed by the source deal, vocabulary, and score kernel.
 module ScrabbleGame:
     const TASK_ID: i64 = 1272532037
     const MAX_CELLS: i64 = 225
@@ -14,6 +12,12 @@ module ScrabbleGame:
     const ACTION_LEFT: i64 = 2
     const ACTION_RIGHT: i64 = 3
     const ACTION_TOGGLE: i64 = 4
+    const ACTION_UP: i64 = 5
+    const ACTION_DOWN: i64 = 6
+    const ACTION_LAY: i64 = 7
+    const ACTION_BACK: i64 = 8
+    const ACTION_APPLY_OPTIONS: i64 = 9
+    const ACTION_START_CLOCK: i64 = 10
     const INFO_PHASE: i64 = 0
     const INFO_RUNG: i64 = 1
     const INFO_TRIAL: i64 = 2
@@ -27,32 +31,83 @@ module ScrabbleGame:
     const VALUE_PREMIUM: i64 = 1
     const VALUE_RACK: i64 = 2
 
-    struct Run:
+    struct ScrabbleRun:
         rng: mutable MT19937
+        start_rung: mutable i64
         rung: mutable i64
         trials: mutable i64
+        show_premiums: mutable bool
+        adaptive: mutable bool
         trial: mutable i64
         right: mutable i64
         phase: mutable i64
         verdict: mutable i64
         score: mutable i64
+        corpus_pointer: mutable i64
+        corpus_length: mutable i64
+        ceiling: mutable i64
+        best_n: mutable i64
+        best_cells: mutable i64[RACK]
+        best_letters: mutable i64[RACK]
+        total_score: mutable i64
+        total_ceiling: mutable i64
+        total_ms: mutable i64
+        started_ms: mutable i64
+        clock_pending: mutable bool
+        played: mutable i64
+        best_rung: mutable i64
+        best_word: mutable u8[15]
+        best_word_n: mutable i64
+        score_text: mutable u8[256]
+        score_text_n: mutable i64
         cursor: mutable i64
         size: mutable i64
+        down: mutable bool
+        laid_count: mutable i64
+        laid_cells: mutable i64[RACK]
+        laid_slots: mutable i64[RACK]
+        message_code: mutable i64
+        hovered: mutable i64
+        hovered_tile: mutable i64
+        hovered_play: mutable bool
         board: mutable i64[MAX_CELLS]
         premium: mutable i64[MAX_CELLS]
         laid: mutable i64[MAX_CELLS]
         rack: mutable i64[RACK]
+        rack_n: mutable i64
         spent: mutable bool[RACK]
 
     def allowed_rung(value: i64) -> bool:
         return value >= 1 and value <= Scrabble::GRADE_COUNT
     def allowed_trials(value: i64) -> bool:
-        return value >= 1 and value <= 100
+        return value == 1 or value == 2 or value == 3 or value == 5 or value == 8 or value == 10 or value == 15
 
-    def clear(run: mutable Run&):
+    def trial_choice(index: i64) -> i64:
+        return 1 if index == 0
+        return 2 if index == 1
+        return 3 if index == 2
+        return 5 if index == 3
+        return 8 if index == 4
+        return 10 if index == 5
+        return 15
+
+    def clear(run: mutable ScrabbleRun&):
         can Abort.Panic:
             run.score <- 0
+            run.size <- 0
+            run.ceiling <- 0
+            run.best_n <- 0
+            run.best_word_n <- 0
+            run.score_text_n <- 0
+            run.rack_n <- 0
+            run.verdict <- -1
             run.cursor <- 0
+            run.down <- false
+            run.laid_count <- 0
+            run.message_code <- 0
+            run.hovered <- -1
+            run.hovered_tile <- -1
+            run.hovered_play <- false
             for cell in 0..<MAX_CELLS |cell, run|:
                 run.board[cell.usize()] <- 0
                 run.premium[cell.usize()] <- 0
@@ -61,28 +116,63 @@ module ScrabbleGame:
                 run.rack[slot.usize()] <- 0
                 run.spent[slot.usize()] <- false
 
-    def build_lexicon(lex: mutable Scrabble::Lexicon&):
-        can Abort.Panic:
-            # A deliberately small source-compatible lexicon. The controller
-            # uses the same source indexing and legality code as the full port.
-            lex.count <- 8
-            words: mutable darray[i64] = [0, 13, 19, 4, 0, 19, 4, 0, 13, 19, 4, 0, 19, 4, 13, 0, 19, 4, 13, 0, 19, 4, 0, 19]
-            lengths: mutable darray[i64] = [3, 3, 3, 3, 3, 3, 3, 3]
-            at: mutable i64 = 0
-            for word in 0..<8 |word, lex, words, lengths, at|:
-                Ints::put(&lex.start, word, at)
-                Ints::put(&lex.length, word, Ints::at_ref(&lengths, word))
-                Ints::put(&lex.rank, word, word + 1)
-                for letter in 0..<3 |letter, lex, words, at, word|:
-                    Ints::put(&lex.letter, at + letter, Ints::at_ref(&words, word * 3 + letter))
-                at <- at + 3
-            Scrabble::index_lexicon(lex)
+    def dispose(run: mutable ScrabbleRun&):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            if run.corpus_pointer != 0:
+                trusted Unsafe.PointerCast:
+                    pointer: heap void& = run.corpus_pointer.uintptr().cast[heap void&]
+                    free(pointer)
+            run.corpus_pointer <- 0
+            run.corpus_length <- 0
 
-    def initialize(run: mutable Run&, rung: i64, trials: i64, seed: i64):
+    def set_lexicon(run: mutable ScrabbleRun&, text: sview) -> i64:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return -6 if run.phase == PHASE_PLAYING
+            length: i64 = sview_len(text).i64()
+            return -3 if length <= 0 or length > 67108864
+            stats: ScrabbleLexicon::ScrabbleIndexStats = ScrabbleLexicon::inspect(text, 1073741824, Scrabble::MOST_SIZE)
+            return -3 if not stats.valid or stats.words == 0 or stats.words > 200000 or stats.letters > 2200000
+            raw: mutable heap void&? = malloc((length + 1).usize())
+            return -4 if raw == null
+            trusted Unsafe.PointerCast:
+                copy: mutable heap void& = raw
+                memcpy(copy, text.data.cast[void&], length.usize())
+                bytes: mutable heap u8& = copy.cast[mutable heap u8&]
+                bytes[length.usize()] <- 0
+                dispose(run)
+                run.corpus_pointer <- copy.uintptr().i64()
+                run.corpus_length <- length
+                run.phase <- PHASE_READY
+                run.rung <- run.start_rung
+                run.trial <- 0
+                run.right <- 0
+                run.total_score <- 0
+                run.total_ceiling <- 0
+                run.total_ms <- 0
+                run.played <- 0
+                run.best_rung <- 0
+                clear(run)
+                return 0
+
+    def initialize(run: mutable ScrabbleRun&, rung: i64, trials: i64, show_premiums: bool, adaptive: bool, seed: i64):
         can Abort.Panic:
             run.rng <- mt19937_new()
             mt_seed_int(&run.rng, seed.u64())
+            run.start_rung <- rung
             run.rung <- rung
+            run.show_premiums <- show_premiums
+            run.adaptive <- adaptive
+            run.corpus_pointer <- 0
+            run.corpus_length <- 0
+            run.ceiling <- 0
+            run.best_n <- 0
+            run.total_score <- 0
+            run.total_ceiling <- 0
+            run.total_ms <- 0
+            run.started_ms <- 0
+            run.clock_pending <- false
+            run.played <- 0
+            run.best_rung <- 0
             run.trials <- trials
             run.trial <- 0
             run.right <- 0
@@ -91,82 +181,310 @@ module ScrabbleGame:
             run.size <- 0
             clear(run)
 
-    def next_trial(run: mutable Run&):
-        can Memory.Allocate, Abort.Panic:
+    def next_trial(run: mutable ScrabbleRun&, now_ms: i64):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
             if run.trial >= run.trials:
                 run.phase <- PHASE_DONE
                 return
             run.trial <- run.trial + 1
             clear(run)
-            region deal(67108864):
+            seed: u64 = py_randbelow(&run.rng, 1073741824.u64())
+            region deal(268435456):
                 in deal:
-                    board: mutable Scrabble::Board = Scrabble::new_board()
-                    Scrabble::blank_board(&board, 7)
-                    run.size <- board.size
-                    for cell in 0..<MAX_CELLS |cell, run, board|:
-                        run.premium[cell.usize()] <- Ints::at_ref(&board.premium, cell)
-                    for slot in 0..<RACK |slot, run|:
-                        run.rack[slot.usize()] <- 97 if slot == 0 or slot == 4 else 101 if slot == 1 or slot == 5 else 110 if slot == 2 else 116 if slot == 3 else 0
+                    text: mutable sview = ScrabbleLexicon::seed_text()
+                    if run.corpus_pointer != 0:
+                        trusted Unsafe.PointerCast:
+                            text <- sview(run.corpus_pointer.uintptr().cast[cstr], 0, run.corpus_length)
+                    grade: Scrabble::ScrabbleGrade = Scrabble::grade_of(run.rung)
+                    stats: mutable ScrabbleLexicon::ScrabbleIndexStats = ScrabbleLexicon::inspect(text, grade.top_rank, grade.size)
+                    if stats.ranked_rows == 0:
+                        text <- ScrabbleLexicon::seed_text()
+                        stats <- ScrabbleLexicon::inspect(text, grade.top_rank, grade.size)
+                    lex: mutable Scrabble::ScrabbleLexiconData = Scrabble::new_lexicon_sized(stats.words, stats.letters)
+                    ScrabbleLexicon::load(text, grade.top_rank, grade.size, &lex)
+                    board: mutable Scrabble::ScrabbleBoard = Scrabble::new_board()
+                    work: mutable Scrabble::ScrabbleWork = Scrabble::new_work()
+                    plays: mutable Scrabble::ScrabblePlays = Scrabble::new_plays()
+                    rack: mutable darray[i64] = Ints::zeros(RACK)
+                    rng: mutable MT19937 = mt19937_new()
+                    mt_seed_int(&rng, seed)
+                    made: Scrabble::ScrabbleSeededDeal = Scrabble::deal_one(&board, &work, &lex, grade, &rng, &rack, &plays)
+                    if made.dealt:
+                        run.size <- board.size
+                        run.ceiling <- Ints::at_ref(&plays.score, made.best)
+                        run.best_word_n <- Ints::at_ref(&plays.word_length, made.best)
+                        word_at: i64 = Ints::at_ref(&plays.word_at, made.best)
+                        for at in 0..<run.best_word_n |run, plays, word_at|:
+                            run.best_word[at.usize()] <- (65 + Ints::at_ref(&plays.word_letter, word_at + at)).u8()
+                        run.started_ms <- now_ms
+                        run.clock_pending <- true
+                        run.best_n <- Ints::at_ref(&plays.laid_n, made.best)
+                        for slot in 0..<run.best_n |run, plays, made|:
+                            run.best_cells[slot.usize()] <- Ints::at_ref(&plays.laid_cell, made.best * RACK + slot)
+                            run.best_letters[slot.usize()] <- 97 + Ints::at_ref(&plays.laid_letter, made.best * RACK + slot)
+                        for cell in 0..<MAX_CELLS |run, board|:
+                            value: i64 = Ints::at_ref(&board.letters, cell)
+                            run.board[cell.usize()] <- value + 97 if value >= 0 else 0
+                            run.premium[cell.usize()] <- Ints::at_ref(&board.premium, cell)
+                        run.rack_n <- made.rack_n
+                        for slot in 0..<made.rack_n |run, rack|:
+                            run.rack[slot.usize()] <- 97 + Ints::at_ref(&rack, slot)
+                        middle: i64 = grade.size / 2
+                        nearest: mutable i64 = grade.size * grade.size * 2
+                        for cell in 0..<(grade.size * grade.size) |run, grade, middle, nearest|:
+                            if run.board[cell.usize()] == 0:
+                                dx: i64 = cell % grade.size - middle
+                                dy: i64 = cell / grade.size - middle
+                                distance: i64 = (0 - dx if dx < 0 else dx) + (0 - dy if dy < 0 else dy)
+                                if distance < nearest:
+                                    nearest <- distance
+                                    run.cursor <- cell
+                        run.phase <- PHASE_PLAYING
+                        run.verdict <- -1
+                    else:
+                        run.phase <- PHASE_DONE
+                        run.message_code <- 5 if made.overflow else 4
                 destroy deal
-            run.verdict <- -1
-            run.phase <- PHASE_PLAYING
 
-    def initialize_play(run: mutable Run&, work: mutable Scrabble::Work&):
-        can Abort.Panic:
-            middle: i64 = run.size / 2
-            Ints::put(&work.laid_cell, 0, middle * run.size + middle - 1)
-            Ints::put(&work.laid_cell, 1, middle * run.size + middle)
-            Ints::put(&work.laid_cell, 2, middle * run.size + middle + 1)
-            Ints::put(&work.laid_letter, 0, 0)
-            Ints::put(&work.laid_letter, 1, 13)
-            Ints::put(&work.laid_letter, 2, 19)
-
-    def apply(run: mutable Run&, action: i64, value: i64, now_ms: i64) -> i64:
-        can Memory.Allocate, Abort.Panic:
-            _ = value
-            _ = now_ms
+    def apply(run: mutable ScrabbleRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            if action == ACTION_START_CLOCK:
+                return 2 if run.phase != PHASE_PLAYING or not run.clock_pending
+                run.started_ms <- now_ms
+                run.clock_pending <- false
+                return 1
+            run.clock_pending <- false
+            if action == ACTION_APPLY_OPTIONS:
+                run.start_rung <- value & 15
+                run.rung <- run.start_rung
+                run.trials <- trial_choice((value >> 4) & 7)
+                run.show_premiums <- (value & 128) != 0
+                run.adaptive <- (value & 256) != 0
+                run.trial <- 0
+                run.right <- 0
+                run.played <- 0
+                run.best_rung <- 0
+                run.total_score <- 0
+                run.total_ceiling <- 0
+                run.total_ms <- 0
+                run.phase <- PHASE_READY
+                clear(run)
+                return 1
             if action == ACTION_START:
                 return 2 if run.phase == PHASE_PLAYING
-                next_trial(run)
+                if run.phase == PHASE_DONE:
+                    run.rung <- run.start_rung
+                    run.trial <- 0
+                    run.right <- 0
+                    run.total_score <- 0
+                    run.total_ceiling <- 0
+                    run.total_ms <- 0
+                    run.played <- 0
+                    run.best_rung <- 0
+                next_trial(run, now_ms)
                 return 1
+            return 2 if run.phase != PHASE_PLAYING
+            row: i64 = run.cursor / run.size
+            col: i64 = run.cursor % run.size
             if action == ACTION_LEFT:
-                run.cursor <- run.cursor - 1 if run.cursor > 0
-                return 1 if run.phase == PHASE_PLAYING else 2
+                if col > 0:
+                    run.cursor <- run.cursor - 1
+                    run.down <- false
+                return 1
             if action == ACTION_RIGHT:
-                run.cursor <- run.cursor + 1 if run.cursor + 1 < run.size * run.size
-                return 1 if run.phase == PHASE_PLAYING else 2
-            if action == ACTION_TOGGLE: return 1 if run.phase == PHASE_PLAYING else 2
-            if action != ACTION_PLAY or run.phase != PHASE_PLAYING: return 2
-            region play(67108864):
+                if col + 1 < run.size:
+                    run.cursor <- run.cursor + 1
+                    run.down <- false
+                return 1
+            if action == ACTION_UP:
+                if row > 0:
+                    run.cursor <- run.cursor - run.size
+                    run.down <- true
+                return 1
+            if action == ACTION_DOWN:
+                if row + 1 < run.size:
+                    run.cursor <- run.cursor + run.size
+                    run.down <- true
+                return 1
+            if action == ACTION_TOGGLE:
+                run.down <- not run.down
+                return 1
+            if action == ACTION_LAY:
+                return 2 if value < 0 or value >= RACK or run.rack[value.usize()] == 0 or run.spent[value.usize()]
+                if run.board[run.cursor.usize()] != 0 or run.laid[run.cursor.usize()] != 0:
+                    run.message_code <- 1
+                    return 1
+                run.laid_cells[run.laid_count.usize()] <- run.cursor
+                run.laid_slots[run.laid_count.usize()] <- value
+                run.laid[run.cursor.usize()] <- run.rack[value.usize()]
+                run.spent[value.usize()] <- true
+                run.laid_count <- run.laid_count + 1
+                if run.down and row + 1 < run.size: run.cursor <- run.cursor + run.size
+                elif not run.down and col + 1 < run.size: run.cursor <- run.cursor + 1
+                return 1
+            if action == ACTION_BACK:
+                if run.laid_count > 0:
+                    run.laid_count <- run.laid_count - 1
+                    cell: i64 = run.laid_cells[run.laid_count.usize()]
+                    slot: i64 = run.laid_slots[run.laid_count.usize()]
+                    run.laid[cell.usize()] <- 0
+                    run.spent[slot.usize()] <- false
+                    run.cursor <- cell
+                return 1
+            return 2 if action != ACTION_PLAY
+            if run.laid_count == 0:
+                run.message_code <- 2
+                return 1
+            region play(268435456):
                 in play:
-                    board: mutable Scrabble::Board = Scrabble::new_board()
-                    work: mutable Scrabble::Work = Scrabble::new_work()
-                    lex: mutable Scrabble::Lexicon = Scrabble::new_lexicon()
-                    words: mutable darray[i64] = Ints::zeros(Scrabble::MOST_SIZE * 2)
+                    text: mutable sview = ScrabbleLexicon::seed_text()
+                    if run.corpus_pointer != 0:
+                        trusted Unsafe.PointerCast:
+                            text <- sview(run.corpus_pointer.uintptr().cast[cstr], 0, run.corpus_length)
+                    grade: Scrabble::ScrabbleGrade = Scrabble::grade_of(run.rung)
+                    stats: mutable ScrabbleLexicon::ScrabbleIndexStats = ScrabbleLexicon::inspect(text, grade.top_rank, grade.size)
+                    if stats.ranked_rows == 0:
+                        text <- ScrabbleLexicon::seed_text()
+                        stats <- ScrabbleLexicon::inspect(text, grade.top_rank, grade.size)
+                    board: mutable Scrabble::ScrabbleBoard = Scrabble::new_board()
+                    work: mutable Scrabble::ScrabbleWork = Scrabble::new_work()
+                    lex: mutable Scrabble::ScrabbleLexiconData = Scrabble::new_lexicon_sized(stats.words, stats.letters)
+                    words: mutable darray[i64] = Ints::zeros(Scrabble::MOST_MADE * Scrabble::MOST_SIZE)
                     starts: mutable darray[i64] = Ints::zeros(Scrabble::MOST_SIZE)
                     lengths: mutable darray[i64] = Ints::zeros(Scrabble::MOST_SIZE)
                     Scrabble::blank_board(&board, run.size)
-                    for cell in 0..<MAX_CELLS |cell, board, run|:
+                    for cell in 0..<MAX_CELLS |board, run|:
                         Ints::put(&board.letters, cell, -1 if run.board[cell.usize()] == 0 else run.board[cell.usize()] - 97)
-                    build_lexicon(&lex)
-                    initialize_play(run, &work)
-                    if Scrabble::legal(&board, &work, 3, false, &lex):
-                        scored: Scrabble::Scored = Scrabble::score_play(&board, &work, 3, false, &starts, &lengths, &words)
+                    for index in 0..<run.laid_count |work, run|:
+                        cell: i64 = run.laid_cells[index.usize()]
+                        Ints::put(&work.laid_cell, index, cell)
+                        Ints::put(&work.laid_letter, index, run.laid[cell.usize()] - 97)
+                    ScrabbleLexicon::load(text, grade.top_rank, grade.size, &lex)
+                    direction: mutable bool = run.down
+                    valid: mutable bool = Scrabble::legal(&board, &work, run.laid_count, direction, &lex)
+                    if not valid:
+                        direction <- not direction
+                        valid <- Scrabble::legal(&board, &work, run.laid_count, direction, &lex)
+                    if valid:
+                        scored: Scrabble::ScrabbleScored = Scrabble::score_play(&board, &work, run.laid_count, direction, &starts, &lengths, &words)
                         run.score <- scored.score
-                        for slot in 0..<3 |slot, run, work|:
-                            cell: i64 = Ints::at_ref(&work.laid_cell, slot)
-                            run.board[cell.usize()] <- Ints::at_ref(&work.laid_letter, slot) + 97
-                            run.laid[cell.usize()] <- run.board[cell.usize()]
-                        run.verdict <- 1
-                        run.right <- run.right + 1
+                        run.total_score <- run.total_score + scored.score
+                        run.total_ceiling <- run.total_ceiling + run.ceiling
+                        run.played <- run.played + 1
+                        run.best_rung <- run.rung if run.rung > run.best_rung
+                        run.total_ms <- run.total_ms + (now_ms - run.started_ms) if now_ms >= run.started_ms
+                        result_text: mutable dstr = []
+                        for word in 0..<scored.words |result_text, starts, lengths, words|:
+                            dstr_append_cstr(&result_text, "/") if word > 0
+                            start: i64 = Ints::at_ref(&starts, word)
+                            length: i64 = Ints::at_ref(&lengths, word)
+                            for digit in 0..<length |result_text, words, start|:
+                                result_text.push((65 + Ints::at_ref(&words, start + digit)).u8())
+                        dstr_append_cstr(&result_text, " for ")
+                        dstr_append_i64(&result_text, scored.score)
+                        dstr_append_cstr(&result_text, "; the best was ")
+                        for digit in 0..<run.best_word_n |result_text, run|:
+                            result_text.push(run.best_word[digit.usize()])
+                        dstr_append_cstr(&result_text, " for ")
+                        dstr_append_i64(&result_text, run.ceiling)
+                        run.score_text_n <- result_text.count.i64()
+                        for digit in 0..<run.score_text_n |result_text, run|:
+                            run.score_text[digit.usize()] <- (get result_text[digit.usize()] else 0.u8()).i64().u8()
+                        share: f64 = scored.score.f64() / run.ceiling.f64() if run.ceiling > 0 else 0.0
+                        won: bool = share >= grade.share
+                        run.verdict <- 1 if won else 0
+                        run.right <- run.right + 1 if won
+                        if run.adaptive:
+                            if won: run.rung <- run.rung + 1 if run.rung < Scrabble::GRADE_COUNT
+                            elif share < grade.share * 0.6: run.rung <- run.rung - 1 if run.rung > 1
+                        run.phase <- PHASE_SCORED
                     else:
-                        run.verdict <- 0
-                    run.phase <- PHASE_SCORED
+                        run.message_code <- 3
                 destroy play
             return 1
-            return 2
 
-    def info(run: Run&, field: i64) -> i64:
+    def cell_at(run: ScrabbleRun&, x: f64, y: f64, width: f64, height: f64) -> i64:
+        can Abort.Panic:
+            return -1 if run.size <= 0
+            board: mutable SceneScrabble::ScrabbleSceneBoard = SceneScrabble::ScrabbleSceneBoard{left: 0.0, bottom: 0.0, side: 0.0}
+            SceneScrabble::board_of(&board, width, height)
+            return -1 if x < board.left or x >= board.left + board.side or y < board.bottom or y >= board.bottom + board.side
+            step: f64 = board.side / run.size.f64()
+            col: i64 = ((x - board.left) / step).i64()
+            row: i64 = run.size - 1 - ((y - board.bottom) / step).i64()
+            return row * run.size + col
+
+    def tile_at(run: ScrabbleRun&, x: f64, y: f64, width: f64, height: f64) -> i64:
+        can Abort.Panic:
+            board: mutable SceneScrabble::ScrabbleSceneBoard = SceneScrabble::ScrabbleSceneBoard{left: 0.0, bottom: 0.0, side: 0.0}
+            SceneScrabble::board_of(&board, width, height)
+            step: f64 = SceneScrabble::rack_step(height)
+            top: f64 = board.bottom - step * 0.3
+            left: f64 = SceneScrabble::rack_left(width, height, run.rack_n)
+            return -1 if y < top - step or y >= top
+            for slot in 0..<run.rack_n |run, x, left, step|:
+                x0: f64 = left + slot.f64() * step
+                return slot if not run.spent[slot.usize()] and x >= x0 and x < x0 + step * 0.9
+            return -1
+
+    def over_play(run: ScrabbleRun&, x: f64, y: f64, width: f64, height: f64) -> bool:
+        can Abort.Panic:
+            board: mutable SceneScrabble::ScrabbleSceneBoard = SceneScrabble::ScrabbleSceneBoard{left: 0.0, bottom: 0.0, side: 0.0}
+            SceneScrabble::board_of(&board, width, height)
+            step: f64 = SceneScrabble::rack_step(height)
+            top: f64 = board.bottom - step * 0.3
+            wide: f64 = step * 2.6
+            wanted: f64 = SceneScrabble::rack_left(width, height, run.rack_n) + SceneScrabble::strip_width(height, run.rack_n) + step * 0.5
+            edge: f64 = width - wide - step * 0.2
+            left: f64 = wanted if wanted < edge else edge
+            return x >= left and x < left + wide and y >= top - step and y < top
+
+    def pointer(run: mutable ScrabbleRun&, x: i64, y: i64, width: i64, height: i64,
+                button: i64, is_motion: bool, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 2 if x < 0 or x > 1000000 or y < 0 or y > 1000000 or width <= 0 or height <= 0
+            px: f64 = x.f64() * width.f64() / 1000000.0
+            py: f64 = y.f64() * height.f64() / 1000000.0
+            if is_motion:
+                if run.phase == PHASE_PLAYING:
+                    run.hovered <- cell_at(run, px, py, width.f64(), height.f64())
+                    run.hovered_tile <- tile_at(run, px, py, width.f64(), height.f64())
+                    run.hovered_play <- over_play(run, px, py, width.f64(), height.f64())
+                else:
+                    run.hovered <- -1
+                    run.hovered_tile <- -1
+                    run.hovered_play <- false
+                return 1
+            return apply(run, ACTION_TOGGLE, 0, now_ms) if button == 2
+            return 2 if button != 0
+            return apply(run, ACTION_START, 0, now_ms) if run.phase != PHASE_PLAYING
+            if over_play(run, px, py, width.f64(), height.f64()):
+                return apply(run, ACTION_PLAY, 0, now_ms)
+            tile: i64 = tile_at(run, px, py, width.f64(), height.f64())
+            return apply(run, ACTION_LAY, tile, now_ms) if tile >= 0
+            cell: i64 = cell_at(run, px, py, width.f64(), height.f64())
+            return 2 if cell < 0
+            if run.laid[cell.usize()] != 0:
+                found: mutable i64 = -1
+                for index in 0..<run.laid_count |run, cell, found|:
+                    found <- index if run.laid_cells[index.usize()] == cell
+                if found >= 0:
+                    run.spent[run.laid_slots[found.usize()].usize()] <- false
+                    run.laid[cell.usize()] <- 0
+                    for index in found..<(run.laid_count - 1) |run|:
+                        run.laid_cells[index.usize()] <- run.laid_cells[(index + 1).usize()]
+                        run.laid_slots[index.usize()] <- run.laid_slots[(index + 1).usize()]
+                    run.laid_count <- run.laid_count - 1
+                    run.cursor <- cell
+                return 1
+            if run.board[cell.usize()] != 0:
+                run.message_code <- 1
+                return 1
+            return apply(run, ACTION_TOGGLE, 0, now_ms) if cell == run.cursor
+            run.cursor <- cell
+            return 1
+
+    def info(run: ScrabbleRun&, field: i64) -> i64:
         if field == INFO_PHASE: return run.phase
         if field == INFO_RUNG: return run.rung
         if field == INFO_TRIAL: return run.trial
@@ -176,41 +494,88 @@ module ScrabbleGame:
         if field == INFO_CURSOR: return run.cursor
         if field == INFO_VERDICT: return run.verdict
         if field == INFO_RIGHT: return run.right
+        if field == 9: return run.ceiling
+        if field == 10: return run.best_n
+        if field == 11: return 1 if run.corpus_pointer != 0 else 0
+        if field == 12: return run.total_score
+        if field == 13: return run.total_ceiling
+        if field == 14: return run.played
+        if field == 15: return run.best_rung
+        if field == 16: return run.total_ms / 1000
+        if field == 17: return 1 if run.show_premiums else 0
+        if field == 18: return 1 if run.adaptive else 0
         return -1
 
-    def value(run: Run&, field: i64, at: i64) -> i64:
+    def value(run: ScrabbleRun&, field: i64, at: i64) -> i64:
         return -1 if at < 0 or at >= MAX_CELLS
         if field == VALUE_BOARD: return run.board[at.usize()]
         if field == VALUE_PREMIUM: return run.premium[at.usize()]
         if field == VALUE_RACK: return run.rack[at.usize()] if at < RACK else -1
+        if field == 3: return run.laid[at.usize()]
+        if field == 4: return 1 if at < RACK and run.spent[at.usize()] else 0
+        if field == 5: return run.best_cells[at.usize()] if at < run.best_n else -1
+        if field == 6: return run.best_letters[at.usize()] if at < run.best_n else -1
         return -1
 
-    def render(run: Run&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
+    def grade_name(rung: i64) -> sview:
+        return sview("a first word", 0, -1) if rung == 1
+        return sview("room to place", 0, -1) if rung == 2
+        return sview("a fuller rack", 0, -1) if rung == 3
+        return sview("common words", 0, -1) if rung == 4
+        return sview("a busier board", 0, -1) if rung == 5
+        return sview("familiar words", 0, -1) if rung == 6
+        return sview("the crowded middle", 0, -1) if rung == 7
+        return sview("bookish", 0, -1) if rung == 8
+        return sview("the whole list", 0, -1) if rung == 9
+        return sview("nothing but best", 0, -1)
+
+    def render(run: ScrabbleRun&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
         can Memory.Allocate, Abort.Panic:
             region frame(67108864):
                 in frame:
                     premiums: mutable darray[i64] = Ints::zeros(MAX_CELLS)
                     letters: mutable darray[i64] = Ints::zeros(MAX_CELLS)
                     laid: mutable darray[i64] = Ints::zeros(MAX_CELLS)
-                    rack: mutable darray[i64] = Ints::zeros(RACK)
+                    rack: mutable darray[i64] = Ints::zeros(run.rack_n)
                     spent: mutable darray[bool] = []
                     for cell in 0..<MAX_CELLS |cell, premiums, letters, laid, run|:
                         Ints::put(&premiums, cell, run.premium[cell.usize()])
                         Ints::put(&letters, cell, run.board[cell.usize()])
                         Ints::put(&laid, cell, run.laid[cell.usize()])
-                    for slot in 0..<RACK |slot, rack, run|:
-                        rack.push(run.rack[slot.usize()])
-                    for slot in 0..<RACK |slot, spent, run|:
+                    for slot in 0..<run.rack_n |slot, rack, run|:
+                        Ints::put(&rack, slot, run.rack[slot.usize()])
+                    for slot in 0..<run.rack_n |slot, spent, run|:
                         spent.push(run.spent[slot.usize()])
                     message: mutable dstr = []
-                    if run.phase == PHASE_READY: dstr_append_cstr(&message, "Press Space to start")
-                    elif run.phase == PHASE_PLAYING: dstr_append_cstr(&message, "Lay the source play")
-                    elif run.verdict == 1: dstr_append_cstr(&message, "Scored")
-                    else: dstr_append_cstr(&message, "No legal play")
+                    if run.message_code == 4: dstr_append_cstr(&message, "No position could be dealt at this level")
+                    elif run.message_code == 5: dstr_append_cstr(&message, "Position search exceeded capacity")
+                    elif run.phase == PHASE_READY: dstr_append_cstr(&message, "Press Space to start")
+                    elif run.phase == PHASE_PLAYING and run.message_code == 1: dstr_append_cstr(&message, "That square is taken")
+                    elif run.phase == PHASE_PLAYING and run.message_code == 2: dstr_append_cstr(&message, "Nothing laid yet")
+                    elif run.phase == PHASE_PLAYING and run.message_code == 3: dstr_append_cstr(&message, "That is not a legal play")
+                    elif run.phase == PHASE_PLAYING:
+                        dstr_append_sview(&message, grade_name(run.rung))
+                        dstr_append_cstr(&message, " ")
+                        dstr_append_em_dash(&message)
+                        dstr_append_cstr(&message, " your rack is ")
+                        for slot in 0..<run.rack_n |message, run|:
+                            message.push((run.rack[slot.usize()] - 32).u8())
+                    elif run.phase == PHASE_DONE:
+                        dstr_append_i64(&message, run.played)
+                        dstr_append_cstr(&message, " played, ")
+                        dstr_append_i64(&message, run.total_score)
+                        dstr_append_cstr(&message, " points of a possible ")
+                        dstr_append_i64(&message, run.total_ceiling)
+                    else:
+                        for digit in 0..<run.score_text_n |message, run|:
+                            message.push(run.score_text[digit.usize()])
+                    verdict_text: mutable dstr = []
+                    for digit in 0..<run.score_text_n |verdict_text, run|:
+                        verdict_text.push(run.score_text[digit.usize()])
                     sx: f64 = width / Display::REFERENCE_WIDTH
                     sy: f64 = height / Display::REFERENCE_HEIGHT
-                    paint: SceneScrabble::Paint = SceneScrabble::paint_of(black, width, height, sx, sy)
+                    paint: SceneScrabble::ScrabblePaint = SceneScrabble::paint_of(black, width, height, sx, sy)
                     SceneScrabble::render(list, &paint, run.phase, run.size > 0, run.size,
-                        premiums, letters, laid, rack, spent, true, run.cursor, -1, -1, false,
-                        false, run.trial, run.trials, bytes_view(message), run.verdict, sview("", 0, -1))
+                        premiums, letters, laid, rack, spent, run.show_premiums, run.cursor, run.hovered, run.hovered_tile, run.down,
+                        run.hovered_play, run.trial, run.trials, bytes_view(message), run.verdict, bytes_view(verdict_text))
                 destroy frame

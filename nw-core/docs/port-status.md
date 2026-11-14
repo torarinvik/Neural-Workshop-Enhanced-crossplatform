@@ -1,6 +1,90 @@
 # Neural Workshop port status snapshot
 
-## Current deployed artifact state — 2026-10-07
+## Fresh Stage1 application and host artifacts — 2026-11-09
+
+The source-fresh selected Elisa Stage1 product is
+`main@d3b2e657d57c159c77b9523542f21fd67a93b916`, fingerprint
+`9de69658a554a61ac1679e3cd52398ea73800adf700fb0c51d7a636324dceef9`, product
+SHA-256 `eaa65de1651631e703365e46a39ede6f1bcee123c3653755c368c59f51725f0f`.
+The fresh-cache Stage1 application build and complete WASM artifact suite
+passed in 4m26.887s with compiler object and incremental caches empty at start;
+no Stage0 or Stage1 compiler product was rebuilt. The application compile
+required current-runtime string-view adapters, narrow `Global.Read` effect
+grants, and renaming the Nina Row fixed-array field from `cells` to `board`.
+The promoted `build/nwcore.wasm` is 1,626,675 bytes, SHA-256
+`27748bd91f6327014d76d432909b2ea38d8df00a980a3981ecc5527dcd7a1889`; its
+Stage1 object SHA-256 is
+`b84e428937b7eda43127bb3a01d911f488db2920913d4b81e447a0bbb419f097`.
+
+The fresh Python 3.13 extension is linked against the selected Stage1 runtime
+object, passes the Marble lifecycle smoke, Sudoku host-options/key contract,
+and direct Sudoku settings/start/frame/pencil/cleanup smoke. Extension SHA-256:
+`6588a98122c4e4569382575bd8941c2ad23c6f90920b4b33a6c784529ed388d2`. The
+SDL3 application was rebuilt from the same Stage1 source/runtime pair; its
+native export object SHA-256 is
+`8737ad9b8086b8b993e20b513317427cb4ab71c1e09e4d7bfe36a7e9f0ec3da8` and
+executable SHA-256 is
+`f223fb89135914a0d743620bee37f11559a25b41f650258aa925ddcba0711c73`. Its
+full headless self-test matrix passes, including Sudoku, Jigsaw, task options,
+and every previously registered native controller. The real-browser Sudoku
+focus check dispatched synthetic blur/hidden/visible/focus events and verified
+state preservation. A headed Chrome tab-strip switch away/back also preserved
+the full Sudoku public state, and ArrowRight worked after restoration; however,
+the automation-launched Chrome kept `document.visibilityState` visible and
+emitted no blur/focus/visibilitychange events. Browser lifecycle-event
+propagation remains open in this harness. Actual DIV2K photographic comparison
+also remains open.
+
+## Current browser-shell update — 2026-11-09
+
+Jigsaw now has a browser options screen for the five source settings. It
+validates and persists 3, 3, adaptive, preview-on, mark-placed-off defaults;
+`C` opens it from the task hub or a READY/DONE task, Escape discards the draft,
+and Enter recreates a task controller with the accepted values. The common-v1
+options pass `mark_placed` through to the scene. Python's native route has
+matching Jigsaw-specific CLI flags; the SDL export and self-test accept and
+report the same setting. The options screen imports a DIV2K directory into
+IndexedDB, preserves unseen-photo rotation across reloads, and can clear the
+stored copies. The browser crops the selected source image into its original
+tile regions and displays the centered-square preview; controller state still
+owns the permutation and score. The browser contract and inline JavaScript
+syntax check pass. A headed replay imported two generated local photo fixtures,
+showed their tile crops and centered preview, confirmed unseen-photo rotation
+after reload, displayed the small-library repeat warning, and cleared the
+library after leaving the active run. An instrumented `ImageBitmap.close()`
+counter reached one on exit; colored tiles remained as the fallback after the
+library was cleared. The browser console had no errors or warnings. Captures:
+`output/playwright/jigsaw-photo-import-synthetic.png`,
+`output/playwright/jigsaw-photo-reload-rotation.png`,
+`output/playwright/jigsaw-photo-clear.png`, and
+`output/playwright/jigsaw-photo-fallback.png`. The promoted 2026-11-09
+source-fresh Stage1 WASM artifact and fresh Python/SDL products verify the
+updated Elisa exports and `mark_placed` ABI. Comparison with actual DIV2K
+photographs remains open.
+
+Count's browser shell now exposes the original six options from the real task
+menu and during READY/DONE. Values are validated, saved under
+`neural-workshop.count.options.v1`, and applied to a fresh Count controller;
+Escape cancels a draft. The selected exposure duration drives the browser
+deadline. A headed deterministic replay verified reload persistence, cancel,
+READY-screen access, the 20-trial Mixed/12-shape controller configuration, and
+automatic HIDDEN transition at 1000 ms; capture:
+`output/playwright/count-options-persistence-seed17.png`. The default seed-17
+run then completed all 15 trials with 100%, 15/15, average error 0.0, matching
+the source score calculation. Active and final frames are captured at
+`output/playwright/count-trial1-seed17.png` and
+`output/playwright/count-multitrial-seed17.png`. The browser now requests Count
+frames in 912×684 reference space before canvas scaling, keeping its text and
+generated shapes inside the viewport. Focused controller coverage includes
+invalid and negative text, zero/wrong, multi-digit correct input, timed hide,
+dense rendering, and completion/replay. Existing source differentials and
+Python/SDL adapters are covered in the Count task record; shared section 18.1
+cross-shell acceptance remains part of the broader port backlog. The final
+promoted-WASM artifact suite passed with the Count smoke and browser contract
+included. Detailed results and screenshot hashes are in
+`output/verification/count-browser-options-run-20261109/`.
+
+## Superseded deployed artifact state — 2026-10-07
 
 - Production browser `build/nwcore.wasm` was rebuilt and promoted from
   Elisa-compiler Stage1 commit `23a0e16a854cddec3016746a0cb9480db0c4db22`.
@@ -818,7 +902,9 @@ the common ABI has no seventh slot. `C` opens options from the hub or only at
 the source controller's ready/done boundary; active-trial `C` is consumed
 without interrupting the run. The legacy darray-backed source sweep adapter is
 kept test-only so the latest compiler's linear-handle ownership checks remain
-active in production. Cross-rasterizer screenshots remain open.
+active in production. Cross-rasterizer screenshot work is closed by the
+2026-11-09 visual review below; pixel acceptance thresholds remain diagnostic
+and are not claimed.
 
 **Graph Mapping controller differential (2026-09-19):**
 `test/graphmapping_controller_diff.py` passes 864 source/controller cases over
@@ -827,11 +913,27 @@ and deterministic seeds. It compares the balanced deck, generated edges, ring
 coordinates, pair truth, timing boundaries, score counters, duplicate answers,
 and adaptation. It found and fixed a controller-only parity bug: the answer
 deck was shuffled forward instead of using Python's descending Fisher–Yates
-order. The remaining Graph Mapping backlog is cross-rasterizer/reference
-screenshots, not the source/controller state contract or browser options
-lifecycle.
+order. The remaining visual review is recorded below; this controller
+differential and the browser options lifecycle remain separate evidence.
 
-**Current Crossed Wires checkpoint (2026-09-18):** the newest WASM build now
+**Graph Mapping compact-canvas scaling and cross-rasterizer review
+(2026-11-09):** `graphMappingFrame()` now renders from the original 640×480
+minimum layout when the web shell leaves a smaller canvas, using
+`devicePixelRatio` to keep backing-store dimensions in source pixels. This
+prevents the native fixed button-height floor from dominating a compact
+browser layout. The source and browser were captured with the same production
+WASM frame (seed 17, 16 nodes, dense, 29 edges per graph) in light and dark at
+912×684; a compact 912×480 page capture also checked the scaled 640×480
+source-minimum frame in a 495×371 canvas. Both themes reached at least 90.8%
+exact pixels at compact size and 94.7% at reference size; RGB MAE ranges from
+2.69 to 7.24. These measurements are diagnostic only and do not define a
+pixel-acceptance policy. Courier New with rounded per-glyph advances, theme
+colors, edge widths, node sizes, divider, buttons, and graph placement were
+reviewed. A real compact-canvas button click advanced to trial 2. Captures,
+metadata, fixture, and metrics are in
+`output/verification/graphmapping-visual-review-20261109/`.
+
+**Current Crossed Wires checkpoint (2026-11-10):** the newest WASM build
 contains a fixed-storage common-v1 controller in
 `src/tasks/crossedwires_game.elisa`, wired to the source kernel and
 `SceneCrossedWires`. It preserves the source's private wiring, seed stream,
@@ -843,10 +945,111 @@ and disposes the handle when the task is replaced. `test/crossedwires_diff.py`
 continues to pass the kernel's whole-bout and player-policy matrix; the new
 `crossedwires_game_smoke.mjs` and
 `crossedwires_browser_contract_test.mjs` pass against the production artifact.
-Native Python and SDL hosts, the source options panel, and headed menu replay
-remain open fidelity work and are not claimed by this checkpoint.
+The browser has a persisted four-setting options screen. Headed checks covered
+defaults, cancel during a round, applying a new configuration, reload
+persistence, and the complete five-round menu replay. Captures include
+`output/playwright/crossed-wires-headed-complete.png` and
+`output/playwright/crossed-wires-options-persisted.png`; the options check had
+no console warnings or errors. Python and SDL expose the controller and accept
+the four settings through validated startup flags; their settings dialog is not
+interactive. Python host checks and SDL self-tests pass. The original UI and
+`CrossedWiresEnv` replay agrees with WASM across 159 actions, including score,
+adaptive climb/stay/drop, and the 800 ms verdict boundary. The latest Stage1
+kernel and scene sweeps match 1,546 cases and 36 frames / 1,019 commands. The
+full WASM artifact gate passed with SHA-256
+`3104d69489df3422264cd8712cc8cd35e8c1590ac14f6ea4389de525429d9e58`.
+Real browser focus and visibility transitions remain unverified.
 
-**Current Sudoku checkpoint (2026-09-18):** the newest WASM build now includes
+**Current Scramble checkpoint (2026-11-10):** the browser controller now
+uses the original 70 offline seed sentences and 746-word vocabulary instead of
+the synthetic fixture. A source oracle matches generated lines for all twelve
+levels, and WASM tests cover normalized exact answers and wrong-answer feedback.
+The full WASM gate passed with SHA-256
+`9012572036bed40159ac14b46b0aed87c1726167f1808e2346a8a4a526bc8d8c`.
+Browser input supports paste and composition commits; event-order tests and a
+headed clipboard/simulated-composition check passed. The browser now persists
+the four source options, and lifecycle tests cover empty answers, adaptive
+climb/drop, and restart. A headed source-backed one-line run completed with one
+correct answer (`output/playwright/scramble-source-complete.png`). Python and
+SDL now offer menu/direct routes, text input, pointer start, startup flags, and
+interactive options with shared persistent settings. The Python source-deal
+and menu tests, SDL controller self-test, and cross-host settings tests pass.
+Both native hosts accept the paste shortcut, with multiline normalization
+covered programmatically. A standalone native window launched but could not
+be bound by computer use, so headed native input remains unverified.
+All three hosts synchronize the trial clock after generation; a lifecycle
+regression verifies accumulated whole-second results and restart.
+The controller uses the downloaded ranked index and sentence bank independently
+when available, falling back to seed data for either missing file. Installed
+data and mixed-source deals match the original at levels 1, 3 and 12; native
+hosts load installed or explicit files, and headed browser checks covered full
+and single-file import, start, reload and removal
+(`output/playwright/scramble-downloaded-corpus.png`). Headed native input and
+physical IME behavior remain open.
+
+**Current Scrabble checkpoint (2026-11-10):** the browser now imports the
+shared word index and generates an occupied board, rack and best play through
+the source kernel. Cursor movement, rack placement, undo, legal submission,
+best-share verdict and adaptive level changes run in the controller. A real
+index test matches the original seeded board, rack, best move and score, and a
+headed menu/import/start check captured `output/playwright/scrabble-real-deal.png`
+without console errors. Browser imports now validate each game's requirements
+independently: Scrabble accepts an index without clues, while Crossword still
+requires clues. A WASM-backed import test covers replacement and restoration.
+Mouse selection, rack placement, arbitrary tile lifting, turning, Play and
+hover are wired and tested; headed evidence is in
+`output/playwright/scrabble-real-pointer.png` and
+`output/playwright/scrabble-real-pointer-lift.png`. The original 669-word offline seed pool is now used when appropriate; a
+source differential and `output/playwright/scrabble-offline-seed.png` cover
+its default-level start. Browser settings now cover level, board count, premiums and adaptive mode;
+defaults, cancel, apply and reload persistence were checked in a headed session
+(`output/playwright/scrabble-options-defaults.png`). Python and SDL now expose
+menu and direct routes, keyboard and pointer input, offline seed and optional
+index loading. Both native hosts offer task-menu and in-game options with
+cancel/apply and shared persistent settings. Python host and SDL self-tests,
+cross-host persistence, invalid-data fallback, and CLI precedence pass. The
+latest full WASM gate passed with SHA-256
+`f28531fe56106a15ed663cb3ffd0f45cddd251f4d95d7092bae112107f713e35`.
+Source score messages,
+run totals and elapsed-time accumulation are tested, including a legal lower
+score and adaptive drop. Browser, Python and SDL synchronize the clock after
+deal generation; the WASM test excludes a simulated generation delay. Exhaustive
+search storage grows beyond the former 4,096-play limit; a permutation lexicon
+produces at least 5,040 plays in a Stage1 regression, and the installed-index
+differential remains green.
+The common WASM keyboard protocol now supports directions, Tab, undo, and rack
+keys 1–7; its source-backed best-play replay uses key events through submission.
+Another source-generated replay covers all four edges, disconnected and
+source-invalid connected words, undo and repeated rack letters; TOO scores 4
+with the original feedback. It passes with both the offline seed and the
+installed index in the surrounding smoke suite.
+A headed run from the Reasoning menu used the offline seed at level 1 and one
+board, matched the original CAT/GLST deal and SALT score of 8, completed the
+run, and returned to the menu with no console warnings or errors. Captures:
+`output/playwright/scrabble-menu-source-playing.png`,
+`output/playwright/scrabble-menu-source-scored.png`, and
+`output/playwright/scrabble-menu-source-complete.png`.
+
+**Current Crossword checkpoint (2026-11-10):** the browser, Python, and SDL
+controllers load a clued source index, stably sorting unsorted entries by rank; the browser persists an
+imported index and exposes all four source settings, while Python and SDL offer
+startup flags and a local index path. SDL supports menu and direct routes,
+keyboard and pointer input, and passes its generated-grid controller self-test. The Stage1 kernel differential matches
+218 cases, and real-index counts and seeded level 1/2 grids match the original.
+Original UI/environment replays cover one-slip and five-slip runs with both a
+test index and the installed index. The full WASM gate passed with SHA-256
+`3104d69489df3422264cd8712cc8cd35e8c1590ac14f6ea4389de525429d9e58`.
+Python and SDL provide interactive options with cancel/apply and shared
+persistent settings. Cross-host restart, invalid-data fallback, and CLI
+precedence are tested. A headed menu run with the installed index solved a
+level-2 grid and reached DONE with one slip; screenshots are
+`output/playwright/crossword-real-solved.png` and
+`output/playwright/crossword-real-complete.png`. Injected blur and visibility events preserved the active grid; Escape and reopen
+returned to a fresh ready run with the index retained. Automated tab switching
+did not generate real focus or visibility events, so those checks remain open.
+
+**Current Sudoku checkpoint (2026-09-18; host update 2026-11-09):** the last
+promoted WASM build includes
 `src/tasks/sudoku_game.elisa`, the source-backed `Sudoku` generator/rater, and
 `SceneSudoku` through common-v1 task ID `4211466488`. The controller copies
 source givens and the unique solution into fixed storage, keeps clues
@@ -858,15 +1061,33 @@ boundary the source's default rung budget retained every abandoned candidate
 grid and the browser artifact failed with a linear-memory access error before
 the first puzzle appeared. The browser route uses the source defaults (rung 3,
 three trials, visible clashes, adaptive scoring), renders the real scene, and
-disposes the run on task/category changes and task exit. `test/sudoku_diff.py`
-and `test/scene_sudoku_diff.py` remain the source kernel/scene parity oracles;
-the production artifact now also passes
-`test/sudoku_game_smoke.mjs` and
-`test/sudoku_browser_contract_test.mjs`, covering seeded replay, immutable
-givens, pencil/erase behavior, a real complete solve, verdict preservation,
-rendering, browser input, and cleanup. Python/native and SDL3 adapters, the
-source options panel, headed menu replay, and controller-level original UI
-differential traces remain open and are not claimed here.
+disposes the run on task/category changes and task exit. The browser now has a
+persisted four-setting options screen available from the task menu and the
+task screen; a headed replay confirmed defaults, apply/cancel, an unchanged
+active board after cancelling from O, reload persistence, and task exit. Its
+captures are `output/playwright/sudoku-options-defaults.png`,
+`sudoku-options-level1-grid.png`, and `sudoku-options-persisted.png`.
+`test/sudoku_diff.py` and `test/scene_sudoku_diff.py` remain the source
+kernel/scene parity oracles. `test/sudoku_original_replay_test.mjs` now compares
+the common-v1 controller against the original UI and exact `SudokuEnv.drive`
+mapping across 186 actions, including the conflicting-cell set and wrong
+full-grid checkpoint; it is registered in the WASM artifact suite. Python's
+route accepts level, puzzle-count, clash, and adaptive CLI settings and maps
+source digits/erase/N-pencil keys. SDL accepts the same Sudoku settings plus
+all five Jigsaw settings and tests its option parser in the native build
+self-test. The Python 3.13 extension was rebuilt against the selected Stage1 runtime
+object and passes the Marble lifecycle smoke, Sudoku host-options/key contract,
+and a direct Sudoku controller/frame/pencil/cleanup smoke. SDL was rebuilt
+from the same current Stage1 source/runtime pair; the complete headless native
+self-test matrix passes, including Sudoku, Jigsaw, and task-option parsing.
+The full latest-Stage1 WASM artifact suite passed before promotion. No Stage0 or
+Stage1 compiler product was rebuilt. A headed browser replay dispatched synthetic blur/hidden/visible/focus events
+and confirmed the controller state was preserved. A native Chrome tab-strip
+switch away/back preserved the complete public Sudoku state, and ArrowRight
+worked after restoration. The automation-launched Chrome kept
+`document.visibilityState` visible and emitted no blur/focus/visibilitychange
+events, so browser lifecycle-event propagation remains open in this harness;
+see `output/verification/sudoku-focus-check-20261109/`.
 
 **Current Matrix Reasoning checkpoint (2026-09-18):** the newest WASM build
 now includes the source-backed `MatrixReasoningGame` controller in
@@ -6728,3 +6949,47 @@ diagnostic pairs, zero synchronization failures, and `accepted:false`; receipt
 `9c2bff894111cb9fd7943244dadcdfaed47270f4326f59a995b84e006b2a3e58`).
 Current-phase/lifecycle coverage, reviewed pixel policy, compiler-driver
 triage, and shipping-build qualification remain open.
+
+## Find the Winning Move (Go) — 2026-11-10
+
+Completed the GAME-027 source-backed controller and shell integration for
+stable task ID `2946453024`. The common-v1 controller owns READY, SOLVING,
+JUDGED, and DONE, seeded source problem generation, score, verdict, captures,
+board state, keyboard cursor, and pointer hit testing. It accepts levels 1–10
+and source trial choices `{1, 3, 5, 8, 10, 15, 20, 30, 50}` (defaults 1 and 10).
+The browser validates and persists these settings at
+`neural-workshop.go.options.v1`; Python and SDL accept the same level/trial
+values at startup. A headed run through the real Games menu completed all ten
+default positions with 10/10 correct, exited with Escape, and reopened cleanly
+in READY. Capture: `output/playwright/go-headed-complete.png`; the browser
+reported zero console errors or warnings.
+
+Live interaction caught a missing browser route: the Go controller's pointer
+mapper was implemented and covered at the ABI level, but the canvas listener
+did not forward Go pointer-down events. The listener now dispatches them through
+common-v1, so clicks on the visible winning point score correctly.
+`scripts/build_latest_stage1_wasm.sh` promoted the resulting 1,629,226-byte artifact
+(SHA-256 `a99f7d098a76f495b94505873a283c7f6cdcdab25c279c5c04e996228069b30d`;
+linked object SHA-256 `c7761d5729d0e66493a6587c1b66f1c497b9c7ef8cd3986b376ab6f9f4bc9837`).
+Stage1 provenance is commit `d3b2e657d57c159c77b9523542f21fd67a93b916`, source
+fingerprint `9de69658a554a61ac1679e3cd52398ea73800adf700fb0c51d7a636324dceef9`,
+and product SHA-256 `eaa65de1651631e703365e46a39ede6f1bcee123c3653755c368c59f51725f0f`.
+The complete artifact suite passed; no Stage0 or Stage1 compiler product was
+rebuilt.
+
+Focused evidence includes `go_game_smoke.mjs` (options, phase keys, captures,
+occupied feedback, pointer rounding/orientation/tolerance, rendering, cleanup),
+`go_browser_contract_test.mjs` (route, persistence, options, lifecycle,
+pointer, render, cleanup), `go_original_replay_test.mjs` (11 original UI and
+environment actions with full board/target/feedback/score comparison),
+`go_rules_diff.py` (edge/corner captures, occupied points, suicide, ko, and
+stateless recapture), source/controller sweeps (120 generated problems and six
+rule fixtures), and `scene_go` (20 frames / 1,721 identical commands). Python
+Go host-options smoke and SDL Go/task-options self-tests also pass.
+
+The task-specific rendering and disposal paths are covered, and Escape followed
+by reopen was confirmed in the headed browser. Actual browser tab
+blur/focus/visibility lifecycle events remain unverified: automation-launched
+Chrome did not emit those events during the existing focus check. Keep this
+shell lifecycle item open pending a browser run that produces real focus and
+visibility transitions.

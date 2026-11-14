@@ -18,11 +18,15 @@ const TASK = BigInt(exports.nw_api_v1_task_crossed_wires());
 const STATUS = Object.freeze({ accepted: 1n, ignored: 2n });
 const EVENT = Object.freeze({ action: 1n, keyDown: 2n });
 const KEY = Object.freeze({ space: 1n, one: 12n });
-const ACTION = Object.freeze({ start: 0n, press: 1n, restart: 2n });
+const ACTION = Object.freeze({ start: 0n, press: 1n, restart: 2n, applyOptions: 3n });
 const PHASE = Object.freeze({ ready: 0n, playing: 1n, scored: 2n, done: 3n });
 const INFO = Object.freeze({
   phase: 0, rung: 1, trial: 2, totalTrials: 3, keys: 4, atX: 5,
   atY: 6, goalX: 7, goalY: 8, goalAt: 9, goals: 10, pressesLeft: 11,
+});
+const GAME_INFO = Object.freeze({
+  reachedTotal: 22, targetTotal: 23, accuracy: 24, bestRung: 25,
+  perfectRounds: 26,
 });
 const STATE_BYTES = 112;
 const FRAME_BYTES = 1048576;
@@ -63,6 +67,10 @@ function state(handle) {
     view.getBigInt64(16 + index * 8, true));
 }
 
+function gameInfo(handle, field) {
+  return exports.nw_api_v1_crossed_wires_info(handle, BigInt(field));
+}
+
 function frame(handle) {
   const length = exports.nw_api_v1_render(handle, BigInt(FRAME_BUFFER),
     BigInt(FRAME_BYTES), 0n, 912n, 684n);
@@ -96,6 +104,9 @@ const replay = create();
 assert.ok(run > 0n && replay > 0n);
 assert.deepEqual(state(run), [0n, 3n, 0n, 5n, 0n, 0n, 0n, 0n, 0n,
   0n, 0n, 0n]);
+for (const field of Object.values(GAME_INFO)) assert.equal(gameInfo(run, field), 0n);
+assert.equal(gameInfo(run, 27), -1n,
+  "the task-specific info endpoint must not expose private run fields");
 const readyFrame = frame(run);
 assert.deepEqual(frame(run), readyFrame, "ready rendering is observational");
 assert.ok(hasText(readyFrame, "Crossed Wires"));
@@ -145,9 +156,31 @@ values = state(run);
 assert.equal(values[INFO.phase], PHASE.scored);
 assert.ok(values[INFO.goalAt] <= values[INFO.goals]);
 const scoredFrame = frame(run);
-assert.ok(hasText(scoredFrame, "out of presses") || hasText(scoredFrame, "— right"));
+assert.ok(hasText(scoredFrame, "out of presses") || hasText(scoredFrame, "All "));
 
-// The one-round form reaches DONE on the next START/Space transition.
+// Changing settings resets the run but retains the original random stream.
+// Match that stream against a reference run that consumes one deal and then
+// restarts under the requested settings.
+const changed = create([3n, 5n, 1n, 1n, 0n, 0n], 31n);
+const reference = create([4n, 5n, 0n, 0n, 0n, 0n], 31n);
+assert.equal(action(changed, ACTION.start, 10, 0), STATUS.accepted);
+const optionPayload = 4n | (3n << 4n) | (0n << 8n) | (0n << 9n);
+assert.equal(action(changed, ACTION.applyOptions, 11, 1, optionPayload), STATUS.accepted);
+assert.deepEqual(state(changed).slice(0, 4), [PHASE.ready, 4n, 0n, 5n]);
+assert.equal(gameInfo(changed, 20), 0n, "adaptive setting must apply");
+assert.equal(gameInfo(changed, 21), 0n, "grid setting must apply");
+assert.equal(action(changed, ACTION.start, 12, 2), STATUS.accepted);
+assert.equal(action(reference, ACTION.start, 10, 0), STATUS.accepted);
+assert.equal(action(reference, ACTION.restart, 11, 1), STATUS.accepted);
+assert.deepEqual(state(changed), state(reference),
+  "options reset must keep the seeded deal stream intact");
+const invalidOptionState = state(changed);
+assert.ok(action(changed, ACTION.applyOptions, 13, 3, 4n | (8n << 4n)) < 0n,
+  "an unknown round choice must fail ABI payload validation");
+assert.deepEqual(state(changed), invalidOptionState,
+  "invalid options must not mutate the controller");
+
+// The one-round form reaches DONE only after the source's 800 ms scored pause.
 const short = create([3n, 1n, 0n, 1n, 0n, 0n], 17n);
 assert.equal(action(short, ACTION.start, 100, 0), STATUS.accepted);
 let shortTime = 101;
@@ -157,11 +190,37 @@ while (state(short)[INFO.phase] === PHASE.playing) {
     STATUS.accepted);
 }
 assert.equal(state(short)[INFO.phase], PHASE.scored);
-assert.equal(action(short, ACTION.start, shortTime++, shortSequence++), STATUS.accepted);
+const settledAt = shortTime - 1;
+assert.equal(action(short, ACTION.start, settledAt + 799, shortSequence++), STATUS.ignored);
+assert.equal(state(short)[INFO.phase], PHASE.scored);
+assert.equal(action(short, ACTION.start, settledAt + 800, shortSequence++), STATUS.accepted);
 assert.equal(state(short)[INFO.phase], PHASE.done);
 assert.ok(hasText(frame(short), "1 rounds"));
+assert.ok(hasText(frame(short), "% of targets reached, highest rung"));
+const reached = Number(gameInfo(short, GAME_INFO.reachedTotal));
+const targets = Number(gameInfo(short, GAME_INFO.targetTotal));
+assert.ok(targets > 0 && reached >= 0 && reached <= targets);
+assert.equal(Number(gameInfo(short, GAME_INFO.accuracy)),
+  (() => {
+    const numerator = reached * 100;
+    const quotient = Math.floor(numerator / targets);
+    const remainder = numerator % targets;
+    return remainder * 2 > targets ||
+      (remainder * 2 === targets && quotient % 2 === 1)
+      ? quotient + 1 : quotient;
+  })());
+assert.equal(gameInfo(short, GAME_INFO.bestRung), 3n);
+assert.equal(gameInfo(short, GAME_INFO.perfectRounds),
+  reached === targets ? 1n : 0n);
 
-for (const handle of [run, replay, short]) {
+// Trial advancement on a multi-round task is gated by exactly the same pause.
+const scoredAt = timestamp - 1;
+assert.equal(action(run, ACTION.start, scoredAt + 799, sequence++), STATUS.ignored);
+assert.equal(state(run)[INFO.phase], PHASE.scored);
+assert.equal(action(run, ACTION.start, scoredAt + 800, sequence++), STATUS.accepted);
+assert.equal(state(run)[INFO.trial], 2n);
+
+for (const handle of [run, replay, short, changed, reference]) {
   assert.equal(exports.nw_api_v1_destroy(handle), 0n);
   assert.equal(exports.nw_api_v1_destroy(handle), 0n, "destroy is idempotent");
 }

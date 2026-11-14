@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 
 const shell = fileURLToPath(new URL("../shells/web/index.html", import.meta.url));
 const source = fs.readFileSync(shell, "utf8");
+const protocolPath = fileURLToPath(new URL("../src/wasm/runtime_protocol.elisa", import.meta.url));
+const protocol = fs.readFileSync(protocolPath, "utf8");
 
 assert.match(source, /nw_api_v1_task_mr_time/,
   "the shell must require and expose the Mr. Time task id");
@@ -41,6 +43,14 @@ assert.match(source, /function taskClick\(event\)[\s\S]*isMrTimeTask\(\)[\s\S]*A
   "the browser click path must dispatch Mr. Time shape clicks");
 assert.match(source, /if \(isMrTimeTask\(\)\) \{[\s\S]*apiDispatchText\(handle, event\.key\)/,
   "the browser keyboard path must forward Mr. Time digit text");
+assert.match(source, /const flags = event\?\.repeat \? 1 : 0;[\s\S]*API_EVENT\.keyDown/,
+  "physical key dispatch must preserve the browser repeat bit");
+assert.match(source, /else if \(event\.key === " " \|\| event\.key === "Enter"\) \{\s*apiDispatchKey\(handle, event\.key === " " \? API_KEY\.space : API_KEY\.enter, event\);/,
+  "Mr. Time Space and Enter must use common physical-key dispatch");
+assert.match(protocol, /elif kind == EVENT_KEY_DOWN:\s*return IGNORED if \(flags & 1\) != 0\s*phase: i64 = task_info\(index, 0\)/,
+  "the common protocol must suppress OS-repeat keydown actions such as Enter");
+assert.match(source, /if \(isMrTimeTask\(\)\) \{[\s\S]*apiDispatchText\(handle, event\.key\)[\s\S]*mrTimeAction\(MR_TIME_ACTION\.backspace\)/,
+  "Mr. Time digit and Backspace paths must preserve source-accepted key repeats");
 assert.match(source, /event\.key === "\." \|\| event\.key === ","/,
   "the browser keyboard path must forward decimal-point input");
 assert.match(source, /mrTimeAction\(MR_TIME_ACTION\.backspace\)/,

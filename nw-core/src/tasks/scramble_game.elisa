@@ -1,8 +1,6 @@
 # Stateful source-backed controller for Scramble.
-# The corpus is the same deterministic synthetic corpus used by the existing
-# Scramble differential sweep. The production controller owns only fixed text;
-# Scramble's Vocab/Bank/Deal darrays are reconstructed inside each call's
-# bounded scratch region.
+# Offline source corpus and selected answer are held independently of the
+# temporary vocabulary, sentence bank, and deal scratch region.
 module ScrambleGame:
     const TASK_ID: i64 = 993915390
     const MAX_TEXT: i64 = 640
@@ -15,6 +13,8 @@ module ScrambleGame:
     const ACTION_WRITE: i64 = 1
     const ACTION_BACKSPACE: i64 = 2
     const ACTION_SUBMIT: i64 = 3
+    const ACTION_APPLY_OPTIONS: i64 = 4
+    const ACTION_START_CLOCK: i64 = 5
     const INFO_PHASE: i64 = 0
     const INFO_RUNG: i64 = 1
     const INFO_TRIAL: i64 = 2
@@ -26,17 +26,33 @@ module ScrambleGame:
     const INFO_WORDS: i64 = 8
     const VALUE_SHOWN: i64 = 0
 
-    struct Run:
+    struct ScrambleRun:
         rng: mutable MT19937
+        start_rung: mutable i64
         rung: mutable i64
         trials: mutable i64
+        show_count: mutable bool
+        adaptive: mutable bool
         trial: mutable i64
         right: mutable i64
+        asked: mutable i64
+        best_rung: mutable i64
+        total_ms: mutable i64
+        started_ms: mutable i64
+        clock_pending: mutable bool
+        no_sentence: mutable bool
+        index_pointer: mutable i64
+        index_length: mutable i64
+        sentences_pointer: mutable i64
+        sentences_length: mutable i64
         phase: mutable i64
         verdict: mutable i64
         shown_n: mutable i64
         typed_n: mutable i64
         words: mutable i64
+        expected_n: mutable i64
+        ambiguity: mutable f64
+        expected: mutable i64[MAX_TEXT]
         shown: mutable i64[MAX_TEXT]
         typed: mutable i64[MAX_TYPED]
 
@@ -45,91 +61,218 @@ module ScrambleGame:
     def allowed_trials(value: i64) -> bool:
         return value >= 1 and value <= 100
 
-    def build_vocab(vocab: mutable Scramble::Vocab&):
+    def build_vocab(vocab: mutable Scramble::ScrambleVocab&):
         can Abort.Panic:
-            vocab.count <- 32
+            text: sview = ScrambleSeed::vocabulary()
+            length: i64 = sview_len(text).i64()
             at: mutable i64 = 0
-            for word in 0..<32 |word, vocab, at|:
-                length: i64 = 3 + word % 6
-                Ints::put(&vocab.start, word, at)
-                Ints::put(&vocab.length, word, length)
-                Ints::put(&vocab.rank, word, word)
-                for letter in 0..<length |letter, vocab, word, at|:
-                    Ints::put(&vocab.letter, at + letter, (word * 7 + letter * 5) % 26)
-                at <- at + length
+            letters: mutable i64 = 0
+            while at < length |vocab, text, length, at, letters|:
+                start: i64 = at
+                while at < length and sview_at(text, at.usize()) != 32.u8() |text, length, at|:
+                    at <- at + 1
+                n: i64 = at - start
+                word: i64 = vocab.count
+                Ints::put(&vocab.start, word, letters)
+                Ints::put(&vocab.length, word, n)
+                Ints::put(&vocab.rank, word, word + 1)
+                for i in 0..<n |vocab, text, start, letters|:
+                    Ints::put(&vocab.letter, letters + i, sview_at(text, (start + i).usize()).i64() - 97)
+                letters <- letters + n
+                vocab.count <- word + 1
+                at <- at + 1
             Scramble::index_vocab(vocab)
 
-    def build_bank(bank: mutable Scramble::Bank&, vocab: mutable Scramble::Vocab&):
+    def build_bank(bank: mutable Scramble::ScrambleBank&, grade: Scramble::ScrambleGrade&):
         can Abort.Panic:
-            bank.count <- 1
-            Ints::put(&bank.words, 0, 8)
-            Ints::put(&bank.word_at, 0, 0)
+            text: sview = ScrambleSeed::sentences()
+            length: i64 = sview_len(text).i64()
+            at: mutable i64 = 0
             word_at: mutable i64 = 0
             letter_at: mutable i64 = 0
-            for word in 0..<8 |word, bank, vocab, word_at, letter_at|:
-                source: i64 = (word * 3) % vocab.count
-                length: i64 = Ints::at_ref(&vocab.length, source)
-                start: i64 = Ints::at_ref(&vocab.start, source)
-                Ints::put(&bank.word_length, word_at, length)
-                Ints::put(&bank.letter_at, word_at, letter_at)
-                for letter in 0..<length |letter, bank, vocab, start, letter_at|:
-                    Ints::put(&bank.letter, letter_at + letter, Ints::at_ref(&vocab.letter, start + letter))
-                word_at <- word_at + 1
-                letter_at <- letter_at + length
+            while at < length |bank, grade, text, length, at, word_at, letter_at|:
+                start: i64 = at
+                count: mutable i64 = 1
+                while at < length and sview_at(text, at.usize()) != 10.u8() |text, length, at, count|:
+                    count <- count + 1 if sview_at(text, at.usize()) == 32.u8()
+                    at <- at + 1
+                end: i64 = at
+                if count >= grade.span_low and count <= grade.span_high:
+                    Ints::put(&bank.words, bank.count, count)
+                    Ints::put(&bank.word_at, bank.count, word_at)
+                    bank.count <- bank.count + 1
+                    pos: mutable i64 = start
+                    while pos < end |bank, text, end, pos, word_at, letter_at|:
+                        first: i64 = pos
+                        while pos < end and sview_at(text, pos.usize()) != 32.u8() |text, end, pos|:
+                            pos <- pos + 1
+                        n: i64 = pos - first
+                        Ints::put(&bank.word_length, word_at, n)
+                        Ints::put(&bank.letter_at, word_at, letter_at)
+                        for i in 0..<n |bank, text, first, letter_at|:
+                            Ints::put(&bank.letter, letter_at + i, sview_at(text, (first + i).usize()).i64() - 97)
+                        word_at <- word_at + 1
+                        letter_at <- letter_at + n
+                        pos <- pos + 1
+                at <- at + 1
 
-    def clear(run: mutable Run&):
+    def clear(run: mutable ScrambleRun&):
         can Abort.Panic:
             run.shown_n <- 0
             run.typed_n <- 0
             run.words <- 0
+            run.expected_n <- 0
+            run.no_sentence <- false
+            run.ambiguity <- 0.0
             for at in 0..<MAX_TEXT |at, run|:
                 run.shown[at.usize()] <- 0
             for at in 0..<MAX_TYPED |at, run|:
                 run.typed[at.usize()] <- 0
 
-    def deal(run: mutable Run&, seed: i64):
-        can Memory.Allocate, Abort.Panic:
-            region scratch(134217728):
+    def dispose(run: mutable ScrambleRun&):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                free(run.index_pointer.uintptr().cast[heap void&]) if run.index_pointer != 0
+                free(run.sentences_pointer.uintptr().cast[heap void&]) if run.sentences_pointer != 0
+            run.index_pointer <- 0
+            run.index_length <- 0
+            run.sentences_pointer <- 0
+            run.sentences_length <- 0
+
+    def set_corpus(run: mutable ScrambleRun&, index: sview, sentences: sview) -> i64:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return -6 if run.phase == PHASE_READING
+            index_n: i64 = sview_len(index).i64()
+            sentences_n: i64 = sview_len(sentences).i64()
+            return -3 if index_n < 0 or index_n > 67108864 or sentences_n < 0 or sentences_n > 67108864 or (index_n == 0 and sentences_n == 0)
+            stats: ScrambleCorpus::ScrambleCorpusStats = ScrambleCorpus::inspect(index, 60000)
+            return -3 if index_n > 0 and (not stats.valid or stats.words <= 0 or stats.words > 200000 or stats.letters > 3000000)
+            raw_index: mutable heap void&? = malloc((index_n + 1).usize())
+            return -4 if raw_index == null
+            raw_sentences: mutable heap void&? = malloc((sentences_n + 1).usize())
+            if raw_sentences == null:
+                trusted Unsafe.PointerCast:
+                    free(raw_index)
+                return -4
+            trusted Unsafe.PointerCast:
+                index_copy: mutable heap void& = raw_index
+                sentences_copy: mutable heap void& = raw_sentences
+                memcpy(index_copy, index.data.cast[void&], index_n.usize()) if index_n > 0
+                memcpy(sentences_copy, sentences.data.cast[void&], sentences_n.usize()) if sentences_n > 0
+                index_bytes: mutable heap u8& = index_copy.cast[mutable heap u8&]
+                sentence_bytes: mutable heap u8& = sentences_copy.cast[mutable heap u8&]
+                index_bytes[index_n.usize()] <- 0
+                sentence_bytes[sentences_n.usize()] <- 0
+                dispose(run)
+                run.index_pointer <- index_copy.uintptr().i64()
+                run.index_length <- index_n
+                run.sentences_pointer <- sentences_copy.uintptr().i64()
+                run.sentences_length <- sentences_n
+            run.rung <- run.start_rung
+            run.trial <- 0
+            run.right <- 0
+            run.asked <- 0
+            run.best_rung <- 0
+            run.total_ms <- 0
+            run.clock_pending <- false
+            run.phase <- PHASE_READY
+            run.verdict <- -1
+            clear(run)
+            return 0
+
+    def deal(run: mutable ScrambleRun&, seed: i64):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            region scratch(268435456):
                 in scratch:
-                    vocab: mutable Scramble::Vocab = Scramble::new_vocab()
-                    bank: mutable Scramble::Bank = Scramble::Bank{count: 0,
+                    grade: Scramble::ScrambleGrade = Scramble::grade_of(run.rung)
+                    index: mutable sview = sview("", 0, -1)
+                    sentences: mutable sview = sview("", 0, -1)
+                    if run.index_length > 0:
+                        trusted Unsafe.PointerCast:
+                            index <- sview(run.index_pointer.uintptr().cast[cstr], 0, run.index_length)
+                    if run.sentences_length > 0:
+                        trusted Unsafe.PointerCast:
+                            sentences <- sview(run.sentences_pointer.uintptr().cast[cstr], 0, run.sentences_length)
+                    sizes: ScrambleCorpus::ScrambleCorpusStats = ScrambleCorpus::inspect(index, grade.top_rank)
+                    vocab: mutable Scramble::ScrambleVocab = Scramble::new_vocab_sized(sizes.words, sizes.letters) if run.index_length > 0 else Scramble::new_vocab()
+                    bank: mutable Scramble::ScrambleBank = Scramble::ScrambleBank{count: 0,
                         words: Ints::zeros(256), word_at: Ints::zeros(256),
                         word_length: Ints::zeros(4096), letter_at: Ints::zeros(4096),
                         letter: Ints::zeros(65536)}
-                    work: mutable Scramble::Work = Scramble::new_work()
-                    got: mutable Scramble::Deal = Scramble::new_deal()
+                    work: mutable Scramble::ScrambleWork = Scramble::new_work()
+                    got: mutable Scramble::ScrambleDeal = Scramble::new_deal()
                     rng: mutable MT19937 = mt19937_new()
                     mt_seed_int(&rng, seed.u64())
-                    grade: Scramble::Grade = Scramble::grade_of(run.rung)
-                    build_vocab(&vocab)
-                    build_bank(&bank, &vocab)
+                    if run.index_length == 0:
+                        build_vocab(&vocab)
+                    else:
+                        ScrambleCorpus::load(index, grade.top_rank, &vocab)
+                    if run.index_length == 0 and run.sentences_length == 0:
+                        build_bank(&bank, &grade)
+                    else:
+                        bank_text: sview = sentences if run.sentences_length > 0 else ScrambleSeed::sentences()
+                        bank_stats: ScrambleCorpus::ScrambleBankStats = ScrambleCorpus::scan_bank(bank_text, &grade, &vocab, &bank, false)
+                        bank.words <- Ints::zeros(bank_stats.sentences)
+                        bank.word_at <- Ints::zeros(bank_stats.sentences)
+                        bank.word_length <- Ints::zeros(bank_stats.words)
+                        bank.letter_at <- Ints::zeros(bank_stats.words)
+                        bank.letter <- Ints::zeros(bank_stats.letters)
+                        _ = ScrambleCorpus::scan_bank(bank_text, &grade, &vocab, &bank, true)
                     Scramble::deal_one(&grade, &bank, &vocab, &work, &got, &rng)
-                    run.shown_n <- 0
-                    run.words <- got.words
-                    for chunk in 0..<got.chunks |chunk, got, run|:
-                        if chunk > 0:
-                            run.shown[run.shown_n.usize()] <- 26
-                            run.shown_n <- run.shown_n + 1
-                        start: i64 = Ints::at_ref(&got.chunk_start, chunk)
-                        length: i64 = Ints::at_ref(&got.chunk_length, chunk)
-                        for at in 0..<length |at, got, run, start|:
-                            run.shown[run.shown_n.usize()] <- Ints::at_ref(&got.corrupted_letter, start + at)
-                            run.shown_n <- run.shown_n + 1
+                    if not got.given:
+                        run.no_sentence <- true
+                        run.phase <- PHASE_DONE
+                    else:
+                        run.shown_n <- 0
+                        run.words <- got.words
+                        run.ambiguity <- got.ambiguity
+                        first: i64 = Ints::at_ref(&bank.word_at, got.sentence)
+                        for slot in 0..<got.words |bank, run, first|:
+                            if slot > 0:
+                                run.expected[run.expected_n.usize()] <- 26
+                                run.expected_n <- run.expected_n + 1
+                            word: i64 = first + slot
+                            start: i64 = Ints::at_ref(&bank.letter_at, word)
+                            length: i64 = Ints::at_ref(&bank.word_length, word)
+                            for at in 0..<length |bank, run, start|:
+                                run.expected[run.expected_n.usize()] <- Ints::at_ref(&bank.letter, start + at)
+                                run.expected_n <- run.expected_n + 1
+                        for chunk in 0..<got.chunks |chunk, got, run|:
+                            if chunk > 0:
+                                run.shown[run.shown_n.usize()] <- 26
+                                run.shown_n <- run.shown_n + 1
+                            start: i64 = Ints::at_ref(&got.chunk_start, chunk)
+                            length: i64 = Ints::at_ref(&got.chunk_length, chunk)
+                            for at in 0..<length |at, got, run, start|:
+                                run.shown[run.shown_n.usize()] <- Ints::at_ref(&got.corrupted_letter, start + at)
+                                run.shown_n <- run.shown_n + 1
                 destroy scratch
 
-    def initialize(run: mutable Run&, rung: i64, trials: i64, seed: i64):
+    def initialize(run: mutable ScrambleRun&, rung: i64, trials: i64, show_count: bool, adaptive: bool, seed: i64):
         can Abort.Panic:
             run.rng <- mt19937_new()
             mt_seed_int(&run.rng, seed.u64())
+            run.start_rung <- rung
+            run.index_pointer <- 0
+            run.index_length <- 0
+            run.sentences_pointer <- 0
+            run.sentences_length <- 0
             run.rung <- rung
             run.trials <- trials
+            run.show_count <- show_count
+            run.adaptive <- adaptive
             run.trial <- 0
             run.right <- 0
+            run.asked <- 0
+            run.best_rung <- 0
+            run.total_ms <- 0
+            run.started_ms <- 0
+            run.clock_pending <- false
             run.phase <- PHASE_READY
             run.verdict <- -1
             clear(run)
 
-    def next_trial(run: mutable Run&):
+    def next_trial(run: mutable ScrambleRun&, now_ms: i64):
         can Memory.Allocate, Abort.Panic:
             if run.trial >= run.trials:
                 run.phase <- PHASE_DONE
@@ -138,14 +281,45 @@ module ScrambleGame:
             clear(run)
             deal(run, py_randrange(&run.rng, 0, 1073741824))
             run.verdict <- -1
-            run.phase <- PHASE_READING
+            if run.words > 0:
+                run.started_ms <- now_ms
+                run.clock_pending <- true
+                run.phase <- PHASE_READING
 
-    def apply(run: mutable Run&, action: i64, value: i64, now_ms: i64) -> i64:
+    def apply(run: mutable ScrambleRun&, action: i64, value: i64, now_ms: i64) -> i64:
         can Abort.Panic:
-            _ = now_ms
+            if action == ACTION_START_CLOCK:
+                return 2 if run.phase != PHASE_READING or not run.clock_pending
+                run.started_ms <- now_ms
+                run.clock_pending <- false
+                return 1
+            run.clock_pending <- false
+            if action == ACTION_APPLY_OPTIONS:
+                run.start_rung <- value & 15
+                run.rung <- run.start_rung
+                choice: i64 = (value >> 4) & 7
+                run.trials <- 1 if choice == 0 else 2 if choice == 1 else 3 if choice == 2 else 5 if choice == 3 else 8 if choice == 4 else 10 if choice == 5 else 15
+                run.show_count <- (value & 128) != 0
+                run.adaptive <- (value & 256) != 0
+                run.trial <- 0
+                run.right <- 0
+                run.asked <- 0
+                run.best_rung <- 0
+                run.total_ms <- 0
+                run.phase <- PHASE_READY
+                run.verdict <- -1
+                clear(run)
+                return 1
             if action == ACTION_START:
                 return 2 if run.phase == PHASE_READING
-                next_trial(run)
+                if run.phase == PHASE_DONE:
+                    run.rung <- run.start_rung
+                    run.trial <- 0
+                    run.right <- 0
+                    run.asked <- 0
+                    run.best_rung <- 0
+                    run.total_ms <- 0
+                next_trial(run, now_ms)
                 return 1
             if action == ACTION_BACKSPACE:
                 return 2 if run.phase != PHASE_READING or run.typed_n <= 0
@@ -163,29 +337,23 @@ module ScrambleGame:
                 for at in 0..<run.typed_n |at, source, run|:
                     Ints::put(&source, at, run.typed[at.usize()])
                 got: i64 = Scramble::normalise(&source, run.typed_n, &normalized)
-                # The source bank is deterministic; reconstruct its canonical
-                # written order and compare the source-normalised answer.
-                expected: mutable darray[i64] = Ints::zeros(MAX_TYPED)
-                at: mutable i64 = 0
-                for word in 0..<8 |word, expected, at|:
-                    if word > 0:
-                        Ints::put(&expected, at, 26)
-                        at <- at + 1
-                    source_word: i64 = (word * 3) % 32
-                    length: i64 = 3 + source_word % 6
-                    for letter in 0..<length |letter, expected, at, source_word|:
-                        Ints::put(&expected, at, (source_word * 7 + letter * 5) % 26)
-                        at <- at + 1
-                run.verdict <- 1 if got == at else 0
+                return 2 if got == 0
+                run.verdict <- 1 if got == run.expected_n else 0
                 if run.verdict == 1:
-                    for index in 0..<at |index, normalized, expected|:
-                        run.verdict <- 0 if Ints::at_ref(&normalized, index) != Ints::at_ref(&expected, index)
+                    for index in 0..<got |index, normalized, run|:
+                        run.verdict <- 0 if Ints::at_ref(&normalized, index) != run.expected[index.usize()]
                 run.right <- run.right + 1 if run.verdict == 1
+                run.asked <- run.asked + 1
+                run.total_ms <- run.total_ms + (now_ms - run.started_ms) if now_ms >= run.started_ms
+                run.best_rung <- run.rung if run.verdict == 1 and run.rung > run.best_rung
+                if run.adaptive:
+                    if run.verdict == 1 and run.rung < Scramble::GRADE_COUNT: run.rung <- run.rung + 1
+                    elif run.verdict == 0 and run.rung > 1: run.rung <- run.rung - 1
                 run.phase <- PHASE_JUDGED
                 return 1
             return 2
 
-    def info(run: Run&, field: i64) -> i64:
+    def info(run: ScrambleRun&, field: i64) -> i64:
         if field == INFO_PHASE: return run.phase
         if field == INFO_RUNG: return run.rung
         if field == INFO_TRIAL: return run.trial
@@ -195,18 +363,26 @@ module ScrambleGame:
         if field == INFO_VERDICT: return run.verdict
         if field == INFO_RIGHT: return run.right
         if field == INFO_WORDS: return run.words
+        if field == 9: return run.asked
+        if field == 10: return run.best_rung
+        if field == 11: return 1 if run.show_count else 0
+        if field == 12: return 1 if run.adaptive else 0
+        if field == 13: return 1 if run.index_length > 0 or run.sentences_length > 0 else 0
+        if field == 14: return 1 if run.index_length > 0 else 0
+        if field == 15: return 1 if run.sentences_length > 0 else 0
+        if field == 16: return run.total_ms / 1000
         return -1
 
-    def value(run: Run&, field: i64, at: i64) -> i64:
+    def value(run: ScrambleRun&, field: i64, at: i64) -> i64:
         return -1 if field != VALUE_SHOWN or at < 0 or at >= run.shown_n else run.shown[at.usize()]
 
-    def append_shown(out: mutable dstr&, run: Run&):
+    def append_shown(out: mutable dstr&, run: ScrambleRun&):
         can Memory.Allocate, Abort.Panic:
             for at in 0..<run.shown_n |at, out, run|:
                 value: i64 = run.shown[at.usize()]
                 out.push((32 if value == 26 else 97 + value).u8())
 
-    def append_typed(out: mutable dstr&, run: Run&):
+    def append_typed(out: mutable dstr&, run: ScrambleRun&):
         can Memory.Allocate, Abort.Panic:
             for at in 0..<run.typed_n |at, out, run|:
                 value: i64 = run.typed[at.usize()]
@@ -214,7 +390,7 @@ module ScrambleGame:
                 elif value >= 0 and value < 26: out.push((97 + value).u8())
                 else: out.push(63.u8())
 
-    def render(run: Run&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
+    def render(run: ScrambleRun&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
         can Memory.Allocate, Abort.Panic:
             shown: mutable dstr = []
             typed: mutable dstr = []
@@ -225,12 +401,25 @@ module ScrambleGame:
             if run.phase == PHASE_READY: dstr_append_cstr(&message, "Press Space to start")
             elif run.phase == PHASE_READING: dstr_append_cstr(&message, "Type the original line")
             elif run.phase == PHASE_JUDGED: dstr_append_cstr(&message, "Right" if run.verdict == 1 else "Wrong")
-            else: dstr_append_cstr(&message, "Session complete")
+            elif run.no_sentence: dstr_append_cstr(&message, "No sentence at this level")
+            else:
+                dstr_append_i64(&message, run.right)
+                dstr_append_cstr(&message, " of ")
+                dstr_append_i64(&message, run.asked)
+                dstr_append_cstr(&message, " right, highest level ")
+                dstr_append_i64(&message, run.best_rung)
             sx: f64 = width / Display::REFERENCE_WIDTH
             sy: f64 = height / Display::REFERENCE_HEIGHT
-            paint: SceneScramble::Paint = SceneScramble::paint_of(black, width, height, sx, sy)
+            paint: SceneScramble::ScramblePaint = SceneScramble::paint_of(black, width, height, sx, sy)
+            answer: mutable dstr = []
+            if run.verdict >= 0:
+                dstr_append_cstr(&answer, "Right - " if run.verdict == 1 else "No - it was: ")
+                for at in 0..<run.expected_n |run, answer|:
+                    value: i64 = run.expected[at.usize()]
+                    answer.push((32 if value == 26 else 97 + value).u8())
+            grade: Scramble::ScrambleGrade = Scramble::grade_of(run.rung)
             SceneScramble::render(list, &paint, run.phase, run.shown_n > 0,
-                                  bytes_view(shown), bytes_view(typed), 0.0,
-                                  false, run.words, true, true, sview("", 0, -1),
+                                  bytes_view(shown), bytes_view(typed), run.ambiguity,
+                                  grade.spaces > 0, run.words, run.show_count, run.sentences_length > 0, sview("Seed sentences", 0, -1),
                                   run.trial, run.trials, bytes_view(message),
-                                  run.verdict, sview("", 0, -1))
+                                  run.verdict, bytes_view(answer))

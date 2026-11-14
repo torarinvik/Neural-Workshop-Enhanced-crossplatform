@@ -9,9 +9,14 @@
  * Build: scripts/build_sdl3.sh
  */
 #include <SDL3/SDL.h>
+#include <errno.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "display_list.h"
 
 /* The core's C ABI, the same surface the wasm build exports (src/wasm/
@@ -234,9 +239,13 @@ extern int64_t nw_reflex_frame_write(int64_t dest, int64_t capacity,
                                      int64_t width, int64_t height);
 extern int64_t nw_reflex_destroy(int64_t handle);
 extern int64_t nw_algebra_create(int64_t level, int64_t trials, int64_t seed);
+extern int64_t nw_algebra_create_options(int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_numberology_options_frame_write(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_algebra_options_frame_write(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
 extern int64_t nw_algebra_action(int64_t handle, int64_t action,
                                  int64_t value, int64_t now_ms);
 extern int64_t nw_algebra_info(int64_t handle, int64_t field);
+extern int64_t nw_algebra_value(int64_t handle, int64_t field, int64_t at);
 extern int64_t nw_algebra_frame_write(int64_t dest, int64_t capacity,
                                       int64_t handle, int64_t black,
                                       int64_t width, int64_t height);
@@ -246,12 +255,16 @@ extern int64_t nw_numberology_create(int64_t start_level, int64_t trials,
 extern int64_t nw_numberology_action(int64_t handle, int64_t action,
                                      int64_t value, int64_t now_ms);
 extern int64_t nw_numberology_info(int64_t handle, int64_t field);
+extern int64_t nw_numberology_value(int64_t handle, int64_t field, int64_t at);
 extern int64_t nw_numberology_frame_write(int64_t dest, int64_t capacity,
                                           int64_t handle, int64_t black,
                                           int64_t width, int64_t height);
 extern int64_t nw_numberology_destroy(int64_t handle);
 extern int64_t nw_jigsaw_create(int64_t start_side, int64_t puzzles,
                                 int64_t adaptive, int64_t preview, int64_t seed);
+extern int64_t nw_jigsaw_create_options(int64_t start_side, int64_t puzzles,
+                                        int64_t adaptive, int64_t preview,
+                                        int64_t mark_placed, int64_t seed);
 extern int64_t nw_jigsaw_action(int64_t handle, int64_t action,
                                 int64_t value, int64_t now_ms);
 extern int64_t nw_jigsaw_info(int64_t handle, int64_t field);
@@ -282,6 +295,42 @@ extern int64_t nw_go_pointer(int64_t handle, int64_t x_millionths, int64_t y_mil
 extern int64_t nw_go_frame_write(int64_t dest, int64_t capacity, int64_t handle,
                                  int64_t black, int64_t width, int64_t height);
 extern int64_t nw_go_destroy(int64_t handle);
+extern int64_t nw_scrabble_create(int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_scramble_create(int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_scramble_set_corpus(int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_scramble_action(int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_scramble_info(int64_t, int64_t);
+extern int64_t nw_scramble_value(int64_t, int64_t, int64_t);
+extern int64_t nw_scramble_frame_write(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_scramble_destroy(int64_t);
+extern int64_t nw_scramble_options_frame_write(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_scrabble_set_lexicon(int64_t, int64_t, int64_t);
+extern int64_t nw_scrabble_action(int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_scrabble_info(int64_t, int64_t);
+extern int64_t nw_scrabble_value(int64_t, int64_t, int64_t);
+extern int64_t nw_scrabble_pointer(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_scrabble_frame_write(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_scrabble_destroy(int64_t);
+extern int64_t nw_scrabble_options_frame_write(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_crossword_create(int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_crossword_set_lexicon(int64_t, int64_t, int64_t);
+extern int64_t nw_crossword_action(int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_crossword_info(int64_t, int64_t);
+extern int64_t nw_crossword_pointer(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_crossword_frame_write(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_crossword_destroy(int64_t);
+extern int64_t nw_crossword_options_frame_write(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_crossed_wires_create(int64_t start_rung, int64_t trials,
+                                       int64_t adaptive, int64_t show_grid,
+                                       int64_t seed);
+extern int64_t nw_crossed_wires_action(int64_t handle, int64_t action,
+                                       int64_t value, int64_t now_ms);
+extern int64_t nw_crossed_wires_advance(int64_t handle, int64_t now_ms);
+extern int64_t nw_crossed_wires_info(int64_t handle, int64_t field);
+extern int64_t nw_crossed_wires_frame_write(int64_t dest, int64_t capacity,
+                                            int64_t handle, int64_t black,
+                                            int64_t width, int64_t height);
+extern int64_t nw_crossed_wires_destroy(int64_t handle);
 extern int64_t nw_ncup_monte_create(int64_t start_cups, int64_t max_cups,
                                     int64_t adaptive, int64_t swap_count,
                                     int64_t swap_ms, int64_t reveal_ms, int64_t seed);
@@ -521,7 +570,7 @@ static void render_frame(SDL_Renderer *r, const nw_view *v, const nw_frame *fram
     float poly_x0 = 0, poly_y0 = 0, poly_prev_x = 0, poly_prev_y = 0;
     int poly_seen = 0;
     int poly_open = 0;   /* a MULTILINE run: stroked and open, not filled */
-    char text_buffer[512];
+    char text_buffer[4096];
 
     events->verdict = -1;
     events->sounds = 0;
@@ -649,8 +698,19 @@ static void render_frame(SDL_Renderer *r, const nw_view *v, const nw_frame *fram
             if (text && len < sizeof text_buffer) {
                 memcpy(text_buffer, text, len);
                 text_buffer[len] = '\0';
-                draw_text(r, v, text_buffer, cmd->a, cmd->b, cmd->c, cmd->color,
-                          NW_ANCHOR_OF(cmd));
+                int rows = 1;
+                for (uint32_t j = 0; j < len; j++) if (text_buffer[j] == '\n') rows++;
+                int row = 0;
+                char *line = text_buffer;
+                for (uint32_t j = 0; j <= len; j++) {
+                    if (text_buffer[j] != '\n' && text_buffer[j] != '\0') continue;
+                    text_buffer[j] = '\0';
+                    float line_y = cmd->b + ((rows - 1) * 0.5f - row) * cmd->c * 1.25f;
+                    draw_text(r, v, line, cmd->a, line_y, cmd->c, cmd->color,
+                              NW_ANCHOR_OF(cmd));
+                    line = text_buffer + j + 1;
+                    row++;
+                }
             }
             break;
         }
@@ -1353,6 +1413,26 @@ static int selftest_algebra(void) {
                                handle, 0, 912, 684) <= 0) bad++;
     if (nw_algebra_action(handle, 2, 0, 0) != 2) bad++;
     if (nw_algebra_destroy(handle) != 0) bad++;
+    /* Independent source-derived fractional and large CRT feedback cases. */
+    static const struct { int level; const char *working; } examples[] = {
+        {5, "over 14: 6 + 7\nwhich is 13/14"},
+        {12, "the moduli are coprime, so there is one n below 1936894310792171506455569293\nafter mod 44371:  n = 40522 (mod 44371)\nafter mod 31699:  n = 1220287393 (mod 1406516329)\nafter mod 18311:  n = 21173510587830 (mod 25754720500319)\nafter mod 55661:  n = 1208793225472559776 (mod 1433533497768255859)\nafter mod 14249:  n = 4059542125407404896605 (mod 20426418809699877734891)\nafter mod 94823:  n = 1313075539886062647836894758 (mod 1936894310792171506455569293)"}
+    };
+    for (size_t i = 0; i < sizeof(examples) / sizeof(examples[0]); i++) {
+        handle = nw_algebra_create(examples[i].level, 1, 19);
+        if (!handle) { bad++; continue; }
+        if (nw_algebra_action(handle, 0, 0, 0) != 1 || nw_algebra_info(handle, 11) != 0 ||
+            nw_algebra_value(handle, 3, 0) != -1 || nw_algebra_action(handle, 1, 'x', 0) != 1 ||
+            nw_algebra_action(handle, 3, 0, 0) != 1) bad++;
+        int64_t count = nw_algebra_info(handle, 11);
+        if (count != (int64_t)strlen(examples[i].working)) bad++;
+        else for (int64_t j = 0; j < count; j++) {
+            if (nw_algebra_value(handle, 3, j) != (unsigned char)examples[i].working[j]) bad++;
+        }
+        if (nw_algebra_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
+                                   handle, 0, 912, 684) <= 0) bad++;
+        if (nw_algebra_destroy(handle) != 0) bad++;
+    }
     free(buffer);
     printf("Algebra selftest: %s\n", bad ? "FAILED" : "PASS");
     return bad ? 1 : 0;
@@ -1377,6 +1457,19 @@ static int selftest_numberology(void) {
     if (nw_numberology_action(handle, 1, 45, 0) != 1) bad++;
     if (nw_numberology_action(handle, 2, 0, 0) != 1) bad++;
     if (nw_numberology_destroy(handle) != 0) bad++;
+    handle = nw_numberology_create(1000, 1, 0, 19);
+    const char *exact = "96448543405967464215539390836603148782077915887889532192857920126483182449263992839";
+    if (!handle) bad++;
+    if (handle) {
+        if (nw_numberology_action(handle, 0, 0, 0) != 1 || nw_numberology_info(handle, 4) != 29 || nw_numberology_info(handle, 17) != 0) bad++;
+        for (size_t i = 0; i < strlen(exact); i++)
+            if (nw_numberology_action(handle, 1, (unsigned char)exact[i], 0) != 1) bad++;
+        if (nw_numberology_action(handle, 3, 0, 0) != 1 || nw_numberology_info(handle, 8) != 1 ||
+            nw_numberology_info(handle, 15) != (int64_t)strlen(exact)) bad++;
+        for (size_t i = 0; i < strlen(exact); i++)
+            if (nw_numberology_value(handle, 2, (int64_t)i) != (unsigned char)exact[i]) bad++;
+        if (nw_numberology_destroy(handle) != 0) bad++;
+    }
     free(buffer);
     printf("Numberology selftest: %s\n", bad ? "FAILED" : "PASS");
     return bad ? 1 : 0;
@@ -1384,7 +1477,7 @@ static int selftest_numberology(void) {
 
 static int selftest_jigsaw(void) {
     int bad = 0;
-    int64_t handle = nw_jigsaw_create(3, 2, 1, 1, 17);
+    int64_t handle = nw_jigsaw_create_options(3, 2, 1, 1, 1, 17);
     uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
     if (!handle || !buffer) {
         if (handle) nw_jigsaw_destroy(handle);
@@ -1396,6 +1489,7 @@ static int selftest_jigsaw(void) {
     if (nw_jigsaw_action(handle, 0, 0, 0) != 1) bad++;
     if (nw_jigsaw_info(handle, 0) != 1) bad++;
     if (nw_jigsaw_info(handle, 1) != 3) bad++;
+    if (nw_jigsaw_info(handle, 14) != 1) bad++;
     if (nw_jigsaw_value(handle, 0, 0) < 0) bad++;
     if (nw_jigsaw_frame_write((int64_t)(uintptr_t)buffer, FRAME_CAPACITY,
                               handle, 0, 912, 684) <= 0) bad++;
@@ -1434,7 +1528,7 @@ static int selftest_sudoku(void) {
 
 static int selftest_go(void) {
     int bad = 0;
-    int64_t handle = nw_go_create(1, 2, 17);
+    int64_t handle = nw_go_create(1, 3, 17);
     uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
     if (!handle || !buffer) {
         if (handle) nw_go_destroy(handle);
@@ -1454,6 +1548,29 @@ static int selftest_go(void) {
     if (nw_go_destroy(handle) != 0) bad++;
     free(buffer);
     printf("Go selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_crossed_wires(void) {
+    int bad = 0;
+    int64_t handle = nw_crossed_wires_create(3, 5, 1, 1, 17);
+    uint8_t *buffer = (uint8_t *)(uintptr_t)malloc(FRAME_CAPACITY);
+    if (!handle || !buffer) {
+        if (handle) nw_crossed_wires_destroy(handle);
+        free(buffer);
+        printf("Crossed Wires selftest: allocation failed\n");
+        return 1;
+    }
+    if (nw_crossed_wires_info(handle, 0) != 0) bad++;
+    if (nw_crossed_wires_action(handle, 0, 0, 100) != 1) bad++;
+    if (nw_crossed_wires_info(handle, 0) != 1) bad++;
+    if (nw_crossed_wires_info(handle, 4) != 4) bad++;
+    if (nw_crossed_wires_frame_write((int64_t)(uintptr_t)buffer,
+                                     FRAME_CAPACITY, handle, 0, 912, 684) <= 0) bad++;
+    if (nw_crossed_wires_action(handle, 1, 7, 101) != 2) bad++;
+    if (nw_crossed_wires_destroy(handle) != 0) bad++;
+    free(buffer);
+    printf("Crossed Wires selftest: %s\n", bad ? "FAILED" : "PASS");
     return bad ? 1 : 0;
 }
 
@@ -1655,7 +1772,1068 @@ static int selftest_overrun(void) {
     return bad ? 1 : 0;
 }
 
+static bool value_in_set(int64_t value, const int64_t *allowed, size_t count) {
+    for (size_t index = 0; index < count; index++) {
+        if (allowed[index] == value) return true;
+    }
+    return false;
+}
+
+typedef struct {
+    int64_t level, trials, show_mistakes, adaptive;
+    const char *lexicon;
+} crossword_options;
+
+/* Python and SDL share this compact, validated settings file. */
+static bool crossword_settings_path(char *path, size_t capacity, bool create_dir) {
+    const char *override = getenv("NW_CROSSWORD_SETTINGS_PATH");
+    if (override && *override) return snprintf(path, capacity, "%s", override) < (int)capacity;
+#ifdef _WIN32
+    const char *base = getenv("APPDATA");
+    if (!base) base = getenv("USERPROFILE");
+    const char *folder = "/Neural Workshop";
+#else
+    const char *base = getenv("HOME");
+    const char *folder = "/.neural-workshop";
+#endif
+    if (!base) return false;
+    char directory[4096];
+    if (snprintf(directory, sizeof(directory), "%s%s", base, folder) >= (int)sizeof(directory)) return false;
+    if (create_dir && !SDL_CreateDirectory(directory)) return false;
+    return snprintf(path, capacity, "%s/crossword-options", directory) < (int)capacity;
+}
+
+static void crossword_read_settings(crossword_options *options) {
+    char path[4096], line[256];
+    if (!crossword_settings_path(path, sizeof(path), false)) return;
+    FILE *file = fopen(path, "r");
+    if (!file) return;
+    bool complete = fgets(line, sizeof(line), file) != NULL && fgetc(file) == EOF && !ferror(file);
+    fclose(file);
+    if (!complete) return;
+    long long fields[4];
+    char *cursor = line;
+    for (int i = 0; i < 4; i++) {
+        while (isspace((unsigned char)*cursor)) cursor++;
+        errno = 0;
+        char *end = NULL;
+        fields[i] = strtoll(cursor, &end, 10);
+        if (errno == ERANGE || end == cursor || (*end && !isspace((unsigned char)*end))) return;
+        cursor = end;
+    }
+    while (isspace((unsigned char)*cursor)) cursor++;
+    static const int64_t trial_choices[] = {1,2,3,5,8,10};
+    if (*cursor == '\0' && fields[0] >= 1 && fields[0] <= 10 &&
+        value_in_set(fields[1], trial_choices, 6) &&
+        (fields[2] == 0 || fields[2] == 1) && (fields[3] == 0 || fields[3] == 1)) {
+        options->level = fields[0]; options->trials = fields[1];
+        options->show_mistakes = fields[2]; options->adaptive = fields[3];
+    }
+}
+
+static bool crossword_write_settings(const crossword_options *options) {
+    char path[4096], temporary[4200];
+    if (!crossword_settings_path(path, sizeof(path), true) ||
+        snprintf(temporary, sizeof(temporary), "%s.%llu.tmp", path,
+                 (unsigned long long)SDL_GetTicksNS()) >= (int)sizeof(temporary)) return false;
+    FILE *file = fopen(temporary, "w");
+    if (!file) return false;
+    bool ok = fprintf(file, "%lld %lld %lld %lld\n", (long long)options->level,
+                      (long long)options->trials, (long long)options->show_mistakes,
+                      (long long)options->adaptive) > 0;
+    if (fclose(file) != 0) ok = false;
+#ifdef _WIN32
+    if (ok) ok = MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    if (ok) ok = rename(temporary, path) == 0;
+#endif
+    if (!ok) remove(temporary);
+    return ok;
+}
+
+static bool scrabble_settings_path(char *path, size_t capacity, bool create_dir) {
+    const char *override = getenv("NW_SCRABBLE_SETTINGS_PATH");
+    if (override && *override) return snprintf(path, capacity, "%s", override) < (int)capacity;
+#ifdef _WIN32
+    const char *base = getenv("APPDATA");
+    if (!base) base = getenv("USERPROFILE");
+    const char *folder = "/Neural Workshop";
+#else
+    const char *base = getenv("HOME");
+    const char *folder = "/.neural-workshop";
+#endif
+    if (!base) return false;
+    char directory[4096];
+    if (snprintf(directory, sizeof(directory), "%s%s", base, folder) >= (int)sizeof(directory)) return false;
+    if (create_dir && !SDL_CreateDirectory(directory)) return false;
+    return snprintf(path, capacity, "%s/scrabble-options", directory) < (int)capacity;
+}
+
+static void scrabble_read_settings(crossword_options *options) {
+    char path[4096], line[256];
+    if (!scrabble_settings_path(path, sizeof(path), false)) return;
+    FILE *file = fopen(path, "r");
+    if (!file) return;
+    bool complete = fgets(line, sizeof(line), file) != NULL && fgetc(file) == EOF && !ferror(file);
+    fclose(file);
+    if (!complete) return;
+    long long fields[4];
+    char *cursor = line;
+    for (int i = 0; i < 4; i++) {
+        while (isspace((unsigned char)*cursor)) cursor++;
+        errno = 0;
+        char *end = NULL;
+        fields[i] = strtoll(cursor, &end, 10);
+        if (errno == ERANGE || end == cursor || (*end && !isspace((unsigned char)*end))) return;
+        cursor = end;
+    }
+    while (isspace((unsigned char)*cursor)) cursor++;
+    static const int64_t trial_choices[] = {1,2,3,5,8,10,15};
+    if (*cursor == '\0' && fields[0] >= 1 && fields[0] <= 10 &&
+        value_in_set(fields[1], trial_choices, 7) &&
+        (fields[2] == 0 || fields[2] == 1) && (fields[3] == 0 || fields[3] == 1)) {
+        options->level = fields[0]; options->trials = fields[1];
+        options->show_mistakes = fields[2]; options->adaptive = fields[3];
+    }
+}
+
+static bool scrabble_write_settings(const crossword_options *options) {
+    char path[4096], temporary[4200];
+    if (!scrabble_settings_path(path, sizeof(path), true) ||
+        snprintf(temporary, sizeof(temporary), "%s.%llu.tmp", path,
+                 (unsigned long long)SDL_GetTicksNS()) >= (int)sizeof(temporary)) return false;
+    FILE *file = fopen(temporary, "w");
+    if (!file) return false;
+    bool ok = fprintf(file, "%lld %lld %lld %lld\n", (long long)options->level,
+                      (long long)options->trials, (long long)options->show_mistakes,
+                      (long long)options->adaptive) > 0;
+    if (fclose(file) != 0) ok = false;
+#ifdef _WIN32
+    if (ok) ok = MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    if (ok) ok = rename(temporary, path) == 0;
+#endif
+    if (!ok) remove(temporary);
+    return ok;
+}
+
+static bool numberology_settings_path(char *path, size_t capacity, bool create_dir) {
+    const char *override = getenv("NW_NUMBEROLOGY_SETTINGS_PATH");
+    if (override && *override) return snprintf(path, capacity, "%s", override) < (int)capacity;
+#ifdef _WIN32
+    const char *base = getenv("APPDATA");
+    if (!base) base = getenv("USERPROFILE");
+    const char *folder = "/Neural Workshop";
+#else
+    const char *base = getenv("HOME");
+    const char *folder = "/.neural-workshop";
+#endif
+    if (!base) return false;
+    char directory[4096];
+    if (snprintf(directory, sizeof(directory), "%s%s", base, folder) >= (int)sizeof(directory)) return false;
+    if (create_dir && !SDL_CreateDirectory(directory)) return false;
+    return snprintf(path, capacity, "%s/numberology-options", directory) < (int)capacity;
+}
+
+static void numberology_read_settings(crossword_options *options) {
+    char path[4096], line[256], *cursor;
+    if (!numberology_settings_path(path, sizeof(path), false)) return;
+    FILE *file = fopen(path, "r");
+    if (!file) return;
+    bool complete = fgets(line, sizeof(line), file) != NULL && fgetc(file) == EOF && !ferror(file);
+    fclose(file);
+    if (!complete) return;
+    long long fields[3]; cursor = line;
+    for (int i = 0; i < 3; i++) {
+        while (isspace((unsigned char)*cursor)) cursor++;
+        errno = 0; char *end = NULL; fields[i] = strtoll(cursor, &end, 10);
+        if (errno == ERANGE || end == cursor || (*end && !isspace((unsigned char)*end))) return;
+        cursor = end;
+    }
+    while (isspace((unsigned char)*cursor)) cursor++;
+    static const int64_t choices[] = {1,2,3,5,6,8,10,15};
+    if (!*cursor && fields[0] >= 1 && value_in_set(fields[1], choices, 8) && (fields[2] == 0 || fields[2] == 1)) {
+        options->level = fields[0]; options->trials = fields[1]; options->adaptive = fields[2];
+    }
+}
+
+static bool numberology_write_settings(const crossword_options *options) {
+    char path[4096], temporary[4200];
+    if (!numberology_settings_path(path, sizeof(path), true) ||
+        snprintf(temporary, sizeof(temporary), "%s.%llu.tmp", path,
+                 (unsigned long long)SDL_GetTicksNS()) >= (int)sizeof(temporary)) return false;
+    FILE *file = fopen(temporary, "w");
+    if (!file) return false;
+    bool ok = fprintf(file, "%lld %lld %lld\n", (long long)options->level,
+                      (long long)options->trials, (long long)options->adaptive) > 0;
+    if (fclose(file) != 0) ok = false;
+#ifdef _WIN32
+    if (ok) ok = MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    if (ok) ok = rename(temporary, path) == 0;
+#endif
+    if (!ok) remove(temporary);
+    return ok;
+}
+
+static bool algebra_settings_path(char *path, size_t capacity, bool create_dir) {
+    const char *override = getenv("NW_ALGEBRA_SETTINGS_PATH");
+    if (override && *override) return snprintf(path, capacity, "%s", override) < (int)capacity;
+#ifdef _WIN32
+    const char *base = getenv("APPDATA");
+    if (!base) base = getenv("USERPROFILE");
+    const char *folder = "/Neural Workshop";
+#else
+    const char *base = getenv("HOME");
+    const char *folder = "/.neural-workshop";
+#endif
+    if (!base) return false;
+    char directory[4096];
+    if (snprintf(directory, sizeof(directory), "%s%s", base, folder) >= (int)sizeof(directory)) return false;
+    if (create_dir && !SDL_CreateDirectory(directory)) return false;
+    return snprintf(path, capacity, "%s/algebra-options", directory) < (int)capacity;
+}
+
+static void algebra_read_settings(crossword_options *options) {
+    char path[4096], line[256];
+    if (!algebra_settings_path(path, sizeof(path), false)) return;
+    FILE *file = fopen(path, "r");
+    if (!file) return;
+    bool complete = fgets(line, sizeof(line), file) != NULL && fgetc(file) == EOF && !ferror(file);
+    fclose(file);
+    if (!complete) return;
+    long long fields[4];
+    char *cursor = line;
+    for (int i = 0; i < 4; i++) {
+        while (isspace((unsigned char)*cursor)) cursor++;
+        errno = 0;
+        char *end = NULL;
+        fields[i] = strtoll(cursor, &end, 10);
+        if (errno == ERANGE || end == cursor || (*end && !isspace((unsigned char)*end))) return;
+        cursor = end;
+    }
+    while (isspace((unsigned char)*cursor)) cursor++;
+    static const int64_t trial_choices[] = {1,2,3,5,6,8,10,15};
+    if (*cursor == '\0' && fields[0] >= 1 && fields[0] <= 12 &&
+        value_in_set(fields[1], trial_choices, 8) &&
+        (fields[2] == 0 || fields[2] == 1) && (fields[3] == 0 || fields[3] == 1)) {
+        options->level = fields[0]; options->trials = fields[1];
+        options->show_mistakes = fields[2]; options->adaptive = fields[3];
+    }
+}
+
+static bool algebra_write_settings(const crossword_options *options) {
+    char path[4096], temporary[4200];
+    if (!algebra_settings_path(path, sizeof(path), true) ||
+        snprintf(temporary, sizeof(temporary), "%s.%llu.tmp", path,
+                 (unsigned long long)SDL_GetTicksNS()) >= (int)sizeof(temporary)) return false;
+    FILE *file = fopen(temporary, "w");
+    if (!file) return false;
+    bool ok = fprintf(file, "%lld %lld %lld %lld\n", (long long)options->level,
+                      (long long)options->trials, (long long)options->show_mistakes,
+                      (long long)options->adaptive) > 0;
+    if (fclose(file) != 0) ok = false;
+#ifdef _WIN32
+    if (ok) ok = MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    if (ok) ok = rename(temporary, path) == 0;
+#endif
+    if (!ok) remove(temporary);
+    return ok;
+}
+
+static bool scramble_settings_path(char *path, size_t capacity, bool create_dir) {
+    const char *override = getenv("NW_SCRAMBLE_SETTINGS_PATH");
+    if (override && *override) return snprintf(path, capacity, "%s", override) < (int)capacity;
+#ifdef _WIN32
+    const char *base = getenv("APPDATA");
+    if (!base) base = getenv("USERPROFILE");
+    const char *folder = "/Neural Workshop";
+#else
+    const char *base = getenv("HOME");
+    const char *folder = "/.neural-workshop";
+#endif
+    if (!base) return false;
+    char directory[4096];
+    if (snprintf(directory, sizeof(directory), "%s%s", base, folder) >= (int)sizeof(directory)) return false;
+    if (create_dir && !SDL_CreateDirectory(directory)) return false;
+    return snprintf(path, capacity, "%s/scramble-options", directory) < (int)capacity;
+}
+
+static void scramble_read_settings(crossword_options *options) {
+    char path[4096], line[256];
+    if (!scramble_settings_path(path, sizeof(path), false)) return;
+    FILE *file = fopen(path, "r");
+    if (!file) return;
+    bool complete = fgets(line, sizeof(line), file) != NULL && fgetc(file) == EOF && !ferror(file);
+    fclose(file);
+    if (!complete) return;
+    long long fields[4];
+    char *cursor = line;
+    for (int i = 0; i < 4; i++) {
+        while (isspace((unsigned char)*cursor)) cursor++;
+        errno = 0;
+        char *end = NULL;
+        fields[i] = strtoll(cursor, &end, 10);
+        if (errno == ERANGE || end == cursor || (*end && !isspace((unsigned char)*end))) return;
+        cursor = end;
+    }
+    while (isspace((unsigned char)*cursor)) cursor++;
+    static const int64_t trial_choices[] = {1,2,3,5,8,10,15};
+    if (*cursor == '\0' && fields[0] >= 1 && fields[0] <= 12 &&
+        value_in_set(fields[1], trial_choices, 7) &&
+        (fields[2] == 0 || fields[2] == 1) && (fields[3] == 0 || fields[3] == 1)) {
+        options->level = fields[0]; options->trials = fields[1];
+        options->show_mistakes = fields[2]; options->adaptive = fields[3];
+    }
+}
+
+static bool scramble_write_settings(const crossword_options *options) {
+    char path[4096], temporary[4200];
+    if (!scramble_settings_path(path, sizeof(path), true) ||
+        snprintf(temporary, sizeof(temporary), "%s.%llu.tmp", path,
+                 (unsigned long long)SDL_GetTicksNS()) >= (int)sizeof(temporary)) return false;
+    FILE *file = fopen(temporary, "w");
+    if (!file) return false;
+    bool ok = fprintf(file, "%lld %lld %lld %lld\n", (long long)options->level,
+                      (long long)options->trials, (long long)options->show_mistakes,
+                      (long long)options->adaptive) > 0;
+    if (fclose(file) != 0) ok = false;
+#ifdef _WIN32
+    if (ok) ok = MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    if (ok) ok = rename(temporary, path) == 0;
+#endif
+    if (!ok) remove(temporary);
+    return ok;
+}
+
+static int parse_crossword_options(int argc, char **argv, crossword_options *options, bool use_saved) {
+    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10};
+    static const int64_t trials[] = {1,2,3,5,8,10};
+    *options = (crossword_options){2, 3, 1, 1, NULL};
+    if (use_saved) crossword_read_settings(options);
+    for (int i = 1; i < argc; i++) {
+        const char *name = argv[i];
+        if (!strcmp(name, "--crossword-no-mistakes")) { options->show_mistakes = 0; continue; }
+        if (!strcmp(name, "--crossword-no-adaptive")) { options->adaptive = 0; continue; }
+        bool is_level = !strcmp(name, "--crossword-level");
+        bool is_trials = !strcmp(name, "--crossword-trials");
+        bool is_path = !strcmp(name, "--crossword-lexicon");
+        if (!is_level && !is_trials && !is_path) continue;
+        if (++i >= argc) { fprintf(stderr, "%s requires a value\n", name); return 2; }
+        if (is_path) { options->lexicon = argv[i]; continue; }
+        errno = 0;
+        char *end = NULL;
+        long long value = strtoll(argv[i], &end, 10);
+        const int64_t *allowed = is_level ? levels : trials;
+        size_t count = is_level ? sizeof(levels)/sizeof(*levels) : sizeof(trials)/sizeof(*trials);
+        if (errno == ERANGE || end == argv[i] || *end || !value_in_set(value, allowed, count)) {
+            fprintf(stderr, "invalid value for %s: %s\n", name, argv[i]); return 2;
+        }
+        if (is_level) options->level = value; else options->trials = value;
+    }
+    return 0;
+}
+
+/* The controller owns its copy. A missing default index leaves the task ready
+ * with its on-screen recovery message; an explicit bad path is an error. */
+static int load_word_index(int64_t handle, const char *explicit_path, bool scrabble) {
+    char default_path[4096];
+    const char *path = explicit_path;
+    if (!path) {
+#ifdef _WIN32
+        const char *base = getenv("APPDATA");
+        const char *suffix = "/Brain Workshop/data/words/lexicon.tsv";
+#elif defined(__APPLE__)
+        const char *base = getenv("HOME");
+        const char *suffix = "/Library/Application Support/Brain Workshop/data/words/lexicon.tsv";
+#else
+        const char *base = getenv("HOME");
+        const char *suffix = "/.brainworkshop/data/words/lexicon.tsv";
+#endif
+        if (!base || snprintf(default_path, sizeof(default_path), "%s%s", base, suffix) >= (int)sizeof(default_path)) return 0;
+        path = default_path;
+    }
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        if (explicit_path) fprintf(stderr, "Cannot open %s lexicon %s: %s\n", scrabble ? "Scrabble" : "Crossword", path, strerror(errno));
+        return explicit_path ? -1 : 0;
+    }
+    if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return -1; }
+    long length = ftell(file);
+    if (length <= 0 || length > 67108864 || fseek(file, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "Invalid %s lexicon size: %s\n", scrabble ? "Scrabble" : "Crossword", path); fclose(file); return -1;
+    }
+    void *data = malloc((size_t)length);
+    if (!data) { fclose(file); return -1; }
+    size_t read_count = fread(data, 1, (size_t)length, file);
+    fclose(file);
+    int64_t result = read_count == (size_t)length
+        ? (scrabble ? nw_scrabble_set_lexicon(handle, (int64_t)(uintptr_t)data, length)
+                    : nw_crossword_set_lexicon(handle, (int64_t)(uintptr_t)data, length)) : -1;
+    free(data);
+    if (result != 0) { fprintf(stderr, "Invalid or unreadable %s lexicon: %s\n", scrabble ? "Scrabble" : "Crossword", path); return -1; }
+    return 0;
+}
+
+static int64_t create_crossword(const crossword_options *options) {
+    int64_t handle = nw_crossword_create(options->level, options->trials,
+                                         options->show_mistakes, options->adaptive, 23);
+    if (handle && load_word_index(handle, options->lexicon, false) != 0) {
+        nw_crossword_destroy(handle); return 0;
+    }
+    return handle;
+}
+
+static int parse_scrabble_options(int argc, char **argv, crossword_options *options, bool use_saved) {
+    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10};
+    static const int64_t trials[] = {1,2,3,5,8,10,15};
+    *options = (crossword_options){3, 5, 1, 1, NULL};
+    if (use_saved) scrabble_read_settings(options);
+    for (int i = 1; i < argc; i++) {
+        const char *name = argv[i];
+        if (!strcmp(name, "--scrabble-no-premiums")) { options->show_mistakes = 0; continue; }
+        if (!strcmp(name, "--scrabble-no-adaptive")) { options->adaptive = 0; continue; }
+        bool level = !strcmp(name, "--scrabble-level"), count = !strcmp(name, "--scrabble-trials");
+        bool path = !strcmp(name, "--scrabble-lexicon");
+        if (!level && !count && !path) continue;
+        if (++i >= argc) { fprintf(stderr, "%s requires a value\n", name); return 2; }
+        if (path) { options->lexicon = argv[i]; continue; }
+        errno = 0; char *end = NULL; long long value = strtoll(argv[i], &end, 10);
+        if (errno == ERANGE || end == argv[i] || *end ||
+            !value_in_set(value, level ? levels : trials, level ? 10 : 7)) {
+            fprintf(stderr, "invalid value for %s: %s\n", name, argv[i]); return 2;
+        }
+        if (level) options->level = value; else options->trials = value;
+    }
+    return 0;
+}
+
+static int64_t create_scrabble(const crossword_options *options) {
+    int64_t handle = nw_scrabble_create(options->level, options->trials,
+                                        options->show_mistakes, options->adaptive, 23);
+    if (handle && load_word_index(handle, options->lexicon, true) != 0) {
+        nw_scrabble_destroy(handle); return 0;
+    }
+    return handle;
+}
+
+static int parse_numberology_options(int argc, char **argv, crossword_options *options, bool use_saved) {
+    static const int64_t trials[] = {1,2,3,5,6,8,10,15};
+    *options = (crossword_options){1, 6, 0, 1, NULL};
+    if (use_saved) numberology_read_settings(options);
+    for (int i = 1; i < argc; i++) {
+        const char *name = argv[i];
+        if (!strcmp(name, "--numberology-no-adaptive")) { options->adaptive = 0; continue; }
+        bool level = !strcmp(name, "--numberology-level"), count = !strcmp(name, "--numberology-trials");
+        if (!level && !count) continue;
+        if (++i >= argc) { fprintf(stderr, "%s requires a value\n", name); return 2; }
+        errno = 0; char *end = NULL; long long value = strtoll(argv[i], &end, 10);
+        if (errno == ERANGE || end == argv[i] || *end || (level ? value < 1 : !value_in_set(value, trials, 8))) {
+            fprintf(stderr, "invalid value for %s: %s\n", name, argv[i]); return 2;
+        }
+        if (level) options->level = value; else options->trials = value;
+    }
+    return 0;
+}
+
+static int parse_algebra_options(int argc, char **argv, crossword_options *options, bool use_saved) {
+    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10,11,12};
+    static const int64_t trials[] = {1,2,3,5,6,8,10,15};
+    *options = (crossword_options){3, 6, 1, 1, NULL};
+    if (use_saved) algebra_read_settings(options);
+    for (int i = 1; i < argc; i++) {
+        const char *name = argv[i];
+        if (!strcmp(name, "--algebra-no-working")) { options->show_mistakes = 0; continue; }
+        if (!strcmp(name, "--algebra-no-adaptive")) { options->adaptive = 0; continue; }
+        bool level = !strcmp(name, "--algebra-level"), count = !strcmp(name, "--algebra-trials");
+        if (!level && !count) continue;
+        if (++i >= argc) { fprintf(stderr, "%s requires a value\n", name); return 2; }
+        errno = 0; char *end = NULL; long long value = strtoll(argv[i], &end, 10);
+        if (errno == ERANGE || end == argv[i] || *end ||
+            !value_in_set(value, level ? levels : trials, level ? 12 : 8)) {
+            fprintf(stderr, "invalid value for %s: %s\n", name, argv[i]); return 2;
+        }
+        if (level) options->level = value; else options->trials = value;
+    }
+    return 0;
+}
+
+static int parse_scramble_options(int argc, char **argv, crossword_options *options, bool use_saved) {
+    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10,11,12};
+    static const int64_t trials[] = {1,2,3,5,8,10,15};
+    *options = (crossword_options){3, 5, 1, 1, NULL};
+    if (use_saved) scramble_read_settings(options);
+    for (int i = 1; i < argc; i++) {
+        const char *name = argv[i];
+        if (!strcmp(name, "--scramble-no-count")) { options->show_mistakes = 0; continue; }
+        if (!strcmp(name, "--scramble-no-adaptive")) { options->adaptive = 0; continue; }
+        bool level = !strcmp(name, "--scramble-level"), count = !strcmp(name, "--scramble-trials");
+        if (!level && !count) continue;
+        if (++i >= argc) { fprintf(stderr, "%s requires a value\n", name); return 2; }
+        errno = 0; char *end = NULL; long long value = strtoll(argv[i], &end, 10);
+        if (errno == ERANGE || end == argv[i] || *end ||
+            !value_in_set(value, level ? levels : trials, level ? 12 : 7)) {
+            fprintf(stderr, "invalid value for %s: %s\n", name, argv[i]); return 2;
+        }
+        if (level) options->level = value; else options->trials = value;
+    }
+    return 0;
+}
+
+static void *scramble_read_file(const char *path, long *length) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return NULL;
+    if (fseek(file, 0, SEEK_END) != 0 || (*length = ftell(file)) <= 0 ||
+        *length > 67108864 || fseek(file, 0, SEEK_SET) != 0) { fclose(file); return NULL; }
+    void *data = malloc((size_t)*length);
+    if (!data) { fclose(file); return NULL; }
+    size_t read_count = fread(data, 1, (size_t)*length, file);
+    fclose(file);
+    if (read_count != (size_t)*length) { free(data); return NULL; }
+    return data;
+}
+
+static int64_t create_scramble(const crossword_options *options, const char *explicit_index, const char *explicit_sentences) {
+    int64_t handle = nw_scramble_create(options->level, options->trials, options->show_mistakes, options->adaptive, 17);
+    if (handle <= 0) return 0;
+    char index_path[4096], sentence_path[4096];
+#ifdef _WIN32
+    const char *base = getenv("APPDATA"), *folder = "/Brain Workshop/data/words";
+#elif defined(__APPLE__)
+    const char *base = getenv("HOME"), *folder = "/Library/Application Support/Brain Workshop/data/words";
+#else
+    const char *base = getenv("HOME"), *folder = "/.brainworkshop/data/words";
+#endif
+    if (!base) base = "";
+    if (snprintf(index_path, sizeof(index_path), "%s%s/lexicon.tsv", base, folder) >= (int)sizeof(index_path) ||
+        snprintf(sentence_path, sizeof(sentence_path), "%s%s/sentences.txt", base, folder) >= (int)sizeof(sentence_path)) {
+        nw_scramble_destroy(handle); return 0;
+    }
+    const char *index = explicit_index ? explicit_index : index_path;
+    const char *sentences = explicit_sentences ? explicit_sentences : sentence_path;
+    long index_length = 0, sentence_length = 0;
+    void *index_data = scramble_read_file(index, &index_length);
+    void *sentence_data = scramble_read_file(sentences, &sentence_length);
+    if ((!index_data && explicit_index) || (!sentence_data && explicit_sentences)) {
+        free(index_data); free(sentence_data);
+        fprintf(stderr, "Cannot load Scramble corpus: requested file must exist and be readable\n");
+        nw_scramble_destroy(handle); return 0;
+    }
+    if (!explicit_sentences && sentence_data && sentence_length <= 4096) {
+        free(sentence_data); sentence_data = NULL; sentence_length = 0;
+    }
+    if (!index_data && !sentence_data) return handle;
+    int64_t result = nw_scramble_set_corpus(handle, (int64_t)(uintptr_t)index_data, index_length,
+                                            (int64_t)(uintptr_t)sentence_data, sentence_length);
+    free(index_data); free(sentence_data);
+    if (result != 0) { fprintf(stderr, "Invalid Scramble corpus\n"); nw_scramble_destroy(handle); return 0; }
+    return handle;
+}
+
+static void numberology_text(int64_t handle, const char *text, int64_t now_ms) {
+    const unsigned char *at = (const unsigned char *)text;
+    while (*at) nw_numberology_action(handle, 1, *at++, now_ms);
+}
+
+static void numberology_advance(int64_t handle, crossword_options *options) {
+    int64_t before = nw_numberology_info(handle, 0);
+    nw_numberology_action(handle, 0, 0, (int64_t)SDL_GetTicks());
+    if (before != 3 && nw_numberology_info(handle, 0) == 3 && options->adaptive) {
+        int64_t next = nw_numberology_info(handle, 13);
+        if (next > options->level) {
+            options->level = next;
+            if (!numberology_write_settings(options)) SDL_Log("Could not save Numberology settings");
+        }
+    }
+}
+
+static void algebra_text(int64_t handle, const char *text, int64_t now_ms) {
+    const unsigned char *at = (const unsigned char *)text;
+    while (*at) nw_algebra_action(handle, 1, *at++, now_ms);
+}
+
+static void algebra_start(int64_t handle) {
+    nw_algebra_action(handle, 0, 0, (int64_t)SDL_GetTicks());
+    if (nw_algebra_info(handle, 0) == 1)
+        nw_algebra_action(handle, 4, 0, (int64_t)SDL_GetTicks());
+}
+
+static void scramble_text(int64_t handle, const char *text, int64_t now_ms) {
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p) {
+        unsigned char c = *p++;
+        int64_t value = c == ' ' ? 26 : c >= 'A' && c <= 'Z' ? c - 'A' :
+                        c >= 'a' && c <= 'z' ? c - 'a' : 27;
+        if (c >= 0x80) while ((*p & 0xc0) == 0x80) p++;
+        nw_scramble_action(handle, 1, value, now_ms);
+    }
+}
+
+static int selftest_scramble(void) {
+    int bad = 0;
+    crossword_options options;
+    char *args[] = {"test", "--scramble-level", "12", "--scramble-trials", "15",
+                    "--scramble-no-count", "--scramble-no-adaptive"};
+    if (parse_scramble_options(7, args, &options, false) || options.level != 12 || options.trials != 15 ||
+        options.show_mistakes != 0 || options.adaptive != 0) bad++;
+    int64_t handle = nw_scramble_create(1, 1, 1, 1, 17);
+    uint8_t *frame = malloc(FRAME_CAPACITY);
+    if (!handle || !frame) bad++;
+    if (handle && frame) {
+        const char *shown = "we saw mnay pepole on the ctiy street";
+        if (nw_scramble_action(handle, 0, 0, 0) != 1 || nw_scramble_info(handle, 4) != (int64_t)strlen(shown)) bad++;
+        if (nw_scramble_action(handle, 5, 0, 100) != 1 || nw_scramble_action(handle, 5, 0, 101) != 2) bad++;
+        for (size_t i = 0; i < strlen(shown); i++) {
+            int64_t value = nw_scramble_value(handle, 0, (int64_t)i);
+            if ((value == 26 ? ' ' : 'a' + value) != shown[i]) bad++;
+        }
+        scramble_text(handle, "WE\nSAW MANY PEOPLE ON THE CITY STREET", 102);
+        if (nw_scramble_action(handle, 3, 0, 2600) != 1 || nw_scramble_info(handle, 6) != 1 ||
+            nw_scramble_info(handle, 16) != 2) bad++;
+        if (nw_scramble_frame_write((int64_t)(uintptr_t)frame, FRAME_CAPACITY, handle, 0, 912, 684) <= 0) bad++;
+        if (nw_scramble_action(handle, 0, 0, 3) != 1 || nw_scramble_info(handle, 0) != 3) bad++;
+        const char *index = "cat\t1\t\na\t2\t\n", *sentences = "a cat a cat a cat\n";
+        if (nw_scramble_set_corpus(handle, (int64_t)(uintptr_t)index, (int64_t)strlen(index),
+                                   (int64_t)(uintptr_t)sentences, (int64_t)strlen(sentences)) != 0 ||
+            nw_scramble_info(handle, 13) != 1) bad++;
+        if (nw_scramble_action(handle, 0, 0, 4) != 1 || nw_scramble_info(handle, 0) != 1) bad++;
+        scramble_text(handle, "a cat a cat a cat", 5);
+        if (nw_scramble_action(handle, 3, 0, 6) != 1 || nw_scramble_info(handle, 6) != 1) bad++;
+        if (nw_scramble_set_corpus(handle, 0, 0, (int64_t)(uintptr_t)sentences, (int64_t)strlen(sentences)) != 0 ||
+            nw_scramble_info(handle, 14) != 0 || nw_scramble_info(handle, 15) != 1) bad++;
+        if (nw_scramble_action(handle, 0, 0, 7) != 1 || nw_scramble_info(handle, 0) != 1) bad++;
+        scramble_text(handle, "a cat a cat a cat", 8);
+        if (nw_scramble_action(handle, 3, 0, 9) != 1 || nw_scramble_info(handle, 6) != 1) bad++;
+        if (nw_scramble_set_corpus(handle, (int64_t)(uintptr_t)index, (int64_t)strlen(index), 0, 0) != 0 ||
+            nw_scramble_info(handle, 14) != 1 || nw_scramble_info(handle, 15) != 0) bad++;
+        if (nw_scramble_action(handle, 0, 0, 10) != 1 || nw_scramble_info(handle, 0) != 3) bad++;
+        if (nw_scramble_options_frame_write((int64_t)(uintptr_t)frame, FRAME_CAPACITY, 0, 0, 12, 15, 0, 1) <= 0) bad++;
+        if (nw_scramble_action(handle, 4, 12 | (6 << 4) | 256, 4) != 1 ||
+            nw_scramble_info(handle, 0) != 0 || nw_scramble_info(handle, 1) != 12 ||
+            nw_scramble_info(handle, 3) != 15 || nw_scramble_info(handle, 11) != 0 || nw_scramble_info(handle, 12) != 1) bad++;
+        nw_scramble_destroy(handle);
+    }
+    free(frame);
+    SDL_Log("Scramble selftest: %s", bad ? "FAIL" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_scrabble(void) {
+    int bad = 0;
+    crossword_options options;
+    char *args[] = {"test", "--scrabble-level", "2", "--scrabble-trials", "1",
+                    "--scrabble-no-premiums", "--scrabble-no-adaptive"};
+    if (parse_scrabble_options(7, args, &options, false) || options.level != 2 || options.trials != 1 ||
+        options.show_mistakes || options.adaptive) bad++;
+    int64_t h = nw_scrabble_create(1, 1, 1, 1, 17);
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    if (!h || !buffer) bad++;
+    else {
+        if (nw_scrabble_action(h, 0, 0, 100) != 1 || nw_scrabble_info(h, 0) != 1) bad++;
+        if (nw_scrabble_action(h, 10, 0, 1100) != 1 || nw_scrabble_action(h, 10, 0, 1101) != 2) bad++;
+        /* Original offline seed-17 level-1 deal: CAT and rack GLST. */
+        if (nw_scrabble_info(h, 9) != 8 || nw_scrabble_info(h, 10) <= 0) bad++;
+        if (nw_scrabble_value(h, 0, 23) != 'c' || nw_scrabble_value(h, 0, 24) != 'a' ||
+            nw_scrabble_value(h, 0, 25) != 't' || nw_scrabble_value(h, 2, 0) != 'g' ||
+            nw_scrabble_value(h, 2, 1) != 'l' || nw_scrabble_value(h, 2, 2) != 's' ||
+            nw_scrabble_value(h, 2, 3) != 't') bad++;
+        if (nw_scrabble_frame_write(buffer, FRAME_CAPACITY, h, 0, 912, 684) <= 0) bad++;
+        if (nw_scrabble_options_frame_write(buffer, FRAME_CAPACITY, 0, 0, 2, 15, 0, 0) <= 0) bad++;
+        if (nw_scrabble_action(h, 9, 2 | (6 << 4), 101) != 1 ||
+            nw_scrabble_info(h, 0) != 0 || nw_scrabble_info(h, 1) != 2 ||
+            nw_scrabble_info(h, 3) != 15 || nw_scrabble_info(h, 17) != 0 || nw_scrabble_info(h, 18) != 0) bad++;
+        if (nw_scrabble_action(h, 0, 0, 102) != 1) bad++;
+        if (nw_scrabble_pointer(h, 500000, 500000, 912, 684, 2, 0, 103) != 1) bad++;
+        if (nw_scrabble_destroy(h) != 0) bad++;
+    }
+    free((void *)(uintptr_t)buffer);
+    printf("Scrabble selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static void crossword_modify_option(crossword_options *draft, int selected, int step) {
+    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10};
+    static const int64_t trials[] = {1,2,3,5,8,10};
+    if (selected >= 2) {
+        if (selected == 2) draft->show_mistakes = !draft->show_mistakes;
+        else draft->adaptive = !draft->adaptive;
+        return;
+    }
+    const int64_t *choices = selected == 0 ? levels : trials;
+    int count = selected == 0 ? 10 : 6;
+    int64_t *value = selected == 0 ? &draft->level : &draft->trials;
+    int at = 0;
+    while (at < count && choices[at] != *value) at++;
+    *value = choices[(at + step + count) % count];
+}
+
+static int64_t crossword_pack_options(const crossword_options *options) {
+    static const int64_t trials[] = {1,2,3,5,8,10};
+    int at = 0;
+    while (at < 5 && trials[at] != options->trials) at++;
+    return options->level | ((int64_t)at << 4) | (options->show_mistakes << 7) | (options->adaptive << 8);
+}
+
+static void numberology_edit_digit(crossword_options *draft, bool *editing, int64_t *value, int digit) {
+    int64_t current = *editing ? *value : 0;
+    if (digit < 0 || digit > 9 || current > (INT64_MAX - digit) / 10) return;
+    *value = current * 10 + digit;
+    draft->level = *value > 0 ? *value : 1;
+    *editing = true;
+}
+
+static void numberology_edit_backspace(crossword_options *draft, bool *editing, int64_t *value) {
+    int64_t current = *editing ? *value : draft->level;
+    *value = current / 10;
+    draft->level = *value > 0 ? *value : 1;
+    *editing = true;
+}
+
+static void numberology_modify_option(crossword_options *draft, int selected, int step) {
+    static const int64_t choices[] = {1, 2, 3, 5, 6, 8, 10, 15};
+    if (selected == 0) {
+        if (step < 0 && draft->level > 1) draft->level--;
+        if (step > 0 && draft->level < INT64_MAX) draft->level++;
+    } else if (selected == 1) {
+        int i = 0; while (i < 8 && choices[i] != draft->trials) i++;
+        draft->trials = choices[(i + (step < 0 ? 7 : 1)) % 8];
+    } else draft->adaptive = !draft->adaptive;
+}
+
+static void algebra_modify_option(crossword_options *draft, int selected, int step) {
+    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10,11,12};
+    static const int64_t trials[] = {1,2,3,5,6,8,10,15};
+    if (selected >= 2) {
+        if (selected == 2) draft->show_mistakes = !draft->show_mistakes;
+        else draft->adaptive = !draft->adaptive;
+        return;
+    }
+    const int64_t *choices = selected == 0 ? levels : trials;
+    int count = selected == 0 ? 12 : 8;
+    int64_t *value = selected == 0 ? &draft->level : &draft->trials;
+    int at = 0;
+    while (at < count && choices[at] != *value) at++;
+    *value = choices[(at + step + count) % count];
+}
+
+static void scramble_modify_option(crossword_options *draft, int selected, int step) {
+    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10,11,12};
+    static const int64_t trials[] = {1,2,3,5,8,10,15};
+    if (selected >= 2) {
+        if (selected == 2) draft->show_mistakes = !draft->show_mistakes;
+        else draft->adaptive = !draft->adaptive;
+        return;
+    }
+    const int64_t *choices = selected == 0 ? levels : trials;
+    int count = selected == 0 ? 12 : 7;
+    int64_t *value = selected == 0 ? &draft->level : &draft->trials;
+    int at = 0;
+    while (at < count && choices[at] != *value) at++;
+    *value = choices[(at + step + count) % count];
+}
+
+static void scrabble_modify_option(crossword_options *draft, int selected, int step) {
+    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10};
+    static const int64_t trials[] = {1,2,3,5,8,10,15};
+    if (selected >= 2) {
+        if (selected == 2) draft->show_mistakes = !draft->show_mistakes;
+        else draft->adaptive = !draft->adaptive;
+        return;
+    }
+    const int64_t *choices = selected == 0 ? levels : trials;
+    int count = selected == 0 ? 10 : 7;
+    int64_t *value = selected == 0 ? &draft->level : &draft->trials;
+    int at = 0;
+    while (at < count && choices[at] != *value) at++;
+    *value = choices[(at + step + count) % count];
+}
+
+static int64_t scrabble_pack_options(const crossword_options *options) {
+    static const int64_t trials[] = {1,2,3,5,8,10,15};
+    int at = 0;
+    while (at < 6 && trials[at] != options->trials) at++;
+    return options->level | ((int64_t)at << 4) | (options->show_mistakes << 7) | (options->adaptive << 8);
+}
+
+static bool shell_exit_key(SDL_Keycode key, bool crossword, bool crossed_wires) {
+    return key == SDLK_ESCAPE || (key == SDLK_Q && !crossword && !crossed_wires);
+}
+
+static int selftest_crossword(void) {
+    static const char index[] = "aaa\t1\tThree-letter fixture clue\naaaa\t2\tFour-letter fixture clue\n";
+    int bad = 0;
+    if (shell_exit_key(SDLK_Q, true, false) || shell_exit_key(SDLK_Q, false, true) ||
+        !shell_exit_key(SDLK_ESCAPE, true, false) || !shell_exit_key(SDLK_Q, false, false)) bad++;
+    crossword_options options;
+    char *defaults[] = {"test"};
+    char *custom[] = {"test", "--crossword-level", "10", "--crossword-trials", "5",
+                      "--crossword-no-mistakes", "--crossword-no-adaptive"};
+    if (parse_crossword_options(1, defaults, &options, false) || options.level != 2 || options.trials != 3 ||
+        !options.show_mistakes || !options.adaptive) bad++;
+    if (parse_crossword_options(7, custom, &options, false) || options.level != 10 || options.trials != 5 ||
+        options.show_mistakes || options.adaptive) bad++;
+    int64_t handle = nw_crossword_create(1, 1, 1, 1, 17);
+    int64_t buffer = nw_frame_alloc(FRAME_CAPACITY);
+    if (!handle || !buffer) bad++;
+    else {
+        if (nw_crossword_action(handle, 0, 0, 100) != 2 || nw_crossword_info(handle, 0) != 0) bad++;
+        if (nw_crossword_action(handle, 10, 2 | (3 << 4), 101) != 1 ||
+            nw_crossword_info(handle, 1) != 2 || nw_crossword_info(handle, 3) != 5 ||
+            nw_crossword_info(handle, 13) != 0 || nw_crossword_info(handle, 14) != 0) bad++;
+        if (nw_crossword_action(handle, 10, 1 | (1 << 7) | (1 << 8), 102) != 1) bad++;
+        if (nw_crossword_set_lexicon(handle, (int64_t)(uintptr_t)"bad", 3) == 0) bad++;
+        if (nw_crossword_set_lexicon(handle, (int64_t)(uintptr_t)index, sizeof(index)-1) != 0) bad++;
+        if (nw_crossword_info(handle, 12) != 1) bad++;
+        if (nw_crossword_frame_write(buffer, FRAME_CAPACITY, handle, 0, 912, 684) <= 0) bad++;
+        if (nw_crossword_options_frame_write(buffer, FRAME_CAPACITY, 0, 0, 2, 3, 1, 1) <= 0) bad++;
+        crossword_modify_option(&options, 0, 1);
+        if (options.level != 1 || crossword_pack_options(&options) != (1 | (3 << 4))) bad++;
+        if (nw_crossword_action(handle, 0, 0, 1000) != 1 || nw_crossword_info(handle, 0) != 1) bad++;
+        if (nw_crossword_action(handle, 7, 1, 1001) != 1 || nw_crossword_info(handle, 10) != 1) bad++;
+        int64_t facing = nw_crossword_info(handle, 7);
+        if (nw_crossword_pointer(handle, 500000, 500000, 912, 684, 2, 1002) != 1 ||
+            nw_crossword_info(handle, 7) == facing) bad++;
+        if (nw_crossword_destroy(handle) != 0) bad++;
+    }
+    free((void *)(uintptr_t)buffer);
+    printf("Crossword selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int parse_task_options(int argc, char **argv,
+                              int64_t *sudoku_level, int64_t *sudoku_puzzles,
+                              int64_t *sudoku_show_clashes,
+                              int64_t *sudoku_adaptive,
+                              int64_t *jigsaw_side, int64_t *jigsaw_puzzles,
+                              int64_t *jigsaw_adaptive, int64_t *jigsaw_preview,
+                              int64_t *jigsaw_mark_placed,
+                              int64_t *go_level, int64_t *go_trials,
+                              int64_t *crossed_wires_level,
+                              int64_t *crossed_wires_rounds,
+                              int64_t *crossed_wires_adaptive,
+                              int64_t *crossed_wires_show_grid) {
+    static const int64_t sudoku_levels[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    static const int64_t sudoku_trials[] = { 1, 2, 3, 5, 8, 10 };
+    static const int64_t jigsaw_sides[] = { 2, 3, 4, 5, 6, 7, 8, 10 };
+    static const int64_t jigsaw_trials[] = { 1, 2, 3, 5, 8, 12, 20 };
+    static const int64_t go_levels[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    static const int64_t go_trials_allowed[] = { 1, 3, 5, 8, 10, 15, 20, 30, 50 };
+    static const int64_t crossed_wires_levels[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    static const int64_t crossed_wires_round_choices[] = { 1, 2, 3, 5, 8, 10, 15, 20 };
+
+    *sudoku_level = 3;
+    *sudoku_puzzles = 3;
+    *sudoku_show_clashes = 1;
+    *sudoku_adaptive = 1;
+    *jigsaw_side = 3;
+    *jigsaw_puzzles = 3;
+    *jigsaw_adaptive = 1;
+    *jigsaw_preview = 1;
+    *jigsaw_mark_placed = 0;
+    *go_level = 1;
+    *go_trials = 10;
+    *crossed_wires_level = 3;
+    *crossed_wires_rounds = 5;
+    *crossed_wires_adaptive = 1;
+    *crossed_wires_show_grid = 1;
+
+    for (int index = 1; index < argc; index++) {
+        const char *name = argv[index];
+        int64_t *target = NULL;
+        const int64_t *allowed = NULL;
+        size_t allowed_count = 0;
+
+        if (strcmp(name, "--sudoku-level") == 0) {
+            target = sudoku_level;
+            allowed = sudoku_levels;
+            allowed_count = sizeof(sudoku_levels) / sizeof(sudoku_levels[0]);
+        } else if (strcmp(name, "--sudoku-puzzles") == 0) {
+            target = sudoku_puzzles;
+            allowed = sudoku_trials;
+            allowed_count = sizeof(sudoku_trials) / sizeof(sudoku_trials[0]);
+        } else if (strcmp(name, "--jigsaw-side") == 0) {
+            target = jigsaw_side;
+            allowed = jigsaw_sides;
+            allowed_count = sizeof(jigsaw_sides) / sizeof(jigsaw_sides[0]);
+        } else if (strcmp(name, "--jigsaw-puzzles") == 0) {
+            target = jigsaw_puzzles;
+            allowed = jigsaw_trials;
+            allowed_count = sizeof(jigsaw_trials) / sizeof(jigsaw_trials[0]);
+        } else if (strcmp(name, "--go-level") == 0) {
+            target = go_level;
+            allowed = go_levels;
+            allowed_count = sizeof(go_levels) / sizeof(go_levels[0]);
+        } else if (strcmp(name, "--go-trials") == 0) {
+            target = go_trials;
+            allowed = go_trials_allowed;
+            allowed_count = sizeof(go_trials_allowed) / sizeof(go_trials_allowed[0]);
+        } else if (strcmp(name, "--crossed-wires-level") == 0) {
+            target = crossed_wires_level;
+            allowed = crossed_wires_levels;
+            allowed_count = sizeof(crossed_wires_levels) / sizeof(crossed_wires_levels[0]);
+        } else if (strcmp(name, "--crossed-wires-rounds") == 0) {
+            target = crossed_wires_rounds;
+            allowed = crossed_wires_round_choices;
+            allowed_count = sizeof(crossed_wires_round_choices) / sizeof(crossed_wires_round_choices[0]);
+        } else if (strcmp(name, "--sudoku-no-clashes") == 0) {
+            *sudoku_show_clashes = 0;
+            continue;
+        } else if (strcmp(name, "--sudoku-no-adaptive") == 0) {
+            *sudoku_adaptive = 0;
+            continue;
+        } else if (strcmp(name, "--jigsaw-no-adaptive") == 0) {
+            *jigsaw_adaptive = 0;
+            continue;
+        } else if (strcmp(name, "--jigsaw-no-preview") == 0) {
+            *jigsaw_preview = 0;
+            continue;
+        } else if (strcmp(name, "--jigsaw-mark-placed") == 0) {
+            *jigsaw_mark_placed = 1;
+            continue;
+        } else if (strcmp(name, "--crossed-wires-no-adaptive") == 0) {
+            *crossed_wires_adaptive = 0;
+            continue;
+        } else if (strcmp(name, "--crossed-wires-no-grid") == 0) {
+            *crossed_wires_show_grid = 0;
+            continue;
+        } else {
+            continue;
+        }
+
+        if (index + 1 >= argc) {
+            fprintf(stderr, "%s requires a value\n", name);
+            return 2;
+        }
+        errno = 0;
+        char *end = NULL;
+        long long parsed = strtoll(argv[++index], &end, 10);
+        if (errno == ERANGE || end == argv[index] || *end != '\0' ||
+            !value_in_set((int64_t)parsed, allowed, allowed_count)) {
+            fprintf(stderr, "invalid value for %s: %s\n", name, argv[index]);
+            return 2;
+        }
+        *target = (int64_t)parsed;
+    }
+    return 0;
+}
+
+static int selftest_algebra_options(void) {
+    int bad = 0;
+    crossword_options options;
+    char *args[] = {"test", "--algebra-level", "12", "--algebra-trials", "6", "--algebra-no-working", "--algebra-no-adaptive"};
+    if (parse_algebra_options(7, args, &options, false) || options.level != 12 || options.trials != 6 || options.show_mistakes || options.adaptive) bad++;
+    algebra_modify_option(&options, 0, 1);
+    if (options.level != 1) bad++;
+    algebra_modify_option(&options, 1, 1);
+    if (options.trials != 8) bad++;
+    algebra_modify_option(&options, 2, 1);
+    algebra_modify_option(&options, 3, 1);
+    if (!options.show_mistakes || !options.adaptive) bad++;
+    int64_t handle = nw_algebra_create_options(12, 1, 0, 1, 19);
+    uint8_t *frame = malloc(FRAME_CAPACITY);
+    if (!handle || !frame) bad++;
+    if (handle && frame) {
+        if (nw_algebra_options_frame_write((int64_t)(uintptr_t)frame, FRAME_CAPACITY, 0, 2, 12, 6, 0, 1) <= 0 ||
+            nw_algebra_action(handle, 0, 0, 0) != 1 || nw_algebra_action(handle, 1, 'x', 0) != 1 ||
+            nw_algebra_action(handle, 3, 0, 0) != 1 || nw_algebra_info(handle, 1) != 11 ||
+            nw_algebra_info(handle, 11) != 0) bad++;
+        algebra_start(handle);
+        algebra_start(handle);
+        algebra_text(handle, "X + Y/2", 100);
+        const char *expected = "x + y/2";
+        if (nw_algebra_info(handle, 6) != (int64_t)strlen(expected)) bad++;
+        else for (size_t j = 0; j < strlen(expected); j++)
+            if (nw_algebra_value(handle, 1, (int64_t)j) != (unsigned char)expected[j]) bad++;
+    }
+    if (handle) nw_algebra_destroy(handle);
+    free(frame);
+    printf("Algebra options selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
+static int selftest_task_options(void) {
+    int bad = 0;
+    int64_t sudoku_level, sudoku_puzzles, sudoku_show_clashes, sudoku_adaptive;
+    int64_t jigsaw_side, jigsaw_puzzles, jigsaw_adaptive, jigsaw_preview;
+    int64_t jigsaw_mark_placed, go_level, go_trials;
+    int64_t crossed_wires_level, crossed_wires_rounds;
+    int64_t crossed_wires_adaptive, crossed_wires_show_grid;
+    char *defaults[] = { "nw-sdl3" };
+    if (parse_task_options(1, defaults, &sudoku_level, &sudoku_puzzles,
+                           &sudoku_show_clashes, &sudoku_adaptive,
+                           &jigsaw_side, &jigsaw_puzzles, &jigsaw_adaptive,
+                           &jigsaw_preview, &jigsaw_mark_placed,
+                           &go_level, &go_trials, &crossed_wires_level,
+                           &crossed_wires_rounds, &crossed_wires_adaptive,
+                           &crossed_wires_show_grid) != 0 ||
+        sudoku_level != 3 || sudoku_puzzles != 3 || !sudoku_show_clashes ||
+        !sudoku_adaptive || jigsaw_side != 3 || jigsaw_puzzles != 3 ||
+        !jigsaw_adaptive || !jigsaw_preview || jigsaw_mark_placed ||
+        go_level != 1 || go_trials != 10 || crossed_wires_level != 3 ||
+        crossed_wires_rounds != 5 || !crossed_wires_adaptive ||
+        !crossed_wires_show_grid) {
+        bad++;
+    }
+
+    char *configured[] = {
+        "nw-sdl3", "--screen", "sudoku", "--sudoku-level", "12",
+        "--sudoku-puzzles", "10", "--sudoku-no-clashes",
+        "--sudoku-no-adaptive", "--jigsaw-side", "10", "--jigsaw-puzzles",
+        "20", "--go-level", "10", "--go-trials", "50",
+        "--crossed-wires-level", "12", "--crossed-wires-rounds", "20",
+        "--crossed-wires-no-adaptive", "--crossed-wires-no-grid",
+        "--jigsaw-no-adaptive", "--jigsaw-no-preview",
+        "--jigsaw-mark-placed"
+    };
+    if (parse_task_options((int)(sizeof(configured) / sizeof(configured[0])),
+                           configured, &sudoku_level, &sudoku_puzzles,
+                           &sudoku_show_clashes, &sudoku_adaptive,
+                           &jigsaw_side, &jigsaw_puzzles, &jigsaw_adaptive,
+                           &jigsaw_preview, &jigsaw_mark_placed,
+                           &go_level, &go_trials, &crossed_wires_level,
+                           &crossed_wires_rounds, &crossed_wires_adaptive,
+                           &crossed_wires_show_grid) != 0 ||
+        sudoku_level != 12 || sudoku_puzzles != 10 || sudoku_show_clashes ||
+        sudoku_adaptive || jigsaw_side != 10 || jigsaw_puzzles != 20 ||
+        jigsaw_adaptive || jigsaw_preview || !jigsaw_mark_placed ||
+        go_level != 10 || go_trials != 50 || crossed_wires_level != 12 ||
+        crossed_wires_rounds != 20 || crossed_wires_adaptive ||
+        crossed_wires_show_grid) {
+        bad++;
+    }
+    crossword_options numberology;
+    char *numberology_args[] = {"nw-sdl3", "--numberology-level", "10000",
+                                "--numberology-trials", "3", "--numberology-no-adaptive"};
+    if (parse_numberology_options(1, defaults, &numberology, false) != 0 ||
+        numberology.level != 1 || numberology.trials != 6 || !numberology.adaptive ||
+        parse_numberology_options(6, numberology_args, &numberology, false) != 0 ||
+        numberology.level != 10000 || numberology.trials != 3 || numberology.adaptive)
+        bad++;
+    numberology_modify_option(&numberology, 0, 1);
+    numberology_modify_option(&numberology, 1, 1);
+    numberology_modify_option(&numberology, 2, 1);
+    if (numberology.level != 10001 || numberology.trials != 5 || !numberology.adaptive) bad++;
+    bool editing = false; int64_t edit_value = 0;
+    numberology_edit_digit(&numberology, &editing, &edit_value, 0);
+    numberology_edit_digit(&numberology, &editing, &edit_value, 5);
+    if (numberology.level != 5) bad++;
+    numberology_edit_backspace(&numberology, &editing, &edit_value);
+    numberology_edit_digit(&numberology, &editing, &edit_value, 7);
+    if (numberology.level != 7) bad++;
+    edit_value = INT64_MAX; numberology.level = INT64_MAX;
+    numberology_edit_digit(&numberology, &editing, &edit_value, 9);
+    if (numberology.level != INT64_MAX) bad++;
+    printf("SDL task-options selftest: %s\n", bad ? "FAILED" : "PASS");
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--selftest-algebra-options") == 0) return selftest_algebra_options();
+    if (argc > 1 && strcmp(argv[1], "--selftest-task-options") == 0) {
+        return selftest_task_options();
+    }
     if (argc > 1 && strcmp(argv[1], "--selftest") == 0) {
         return selftest(argc > 2 ? atoi(argv[2]) : 180);
     }
@@ -1731,6 +2909,45 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--selftest-go") == 0) {
         return selftest_go();
     }
+    if (argc > 1 && strcmp(argv[1], "--selftest-crossword-settings-write") == 0) {
+        crossword_options saved = {7, 8, 0, 1, NULL};
+        return crossword_write_settings(&saved) ? 0 : 1;
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-crossword-settings-read") == 0) {
+        crossword_options saved;
+        if (parse_crossword_options(argc, argv, &saved, true)) return 2;
+        printf("%lld %lld %lld %lld\n", (long long)saved.level, (long long)saved.trials,
+               (long long)saved.show_mistakes, (long long)saved.adaptive);
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-scrabble-settings-write") == 0) {
+        crossword_options saved = {7, 15, 0, 1, NULL};
+        return scrabble_write_settings(&saved) ? 0 : 1;
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-scramble-settings-write") == 0) {
+        crossword_options saved = {12, 15, 0, 1, NULL};
+        return scramble_write_settings(&saved) ? 0 : 1;
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-scramble-settings-read") == 0) {
+        crossword_options saved;
+        if (parse_scramble_options(argc, argv, &saved, true)) return 2;
+        printf("%lld %lld %lld %lld\n", (long long)saved.level, (long long)saved.trials,
+               (long long)saved.show_mistakes, (long long)saved.adaptive);
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-scrabble-settings-read") == 0) {
+        crossword_options saved;
+        if (parse_scrabble_options(argc, argv, &saved, true)) return 2;
+        printf("%lld %lld %lld %lld\n", (long long)saved.level, (long long)saved.trials,
+               (long long)saved.show_mistakes, (long long)saved.adaptive);
+        return 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--selftest-scrabble") == 0) return selftest_scrabble();
+    if (argc > 1 && strcmp(argv[1], "--selftest-scramble") == 0) return selftest_scramble();
+    if (argc > 1 && strcmp(argv[1], "--selftest-crossword") == 0) return selftest_crossword();
+    if (argc > 1 && strcmp(argv[1], "--selftest-crossed-wires") == 0) {
+        return selftest_crossed_wires();
+    }
     if (argc > 1 && strcmp(argv[1], "--selftest-ncup-monte") == 0) {
         return selftest_ncup_monte();
     }
@@ -1757,6 +2974,37 @@ int main(int argc, char **argv) {
     }
     if (argc > 1 && strcmp(argv[1], "--selftest-overrun") == 0) {
         return selftest_overrun();
+    }
+    int64_t sudoku_level, sudoku_puzzles, sudoku_show_clashes, sudoku_adaptive;
+    int64_t jigsaw_side, jigsaw_puzzles, jigsaw_adaptive, jigsaw_preview;
+    int64_t jigsaw_mark_placed, go_level, go_trials;
+    int64_t crossed_wires_level, crossed_wires_rounds;
+    int64_t crossed_wires_adaptive, crossed_wires_show_grid;
+    int options_status = parse_task_options(
+        argc, argv, &sudoku_level, &sudoku_puzzles, &sudoku_show_clashes,
+        &sudoku_adaptive, &jigsaw_side, &jigsaw_puzzles, &jigsaw_adaptive,
+        &jigsaw_preview, &jigsaw_mark_placed, &go_level, &go_trials,
+        &crossed_wires_level, &crossed_wires_rounds,
+        &crossed_wires_adaptive, &crossed_wires_show_grid);
+    if (options_status != 0) return options_status;
+    crossword_options crossword_config;
+    if (parse_crossword_options(argc, argv, &crossword_config, true)) return 2;
+    crossword_options scrabble_config;
+    if (parse_scrabble_options(argc, argv, &scrabble_config, true)) return 2;
+    crossword_options numberology_config;
+    if (parse_numberology_options(argc, argv, &numberology_config, true)) return 2;
+    crossword_options algebra_config;
+    if (parse_algebra_options(argc, argv, &algebra_config, true)) return 2;
+    crossword_options scramble_config;
+    if (parse_scramble_options(argc, argv, &scramble_config, true)) return 2;
+    const char *scramble_index_path = NULL, *scramble_sentence_path = NULL;
+    for (int i = 1; i < argc; i++) {
+        bool index = !strcmp(argv[i], "--scramble-index");
+        bool sentences = !strcmp(argv[i], "--scramble-sentences");
+        if (index || sentences) {
+            if (++i >= argc) { fprintf(stderr, "Scramble corpus option requires a path\n"); return 2; }
+            if (index) scramble_index_path = argv[i]; else scramble_sentence_path = argv[i];
+        }
     }
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
@@ -1824,6 +3072,14 @@ int main(int argc, char **argv) {
                        strcmp(argv[2], "sudoku") == 0;
     bool go_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
                    strcmp(argv[2], "go") == 0;
+    bool crossed_wires_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                              strcmp(argv[2], "crossed-wires") == 0;
+    bool scrabble_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                         strcmp(argv[2], "scrabble") == 0;
+    bool scramble_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                         strcmp(argv[2], "scramble") == 0;
+    bool crossword_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                          strcmp(argv[2], "crossword") == 0;
     bool ncup_monte_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
                            strcmp(argv[2], "ncup-monte") == 0;
     bool tracking_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
@@ -1876,14 +3132,26 @@ int main(int argc, char **argv) {
     int64_t reflex_handle = reflex_mode
         ? nw_reflex_create(10, 1200, 400, 3, 100, 1, 23) : 0;
     int64_t algebra_handle = algebra_mode
-        ? nw_algebra_create(1, 5, 23) : 0;
+        ? nw_algebra_create_options(algebra_config.level, algebra_config.trials, algebra_config.show_mistakes, algebra_config.adaptive, 23) : 0;
+    if (algebra_handle) SDL_StartTextInput(window);
     int64_t numberology_handle = numberology_mode
-        ? nw_numberology_create(1, 5, 1, 23) : 0;
+        ? nw_numberology_create(numberology_config.level, numberology_config.trials, numberology_config.adaptive, 23) : 0;
+    if (numberology_handle) SDL_StartTextInput(window);
     int64_t jigsaw_handle = jigsaw_mode
-        ? nw_jigsaw_create(3, 5, 1, 1, 23) : 0;
+        ? nw_jigsaw_create_options(jigsaw_side, jigsaw_puzzles,
+                                   jigsaw_adaptive, jigsaw_preview,
+                                   jigsaw_mark_placed, 23) : 0;
     int64_t sudoku_handle = sudoku_mode
-        ? nw_sudoku_create(1, 5, 1, 1, 23) : 0;
-    int64_t go_handle = go_mode ? nw_go_create(1, 5, 23) : 0;
+        ? nw_sudoku_create(sudoku_level, sudoku_puzzles,
+                           sudoku_show_clashes, sudoku_adaptive, 23) : 0;
+    int64_t go_handle = go_mode ? nw_go_create(go_level, go_trials, 23) : 0;
+    int64_t crossed_wires_handle = crossed_wires_mode
+        ? nw_crossed_wires_create(crossed_wires_level, crossed_wires_rounds,
+                                  crossed_wires_adaptive,
+                                  crossed_wires_show_grid, 23) : 0;
+    int64_t scrabble_handle = scrabble_mode ? create_scrabble(&scrabble_config) : 0;
+    int64_t scramble_handle = scramble_mode ? create_scramble(&scramble_config, scramble_index_path, scramble_sentence_path) : 0;
+    int64_t crossword_handle = crossword_mode ? create_crossword(&crossword_config) : 0;
     int64_t ncup_monte_handle = ncup_monte_mode
         ? nw_ncup_monte_create(3, 10, 1, 4, 160, 750, 23) : 0;
     int64_t tracking_handle = tracking_mode
@@ -2084,6 +3352,25 @@ int main(int argc, char **argv) {
         SDL_Quit();
         return 1;
     }
+    if (crossed_wires_mode && !crossed_wires_handle) {
+        SDL_Log("Crossed Wires controller creation failed");
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    if (scrabble_mode && !scrabble_handle) {
+        SDL_Log("Scrabble controller creation or index loading failed");
+        SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); SDL_Quit(); return 1;
+    }
+    if (scramble_mode && !scramble_handle) {
+        SDL_Log("Scramble controller creation failed");
+        SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); SDL_Quit(); return 1;
+    }
+    if (crossword_mode && !crossword_handle) {
+        SDL_Log("Crossword controller creation or index loading failed");
+        SDL_DestroyRenderer(renderer); SDL_DestroyWindow(window); SDL_Quit(); return 1;
+    }
     if (ncup_monte_mode && !ncup_monte_handle) {
         SDL_Log("N-Cup Monte controller creation failed");
         SDL_DestroyRenderer(renderer);
@@ -2131,16 +3418,90 @@ int main(int argc, char **argv) {
     Uint64 last_step = SDL_GetTicks();
     Uint64 last_marble_tick = SDL_GetTicks();
     bool playing = false, running = true;
+    bool scrabble_options_open = false;
+    bool numberology_options_open = false, numberology_options_from_hub = false, numberology_level_editing = false;
+    int numberology_options_selected = 0;
+    int64_t numberology_level_edit_value = 0;
+    crossword_options numberology_draft = numberology_config;
+    bool algebra_options_open = false, algebra_options_from_hub = false;
+    int algebra_options_selected = 0;
+    crossword_options algebra_draft = algebra_config;
+    bool scramble_options_open = false, scramble_options_from_hub = false;
+    int scramble_options_selected = 0;
+    crossword_options scramble_draft = scramble_config;
+    bool scramble_suppress_space = false;
+    bool scrabble_options_from_hub = false;
+    int scrabble_options_selected = 0;
+    crossword_options scrabble_draft = scrabble_config;
+    bool crossword_options_open = false;
+    int crossword_options_selected = 0;
+    crossword_options crossword_draft = crossword_config;
 
     while (running) {
         SDL_Event event;
         bool step = false;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT) running = false;
+            if (event.type == SDL_EVENT_TEXT_INPUT && scramble_mode && !scramble_options_open && nw_scramble_info(scramble_handle, 0) == 1) {
+                const char *text = event.text.text;
+                if (scramble_suppress_space && text[0] == ' ') text++;
+                scramble_suppress_space = false;
+                scramble_text(scramble_handle, text, (int64_t)SDL_GetTicks());
+            }
+            if (event.type == SDL_EVENT_TEXT_INPUT && numberology_mode) {
+                if (numberology_options_open && numberology_options_selected == 0) {
+                    for (const char *p = event.text.text; *p; p++) if (*p >= '0' && *p <= '9') {
+                        numberology_edit_digit(&numberology_draft, &numberology_level_editing,
+                                               &numberology_level_edit_value, *p - '0');
+                    }
+                } else if (!numberology_options_open && nw_numberology_info(numberology_handle, 0) == 1)
+                    numberology_text(numberology_handle, event.text.text, (int64_t)SDL_GetTicks());
+            }
+            if (event.type == SDL_EVENT_TEXT_INPUT && algebra_mode && !algebra_options_open && nw_algebra_info(algebra_handle, 0) == 1) {
+                algebra_text(algebra_handle, event.text.text, (int64_t)SDL_GetTicks());
+            }
             if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST && marble_mode)
                 marble_release_all(marble_handle);
             if (event.type == SDL_EVENT_KEY_DOWN) {
-                if (event.key.key == SDLK_ESCAPE || event.key.key == SDLK_Q) {
+                if (numberology_mode && numberology_options_open && event.key.key == SDLK_ESCAPE) {
+                    numberology_options_open = false;
+                    if (numberology_options_from_hub) {
+                        nw_numberology_destroy(numberology_handle); numberology_handle = 0;
+                        numberology_mode = false; numberology_options_from_hub = false;
+                        SDL_StopTextInput(window);
+                    }
+                    continue;
+                }
+                if (algebra_mode && algebra_options_open && event.key.key == SDLK_ESCAPE) {
+                    algebra_options_open = false;
+                    if (algebra_options_from_hub) {
+                        nw_algebra_destroy(algebra_handle);
+                        algebra_handle = 0; algebra_mode = false; algebra_options_from_hub = false;
+                        SDL_StopTextInput(window);
+                    }
+                    continue;
+                }
+                if (scramble_mode && scramble_options_open && event.key.key == SDLK_ESCAPE) {
+                    scramble_options_open = false;
+                    if (scramble_options_from_hub) {
+                        nw_scramble_destroy(scramble_handle);
+                        scramble_handle = 0; scramble_mode = false; scramble_options_from_hub = false;
+                    }
+                    continue;
+                }
+                if (scrabble_mode && scrabble_options_open && event.key.key == SDLK_ESCAPE) {
+                    scrabble_options_open = false;
+                    if (scrabble_options_from_hub) {
+                        nw_scrabble_destroy(scrabble_handle);
+                        scrabble_handle = 0; scrabble_mode = false; scrabble_options_from_hub = false;
+                    }
+                    continue;
+                }
+                if (crossword_mode && crossword_options_open && event.key.key == SDLK_ESCAPE) {
+                    crossword_options_open = false;
+                    continue;
+                }
+                if (shell_exit_key(event.key.key, crossword_mode || scrabble_mode || scramble_mode, crossed_wires_mode)) {
                     if (taskhub_mode && maze_mode) {
                         nw_you_are_here_destroy(maze_handle);
                         maze_handle = 0;
@@ -2217,10 +3578,12 @@ int main(int argc, char **argv) {
                         nw_algebra_destroy(algebra_handle);
                         algebra_handle = 0;
                         algebra_mode = false;
+                        SDL_StopTextInput(window);
                     } else if (taskhub_mode && numberology_mode) {
                         nw_numberology_destroy(numberology_handle);
                         numberology_handle = 0;
                         numberology_mode = false;
+                        SDL_StopTextInput(window);
                     } else if (taskhub_mode && jigsaw_mode) {
                         nw_jigsaw_destroy(jigsaw_handle);
                         jigsaw_handle = 0;
@@ -2233,6 +3596,20 @@ int main(int argc, char **argv) {
                         nw_go_destroy(go_handle);
                         go_handle = 0;
                         go_mode = false;
+                    } else if (taskhub_mode && crossed_wires_mode) {
+                        nw_crossed_wires_destroy(crossed_wires_handle);
+                        crossed_wires_handle = 0;
+                        crossed_wires_mode = false;
+                    } else if (taskhub_mode && scramble_mode) {
+                        SDL_StopTextInput(window);
+                        nw_scramble_destroy(scramble_handle);
+                        scramble_handle = 0; scramble_mode = false;
+                    } else if (taskhub_mode && scrabble_mode) {
+                        nw_scrabble_destroy(scrabble_handle);
+                        scrabble_handle = 0; scrabble_mode = false;
+                    } else if (taskhub_mode && crossword_mode) {
+                        nw_crossword_destroy(crossword_handle);
+                        crossword_handle = 0; crossword_mode = false;
                     } else if (taskhub_mode && ncup_monte_mode) {
                         nw_ncup_monte_destroy(ncup_monte_handle);
                         ncup_monte_handle = 0;
@@ -2276,11 +3653,48 @@ int main(int argc, char **argv) {
                 if (taskhub_mode && !maze_mode && !sokoban_mode && !nback3d_mode &&
                     !marble_mode &&
                     !monkey_ladder_mode && !tetris_mode && !count_mode && !mr_time_mode &&
-                    !graph_mapping_mode && !matrix_reasoning_mode && !in_the_dark_mode && !fog_mode && !removals_mode && !custody_mode && !concentration_mode && !recognition_mode && !trivia_mode && !reflex_mode && !algebra_mode && !numberology_mode && !jigsaw_mode && !sudoku_mode && !go_mode && !ncup_monte_mode && !tracking_mode && !lookout_mode && !pursuit_mode && !out_of_sight_mode && !buzz_wire_mode && !donkey_mode && !two_hands_mode && !overrun_mode) {
+                    !graph_mapping_mode && !matrix_reasoning_mode && !in_the_dark_mode && !fog_mode && !removals_mode && !custody_mode && !concentration_mode && !recognition_mode && !trivia_mode && !reflex_mode && !algebra_mode && !numberology_mode && !jigsaw_mode && !sudoku_mode && !go_mode && !crossed_wires_mode && !crossword_mode && !scrabble_mode && !scramble_mode && !ncup_monte_mode && !tracking_mode && !lookout_mode && !pursuit_mode && !out_of_sight_mode && !buzz_wire_mode && !donkey_mode && !two_hands_mode && !overrun_mode) {
                     if (event.key.key == SDLK_LEFT) category = (category + 6) % 7, selected = 0;
                     if (event.key.key == SDLK_RIGHT) category = (category + 1) % 7, selected = 0;
                     if (event.key.key == SDLK_UP) selected = selected > 0 ? selected - 1 : 0;
                     if (event.key.key == SDLK_DOWN) selected += 1;
+                    if (event.key.key == SDLK_C && category == 4 && selected == 7) {
+                        scrabble_handle = create_scrabble(&scrabble_config);
+                        scrabble_mode = scrabble_handle != 0;
+                        if (scrabble_mode) {
+                            scrabble_draft = scrabble_config;
+                            scrabble_options_selected = 0;
+                            scrabble_options_open = true;
+                            scrabble_options_from_hub = true;
+                        }
+                    }
+                    if (event.key.key == SDLK_C && category == 4 && selected == 10) {
+                        numberology_handle = nw_numberology_create(numberology_config.level, numberology_config.trials, numberology_config.adaptive, 23);
+                        numberology_mode = numberology_handle != 0;
+                        if (numberology_mode) {
+                            numberology_draft = numberology_config; numberology_options_selected = 0;
+                            numberology_level_editing = false; numberology_options_open = true;
+                            numberology_options_from_hub = true; SDL_StartTextInput(window);
+                        }
+                    }
+                    if (event.key.key == SDLK_C && category == 4 && selected == 9) {
+                        algebra_handle = nw_algebra_create_options(algebra_config.level, algebra_config.trials, algebra_config.show_mistakes, algebra_config.adaptive, 23);
+                        algebra_mode = algebra_handle != 0;
+                        if (algebra_mode) {
+                            algebra_draft = algebra_config; algebra_options_selected = 0;
+                            algebra_options_open = true; algebra_options_from_hub = true;
+                        }
+                    }
+                    if (event.key.key == SDLK_C && category == 4 && selected == 8) {
+                        scramble_handle = create_scramble(&scramble_config, scramble_index_path, scramble_sentence_path);
+                        scramble_mode = scramble_handle != 0;
+                        if (scramble_mode) {
+                            scramble_draft = scramble_config;
+                            scramble_options_selected = 0;
+                            scramble_options_open = true;
+                            scramble_options_from_hub = true;
+                        }
+                    }
                     if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN) {
                         if (category == 5 && selected == 4) {
                             maze_handle = nw_you_are_here_create(1, 1, 0, 1, 17);
@@ -2337,20 +3751,41 @@ int main(int argc, char **argv) {
                             reflex_handle = nw_reflex_create(10, 1200, 400, 3, 100, 1, 23);
                             reflex_mode = reflex_handle != 0;
                         } else if (category == 4 && selected == 9) {
-                            algebra_handle = nw_algebra_create(1, 5, 23);
+                            algebra_handle = nw_algebra_create_options(algebra_config.level, algebra_config.trials, algebra_config.show_mistakes, algebra_config.adaptive, 23);
                             algebra_mode = algebra_handle != 0;
+                            if (algebra_mode) SDL_StartTextInput(window);
                         } else if (category == 4 && selected == 10) {
-                            numberology_handle = nw_numberology_create(1, 5, 1, 23);
+                            numberology_handle = nw_numberology_create(numberology_config.level, numberology_config.trials, numberology_config.adaptive, 23);
                             numberology_mode = numberology_handle != 0;
+                            if (numberology_mode) SDL_StartTextInput(window);
                         } else if (category == 4 && selected == 2) {
-                            jigsaw_handle = nw_jigsaw_create(3, 5, 1, 1, 23);
+                            jigsaw_handle = nw_jigsaw_create_options(
+                                jigsaw_side, jigsaw_puzzles, jigsaw_adaptive,
+                                jigsaw_preview, jigsaw_mark_placed, 23);
                             jigsaw_mode = jigsaw_handle != 0;
                         } else if (category == 4 && selected == 3) {
-                            sudoku_handle = nw_sudoku_create(1, 5, 1, 1, 23);
+                            sudoku_handle = nw_sudoku_create(
+                                sudoku_level, sudoku_puzzles,
+                                sudoku_show_clashes, sudoku_adaptive, 23);
                             sudoku_mode = sudoku_handle != 0;
                         } else if (category == 4 && selected == 4) {
-                            go_handle = nw_go_create(1, 5, 23);
+                            go_handle = nw_go_create(go_level, go_trials, 23);
                             go_mode = go_handle != 0;
+                        } else if (category == 4 && selected == 5) {
+                            crossed_wires_handle = nw_crossed_wires_create(
+                                crossed_wires_level, crossed_wires_rounds,
+                                crossed_wires_adaptive,
+                                crossed_wires_show_grid, 23);
+                            crossed_wires_mode = crossed_wires_handle != 0;
+                        } else if (category == 4 && selected == 6) {
+                            crossword_handle = create_crossword(&crossword_config);
+                            crossword_mode = crossword_handle != 0;
+                        } else if (category == 4 && selected == 7) {
+                            scrabble_handle = create_scrabble(&scrabble_config);
+                            scrabble_mode = scrabble_handle != 0;
+                        } else if (category == 4 && selected == 8) {
+                            scramble_handle = create_scramble(&scramble_config, scramble_index_path, scramble_sentence_path);
+                            scramble_mode = scramble_handle != 0;
                         } else if (category == 2 && selected == 1) {
                             ncup_monte_handle = nw_ncup_monte_create(3, 10, 1, 4, 160, 750, 23);
                             ncup_monte_mode = ncup_monte_handle != 0;
@@ -2584,35 +4019,85 @@ int main(int argc, char **argv) {
                     if (event.key.key == SDLK_SPACE || event.key.key == SDLK_RETURN)
                         nw_reflex_action(reflex_handle, 0, 0, (int64_t)SDL_GetTicks());
                 } else if (algebra_mode) {
-                    if (event.key.key == SDLK_SPACE)
-                        nw_algebra_action(algebra_handle, 0, 0, (int64_t)SDL_GetTicks());
+                    if (algebra_options_open) {
+                        if (event.key.key == SDLK_UP && algebra_options_selected > 0) algebra_options_selected--;
+                        else if (event.key.key == SDLK_DOWN && algebra_options_selected < 3) algebra_options_selected++;
+                        else if (event.key.key == SDLK_LEFT || event.key.key == SDLK_RIGHT || event.key.key == SDLK_SPACE)
+                            algebra_modify_option(&algebra_draft, algebra_options_selected, event.key.key == SDLK_LEFT ? -1 : 1);
+                        else if (event.key.key == SDLK_RETURN) {
+                            int64_t fresh = nw_algebra_create_options(algebra_draft.level, algebra_draft.trials, algebra_draft.show_mistakes, algebra_draft.adaptive, 23);
+                            if (fresh) {
+                                nw_algebra_destroy(algebra_handle); algebra_handle = fresh;
+                                algebra_config = algebra_draft;
+                                if (!algebra_write_settings(&algebra_config)) SDL_Log("Could not save Algebra settings");
+                            }
+                            algebra_options_open = false;
+                            if (algebra_options_from_hub) {
+                                nw_algebra_destroy(algebra_handle); algebra_handle = 0;
+                                algebra_mode = false; algebra_options_from_hub = false;
+                            }
+                        }
+                    } else if (event.key.key == SDLK_V && nw_algebra_info(algebra_handle, 0) == 1 &&
+#ifdef __APPLE__
+                               (event.key.mod & SDL_KMOD_GUI)) {
+#else
+                               (event.key.mod & SDL_KMOD_CTRL)) {
+#endif
+                        char *clipboard = SDL_GetClipboardText();
+                        if (clipboard) { algebra_text(algebra_handle, clipboard, (int64_t)SDL_GetTicks()); SDL_free(clipboard); }
+                    } else if (event.key.key == SDLK_O && nw_algebra_info(algebra_handle, 0) != 1) {
+                        algebra_draft = algebra_config; algebra_options_selected = 0; algebra_options_open = true;
+                    } else if (event.key.key == SDLK_SPACE && nw_algebra_info(algebra_handle, 0) != 1)
+                        algebra_start(algebra_handle);
                     else if (event.key.key == SDLK_RETURN) {
                         int64_t phase = nw_algebra_info(algebra_handle, 0);
-                        nw_algebra_action(algebra_handle, phase == 1 ? 3 : 0,
-                                          0, (int64_t)SDL_GetTicks());
+                        if (phase == 1) nw_algebra_action(algebra_handle, 3, 0, (int64_t)SDL_GetTicks());
                     } else if (event.key.key == SDLK_BACKSPACE) {
                         nw_algebra_action(algebra_handle, 2, 0, (int64_t)SDL_GetTicks());
-                    } else if (event.key.key == SDLK_MINUS) {
-                        nw_algebra_action(algebra_handle, 1, 45, (int64_t)SDL_GetTicks());
-                    } else if (event.key.key >= SDLK_0 && event.key.key <= SDLK_9) {
-                        nw_algebra_action(algebra_handle, 1,
-                                          48 + event.key.key - SDLK_0,
-                                          (int64_t)SDL_GetTicks());
                     }
                 } else if (numberology_mode) {
                     int64_t now_ms = (int64_t)SDL_GetTicks();
                     int64_t phase = nw_numberology_info(numberology_handle, 0);
-                    if (event.key.key == SDLK_SPACE)
-                        nw_numberology_action(numberology_handle, 0, 0, now_ms);
-                    else if (event.key.key == SDLK_RETURN)
-                        nw_numberology_action(numberology_handle, phase == 1 ? 3 : 0, 0, now_ms);
-                    else if (event.key.key == SDLK_BACKSPACE)
+                    if (numberology_options_open) {
+                        if (event.key.key == SDLK_UP && numberology_options_selected > 0) { numberology_options_selected--; numberology_level_editing = false; }
+                        else if (event.key.key == SDLK_DOWN && numberology_options_selected < 2) { numberology_options_selected++; numberology_level_editing = false; }
+                        else if (event.key.key == SDLK_LEFT || event.key.key == SDLK_RIGHT || event.key.key == SDLK_SPACE) {
+                            numberology_modify_option(&numberology_draft, numberology_options_selected, event.key.key == SDLK_LEFT ? -1 : 1);
+                            numberology_level_editing = false;
+                        } else if ((event.key.key == SDLK_BACKSPACE || event.key.key == SDLK_DELETE) && numberology_options_selected == 0) {
+                            numberology_edit_backspace(&numberology_draft, &numberology_level_editing,
+                                                       &numberology_level_edit_value);
+                        } else if (event.key.key == SDLK_RETURN) {
+                            int64_t fresh = nw_numberology_create(numberology_draft.level, numberology_draft.trials, numberology_draft.adaptive, 23);
+                            if (fresh) {
+                                nw_numberology_destroy(numberology_handle); numberology_handle = fresh;
+                                numberology_config = numberology_draft;
+                                if (!numberology_write_settings(&numberology_config)) SDL_Log("Could not save Numberology settings");
+                            }
+                            numberology_options_open = false;
+                            if (numberology_options_from_hub) {
+                                nw_numberology_destroy(numberology_handle); numberology_handle = 0;
+                                numberology_mode = false; numberology_options_from_hub = false; SDL_StopTextInput(window);
+                            }
+                        }
+                    } else if (event.key.key == SDLK_O && phase != 1) {
+                        numberology_draft = numberology_config; numberology_options_selected = 0;
+                        numberology_level_editing = false; numberology_options_open = true;
+                    } else if (event.key.key == SDLK_SPACE && phase != 1)
+                        numberology_advance(numberology_handle, &numberology_config);
+                    else if (event.key.key == SDLK_RETURN && phase == 1)
+                        nw_numberology_action(numberology_handle, 3, 0, now_ms);
+                    else if (event.key.key == SDLK_BACKSPACE || event.key.key == SDLK_DELETE)
                         nw_numberology_action(numberology_handle, 2, 0, now_ms);
-                    else if (event.key.key == SDLK_MINUS)
-                        nw_numberology_action(numberology_handle, 1, 45, now_ms);
-                    else if (event.key.key >= SDLK_0 && event.key.key <= SDLK_9)
-                        nw_numberology_action(numberology_handle, 1,
-                                              48 + event.key.key - SDLK_0, now_ms);
+                    else if (event.key.key == SDLK_V && phase == 1 &&
+#ifdef __APPLE__
+                             (event.key.mod & SDL_KMOD_GUI)) {
+#else
+                             (event.key.mod & SDL_KMOD_CTRL)) {
+#endif
+                        char *clipboard = SDL_GetClipboardText();
+                        if (clipboard) { numberology_text(numberology_handle, clipboard, now_ms); SDL_free(clipboard); }
+                    }
                 } else if (jigsaw_mode) {
                     int64_t now_ms = (int64_t)SDL_GetTicks();
                     int64_t phase = nw_jigsaw_info(jigsaw_handle, 0);
@@ -2634,13 +4119,21 @@ int main(int argc, char **argv) {
                         nw_sudoku_action(sudoku_handle, 3, 0, now_ms);
                     else if (phase == 1 && event.key.key == SDLK_RIGHT)
                         nw_sudoku_action(sudoku_handle, 4, 0, now_ms);
-                    else if (phase == 1 && event.key.key == SDLK_BACKSPACE)
+                    else if (phase == 1 &&
+                             (event.key.key == SDLK_BACKSPACE ||
+                              event.key.key == SDLK_DELETE ||
+                              event.key.key == SDLK_0))
                         nw_sudoku_action(sudoku_handle, 6, 0, now_ms);
-                    else if (phase == 1 && event.key.key == SDLK_P)
+                    else if (phase == 1 && event.key.key == SDLK_N)
                         nw_sudoku_action(sudoku_handle, 7, 0, now_ms);
                     else if (phase == 1 && event.key.key >= SDLK_1 && event.key.key <= SDLK_9)
                         nw_sudoku_action(sudoku_handle, 5,
                                          event.key.key - SDLK_0, now_ms);
+                    else if (phase == 1 && event.key.key >= SDLK_A && event.key.key <= SDLK_G &&
+                             (event.key.key != SDLK_C ||
+                              nw_sudoku_info(sudoku_handle, 5) >= 12))
+                        nw_sudoku_action(sudoku_handle, 5,
+                                         10 + event.key.key - SDLK_A, now_ms);
                 } else if (go_mode) {
                     int64_t now_ms = (int64_t)SDL_GetTicks();
                     int64_t phase = nw_go_info(go_handle, 0);
@@ -2656,6 +4149,185 @@ int main(int argc, char **argv) {
                     else if (phase == 1 && event.key.key == SDLK_DOWN) nw_go_action(go_handle, 4, 0, now_ms);
                     else if (phase == 1 && event.key.key == SDLK_LEFT) nw_go_action(go_handle, 5, 0, now_ms);
                     else if (phase == 1 && event.key.key == SDLK_RIGHT) nw_go_action(go_handle, 6, 0, now_ms);
+                    else if ((phase == 0 || phase == 3) &&
+                             event.key.key >= SDLK_1 && event.key.key <= SDLK_9)
+                        nw_go_action(go_handle, 7,
+                                     event.key.key - SDLK_0, now_ms);
+                    else if ((phase == 0 || phase == 3) && event.key.key == SDLK_0)
+                        nw_go_action(go_handle, 7, 10, now_ms);
+                } else if (scramble_mode) {
+                    int64_t phase = nw_scramble_info(scramble_handle, 0);
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    if (scramble_options_open) {
+                        if (event.key.key == SDLK_UP && scramble_options_selected > 0) scramble_options_selected--;
+                        else if (event.key.key == SDLK_DOWN && scramble_options_selected < 3) scramble_options_selected++;
+                        else if (event.key.key == SDLK_LEFT || event.key.key == SDLK_RIGHT || event.key.key == SDLK_SPACE)
+                            scramble_modify_option(&scramble_draft, scramble_options_selected, event.key.key == SDLK_LEFT ? -1 : 1);
+                        else if (event.key.key == SDLK_RETURN) {
+                            if (nw_scramble_action(scramble_handle, 4, scrabble_pack_options(&scramble_draft), now_ms) == 1) {
+                                scramble_config = scramble_draft;
+                                if (!scramble_write_settings(&scramble_config)) SDL_Log("Could not save Scramble settings");
+                            }
+                            scramble_options_open = false;
+                            if (scramble_options_from_hub) {
+                                nw_scramble_destroy(scramble_handle);
+                                scramble_handle = 0; scramble_mode = false; scramble_options_from_hub = false;
+                            }
+                        }
+                    } else if (phase == 1 && event.key.key == SDLK_V &&
+#ifdef __APPLE__
+                               (event.key.mod & SDL_KMOD_GUI)) {
+#else
+                               (event.key.mod & SDL_KMOD_CTRL)) {
+#endif
+                        char *clipboard = SDL_GetClipboardText();
+                        if (clipboard) { scramble_text(scramble_handle, clipboard, now_ms); SDL_free(clipboard); }
+                    } else if (event.key.key == SDLK_O && phase != 1) {
+                        scramble_draft = scramble_config;
+                        scramble_options_selected = 0;
+                        scramble_options_open = true;
+                        scramble_options_from_hub = false;
+                        SDL_StopTextInput(window);
+                    } else if (event.key.key == SDLK_SPACE && phase != 1) {
+                        nw_scramble_action(scramble_handle, 0, 0, now_ms);
+                        if (nw_scramble_info(scramble_handle, 0) == 1) {
+                            nw_scramble_action(scramble_handle, 5, 0, (int64_t)SDL_GetTicks());
+                            scramble_suppress_space = true;
+                            SDL_StartTextInput(window);
+                        }
+                    } else if (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER) {
+                        nw_scramble_action(scramble_handle, 3, 0, now_ms);
+                        if (nw_scramble_info(scramble_handle, 0) != 1) SDL_StopTextInput(window);
+                    } else if (event.key.key == SDLK_BACKSPACE || event.key.key == SDLK_DELETE) {
+                        nw_scramble_action(scramble_handle, 2, 0, now_ms);
+                    }
+                } else if (scrabble_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_scrabble_info(scrabble_handle, 0);
+                    SDL_Keycode key = event.key.key;
+                    if (scrabble_options_open) {
+                        if (key == SDLK_UP && scrabble_options_selected > 0) scrabble_options_selected--;
+                        else if (key == SDLK_DOWN && scrabble_options_selected < 3) scrabble_options_selected++;
+                        else if (key == SDLK_LEFT || key == SDLK_RIGHT || key == SDLK_SPACE)
+                            scrabble_modify_option(&scrabble_draft, scrabble_options_selected, key == SDLK_LEFT ? -1 : 1);
+                        else if (key == SDLK_RETURN) {
+                            if (nw_scrabble_action(scrabble_handle, 9, scrabble_pack_options(&scrabble_draft), now_ms) == 1) {
+                                scrabble_config = scrabble_draft;
+                                if (!scrabble_write_settings(&scrabble_config)) SDL_Log("Could not save Scrabble settings");
+                            }
+                            scrabble_options_open = false;
+                            if (scrabble_options_from_hub) {
+                                nw_scrabble_destroy(scrabble_handle);
+                                scrabble_handle = 0; scrabble_mode = false; scrabble_options_from_hub = false;
+                            }
+                        }
+                    } else if (key == SDLK_O || key == SDLK_C) {
+                        scrabble_draft = scrabble_config;
+                        scrabble_options_selected = 0;
+                        scrabble_options_open = true;
+                        scrabble_options_from_hub = false;
+                    } else if (key == SDLK_SPACE && phase != 1) {
+                        nw_scrabble_action(scrabble_handle, 0, 0, now_ms);
+                        if (nw_scrabble_info(scrabble_handle, 0) == 1)
+                            nw_scrabble_action(scrabble_handle, 10, 0, (int64_t)SDL_GetTicks());
+                    }
+                    else if (phase == 1) {
+                        int action = key == SDLK_RETURN || key == SDLK_KP_ENTER ? 1 :
+                                     key == SDLK_LEFT ? 2 : key == SDLK_RIGHT ? 3 : key == SDLK_TAB ? 4 :
+                                     key == SDLK_UP ? 5 : key == SDLK_DOWN ? 6 :
+                                     (key == SDLK_BACKSPACE || key == SDLK_DELETE) ? 8 : -1;
+                        if (action >= 0) nw_scrabble_action(scrabble_handle, action, 0, now_ms);
+                        else if (key >= SDLK_1 && key <= SDLK_7) nw_scrabble_action(scrabble_handle, 7, key - SDLK_1, now_ms);
+                        else if (key >= SDLK_KP_1 && key <= SDLK_KP_7) nw_scrabble_action(scrabble_handle, 7, key - SDLK_KP_1, now_ms);
+                    }
+                } else if (crossword_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_crossword_info(crossword_handle, 0);
+                    SDL_Keycode key = event.key.key;
+                    if (crossword_options_open) {
+                        if (key == SDLK_UP && crossword_options_selected > 0) crossword_options_selected--;
+                        else if (key == SDLK_DOWN && crossword_options_selected < 3) crossword_options_selected++;
+                        else if (key == SDLK_LEFT || key == SDLK_RIGHT || key == SDLK_SPACE)
+                            crossword_modify_option(&crossword_draft, crossword_options_selected, key == SDLK_LEFT ? -1 : 1);
+                        else if (key == SDLK_RETURN) {
+                            if (nw_crossword_action(crossword_handle, 10, crossword_pack_options(&crossword_draft), now_ms) == 1) {
+                                crossword_config = crossword_draft;
+                                if (!crossword_write_settings(&crossword_config))
+                                    SDL_Log("Could not save Crossword settings");
+                            }
+                            crossword_options_open = false;
+                        }
+                    } else if (key == SDLK_O && phase != 1) {
+                        crossword_draft = crossword_config;
+                        crossword_options_selected = 0;
+                        crossword_options_open = true;
+                    } else if (key == SDLK_SPACE && (phase == 0 || phase == 2 || phase == 3))
+                        nw_crossword_action(crossword_handle, 0, 0, now_ms);
+                    else if (phase == 1) {
+                        int action = key == SDLK_LEFT ? 2 : key == SDLK_RIGHT ? 3 :
+                                     key == SDLK_UP ? 4 : key == SDLK_DOWN ? 5 :
+                                     key == SDLK_TAB ? 6 :
+                                     (key == SDLK_BACKSPACE || key == SDLK_DELETE) ? 8 : -1;
+                        if (action >= 0) nw_crossword_action(crossword_handle, action, 0, now_ms);
+                        else if (key >= SDLK_A && key <= SDLK_Z)
+                            nw_crossword_action(crossword_handle, 7, key - SDLK_A, now_ms);
+                    }
+                } else if (crossed_wires_mode) {
+                    int64_t now_ms = (int64_t)SDL_GetTicks();
+                    int64_t phase = nw_crossed_wires_info(crossed_wires_handle, 0);
+                    int64_t keys = nw_crossed_wires_info(crossed_wires_handle, 4);
+                    if (event.key.key == SDLK_SPACE) {
+                        nw_crossed_wires_action(crossed_wires_handle, 0, 0, now_ms);
+                    } else if (event.key.key == SDLK_O) {
+                        /* O is reserved for the source options shortcut. The
+                         * native shell exposes the same values as CLI flags. */
+                    } else if (phase == 1 && keys == 4 &&
+                               (event.key.key == SDLK_UP || event.key.key == SDLK_W ||
+                                event.key.key == SDLK_KP_8)) {
+                        nw_crossed_wires_action(crossed_wires_handle, 1, 0, now_ms);
+                    } else if (phase == 1 && keys == 4 &&
+                               (event.key.key == SDLK_RIGHT || event.key.key == SDLK_D ||
+                                event.key.key == SDLK_KP_6)) {
+                        nw_crossed_wires_action(crossed_wires_handle, 1, 1, now_ms);
+                    } else if (phase == 1 && keys == 4 &&
+                               (event.key.key == SDLK_DOWN || event.key.key == SDLK_S ||
+                                event.key.key == SDLK_KP_2)) {
+                        nw_crossed_wires_action(crossed_wires_handle, 1, 2, now_ms);
+                    } else if (phase == 1 && keys == 4 &&
+                               (event.key.key == SDLK_LEFT || event.key.key == SDLK_A ||
+                                event.key.key == SDLK_KP_4)) {
+                        nw_crossed_wires_action(crossed_wires_handle, 1, 3, now_ms);
+                    } else if (phase == 1 && keys == 8 &&
+                               (event.key.key == SDLK_W || event.key.key == SDLK_KP_8 ||
+                                event.key.key == SDLK_UP)) {
+                        nw_crossed_wires_action(crossed_wires_handle, 1, 0, now_ms);
+                    } else if (phase == 1 && keys == 8 &&
+                               (event.key.key == SDLK_E || event.key.key == SDLK_KP_9)) {
+                        nw_crossed_wires_action(crossed_wires_handle, 1, 1, now_ms);
+                    } else if (phase == 1 && keys == 8 &&
+                               (event.key.key == SDLK_D || event.key.key == SDLK_KP_6 ||
+                                event.key.key == SDLK_RIGHT)) {
+                        nw_crossed_wires_action(crossed_wires_handle, 1, 2, now_ms);
+                    } else if (phase == 1 && keys == 8 &&
+                               (event.key.key == SDLK_C || event.key.key == SDLK_KP_3)) {
+                        nw_crossed_wires_action(crossed_wires_handle, 1, 3, now_ms);
+                    } else if (phase == 1 && keys == 8 &&
+                               (event.key.key == SDLK_X || event.key.key == SDLK_KP_2 ||
+                                event.key.key == SDLK_DOWN)) {
+                        nw_crossed_wires_action(crossed_wires_handle, 1, 4, now_ms);
+                    } else if (phase == 1 && keys == 8 &&
+                               (event.key.key == SDLK_Z || event.key.key == SDLK_KP_1)) {
+                        nw_crossed_wires_action(crossed_wires_handle, 1, 5, now_ms);
+                    } else if (phase == 1 && keys == 8 &&
+                               (event.key.key == SDLK_A || event.key.key == SDLK_KP_4 ||
+                                event.key.key == SDLK_LEFT)) {
+                        nw_crossed_wires_action(crossed_wires_handle, 1, 6, now_ms);
+                    } else if (phase == 1 && keys == 8 &&
+                               (event.key.key == SDLK_Q || event.key.key == SDLK_KP_7)) {
+                        nw_crossed_wires_action(crossed_wires_handle, 1, 7, now_ms);
+                    } else if (event.key.key == SDLK_C && keys == 4) {
+                        /* The source options are available through CLI flags. */
+                    }
                 } else if (ncup_monte_mode) {
                     int64_t now_ms = (int64_t)SDL_GetTicks();
                     int64_t phase = nw_ncup_monte_info(ncup_monte_handle, 0);
@@ -2820,6 +4492,114 @@ int main(int argc, char **argv) {
                         (int64_t)((py - event.button.y) * 1000000.0f / (float)py),
                         px, py, (int64_t)SDL_GetTicks());
             }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && numberology_mode && event.button.button == SDL_BUTTON_LEFT) {
+                if (numberology_options_open) {
+                    int px = 0, py = 0; SDL_GetWindowSize(window, &px, &py);
+                    if (px > 0 && py > 0) {
+                        float x = event.button.x * 912.0f / px, y = (py - event.button.y) * 684.0f / py;
+                        for (int row = 0; row < 3; row++) {
+                            float center = 474.0f - row * 48.0f;
+                            if (x >= 102 && x <= 810 && y >= center - 18 && y <= center + 18) {
+                                if (row == numberology_options_selected) numberology_modify_option(&numberology_draft, row, 1);
+                                else numberology_options_selected = row;
+                                numberology_level_editing = false; break;
+                            }
+                        }
+                    }
+                } else if (nw_numberology_info(numberology_handle, 0) != 1)
+                    numberology_advance(numberology_handle, &numberology_config);
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && algebra_mode && event.button.button == SDL_BUTTON_LEFT) {
+                if (algebra_options_open) {
+                    int px = 0, py = 0; SDL_GetWindowSize(window, &px, &py);
+                    if (px > 0 && py > 0) {
+                        float x = event.button.x * 912.0f / px, y = (py - event.button.y) * 684.0f / py;
+                        for (int row = 0; row < 4; row++) {
+                            float center = 474.0f - row * 48.0f;
+                            if (x >= 102 && x <= 810 && y >= center - 18 && y <= center + 18) {
+                                if (row == algebra_options_selected) algebra_modify_option(&algebra_draft, row, 1);
+                                else algebra_options_selected = row;
+                                break;
+                            }
+                        }
+                    }
+                } else if (nw_algebra_info(algebra_handle, 0) != 1) algebra_start(algebra_handle);
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && scramble_mode && scramble_options_open && event.button.button == SDL_BUTTON_LEFT) {
+                int px = 0, py = 0; SDL_GetWindowSize(window, &px, &py);
+                if (px > 0 && py > 0) {
+                    float x = event.button.x * 912.0f / px, y = (py - event.button.y) * 684.0f / py;
+                    for (int row = 0; row < 4; row++) {
+                        float center = 474.0f - row * 48.0f;
+                        if (x >= 102 && x <= 810 && y >= center - 18 && y <= center + 18) {
+                            if (row == scramble_options_selected) scramble_modify_option(&scramble_draft, row, 1);
+                            else scramble_options_selected = row;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && scramble_mode && !scramble_options_open && event.button.button == SDL_BUTTON_LEFT &&
+                nw_scramble_info(scramble_handle, 0) != 1) {
+                nw_scramble_action(scramble_handle, 0, 0, (int64_t)SDL_GetTicks());
+                if (nw_scramble_info(scramble_handle, 0) == 1) {
+                    nw_scramble_action(scramble_handle, 5, 0, (int64_t)SDL_GetTicks());
+                    scramble_suppress_space = false;
+                    SDL_StartTextInput(window);
+                }
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && scrabble_mode &&
+                (event.button.button == SDL_BUTTON_LEFT || event.button.button == SDL_BUTTON_RIGHT)) {
+                int px = 0, py = 0; SDL_GetWindowSize(window, &px, &py);
+                if (px > 0 && py > 0 && scrabble_options_open && event.button.button == SDL_BUTTON_LEFT) {
+                    float x = event.button.x * 912.0f / px;
+                    float y = (py - event.button.y) * 684.0f / py;
+                    for (int row = 0; row < 4; row++) {
+                        float center = 474.0f - row * 48.0f;
+                        if (x >= 102 && x <= 810 && y >= center - 18 && y <= center + 18) {
+                            if (row == scrabble_options_selected) scrabble_modify_option(&scrabble_draft, row, 1);
+                            else scrabble_options_selected = row;
+                            break;
+                        }
+                    }
+                } else if (px > 0 && py > 0 && !scrabble_options_open) {
+                    int64_t phase = nw_scrabble_info(scrabble_handle, 0);
+                    nw_scrabble_pointer(scrabble_handle,
+                        (int64_t)(event.button.x * 1000000.0f / px),
+                        (int64_t)((py - event.button.y) * 1000000.0f / py), px, py,
+                        event.button.button == SDL_BUTTON_RIGHT ? 2 : 0, 0, (int64_t)SDL_GetTicks());
+                    if (phase != 1 && nw_scrabble_info(scrabble_handle, 0) == 1)
+                        nw_scrabble_action(scrabble_handle, 10, 0, (int64_t)SDL_GetTicks());
+                }
+            }
+            if (event.type == SDL_EVENT_MOUSE_MOTION && scrabble_mode && !scrabble_options_open) {
+                int px = 0, py = 0; SDL_GetWindowSize(window, &px, &py);
+                if (px > 0 && py > 0) nw_scrabble_pointer(scrabble_handle,
+                    (int64_t)(event.motion.x * 1000000.0f / px),
+                    (int64_t)((py - event.motion.y) * 1000000.0f / py), px, py, 0, 1, (int64_t)SDL_GetTicks());
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && crossword_mode &&
+                (event.button.button == SDL_BUTTON_LEFT || event.button.button == SDL_BUTTON_RIGHT)) {
+                int px = 0, py = 0;
+                SDL_GetWindowSize(window, &px, &py);
+                if (px > 0 && py > 0 && crossword_options_open && event.button.button == SDL_BUTTON_LEFT) {
+                    float x = event.button.x * 912.0f / px;
+                    float y = (py - event.button.y) * 684.0f / py;
+                    for (int row = 0; row < 4; row++) {
+                        float center = 474.0f - row * 48.0f;
+                        if (x >= 102 && x <= 810 && y >= center - 18 && y <= center + 18) {
+                            if (row == crossword_options_selected) crossword_modify_option(&crossword_draft, row, 1);
+                            else crossword_options_selected = row;
+                            break;
+                        }
+                    }
+                } else if (px > 0 && py > 0 && !crossword_options_open)
+                    nw_crossword_pointer(crossword_handle,
+                        (int64_t)(event.button.x * 1000000.0f / px),
+                        (int64_t)((py - event.button.y) * 1000000.0f / py),
+                        px, py, event.button.button == SDL_BUTTON_RIGHT ? 2 : 0,
+                        (int64_t)SDL_GetTicks());
+            }
             if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && go_mode) {
                 int px = 0, py = 0;
                 SDL_GetWindowSizeInPixels(window, &px, &py);
@@ -2913,8 +4693,24 @@ int main(int argc, char **argv) {
         SDL_GetWindowSizeInPixels(window, &width, &height);
         nw_view v = view_for(width, height);
 
-        int64_t length = maze_mode
-            ? nw_you_are_here_frame_write(buffer, FRAME_CAPACITY, maze_handle,
+        int64_t length = numberology_mode && numberology_options_open
+            ? nw_numberology_options_frame_write(buffer, FRAME_CAPACITY, 0, numberology_options_selected,
+                  numberology_draft.level, numberology_draft.trials, numberology_draft.adaptive)
+            : algebra_mode && algebra_options_open
+            ? nw_algebra_options_frame_write(buffer, FRAME_CAPACITY, 0, algebra_options_selected,
+                  algebra_draft.level, algebra_draft.trials, algebra_draft.show_mistakes, algebra_draft.adaptive)
+            : scramble_mode && scramble_options_open
+            ? nw_scramble_options_frame_write(buffer, FRAME_CAPACITY, 0, scramble_options_selected,
+                  scramble_draft.level, scramble_draft.trials, scramble_draft.show_mistakes, scramble_draft.adaptive)
+            : scramble_mode ? nw_scramble_frame_write(buffer, FRAME_CAPACITY, scramble_handle, 0, width, height)
+            : scrabble_mode && scrabble_options_open
+            ? nw_scrabble_options_frame_write(buffer, FRAME_CAPACITY, 0, scrabble_options_selected,
+                  scrabble_draft.level, scrabble_draft.trials, scrabble_draft.show_mistakes, scrabble_draft.adaptive)
+            : scrabble_mode ? nw_scrabble_frame_write(buffer, FRAME_CAPACITY, scrabble_handle, 0, width, height)
+            : crossword_mode && crossword_options_open
+            ? nw_crossword_options_frame_write(buffer, FRAME_CAPACITY, 0, crossword_options_selected,
+                  crossword_draft.level, crossword_draft.trials, crossword_draft.show_mistakes, crossword_draft.adaptive)
+            : maze_mode ? nw_you_are_here_frame_write(buffer, FRAME_CAPACITY, maze_handle,
                                           0, width, height)
             : (sokoban_mode
                 ? nw_sokoban_frame_write(buffer, FRAME_CAPACITY, sokoban_handle,
@@ -2984,6 +4780,12 @@ int main(int argc, char **argv) {
                                         sudoku_handle, 0, width, height)
             : (go_mode
                 ? nw_go_frame_write(buffer, FRAME_CAPACITY, go_handle, 0, width, height)
+            : (crossword_mode
+                ? nw_crossword_frame_write(buffer, FRAME_CAPACITY, crossword_handle, 0, width, height)
+            : (crossed_wires_mode
+                ? nw_crossed_wires_frame_write(buffer, FRAME_CAPACITY,
+                                               crossed_wires_handle, 0,
+                                               width, height)
             : (ncup_monte_mode
                 ? nw_ncup_monte_frame_write(buffer, FRAME_CAPACITY,
                                             ncup_monte_handle, 0, width, height)
@@ -3014,7 +4816,7 @@ int main(int argc, char **argv) {
             : (taskhub_mode
                 ? nw_taskhub_write(buffer, FRAME_CAPACITY, category, selected,
                                    0, width, height)
-                : nw_title_write(buffer, FRAME_CAPACITY, trial % 4, 0, 1, 1)))))))))))))))))))))))))))))))));
+                : nw_title_write(buffer, FRAME_CAPACITY, trial % 4, 0, 1, 1)))))))))))))))))))))))))))))))))));
 
         SDL_SetRenderDrawColor(renderer, 20, 22, 26, 255);
         SDL_RenderClear(renderer);
@@ -3055,6 +4857,10 @@ int main(int argc, char **argv) {
     if (jigsaw_handle) nw_jigsaw_destroy(jigsaw_handle);
     if (sudoku_handle) nw_sudoku_destroy(sudoku_handle);
     if (go_handle) nw_go_destroy(go_handle);
+    if (crossed_wires_handle) nw_crossed_wires_destroy(crossed_wires_handle);
+    if (crossword_handle) nw_crossword_destroy(crossword_handle);
+    if (scrabble_handle) nw_scrabble_destroy(scrabble_handle);
+    if (scramble_handle) nw_scramble_destroy(scramble_handle);
     if (ncup_monte_handle) nw_ncup_monte_destroy(ncup_monte_handle);
     if (tracking_handle) nw_tracking_destroy(tracking_handle);
     if (lookout_handle) nw_lookout_destroy(lookout_handle);

@@ -53,22 +53,38 @@ printf 'Elisa Stage1 compiler: %s\n' "$NATIVE_COMPILER"
 
 SOURCE_TREE_PARENT="$(mktemp -d "$ROOT/build/sdl3-sources.XXXXXX")"
 SOURCE_TREE="$SOURCE_TREE_PARENT/source"
+NATIVE_LINK_OBJECT="$SOURCE_TREE_PARENT/nwcore_native_link.o"
 trap 'rm -rf -- "$SOURCE_TREE_PARENT"' EXIT INT TERM HUP
+RUNTIME_OBJ="${ELISA_SDL_RUNTIME_OBJ:-$RUNTIME_ROOT/build/runtime/elisacore_runtime.o}"
+if [[ ! -f "$RUNTIME_OBJ" ]]; then
+    echo "build_sdl3.sh: selected Stage1 runtime object is missing: $RUNTIME_OBJ" >&2
+    echo "Set ELISA_SDL_RUNTIME_OBJ to the matching elisacore_runtime.o." >&2
+    exit 2
+fi
 python3 "$ROOT/scripts/prepare_runtime_sources.py" \
     "$ROOT" "$SOURCE_TREE" "$RUNTIME_ROOT"
 
 "$NATIVE_COMPILER" -emit obj -O2 -o "$ROOT/build/nwcore_native.o" \
     "$SOURCE_TREE/src/native/sdl_exports.elisa"
 
-SHIM_OBJ="$ROOT/build/sdl_runtime_shim.o"
-cc -c -fPIC -fno-builtin -O2 -o "$SHIM_OBJ" \
-    "$ROOT/scripts/pymodule_runtime_shim.c"
+# Keep the original object for inspection and future consumers. The private
+# link object redirects the eight common arena/cache cells to the selected
+# runtime object's single process-wide definitions.
+python3 "$ROOT/scripts/prepare_native_object.py" \
+    "$ROOT/build/nwcore_native.o" "$NATIVE_LINK_OBJECT"
+
+RUNTIME_LINK_FLAGS=()
+case "$(uname -s)" in
+    Darwin) RUNTIME_LINK_FLAGS=(-Wl,-dead_strip) ;;
+    Linux|MINGW*|MSYS*|CYGWIN*) RUNTIME_LINK_FLAGS=(-Wl,--allow-multiple-definition) ;;
+esac
 
 cc -O2 -std=c11 $SDL_CFLAGS \
     -o "$ROOT/build/nw-sdl3" \
     "$ROOT/shells/sdl3/main.c" \
-    "$ROOT/build/nwcore_native.o" \
-    "$SHIM_OBJ" \
+    "$NATIVE_LINK_OBJECT" \
+    "$RUNTIME_OBJ" \
+    "${RUNTIME_LINK_FLAGS[@]}" \
     $SDL_LIBS
 
 # Prove it RUNS, not just that it linked. --selftest drives the same decode and
@@ -96,10 +112,19 @@ cc -O2 -std=c11 $SDL_CFLAGS \
 "$ROOT/build/nw-sdl3" --selftest-trivia
 "$ROOT/build/nw-sdl3" --selftest-reflex
 "$ROOT/build/nw-sdl3" --selftest-algebra
+"$ROOT/build/nw-sdl3" --selftest-algebra-options
 "$ROOT/build/nw-sdl3" --selftest-numberology
 "$ROOT/build/nw-sdl3" --selftest-jigsaw
 "$ROOT/build/nw-sdl3" --selftest-sudoku
+"$ROOT/build/nw-sdl3" --selftest-task-options
 "$ROOT/build/nw-sdl3" --selftest-go
+"$ROOT/build/nw-sdl3" --selftest-crossed-wires
+"$ROOT/build/nw-sdl3" --selftest-scrabble
+"$ROOT/build/nw-sdl3" --selftest-scramble
+"$ROOT/build/nw-sdl3" --selftest-crossword
+"${PYTHON_BIN:-python3}" "$ROOT/test/crossword_native_settings_test.py"
+"${PYTHON_BIN:-python3}" "$ROOT/test/scrabble_native_settings_test.py"
+"${PYTHON_BIN:-python3}" "$ROOT/test/scramble_native_settings_test.py"
 "$ROOT/build/nw-sdl3" --selftest-ncup-monte
 "$ROOT/build/nw-sdl3" --selftest-moving-targets
 "$ROOT/build/nw-sdl3" --selftest-lookout
@@ -129,11 +154,19 @@ printf '  --screen concentration: Space=start, arrows=cursor, Enter=select\n'
 printf '  --screen recognition: Space=start, left=seen, right=new\n'
 printf '  --screen trivia: Space=start/submit/advance, arrows=choice, 1-8=answer\n'
 printf '  --screen reflex: Space/Enter=start, click=target, Esc=menu\n'
-printf '  --screen algebra: Space=start, digits/type answer, Enter=submit\n'
-printf '  --screen numberology: Space=start, digits/type answer, Enter=submit\n'
+printf '  --screen algebra: Space=start/next, type answer, Enter=submit, O=options\n'
+printf '    Algebra options: --algebra-level N --algebra-trials N --algebra-no-working --algebra-no-adaptive\n'
+printf '  --screen numberology: Space=start, type answer, Enter=submit, O=options\n'
+printf '    --numberology-level N --numberology-trials N --numberology-no-adaptive\n'
 printf '  --screen jigsaw: Space=start, 0-9=select tile, Enter=advance\n'
-printf '  --screen sudoku: Space=start, arrows=cursor, 1-9=write, P=pencil\n'
+printf '    Jigsaw options: --jigsaw-side N --jigsaw-puzzles N --jigsaw-no-adaptive --jigsaw-no-preview --jigsaw-mark-placed\n'
+printf '  --screen sudoku: Space=start, arrows=cursor, 1-9/A-G=write, 0/Backspace/Delete=erase, N=pencil\n'
+printf '    Sudoku options: --sudoku-level N --sudoku-puzzles N --sudoku-no-clashes --sudoku-no-adaptive\n'
 printf '  --screen go: Space=start/answer/next, arrows=cursor, mouse=intersection\n'
+printf '  --screen scrabble: Space=start/next, 1-7=lay, arrows=move, Tab=turn, Enter=play, mouse=select/lay\n'
+printf '    Scrabble options: --scrabble-level N --scrabble-trials N --scrabble-no-premiums --scrabble-no-adaptive --scrabble-lexicon PATH\n'
+printf '  --screen crossword: Space=start/next, letters=write, arrows=move, Tab=turn, mouse=select/turn\n'
+printf '    Crossword options: --crossword-level N --crossword-trials N --crossword-no-mistakes --crossword-no-adaptive --crossword-lexicon PATH\n'
 printf '  --screen ncup-monte: Space=start/next, mouse=choose cup\n'
 printf '  --screen moving-targets: Space=start, mouse=select tracked balls\n'
 printf '  --screen lookout: Space=start, F=form, J=colour\n'

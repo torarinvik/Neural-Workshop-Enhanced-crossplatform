@@ -9,7 +9,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECTS_ROOT="$(cd -- "$ROOT/../.." && pwd)"
 UPSTREAM="${ELISA_PYMODULE_COMPILER:-${ELISA_STAGE1_ROOT:-$PROJECTS_ROOT/Elisa-compiler-port-current-23a0}}"
 STAGE1_BIN="${ELISA_PYMODULE_STAGE1:-${ELISA_STAGE1_BIN:-$UPSTREAM/bin/elisac-stage1}}"
-OUT="$ROOT/build/pymod"
+OUT="${ELISA_PYMODULE_OUT_DIR:-$ROOT/build/pymod}"
 mkdir -p "$OUT"
 
 # Stage0 remains an isolated bootstrap input for the compiler wrapper; Stage1
@@ -48,13 +48,16 @@ if [[ -n "$compiler_head" && -n "$origin_head" ]]; then
 fi
 export ELISACORE_BIN="$SEED_STAGE0" ELISA_STAGE1_BIN="$STAGE1_BIN"
 
-# pymodule_exports.elisa includes the runtime SOURCE, so the module object
-# already defines the runtime and the prebuilt elisacore_runtime.o must not be
-# linked beside it. ELISA_RUNTIME_OBJ takes its place with a shim carrying only
-# the optional host hooks the runtime leaves undefined. See the comments in
-# scripts/pymodule_runtime_shim.c and src/pymodule_exports.elisa.
-SHIM_OBJ="$OUT/pymodule_runtime_shim.o"
-cc -c -fPIC -fno-builtin -O2 -o "$SHIM_OBJ" "$ROOT/scripts/pymodule_runtime_shim.c"
+# The current Stage1 pymodule wrapper calls arena_free for its temporary input
+# and result arenas. Link the runtime object built with the selected Stage1
+# checkout so that its allocator matches the compiler product. A hook-only
+# shim is insufficient for this ABI (it leaves arena_free unresolved).
+RUNTIME_OBJ="${ELISA_PYMODULE_RUNTIME_OBJ:-$UPSTREAM/build/runtime/elisacore_runtime.o}"
+if [[ ! -f "$RUNTIME_OBJ" ]]; then
+    echo "build_pymodule.sh: selected Stage1 runtime object is missing: $RUNTIME_OBJ" >&2
+    echo "Set ELISA_PYMODULE_RUNTIME_OBJ to the matching elisacore_runtime.o." >&2
+    exit 2
+fi
 
 cd "$OUT"
 PYMODULE_SOURCE_TMP="$(mktemp "$ROOT/src/pymodule_exports_stage1.XXXXXX")"
@@ -63,9 +66,19 @@ mv -- "$PYMODULE_SOURCE_TMP" "$PYMODULE_SOURCE"
 trap 'rm -f -- "$PYMODULE_SOURCE"' EXIT INT TERM HUP
 "$PYTHON_CHECK_BIN" "$ROOT/scripts/prepare_wasm_exports.py" \
     "$ROOT/src/pymodule_exports.elisa" "$PYMODULE_SOURCE" "$UPSTREAM"
-ELISA_RUNTIME_OBJ="$SHIM_OBJ" ELISA_STAGE1_SEMANTIC_GATE=1 \
+ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" ELISA_STAGE1_SEMANTIC_GATE=1 \
     "$UPSTREAM/scripts/elisac_stage1.sh" \
     -emit pymodule-so "$PYMODULE_SOURCE"
 PYTHON_TEST_BIN="${PYTHON_BIN:-python3}"
-"$PYTHON_TEST_BIN" "$ROOT/shells/python/test_marble.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/shells/python/test_marble.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/sudoku_python_host_options_test.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/go_python_host_options_test.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/crossedwires_python_host_options_test.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/crossword_python_host_options_test.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/scrabble_python_host_test.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/scramble_python_host_test.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/algebra_python_working_test.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/algebra_python_options_test.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/numberology_exact_python_test.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/numberology_python_host_test.py"
 echo "built in $OUT"

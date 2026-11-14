@@ -24,8 +24,8 @@ PREMIUM_INDEX = {"": 0, "DL": 1, "TL": 2, "DW": 3, "TW": 4}
 
 WANTED_FN = {"grade_of", "premiums", "blank_board", "written", "_run",
              "score_play", "legal", "anchors", "_cross_check", "plays",
-             "_line_of", "_extend", "_walk", "best_play", "draw"}
-WANTED_CLASS = {"Play", "Board", "Grade"}
+             "_line_of", "_extend", "_walk", "best_play", "draw", "hooks", "_seed_board", "deal_one"}
+WANTED_CLASS = {"Play", "Board", "Grade", "Deal"}
 WANTED_CONST = {"VALUES", "BAG", "GRADES", "BINGO", "RACK", "PLAIN",
                 "DOUBLE_LETTER", "TRIPLE_LETTER", "DOUBLE_WORD",
                 "TRIPLE_WORD"}
@@ -77,8 +77,12 @@ class Lexicon(object):
 
     def __init__(self, words):
         self.words = frozenset(words)
+        self.entries = tuple(__import__("types").SimpleNamespace(word=word) for word in words)
         self._prefixes = frozenset(word[:cut] for word in words
                                    for cut in range(1, len(word)))
+
+    def narrowed(self, **_kwargs):
+        return self
 
     def valid(self, word):
         return word in self.words
@@ -184,6 +188,21 @@ def reference():
         if best is not None:
             row.extend((best.score, 1 if best.down else 0))
         out.append(row)
+    for rung in range(1, 11):
+        for seed in range(5):
+            grade = REF["grade_of"](rung)
+            board = REF["_seed_board"](grade, lex, random.Random(seed))
+            out.append(["seedboard", rung, seed, int(board is not None)]
+                       + ([LETTERS.index(ch) if ch else -1 for ch in board.letters] if board else []))
+    for rung in range(1, 11):
+        for seed in range(2):
+            deal = REF["deal_one"](REF["grade_of"](rung), random.Random(seed), lex)
+            row = ["seeddeal", rung, seed, int(deal is not None)]
+            if deal:
+                row += [LETTERS.index(ch) if ch else -1 for ch in deal.board.letters]
+                row += [len(deal.rack), *coded(deal.rack), deal.best.score,
+                        int(deal.best.down), len(deal.best.word), *coded(deal.best.word)]
+            out.append(row)
     return [",".join(str(one) for one in row) for row in out]
 
 

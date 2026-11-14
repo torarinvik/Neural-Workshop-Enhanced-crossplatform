@@ -9,11 +9,9 @@ The typed answers a rung is marked against are written to a file the sweep
 reads back, so both sides read the same strings.
 
 `Problem.candidates` is `log10(max(1, space))`, a display value, so `space`
-itself is what is compared here and the logarithm is left to the shell. So is
-`working`: it is English built round numbers that are checked elsewhere, and
-the one part of it that is load-bearing -- the running recombination inside
-`build_crt` -- raises there if it disagrees with the answer, which the port
-also does.
+itself is what is compared here and the logarithm is left to the shell.
+`algebra_working_test.mjs` separately compares the generated derivation with
+original Python fixtures and checks that the complete label reaches the display list.
 """
 import subprocess
 import sys

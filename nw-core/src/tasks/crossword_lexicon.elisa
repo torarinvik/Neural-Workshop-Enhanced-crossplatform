@@ -1,0 +1,143 @@
+# Read the original wordlist index: lowercase word, rank, and UTF-8 clue,
+# separated by tabs and terminated by a newline. Clue offsets refer to the
+# caller-owned text, so the caller must retain it for the life of a puzzle.
+module CrosswordLexicon:
+    struct CrosswordIndexRow:
+        next: i64
+        word_at: i64
+        word_length: i64
+        rank: i64
+        clue_at: i64
+        clue_length: i64
+        valid: bool
+
+    struct CrosswordIndexStats:
+        words: mutable i64
+        letters: mutable i64
+        clued: mutable bool
+        valid: mutable bool
+
+    def row_at(text: sview, start: i64, total: i64) -> CrosswordIndexRow:
+        can Abort.Panic:
+            end: mutable i64 = start
+            while end < total and sview_at(text, end.usize()) != 10.u8() |text, total, end|:
+                end <- end + 1
+            next: i64 = end + 1 if end < total else end
+            line_end: i64 = end - 1 if end > start and sview_at(text, (end - 1).usize()) == 13.u8() else end
+            tab: mutable i64 = start
+            while tab < line_end and sview_at(text, tab.usize()) != 9.u8() |text, line_end, tab|:
+                tab <- tab + 1
+            second: mutable i64 = tab + 1
+            while second < line_end and sview_at(text, second.usize()) != 9.u8() |text, line_end, second|:
+                second <- second + 1
+            rank: mutable i64 = 0
+            valid: mutable bool = tab > start and tab < line_end and second > tab + 1 and second < line_end
+            for at in start..<tab |text, valid|:
+                byte: u8 = sview_at(text, at.usize())
+                valid <- false if byte < 97.u8() or byte > 122.u8()
+            for at in (tab + 1)..<second |text, rank, valid|:
+                byte: u8 = sview_at(text, at.usize())
+                if byte < 48.u8() or byte > 57.u8() or rank > 214748364:
+                    valid <- false
+                else:
+                    rank <- rank * 10 + byte.i64() - 48
+            for at in (second + 1)..<line_end |text, valid|:
+                byte: u8 = sview_at(text, at.usize())
+                valid <- false if byte == 9.u8() or byte == 0.u8()
+            valid <- false if rank <= 0
+            return CrosswordIndexRow{next: next, word_at: start, word_length: tab - start,
+                                     rank: rank, clue_at: second + 1,
+                                     clue_length: line_end - second - 1, valid: valid}
+
+    # Match Lexicon.clued: inspect the first 64 entries in stable rank order,
+    # including short words that are not usable in crossword grids.
+    def inspect(text: sview, rank_limit: i64, max_length: i64) -> CrosswordIndexStats:
+        can Abort.Panic:
+            stats: mutable CrosswordIndexStats = CrosswordIndexStats{words: 0, letters: 0, clued: false, valid: true}
+            total: i64 = sview_len(text).i64()
+            at: mutable i64 = 0
+            first_count: mutable i64 = 0
+            first_rank: mutable i64[64] = zeroed
+            first_clued: mutable bool[64] = zeroed
+            while at < total |text, rank_limit, max_length, stats, total, at, first_count, first_rank, first_clued|:
+                row: CrosswordIndexRow = row_at(text, at, total)
+                if not row.valid:
+                    stats.valid <- false
+                    return stats
+                if row.rank < rank_limit and row.word_length <= 15:
+                    if first_count < 64 or row.rank < first_rank[63]:
+                        position: mutable i64 = first_count if first_count < 64 else 63
+                        while position > 0 and first_rank[(position - 1).usize()] > row.rank |position, first_rank, first_clued, row|:
+                            first_rank[position.usize()] <- first_rank[(position - 1).usize()]
+                            first_clued[position.usize()] <- first_clued[(position - 1).usize()]
+                            position <- position - 1
+                        first_rank[position.usize()] <- row.rank
+                        first_clued[position.usize()] <- row.clue_length > 0
+                        first_count <- first_count + 1 if first_count < 64
+                if row.rank < rank_limit and row.word_length >= Crossword::MIN_ENTRY and row.word_length <= max_length:
+                    stats.words <- stats.words + 1
+                    stats.letters <- stats.letters + row.word_length
+                at <- row.next
+            for index in 0..<first_count |first_clued, stats|:
+                stats.clued <- true if first_clued[index.usize()]
+            return stats
+
+    # Stable bottom-up merge sort preserves input order for equal ranks, just
+    # as Python's sorted(..., key=rank) does. Letter storage stays in place.
+    def sort_entries(lex: mutable Crossword::Lexicon&):
+        can Memory.Allocate, Abort.Panic:
+            starts: mutable darray[i64] = Ints::zeros(lex.count)
+            lengths: mutable darray[i64] = Ints::zeros(lex.count)
+            ranks: mutable darray[i64] = Ints::zeros(lex.count)
+            clues: mutable darray[i64] = Ints::zeros(lex.count)
+            width: mutable i64 = 1
+            while width < lex.count |lex, starts, lengths, ranks, clues, width|:
+                begin: mutable i64 = 0
+                while begin < lex.count |lex, starts, lengths, ranks, clues, width, begin|:
+                    middle: i64 = begin + width if begin + width < lex.count else lex.count
+                    end: i64 = middle + width if middle + width < lex.count else lex.count
+                    left: mutable i64 = begin
+                    right: mutable i64 = middle
+                    for dest in begin..<end |lex, starts, lengths, ranks, clues, left, right, middle, end|:
+                        take_left: bool = left < middle and (right >= end or Ints::at_ref(&lex.rank, left) <= Ints::at_ref(&lex.rank, right))
+                        source: i64 = left if take_left else right
+                        left <- left + 1 if take_left
+                        right <- right + 1 if not take_left
+                        Ints::put(&starts, dest, Ints::at_ref(&lex.start, source))
+                        Ints::put(&lengths, dest, Ints::at_ref(&lex.length, source))
+                        Ints::put(&ranks, dest, Ints::at_ref(&lex.rank, source))
+                        Ints::put(&clues, dest, Ints::at_ref(&lex.clue, source))
+                    begin <- end
+                for index in 0..<lex.count |lex, starts, lengths, ranks, clues|:
+                    Ints::put(&lex.start, index, Ints::at_ref(&starts, index))
+                    Ints::put(&lex.length, index, Ints::at_ref(&lengths, index))
+                    Ints::put(&lex.rank, index, Ints::at_ref(&ranks, index))
+                    Ints::put(&lex.clue, index, Ints::at_ref(&clues, index))
+                width <- width * 2
+
+    # `lex` must have the capacities returned by inspect for the same band.
+    def load(text: sview, rank_limit: i64, max_length: i64, lex: mutable Crossword::Lexicon&):
+        can Memory.Allocate, Abort.Panic:
+            total: i64 = sview_len(text).i64()
+            at: mutable i64 = 0
+            letters: mutable i64 = 0
+            previous_rank: mutable i64 = 0
+            unsorted: mutable bool = false
+            lex.count <- 0
+            while at < total |text, rank_limit, max_length, lex, total, at, letters, previous_rank, unsorted|:
+                row: CrosswordIndexRow = row_at(text, at, total)
+                if row.rank < rank_limit and row.word_length >= Crossword::MIN_ENTRY and row.word_length <= max_length:
+                    word: i64 = lex.count
+                    unsorted <- true if row.rank < previous_rank
+                    previous_rank <- row.rank
+                    Ints::put(&lex.start, word, letters)
+                    Ints::put(&lex.length, word, row.word_length)
+                    Ints::put(&lex.rank, word, row.rank)
+                    Ints::put(&lex.clue, word, row.clue_at if row.clue_length > 0 else -1)
+                    for offset in 0..<row.word_length |text, lex, row, letters|:
+                        Ints::put(&lex.letter, letters + offset, sview_at(text, (row.word_at + offset).usize()).i64() - 97)
+                    letters <- letters + row.word_length
+                    lex.count <- lex.count + 1
+                at <- row.next
+            if unsorted: sort_entries(lex)
+            Crossword::index_lexicon(lex)

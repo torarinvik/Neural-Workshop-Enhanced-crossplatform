@@ -1,6 +1,8 @@
 # Common-v1 controller for Find the Winning Move.
 # The persistent ABI record uses fixed arrays; Go::GoProblem and Go::GoWork are
 # rebuilt in a scratch region so their darrays never escape an ABI call.
+extern rint(x: f64) -> f64
+
 module GoGame:
     const TASK_ID: i64 = 2946453024
     const MAX_CELLS: i64 = 361
@@ -15,6 +17,7 @@ module GoGame:
     const ACTION_DOWN: i64 = 4
     const ACTION_LEFT: i64 = 5
     const ACTION_RIGHT: i64 = 6
+    const ACTION_LEVEL: i64 = 7
     const INFO_PHASE: i64 = 0
     const INFO_DIFFICULTY: i64 = 1
     const INFO_TRIAL: i64 = 2
@@ -27,6 +30,7 @@ module GoGame:
     const INFO_BEST: i64 = 9
     const INFO_CAPTURE_OPTIONS: i64 = 10
     const INFO_WINNING: i64 = 11
+    const INFO_CAPTURED: i64 = 12
     const VALUE_BOARD: i64 = 0
     const VALUE_TARGET: i64 = 1
 
@@ -39,6 +43,8 @@ module GoGame:
         correct: mutable i64
         phase: mutable i64
         verdict: mutable i64
+        captured: mutable i64
+        level_changed: mutable bool
         size: mutable i64
         cursor_x: mutable i64
         cursor_y: mutable i64
@@ -52,7 +58,7 @@ module GoGame:
     def allowed_difficulty(value: i64) -> bool:
         return value >= 1 and value <= Go::DIFFICULTY_COUNT
     def allowed_trials(value: i64) -> bool:
-        return value >= 1 and value <= 100
+        return value == 1 or value == 3 or value == 5 or value == 8 or value == 10 or value == 15 or value == 20 or value == 30 or value == 50
 
     def copy_problem(run: mutable GoRun&, problem: Go::GoProblem&):
         can Abort.Panic:
@@ -88,6 +94,8 @@ module GoGame:
             run.correct <- 0
             run.phase <- PHASE_READY
             run.verdict <- -1
+            run.captured <- 0
+            run.level_changed <- false
             run.size <- 0
             run.cursor_x <- 0
             run.cursor_y <- 0
@@ -104,6 +112,14 @@ module GoGame:
             if run.trial >= run.total_trials:
                 run.phase <- PHASE_DONE
                 run.size <- 0
+                run.captured <- 0
+                run.winning <- -1
+                run.best <- 0
+                run.capture_options <- 0
+                run.problem_seed <- 0
+                for cell in 0..<MAX_CELLS |cell, run|:
+                    run.board[cell.usize()] <- 0
+                    run.target[cell.usize()] <- 0
                 return
             run.trial <- run.trial + 1
             run.problem_seed <- py_randrange(&run.rng, 0, 1073741824)
@@ -115,13 +131,35 @@ module GoGame:
             run.cursor_x <- run.size / 2
             run.cursor_y <- run.size / 2
             run.verdict <- -1
+            run.captured <- 0
+            run.level_changed <- false
             run.phase <- PHASE_SOLVING
+
+    def reset_run(run: mutable GoRun&):
+        run.difficulty <- run.start_difficulty
+        run.trial <- 0
+        run.correct <- 0
+        run.phase <- PHASE_READY
+        run.verdict <- -1
+        run.captured <- 0
+        run.level_changed <- false
+        run.size <- 0
+        run.cursor_x <- 0
+        run.cursor_y <- 0
+        run.winning <- -1
+        run.best <- 0
+        run.capture_options <- 0
+        run.problem_seed <- 0
+        for cell in 0..<MAX_CELLS |cell, run|:
+            run.board[cell.usize()] <- 0
+            run.target[cell.usize()] <- 0
 
     def apply(run: mutable GoRun&, action: i64, value: i64, now_ms: i64) -> i64:
         can Memory.Allocate, Abort.Panic:
             _ = now_ms
             if action == ACTION_START:
                 return 2 if run.phase != PHASE_READY and run.phase != PHASE_DONE
+                reset_run(run) if run.phase == PHASE_DONE
                 next_trial(run)
                 return 1
             if action == ACTION_NEXT:
@@ -135,6 +173,16 @@ module GoGame:
                 if action == ACTION_LEFT: run.cursor_x <- run.cursor_x - 1 if run.cursor_x > 0
                 if action == ACTION_RIGHT: run.cursor_x <- run.cursor_x + 1 if run.cursor_x + 1 < run.size
                 return 1
+            if action == ACTION_LEVEL:
+                return 2 if run.phase != PHASE_READY and run.phase != PHASE_DONE
+                difficulty: mutable i64 = value
+                difficulty <- value - 48 if value >= 48 and value <= 57
+                difficulty <- 10 if difficulty == 0
+                return 2 if not allowed_difficulty(difficulty)
+                run.start_difficulty <- difficulty
+                run.difficulty <- difficulty
+                run.level_changed <- true
+                return 1
             if action != ACTION_ANSWER or run.phase != PHASE_SOLVING:
                 return 2
             return 2 if value < 0 or value >= run.size * run.size
@@ -142,16 +190,34 @@ module GoGame:
                 in answer:
                     problem: mutable Go::GoProblem = source_problem(run)
                     work: mutable Go::GoWork = Go::GoWork()
+                    work.size <- run.size
+                    work.cells <- run.size * run.size
                     options: i64 = Go::capture_moves(&work, &problem.board, 1)
                     run.capture_options <- options
                     if value == problem.winning:
                         _ = Go::play(&work, &problem.board, value % run.size, value / run.size, 1, &work.scratch_board)
                         run.correct <- run.correct + 1
                         run.verdict <- 1
+                        run.captured <- run.best
                     else:
-                        run.verdict <- 0
+                        captured: mutable i64 = 0
+                        move_index: mutable i64 = 0
+                        while move_index < work.move_n |move_index, work, value, run, captured|:
+                            if Ints::at_ref(&work.move_x, move_index) == value % run.size and Ints::at_ref(&work.move_y, move_index) == value / run.size:
+                                captured <- Ints::at_ref(&work.move_count, move_index)
+                            move_index <- move_index + 1
+                        run.captured <- captured
+                        if captured > 0:
+                            run.verdict <- 3
+                        elif Ints::at_ref(&problem.board, value) != 0:
+                            run.verdict <- 2
+                        else:
+                            run.verdict <- 0
                     for cell in 0..<MAX_CELLS |cell, run, problem|:
-                        run.board[cell.usize()] <- Ints::at_ref(&problem.board, cell)
+                        if value == problem.winning:
+                            run.board[cell.usize()] <- Ints::at_ref(&work.scratch_board, cell)
+                        else:
+                            run.board[cell.usize()] <- Ints::at_ref(&problem.board, cell)
                     run.phase <- PHASE_JUDGED
                 destroy answer
             return 1
@@ -169,6 +235,7 @@ module GoGame:
         if field == INFO_BEST: return run.best
         if field == INFO_CAPTURE_OPTIONS: return run.capture_options
         if field == INFO_WINNING: return run.winning
+        if field == INFO_CAPTURED: return run.captured
         return -1
 
     def value(run: GoRun&, field: i64, at: i64) -> i64:
@@ -182,12 +249,17 @@ module GoGame:
             return -1 if run.phase != PHASE_SOLVING or run.size <= 0
             board: mutable SceneGo::GoGoban = SceneGo::GoGoban{left: 0.0, bottom: 0.0, step: 0.0}
             SceneGo::board_of(&board, width, height, run.size)
-            px: f64 = ((x - board.left) / board.step).i64().f64()
-            py: f64 = ((y - board.bottom) / board.step).i64().f64()
-            ix: i64 = px.i64()
-            iy: i64 = py.i64()
+            px: f64 = (x - board.left) / board.step
+            py: f64 = (y - board.bottom) / board.step
+            ix: i64 = rint(px).i64()
+            iy: i64 = rint(py).i64()
             return -1 if ix < 0 or ix >= run.size or iy < 0 or iy >= run.size
-            return iy * run.size + ix
+            dx: mutable f64 = x - (board.left + ix.f64() * board.step)
+            dy: mutable f64 = y - (board.bottom + iy.f64() * board.step)
+            dx <- -dx if dx < 0.0
+            dy <- -dy if dy < 0.0
+            return -1 if dx >= board.step * 0.42 or dy >= board.step * 0.42
+            return (run.size - 1 - iy) * run.size + ix
 
     def render(run: GoRun&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
         can Memory.Allocate, Abort.Panic:
@@ -197,12 +269,30 @@ module GoGame:
                     message: mutable dstr = []
                     if run.phase == PHASE_READY: dstr_append_cstr(&message, "Press Space to start")
                     elif run.phase == PHASE_SOLVING: dstr_append_cstr(&message, "Choose the winning move")
-                    elif run.verdict == 1: dstr_append_cstr(&message, "Winning move")
-                    else: dstr_append_cstr(&message, "Wrong move")
+                    elif run.phase == PHASE_DONE:
+                        if run.level_changed:
+                            dstr_append_cstr(&message, "Press Space to start")
+                        else:
+                            dstr_append_i64(&message, run.correct)
+                            dstr_append_cstr(&message, " of ")
+                            dstr_append_i64(&message, run.total_trials)
+                            dstr_append_cstr(&message, " winning moves found")
+                    elif run.verdict == 1:
+                        dstr_append_cstr(&message, "Winning move — captured ")
+                        dstr_append_i64(&message, run.captured)
+                        dstr_append_cstr(&message, " stones")
+                    elif run.verdict == 2: dstr_append_cstr(&message, "That intersection is occupied")
+                    elif run.verdict == 3:
+                        dstr_append_cstr(&message, "Captured ")
+                        dstr_append_i64(&message, run.captured)
+                        dstr_append_cstr(&message, ", but the winning move captures ")
+                        dstr_append_i64(&message, run.best)
+                    else: dstr_append_cstr(&message, "That move captures no White stones")
                     paint: mutable SceneGo::GoPaint = SceneGo::paint_of(black, width, height, width / 912.0, height / 684.0)
+                    render_phase: i64 = PHASE_READY if run.phase == PHASE_DONE and run.level_changed else run.phase
                     SceneGo::render(list, &paint, &problem.board, &problem.target,
                                     problem.size, problem.winning, problem.show_target,
-                                    problem.show_move, run.size > 0, run.phase,
+                                    problem.show_move, run.size > 0, render_phase,
                                     run.difficulty, run.trial, run.total_trials,
                                     run.cursor_x, run.cursor_y, bytes_view(message))
                 destroy frame

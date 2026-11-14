@@ -1,6 +1,6 @@
 # Neural Workshop runtime protocol
 
-**Status (2026-10-07):** common WASM v1 remains partial. The reviewed
+**Status (2026-11-10):** common WASM v1 remains partial. The reviewed
 capability manifest records 43 stateful web controllers, one web stateless
 entry, and the host-owned Marble physics prototype; Python and SDL each record
 24 stateful controllers and 21 not-yet-integrated entries. The web menu is now
@@ -11,25 +11,24 @@ Python and SDL task hubs expose only their explicitly implemented controllers;
 unintegrated entries remain inert. No generic or
 non-3D N-Back mode is part of the port.
 
-The current Stage1 artifact was promoted on 2026-10-07 from Elisa-compiler
-Stage1 commit `23a0e16a854cddec3016746a0cb9480db0c4db22`, source fingerprint
-`0e17e6c92e8a03735d46be9eec69953336395d909c4121fbe83414d060589f57`, and
-product SHA-256
-`f1d15c7713b8583c0ec3d5b617599f7208786b374eb291dab9c86892ca0d8b56`. The
+The current application artifact was promoted on 2026-11-10 using the
+source-fresh Elisa-compiler Stage1 product at commit
+`d3b2e657d57c159c77b9523542f21fd67a93b916`, source fingerprint
+`9de69658a554a61ac1679e3cd52398ea73800adf700fb0c51d7a636324dceef9`, product
+SHA-256 `eaa65de1651631e703365e46a39ede6f1bcee123c3653755c368c59f51725f0f`.
+The promoted `build/nwcore.wasm` is 1,629,226 bytes, SHA-256
+`a99f7d098a76f495b94505873a283c7f6cdcdab25c279c5c04e996228069b30d`; the
 linked Stage1 object SHA-256 is
-`bd71fdd5aa54123c8e87d90794e100967353d9d7c581069077f868d726fe0233`, and
-`build/nwcore.wasm` is 1,685,170 bytes with SHA-256
-`4e4b6e90f58257883672da6309793db175f5a1f501c6042a1ef2dccaa6eec897`. The
-complete WASM artifact suite passed, including Count v6, N-Back v4, Monkey
-Ladder v5, Sokoban v2, and Tetris v3 field snapshot roundtrips/continuations
-and malformed-state checks, browser contracts, and 275 Marble trajectory
-scenarios (33,982 per-frame states). The Count v6 promotion receipt and prior
-artifact copy are in
-`output/verification/count-v6-snapshot-promotion-20261007/`. The full
-compiler gate completed on 2026-10-07 and failed: 232 of 569 Stage1 parity
-checks failed, with three top-level gate steps failing. The live response at
-`http://127.0.0.1:8000/build/nwcore.wasm` was fetched and matches the promoted
-artifact byte-for-byte.
+`c7761d5729d0e66493a6587c1b66f1c497b9c7ef8cd3986b376ab6f9f4bc9837`. The
+complete latest-Stage1 application build and artifact suite passed before
+promotion, including Go rules, browser interaction, and original-source replay,
+the Sudoku 186-action original-source replay, common-v1 contracts, browser
+contracts, and 275 Marble trajectory scenarios / 33,982 frame states. No
+Stage0 or Stage1 compiler product was rebuilt. The older 2026-10-07 Count v6 artifact and
+receipt remain in
+`output/verification/count-v6-snapshot-promotion-20261007/`; the full compiler
+gate result recorded there is historical and is not a current Stage1 compiler
+gate claim.
 
 The immediately previous 2026-10-07 artifact was the Tetris v3-only product
 with WASM SHA-256
@@ -127,7 +126,7 @@ returned as positive `i64` values:
 | `monkey_ladder` | `4150660153` | yes |
 | `graph_mapping` | `921237686` | yes; browser controller |
 | `matrix_reasoning` | `3934003723` | yes; browser controller |
-| `crossed_wires` | `2239133075` | yes; browser controller |
+| `crossed_wires` | `2239133075` | yes; browser, Python and SDL controllers |
 | `sudoku` | `4211466488` | yes; browser controller |
 | `sokoban` | `498559474` | yes |
 | `count` | `967958004` | yes |
@@ -168,7 +167,11 @@ slots must be zero:
 | Count | shape kind, 0–4 | start count: 2, 4, 6, 8, 10, 12, 16, 20, 25, 30, 40, 50, 60 | trials: 5, 10, 15, 20, 30, 50, 80, 100 | exposure ms: 0, 200, 350, 500, 750, 1000, 2000, 4000 | adaptive, 0/1 | show answer, 0/1 |
 | Mr. Time | mode: recall `0`, produce `1`, both `2` | starting rung: 1–6 | trials: 5, 10, 15, 20, 30, 50, 80 | maximum gap ms: 500, 1000, 2000, 3000, 5000, 8000, 15000 | flash ms: 100, 200, 400, 800, 1500 | adaptive, 0/1 |
 | Graph Mapping | nodes: 4, 5, 6, 7, 8, 9, 10, 12, 14, 16 | density: sparse `0`, medium `1`, dense `2` | trials: 5, 10, 15, 20, 30, 50, 80, 100 | exposure ms: 0, 3000, 5000, 8000, 12000, 20000 | adaptive, 0/1 | subtle, 0/1 |
+| Find the Winning Move (Go) | starting level: 1–10 | positions per run: 1, 3, 5, 8, 10, 15, 20, 30, 50 | 0 | 0 | 0 | 0 |
 | Matrix Reasoning | level: 1–12 | trials: 5, 10, 15, 20, 30, 50, 80, 100 | exposure ms: 0, 10000, 20000, 30000, 45000, 60000 | adaptive, 0/1 | `e` bit 0 feedback and bit 1 explanation | color, 0/1 |
+| Jigsaw Puzzle | starting side: 2, 3, 4, 5, 6, 7, 8, 10 | puzzles: 1, 2, 3, 5, 8, 12, 20 | adaptive, 0/1 | preview, 0/1 | mark placed, 0/1 | 0 |
+| Scramble | starting level: 1–12 | lines per run: 1–100 | show word count, 0/1 | adaptive, 0/1 | 0 | 0 |
+| Scrabble | starting level: 1–10 | boards per run: 1, 2, 3, 5, 8, 10, 15 | show premiums, 0/1 | adaptive, 0/1 | 0 | 0 |
 | Crossed Wires | rung: 1–12 | rounds: 1, 2, 3, 5, 8, 10, 15, 20 | adaptive, 0/1 | draw grid, 0/1 | 0 | 0 |
 | Sudoku | rung: 1–12 | trials: 1, 2, 3, 5, 8, 10 | show clashes, 0/1 | adaptive, 0/1 | 0 | 0 |
 | Marble Maze | starting rung, 1–16 | trial count, 1–1000 | adaptive, 0/1 | feedback ms, 0–600000 | time override ms: 0 or 15000, 30000, 45000, 60000, 90000, 120000 | cast shadows, 0/1 |
@@ -196,13 +199,20 @@ slots must be zero:
 The current browser defaults are 3D N-Back `(2, 1, 24, 3000, 500, 200)` with
 seed 1, Monkey Ladder `(5, 3, 1, 700, 280, 1)` with
 seed 1, Sokoban `(2, 5, 1, 0, 0, 0)` with seed 17, Count
-`(0, 8, 15, 0, 1, 1)` with a run seed from browser entropy, Marble Maze
+`(0, 8, 15, 0, 1, 1)` with a run seed from browser entropy, Find the Winning
+Move `(1, 10, 0, 0, 0, 0)` with seed 17, Marble Maze
 `(1, 5, 1, 2600, 0, 1)` with a run seed from browser entropy, and Tower of
 Hanoi `(4, 3, 1, 0, 0, 0)` with seed 1. Marble's `e=0`
 uses the original rung-specific time limit; a positive supported value overrides
 it. `f=1` enables the source-default shadows setting. Count accepts
-`?count-seed=<nonnegative-i64>` for deterministic replay and currently uses
-these source defaults without a Count-specific options screen or persistence.
+`?count-seed=<nonnegative-i64>` for deterministic replay. New browser profiles
+use the source defaults `(0, 8, 15, 0, 1, 1)`; the real task menu and the task
+screen in READY/DONE open six source-defined options with `C`. Accepted values
+are validated and persisted under `neural-workshop.count.options.v1`, then
+passed to a fresh controller. Escape cancels the draft, and timed shape
+exposure follows the selected duration. The browser requests Count display
+lists in the shared 912×684 reference space; the canvas applies device-pixel
+scaling once, keeping text, prompts, and generated shapes in the viewport.
 Mr. Time accepts `?mrtime-seed=<nonnegative-i64>` for deterministic
 recall/produce replays; the browser defaults recall mode, rung 1, 15 trials,
 a 3-second hidden gap, 400 ms flash, and adaptive difficulty. The real task
@@ -220,6 +230,14 @@ advance, overrun, and sighting rules; the browser supplies only normalized
 keyboard/pointer events, monotonic time, and display-list presentation. The
 source road, sky target, ride, scoring, verdict, and result fields remain
 owned by the controller.
+Jigsaw defaults to `(3, 3, 1, 1, 0, 0)`, matching the original side, puzzle
+count, adaptive, preview, and mark-placed settings. Its browser options panel
+validates and persists all five values and recreates the controller when
+applied. The `e` slot carries `mark_placed`; `f` is reserved. The shell can
+import the external DIV2K directory into IndexedDB, stores its unseen-photo
+rotation across sessions, and renders the source tile crops and centered-square
+preview. The coloured-tile fallback remains available when no photos are
+imported.
 N-Cup Monte uses `(3, 8, 1, 6, 340, 1150)` with seed 17 in the browser
 route. Its source-default cup numbers remain enabled because the shared six-
 slot options ABI has no seventh `show_numbers` field; the controller documents
@@ -344,6 +362,17 @@ digits `0`–`9`. Space starts or replays from READY/DONE, Enter submits, and
 Backspace/Delete removes one typed digit. Input is capped at three digits and
 follows the reference's leading-zero normalization.
 
+Scrabble hosts send `START_CLOCK=10` with a fresh monotonic timestamp immediately
+after a start action or pointer event successfully creates a playing board.
+This one-time action excludes synchronous deal generation from the elapsed
+time. It is ignored after the first synchronization or another action; hosts
+that do not send it retain the start event's timestamp for compatibility.
+
+Scramble uses the same post-generation clock handoff with `START_CLOCK=5`.
+The action is accepted once immediately after a deal starts; hosts that omit
+it retain the start-event timestamp. Scramble info field 16 reports the sum of
+answered-line elapsed times in whole seconds, truncated after accumulation.
+
 Mr. Time semantic action codes are `START=0`, `DIGIT=1`, `POINT=2`,
 `BACKSPACE=3`, `SUBMIT=4`, and `ACT=5`. Digit, point, and backspace actions
 edit the controller-owned decimal response; `SUBMIT` grades recall duration
@@ -435,6 +464,26 @@ feedback expiry are blocked until both score commitment and result-row
 commitment have succeeded, so a stalled host cannot silently skip a source
 result between trays.
 
+Find the Winning Move (Go) semantic action codes are `START=0`, `ANSWER=1`,
+`NEXT=2`, `UP=3`, `DOWN=4`, `LEFT=5`, `RIGHT=6`, and `LEVEL=7`. The common
+create options are starting level and positions per run; defaults are level 1
+and 10 positions, and the accepted trial counts are exactly 1, 3, 5, 8, 10,
+15, 20, 30, and 50. Phases are READY, SOLVING, JUDGED, and DONE. Space starts
+READY or advances JUDGED; Enter submits the cursor intersection; arrows move
+the cursor; number keys set levels 1–9 or 10 with `0` in READY/DONE; `C` opens
+the source options UI; Escape returns to the task hub. A primary pointer-down
+maps to the nearest Go intersection in the 912×684 reference canvas and is
+accepted only when each axis is strictly within 0.42 of one board step. The
+pointer mapper converts the source bottom-origin board geometry to row-major
+cell order. `ANSWER.value` is that row-major cell. The source Go kernel grades
+captures, occupied points, suicide, and its stateless immediate-ko behavior;
+the puzzle environment itself supplies no ko history. Correct moves place the
+stone and report captured stones, while misses distinguish occupied points,
+non-captures, and captures below the puzzle target. The common public state
+reports score and capture/verdict fields without exposing the winning point.
+The browser persists options under `neural-workshop.go.options.v1`; Python and
+SDL host launchers accept the same validated level/trial options.
+
 Tower of Hanoi semantic action codes are `START=0`, `PICK_0=1`, `PICK_1=2`,
 and `PICK_2=3`. Space and Enter start from READY/DONE; number keys 1–3 and
 primary pointer-down events select a peg while SOLVING. Selecting a source peg
@@ -497,6 +546,9 @@ Left 3, Up 4, Right 5, Down 6, Escape 7, Undo 8, Restart 9, and Options 10;
 Marble-specific Level is 11; Tower-of-Hanoi peg keys 1, 2, and 3 are 12, 13,
 and 14. In the Dark uses numeric key codes 12–16 (keys `1`–`5`) for its five
 colour-answer actions. Maze uses the same directional and restart key codes.
+Scrabble maps arrows, Undo, keys 1–7, and Tab (logical key code 23) to its
+movement, tile placement, and turn actions; the numeric key selects the rack
+slot independently of the event's `value` field.
 `value` carries the physical code. A text event
 carries one Unicode scalar in `value`; a host would split longer UTF-8 text
 into scalar events in order.
@@ -844,7 +896,11 @@ on-target time, schedule a turn, or consume RNG. The browser scales the source
 controller alone converts them to source coordinates and owns the score.
 Graph Mapping projects the source title/status, two independently ring-placed
 graphs, divider, answer buttons, question text, and verdict through
-`SceneGraphMapping`. The controller owns the balanced same/different deck,
+`SceneGraphMapping`. On compact browser canvases, the shell asks the controller
+for the original 640×480-point minimum layout (scaled by device-pixel ratio)
+and then scales the complete display list into the available 4:3 canvas; this
+keeps the source's fixed minimum controls proportional to the graphs. The
+controller owns the balanced same/different deck,
 graph-pair generation, actual equivalence truth, exposure hiding, 900 ms
 feedback deadline, adaptive node count, score counters, and RNG stream. The
 browser supplies only normalized keyboard/pointer events, monotonic time, and
@@ -888,6 +944,24 @@ source default rung 3 with five adaptive rounds and grid enabled, and destroys
 the controller when leaving the task. The focused smoke and browser contract
 tests cover seeded replay, hidden-wiring non-leakage, physical-port transport,
 budget exhaustion, verdict rendering, completion, and idempotent cleanup.
+The browser persists all four source settings and applies or cancels them from
+the menu or task. Applying settings resets the run while preserving its random
+stream. Python and SDL accept the same settings through validated startup flags;
+their interactive settings dialog remains unimplemented. The additive
+`nw_api_v1_crossed_wires_info` accessor exposes public counters and score
+aggregates, with no wiring or dead-port field. The original UI and environment
+replay compares key and port actions, adaptive climb/stay/drop, score, and the
+800 ms verdict boundary against the promoted WASM controller.
+Crossword uses the shared controller to load a clued TSV index and stably sort
+entries by rank,
+deal source puzzles, navigate and edit cells, and settle correct grids. The
+browser stores an imported index locally and exposes the source level, grid
+count, mistake marking, and adaptive settings. Python and SDL load an explicit index or
+the standard local data path and accept the same settings as startup flags.
+The index setter copies validated input into controller-owned storage; a missing
+index leaves the task in its ready state with an explanatory message. SDL routes menu/direct entry, keyboard, and pointer events to the same controller.
+Both native hosts provide an O-key options screen outside solving and share a
+validated settings file across restarts. Explicit startup options take precedence.
 Sudoku projects the source title, grade/technique prompt, immutable givens,
 filled values, pencil masks, conflict washes, cursor, trial summary, solved
 message, and DONE verdict through `SceneSudoku`. The controller uses the
@@ -898,15 +972,33 @@ accumulate across the source's default rung budget or exhaust browser linear
 memory. Common-v1 state exposes only public board metadata; the solution and
 given/filled/mark arrays are available only through additive diagnostic
 accessors for focused tests, never through the browser renderer. The browser
-route starts with rung 3, three trials, visible clashes, and adaptive scoring;
-it maps arrows, 1–9/A–G, 0, Backspace/Delete, N, Space/Enter, and the source
-option shortcuts, and destroys the run on task replacement. The focused smoke
-covers seeded replay, immutable givens, pencil/erase behavior, wrong-entry
-accounting, a real full solve, verdict preservation, rendering, completion,
-and idempotent cleanup; the browser contract covers task position, defaults,
-input, render, lifecycle, and cleanup. Native Python integration, SDL3, the
-source options panel, and a headed original-vs-port controller replay remain
-open.
+route defaults to rung 3, three trials, visible clashes, and adaptive scoring;
+it persists the four source settings and opens their options screen from the
+task menu or task screen. O always opens options; C opens them only below level
+12, where C is not digit twelve. The browser maps arrows, 1–9/A–G, 0,
+Backspace/Delete, N, and Space/Enter, and destroys the run on task replacement.
+Python and SDL use the same source defaults, accept the four Sudoku settings as
+validated startup flags, and map 1–9/A–G, erase keys, and N to the controller;
+SDL also accepts Jigsaw settings. Native options are startup-only, not
+interactive or persisted. The focused smoke covers seeded replay, immutable
+givens, pencil/erase behavior, wrong-entry accounting, a real full solve,
+verdict preservation, rendering, completion, and idempotent cleanup. The
+original-source differential replays 186 `SudokuEnv.drive` ports through the
+source UI and controller and compares generation, state, cells, pencil masks,
+clashes, incorrect full-grid handling, score, and DONE. The browser contract
+and headed options replay cover defaults, input, rendering, apply/cancel,
+persistence, active-run preservation, and task exit. The Python 3.13 extension was rebuilt against the selected Stage1 runtime
+object and passes the Marble lifecycle smoke, Sudoku host-options/key contract,
+and direct Sudoku settings/start/frame/pencil/cleanup smoke. SDL was rebuilt
+from the same source-fresh Stage1 product and its complete headless native
+self-test matrix passes, including Sudoku, Jigsaw, and task-option parsing. The
+full latest-Stage1 WASM artifact suite passed before promotion. A headed replay dispatched synthetic blur/hidden/visible/focus events and
+confirmed state preservation. A native Chrome tab-strip switch away/back
+preserved the complete public Sudoku state, and ArrowRight worked after
+restoration. The automation-launched Chrome kept `document.visibilityState`
+visible and emitted no blur/focus/visibilitychange events, so browser
+lifecycle-event propagation remains open in this harness; see
+`output/verification/sudoku-focus-check-20261109/`.
 Mr. Time projects its title, source mode/rung/trial line, recall or produce
 clock, target/response values, decimal answer buffer, verdict feedback, and
 DONE summary through `SceneMrTime`. The controller owns the phase, timing,

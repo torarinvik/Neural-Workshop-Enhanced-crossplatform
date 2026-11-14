@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import {fileURLToPath} from 'node:url';
+const source=fs.readFileSync(fileURLToPath(new URL('../shells/web/index.html',import.meta.url)),'utf8');
+assert.match(source,/"nw_api_v1_numberology_info", "nw_api_v1_numberology_value"/);
+assert.match(source,/function ensureNumberologyRun\(\)/);
+assert.match(source,/function numberologyExactInfo\(field\)/);
+assert.match(source,/function numberologyValue\(field, at = 0\)/);
+assert.match(source,/exports\.nw_api_v1_numberology_value\(handle, BigInt\(field\), BigInt\(at\)\)/);
+assert.match(source,/if \(isNumberologyTask\(\)\) destroyNumberologyRun\(\)/);
+const keyboard=source.slice(source.lastIndexOf('if (isNumberologyTask()) {'));
+assert.match(keyboard,/apiDispatchText\(handle, event\.key\)/);
+assert.match(keyboard,/NUMBEROLOGY_ACTION\.backspace/);
+console.log('Numberology browser contract: route, exact-byte access, keyboard and cleanup present');

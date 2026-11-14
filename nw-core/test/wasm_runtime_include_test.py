@@ -63,6 +63,7 @@ class WasmRuntimeIncludeTest(unittest.TestCase):
                 "elisacore_runtime.elisa",
                 "elisacore_rng.elisa",
                 "elisacore_math.elisa",
+                "elisacore_bigint.elisa",
             ):
                 (runtime / module).write_text("# selected runtime\n", encoding="utf-8")
 
@@ -74,6 +75,7 @@ class WasmRuntimeIncludeTest(unittest.TestCase):
                 "elisacore_runtime.elisa",
                 "elisacore_rng.elisa",
                 "elisacore_math.elisa",
+                "elisacore_bigint.elisa",
             ):
                 self.assertIn(
                     f'include "{compiler.resolve()}/elisacore_std/{module}"', rendered

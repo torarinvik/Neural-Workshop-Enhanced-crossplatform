@@ -17,11 +17,12 @@
     python3 shells/python/app.py --dump             # canonical frame text
 
 The browser remains the authority for the complete task registry. The native
-Python shell exposes the shared title contract plus source-backed 3D N-Back,
-3D Maze, Monkey Ladder, Sokoban, Freeform Tetris, Count, Mr. Time, and the
-Marble Maze controller/fallback; other task
-routes stay unavailable until they have the same real state and lifecycle
-implementation.
+Python shell exposes the shared title contract and its implemented subset of
+source-backed controllers, including Sudoku and Jigsaw. Sudoku accepts
+``--sudoku-level``, ``--sudoku-puzzles``, ``--sudoku-no-clashes``, and
+``--sudoku-no-adaptive``; Jigsaw accepts the corresponding ``--jigsaw-*``
+settings. Other task routes remain unavailable until they have the same real
+state and lifecycle implementation.
 """
 from __future__ import annotations
 
@@ -45,7 +46,7 @@ BUILD_HINT = ("nwcore is not built: run scripts/build_pymodule.sh "
 
 def load_core(entry: str = "title_frame"):
     """Load the Elisa display-list extension and require one safe entry point."""
-    pymod = _ROOT / "build" / "pymod"
+    pymod = Path(os.environ.get("ELISA_PYMODULE_DIR", _ROOT / "build" / "pymod"))
     if str(pymod) not in sys.path:
         sys.path.insert(0, str(pymod))
     try:
@@ -1258,7 +1259,16 @@ class AlgebraSession:
 
     def __init__(self, core, args) -> None:
         self.core = core
-        self.handle = core.algebra_create(1, args.trials, args.seed)
+        self.args = args
+        saved = read_algebra_settings()
+        self.options = [getattr(args, 'algebra_level', None) or saved[0],
+                        getattr(args, 'algebra_trials', None) or saved[1],
+                        saved[2] if getattr(args, 'algebra_no_working', None) is None else int(not args.algebra_no_working),
+                        saved[3] if getattr(args, 'algebra_no_adaptive', None) is None else int(not args.algebra_no_adaptive)]
+        self.options_draft = None
+        self.options_selection = 0
+        self.options_from_hub = False
+        self.handle = core.algebra_create_options(*self.options, args.seed)
         if self.handle <= 0:
             raise SystemExit("native Algebra rejected its options")
         self.black_background = args.black_background
@@ -1269,6 +1279,8 @@ class AlgebraSession:
                      for field in range(10))
 
     def frame_bytes(self, _core, width=912, height=684) -> bytes:
+        if self.options_draft is not None:
+            return self.core.algebra_options_frame(int(self.black_background), self.options_selection, *self.options_draft)
         return self.core.algebra_frame(
             self.handle, 1 if self.black_background else 0, width, height)
 
@@ -1282,22 +1294,62 @@ class AlgebraSession:
                 f" · typed {current[self.INFO_TYPED]}")
 
     def action(self, action: int, value: int = 0) -> None:
-        self.core.algebra_action(self.handle, action, value, 0)
+        phase = self.state[self.INFO_PHASE]
+        self.core.algebra_action(self.handle, action, value, int(time.monotonic() * 1000))
+        if phase != 1 and self.state[self.INFO_PHASE] == 1:
+            self.core.algebra_action(self.handle, 4, 0, int(time.monotonic() * 1000))
+
+    def modify_option(self, delta):
+        choices = (tuple(range(1, 13)), ALGEBRA_TRIALS, (0, 1), (0, 1))
+        values = choices[self.options_selection]
+        current = self.options_draft[self.options_selection]
+        self.options_draft[self.options_selection] = values[(values.index(current) + delta) % len(values)]
 
     def key(self, symbol, key) -> None:
+        if self.options_draft is not None:
+            if symbol == key.ESCAPE: self.options_draft = None
+            elif symbol == key.UP: self.options_selection = max(0, self.options_selection - 1)
+            elif symbol == key.DOWN: self.options_selection = min(3, self.options_selection + 1)
+            elif symbol in (key.LEFT, key.RIGHT, key.SPACE): self.modify_option(-1 if symbol == key.LEFT else 1)
+            elif symbol == key.RETURN:
+                new_handle = self.core.algebra_create_options(*self.options_draft, self.args.seed)
+                if new_handle > 0:
+                    self.core.algebra_destroy(self.handle)
+                    self.handle = new_handle
+                    self.options = list(self.options_draft)
+                    level, trials, working, adaptive = self.options
+                    self.args.algebra_level, self.args.algebra_trials = level, trials
+                    self.args.algebra_no_working = not working
+                    self.args.algebra_no_adaptive = not adaptive
+                    write_algebra_settings(self.options)
+                self.options_draft = None
+            return
         phase = self.state[self.INFO_PHASE]
-        if symbol == key.SPACE and phase != 1:
+        if symbol == key.O and phase != 1:
+            self.options_draft = list(self.options)
+            self.options_selection = 0
+        elif symbol == key.SPACE and phase != 1: self.action(self.ACTION_START)
+        elif symbol == key.RETURN and phase == 1: self.action(self.ACTION_SUBMIT)
+        elif symbol in (key.BACKSPACE, key.DELETE): self.action(self.ACTION_BACKSPACE)
+
+    def pointer(self, x, y, width, height, button=0, _motion=False):
+        if self.options_draft is not None:
+            if button == 0:
+                row = round((474 - y * 684 / height) / 48)
+                if 0 <= row < 4 and abs(y * 684 / height - (474 - row * 48)) <= 18:
+                    if row == self.options_selection: self.modify_option(1)
+                    else: self.options_selection = row
+        elif self.state[self.INFO_PHASE] != 1:
             self.action(self.ACTION_START)
-        elif symbol == key.RETURN:
-            self.action(self.ACTION_SUBMIT if phase == 1 else self.ACTION_START)
-        elif symbol == key.BACKSPACE:
-            self.action(self.ACTION_BACKSPACE)
-        elif symbol == key.MINUS:
-            self.action(self.ACTION_WRITE, 45)
-        else:
-            digits = {getattr(key, f"_{digit}"): digit for digit in range(10)}
-            if symbol in digits:
-                self.action(self.ACTION_WRITE, 48 + digits[symbol])
+
+    def text(self, text: str) -> None:
+        if self.options_draft is None and self.state[self.INFO_PHASE] == 1:
+            for char in text:
+                self.action(self.ACTION_WRITE, ord(char))
+
+    def paste(self) -> None:
+        if self.options_draft is None and self.state[self.INFO_PHASE] == 1:
+            self.text(read_scramble_clipboard())
 
     def close(self) -> None:
         if self.handle > 0:
@@ -1314,8 +1366,18 @@ class NumberologySession:
 
     def __init__(self, core, args) -> None:
         self.core = core
-        self.handle = core.numberology_create(1, args.trials, 1 if args.adaptive else 0,
-                                              args.seed)
+        self.args = args
+        saved = read_numberology_settings()
+        self.options = [getattr(args, 'numberology_level', None) or saved[0],
+                        getattr(args, 'numberology_trials', None) or saved[1],
+                        saved[2] if getattr(args, 'numberology_no_adaptive', None) is None
+                        else int(not args.numberology_no_adaptive)]
+        self.options_draft = None
+        self.options_selection = 0
+        self.options_from_hub = False
+        self.level_editing = False
+        self.level_edit_value = 0
+        self.handle = core.numberology_create(*self.options, args.seed)
         if self.handle <= 0:
             raise SystemExit("native Numberology rejected its options")
         self.black_background = args.black_background
@@ -1326,6 +1388,8 @@ class NumberologySession:
                      for field in range(14))
 
     def frame_bytes(self, _core, width=912, height=684) -> bytes:
+        if self.options_draft is not None:
+            return self.core.numberology_options_frame(int(self.black_background), self.options_selection, *self.options_draft)
         return self.core.numberology_frame(
             self.handle, 1 if self.black_background else 0, width, height)
 
@@ -1339,22 +1403,93 @@ class NumberologySession:
                 f" · level {current[self.INFO_LEVEL]}")
 
     def action(self, action: int, value: int = 0) -> None:
+        phase = self.state[self.INFO_PHASE]
         self.core.numberology_action(self.handle, action, value, 0)
+        current = self.state
+        if phase != 3 and current[self.INFO_PHASE] == 3 and self.options[2]:
+            next_level = current[13]
+            if next_level > self.options[0]:
+                self.options[0] = next_level
+                self.args.numberology_level = next_level
+                write_numberology_settings(self.options)
+
+    def modify_option(self, delta):
+        row = self.options_selection
+        if row == 0:
+            self.options_draft[0] = max(1, min(NUMBEROLOGY_MAX_LEVEL, self.options_draft[0] + delta))
+            self.level_editing = False
+        elif row == 1:
+            index = NUMBEROLOGY_TRIALS.index(self.options_draft[1])
+            self.options_draft[1] = NUMBEROLOGY_TRIALS[(index + delta) % len(NUMBEROLOGY_TRIALS)]
+        else:
+            self.options_draft[2] = 1 - self.options_draft[2]
 
     def key(self, symbol, key) -> None:
+        if self.options_draft is not None:
+            if symbol == key.ESCAPE:
+                self.options_draft = None
+            elif symbol == key.UP:
+                self.options_selection = max(0, self.options_selection - 1)
+                self.level_editing = False
+            elif symbol == key.DOWN:
+                self.options_selection = min(2, self.options_selection + 1)
+                self.level_editing = False
+            elif symbol in (key.LEFT, key.RIGHT, key.SPACE):
+                self.modify_option(-1 if symbol == key.LEFT else 1)
+            elif symbol in (key.BACKSPACE, key.DELETE) and self.options_selection == 0:
+                current = self.level_edit_value if self.level_editing else self.options_draft[0]
+                self.level_edit_value = current // 10
+                self.options_draft[0] = max(1, self.level_edit_value)
+                self.level_editing = True
+            elif symbol == key.RETURN:
+                fresh = self.core.numberology_create(*self.options_draft, self.args.seed)
+                if fresh > 0:
+                    self.core.numberology_destroy(self.handle)
+                    self.handle = fresh
+                    self.options = list(self.options_draft)
+                    self.args.numberology_level, self.args.numberology_trials = self.options[:2]
+                    self.args.numberology_no_adaptive = not self.options[2]
+                    write_numberology_settings(self.options)
+                self.options_draft = None
+            return
         phase = self.state[self.INFO_PHASE]
-        if symbol == key.SPACE and phase != 1:
+        if symbol == key.O and phase != 1:
+            self.options_draft = list(self.options)
+            self.options_selection = 0
+            self.level_editing = False
+        elif symbol == key.SPACE and phase != 1: self.action(self.ACTION_START)
+        elif symbol == key.RETURN and phase == 1: self.action(self.ACTION_SUBMIT)
+        elif symbol in (key.BACKSPACE, key.DELETE): self.action(self.ACTION_BACKSPACE)
+
+    def text(self, text: str) -> None:
+        if self.options_draft is not None:
+            if self.options_selection == 0:
+                for character in text:
+                    if character in '0123456789':
+                        value = (self.level_edit_value if self.level_editing else 0) * 10 + int(character)
+                        if value <= NUMBEROLOGY_MAX_LEVEL:
+                            self.level_edit_value = value
+                            self.options_draft[0] = max(1, value)
+                            self.level_editing = True
+            return
+        if self.state[self.INFO_PHASE] == 1:
+            for character in text:
+                self.action(self.ACTION_WRITE, ord(character))
+
+    def paste(self) -> None:
+        if self.options_draft is None and self.state[self.INFO_PHASE] == 1:
+            self.text(read_scramble_clipboard())
+
+    def pointer(self, x, y, width, height, button=0, _motion=False):
+        if button != 0:
+            return
+        if self.options_draft is not None:
+            row = round((474 - y * 684 / height) / 48)
+            if 102 <= x * 912 / width <= 810 and 0 <= row < 3 and abs(y * 684 / height - (474 - row * 48)) <= 18:
+                if row == self.options_selection: self.modify_option(1)
+                else: self.options_selection = row
+        elif self.state[self.INFO_PHASE] != 1:
             self.action(self.ACTION_START)
-        elif symbol == key.RETURN:
-            self.action(self.ACTION_SUBMIT if phase == 1 else self.ACTION_START)
-        elif symbol == key.BACKSPACE:
-            self.action(self.ACTION_BACKSPACE)
-        elif symbol == key.MINUS:
-            self.action(self.ACTION_WRITE, 45)
-        else:
-            digits = {getattr(key, f"_{digit}"): digit for digit in range(10)}
-            if symbol in digits:
-                self.action(self.ACTION_WRITE, 48 + digits[symbol])
 
     def close(self) -> None:
         if self.handle > 0:
@@ -1368,18 +1503,22 @@ class JigsawSession:
     INFO_PHASE, INFO_SIDE, INFO_TRIAL_SIDE, INFO_PUZZLE = 0, 1, 2, 3
     INFO_TOTAL, INFO_PAR, INFO_SWAPS, INFO_PICKED = 4, 5, 6, 7
     INFO_VERDICT, INFO_RESULTS = 8, 9
+    INFO_MARK_PLACED = 14
 
     def __init__(self, core, args) -> None:
         self.core = core
-        self.handle = core.jigsaw_create(3, args.trials, 1 if args.adaptive else 0,
-                                         1, args.seed)
+        self.handle = core.jigsaw_create_options(
+            args.jigsaw_side, args.jigsaw_puzzles,
+            1 if args.jigsaw_adaptive else 0,
+            1 if args.jigsaw_preview else 0,
+            1 if args.jigsaw_mark_placed else 0, args.seed)
         if self.handle <= 0:
             raise SystemExit("native Jigsaw rejected its options")
         self.black_background = args.black_background
 
     @property
     def state(self):
-        return tuple(self.core.jigsaw_info(self.handle, field) for field in range(14))
+        return tuple(self.core.jigsaw_info(self.handle, field) for field in range(15))
 
     def frame_bytes(self, _core, width=912, height=684) -> bytes:
         return self.core.jigsaw_frame(
@@ -1423,8 +1562,10 @@ class SudokuSession:
 
     def __init__(self, core, args) -> None:
         self.core = core
-        self.handle = core.sudoku_create(1, args.trials, 1, 1 if args.adaptive else 0,
-                                         args.seed)
+        self.handle = core.sudoku_create(
+            args.sudoku_level, args.sudoku_puzzles,
+            0 if args.sudoku_no_clashes else 1,
+            0 if args.sudoku_no_adaptive else 1, args.seed)
         if self.handle <= 0:
             raise SystemExit("native Sudoku rejected its options")
         self.black_background = args.black_background
@@ -1449,7 +1590,8 @@ class SudokuSession:
         self.core.sudoku_action(self.handle, action, value, 0)
 
     def key(self, symbol, key) -> None:
-        phase = self.state[self.INFO_PHASE]
+        state = self.state
+        phase = state[self.INFO_PHASE]
         if symbol in (key.SPACE, key.RETURN):
             self.action(self.ACTION_START)
         elif phase == 1 and symbol == key.UP:
@@ -1460,12 +1602,18 @@ class SudokuSession:
             self.action(self.ACTION_LEFT)
         elif phase == 1 and symbol == key.RIGHT:
             self.action(self.ACTION_RIGHT)
-        elif phase == 1 and symbol == key.BACKSPACE:
+        elif phase == 1 and symbol in (key.BACKSPACE, key.DELETE,
+                                       key._0, key.NUM_0):
             self.action(self.ACTION_ERASE)
-        elif phase == 1 and symbol == key.P:
+        elif phase == 1 and symbol == key.N:
             self.action(self.ACTION_PENCIL)
         elif phase == 1:
+            if symbol == key.C and state[self.INFO_SIZE] < 12:
+                return
             digits = {getattr(key, f"_{digit}"): digit for digit in range(1, 10)}
+            digits.update({getattr(key, f"NUM_{digit}"): digit for digit in range(1, 10)})
+            digits.update({getattr(key, letter): value
+                           for value, letter in enumerate("ABCDEFG", start=10)})
             if symbol in digits:
                 self.action(self.ACTION_WRITE, digits[symbol])
 
@@ -1479,18 +1627,19 @@ class GoSession:
     """Native Python adapter for source-backed winning-move Go."""
     ACTION_START, ACTION_ANSWER, ACTION_NEXT = 0, 1, 2
     ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT = 3, 4, 5, 6
+    ACTION_LEVEL = 7
     INFO_PHASE, INFO_SIZE, INFO_CURSOR_X, INFO_CURSOR_Y = 0, 4, 5, 6
 
     def __init__(self, core, args) -> None:
         self.core = core
-        self.handle = core.go_create(1, args.trials, args.seed)
+        self.handle = core.go_create(args.go_level, args.go_trials, args.seed)
         if self.handle <= 0:
             raise SystemExit("native Go rejected its options")
         self.black_background = args.black_background
 
     @property
     def state(self):
-        return tuple(self.core.go_info(self.handle, field) for field in range(12))
+        return tuple(self.core.go_info(self.handle, field) for field in range(13))
 
     def frame_bytes(self, _core, width=912, height=684) -> bytes:
         return self.core.go_frame(self.handle, 1 if self.black_background else 0,
@@ -1530,10 +1679,712 @@ class GoSession:
             self.action(self.ACTION_LEFT)
         elif phase == 1 and symbol == key.RIGHT:
             self.action(self.ACTION_RIGHT)
+        elif phase in (0, 3):
+            digits = {getattr(key, f"_{digit}"): digit for digit in range(1, 10)}
+            digits.update({getattr(key, f"NUM_{digit}"): digit for digit in range(1, 10)})
+            digits.update({key._0: 10, key.NUM_0: 10})
+            if symbol in digits:
+                self.action(self.ACTION_LEVEL, digits[symbol])
 
     def close(self) -> None:
         if self.handle > 0:
             self.core.go_destroy(self.handle)
+            self.handle = 0
+
+
+CROSSWORD_TRIALS = (1, 2, 3, 5, 8, 10)
+
+
+def crossword_settings_path() -> Path:
+    override = os.environ.get("NW_CROSSWORD_SETTINGS_PATH")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA", str(Path.home()))) / "Neural Workshop" / "crossword-options"
+    return Path.home() / ".neural-workshop" / "crossword-options"
+
+
+def read_crossword_settings() -> tuple[int, int, int, int]:
+    defaults = (2, 3, 1, 1)
+    try:
+        fields = tuple(map(int, crossword_settings_path().read_text(encoding="ascii").split()))
+        if len(fields) == 4 and 1 <= fields[0] <= 10 and fields[1] in CROSSWORD_TRIALS and all(x in (0, 1) for x in fields[2:]):
+            return fields
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return defaults
+
+
+def write_crossword_settings(values) -> None:
+    path = crossword_settings_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Write a sibling first so interrupted writes do not corrupt settings.
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=path.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write("%d %d %d %d\n" % tuple(values))
+        try:
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except OSError as error:
+        print(f"Could not save Crossword settings: {error}", file=sys.stderr)
+
+
+SCRABBLE_TRIALS = (1, 2, 3, 5, 8, 10, 15)
+
+
+def scrabble_settings_path() -> Path:
+    override = os.environ.get("NW_SCRABBLE_SETTINGS_PATH")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA", str(Path.home()))) / "Neural Workshop" / "scrabble-options"
+    return Path.home() / ".neural-workshop" / "scrabble-options"
+
+
+def read_scrabble_settings() -> tuple[int, int, int, int]:
+    defaults = (3, 5, 1, 1)
+    try:
+        fields = tuple(map(int, scrabble_settings_path().read_text(encoding="ascii").split()))
+        if len(fields) == 4 and 1 <= fields[0] <= 10 and fields[1] in SCRABBLE_TRIALS and all(x in (0, 1) for x in fields[2:]):
+            return fields
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return defaults
+
+
+def write_scrabble_settings(values) -> None:
+    path = scrabble_settings_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Write a sibling first so interrupted writes do not corrupt settings.
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=path.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write("%d %d %d %d\n" % tuple(values))
+        try:
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except OSError as error:
+        print(f"Could not save Scrabble settings: {error}", file=sys.stderr)
+
+
+NUMBEROLOGY_TRIALS = (1, 2, 3, 5, 6, 8, 10, 15)
+NUMBEROLOGY_MAX_LEVEL = (1 << 63) - 1
+
+
+def parse_numberology_level(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("level must be a positive integer") from error
+    if not 1 <= value <= NUMBEROLOGY_MAX_LEVEL:
+        raise argparse.ArgumentTypeError("level is outside the supported integer range")
+    return value
+
+
+def numberology_settings_path() -> Path:
+    override = os.environ.get("NW_NUMBEROLOGY_SETTINGS_PATH")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA", str(Path.home()))) / "Neural Workshop" / "numberology-options"
+    return Path.home() / ".neural-workshop" / "numberology-options"
+
+
+def read_numberology_settings() -> tuple[int, int, int]:
+    try:
+        fields = tuple(map(int, numberology_settings_path().read_text(encoding="ascii").split()))
+        if len(fields) == 3 and 1 <= fields[0] <= NUMBEROLOGY_MAX_LEVEL and fields[1] in NUMBEROLOGY_TRIALS and fields[2] in (0, 1):
+            return fields
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return (1, 6, 1)
+
+
+def write_numberology_settings(values) -> None:
+    path = numberology_settings_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=path.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write("%d %d %d\n" % tuple(values))
+        try:
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except OSError as error:
+        print(f"Could not save Numberology settings: {error}", file=sys.stderr)
+
+
+ALGEBRA_TRIALS = (1, 2, 3, 5, 6, 8, 10, 15)
+
+def algebra_settings_path() -> Path:
+    override = os.environ.get("NW_ALGEBRA_SETTINGS_PATH")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA", str(Path.home()))) / "Neural Workshop" / "algebra-options"
+    return Path.home() / ".neural-workshop" / "algebra-options"
+
+
+def read_algebra_settings() -> tuple[int, int, int, int]:
+    defaults = (3, 6, 1, 1)
+    try:
+        fields = tuple(map(int, algebra_settings_path().read_text(encoding="ascii").split()))
+        if len(fields) == 4 and 1 <= fields[0] <= 12 and fields[1] in ALGEBRA_TRIALS and all(x in (0, 1) for x in fields[2:]):
+            return fields
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return defaults
+
+
+def write_algebra_settings(values) -> None:
+    path = algebra_settings_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Write a sibling first so interrupted writes do not corrupt settings.
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=path.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write("%d %d %d %d\n" % tuple(values))
+        try:
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except OSError as error:
+        print(f"Could not save Algebra settings: {error}", file=sys.stderr)
+
+
+def scramble_settings_path() -> Path:
+    override = os.environ.get("NW_SCRAMBLE_SETTINGS_PATH")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA", str(Path.home()))) / "Neural Workshop" / "scramble-options"
+    return Path.home() / ".neural-workshop" / "scramble-options"
+
+
+def read_scramble_settings() -> tuple[int, int, int, int]:
+    defaults = (3, 5, 1, 1)
+    try:
+        fields = tuple(map(int, scramble_settings_path().read_text(encoding="ascii").split()))
+        if len(fields) == 4 and 1 <= fields[0] <= 12 and fields[1] in SCRABBLE_TRIALS and all(x in (0, 1) for x in fields[2:]):
+            return fields
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return defaults
+
+
+def write_scramble_settings(values) -> None:
+    path = scramble_settings_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Write a sibling first so interrupted writes do not corrupt settings.
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=path.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write("%d %d %d %d\n" % tuple(values))
+        try:
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except OSError as error:
+        print(f"Could not save Scramble settings: {error}", file=sys.stderr)
+
+
+def read_scramble_clipboard() -> str:
+    """Read text only in response to the user's native paste shortcut."""
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+            user32.GetClipboardData.restype = wintypes.HANDLE
+            kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+            kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+            if not user32.OpenClipboard(None): return ''
+            try:
+                handle = user32.GetClipboardData(13)  # CF_UNICODETEXT
+                if not handle: return ''
+                pointer = kernel32.GlobalLock(handle)
+                if not pointer: return ''
+                try: return ctypes.wstring_at(pointer)
+                finally: kernel32.GlobalUnlock(handle)
+            finally:
+                user32.CloseClipboard()
+        except (OSError, AttributeError):
+            return ''
+    import shutil
+    import subprocess
+    candidates = ([('pbpaste',)] if sys.platform == 'darwin' else
+                  [('wl-paste', '--no-newline'), ('xclip', '-selection', 'clipboard', '-o'),
+                   ('xsel', '--clipboard', '--output')])
+    for command in candidates:
+        if shutil.which(command[0]):
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=2, check=True)
+                return result.stdout
+            except (OSError, UnicodeError, subprocess.SubprocessError):
+                continue
+    try:
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        try: return root.clipboard_get()
+        finally: root.destroy()
+    except (ImportError, RuntimeError, OSError):
+        pass
+    except Exception as error:
+        # Tk can be installed without an available display or clipboard.
+        if error.__class__.__name__ != 'TclError': raise
+    return ''
+
+
+class ScrambleSession:
+    """Native text input and lifecycle for the source-backed Scramble game."""
+    def __init__(self, core, args):
+        self.core = core
+        self.args = args
+        self.black_background = args.black_background
+        self.options = [getattr(args, 'scramble_level', 3), getattr(args, 'scramble_trials', 5),
+                        int(not getattr(args, 'scramble_no_count', False)), int(not getattr(args, 'scramble_no_adaptive', False))]
+        self.options_draft = None
+        self.options_selection = 0
+        self.options_from_hub = False
+        self.handle = core.scramble_create(getattr(args, 'scramble_level', 3),
+            getattr(args, 'scramble_trials', 5), int(not getattr(args, 'scramble_no_count', False)),
+            int(not getattr(args, 'scramble_no_adaptive', False)), args.seed)
+        if self.handle <= 0:
+            raise SystemExit('native Scramble rejected its options')
+        self.suppress_space = False
+        if sys.platform == 'darwin':
+            data_dir = Path.home() / 'Library/Application Support/Brain Workshop/data/words'
+        elif sys.platform == 'win32':
+            data_dir = Path(os.environ.get('APPDATA', str(Path.home()))) / 'Brain Workshop/data/words'
+        else:
+            data_dir = Path.home() / '.brainworkshop/data/words'
+        index_arg = getattr(args, 'scramble_index', None)
+        sentences_arg = getattr(args, 'scramble_sentences', None)
+        index_path = Path(index_arg).expanduser() if index_arg else data_dir / 'lexicon.tsv'
+        sentence_path = Path(sentences_arg).expanduser() if sentences_arg else data_dir / 'sentences.txt'
+        try:
+            if index_arg and not index_path.is_file(): raise FileNotFoundError(index_path)
+            if sentences_arg and not sentence_path.is_file(): raise FileNotFoundError(sentence_path)
+            index = index_path.read_bytes() if index_path.is_file() else b''
+            has_sentences = sentence_path.is_file() and (bool(sentences_arg) or sentence_path.stat().st_size > 4096)
+            sentences = sentence_path.read_bytes() if has_sentences else b''
+            if index or sentences:
+                if core.scramble_set_corpus(self.handle, index, sentences) != 0:
+                    raise ValueError('invalid or oversized corpus')
+        except (OSError, ValueError) as error:
+            self.close()
+            raise SystemExit(f'Cannot load Scramble corpus: {error}') from error
+
+    @property
+    def state(self):
+        return tuple(self.core.scramble_info(self.handle, field) for field in range(17))
+
+    def frame_bytes(self, _core, width=912, height=684):
+        if self.options_draft is not None:
+            return self.core.scramble_options_frame(int(self.black_background), self.options_selection, *self.options_draft)
+        return self.core.scramble_frame(self.handle, int(self.black_background), width, height)
+
+    def describe(self, _frame):
+        state = self.state
+        return f'Scramble · line {state[2]}/{state[3]} · right {state[7]}'
+
+    def action(self, action, value=0):
+        phase = self.core.scramble_info(self.handle, 0)
+        result = self.core.scramble_action(self.handle, action, value, int(time.monotonic() * 1000))
+        if phase != 1 and self.core.scramble_info(self.handle, 0) == 1:
+            self.core.scramble_action(self.handle, 5, 0, int(time.monotonic() * 1000))
+        return result
+
+    def key(self, symbol, key):
+        if self.options_draft is not None:
+            if symbol == key.ESCAPE:
+                self.options_draft = None
+            elif symbol == key.UP:
+                self.options_selection = max(0, self.options_selection - 1)
+            elif symbol == key.DOWN:
+                self.options_selection = min(3, self.options_selection + 1)
+            elif symbol in (key.LEFT, key.RIGHT, key.SPACE):
+                self.modify_option(-1 if symbol == key.LEFT else 1)
+            elif symbol == key.RETURN:
+                level, trials, count, adaptive = self.options_draft
+                packed = level | (SCRABBLE_TRIALS.index(trials) << 4) | (count << 7) | (adaptive << 8)
+                if self.action(4, packed) == 1:
+                    self.options = list(self.options_draft)
+                    self.args.scramble_level, self.args.scramble_trials = level, trials
+                    self.args.scramble_no_count = not count
+                    self.args.scramble_no_adaptive = not adaptive
+                    write_scramble_settings(self.options)
+                self.options_draft = None
+            return
+        phase = self.state[0]
+        if symbol == key.O and phase != 1:
+            self.options_draft = list(self.options)
+            self.options_selection = 0
+        elif symbol == key.SPACE and phase != 1:
+            self.action(0)
+            self.suppress_space = True
+        elif symbol in (key.RETURN, getattr(key, 'NUM_ENTER', key.RETURN)):
+            self.action(3)
+        elif symbol in (key.BACKSPACE, key.DELETE):
+            self.action(2)
+
+    def text(self, text):
+        if self.options_draft is not None:
+            return
+        for char in text:
+            if self.suppress_space and char == ' ':
+                self.suppress_space = False
+                continue
+            self.suppress_space = False
+            value = 26 if char == ' ' else ord(char.lower()) - 97 if char.isascii() and char.isalpha() else 27
+            self.action(1, value)
+
+    def paste(self):
+        if self.options_draft is None and self.state[0] == 1:
+            self.text(read_scramble_clipboard())
+
+    def modify_option(self, delta):
+        choices = (tuple(range(1, 13)), SCRABBLE_TRIALS, (0, 1), (0, 1))
+        values = choices[self.options_selection]
+        current = self.options_draft[self.options_selection]
+        self.options_draft[self.options_selection] = values[(values.index(current) + delta) % len(values)]
+
+    def pointer(self, x, y, width, height, button=0, _motion=False):
+        if self.options_draft is not None:
+            if button == 0:
+                row = round((474 - y * 684 / height) / 48)
+                if 0 <= row < 4 and abs(y * 684 / height - (474 - row * 48)) <= 18:
+                    if row == self.options_selection: self.modify_option(1)
+                    else: self.options_selection = row
+            return
+        if self.state[0] != 1:
+            self.action(0)
+
+    def close(self):
+        if self.handle:
+            self.core.scramble_destroy(self.handle)
+            self.handle = 0
+
+
+class ScrabbleSession:
+    """Native adapter for the source-backed Scrabble controller."""
+    ACTION_START = 0
+
+    def __init__(self, core, args):
+        self.core = core
+        self.black_background = args.black_background
+        self.args = args
+        self.options = [args.scrabble_level, args.scrabble_trials,
+                        int(not args.scrabble_no_premiums), int(not args.scrabble_no_adaptive)]
+        self.options_draft = None
+        self.options_selection = 0
+        self.options_from_hub = False
+        self.handle = core.scrabble_create(args.scrabble_level, args.scrabble_trials,
+            int(not args.scrabble_no_premiums), int(not args.scrabble_no_adaptive), args.seed)
+        if self.handle <= 0:
+            raise SystemExit("native Scrabble rejected its options")
+        if args.scrabble_lexicon:
+            path = Path(args.scrabble_lexicon).expanduser()
+        elif sys.platform == "darwin":
+            path = Path.home() / "Library/Application Support/Brain Workshop/data/words/lexicon.tsv"
+        elif sys.platform == "win32":
+            path = Path(os.environ.get("APPDATA", str(Path.home()))) / "Brain Workshop/data/words/lexicon.tsv"
+        else:
+            path = Path.home() / ".brainworkshop/data/words/lexicon.tsv"
+        try:
+            if path.is_file():
+                if core.scrabble_set_lexicon(self.handle, path.read_bytes()) != 0:
+                    raise ValueError("the index is invalid or exceeds the supported capacity")
+            elif args.scrabble_lexicon:
+                raise FileNotFoundError(path)
+        except (OSError, ValueError) as error:
+            self.close()
+            raise SystemExit(f"Cannot load Scrabble lexicon {path}: {error}") from error
+
+    @property
+    def state(self):
+        return tuple(self.core.scrabble_info(self.handle, field) for field in range(19))
+
+    def frame_bytes(self, _core, width=912, height=684):
+        if self.options_draft is not None:
+            return self.core.scrabble_options_frame(int(self.black_background), self.options_selection, *self.options_draft)
+        return self.core.scrabble_frame(self.handle, int(self.black_background), width, height)
+
+    def describe(self, _frame):
+        state = self.state
+        return f"Scrabble · board {state[2]}/{state[3]} · score {state[5]}"
+
+    def action(self, action, value=0):
+        phase = self.core.scrabble_info(self.handle, 0)
+        result = self.core.scrabble_action(self.handle, action, value, int(time.monotonic() * 1000))
+        if phase != 1 and self.core.scrabble_info(self.handle, 0) == 1:
+            self.core.scrabble_action(self.handle, 10, 0, int(time.monotonic() * 1000))
+        return result
+
+    def pointer(self, x, y, width, height, button=0, motion=False):
+        if self.options_draft is not None:
+            if not motion and button == 0:
+                row = round((474 - y * 684 / height) / 48)
+                if 0 <= row < 4 and abs(y * 684 / height - (474 - row * 48)) <= 18:
+                    if row == self.options_selection: self.modify_option(1)
+                    else: self.options_selection = row
+            return
+        phase = self.core.scrabble_info(self.handle, 0)
+        result = self.core.scrabble_pointer(self.handle, int(x * 1000000 / width),
+            int(y * 1000000 / height), width, height, button, int(motion), int(time.monotonic() * 1000))
+        if phase != 1 and self.core.scrabble_info(self.handle, 0) == 1:
+            self.core.scrabble_action(self.handle, 10, 0, int(time.monotonic() * 1000))
+        return result
+
+    def modify_option(self, delta):
+        choices = (tuple(range(1, 11)), SCRABBLE_TRIALS, (0, 1), (0, 1))
+        values = choices[self.options_selection]
+        current = self.options_draft[self.options_selection]
+        self.options_draft[self.options_selection] = values[(values.index(current) + delta) % len(values)]
+
+    def key(self, symbol, key):
+        if self.options_draft is not None:
+            if symbol == key.ESCAPE: self.options_draft = None
+            elif symbol == key.UP: self.options_selection = max(0, self.options_selection - 1)
+            elif symbol == key.DOWN: self.options_selection = min(3, self.options_selection + 1)
+            elif symbol in (key.LEFT, key.RIGHT, key.SPACE): self.modify_option(-1 if symbol == key.LEFT else 1)
+            elif symbol == key.RETURN:
+                level, trials, premiums, adaptive = self.options_draft
+                packed = level | (SCRABBLE_TRIALS.index(trials) << 4) | (premiums << 7) | (adaptive << 8)
+                if self.action(9, packed) == 1:
+                    self.options = self.options_draft
+                    self.args.scrabble_level, self.args.scrabble_trials = level, trials
+                    self.args.scrabble_no_premiums = not premiums
+                    self.args.scrabble_no_adaptive = not adaptive
+                    write_scrabble_settings(self.options)
+                self.options_draft = None
+            return
+        if symbol in (key.O, key.C):
+            self.options_draft = self.options.copy()
+            self.options_selection = 0
+            return
+        phase = self.state[0]
+        if symbol == key.SPACE and phase in (0, 2, 3):
+            self.action(0)
+        elif phase == 1:
+            actions = {key.RETURN: 1, key.LEFT: 2, key.RIGHT: 3, key.TAB: 4,
+                       key.UP: 5, key.DOWN: 6, key.BACKSPACE: 8, key.DELETE: 8}
+            if symbol in actions:
+                self.action(actions[symbol])
+            else:
+                for slot in range(7):
+                    if symbol in (getattr(key, f"_{slot + 1}"), getattr(key, f"NUM_{slot + 1}")):
+                        self.action(7, slot)
+                        break
+
+    def close(self):
+        if self.handle > 0:
+            self.core.scrabble_destroy(self.handle)
+            self.handle = 0
+
+
+class CrosswordSession:
+    """Native adapter for the source-backed Crossword controller."""
+    ACTION_START = 0
+
+    def __init__(self, core, args) -> None:
+        self.core = core
+        self.handle = core.crossword_create(
+            args.crossword_level, args.crossword_trials,
+            int(not args.crossword_no_mistakes), int(not args.crossword_no_adaptive), args.seed)
+        if self.handle <= 0:
+            raise SystemExit("native Crossword rejected its options")
+        self.black_background = args.black_background
+        self.args = args
+        self.options = [args.crossword_level, args.crossword_trials,
+                        int(not args.crossword_no_mistakes), int(not args.crossword_no_adaptive)]
+        self.options_draft = None
+        self.options_selection = 0
+        if args.crossword_lexicon:
+            path = Path(args.crossword_lexicon).expanduser()
+        elif sys.platform == "darwin":
+            path = Path.home() / "Library/Application Support/Brain Workshop/data/words/lexicon.tsv"
+        elif sys.platform == "win32":
+            path = Path(os.environ.get("APPDATA", str(Path.home()))) / "Brain Workshop/data/words/lexicon.tsv"
+        else:
+            path = Path.home() / ".brainworkshop/data/words/lexicon.tsv"
+        try:
+            if path.is_file():
+                if core.crossword_set_lexicon(self.handle, path.read_bytes()) != 0:
+                    raise ValueError("the index is invalid or exceeds the supported capacity")
+            elif args.crossword_lexicon:
+                raise FileNotFoundError(path)
+        except (OSError, ValueError) as error:
+            self.close()
+            raise SystemExit(f"Cannot load Crossword lexicon {path}: {error}") from error
+
+    @property
+    def state(self):
+        return tuple(self.core.crossword_info(self.handle, field) for field in range(20))
+
+    def frame_bytes(self, _core, width=912, height=684) -> bytes:
+        if self.options_draft is not None:
+            return self.core.crossword_options_frame(int(self.black_background),
+                self.options_selection, *self.options_draft)
+        return self.core.crossword_frame(self.handle, int(self.black_background), width, height)
+
+    def describe(self, _frame) -> str:
+        state = self.state
+        return f"Crossword · puzzle {state[2]}/{state[3]} · solved {state[9]}"
+
+    def action(self, action, value=0):
+        return self.core.crossword_action(self.handle, action, value, int(time.monotonic() * 1000))
+
+    def pointer(self, x, y, width, height, button=0):
+        if self.options_draft is not None:
+            if button == 0:
+                row = round((474 - y * 684 / height) / 48)
+                if 0 <= row < 4 and abs(y * 684 / height - (474 - row * 48)) <= 18:
+                    if row == self.options_selection:
+                        self.modify_option(1)
+                    else:
+                        self.options_selection = row
+            return
+        return self.core.crossword_pointer(self.handle, int(x * 1000000 / width),
+            int(y * 1000000 / height), width, height, button, int(time.monotonic() * 1000))
+
+    def modify_option(self, delta):
+        choices = (tuple(range(1, 11)), (1, 2, 3, 5, 8, 10), (0, 1), (0, 1))
+        values = choices[self.options_selection]
+        current = self.options_draft[self.options_selection]
+        self.options_draft[self.options_selection] = values[(values.index(current) + delta) % len(values)]
+
+    def key(self, symbol, key):
+        if self.options_draft is not None:
+            if symbol == key.ESCAPE:
+                self.options_draft = None
+            elif symbol == key.UP:
+                self.options_selection = max(0, self.options_selection - 1)
+            elif symbol == key.DOWN:
+                self.options_selection = min(3, self.options_selection + 1)
+            elif symbol in (key.LEFT, key.RIGHT, key.SPACE):
+                self.modify_option(-1 if symbol == key.LEFT else 1)
+            elif symbol == key.RETURN:
+                level, trials, mistakes, adaptive = self.options_draft
+                packed = level | ((1, 2, 3, 5, 8, 10).index(trials) << 4) | (mistakes << 7) | (adaptive << 8)
+                if self.action(10, packed) == 1:
+                    self.options = self.options_draft
+                    self.args.crossword_level, self.args.crossword_trials = level, trials
+                    self.args.crossword_no_mistakes = not mistakes
+                    self.args.crossword_no_adaptive = not adaptive
+                    write_crossword_settings(self.options)
+                self.options_draft = None
+            return
+        phase = self.state[0]
+        if symbol == key.O and phase != 1:
+            self.options_draft = self.options.copy()
+            self.options_selection = 0
+            return
+        if symbol == key.SPACE and phase in (0, 2, 3):
+            self.action(0)
+        elif phase == 1:
+            actions = {key.LEFT: 2, key.RIGHT: 3, key.UP: 4, key.DOWN: 5,
+                       key.TAB: 6, key.BACKSPACE: 8, key.DELETE: 8}
+            if symbol in actions:
+                self.action(actions[symbol])
+            else:
+                for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                    if symbol == getattr(key, letter):
+                        self.action(7, ord(letter) - ord("A"))
+                        break
+
+    def close(self):
+        if self.handle > 0:
+            self.core.crossword_destroy(self.handle)
+            self.handle = 0
+
+
+class CrossedWiresSession:
+    """Native Python adapter for source-backed Crossed Wires."""
+    ACTION_START, ACTION_PRESS = 0, 1
+    INFO_PHASE, INFO_RUNG, INFO_TRIAL, INFO_TOTAL_TRIALS = 0, 1, 2, 3
+    INFO_KEYS, INFO_REACHED, INFO_TARGETS, INFO_RIGHT = 4, 16, 12, 19
+    TRIAL_CHOICES = (1, 2, 3, 5, 8, 10, 15, 20)
+
+    def __init__(self, core, args) -> None:
+        self.core = core
+        self.handle = core.crossed_wires_create(
+            args.crossed_wires_level, args.crossed_wires_rounds,
+            0 if args.crossed_wires_no_adaptive else 1,
+            0 if args.crossed_wires_no_grid else 1, args.seed)
+        if self.handle <= 0:
+            raise SystemExit("native Crossed Wires rejected its options")
+        self.black_background = args.black_background
+
+    @property
+    def state(self):
+        return tuple(self.core.crossed_wires_info(self.handle, field)
+                     for field in range(27))
+
+    def frame_bytes(self, _core, width=912, height=684) -> bytes:
+        return self.core.crossed_wires_frame(
+            self.handle, 1 if self.black_background else 0, width, height)
+
+    def describe(self, _frame) -> str:
+        state = self.state
+        names = ("ready", "playing", "scored", "done")
+        phase = state[self.INFO_PHASE]
+        name = names[phase] if 0 <= phase < len(names) else "unknown"
+        return (f"Crossed Wires {name} · round {state[self.INFO_TRIAL]}/"
+                f"{state[self.INFO_TOTAL_TRIALS]} · targets "
+                f"{state[self.INFO_REACHED]}/{state[self.INFO_TARGETS]} · "
+                f"right {state[self.INFO_RIGHT]}")
+
+    def action(self, action: int, value: int = 0) -> None:
+        self.core.crossed_wires_action(
+            self.handle, action, value, int(time.monotonic() * 1000))
+
+    @staticmethod
+    def _key_symbols(key):
+        aliases = (
+            ((key.UP, key.W, key.NUM_8),
+             (key.RIGHT, key.D, key.NUM_6),
+             (key.DOWN, key.S, key.NUM_2),
+             (key.LEFT, key.A, key.NUM_4)),
+            ((key.W, key.NUM_8, key.UP), (key.E, key.NUM_9),
+             (key.D, key.NUM_6, key.RIGHT), (key.C, key.NUM_3),
+             (key.X, key.NUM_2, key.DOWN), (key.Z, key.NUM_1),
+             (key.A, key.NUM_4, key.LEFT), (key.Q, key.NUM_7)),
+        )
+        return aliases
+
+    def key(self, symbol, key) -> None:
+        phase = self.state[self.INFO_PHASE]
+        if symbol == key.SPACE:
+            if phase in (0, 3) or phase == 2:
+                self.action(self.ACTION_START)
+            return
+        if symbol in (key.O, key.F11):
+            # The source O settings dialog is not part of the Python shell;
+            # startup options remain available through the CLI.
+            return
+        keys = self._key_symbols(key)[1 if self.state[self.INFO_KEYS] == 8 else 0]
+        for index, aliases in enumerate(keys):
+            if symbol in aliases:
+                self.action(self.ACTION_PRESS, index)
+                return
+        if symbol == key.C and len(keys) == 4:
+            return
+
+    def close(self) -> None:
+        if self.handle > 0:
+            self.core.crossed_wires_destroy(self.handle)
             self.handle = 0
 
 
@@ -2044,7 +2895,7 @@ class TaskHubSession:
         self.black_background = args.black_background
         self.category = 0
         self.selected = 0
-        self.child: NBack3DSession | MarbleMazeSession | YouAreHereSession | SokobanSession | MonkeyLadderSession | TetrisSession | CountSession | MrTimeSession | GraphMappingSession | InTheDarkSession | FogOfWarSession | RemovalsSession | CustodySession | ConcentrationSession | RecognitionSession | TriviaSession | ReflexSession | AlgebraSession | NumberologySession | JigsawSession | SudokuSession | GoSession | NCupMonteSession | TrackingSession | LookoutSession | PursuitSession | OutOfSightSession | BuzzWireSession | DonkeySession | TwoHandsSession | OverrunSession | None = None
+        self.child: NBack3DSession | MarbleMazeSession | YouAreHereSession | SokobanSession | MonkeyLadderSession | TetrisSession | CountSession | MrTimeSession | GraphMappingSession | InTheDarkSession | FogOfWarSession | RemovalsSession | CustodySession | ConcentrationSession | RecognitionSession | TriviaSession | ReflexSession | AlgebraSession | NumberologySession | JigsawSession | SudokuSession | GoSession | CrossedWiresSession | CrosswordSession | ScrabbleSession | NCupMonteSession | TrackingSession | LookoutSession | PursuitSession | OutOfSightSession | BuzzWireSession | DonkeySession | TwoHandsSession | OverrunSession | None = None
         self.args = args
 
     @property
@@ -2067,11 +2918,34 @@ class TaskHubSession:
 
     def key(self, symbol, key) -> None:
         if self.child is not None:
-            if symbol == key.ESCAPE:
+            if symbol == key.ESCAPE and not (isinstance(self.child, (CrosswordSession, ScrabbleSession, ScrambleSession, AlgebraSession, NumberologySession)) and self.child.options_draft is not None):
                 self.child.close()
                 self.child = None
             else:
                 self.child.key(symbol, key)
+                if isinstance(self.child, (ScrabbleSession, ScrambleSession, AlgebraSession, NumberologySession)) and self.child.options_from_hub and self.child.options_draft is None:
+                    self.child.close()
+                    self.child = None
+            return
+        if symbol == key.C and self.category == 4 and self.selected == 10:
+            self.child = NumberologySession(self.core, self.args)
+            self.child.options_from_hub = True
+            self.child.key(key.O, key)
+            return
+        if symbol == key.C and self.category == 4 and self.selected == 9:
+            self.child = AlgebraSession(self.core, self.args)
+            self.child.options_from_hub = True
+            self.child.key(key.O, key)
+            return
+        if symbol == key.C and self.category == 4 and self.selected == 7:
+            self.child = ScrabbleSession(self.core, self.args)
+            self.child.options_from_hub = True
+            self.child.key(key.C, key)
+            return
+        if symbol == key.C and self.category == 4 and self.selected == 8:
+            self.child = ScrambleSession(self.core, self.args)
+            self.child.options_from_hub = True
+            self.child.key(key.O, key)
             return
         if symbol == key.LEFT:
             self.category = (self.category - 1) % len(self.CATEGORIES)
@@ -2130,6 +3004,14 @@ class TaskHubSession:
                 self.child = SudokuSession(self.core, self.args)
             elif self.category == 4 and self.selected == 4:
                 self.child = GoSession(self.core, self.args)
+            elif self.category == 4 and self.selected == 5:
+                self.child = CrossedWiresSession(self.core, self.args)
+            elif self.category == 4 and self.selected == 6:
+                self.child = CrosswordSession(self.core, self.args)
+            elif self.category == 4 and self.selected == 7:
+                self.child = ScrabbleSession(self.core, self.args)
+            elif self.category == 4 and self.selected == 8:
+                self.child = ScrambleSession(self.core, self.args)
             elif self.category == 2 and self.selected == 1:
                 self.child = NCupMonteSession(self.core, self.args)
             elif self.category == 2 and self.selected == 2:
@@ -2183,6 +3065,10 @@ SCREENS = {
     "jigsaw": ("jigsaw_create", None),
     "sudoku": ("sudoku_create", None),
     "go": ("go_create", None),
+    "crossed-wires": ("crossed_wires_create", None),
+    "crossword": ("crossword_create", None),
+    "scrabble": ("scrabble_create", None),
+    "scramble": ("scramble_create", None),
     "ncup-monte": ("ncup_monte_create", None),
     "moving-targets": ("tracking_create", None),
     "lookout": ("lookout_create", None),
@@ -2203,7 +3089,7 @@ def dump(core, session: TitleSession, trials: int) -> int:
         print(f"# state={session.state} bytes={len(blob)}")
         for line in canonical(decode(blob)):
             print("  " + line)
-        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, CountSession, MrTimeSession, GraphMappingSession, MatrixReasoningSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, ConcentrationSession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, JigsawSession, SudokuSession, GoSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession, BuzzWireSession, DonkeySession, TwoHandsSession, OverrunSession)):
+        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, CountSession, MrTimeSession, GraphMappingSession, MatrixReasoningSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, ConcentrationSession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, JigsawSession, SudokuSession, GoSession, CrossedWiresSession, CrosswordSession, ScrabbleSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession, BuzzWireSession, DonkeySession, TwoHandsSession, OverrunSession)):
             session.action(session.ACTION_START)
         elif isinstance(session, TetrisSession):
             session.action(session.ACTION_SPACE)
@@ -2247,7 +3133,7 @@ def run_window(core, session: TitleSession, width: int, height: int,
                 marble_renderer = MarbleNativeRenderer()
             if not marble_session.native_physics:
                 marble_session.enable_native_physics()
-        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, JigsawSession, SudokuSession, GoSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession, BuzzWireSession,
+        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, JigsawSession, SudokuSession, GoSession, CrossedWiresSession, CrosswordSession, ScrabbleSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession, BuzzWireSession,
                                 TetrisSession, CountSession, MrTimeSession, GraphMappingSession,
                                 MatrixReasoningSession, DonkeySession, TwoHandsSession, OverrunSession, TaskHubSession)):
             blob = session.frame_bytes(core, window.width, window.height)
@@ -2296,7 +3182,26 @@ def run_window(core, session: TitleSession, width: int, height: int,
 
     @window.event
     def on_key_press(symbol, _modifiers):
-        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, ConcentrationSession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, JigsawSession, SudokuSession, GoSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession,
+        target = session.child if isinstance(session, TaskHubSession) else session
+        if (isinstance(target, NumberologySession) and target.state[0] == 1
+                and symbol == key.V and _modifiers & key.MOD_ACCEL):
+            target.paste()
+            draw_frame()
+            return pyglet.event.EVENT_HANDLED
+        if (isinstance(target, AlgebraSession) and target.options_draft is None and target.state[0] == 1
+                and symbol == key.V and _modifiers & key.MOD_ACCEL):
+            target.paste()
+            draw_frame()
+            return pyglet.event.EVENT_HANDLED
+        if (isinstance(target, ScrambleSession) and target.options_draft is None and target.state[0] == 1
+                and symbol == key.V and _modifiers & key.MOD_ACCEL):
+            target.paste()
+            draw_frame()
+            return pyglet.event.EVENT_HANDLED
+        if symbol == key.ESCAPE and isinstance(session, (ScrambleSession, AlgebraSession, NumberologySession)) and session.options_draft is None:
+            window.close()
+            return
+        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, ConcentrationSession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, JigsawSession, SudokuSession, GoSession, CrossedWiresSession, CrosswordSession, ScrabbleSession, ScrambleSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession,
                                 TetrisSession, DonkeySession, TwoHandsSession, OverrunSession, TaskHubSession)):
             session.key(symbol, key)
             draw_frame()
@@ -2308,6 +3213,14 @@ def run_window(core, session: TitleSession, width: int, height: int,
             draw_frame()
         elif symbol == key.ESCAPE:
             window.close()
+
+    @window.event
+    def on_text(text):
+        target = session.child if isinstance(session, TaskHubSession) else session
+        if isinstance(target, (ScrambleSession, AlgebraSession, NumberologySession)):
+            if text not in ('\r', '\n', '\b', '\x7f'):
+                target.text(text)
+            draw_frame()
 
     @window.event
     def on_key_release(symbol, _modifiers):
@@ -2328,11 +3241,23 @@ def run_window(core, session: TitleSession, width: int, height: int,
 
     @window.event
     def on_mouse_press(x, y, _button, _modifiers):
+        target = session.child if isinstance(session, TaskHubSession) else session
+        if isinstance(target, (CrosswordSession, ScrabbleSession, ScrambleSession, AlgebraSession, NumberologySession)):
+            target.pointer(x, y, window.width, window.height, 2 if _button == 4 else 0)
+            draw_frame()
+            return
         if isinstance(session, ReflexSession) or isinstance(session, JigsawSession) or isinstance(session, GoSession) or isinstance(session, NCupMonteSession) or isinstance(session, TrackingSession) or isinstance(session, PursuitSession):
             session.pointer(x, y, window.width, window.height)
             draw_frame()
         elif isinstance(session, TwoHandsSession):
             session.pointer(x / window.width, y / window.height)
+            draw_frame()
+
+    @window.event
+    def on_mouse_motion(x, y, _dx, _dy):
+        target = session.child if isinstance(session, TaskHubSession) else session
+        if isinstance(target, ScrabbleSession):
+            target.pointer(x, y, window.width, window.height, motion=True)
             draw_frame()
 
     @window.event
@@ -2508,9 +3433,79 @@ def main(argv=None) -> int:
                         help="print frames as canonical text; opens no window")
     parser.add_argument("--trials", type=int, default=1,
                         help="3D Maze trial count, or title dump count")
+    parser.add_argument("--jigsaw-side", type=int, choices=(2, 3, 4, 5, 6, 7, 8, 10),
+                        default=3, help="Jigsaw starting grid side (source default: 3)")
+    parser.add_argument("--jigsaw-puzzles", type=int, choices=(1, 2, 3, 5, 8, 12, 20),
+                        default=3, help="Jigsaw puzzles per run (source default: 3)")
+    parser.add_argument("--jigsaw-no-adaptive", action="store_false",
+                        dest="jigsaw_adaptive", default=True,
+                        help="keep the Jigsaw grid side fixed")
+    parser.add_argument("--jigsaw-no-preview", action="store_false",
+                        dest="jigsaw_preview", default=True,
+                        help="hide the finished-picture preview in Jigsaw")
+    parser.add_argument("--jigsaw-mark-placed", action="store_true",
+                        help="outline correctly placed Jigsaw tiles")
+    parser.add_argument("--sudoku-level", type=int, choices=tuple(range(1, 13)),
+                        default=3, help="Sudoku starting level (source default: 3)")
+    parser.add_argument("--sudoku-puzzles", type=int, choices=(1, 2, 3, 5, 8, 10),
+                        default=3, help="Sudoku puzzles per run (source default: 3)")
+    parser.add_argument("--sudoku-no-clashes", action="store_true",
+                        help="do not mark digits that clash with peers")
+    parser.add_argument("--sudoku-no-adaptive", action="store_true",
+                        help="keep the Sudoku level fixed during the run")
+    parser.add_argument("--go-level", type=int, choices=tuple(range(1, 11)),
+                        default=1, help="Go starting level (source default: 1)")
+    parser.add_argument("--go-trials", type=int, choices=(1, 3, 5, 8, 10, 15, 20, 30, 50),
+                        default=10, help="Go positions per run (source default: 10)")
+    parser.add_argument("--crossed-wires-level", type=int, choices=tuple(range(1, 13)),
+                        default=3, help="Crossed Wires starting rung (source default: 3)")
+    parser.add_argument("--crossed-wires-rounds", type=int, choices=(1, 2, 3, 5, 8, 10, 15, 20),
+                        default=5, help="Crossed Wires rounds per run (source default: 5)")
+    parser.add_argument("--crossed-wires-no-adaptive", action="store_true",
+                        help="keep the Crossed Wires rung fixed during the run")
+    parser.add_argument("--crossed-wires-no-grid", action="store_true",
+                        help="hide the Crossed Wires background grid")
+    parser.add_argument("--crossword-level", type=int, choices=range(1, 11))
+    parser.add_argument("--crossword-trials", type=int, choices=CROSSWORD_TRIALS)
+    parser.add_argument("--crossword-no-mistakes", action="store_true", default=None)
+    parser.add_argument("--crossword-no-adaptive", action="store_true", default=None)
+    parser.add_argument("--crossword-lexicon", metavar="PATH", help="clued Crossword lexicon.tsv")
+    parser.add_argument("--scrabble-level", type=int, choices=range(1, 11))
+    parser.add_argument("--numberology-level", type=parse_numberology_level)
+    parser.add_argument("--numberology-trials", type=int, choices=NUMBEROLOGY_TRIALS)
+    parser.add_argument("--numberology-no-adaptive", action="store_true", default=None)
+    parser.add_argument("--algebra-level", type=int, choices=range(1, 13))
+    parser.add_argument("--algebra-trials", type=int, choices=ALGEBRA_TRIALS)
+    parser.add_argument("--algebra-no-working", action="store_true", default=None)
+    parser.add_argument("--algebra-no-adaptive", action="store_true", default=None)
+    parser.add_argument("--scramble-level", type=int, choices=range(1, 13))
+    parser.add_argument("--scramble-trials", type=int, choices=SCRABBLE_TRIALS)
+    parser.add_argument("--scramble-no-count", action="store_true", default=None)
+    parser.add_argument("--scramble-no-adaptive", action="store_true", default=None)
+    parser.add_argument("--scramble-index", metavar="PATH", help="ranked Scramble lexicon.tsv")
+    parser.add_argument("--scramble-sentences", metavar="PATH", help="Scramble sentences.txt")
+    parser.add_argument("--scrabble-trials", type=int, choices=SCRABBLE_TRIALS)
+    parser.add_argument("--scrabble-no-premiums", action="store_true", default=None)
+    parser.add_argument("--scrabble-no-adaptive", action="store_true", default=None)
+    parser.add_argument("--scrabble-lexicon", metavar="PATH", help="Scrabble lexicon.tsv")
     parser.add_argument("--marble-start-rung", type=int, default=1,
                         help="starting Marble Maze rung (1..16)")
     args = parser.parse_args(argv)
+    saved_level, saved_trials, saved_count, saved_adaptive = read_scramble_settings()
+    if args.scramble_level is None: args.scramble_level = saved_level
+    if args.scramble_trials is None: args.scramble_trials = saved_trials
+    if args.scramble_no_count is None: args.scramble_no_count = not saved_count
+    if args.scramble_no_adaptive is None: args.scramble_no_adaptive = not saved_adaptive
+    saved_level, saved_trials, saved_premiums, saved_adaptive = read_scrabble_settings()
+    if args.scrabble_level is None: args.scrabble_level = saved_level
+    if args.scrabble_trials is None: args.scrabble_trials = saved_trials
+    if args.scrabble_no_premiums is None: args.scrabble_no_premiums = not saved_premiums
+    if args.scrabble_no_adaptive is None: args.scrabble_no_adaptive = not saved_adaptive
+    saved_level, saved_trials, saved_mistakes, saved_adaptive = read_crossword_settings()
+    if args.crossword_level is None: args.crossword_level = saved_level
+    if args.crossword_trials is None: args.crossword_trials = saved_trials
+    if args.crossword_no_mistakes is None: args.crossword_no_mistakes = not saved_mistakes
+    if args.crossword_no_adaptive is None: args.crossword_no_adaptive = not saved_adaptive
 
     entry, build_session = SCREENS[args.screen]
     core = load_core(entry)
@@ -2576,6 +3571,14 @@ def main(argv=None) -> int:
         session = SudokuSession(core, args)
     elif args.screen == "go":
         session = GoSession(core, args)
+    elif args.screen == "crossed-wires":
+        session = CrossedWiresSession(core, args)
+    elif args.screen == "crossword":
+        session = CrosswordSession(core, args)
+    elif args.screen == "scrabble":
+        session = ScrabbleSession(core, args)
+    elif args.screen == "scramble":
+        session = ScrambleSession(core, args)
     elif args.screen == "ncup-monte":
         session = NCupMonteSession(core, args)
     elif args.screen == "moving-targets":

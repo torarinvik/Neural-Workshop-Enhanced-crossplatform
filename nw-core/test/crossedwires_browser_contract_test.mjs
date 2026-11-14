@@ -13,14 +13,24 @@ assert.match(source, /crossedWires:\s*exports\.nw_api_v1_task_crossed_wires\(\)/
   "the task table must expose the Crossed Wires stable ID");
 assert.match(source, /function crossedWiresKeyIndex\(/,
   "the shell must preserve the source's four/eight-key physical mapping");
-assert.match(source, /\[3n, 5n, 1n, 1n, 0n, 0n\]/,
-  "the shell defaults must match WIRES_LEVEL=3 and source defaults");
+assert.match(source, /const defaults = \{ level: 3, trials: 5, adaptive: true, showGrid: true \}/,
+  "the options defaults must match the source level, rounds, adaptive, and grid settings");
 assert.match(source, /function crossedWiresFrame\(/,
   "Crossed Wires must render through its source scene");
 assert.match(source, /if \(isCrossedWiresTask\(\)\) \{[\s\S]*crossedWiresKeyIndex\(/,
   "Crossed Wires keyboard input must use source ports");
-assert.match(source, /event\.key === "o" \|\| event\.key === "O"/,
-  "the source O options shortcut must be consumed in the task route");
+assert.match(source, /CROSSED_WIRES_ACTION = Object\.freeze\([^\n]*applyOptions: 3/,
+  "the options panel must apply settings through the controller");
+assert.match(source, /neural-workshop\.crossed-wires\.options\.v1/,
+  "settings must persist under a task-specific storage key");
+assert.match(source, /function openCrossedWiresOptions\(/,
+  "O and the four-key C shortcut must open the options panel");
+assert.match(source, /crossedWiresAction\(CROSSED_WIRES_ACTION\.applyOptions,/,
+  "applying options from a live task must reset the existing controller");
+assert.match(source, /if \(event\.key === "Escape"\) cancelCrossedWiresOptions\(\)/,
+  "Escape must discard an options draft");
+assert.match(source, /CROSSED_WIRES_OPTIONS_STORAGE,\s*JSON\.stringify\(crossedWiresOptions\)/,
+  "accepted options must be saved");
 assert.match(source, /isCrossedWiresTask\(\)\) \{\s*bytes = crossedWiresFrame\(dark\(\)\)/,
   "the generic stateless frame must not render Crossed Wires");
 assert.match(source, /if \(isCrossedWiresTask\(\)\) destroyCrossedWiresRun\(\)/,

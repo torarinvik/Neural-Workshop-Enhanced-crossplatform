@@ -324,14 +324,18 @@ def plan(commands: Sequence[Mapping[str, Any]], viewport: Viewport,
             x, y = viewport.point(cmd["x"], cmd["y"])
             anchor = cmd.get("anchor", "left_bottom")
             anchor_x, _, anchor_y = anchor.partition("_")
-            ops.append(DrawOp("text", {
-                "text": cmd["text"], "x": x, "y": y,
-                "font_size": viewport.font_size(cmd["size"]),
-                "color": rgba(cmd["color"]),
-                "anchor_x": _ANCHOR_X.get(anchor_x, "left"),
-                "anchor_y": _ANCHOR_Y.get(anchor_y, "baseline"),
-                "bold": bool(cmd.get("bold", False)),
-            }))
+            lines = cmd["text"].split("\n")
+            font_size = viewport.font_size(cmd["size"])
+            for index, line in enumerate(lines):
+                ops.append(DrawOp("text", {
+                    "text": line, "x": x,
+                    "y": y + ((len(lines) - 1) / 2 - index) * font_size * 1.25,
+                    "font_size": font_size,
+                    "color": rgba(cmd["color"]),
+                    "anchor_x": _ANCHOR_X.get(anchor_x, "left"),
+                    "anchor_y": _ANCHOR_Y.get(anchor_y, "baseline"),
+                    "bold": bool(cmd.get("bold", False)),
+                }))
 
         elif kind == "verdict":
             verdict = cmd["verdict"]

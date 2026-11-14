@@ -1,8 +1,32 @@
 # Neural Workshop cross-platform implementation plan
 
-Document version: 3.80
-Prepared: 2026-09-13; updated: 2026-10-07
+Document version: 3.85
+Prepared: 2026-09-13; updated: 2026-11-09
 Status: implementation backlog; no completion claim is implied by this document.
+
+**Current application-artifact/compiler boundary (2026-11-09):** the selected
+external Elisa Stage1 source-fresh product is
+`main@d3b2e657d57c159c77b9523542f21fd67a93b916`, source fingerprint
+`9de69658a554a61ac1679e3cd52398ea73800adf700fb0c51d7a636324dceef9`, product
+SHA-256 `eaa65de1651631e703365e46a39ede6f1bcee123c3653755c368c59f51725f0f`.
+The fresh-cache Stage1 **application** build and complete
+`test_wasm_artifact.sh` gate passed in 4m26.887s after starting with empty
+compiler object/incremental caches. The app compile needed current-runtime
+string-view adapters, narrow `Global.Read` grants at the effect boundaries,
+and the Nina Row fixed-array field rename; no Stage0 or Stage1 compiler product
+was rebuilt. The promoted `nw-core/build/nwcore.wasm` is 1,626,675 bytes,
+SHA-256 `27748bd91f6327014d76d432909b2ea38d8df00a980a3981ecc5527dcd7a1889`,
+with matching Stage1 object SHA-256
+`b84e428937b7eda43127bb3a01d911f488db2920913d4b81e447a0bbb419f097`.
+The Python 3.13 extension was rebuilt against that compiler's runtime object
+and passed the Marble and Sudoku host checks; its SHA-256 is
+`6588a98122c4e4569382575bd8941c2ad23c6f90920b4b33a6c784529ed388d2`. The
+current SDL3 native export object and executable also passed the full native
+self-test matrix; their SHA-256 values are `8737ad9b8086b8b993e20b513317427cb4ab71c1e09e4d7bfe36a7e9f0ec3da8` and
+`f223fb89135914a0d743620bee37f11559a25b41f650258aa925ddcba0711c73`.
+Sudoku's real-browser options/replay, original 186-action source replay, and
+fresh WASM/Python/SDL routes are verified. Real OS/browser tab-visibility
+transition acceptance and actual DIV2K photo comparison remain open.
 
 **Source-derived capability catalog (2026-10-07; partial CAT-001 / APP-001
 evidence):** `task_catalog.json` is schema v5 and now contains capability
@@ -90,8 +114,12 @@ reload, a cancelled draft does not overwrite them, and launch starts in the
 saved Produce mode with 20 trials. Capture:
 `nw-core/output/playwright/mrtime-options-persistence-seed17.png`. The common
 API smoke also covers duplicate start/submit/ACT, malformed and repeated text,
-and the inclusive late-grace deadline. OS-held-key repeat equivalence and the
-source scene differential remain open.
+and the inclusive late-grace deadline. A headed key-hold replay on
+2026-11-09 confirmed OS repeat reaches Mr. Time digits and Backspace while
+repeated Enter is suppressed by the common protocol during feedback. The
+Stage0 and Stage1 original-scene sweeps both pass 42 frames and 268 commands;
+the scene source has not changed since those sweeps. Receipt:
+`nw-core/output/verification/mrtime-held-key-repeat-20261109/`.
 
 **Count v6 portable snapshot and artifact promotion (2026-10-07; partial
 API-001 / GAME-039 evidence):** Count snapshots use a variable-length,
@@ -112,6 +140,49 @@ preserved under
 `nw-core/output/verification/count-v6-snapshot-promotion-20261007/`. The served
 response matches the promoted WASM byte-for-byte. This is partial evidence;
 API-001, GAME-039, native adapters, and cross-version migration remain open.
+
+**Count browser options (2026-11-09; partial GAME-021 evidence):** the real
+task menu and the Count screen in READY/DONE now expose all six source settings.
+Accepted values are validated and persisted in
+`neural-workshop.count.options.v1`, and they configure a fresh controller;
+Escape cancels edits. The browser deadline scheduler uses the selected
+exposure duration. A headed deterministic replay verified all six saved values
+after reload, cancellation without persistence, task-screen access, and launch
+with the selected settings; the 1000 ms exposure reached HIDDEN automatically.
+A separate headed default run completed all 15 trials with answers 8–22 and
+matched the source summary: 100%, 15/15, average error 0.0. Its final WASM frame
+now renders the completion summary in reference space; the active frame shows
+the full tangle and prompt. Captures are
+`nw-core/output/playwright/count-options-persistence-seed17.png`,
+`nw-core/output/playwright/count-trial1-seed17.png`, and
+`nw-core/output/playwright/count-multitrial-seed17.png`. The source generator
+differential and Python/SDL lifecycle adapters are already covered in the
+Count evidence below; full acceptance still depends on the shared section 18.1
+gate and the remaining cross-shell matrix. The final promoted-WASM artifact
+suite passed with the Count smoke and browser contract included. Detailed
+results and capture hashes are in
+`nw-core/output/verification/count-browser-options-run-20261109/`.
+
+**Jigsaw source options, defaults, and photo imports (2026-11-09; partial GAME-025 evidence):** the browser now exposes and persists the source's five options, uses the actual 3×3 / three-puzzle defaults, and passes `mark_placed` through common-v1 to the read-only scene. Python's native route accepts equivalent Jigsaw-specific CLI options; the SDL route and self-test carry the added flag while retaining source defaults. The browser imports a player-selected DIV2K directory into IndexedDB, rotates unseen images across sessions, and renders source tile crops plus the centered-square preview. A headed replay using two generated local image fixtures confirmed import, repeat warnings, tile/preview cropping, page-reload rotation, library clearing, and the colored-tile fallback; a wrapped `ImageBitmap.close()` counter reached 1 when leaving the active run. Browser console errors/warnings: zero. Captures are `nw-core/output/playwright/jigsaw-photo-import-synthetic.png`, `jigsaw-photo-reload-rotation.png`, `jigsaw-photo-clear.png`, and `jigsaw-photo-fallback.png`. The external dataset still must be supplied by the player. The promoted source-fresh 2026-11-09 Stage1 WASM artifact and fresh Python 3.13 / SDL products verify the updated Elisa exports and `mark_placed` ABI; the compiler product itself was not rebuilt. Direct comparison using actual DIV2K images remains open.
+
+**Sudoku options and source replay (2026-11-09; partial GAME-026 evidence):** the browser now presents all four source settings from the task hub and active task, persists accepted values under `neural-workshop.sudoku.options.v1`, and keeps an active run intact when an options draft is cancelled. A headed replay confirmed the source defaults (level 3, three puzzles, clashes/adaptive enabled), cancelling edits, applying level 1 / one puzzle / both flags disabled, O opening options during a run, cancellation preserving the current board, and saved options surviving reload. Captures: `nw-core/output/playwright/sudoku-options-defaults.png`, `sudoku-options-level1-grid.png`, and `sudoku-options-persisted.png`; browser console errors/warnings: zero. `test/sudoku_source_oracle.py` now replays the original `Sudoku` UI and the exact `SudokuEnv.drive` port map, and `test/sudoku_original_replay_test.mjs` matches 186 source-port actions against common-v1, including clue refusal, pencil masks, the exact conflicting-cell set, a wrong full grid, correct solve, slip score, and DONE. The artifact suite now includes that replay. Python exposes all four Sudoku CLI settings and uses the source key map; SDL exposes the same settings and has an option-parser self-test, while both native shells retain CLI rather than interactive options panels. The fresh Python 3.13 extension passes the host-options/key contract and direct Sudoku settings/start/frame/pencil/cleanup smoke; the fresh SDL build passes its complete headless native self-test matrix, including Sudoku and task-option parsing. The promoted source-fresh 2026-11-09 WASM artifact passes the complete artifact suite including the 186-action original-source replay. No Stage0 or Stage1 compiler product was rebuilt. Synthetic blur/hidden/visible/focus dispatch preserved controller state, but a real OS/browser tab-visibility transition remains open.
+
+**Graph Mapping responsive minimum sizing and visual review (2026-11-09;
+GAME-023 evidence):** Graph Mapping now renders at the original Pyglet
+640×480-point minimum when the browser shell leaves a smaller 4:3 canvas, then
+scales the complete source layout into that canvas. The scale includes
+`devicePixelRatio`, so fixed minimum controls do not grow relative to the
+graphs on compact/high-DPI screens. A seeded 16-node dense ASKING frame was
+captured from the original Pyglet UI and the real browser route in both themes
+at the 912×684 reference canvas and the compact 912×480 page viewport. The
+912×684 pairs are 94.70% exact (MAE 2.76/2.69); the compact pairs are
+90.87%/90.90% exact (MAE 7.24/6.96) after matching the original 640×480
+minimum to the browser's 495×371 canvas. These are diagnostic metrics, not a
+pixel acceptance threshold. Fixed-width Courier New, per-glyph advance
+rounding, colors, divider, graph geometry, line widths, node sizes, and button
+layout were visually checked. A real compact-canvas Same-button click advanced
+the run to trial 2. Receipt and source/browser captures:
+`nw-core/output/verification/graphmapping-visual-review-20261109/`.
 
 The latest Stage1 artifact passed `scripts/build_latest_stage1_wasm.sh` and the
 full `test_wasm_artifact.sh` suite. Stage1 compiler commit is
@@ -4249,8 +4320,10 @@ broader all-shell/resource acceptance—not another JavaScript-side game state.
   they do not expose generic previews or unported N-Back/session routes. An
   isolated current-source stage1 browser check
   now confirms Games → Perception → Count and Mr. Time, Space start, typed
-  input, timing, grading, and trial progression. Count's options UI and complete
-  run/result/replay acceptance remain open. Mr. Time's real-menu 15-trial run
+  input, timing, grading, and trial progression. Count's six browser options
+  now persist and configure the controller, and its seeded 15-trial default run
+  matches the source score summary. The Count frame is scaled from reference
+  dimensions so its text and tangle stay in view. Mr. Time's real-menu 15-trial run
   and 1,886-case Stage0/Stage1 source differential now pass, including the
   all-rung recall/produce boundary matrix. Its six browser options persist and
   reapply from the real task menu. The default WASM artifact has now
@@ -5690,7 +5763,7 @@ Python and SDL adapters keep the source controller authoritative; their frame
 projection is emitted from the same `SceneCounting` path rather than a shell
 specific answer or shape generator.
 
-**Complete browser-menu replay (2026-09-19):** a headed localhost replay
+**Single-trial browser-menu replay (2026-09-19):** a headed localhost replay
 entered Perception → Count through the real task hub with the deterministic
 `count-seed=1` query, started the generated eight-shape trial with Space,
 entered the source-derived answer `8` with a digit key, and submitted with
@@ -5700,16 +5773,46 @@ Enter. The production status advanced from trial 1 to trial 2 and reported
 timing, typed-answer, grading, and next-trial path rather than only the
 controller export.
 
-**Required task-specific replays:** Test zero if legal, single-digit and multi-digit counts, negative/invalid input, timed exposure, dense layouts, and correct/wrong answers. Compare visible count with internal expected count.
+**Options and full-run browser replays (2026-11-09):** the real task menu and
+READY/DONE task screen open the six source options. Values are validated and
+persisted at `neural-workshop.count.options.v1`; apply creates a fresh run and
+Escape cancels the draft. Headed Playwright changed all six settings to Mixed,
+12 starting shapes, 20 trials, 1000 ms exposure, adaptive off, and answer
+feedback off. It reloaded, verified each value, confirmed cancel preserved the
+stored values, launched at trial 1/20, and observed the automatic SHOWING →
+HIDDEN transition at 1000 ms. The options capture is
+`nw-core/output/playwright/count-options-persistence-seed17.png`.
+
+A second headed replay used the default Lines/8/15/never/adaptive/feedback
+settings and completed all 15 trials through the real task route. It read the
+source-owned shown count for each trial and sent that answer through ordinary
+keyboard input; the adaptive sequence was 8 through 22. The visible final
+summary was `100% — 15 of 15, average error 0.0`, matching the source score
+calculation. Captures:
+`nw-core/output/playwright/count-trial1-seed17.png` and
+`nw-core/output/playwright/count-multitrial-seed17.png`. Console: zero errors
+and zero warnings. The replay also exposed a display sizing defect: Count had
+been generating device-sized coordinates that the browser scaled a second
+time. `countFrame` now requests the 912×684 reference space, so the full tangle,
+prompt, and DONE summary render in the viewport.
+
+**Required task-specific replays (current coverage):** the controller smoke
+covers a zero answer graded wrong, single- and multi-digit entry, ignored
+negative and nonnumeric text, timed exposure, a dense 60-shape mixed layout,
+correct and incorrect grading, feedback, and completion/replay. Its render
+checks compare generated shape counts to controller state; the 113-case Stage0
+and Stage1 differential compares generated geometry and grading against the
+original Python reference.
 
 **Delivery checklist:**
 
 - [x] Record source-derived phases, options, action vocabulary, generation, and grading.
 - [x] Connect the kernel/controller to exports and all three shells using the shared lifecycle/display contract; browser common-v1, Python pymodule, and SDL native adapters are covered.
-- [x] Drive at least one complete run from the real menu with ordinary input; the headed deterministic replay starts Count and grades the generated eight-shape trial correctly before advancing to trial 2.
+- [x] Drive the default 15-trial run from the real menu with ordinary keyboard input; the headed seed-17 replay scored 100%, 15/15, average error 0.0, matching the source score calculation.
 - [x] Compare generated state, action outcomes, feedback, and score against the original through the 113-case Stage0/Stage1 differential and controller smoke matrix.
 - [x] Add task-specific rendering checkpoints and resource/focus/exit checks for browser, Python, and SDL lifecycle/disposal paths.
-- [x] Link current evidence and remaining platform gaps in the task matrix; the headed complete-run evidence is recorded above, while the broader option/replay matrix remains open.
+- [x] Add the six source-defined browser options, validated persistence, cancel/apply behavior, READY/DONE task-screen entry, and controller recreation; headed reload verification is recorded above.
+- [x] Link current evidence and remaining platform gaps in the task matrix; source generator differential and Python/SDL lifecycle adapters are covered, with remaining cross-shell acceptance tracked in section 18.1.
 
 **Done when:** the task-specific replays and section 18.1 pass, with no production fixture standing in for this game's state or verdict.
 
@@ -5725,7 +5828,7 @@ controller export.
 
 **Implementation completed for the current browser/WASM slice:** `src/tasks/mrtime.elisa` owns the persistent MT19937 stream, fixed arrays, phase/deadline transitions, decimal buffer, recall/produce verdicts, timeout, feedback, adaptive rung, and result counters. `runtime_protocol.elisa` exposes task ID `337138730`, common lifecycle, additive info, action/text/pointer dispatch, display-list render, and idempotent destroy. `shells/web/index.html` maps the real menu route and browser events to that ABI, schedules `advance` from monotonic time, cancels the timer on replacement/exit, and exposes validated, persistent options that recreate the controller when accepted.
 
-**Verified task-specific replays:** `test/mrtime_game_smoke.mjs` covers recall flash/ask timing, frozen interval, digit/decimal/backspace input, correct grading, feedback expiry, produce ACT at the target, timeout miss, pointer center hit-testing, display-list render, duplicate start/submit/ACT, malformed/repeated text, the late-grace boundary, and idempotent disposal. The headed Playwright replay entered Games → Perception → Mr. Time, completed all 15 default trials with ordinary Space/0/Enter input, reached DONE, and recorded the displayed score summary at `nw-core/output/playwright/mrtime-multitrial-seed17.png`. The browser options replay changed all six source settings, applied them from the menu, reloaded, verified persistence, cancelled a modified draft, then launched a 20-trial Produce run; its options capture is `nw-core/output/playwright/mrtime-options-persistence-seed17.png`. The source differential now covers 1,886 cases under Stage0 and Stage1, including each result, the exact 15-trial default summary, and all-rung recall/produce answer boundaries. OS-held-key repeat behavior and the source scene differential remain open; the latter requires a Cocoa display for the original pyglet renderer.
+**Verified task-specific replays:** `test/mrtime_game_smoke.mjs` covers recall flash/ask timing, frozen interval, digit/decimal/backspace input, correct grading, feedback expiry, produce ACT at the target, timeout miss, pointer center hit-testing, display-list render, duplicate start/submit/ACT, malformed/repeated text, the late-grace boundary, and idempotent disposal. The headed Playwright replay entered Games → Perception → Mr. Time, completed all 15 default trials with ordinary Space/0/Enter input, reached DONE, and recorded the displayed score summary at `nw-core/output/playwright/mrtime-multitrial-seed17.png`. The browser options replay changed all six source settings, applied them from the menu, reloaded, verified persistence, cancelled a modified draft, then launched a 20-trial Produce run; its options capture is `nw-core/output/playwright/mrtime-options-persistence-seed17.png`. The source differential now covers 1,886 cases under Stage0 and Stage1, including each result, the exact 15-trial default summary, and all-rung recall/produce answer boundaries. The 2026-11-09 headed held-key replay records both `repeat=false` and `repeat=true`: repeated digits append and repeated Backspace deletes in ASKING, while Enter submits once and its repeated keydown is ignored during FEEDBACK. The Stage0 and Stage1 original pyglet scene sweeps both pass with 42 frames and 268 commands identical; the scene source has not changed since those sweeps. Full replay and scene evidence are in `nw-core/output/verification/mrtime-held-key-repeat-20261109/`.
 
 **Mr. Time verification receipt:** source results and a concise browser/smoke
 summary are preserved in
@@ -5739,9 +5842,8 @@ smokes exercise READY → SHOWING → ASKING → FEEDBACK, typed input,
 display-list rendering, and disposal; the SDL build gate runs
 `--selftest-mr-time`. The Stage0 and newest Stage1 `mrtime` differentials
 both pass all 1,886 cases, including the seeded default 15-trial run and the
-all-rung recall/produce boundary matrix. The source scene differential remains unrerun in
-this headless environment because the original pyglet reference requires a
-Cocoa display; that is an environment limitation, not a passing claim.
+all-rung recall/produce boundary matrix. The Stage0 and Stage1 source scene
+differentials both pass 42 frames and 268 commands identical.
 
 **Delivery checklist:**
 
@@ -5749,7 +5851,7 @@ Cocoa display; that is an environment limitation, not a passing claim.
 - [x] Connect the controller to exports and all three shells using the shared protocol; browser/WASM, Python pymodule, and SDL native adapters and routes are covered by focused lifecycle/render smokes.
 - [x] Drive a complete multi-trial run from the real menu with ordinary input and capture the source-comparable result summary. The headed seed-17 run completed all 15 default recall trials and matched the source summary: 0% accuracy, 0/15 correct, 100.0% typical error, best rung 1; screenshot: `nw-core/output/playwright/mrtime-multitrial-seed17.png`.
 - [x] Compare generated state, action outcomes, feedback, timing tolerances, adaptive changes, and score against the original UI/environment. The lifted source reference and both Stage0/Stage1 implementations match across 1,886 cases, including every result, the exact 15-trial default summary, and all-rung recall/produce answer boundaries.
-- [x] Add browser/WASM and native rendering, pointer/timer, focus/cleanup, timeout, and resource-lifecycle checkpoints; OS-held-key repeat behavior and the original pyglet source scene differential remain open.
+- [x] Add browser/WASM and native rendering, pointer/timer, focus/cleanup, timeout, and resource-lifecycle checkpoints. Headed browser evidence covers repeated digit, Backspace, and Enter keydowns; Stage0 and Stage1 source scene sweeps both match all 42 frames and 268 commands.
 - [x] Link current evidence and remaining platform gaps in the runtime protocol, artifact gate, focused smoke, browser contract, and this task section.
 
 **Done when:** the task-specific replays and section 18.1 pass, with no production fixture standing in for this game's state or verdict.
@@ -5894,10 +5996,19 @@ now uses the descending order shared by the source, and the full matrix passes.
   display-list decode, and cleanup. Both native hosts use the shared
   `GraphMappingGame` controller; neither reimplements graph generation or
   grading.
-- [ ] Capture source/reference screenshots at the supported viewport sizes and
+- [x] Capture source/reference screenshots at the supported viewport sizes and
   perform the remaining typography, line-width, color, scaling, and
-  cross-rasterizer checks. The current display-list smoke proves the scene is
-  real, not that every pixel is final.
+  cross-rasterizer checks. **Updated 2026-11-09:** original Pyglet and browser
+  captures cover 912×684 and the compact 912×480 page viewport, in light/dark,
+  using the 16-node dense ASKING fixture. Browser text now uses Courier New
+  with source-compatible glyph-advance rounding. Compact browser canvases
+  render at the source 640×480 minimum, scaled by device-pixel ratio; this
+  prevents fixed-size controls from distorting the graph layout. Side-by-side
+  review confirmed title/status/footer typography, accent/background colors,
+  divider, edge widths, node sizes, graph scaling, and answer buttons. Pyglet
+  versus Chromium metrics are recorded as diagnostics only, without an
+  acceptance threshold. A real click on the compact Same button advanced to
+  trial 2. Receipt: `nw-core/output/verification/graphmapping-visual-review-20261109/`.
 
 **Done when:** the source differential matrix, boundary/restart fixtures,
 browser lifecycle evidence, and any explicitly supported host adapters pass;
@@ -6026,11 +6137,11 @@ feedback scheduling, and next-trial transition.
 **Original UI:** `original-neural-workshop-enhanced/neural_workshop/ui/jigsaw.py`.  
 **Original environment:** `original-neural-workshop-enhanced/nwenv/jigsaw.py`.
 
-**Reference discovery:** Read piece geometry, source imagery, transforms, snapping, and completion rules. Read the environment wrapper's action mapping and compare it with the actual UI handlers; record any difference in the replay specification.
+**Reference discovery:** Read piece geometry, source imagery, transforms, and completion rules. The original UI uses two pointer clicks to swap tiles; it has no drag, rotation, snapping, or piece placement. The stepped environment maps each action to one `_pick(position)`, so a swap costs the second tile action and selecting the same tile twice cancels the selection. The task uses a separately downloaded DIV2K photograph library, not repository imagery.
 
-**Implementation:** Implement piece selection, drag, orientation, placement, and z-order using real piece state. Separate view transforms from piece identity and solution transforms.
+**Implementation:** Preserve source tile identity under shuffle, source two-click selection/swap, preview crop, and mark-placed outlines. Keep layout transforms separate from permutation identity; do not add drag, rotation, snap, or placement behavior that the source does not have.
 
-**Required task-specific replays:** Test correct snap, almost-snap, invalid placement, rotations if supported, overlap selection, drag cancellation, resize during drag, and full assembly. Validate all required pieces before declaring success.
+**Required task-specific replays:** Test a one-click selection, same-tile cancellation, a valid swap, seam/outside clicks, resize while a tile is selected, preview and mark-placed options, feedback boundary, and full assembly. The source's exact-solution permutation is the completion criterion.
 
 Current evidence: the source-backed `JigsawGame` controller is now exported
 through the Python extension and SDL native ABI in addition to common WASM v1.
@@ -6042,16 +6153,44 @@ pass. The native adapters expose numeric tile selection as a deterministic
 keyboard fallback and now also route pointer coordinates through the source
 `Jigsaw::tile_at` hit-test. The browser lifecycle now dispatches rendered tile
 pointer hits, advances the solved-feedback boundary, and cleans up the advance
-timer on exit. A full source-image asset path and the headed drag/resize/
-resource replay remain open for the final fidelity pass.
+timer on exit. **Updated 2026-11-09:** the browser options screen now exposes
+all five source settings, validates/persists them, and applies changes by
+recreating the controller. Its defaults now match `JIGSAW_SIDE=3`,
+`JIGSAW_PUZZLES=3`, adaptive growth, preview enabled, and placed-tile marks
+disabled. Common-v1 carries the fifth `mark_placed` option into the scene;
+Python's native route accepts equivalent Jigsaw-specific CLI options, and SDL
+exports/tests the same flag. The source-fresh current Stage1 application build
+and complete WASM artifact suite now pass with the changed common-v1 ABI; the
+fresh Python 3.13 extension and SDL native build/self-test matrix also pass.
+The compiler product itself was not rebuilt. The
+browser can import the external DIV2K folder into IndexedDB, retain the
+source-style unseen-image rotation across sessions, and render cropped photo
+tiles plus the centered-square preview. The player must provide the dataset;
+without an imported photo library the colored-tile fallback remains active.
+The headed replay imported two generated local image fixtures, confirmed the
+repeat warning, saw the selected fixture change after reload, and cleared the
+stored library after exiting the active run; an instrumented
+`ImageBitmap.close()` counter confirmed one close call on that transition. The
+colored-tile fallback remained visible after clearing. The browser console had
+no errors or warnings. Captures:
+`nw-core/output/playwright/jigsaw-photo-import-synthetic.png`,
+`nw-core/output/playwright/jigsaw-photo-reload-rotation.png`, and
+`nw-core/output/playwright/jigsaw-photo-clear.png`, and
+`nw-core/output/playwright/jigsaw-photo-fallback.png`. The external dataset
+still must be provided by the player. The promoted 2026-11-09 WASM artifact
+verifies the updated Elisa `mark_placed` ABI. Comparison against actual DIV2K
+photographs remains open.
 
 **Delivery checklist:**
 
 - [x] Record source-derived phases, options, action vocabulary, generation, and grading. The controller and focused Jigsaw smoke cover generated permutations, tile selection, swaps, feedback, completion, adaptive results, and rendering.
-- [x] Connect the kernel/controller to exports and all three shells using the shared protocol. WASM v1, Python `nwcore`, and SDL native exports are present and build successfully.
+- [x] Connect the existing kernel/controller to exports and all three shells using the shared protocol. WASM v1, Python `nwcore`, and SDL native exports are present and have prior successful-build evidence.
+- [x] Fresh-build and validate the changed `mark_placed` common-v1 path and backward-compatible Python/SDL options exports. The current source-fresh Stage1 application build, full WASM artifact suite, fresh Python 3.13 extension, and complete SDL self-test matrix pass.
 - [x] Drive at least one complete run from the real menu with ordinary input. Headed Playwright evidence covers Games → Reasoning → Jigsaw Puzzle → Space, rendered tile pointer swaps across side lengths 2×2 through 6×6, all five puzzles, and terminal `done · puzzle 5/5 · swaps 33 · minimum 33`; capture: `nw-core/output/playwright/jigsaw-headed-complete.png`. No browser console errors occurred.
 - [x] Compare generated state, action outcomes, feedback, and score against the original. Stage0 and latest Stage1 both match 2,477 controller cases against the Python reference.
-- [x] Add task-specific rendering checkpoints and resource/focus/exit checks. Stage0 and latest Stage1 both match 40 source scene frames and 545 display commands; native/browser lifecycle and cleanup smokes remain recorded, while headed drag/resize remains open.
+- [x] Compare the source scene geometry and display commands; Stage0 and latest Stage1 match 40 frames and 545 commands. The source action mapping is two clicks per swap, so drag/rotation/snap cases do not apply.
+- [x] Verify browser options persistence/application and photo import/lifecycle through a headed replay. Generated fixtures confirmed IndexedDB import, crop rendering, preview, unseen-photo rotation after reload, an `ImageBitmap.close()` call on exit, library clear, colored-tile fallback, and the repeat warning; see the four `output/playwright/jigsaw-photo-*.png` captures. Browser console errors/warnings: zero.
+- [ ] Compare rendering against actual DIV2K photographs. The generated fixture replay validates crop orientation and preview but not the source dataset's real-photo appearance; the deterministic scene sweep still uses the coloured-tile asset fallback.
 - [x] Link current evidence and remaining platform gaps in the task matrix.
 
 **Done when:** the task-specific replays and section 18.1 pass, with no production fixture standing in for this game's state or verdict.
@@ -6103,21 +6242,50 @@ Evidence currently in the production artifact:
 - `test/sudoku_browser_contract_test.mjs` covers stable export wiring, task-hub
   position, defaults, input mapping, real render routing, lifecycle cleanup,
   and the browser diagnostics surface.
+- `test/sudoku_source_oracle.py` drives the original UI and the exact
+  `SudokuEnv.drive` port mapping. `test/sudoku_original_replay_test.mjs`
+  compares generation and every controller state, filled grid, and pencil
+  mask for 186 actions, including immutable clues, the exact clash set, an
+  incorrect full grid that remains unsolved, the correct solution, score, and
+  terminal state. It is included in `scripts/test_wasm_artifact.sh`.
 - `test/catalog_audit.py` and the configured artifact build pass with the
   Sudoku controller/catalog/export entries included. Python and SDL3 now use
   the same source-backed controller through native exports: arrows move the
-  cursor, digits write, Backspace erases, and P toggles pencil marks. Direct
-  lifecycle tests and the native SDL self-test pass; a full headed menu replay,
-  source options panel, and controller-level original UI/environment
-  differential remain open.
+  cursor, 1–9/A–G write, 0/Backspace/Delete erase, and N toggles pencil mode.
+  Their four Sudoku settings are available as CLI options; SDL's parser also
+  accepts all five Jigsaw settings and has a dedicated self-test. The Python
+  options/key contract passes against the existing native extension and SDL C
+  syntax validation passes. The browser options screen is complete and its
+  headed replay confirms defaults, apply/cancel, active-run preservation, task
+  exit, and reload persistence. Captures are linked in the 2026-11-09 evidence
+  entry above.
+
+The common-v1 source differential passes 186 original `SudokuEnv` port actions
+against the fresh 2026-11-09 WASM artifact. The full artifact suite passed
+before promotion. The Python 3.13 extension was rebuilt against the selected
+Stage1 runtime object and passes its native Marble smoke, Sudoku source-options
+contract, and direct Sudoku controller/frame/pencil/cleanup smoke. SDL was
+rebuilt from the same source-fresh Stage1 product and its complete native
+self-test matrix passes, including Sudoku and task-option parsing. No Stage0 or
+Stage1 compiler product was rebuilt. The browser options source, native CLI
+controls, and original UI/environment controller trace are implemented;
+interactive options panels remain browser-only. A headed replay dispatched
+blur/hidden/visible/focus lifecycle events and verified state preservation,
+and a native Chrome tab-strip switch away/back left the complete public
+controller state unchanged. ArrowRight moved the cursor after restoration. The
+automation-launched Chrome nevertheless kept `document.visibilityState` visible
+and emitted no blur/focus/visibilitychange events, so browser lifecycle-event
+propagation remains open in this harness. Capture: `nw-core/output/playwright/sudoku-tab-switch-restored.png`; receipt: `nw-core/output/verification/sudoku-focus-check-20261109/`.
 
 **Delivery checklist:**
 
 - [x] Record source-derived phases, options, action vocabulary, generation, and grading.
-- [x] Connect the kernel/controller to exports and all three shells using the shared protocol. Web/WASM, Python `nwcore`, and SDL native exports are implemented and built.
+- [x] Connect the kernel/controller to exports and all three shells using the shared protocol. The fresh current WASM, Python 3.13, and SDL native products pass their focused controller and host checks.
+- [x] Expose and persist the source options in the browser; Python and SDL also accept validated startup options from the command line.
 - [x] Drive at least one complete run from the real menu with ordinary input. Headed Playwright evidence covers Games → Reasoning → Sudoku → Space, ordinary arrow navigation and digit entry for all three generated 9×9 puzzles, and the terminal state `done · puzzle 3/3 · 0 left`; capture: `nw-core/output/playwright/sudoku-headed-complete.png`. No browser console errors occurred.
-- [ ] Compare generated state, action outcomes, feedback, and score against the original UI/environment. Kernel and controller smoke evidence is present; the controller-level original replay remains open.
-- [ ] Add task-specific rendering checkpoints and resource/focus/exit checks. The scene differential and browser contract are present; headed focus/exit evidence remains open.
+- [x] Compare generated state, action outcomes, feedback, and score against the original UI/environment. The 186-action `sudoku_original_replay_test.mjs` checks every state and grid transition against the original UI plus exact environment port map.
+- [ ] Add task-specific rendering checkpoints and resource/focus/exit checks. The scene differential, browser contract, options cancellation, active-task O/cancel, and exit paths are covered. A headed Chrome tab-strip switch away/back preserved the entire public controller state, and ArrowRight worked after restoration; however, automation-launched Chrome kept `document.visibilityState` visible and emitted no blur/focus/visibilitychange event. The browser lifecycle-event path remains unverified; see `nw-core/output/verification/sudoku-focus-check-20261109/`.
+- [x] Fresh-build and verify the changed Python/SDL host routes and WASM artifact. The current source-fresh Stage1 application build, full artifact suite, Python native smoke, and SDL self-test matrix pass; no Stage0/Stage1 compiler product rebuild was needed.
 - [x] Link current evidence and remaining platform gaps in the task matrix.
 
 **Done when:** the task-specific replays and section 18.1 pass, with no production fixture standing in for this game's state or verdict.
@@ -6138,12 +6306,12 @@ Evidence currently in the production artifact:
 
 **Delivery checklist:**
 
-- [ ] Record source-derived phases, options, action vocabulary, generation, and grading.
-- [ ] Connect the kernel/controller to exports and all three shells using the shared protocol.
-- [x] Drive at least one complete run from the real menu with ordinary input. Headed Playwright evidence covers Games → Reasoning → Find the Winning Move → Space, ordinary arrow navigation plus Enter for all five generated problems, and terminal `done · problem 5/5 · correct 5`; capture: `nw-core/output/playwright/go-headed-complete.png`. No browser console errors occurred; `test/go_game_smoke.mjs` also passes.
-- [ ] Compare generated state, action outcomes, feedback, and score against the original.
-- [ ] Add task-specific rendering checkpoints and resource/focus/exit checks.
-- [ ] Link current evidence and remaining platform gaps in the task matrix.
+- [x] Record source-derived phases (READY/SOLVING/JUDGED/DONE), level/trial options, action vocabulary, generation, captures, and grading in `nw-core/docs/runtime-protocol.md` and `nw-core/docs/port-status.md`.
+- [x] Connect the kernel/controller to common-v1 exports and browser, Python, and SDL hosts. Focused ABI/host checks and the complete promoted Stage1 WASM artifact suite pass.
+- [x] Drive a complete run from the real menu with ordinary input. Headed Playwright evidence covers Games → Reasoning → Find the Winning Move, all ten default positions solved by clicking the visible winning point, terminal `done · problem 10/10 · correct 10`, Escape to the hub, and clean reopen to READY; capture: `nw-core/output/playwright/go-headed-complete.png`. No browser console errors or warnings occurred.
+- [x] Compare generated state, action outcomes, feedback, and score against the original. `go_original_replay_test.mjs` checks 11 original UI/environment actions and complete board/target/verdict/score transitions; `go_rules_diff.py` compares edge/corner capture, occupied, suicide, ko, and recapture behavior.
+- [ ] Add task-specific rendering checkpoints and resource/focus/exit checks. `scene_go` compares 20 frames / 1,721 commands; Go smoke and browser contract cover rendering/disposal, and the headed run verified Escape/reopen. Real browser blur/focus/visibility transitions remain unverified because the automation-launched Chrome did not emit those lifecycle events; see `nw-core/docs/port-status.md`.
+- [x] Link current evidence and remaining platform gaps in the task matrix and `nw-core/docs/port-status.md`.
 
 **Done when:** the task-specific replays and section 18.1 pass, with no production fixture standing in for this game's state or verdict.
 
@@ -6161,8 +6329,7 @@ Evidence currently in the production artifact:
 
 **Required task-specific replays:** Test useful and redundant probes, exhausted budget, invalid actions, successful inference, and incorrect connection. Confirm scene/host snapshots do not leak hidden wire topology.
 
-**Current implementation checkpoint (2026-09-18):** the web/WASM slice is now
-implemented and tested, but this does not close the complete GAME-028 packet.
+**Current implementation checkpoint (2026-11-10):**
 `src/tasks/crossedwires_game.elisa` owns persistent fixed storage and delegates
 deal/press rules to the source kernel. It copies only public board state out of
 the temporary source bout; wiring, drift turn, dead port, and budget inputs
@@ -6178,19 +6345,24 @@ idempotent destruction. `test/crossedwires_browser_contract_test.mjs` verifies
 the route/default/input/render/cleanup contract, and the existing kernel
 differential matrix remains green.
 
-The following remain intentionally open: a headed menu replay against the
-served artifact, a controller-level differential replay against the original
-UI/environment (the kernel differential is not sufficient by itself), the
-source task-options panel, native Python integration, and SDL3 integration.
+The browser persists the four source settings; a headed check verified defaults,
+apply, cancel during a round, and reload persistence. Python and SDL expose the
+same startup settings through validated CLI flags; interactive native settings
+remain open. The original UI/environment replay compares 159 actions across
+perfect, partial, and missed rounds, including adaptive climb, stay, and drop,
+score, and the 800 ms verdict boundary. The latest Stage1 kernel sweep matches
+1,546 cases and the scene sweep matches 36 frames / 1,019 commands. The full
+WASM artifact gate and Python and SDL builds pass. Browser focus and visibility
+transitions remain unverified.
 
 **Delivery checklist:**
 
 - [x] Record source-derived phases, options, action vocabulary, generation, and grading in the source notes, runtime protocol, and focused smoke.
-- [ ] Connect the kernel/controller to exports and all three shells using the shared protocol. Web/WASM is complete; Python and SDL3 remain open.
+- [x] Connect the kernel/controller to exports and all three shells using the shared protocol. Python and SDL use startup flags for settings.
 - [x] Drive at least one complete run from the real menu with ordinary input. Headed Playwright evidence covers Games → Reasoning → Crossed Wires → Space, ordinary ArrowUp presses through all five source-budget rounds, Space score transitions, and terminal `done · round 5/5 · target 1/3 · presses left 0`; capture: `nw-core/output/playwright/crossed-wires-headed-complete.png`. No browser console errors occurred.
-- [ ] Compare generated state, action outcomes, feedback, and score against the original.
-- [ ] Add task-specific rendering checkpoints and resource/focus/exit checks.
-- [ ] Link current evidence and remaining platform gaps in the task matrix.
+- [x] Compare generated state, action outcomes, feedback, and score against the original. `crossedwires_original_replay_test.mjs` compares the original UI and environment routes over three deterministic runs.
+- [ ] Add task-specific rendering checkpoints and resource/focus/exit checks. Scene differential, disposal checks, and headed menu replay pass; real browser focus and visibility transitions remain open.
+- [x] Link current evidence and remaining platform gaps in the task matrix and `nw-core/docs/port-status.md`.
 
 **Done when:** the task-specific replays and section 18.1 pass, with no production fixture standing in for this game's state or verdict.
 
@@ -6208,11 +6380,60 @@ source task-options panel, native Python integration, and SDL3 integration.
 
 **Required task-specific replays:** Replay across/down edits, shared letters, blocked cells, Unicode/punctuation rules, wrong filled grid, correct completion, and absent corpus. Ensure a renderer fixture cannot supply production answers.
 
+**Source discovery (2026-11-10):** the original reads a rank-ordered,
+clued `words/lexicon.tsv` distilled from the frequency and definition sources
+described in `neural_workshop/wordlist.py`. It refuses to start without a ready
+clued index. Defaults are level 2, three grids, visible mistakes, and adaptive
+level changes. A run moves through ready, solving, solved, and done; a deal
+failure ends the run with a message. The first unfilled cell is selected.
+Arrows skip blocks and set direction; Tab turns; a letter writes only to a
+non-given open cell, counts a new wrong entry as a slip, advances within the
+current slot, and automatically settles only when the whole grid is correct.
+An incorrect full grid stays open. Backspace/Delete erase, and clicks select a
+cell or turn at the current cell. O opens options outside solving. The
+environment maps four movement ports, 26 letters, erase, and turn directly to
+the same methods. Clean solves climb, more than four slips drop a rung, and
+score records solves, slips, best rung, clean solves, and elapsed seconds.
+
+The browser, Python, and SDL controllers now load a real clued `lexicon.tsv` and
+refuse to start without it. Browser import persists the index locally, rejects
+invalid replacements without discarding the old one, and exposes the four
+source settings. The Python and SDL hosts accept equivalent startup flags and load
+an explicit index or the standard local data path. SDL supports menu and direct
+screen entry, keyboard and pointer controls, and a controller self-test.
+Python and SDL now show the shared four-setting options screen from O outside
+a puzzle, with cancel/apply and a shared persisted settings file. Restart,
+cross-host interoperability, malformed-data fallback, and CLI precedence pass
+`test/crossword_native_settings_test.py`. A headed run from the Reasoning menu imported the installed index, solved one
+level-2 grid via 50 source-derived keyboard actions including a wrong letter and
+correction, and reached DONE with one solve and one slip. Screenshots are
+`nw-core/output/playwright/crossword-real-solved.png` and
+`nw-core/output/playwright/crossword-real-complete.png`; the browser console
+had no warnings or errors. A headed check also confirmed that injected blur
+and hidden/visible events preserve the grid, and Escape/reopen returns to a
+fresh ready run while retaining the index. Real tab-switch events were not
+observed in the automation session, so real focus/visibility checks remain open.
+
+The installed original index has SHA-256
+`b7ce80a7ad8e4109dd861186fca2112adfadd5f6b28bc704ba05ca54cd7adc8d`.
+The loader preserves rank and clue offsets without truncation, with explicit
+capacity limits; unsorted rows are stably sorted by rank as in the original.
+The reversed 143,806-row index matches source counts and seeded level 1/2
+deals, and sorted/unsorted UI replays agree. A Stage1 100,000-entry capacity
+sweep and 218-case kernel differential pass. The real
+index matches original rank counts and complete seeded level 1 and 2 deals.
+The source UI/environment replay matches one-slip and five-slip runs using
+both a test index and the installed index, including blocked cells, clues,
+incorrect full grids, correction, score, and adaptive drop. Headed browser
+checks covered real clues, import, reload, invalid replacement, options, and
+pointer selection. The earlier completed-run screenshot used synthetic data;
+the real-index completed run above supplies the source-backed evidence.
+
 **Delivery checklist:**
 
 - [ ] Record source-derived phases, options, action vocabulary, generation, and grading.
 - [ ] Connect the kernel/controller to exports and all three shells using the shared protocol.
-- [x] Drive at least one complete run from the real menu with ordinary input. Headed Playwright evidence covers Games → Reasoning → Crossword → Space, coordinate-aware arrow navigation and ordinary letter entry across all five generated 4×4 puzzles, and terminal `done · puzzle 5/5 · right 5`; capture: `nw-core/output/playwright/crossword-headed-complete.png`. No browser console errors occurred.
+- [x] Drive at least one source-backed complete run from the real menu with ordinary input. See `nw-core/output/playwright/crossword-real-complete.png`.
 - [ ] Compare generated state, action outcomes, feedback, and score against the original.
 - [ ] Add task-specific rendering checkpoints and resource/focus/exit checks.
 - [ ] Link current evidence and remaining platform gaps in the task matrix.
@@ -6233,11 +6454,62 @@ source task-options panel, native Python integration, and SDL3 integration.
 
 **Required task-specific replays:** Test repeated letters, invalid words, board boundaries, bonuses, tiles moved back to rack, correct/best answer where applicable, and legal lower-scoring answers. Compare numerical score and accepted vocabulary.
 
+**Source discovery (2026-11-10):** Defaults are level 3, five boards,
+show premiums and adaptive on. Each seeded source deal contains an occupied
+board, rack, and best play. Arrow keys move one square, Tab switches direction,
+1–7 place rack tiles, Backspace removes the last tile, and Enter submits. The
+source refuses an empty or illegal submission, checks both directions, and
+compares a legal score with the generated best-play ceiling for the verdict
+and adaptive change. The environment maps four directions, seven rack slots,
+undo, turn, and submit to the same UI methods. The hosts synchronize the
+trial clock after synchronous deal generation. The common WASM key protocol
+also maps all four directions, Tab, Backspace, and rack keys 1–7; a
+source-backed best-play replay exercises those key events. Python and SDL expose
+menu/direct routes, keyboard and pointer input, offline seed data, optional
+local index loading, and validated startup flags. Their task menu and in-game
+options support cancel and apply, with settings persisted across native hosts;
+cross-host persistence, invalid settings fallback, and flag precedence are
+tested. The browser provides all
+four persisted source settings from the task menu and during a
+run; applying them resets the run and cancel preserves it. A headed check
+covered defaults, cancel, apply and reload; the captured defaults are in
+`nw-core/output/playwright/scrabble-options-defaults.png`. Score and verdict messages, run totals,
+and elapsed-time accumulation now match source replays; a WASM test excludes
+a simulated generation delay. The browser uses the
+original 669-word seed pool when no index is available, and generates source
+boards and evaluates actual moves using the selected pool. A headed offline
+start is captured in `nw-core/output/playwright/scrabble-offline-seed.png`.
+Browser imports accept Scrabble indexes without clues and separately enforce
+Crossword's clue requirement; a WASM-backed test covers both validators,
+rejected replacement, and restoring a Scrabble-only index. The controller uses
+the best-score share for its verdict and adaptive level change. A real
+index controller test matches the original seeded board, rack, best play and
+score, and a legal lower-scoring play matches its message, verdict and adaptive
+drop. A separate source-backed controller replay checks all four board edges,
+disconnected and source-invalid connected submissions, undo, and inventory for
+two identical rack letters; its legal TOO scores 4 and matches source feedback.
+A headed menu/import/start check captured
+`nw-core/output/playwright/scrabble-real-deal.png`; a subsequent headed check
+selected a square, laid a rack tile and lifted it again with the mouse, captured
+in `nw-core/output/playwright/scrabble-real-pointer.png` and
+`nw-core/output/playwright/scrabble-real-pointer-lift.png`, without console
+warnings or errors. Pointer hit tests also cover hover, right-click turning,
+Play, and lifting a tile out of order. The kernel now implements the source seeded-board hook order and deal/retry loop,
+including bag draws and exhaustive best-play selection. Play storage grows
+beyond its former 4,096-entry limit; a permutation lexicon exercises a real
+search with at least 5,040 plays. A Stage1 source
+differential using a shared test lexicon matches 50 seeded boards and 20
+complete deals across all ten levels. Caller-sized lexicon storage passes a 10,000-word capacity
+check. A Scrabble index loader now handles the real source index, including stable
+rank sorting and two-letter words. Full-band indexing passed with 142,066
+entries / 1,173,575 letters, and level 1/2 deals matched the source using both
+the original and reversed index. The controller now calls these functions.
+
 **Delivery checklist:**
 
 - [ ] Record source-derived phases, options, action vocabulary, generation, and grading.
 - [ ] Connect the kernel/controller to exports and all three shells using the shared protocol.
-- [x] Drive at least one complete run from the real menu with ordinary input. Headed Playwright evidence covers Games → Reasoning → Scrabble → Space, ordinary Space/Enter play and score transitions for all five generated trials, and terminal `done · trial 5/5 · score 10 · right 5`; capture: `nw-core/output/playwright/scrabble-headed-complete.png`. No browser console errors occurred.
+- [x] Drive at least one source-backed complete run from the real menu with ordinary input. A headed run selected Reasoning → Scrabble, configured level 1 and one board, and used keyboard input to play the source offline-seed deal: CAT with rack GLST, then SALT for 8, matching the original oracle. The scored and completed screens are `nw-core/output/playwright/scrabble-menu-source-scored.png` and `nw-core/output/playwright/scrabble-menu-source-complete.png`; Escape returned to the menu and the console had no warnings or errors. The older `scrabble-headed-complete.png` used a synthetic board and is not evidence of source parity.
 - [ ] Compare generated state, action outcomes, feedback, and score against the original.
 - [ ] Add task-specific rendering checkpoints and resource/focus/exit checks.
 - [ ] Link current evidence and remaining platform gaps in the task matrix.
@@ -6258,11 +6530,40 @@ source task-options panel, native Python integration, and SDL3 integration.
 
 **Required task-specific replays:** Test spaces, apostrophes, punctuation, case, repeated letters, backspace, paste, IME composition, and exact/wrong reconstruction. Ensure game hotkeys do not consume answer letters.
 
+**Current checkpoint (2026-11-10):** The browser controller now uses the
+original 70 offline seed sentences and 746-word offline vocabulary, filtered
+by the source rung's sentence-length band. It stores the selected original
+sentence for grading and wrong-answer feedback. A source-derived oracle matches
+the first generated line at all twelve levels; uppercase, punctuation as word
+breaks, exact grading and wrong-answer feedback pass in the WASM test. Browser
+text input supports clipboard paste and composition commits, including both
+common composition event orderings; a headed check exercised clipboard paste,
+simulated composition, typing, backspace, grading and exit. Physical IME
+behavior remains unverified. Browser options now expose the source defaults,
+persist changes, and support cancel/apply; correct and wrong answers climb or
+drop when adaptive mode is enabled. Python and SDL expose direct and menu
+routes, text input, pointer start, validated startup flags, and interactive
+options with shared persistence. Python's source-deal and menu tests, SDL's
+controller self-test, and cross-host settings tests pass. Both native hosts
+route the paste shortcut into text input; tests cover multiline normalization,
+but the standalone native window could not be bound for a headed check. The controller now
+loads a ranked index and sentence bank, matching source filtering and order;
+all three hosts start timing after generation, and elapsed time accumulates
+across judged lines in the source score's whole-second form. The WASM lifecycle
+test covers generation delays, accumulation, and restart. The
+installed-corpus deals and grading match at levels 1, 3 and 12, including
+index-only and sentences-only fallback combinations. Python and SDL load
+installed files or explicit paths, while the browser imports and persists
+either or both files. Headed checks covered full and single-file imports;
+`nw-core/output/playwright/scramble-downloaded-corpus.png` captures a full
+corpus challenge. Headed native input remains open. The former synthetic headed run is not evidence for the
+current controller.
+
 **Delivery checklist:**
 
 - [ ] Record source-derived phases, options, action vocabulary, generation, and grading.
 - [ ] Connect the kernel/controller to exports and all three shells using the shared protocol.
-- [x] Drive at least one complete run from the real menu with ordinary input. Headed Playwright evidence covers Games → Reasoning → Scramble → Space, ordinary letter/space reconstruction and Enter submission for all five generated lines, and terminal `done · line 5/5 · right 5`; capture: `nw-core/output/playwright/scramble-headed-complete.png`. No browser console errors occurred.
+- [x] Drive at least one source-backed complete run from the real menu with ordinary input. A headed run configured one level-1 line, reconstructed the original offline sentence and finished with one correct answer; capture: `nw-core/output/playwright/scramble-source-complete.png`. The earlier `scramble-headed-complete.png` exercised a synthetic corpus and is not source-backed evidence.
 - [ ] Compare generated state, action outcomes, feedback, and score against the original.
 - [ ] Add task-specific rendering checkpoints and resource/focus/exit checks.
 - [ ] Link current evidence and remaining platform gaps in the task matrix.
@@ -6301,6 +6602,12 @@ source task-options panel, native Python integration, and SDL3 integration.
 **Existing scene anchor:** `nw-core/src/scene_numberology.elisa`.  
 **Original UI:** `original-neural-workshop-enhanced/neural_workshop/ui/numberology.py`.  
 **Original environment:** `original-neural-workshop-enhanced/nwenv/numberology.py`.
+
+**Current exact-number evidence:** The shared controller now uses dynamically
+sized integer generation and decimal input rather than narrowing sequence
+values to i64. Source replays include level 10,000 and a 1,341-digit answer;
+see `nw-core/docs/replays/numberology.md` for ABI details, verification, resource
+limits, and open Stage0 and user-interface gaps.
 
 **Reference discovery:** Read sequence families, parameters, valid answer conventions, and explanation text. Read the environment wrapper's action mapping and compare it with the actual UI handlers; record any difference in the replay specification.
 
@@ -15188,6 +15495,26 @@ boundary coverage, original UI/environment differential replay, full options
 fidelity, and headed menu/focus/exit evidence.
 ## Algebra source-backed controller slice — 2026-09-19
 
+**Updated status (2026-11-10):** The lowest-grade integer-only limitation
+below has been superseded by exact fraction and polynomial checking for all
+twelve generated rungs. `nw-core/test/algebra_exact_game_test.mjs` and
+`nw-core/test/algebra_feedback_test.mjs` cover the shared WASM controller,
+including long answers, all-rung answer round trips, safe parser nesting and
+large exponents. The WASM stack was enlarged for expression parsing. The
+source controls and outstanding UI, explanation, native and rendering gaps
+are recorded in `nw-core/docs/replays/algebra.md`; the plan's Algebra delivery
+checklist remains open. Source-derived working is now carried by the shared
+controller and displayed after judgment: 48 cases across all twelve levels
+match original Python derivations in WASM and the native Python extension,
+and the SDL self-test checks fractional and top-rung CRT examples. The scene
+differential matches 28 source frames. All shells now expose source options
+and adaptive progression; browser headed and native host tests cover option
+application, while native headed verification remains open. Session scoring
+now tracks response time and the highest correctly answered rung; browser text
+input supports composition and paste events and native shells have clipboard
+paths. See the replay notes for the remaining real-device and result-persistence
+gaps.
+
 Algebra is being promoted from the generic reasoning-card renderer to a real
 common-v1 controller. The initial slice uses Algebra's lowest numeric grade:
 the source `Algebra::build_one` generator deals the question from the session
@@ -15222,7 +15549,13 @@ completion still requires a headed keyboard/reopen check, all higher Algebra
 grades, symbolic-expression input, source options persistence, and a native
 cross-host differential rather than this lowest-grade adapter slice.
 
-## Scrabble source-backed controller slice — 2026-09-19
+## Scrabble controller slice — 2026-09-19
+
+**Superseded status (2026-11-10):** This historical fixture slice was not a
+source-backed playable game: it dealt an empty board and auto-submitted a
+hard-coded word. The current controller accepts actual rack placement, undo,
+and legality checks, but still uses the synthetic deal and vocabulary. See
+GAME-030 for the outstanding implementation and acceptance requirements.
 
 Scrabble is now promoted from the generic reasoning frame to a common-v1
 source-backed controller. `ScrabbleGame` owns the persistent board, generated

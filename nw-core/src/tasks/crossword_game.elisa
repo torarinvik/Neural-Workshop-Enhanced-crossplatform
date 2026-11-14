@@ -19,15 +19,32 @@ module CrosswordGame:
     const TOGGLE: i64 = 6
     const WRITE: i64 = 7
     const BACKSPACE: i64 = 8
+    const CLICK: i64 = 9
+    const APPLY_OPTIONS: i64 = 10
 
-    struct Run:
+    struct CrosswordRun:
         rng: mutable MT19937
+        start_rung: mutable i64
         rung: mutable i64
         trials: mutable i64
+        show_mistakes: mutable bool
+        adaptive: mutable bool
         trial: mutable i64
         right: mutable i64
+        total_slips: mutable i64
+        best_rung: mutable i64
+        clean: mutable i64
+        total_ms: mutable i64
+        started_ms: mutable i64
+        solved_ms: mutable i64
+        start_blanks: mutable i64
         phase: mutable i64
         verdict: mutable i64
+        slips: mutable i64
+        full_wrong: mutable bool
+        corpus_pointer: mutable i64
+        corpus_length: mutable i64
+        deal_failed: mutable bool
         size: mutable i64
         cursor: mutable i64
         down: mutable bool
@@ -39,18 +56,30 @@ module CrosswordGame:
         slot_down: mutable bool[MAX_SLOTS]
         slot_first: mutable i64[MAX_SLOTS]
         slot_length: mutable i64[MAX_SLOTS]
+        slot_clue: mutable i64[MAX_SLOTS]
 
     def allowed_rung(value: i64) -> bool:
         return value >= 1 and value <= Crossword::GRADE_COUNT
     def allowed_trials(value: i64) -> bool:
-        return value >= 1 and value <= 100
+        return value == 1 or value == 2 or value == 3 or value == 5 or value == 8 or value == 10
 
-    def clear(run: mutable Run&):
+    def trial_choice(index: i64) -> i64:
+        return 1 if index == 0
+        return 2 if index == 1
+        return 3 if index == 2
+        return 5 if index == 3
+        return 8 if index == 4
+        return 10
+
+    def clear(run: mutable CrosswordRun&):
         can Abort.Panic:
             run.size <- 0
             run.cursor <- 0
             run.down <- false
             run.slots <- 0
+            run.slips <- 0
+            run.full_wrong <- false
+            run.start_blanks <- 0
             for cell in 0..<MAX_CELLS |cell, run|:
                 run.solution[cell.usize()] <- 0
                 run.filled[cell.usize()] <- 0
@@ -60,115 +89,239 @@ module CrosswordGame:
                 run.slot_down[slot.usize()] <- false
                 run.slot_first[slot.usize()] <- 0
                 run.slot_length[slot.usize()] <- 0
+                run.slot_clue[slot.usize()] <- -1
 
-    def build_lexicon(lex: mutable Crossword::Lexicon&):
-        can Abort.Panic:
-            # A minimal source-compatible corpus that can fill the junior
-            # four-square rung. The controller deliberately exercises the
-            # production index/fill/deal path; the full ranked corpus remains
-            # a separate data-integration requirement.
-            lex.count <- 2
-            words: mutable darray[i64] = [0, 0, 0, 0, 0, 0, 0]
-            lengths: mutable darray[i64] = [3, 4]
-            at: mutable i64 = 0
-            for word in 0..<2 |word, lex, words, lengths, at|:
-                Ints::put(&lex.start, word, at)
-                Ints::put(&lex.length, word, Ints::at_ref(&lengths, word))
-                Ints::put(&lex.rank, word, word + 1)
-                Ints::put(&lex.clue, word, 0)
-                for letter in 0..<Ints::at_ref(&lengths, word) |letter, lex, words, at, word|:
-                    Ints::put(&lex.letter, at + letter, Ints::at_ref(&words, at + letter))
-                at <- at + Ints::at_ref(&lengths, word)
-            Crossword::index_lexicon(lex)
-
-    def deal(run: mutable Run&):
-        can Memory.Allocate, Abort.Panic:
-            region work(67108864):
+    def deal(run: mutable CrosswordRun&) -> bool:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            made: mutable bool = false
+            puzzle_seed: u64 = py_randbelow(&run.rng, 1073741824.u64())
+            region work(268435456):
                 in work:
-                    puzzle: mutable Crossword::Puzzle = Crossword::new_puzzle()
+                    text: mutable sview = sview("", 0, -1)
+                    trusted Unsafe.PointerCast:
+                        text <- sview(run.corpus_pointer.uintptr().cast[cstr], 0, run.corpus_length)
+                    puzzle: mutable Crossword::CrosswordPuzzle = Crossword::new_puzzle()
                     filler: mutable Crossword::Filler = Crossword::new_filler()
-                    lex: mutable Crossword::Lexicon = Crossword::new_lexicon()
                     shaper: mutable Crossword::Shaper = Crossword::new_shaper()
                     numbers: mutable darray[i64] = Ints::zeros(Crossword::MOST_CELLS)
                     word: mutable darray[i64] = Ints::zeros(Crossword::MAX_ENTRY)
-                    build_lexicon(&lex)
-                    grade: Crossword::Grade = Crossword::grade_of(run.rung)
-                    Crossword::deal_one(&puzzle, grade, &filler, &lex, &shaper, &numbers, &word, &run.rng)
+                    grade: Crossword::CrosswordGrade = Crossword::grade_of(run.rung)
+                    max_length: i64 = grade.size if grade.size < Crossword::MAX_ENTRY else Crossword::MAX_ENTRY
+                    stats: CrosswordLexicon::CrosswordIndexStats = CrosswordLexicon::inspect(text, grade.top_rank, max_length)
+                    lex: mutable Crossword::Lexicon = Crossword::new_lexicon_sized(stats.words, stats.letters)
+                    CrosswordLexicon::load(text, grade.top_rank, max_length, &lex)
+                    puzzle_rng: mutable MT19937 = mt19937_new()
+                    mt_seed_int(&puzzle_rng, puzzle_seed)
+                    Crossword::deal_one(&puzzle, grade, &filler, &lex, &shaper, &numbers, &word, &puzzle_rng)
+                    made <- puzzle.dealt
+                    run.start_blanks <- Crossword::blanks(&puzzle) if made else 0
                     run.size <- puzzle.size
                     run.slots <- puzzle.slots
-                    for cell in 0..<(puzzle.size * puzzle.size) |cell, puzzle, run|:
+                    found_cursor: mutable bool = false
+                    for cell in 0..<(puzzle.size * puzzle.size) |cell, puzzle, run, found_cursor|:
                         source: i64 = Ints::at_ref(&puzzle.solution, cell)
                         run.solution[cell.usize()] <- 97 + source if source >= 0 else 0
                         run.filled[cell.usize()] <- 97 + source if Ints::at_ref(&puzzle.givens, cell) != 0 and source >= 0 else 0
                         run.givens[cell.usize()] <- Ints::at_ref(&puzzle.givens, cell) != 0
+                        if not found_cursor and source >= 0 and not run.givens[cell.usize()]:
+                            run.cursor <- cell
+                            found_cursor <- true
                     for slot in 0..<puzzle.slots |slot, puzzle, run|:
                         run.slot_number[slot.usize()] <- Ints::at_ref(&puzzle.slot_number, slot)
                         run.slot_down[slot.usize()] <- Ints::at_ref(&puzzle.slot_down, slot) != 0
                         first_at: i64 = Ints::at_ref(&puzzle.slot_at, slot)
                         run.slot_first[slot.usize()] <- Ints::at_ref(&puzzle.slot_cell, first_at)
                         run.slot_length[slot.usize()] <- Ints::at_ref(&puzzle.slot_n, slot)
+                        run.slot_clue[slot.usize()] <- Ints::at_ref(&puzzle.slot_clue, slot)
                 destroy work
+            return made
 
-    def initialize(run: mutable Run&, rung: i64, trials: i64, seed: i64):
+    def reset_run(run: mutable CrosswordRun&):
+        can Abort.Panic:
+            run.rung <- run.start_rung
+            run.trial <- 0
+            run.right <- 0
+            run.total_slips <- 0
+            run.best_rung <- 0
+            run.clean <- 0
+            run.total_ms <- 0
+            run.started_ms <- 0
+            run.solved_ms <- 0
+            run.phase <- READY
+            run.verdict <- -1
+            run.deal_failed <- false
+            clear(run)
+
+    def initialize(run: mutable CrosswordRun&, rung: i64, trials: i64,
+                   show_mistakes: bool, adaptive: bool, seed: i64):
         can Abort.Panic:
             run.rng <- mt19937_new()
             mt_seed_int(&run.rng, seed.u64())
-            run.rung <- rung
+            run.start_rung <- rung
             run.trials <- trials
-            run.trial <- 0
-            run.right <- 0
-            run.phase <- READY
-            run.verdict <- -1
-            clear(run)
+            run.show_mistakes <- show_mistakes
+            run.adaptive <- adaptive
+            run.corpus_pointer <- 0
+            run.corpus_length <- 0
+            reset_run(run)
 
-    def apply(run: mutable Run&, action: i64, value: i64, now_ms: i64) -> i64:
-        can Memory.Allocate, Abort.Panic:
-            _ = now_ms
+    def dispose(run: mutable CrosswordRun&):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            if run.corpus_pointer != 0:
+                trusted Unsafe.PointerCast:
+                    pointer: heap void& = run.corpus_pointer.uintptr().cast[heap void&]
+                    free(pointer)
+            run.corpus_pointer <- 0
+            run.corpus_length <- 0
+
+    # Keep a private copy: host input buffers and Python wrapper arenas may be
+    # released immediately after this call. Failed replacements preserve the
+    # previous index and its current state.
+    def set_lexicon(run: mutable CrosswordRun&, text: sview) -> i64:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return -6 if run.phase == SOLVING
+            length: i64 = sview_len(text).i64()
+            return -3 if length <= 0 or length > 67108864
+            stats: CrosswordLexicon::CrosswordIndexStats = CrosswordLexicon::inspect(text, 1073741824, Crossword::MAX_ENTRY)
+            return -3 if not stats.valid or not stats.clued or stats.words > 200000 or stats.letters > 2200000
+            raw: mutable heap void&? = malloc((length + 1).usize())
+            return -4 if raw == null
+            trusted Unsafe.PointerCast:
+                copy: mutable heap void& = raw
+                memcpy(copy, text.data.cast[void&], length.usize())
+                bytes: mutable heap u8& = copy.cast[mutable heap u8&]
+                bytes[length.usize()] <- 0
+                dispose(run)
+                run.corpus_pointer <- copy.uintptr().i64()
+                run.corpus_length <- length
+                reset_run(run)
+                return 0
+
+    # Movement follows the source UI: skip blocks, stop at the edge, and face
+    # the direction of a successful move.
+    def move_cursor(run: mutable CrosswordRun&, dx: i64, dy: i64):
+        can Abort.Panic:
+            x: mutable i64 = run.cursor % run.size + dx
+            y: mutable i64 = run.cursor / run.size + dy
+            while x >= 0 and x < run.size and y >= 0 and y < run.size |run, dx, dy, x, y|:
+                cell: i64 = y * run.size + x
+                if run.solution[cell.usize()] != 0:
+                    run.cursor <- cell
+                    run.down <- dy != 0
+                    return
+                x <- x + dx
+                y <- y + dy
+
+    # Locate the entry containing the cursor, preferring its current facing.
+    def slot_here(run: CrosswordRun&) -> i64:
+        can Abort.Panic:
+            fallback: mutable i64 = -1
+            for slot in 0..<run.slots |run, fallback|:
+                stride: i64 = run.size if run.slot_down[slot.usize()] else 1
+                for at in 0..<run.slot_length[slot.usize()] |run, slot, stride, fallback|:
+                    if run.slot_first[slot.usize()] + at * stride == run.cursor:
+                        return slot if run.slot_down[slot.usize()] == run.down
+                        fallback <- slot
+            return fallback
+
+    def step_on(run: mutable CrosswordRun&):
+        can Abort.Panic:
+            slot: i64 = slot_here(run)
+            return if slot < 0
+            stride: i64 = run.size if run.slot_down[slot.usize()] else 1
+            last: i64 = run.slot_first[slot.usize()] + (run.slot_length[slot.usize()] - 1) * stride
+            run.cursor <- run.cursor + stride if run.cursor != last
+
+    def apply(run: mutable CrosswordRun&, action: i64, value: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            if action == APPLY_OPTIONS:
+                return 2 if run.phase == SOLVING
+                run.start_rung <- value & 15
+                run.trials <- trial_choice((value >> 4) & 7)
+                run.show_mistakes <- (value & 128) != 0
+                run.adaptive <- (value & 256) != 0
+                reset_run(run)
+                return 1
             if action == START:
                 if run.phase == SOLVING: return 2
+                if run.corpus_pointer == 0: return 2
+                if run.phase == READY or run.phase == DONE:
+                    reset_run(run)
                 if run.trial >= run.trials:
                     run.phase <- DONE
-                    return 2
+                    return 1
                 run.trial <- run.trial + 1
                 clear(run)
-                deal(run)
+                if not deal(run):
+                    run.deal_failed <- true
+                    run.phase <- DONE
+                    return 1
+                run.deal_failed <- false
                 run.phase <- SOLVING
                 run.verdict <- -1
+                run.started_ms <- now_ms
                 return 1
             if run.phase != SOLVING: return 2
             if action == LEFT:
-                run.cursor <- run.cursor - 1 if run.cursor % run.size != 0
+                move_cursor(run, -1, 0)
                 return 1
             if action == RIGHT:
-                run.cursor <- run.cursor + 1 if run.cursor % run.size + 1 < run.size
+                move_cursor(run, 1, 0)
                 return 1
             if action == UP:
-                run.cursor <- run.cursor - run.size if run.cursor >= run.size
+                move_cursor(run, 0, -1)
                 return 1
             if action == DOWN:
-                run.cursor <- run.cursor + run.size if run.cursor + run.size < run.size * run.size
+                move_cursor(run, 0, 1)
                 return 1
             if action == TOGGLE:
                 run.down <- not run.down
+                return 1
+            if action == CLICK:
+                return 2 if value < 0 or value >= run.size * run.size or run.solution[value.usize()] == 0
+                if value == run.cursor:
+                    run.down <- not run.down
+                else:
+                    run.cursor <- value
                 return 1
             if action == BACKSPACE:
                 if not run.givens[run.cursor.usize()]: run.filled[run.cursor.usize()] <- 0
                 return 1
             if action == WRITE:
-                if value >= 0 and value < 26 and not run.givens[run.cursor.usize()]:
-                    run.filled[run.cursor.usize()] <- value + 97
-                    if run.cursor + 1 < run.size * run.size: run.cursor <- run.cursor + 1
+                if value >= 0 and value < 26 and run.solution[run.cursor.usize()] != 0 and not run.givens[run.cursor.usize()]:
+                    letter: i64 = value + 97
+                    if run.filled[run.cursor.usize()] != letter and run.solution[run.cursor.usize()] != letter:
+                        run.slips <- run.slips + 1
+                    run.filled[run.cursor.usize()] <- letter
+                    step_on(run)
+                    full: mutable bool = true
+                    correct: mutable bool = true
+                    for cell in 0..<(run.size * run.size) |run, full, correct|:
+                        if run.solution[cell.usize()] != 0:
+                            full <- false if run.filled[cell.usize()] == 0
+                            correct <- false if run.filled[cell.usize()] != run.solution[cell.usize()]
+                    if full and not correct: run.full_wrong <- true
+                    if full and correct:
+                        run.full_wrong <- false
+                        run.verdict <- 1 if run.slips == 0 else 0
+                        run.right <- run.right + 1
+                        run.total_slips <- run.total_slips + run.slips
+                        run.best_rung <- run.rung if run.rung > run.best_rung
+                        run.clean <- run.clean + 1 if run.slips == 0
+                        run.solved_ms <- now_ms - run.started_ms if now_ms >= run.started_ms else 0
+                        run.total_ms <- run.total_ms + run.solved_ms
+                        if run.adaptive:
+                            if run.slips == 0 and run.rung < Crossword::GRADE_COUNT:
+                                run.rung <- run.rung + 1
+                            elif run.slips > 4 and run.rung > 1:
+                                run.rung <- run.rung - 1
+                        run.phase <- SOLVED
                 return 1
             if action == SUBMIT:
-                run.verdict <- 1
-                for cell in 0..<(run.size * run.size) |cell, run|:
-                    if run.solution[cell.usize()] != run.filled[cell.usize()]: run.verdict <- 0
-                run.phase <- SOLVED
-                if run.verdict == 1: run.right <- run.right + 1
-                return 1
+                return 2
             return 2
 
-    def info(run: Run&, field: i64) -> i64:
+    def info(run: CrosswordRun&, field: i64) -> i64:
         if field == 0: return run.phase
         if field == 1: return run.rung
         if field == 2: return run.trial
@@ -179,19 +332,95 @@ module CrosswordGame:
         if field == 7: return 1 if run.down else 0
         if field == 8: return run.verdict
         if field == 9: return run.right
+        if field == 10: return run.slips
+        if field == 11: return 1 if run.full_wrong else 0
+        if field == 12: return 1 if run.corpus_pointer != 0 else 0
+        if field == 13: return 1 if run.show_mistakes else 0
+        if field == 14: return 1 if run.adaptive else 0
+        if field == 15: return run.total_slips
+        if field == 16: return run.best_rung
+        if field == 17: return run.clean
+        if field == 18: return run.total_ms / 1000
+        if field == 19: return run.solved_ms / 1000
         return -1
 
-    def value(run: Run&, field: i64, at: i64) -> i64:
+    def pointer(run: mutable CrosswordRun&, x: i64, y: i64, width: i64,
+                height: i64, button: i64, now_ms: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return apply(run, TOGGLE, 0, now_ms) if button == 2
+            return 2 if button != 0 or x < 0 or x > 1000000 or y < 0 or y > 1000000 or width <= 0 or height <= 0
+            if run.phase == READY or run.phase == SOLVED or run.phase == DONE:
+                return apply(run, START, 0, now_ms)
+            return 2 if run.phase != SOLVING or run.size <= 0
+            board: mutable SceneCrossword::CrosswordBoard = SceneCrossword::CrosswordBoard{left: 0.0, bottom: 0.0, side: 0.0}
+            SceneCrossword::board_of(&board, width.f64(), height.f64())
+            px: f64 = x.f64() * width.f64() / 1000000.0
+            py: f64 = y.f64() * height.f64() / 1000000.0
+            return 2 if px < board.left or px >= board.left + board.side or py < board.bottom or py >= board.bottom + board.side
+            step: f64 = board.side / run.size.f64()
+            col: i64 = ((px - board.left) / step).i64()
+            row: i64 = run.size - 1 - ((py - board.bottom) / step).i64()
+            return apply(run, CLICK, row * run.size + col, now_ms)
+
+    def value(run: CrosswordRun&, field: i64, at: i64) -> i64:
         return -1 if at < 0 or at >= MAX_CELLS
         if field == 0: return run.solution[at.usize()]
         if field == 1: return run.filled[at.usize()]
         if field == 2: return 1 if run.givens[at.usize()] == true else 0
         return -1
 
-    def render(run: Run&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
+    def grade_name(rung: i64) -> sview:
+        return sview("first crossing", 0, -1) if rung == 1
+        return sview("a small grid", 0, -1) if rung == 2
+        return sview("a proper one", 0, -1) if rung == 3
+        return sview("wider", 0, -1) if rung == 4
+        return sview("no help", 0, -1) if rung == 5
+        return sview("bookish", 0, -1) if rung == 6
+        return sview("a clue short", 0, -1) if rung == 7
+        return sview("the square", 0, -1) if rung == 8
+        return sview("a square, half said", 0, -1) if rung == 9
+        return sview("half of it unsaid", 0, -1)
+
+    def append_message(out: mutable dstr&, run: CrosswordRun&):
         can Memory.Allocate, Abort.Panic:
+            if run.corpus_pointer == 0:
+                dstr_append_cstr(out, "Load a clued lexicon.tsv to start")
+            elif run.deal_failed:
+                dstr_append_cstr(out, "No grid could be built at this level")
+            elif run.phase == READY:
+                dstr_append_cstr(out, "Press Space to start")
+            elif run.phase == SOLVING:
+                if run.full_wrong:
+                    dstr_append_cstr(out, "Full, but not right yet")
+                else:
+                    dstr_append_sview(out, grade_name(run.rung))
+                    dstr_append_cstr(out, " ")
+                    dstr_append_em_dash(out)
+                    dstr_append_cstr(out, " ")
+                    dstr_append_i64(out, run.start_blanks)
+                    dstr_append_cstr(out, " to fill")
+            elif run.phase == SOLVED:
+                dstr_append_cstr(out, "Solved in ")
+                dstr_append_i64(out, run.solved_ms / 1000)
+                if run.slips == 0:
+                    dstr_append_cstr(out, "s, no slips")
+                else:
+                    dstr_append_cstr(out, "s, ")
+                    dstr_append_i64(out, run.slips)
+                    dstr_append_cstr(out, " slips")
+            else:
+                dstr_append_i64(out, run.right)
+                dstr_append_cstr(out, " solved, ")
+                dstr_append_i64(out, run.total_slips)
+                dstr_append_cstr(out, " slips, highest level ")
+                dstr_append_i64(out, run.best_rung)
+
+    def render(run: CrosswordRun&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
             region frame(67108864):
                 in frame:
+                    message: mutable dstr = []
+                    append_message(&message, run)
                     solution: mutable darray[i64] = Ints::zeros(MAX_CELLS)
                     filled: mutable darray[i64] = Ints::zeros(MAX_CELLS)
                     givens: mutable darray[bool] = []
@@ -200,22 +429,32 @@ module CrosswordGame:
                     slot_first: mutable darray[i64] = Ints::zeros(MAX_SLOTS)
                     slot_length: mutable darray[i64] = Ints::zeros(MAX_SLOTS)
                     clues: mutable darray[sview] = []
+                    corpus: mutable sview = sview("", 0, -1)
+                    if run.corpus_pointer != 0 and run.slots > 0:
+                        trusted Unsafe.PointerCast:
+                            corpus <- sview(run.corpus_pointer.uintptr().cast[cstr], 0, run.corpus_length)
                     for cell in 0..<MAX_CELLS |cell, solution, filled, givens, run|:
                         Ints::put(&solution, cell, run.solution[cell.usize()])
                         Ints::put(&filled, cell, run.filled[cell.usize()])
                         givens.push(run.givens[cell.usize()])
-                    for slot in 0..<run.slots |slot, slot_number, slot_down, slot_first, slot_length, clues, run|:
+                    for slot in 0..<run.slots |slot, slot_number, slot_down, slot_first, slot_length, clues, run, corpus|:
                         Ints::put(&slot_number, slot, run.slot_number[slot.usize()])
                         slot_down.push(run.slot_down[slot.usize()])
                         Ints::put(&slot_first, slot, run.slot_first[slot.usize()])
                         Ints::put(&slot_length, slot, run.slot_length[slot.usize()])
-                        clues.push(sview("", 0, -1))
-                    message: sview = sview("Press Space to start", 0, -1) if run.phase == READY else sview("Fill the grid", 0, -1)
+                        clue_at: i64 = run.slot_clue[slot.usize()]
+                        clue_end: mutable i64 = clue_at
+                        if clue_at >= 0:
+                            while clue_end < run.corpus_length and sview_at(corpus, clue_end.usize()) != 10.u8() and sview_at(corpus, clue_end.usize()) != 13.u8() |corpus, run, clue_end|:
+                                clue_end <- clue_end + 1
+                            clues.push(string_view_slice(corpus, clue_at, clue_end))
+                        else:
+                            clues.push(sview("", 0, -1))
                     sx: f64 = width / Display::REFERENCE_WIDTH
                     sy: f64 = height / Display::REFERENCE_HEIGHT
-                    paint: SceneCrossword::Paint = SceneCrossword::paint_of(black, width, height, sx, sy)
+                    paint: SceneCrossword::CrosswordPaint = SceneCrossword::paint_of(black, width, height, sx, sy)
                     SceneCrossword::render(list, &paint, run.phase, run.size > 0, run.size, solution,
                         filled, givens, slot_number, slot_down, slot_first, slot_length, clues,
-                        run.cursor, run.down, -1, run.phase == SOLVED, run.trial, run.trials,
-                        message, run.verdict, sview("", 0, -1))
+                        run.cursor, run.down, -1, run.show_mistakes, run.trial, run.trials,
+                        bytes_view(message), run.verdict, bytes_view(message))
                 destroy frame

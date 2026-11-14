@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { instantiateElisa } from '../shells/web/elisa-wasm-runtime.js';
+import { decode, Kind } from '../shells/web/display-list.js';
+const wasm = process.env.NWCORE_WASM_PATH ?? fileURLToPath(new URL('../build/nwcore.wasm', import.meta.url));
+const cases = JSON.parse(fs.readFileSync(new URL('./algebra_working_oracle.json', import.meta.url)));
+const { exports: e, instance } = await instantiateElisa(fs.readFileSync(wasm), { warn: false });
+const task = BigInt(e.nw_api_v1_task_algebra());
+const frame = Number(e.nw_frame_alloc(1048576n));
+let sequence = 0n;
+const action = (run, code, value = 0) => e.nw_api_v1_dispatch(run, 1n, 1n, sequence++, BigInt(code), BigInt(value), 0n, 0n, 0n, 0n, 0n);
+const info = (run, field) => e.nw_api_v1_algebra_info(run, BigInt(field));
+const read = (run, field, length) => new TextDecoder().decode(Uint8Array.from({length: Number(length)}, (_, at) => Number(e.nw_api_v1_algebra_value(run, BigInt(field), BigInt(at)))));
+for (const example of cases) {
+  const run = e.nw_api_v1_create(task, 1n, BigInt(example.level), 1n, 0n, 0n, 0n, 0n, BigInt(example.seed));
+  assert.ok(run > 0n);
+  assert.equal(action(run, 0), 1n);
+  assert.equal(read(run, 0, info(run, 4)), example.asked, `question level ${example.level} seed ${example.seed}`);
+  assert.equal(info(run, 11), 0n, 'working is hidden before judgment');
+  assert.equal(e.nw_api_v1_algebra_value(run, 3n, 0n), -1n);
+  assert.equal(action(run, 1, 120), 1n);
+  assert.equal(action(run, 3), 1n);
+  assert.equal(read(run, 3, info(run, 11)), example.working, `working level ${example.level} seed ${example.seed}`);
+  const size = Number(e.nw_api_v1_render(run, BigInt(frame), 1048576n, 0n, 912n, 684n));
+  assert.ok(size > 0);
+  const texts = decode(new Uint8Array(instance.exports.memory.buffer, frame, size).slice()).filter(c => c.kind === Kind.TEXT).map(c => c.text);
+  assert.ok(texts.includes(example.working), 'display list carries the complete derivation');
+  assert.equal(e.nw_api_v1_destroy(run), 0n);
+}
+console.log(`Algebra working: ${cases.length} source-oracle questions and derivations match and render`);

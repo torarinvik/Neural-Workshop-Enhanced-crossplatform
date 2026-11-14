@@ -45,6 +45,8 @@ assert.match(source, /function scheduleGraphMappingAdvance\(/,
   "Graph Mapping exposure and feedback deadlines must use the browser clock");
 assert.match(source, /function graphMappingFrame\(/,
   "Graph Mapping must render through the common display-list ABI");
+assert.match(source, /const minimumWidth = Math\.round\(640 \* ratio\);[\s\S]*const minimumHeight = Math\.round\(480 \* ratio\);[\s\S]*belowSourceMinimum[\s\S]*BigInt\(renderWidth\), BigInt\(renderHeight\)/,
+  "compact browser canvases must scale the source 640×480 minimum layout, including on HiDPI displays");
 assert.match(source, /screen === "task" && isGraphMappingTask\(\)[\s\S]*apiDispatchPointer\(ensureGraphMappingRun\(\), API_EVENT\.pointerDown/,
   "browser pointer-down must reach source-owned Graph Mapping button hit testing");
 assert.match(source, /if \(isGraphMappingTask\(\)\) \{[\s\S]*event\.key === " " \|\| event\.key === "Enter"[\s\S]*GRAPH_MAPPING_ACTION\.start/,
@@ -59,5 +61,7 @@ assert.match(source, /graphMappingInfo, graphMappingValue, graphMappingAction, g
   "Graph Mapping diagnostics must remain available to focused browser smoke tests");
 assert.match(source, /else if \(isGraphMappingTask\(\)\) \{[\s\S]*bytes = graphMappingFrame\(dark\(\)\)/,
   "the generic stateless task frame must not be the Graph Mapping render path");
+assert.match(source, /const fixedWidthTaskText = screen === "task" &&[\s\S]*isGraphMappingTask\(\)[\s\S]*fontFamily: fixedWidthTaskText[\s\S]*roundGlyphAdvances: fixedWidthTaskText/,
+  "Graph Mapping text must use the source fixed-width face and Pyglet-compatible glyph advances");
 
-console.log("graphmapping_browser_contract_test: PASS (exports, lifecycle, timers, keyboard, pointer, render, cleanup)");
+console.log("graphmapping_browser_contract_test: PASS (exports, lifecycle, timers, keyboard, pointer, render, cleanup, source typography)");

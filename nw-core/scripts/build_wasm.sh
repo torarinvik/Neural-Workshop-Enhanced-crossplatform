@@ -34,7 +34,7 @@ trap - EXIT INT TERM HUP
 # --export=__heap_base is NOT implied by --export-dynamic: the symbol is
 # linker-synthesized, not a definition in the object, so it has to be named.
 # Without it the shim has no idea where static data ends.
-wasm-ld --no-entry --export-dynamic --allow-undefined --export=__heap_base \
+wasm-ld --no-entry --export-dynamic --allow-undefined --export=__heap_base -z stack-size=8388608 \
     -o "$ARTIFACT" "$OBJECT"
 
 printf 'wasm: %s bytes\n' "$(wc -c < "$ARTIFACT" | tr -d ' ')"

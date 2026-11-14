@@ -1,7 +1,7 @@
 # Stateful common-v1 adapter for Crossed Wires.
 #
 # The source task keeps its deal in darrays and its player in a small mutable
-# Bench.  The ABI run must survive between calls, so this adapter copies the
+# CrossedWiresBench.  The ABI run must survive between calls, so this adapter copies the
 # dealt bout into fixed storage and reconstructs the source objects only for a
 # press.  The source kernel remains the authority for target spacing, wiring,
 # drift, dead keys, movement, and the press budget.
@@ -19,6 +19,7 @@ module CrossedWiresGame:
     const ACTION_START: i64 = 0
     const ACTION_PRESS: i64 = 1
     const ACTION_RESTART: i64 = 2
+    const ACTION_APPLY_OPTIONS: i64 = 3
 
     const INFO_PHASE: i64 = 0
     const INFO_RUNG: i64 = 1
@@ -42,9 +43,13 @@ module CrossedWiresGame:
     const INFO_RIGHT: i64 = 19
     const INFO_ADAPTIVE: i64 = 20
     const INFO_SHOW_GRID: i64 = 21
-    const INFO_DEAD: i64 = 22
+    const INFO_REACHED_TOTAL: i64 = 22
+    const INFO_TARGET_TOTAL: i64 = 23
+    const INFO_ACCURACY: i64 = 24
+    const INFO_BEST_RUNG: i64 = 25
+    const INFO_PERFECT_ROUNDS: i64 = 26
 
-    struct Run:
+    struct CrossedWiresRun:
         rng: mutable MT19937
         start_rung: mutable i64
         rung: mutable i64
@@ -55,6 +60,11 @@ module CrossedWiresGame:
         phase: mutable i64
         verdict: mutable i64
         right: mutable i64
+        reached_total: mutable i64
+        targets_total: mutable i64
+        best_rung: mutable i64
+        perfect_rounds: mutable i64
+        verdict_until_ms: mutable i64
         keys: mutable i64
         across: mutable i64
         down: mutable i64
@@ -87,7 +97,7 @@ module CrossedWiresGame:
         can Abort.Panic:
             return value == 0 or value == 1
 
-    def clear_board(run: mutable Run&):
+    def clear_board(run: mutable CrossedWiresRun&):
         can Abort.Panic:
             run.keys <- 0
             run.across <- 0
@@ -111,7 +121,7 @@ module CrossedWiresGame:
             for at in 0..<MAX_KEYS |at, run|:
                 run.wiring[at.usize()] <- CrossedWires::DEAD
 
-    def copy_deal(run: mutable Run&, bout: CrossedWires::Bout&, grade: CrossedWires::Grade):
+    def copy_deal(run: mutable CrossedWiresRun&, bout: CrossedWires::Bout&, grade: CrossedWires::CrossedWiresGrade):
         can Abort.Panic:
             run.keys <- grade.keys
             run.across <- grade.across
@@ -129,10 +139,10 @@ module CrossedWiresGame:
             for at in 0..<MAX_KEYS |at, run, bout|:
                 run.wiring[at.usize()] <- Ints::at(bout.wiring, at) if at < run.keys else CrossedWires::DEAD
 
-    def deal_trial(run: mutable Run&):
+    def deal_trial(run: mutable CrossedWiresRun&):
         can Memory.Allocate, Abort.Panic:
             seed: i64 = py_randbelow(&run.rng, 1073741824.u64()).i64()
-            grade: CrossedWires::Grade = CrossedWires::grade_at(run.rung)
+            grade: CrossedWires::CrossedWiresGrade = CrossedWires::grade_at(run.rung)
             region deal_scratch(134217728):
                 in deal_scratch:
                     bout: mutable CrossedWires::Bout = CrossedWires::deal(run.rung, seed)
@@ -147,21 +157,26 @@ module CrossedWiresGame:
             run.verdict <- -1
             run.phase <- PHASE_PLAYING
 
-    def reset(run: mutable Run&):
+    def reset(run: mutable CrossedWiresRun&):
         can Abort.Panic:
             run.rung <- run.start_rung
             run.trial <- 0
             run.right <- 0
+            run.reached_total <- 0
+            run.targets_total <- 0
+            run.best_rung <- 0
+            run.perfect_rounds <- 0
+            run.verdict_until_ms <- 0
             run.phase <- PHASE_READY
             run.verdict <- -1
             clear_board(run)
 
-    def start_run(run: mutable Run&):
+    def start_run(run: mutable CrossedWiresRun&):
         can Memory.Allocate, Abort.Panic:
             reset(run)
             next_trial(run)
 
-    def next_trial(run: mutable Run&):
+    def next_trial(run: mutable CrossedWiresRun&):
         can Memory.Allocate, Abort.Panic:
             if run.trial >= run.total_trials:
                 run.phase <- PHASE_DONE
@@ -169,17 +184,17 @@ module CrossedWiresGame:
             run.trial <- run.trial + 1
             deal_trial(run)
 
-    def goal_index(run: Run&) -> i64:
+    def goal_index(run: CrossedWiresRun&) -> i64:
         can Abort.Panic:
             return 0 if run.goals_n <= 0 else (run.goals_n - 1 if run.goal_at >= run.goals_n else run.goal_at)
 
-    # Rebuild a source Bout and Bench for one key press.  Neither object is
-    # retained; only the scalar Bench fields are copied back to the durable Run.
-    def press(run: mutable Run&, keyed: i64) -> i64:
+    # Rebuild a source Bout and CrossedWiresBench for one key press.  Neither object is
+    # retained; only the scalar CrossedWiresBench fields are copied back to the durable CrossedWiresRun.
+    def press(run: mutable CrossedWiresRun&, keyed: i64, now_ms: i64) -> i64:
         can Memory.Allocate, Abort.Panic:
             return 2 if run.phase != PHASE_PLAYING
             return 2 if keyed < 0 or keyed >= run.keys
-            grade: CrossedWires::Grade = CrossedWires::grade_at(run.rung)
+            grade: CrossedWires::CrossedWiresGrade = CrossedWires::grade_at(run.rung)
             moved: mutable i64 = 2
             region press_scratch(1048576):
                 in press_scratch:
@@ -199,7 +214,7 @@ module CrossedWiresGame:
                         Ints::put(&bout.goals_y, at, run.goal_y[at.usize()]) if at < run.goals_n
                     for at in 0..<MAX_KEYS |at, run, bout|:
                         Ints::put(&bout.wiring, at, run.wiring[at.usize()]) if at < run.keys
-                    bench: mutable CrossedWires::Bench = CrossedWires::Bench(&bout)
+                    bench: mutable CrossedWires::CrossedWiresBench = CrossedWires::CrossedWiresBench(&bout)
                     bench.at_x <- run.at_x
                     bench.at_y <- run.at_y
                     bench.goal_at <- run.goal_at
@@ -218,12 +233,20 @@ module CrossedWiresGame:
             if run.reached >= run.goals_n or run.presses >= run.budget:
                 run.verdict <- 1 if run.reached >= run.goals_n else 0
                 run.right <- run.right + 1 if run.verdict == 1 else run.right
+                run.reached_total <- run.reached_total + run.reached
+                run.targets_total <- run.targets_total + run.goals_n
+                run.best_rung <- run.rung if run.rung > run.best_rung else run.best_rung
+                run.perfect_rounds <- run.perfect_rounds + 1 if run.verdict == 1 else run.perfect_rounds
                 if run.adaptive:
-                    run.rung <- clamp_rung(run.rung + (1 if run.verdict == 1 else -1))
+                    if run.verdict == 1:
+                        run.rung <- clamp_rung(run.rung + 1)
+                    elif run.reached * 2 < run.goals_n:
+                        run.rung <- clamp_rung(run.rung - 1)
                 run.phase <- PHASE_SCORED
+                run.verdict_until_ms <- now_ms + 800
             return 1
 
-    def initialize(run: mutable Run&, start_rung: i64, total_trials: i64,
+    def initialize(run: mutable CrossedWiresRun&, start_rung: i64, total_trials: i64,
                    adaptive: bool, show_grid: bool, seed: i64):
         can Abort.Panic:
             rng: mutable MT19937 = mt19937_new()
@@ -235,28 +258,72 @@ module CrossedWiresGame:
             run.show_grid <- show_grid
             reset(run)
 
-    def apply(run: mutable Run&, action: i64, value: i64) -> i64:
+    def allowed_option_bool(value: i64) -> bool:
+        return value == 0 or value == 1
+
+    def apply_options(run: mutable CrossedWiresRun&, start_rung: i64, total_trials: i64,
+                      adaptive: i64, show_grid: i64) -> i64:
+        can Abort.Panic:
+            return -3 if start_rung < 1 or start_rung > CrossedWires::GRADE_COUNT
+            return -3 if not allowed_trials(total_trials)
+            return -3 if not allowed_option_bool(adaptive) or not allowed_show_grid(show_grid)
+            run.start_rung <- start_rung
+            run.total_trials <- total_trials
+            run.adaptive <- adaptive != 0
+            run.show_grid <- show_grid != 0
+            reset(run)
+            return 1
+
+    def apply(run: mutable CrossedWiresRun&, action: i64, value: i64, now_ms: i64) -> i64:
         can Memory.Allocate, Abort.Panic:
             if action == ACTION_START:
                 if run.phase == PHASE_READY or run.phase == PHASE_DONE:
                     start_run(run)
                     return 1
                 if run.phase == PHASE_SCORED:
+                    return 2 if now_ms < run.verdict_until_ms
                     next_trial(run)
                     return 1
                 return 2
             if action == ACTION_PRESS:
-                return press(run, value)
+                return press(run, value, now_ms)
             if action == ACTION_RESTART:
                 start_run(run)
                 return 1
+            if action == ACTION_APPLY_OPTIONS:
+                level: i64 = value & 15
+                trial_index: i64 = (value >> 4) & 15
+                trials: mutable i64 = -1
+                if trial_index == 0: trials <- 1
+                elif trial_index == 1: trials <- 2
+                elif trial_index == 2: trials <- 3
+                elif trial_index == 3: trials <- 5
+                elif trial_index == 4: trials <- 8
+                elif trial_index == 5: trials <- 10
+                elif trial_index == 6: trials <- 15
+                elif trial_index == 7: trials <- 20
+                adaptive: i64 = (value >> 8) & 1
+                show_grid: i64 = (value >> 9) & 1
+                return -3 if value < 0 or (value >> 10) != 0
+                return apply_options(run, level, trials, adaptive, show_grid)
             return -6
 
-    def advance(run: mutable Run&) -> i64:
+    def advance(run: mutable CrossedWiresRun&, logical_time_ms: i64) -> i64:
         can Abort.Panic:
+            _ = logical_time_ms
             return 2
 
-    def info(run: Run&, field: i64) -> i64:
+    def accuracy(run: CrossedWiresRun&) -> i64:
+        can Abort.Panic:
+            return 0 if run.targets_total <= 0
+            numerator: i64 = run.reached_total * 100
+            quotient: mutable i64 = numerator / run.targets_total
+            remainder: i64 = numerator % run.targets_total
+            if remainder * 2 > run.targets_total or (remainder * 2 == run.targets_total and quotient % 2 == 1):
+                quotient <- quotient + 1
+            return quotient
+
+    def info(run: CrossedWiresRun&, field: i64) -> i64:
         can Abort.Panic:
             if field == INFO_PHASE: return run.phase
             if field == INFO_RUNG: return run.rung
@@ -280,10 +347,14 @@ module CrossedWiresGame:
             if field == INFO_RIGHT: return run.right
             if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
             if field == INFO_SHOW_GRID: return 1 if run.show_grid else 0
-            if field == INFO_DEAD: return run.dead
+            if field == INFO_REACHED_TOTAL: return run.reached_total
+            if field == INFO_TARGET_TOTAL: return run.targets_total
+            if field == INFO_ACCURACY: return accuracy(run)
+            if field == INFO_BEST_RUNG: return run.best_rung
+            if field == INFO_PERFECT_ROUNDS: return run.perfect_rounds
             return -1
 
-    def append_message(out: mutable dstr&, run: Run&):
+    def append_message(out: mutable dstr&, run: CrossedWiresRun&):
         can Memory.Allocate, Abort.Panic:
             if run.phase == PHASE_READY:
                 dstr_append_cstr(out, "Press Space to start")
@@ -295,26 +366,28 @@ module CrossedWiresGame:
                 dstr_append_i64(out, run.goals_n)
                 dstr_append_cstr(out, " targets")
             elif run.phase == PHASE_SCORED:
-                dstr_append_cstr(out, "Reached ")
-                dstr_append_i64(out, run.reached)
-                dstr_append_cstr(out, " of ")
-                dstr_append_i64(out, run.goals_n)
                 if run.verdict == 1:
-                    dstr_append_cstr(out, " — right")
+                    dstr_append_cstr(out, "All ")
+                    dstr_append_i64(out, run.goals_n)
+                    dstr_append_cstr(out, " reached")
                 else:
-                    dstr_append_cstr(out, " — out of presses")
+                    dstr_append_i64(out, run.reached)
+                    dstr_append_cstr(out, " of ")
+                    dstr_append_i64(out, run.goals_n)
+                    dstr_append_cstr(out, " reached, out of presses")
             else:
-                dstr_append_i64(out, run.right)
-                dstr_append_cstr(out, " of ")
                 dstr_append_i64(out, run.total_trials)
-                dstr_append_cstr(out, " rounds right")
+                dstr_append_cstr(out, " rounds, ")
+                dstr_append_i64(out, accuracy(run))
+                dstr_append_cstr(out, "% of targets reached, highest rung ")
+                dstr_append_i64(out, run.best_rung)
 
-    def render(run: Run&, black_background: bool, width: f64, height: f64,
+    def render(run: CrossedWiresRun&, black_background: bool, width: f64, height: f64,
                list: mutable Display::DisplayList&):
         can Memory.Allocate, Abort.Panic:
             sx: f64 = width / Display::REFERENCE_WIDTH
             sy: f64 = height / Display::REFERENCE_HEIGHT
-            paint: SceneCrossedWires::Paint = SceneCrossedWires::paint_of(
+            paint: SceneCrossedWires::CrossedWiresPaint = SceneCrossedWires::paint_of(
                 black_background, width, height, sx, sy)
             message: mutable dstr = []
             append_message(&message, run)

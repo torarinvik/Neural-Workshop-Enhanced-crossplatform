@@ -2,12 +2,14 @@
 """Headless lifecycle smoke for the native Python Marble controller bridge."""
 from __future__ import annotations
 
+import os
 import sys
 import struct
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "build" / "pymod"))
+PYMODULE_DIR = Path(os.environ.get("ELISA_PYMODULE_DIR", ROOT / "build" / "pymod"))
+sys.path.insert(0, str(PYMODULE_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import nwcore  # noqa: E402
@@ -24,6 +26,7 @@ class Keys:
     ESCAPE = 7
     L = 8
     R = 9
+    C = 10
 
 
 def main() -> int:

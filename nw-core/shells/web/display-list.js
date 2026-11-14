@@ -105,7 +105,7 @@ export function fillTextRoundedAdvances(ctx, text, x, y, {
 export function render(ctx, commands, {
     width, height, assets = {}, fontFamily = "system-ui, sans-serif",
     fontScale = 1, textOffsetY = 0, roundGlyphAdvances = false,
-    glyphStrokeRatio = 0,
+    glyphStrokeRatio = 0, replaceRect = null, afterCommands = null,
 } = {}) {
     const scale = Math.min(width / REFERENCE_WIDTH, height / REFERENCE_HEIGHT);
     const offsetX = (width - REFERENCE_WIDTH * scale) / 2;
@@ -125,6 +125,7 @@ export function render(ctx, commands, {
     for (const cmd of commands) {
         switch (cmd.kind) {
             case Kind.RECT: {
+                if (typeof replaceRect === "function" && replaceRect(ctx, cmd)) break;
                 // `e`, `f` are the anchor inside the rectangle and `ref` holds
                 // the BITS of the rotation about it. Both are zero for all but
                 // two screens, so the plain path stays a single fillRect.
@@ -294,10 +295,12 @@ export function render(ctx, commands, {
                         : "alphabetic";
                     const x = offsetX + cmd.a * scale;
                     const y = height - offsetY - (cmd.b + commandTextOffsetY) * scale;
-                    fillTextRoundedAdvances(ctx, cmd.text, x, y, {
-                        align, pixelScale: 1,
-                        strokeWidth: cmd.c * fontScale * scale * glyphStrokeRatio,
-                    });
+                    const lines = cmd.text.split("\n");
+                    lines.forEach((line, index) => fillTextRoundedAdvances(ctx, line, x,
+                        y + (index - (lines.length - 1) / 2) * cmd.c * fontScale * scale * 1.25, {
+                            align, pixelScale: 1,
+                            strokeWidth: cmd.c * fontScale * scale * glyphStrokeRatio,
+                        }));
                 } else {
                     ctx.translate(cmd.a, cmd.b + commandTextOffsetY);
                     ctx.scale(1, -1);
@@ -306,7 +309,9 @@ export function render(ctx, commands, {
                     ctx.textBaseline = cmd.anchor
                         ? { bottom: "alphabetic", middle: "middle", top: "top" }[cmd.anchor[1]]
                         : "alphabetic";
-                    ctx.fillText(cmd.text, 0, 0);
+                    const lines = cmd.text.split("\n");
+                    lines.forEach((line, index) => ctx.fillText(line, 0,
+                        (index - (lines.length - 1) / 2) * cmd.c * fontScale * 1.25));
                 }
                 ctx.restore();
                 break;
@@ -321,6 +326,9 @@ export function render(ctx, commands, {
                 events.markers.push(cmd.text);
                 break;
         }
+    }
+    if (typeof afterCommands === "function") {
+        afterCommands(ctx, { scale, offsetX, offsetY, width, height });
     }
     ctx.restore();
     return events;

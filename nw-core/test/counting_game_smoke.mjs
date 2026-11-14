@@ -130,20 +130,43 @@ assert.equal(exports.nw_api_v1_destroy(run), 0n);
 assert.equal(exports.nw_api_v1_destroy(run), 0n,
   "common v1 destroy remains idempotent for Count");
 
-// With feedback disabled, submit deals the next round immediately. The
-// controller does not expose a transient answer/verdict frame.
+// With feedback disabled, invalid and negative text is ignored, zero is kept
+// as a wrong answer, and submit deals the next round immediately.
 const immediate = create([1n, 2n, 5n, 0n, 0n, 0n], 4n);
 assert.ok(immediate > run);
 assert.equal(action(immediate, ACTION.start, 0n, 50, 0), STATUS.accepted);
 assert.equal(shapeCommands(frame(immediate)).filter(({ kind }) => kind === Kind.ARC).length,
   2, "the circles option routes through the real Count renderer");
-assert.equal(action(immediate, ACTION.digit, 1n, 51, 1), STATUS.accepted);
-assert.equal(action(immediate, ACTION.submit, 0n, 52, 2), STATUS.accepted);
+assert.equal(text(immediate, "-", 51, 1), STATUS.ignored,
+  "negative input is ignored by the numeric text handler");
+assert.equal(text(immediate, "x", 51, 2), STATUS.ignored,
+  "nonnumeric input is ignored");
+assert.equal(text(immediate, "0", 51, 3), STATUS.accepted,
+  "zero remains a legal typed answer even though a zero-shape trial is not legal");
+assert.equal(action(immediate, ACTION.submit, 0n, 52, 4), STATUS.accepted);
 values = state(immediate);
 assert.equal(values[FIELD.phase], PHASE.showing);
 assert.equal(values[FIELD.trial], 2n);
 assert.equal(values[FIELD.verdict], -1n);
+assert.equal(values[FIELD.correct], 0n, "zero is graded wrong against two shapes");
 assert.equal(values[FIELD.count], 2n, "non-adaptive mode retains its starting count");
+
+// Multi-digit correct entry uses the actual 12-shape source setting, rather
+// than relying only on leading-zero normalization around a one-digit answer.
+const multiDigit = create([0n, 12n, 5n, 0n, 0n, 1n], 7n);
+assert.ok(multiDigit > immediate);
+assert.equal(action(multiDigit, ACTION.start, 0n, 60, 0), STATUS.accepted);
+assert.equal(shapeCommands(frame(multiDigit)).length, 12);
+assert.equal(text(multiDigit, "1", 61, 1), STATUS.accepted);
+assert.equal(text(multiDigit, "2", 61, 2), STATUS.accepted);
+assert.equal(state(multiDigit)[FIELD.answer], 12n);
+assert.equal(action(multiDigit, ACTION.submit, 0n, 62, 3), STATUS.accepted);
+values = state(multiDigit);
+assert.equal(values[FIELD.phase], PHASE.feedback);
+assert.equal(values[FIELD.correct], 1n);
+assert.equal(values[FIELD.answer], 12n);
+assert.ok(frame(multiDigit).some(({ kind, text: label }) =>
+  kind === Kind.TEXT && label === "Yes, 12"));
 
 // Dense mixed generation reaches the real upper bound and remains renderable.
 const dense = create([4n, 60n, 5n, 0n, 0n, 1n], 99n);
@@ -186,8 +209,8 @@ assert.equal(state(complete)[FIELD.phase], PHASE.showing);
 assert.equal(state(complete)[FIELD.trial], 1n);
 assert.equal(state(complete)[FIELD.correct], 0n);
 
-for (const handle of [immediate, dense, complete]) {
+for (const handle of [immediate, multiDigit, dense, complete]) {
   assert.equal(exports.nw_api_v1_destroy(handle), 0n);
 }
 
-console.log("counting_game_smoke: PASS (common lifecycle, source options, typed input, exposure, adaptive scoring, dense render, completion/replay)");
+console.log("counting_game_smoke: PASS (common lifecycle, source options, single/multi-digit and invalid input, exposure, adaptive scoring, dense render, completion/replay)");
