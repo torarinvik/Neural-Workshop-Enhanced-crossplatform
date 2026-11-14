@@ -1,0 +1,196 @@
+# Resolve the Numberology result directory using the process environment.
+# Kept separate from persistence so failed records can retry after a path change.
+extern getenv(name: cstr) -> u8&?
+
+def numberology_results_directory(dest: mutable u8&?, capacity: usize) -> i32:
+    can Abort.Panic, Unsafe.PointerCast:
+        return 0 if dest == null or capacity == 0.usize() or capacity > 2147483647.usize()
+        trusted Unsafe.PointerCast:
+            target: mutable u8& = dest
+            address: i64 = target.uintptr().i64()
+            if getenv("NW_NUMBEROLOGY_RESULTS_DIR") is override:
+                if override != 0.u8():
+                    return 1 if SyllogismOptionsHost::append(address, capacity.i64(), 0, override.cast[cstr]) >= 0 else 0
+            if getenv("NW_NUMBEROLOGY_SETTINGS_PATH") is settings:
+                if settings != 0.u8():
+                    bytes: heap u8& = settings.cast[heap u8&]
+                    platform: heap u8& = SDL_GetPlatform().cast[heap u8&]
+                    windows: bool = platform[0] == 87.u8() and platform[1] == 105.u8() and platform[2] == 110.u8()
+                    index: mutable i64 = 0
+                    last: mutable i64 = -1
+                    while bytes[index.usize()] != 0.u8() |index, last, bytes, windows|:
+                        if bytes[index.usize()] == 47.u8() or (windows and bytes[index.usize()] == 92.u8()):
+                            last <- index
+                        index <- index + 1
+                    if last < 0:
+                        return 1 if SyllogismOptionsHost::append(address, capacity.i64(), 0, "./results/numberology") >= 0 else 0
+                    return 0 if last >= capacity.i64()
+                    output: mutable heap u8& = target.cast[mutable heap u8&]
+                    for at in 0..<last |at, output, bytes|:
+                        output[at.usize()] <- bytes[at.usize()]
+                    output[last.usize()] <- 0.u8()
+                    return 1 if SyllogismOptionsHost::append(address, capacity.i64(), last, "/results/numberology") >= 0 else 0
+            platform: heap u8& = SDL_GetPlatform().cast[heap u8&]
+            windows: bool = platform[0] == 87.u8() and platform[1] == 105.u8() and platform[2] == 110.u8()
+            base: mutable i64 = 0
+            if windows:
+                if getenv("APPDATA") is found:
+                    base <- found.uintptr().i64() if found != 0.u8()
+                if base == 0:
+                    if getenv("USERPROFILE") is found:
+                        base <- found.uintptr().i64() if found != 0.u8()
+            else:
+                if getenv("HOME") is found:
+                    base <- found.uintptr().i64() if found != 0.u8()
+            return 0 if base == 0
+            end: i64 = SyllogismOptionsHost::append(address, capacity.i64(), 0, base.uintptr().cast[cstr])
+            return 0 if end < 0
+            suffix: cstr = "/Neural Workshop/results/numberology" if windows else "/.neural-workshop/results/numberology"
+            return 1 if SyllogismOptionsHost::append(address, capacity.i64(), end, suffix) >= 0 else 0
+
+export fn nw_numberology_results_directory(dest: mutable u8&?, capacity: usize) -> i32 = numberology_results_directory
+
+# Commit only a fully closed temporary record. On failure remove only the
+# temporary file owned by this writer, leaving the previous result untouched.
+def numberology_results_commit(temporary: u8&?, final_path: u8&?) -> i32:
+    can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+        return 0 if temporary == null or final_path == null
+        trusted Unsafe.PointerCast:
+            source: u8& = temporary
+            destination: u8& = final_path
+            source_address: i64 = source.uintptr().i64()
+            destination_address: i64 = destination.uintptr().i64()
+            return 0 if syllogism_options_same_path(source_address, destination_address)
+            if SDL_RenamePath(source.cast[cstr], destination.cast[cstr]):
+                return 1
+            _ = SDL_RemovePath(source.cast[cstr])
+            return 0
+
+export fn nw_numberology_results_commit(temporary: u8&?, final_path: u8&?) -> i32 = numberology_results_commit
+
+# Write a complete encoded result to an exclusively-created temporary file.
+# A collision never removes another writer's file.
+def numberology_results_write(temporary: u8&?, final_path: u8&?, data: u8&?, length: usize) -> i32:
+    can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+        return 0 if temporary == null or final_path == null or data == null
+        trusted Unsafe.PointerCast:
+            source: u8& = temporary
+            destination: u8& = final_path
+            bytes: u8& = data
+            return 0 if syllogism_options_same_path(source.uintptr().i64(), destination.uintptr().i64())
+            file: mutable void&? = SDL_IOFromFile(source.cast[cstr], "wbx")
+            return 0 if file == null
+            stream: mutable void& = file
+            wrote: usize = SDL_WriteIO(stream, bytes.cast[void&], length)
+            closed: bool = SDL_CloseIO(stream)
+            if wrote != length or not closed:
+                _ = SDL_RemovePath(source.cast[cstr])
+                return 0
+            return numberology_results_commit(source, destination)
+
+export fn nw_numberology_results_write(temporary: u8&?, final_path: u8&?, data: u8&?, length: usize) -> i32 = numberology_results_write
+
+# JSON fragments are formatted in Elisa; SDL supplies the bounded formatting ABI.
+extern SDL_snprintf(dest: mutable u8&, capacity: usize, format: cstr, ...) -> i32
+
+def numberology_results_header(dest: mutable u8&?, capacity: usize, id: u8&?, started: f64, level: i64, trials: i64, adaptive: i32) -> i32:
+    can Unsafe.PointerCast:
+        return -1 if dest == null or id == null
+        trusted Unsafe.PointerCast:
+            out: mutable u8& = dest
+            name: u8& = id
+            return SDL_snprintf(out, capacity, "{\"id\":\"%s\",\"task\":\"numberology\",\"started_at\":%.9f,\"options\":[%lld,%lld,%d],\"results\":[", name.cast[cstr], started, level, trials, adaptive)
+
+def numberology_results_row(dest: mutable u8&?, capacity: usize, index: i32, trial: i64, level: i64, correct: i32, judged: f64) -> i32:
+    can Unsafe.PointerCast:
+        return -1 if dest == null
+        out: mutable u8& = dest
+        return SDL_snprintf(out, capacity, "%s{\"trial\":%lld,\"level\":\"%lld\",\"correct\":%s,\"judged_at\":%.9f}", "," if index != 0 else "", trial, level, "true" if correct != 0 else "false", judged)
+
+def numberology_results_end(dest: mutable u8&?, capacity: usize, completed: i32, right: i64) -> i32:
+    can Unsafe.PointerCast:
+        return -1 if dest == null
+        out: mutable u8& = dest
+        if completed != 0:
+            return SDL_snprintf(out, capacity, "],\"completed\":true,\"right\":%lld}\n", right)
+        return SDL_snprintf(out, capacity, "],\"completed\":false}\n")
+
+export fn nw_numberology_results_header(dest: mutable u8&?, capacity: usize, id: u8&?, started: f64, level: i64, trials: i64, adaptive: i32) -> i32 = numberology_results_header
+export fn nw_numberology_results_row(dest: mutable u8&?, capacity: usize, index: i32, trial: i64, level: i64, correct: i32, judged: f64) -> i32 = numberology_results_row
+export fn nw_numberology_results_end(dest: mutable u8&?, capacity: usize, completed: i32, right: i64) -> i32 = numberology_results_end
+
+# Construct both paths only after resolving and creating the result directory.
+def numberology_results_paths(path: mutable u8&?, path_capacity: usize, temporary: mutable u8&?, temporary_capacity: usize, id: u8&?, serial: u64) -> i32:
+    can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+        return 0 if path == null or temporary == null or id == null
+        directory: mutable u8[4096] = zeroed
+        trusted Unsafe.PointerCast:
+            final: mutable u8& = path
+            temp: mutable u8& = temporary
+            name: u8& = id
+            dir: mutable u8& = &directory[0]
+            return 0 if numberology_results_directory(dir, 4096.usize()) == 0
+            return 0 if not SDL_CreateDirectory(dir.cast[cstr])
+            n: i32 = SDL_snprintf(final, path_capacity, "%s/%s.json", dir.cast[cstr], name.cast[cstr])
+            return 0 if n < 0.i32() or n.usize() >= path_capacity
+            m: i32 = SDL_snprintf(temp, temporary_capacity, "%s.%llu.tmp", final.cast[cstr], serial)
+            return 0 if m < 0.i32() or m.usize() >= temporary_capacity
+            return 1
+
+export fn nw_numberology_results_paths(path: mutable u8&?, path_capacity: usize, temporary: mutable u8&?, temporary_capacity: usize, id: u8&?, serial: u64) -> i32 = numberology_results_paths
+
+# Decide whether a notification advances the record. Repeated or out-of-order
+# notifications must never create extra rows or change the saved score.
+def numberology_results_accept(count: i32, previous_trial: i64, trial: i64) -> i32:
+    return 0 if count < 0.i32() or count >= 15.i32()
+    return 0 if count > 0.i32() and trial <= previous_trial
+    return 1
+
+export fn nw_numberology_results_accept(count: i32, previous_trial: i64, trial: i64) -> i32 = numberology_results_accept
+
+# Serialize all rows using field addresses and a caller-provided stride, so the
+# temporary C caller does not impose a particular compiler's struct padding.
+def numberology_results_encode(dest: mutable u8&?, capacity: usize, id: u8&?, started: f64, level: i64, trials: i64, adaptive: i32, count: i32, completed: i32, right: i64, trial_address: i64, level_address: i64, correct_address: i64, judged_address: i64, stride: i64) -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        return -1 if dest == null or count < 0.i32() or count > 15.i32() or stride <= 0
+        trusted Unsafe.PointerCast:
+            out: mutable u8& = dest
+            wrote: mutable i32 = numberology_results_header(out, capacity, id, started, level, trials, adaptive)
+            return -1 if wrote < 0.i32() or wrote.usize() >= capacity
+            used: mutable i64 = wrote.i64()
+            index: mutable i64 = 0
+            while index < count.i64() |index, count, stride, trial_address, level_address, correct_address, judged_address, used, out, capacity|:
+                trial_ptr: heap i64& = (trial_address + index * stride).uintptr().cast[heap i64&]
+                level_ptr: heap i64& = (level_address + index * stride).uintptr().cast[heap i64&]
+                correct_ptr: heap u8& = (correct_address + index * stride).uintptr().cast[heap u8&]
+                judged_ptr: heap f64& = (judged_address + index * stride).uintptr().cast[heap f64&]
+                cursor: mutable u8& = (out.uintptr().i64() + used).uintptr().cast[mutable u8&]
+                part: i32 = numberology_results_row(cursor, capacity - used.usize(), index.i32(), trial_ptr[0], level_ptr[0], correct_ptr[0].i32(), judged_ptr[0])
+                return -1 if part < 0.i32() or part.usize() >= capacity - used.usize()
+                used <- used + part.i64()
+                index <- index + 1
+            cursor: mutable u8& = (out.uintptr().i64() + used).uintptr().cast[mutable u8&]
+            ending: i32 = numberology_results_end(cursor, capacity - used.usize(), completed, right)
+            return -1 if ending < 0.i32() or ending.usize() >= capacity - used.usize()
+            return used + ending.i64()
+
+export fn nw_numberology_results_encode(dest: mutable u8&?, capacity: usize, id: u8&?, started: f64, level: i64, trials: i64, adaptive: i32, count: i32, completed: i32, right: i64, trial_address: i64, level_address: i64, correct_address: i64, judged_address: i64, stride: i64) -> i64 = numberology_results_encode
+
+# Complete one save transaction; the manager retains ownership and clears its
+# dirty flag only after this returns success.
+def numberology_results_persist(id: u8&?, started: f64, level: i64, trials: i64, adaptive: i32, count: i32, completed: i32, right: i64, trial_address: i64, level_address: i64, correct_address: i64, judged_address: i64, stride: i64, serial: u64) -> i32:
+    can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+        return 1 if count == 0.i32()
+        path: mutable u8[4300] = zeroed
+        temporary: mutable u8[4400] = zeroed
+        data: mutable u8[8192] = zeroed
+        trusted Unsafe.PointerCast:
+            final: mutable u8& = &path[0]
+            temp: mutable u8& = &temporary[0]
+            bytes: mutable u8& = &data[0]
+            return 0 if numberology_results_paths(final, 4300.usize(), temp, 4400.usize(), id, serial) == 0.i32()
+            used: i64 = numberology_results_encode(bytes, 8192.usize(), id, started, level, trials, adaptive, count, completed, right, trial_address, level_address, correct_address, judged_address, stride)
+            return 0 if used < 0
+            return numberology_results_write(temp, final, bytes, used.usize())
+
+export fn nw_numberology_results_persist(id: u8&?, started: f64, level: i64, trials: i64, adaptive: i32, count: i32, completed: i32, right: i64, trial_address: i64, level_address: i64, correct_address: i64, judged_address: i64, stride: i64, serial: u64) -> i32 = numberology_results_persist

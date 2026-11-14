@@ -18,6 +18,7 @@
 #include <windows.h>
 #endif
 #include "display_list.h"
+#include "numberology_results.h"
 
 /* The core's C ABI, the same surface the wasm build exports (src/wasm/
  * wasm_exports.elisa). Everything is scalar: aggregates do not cross it. */
@@ -442,6 +443,23 @@ extern int64_t nw_overrun_frame_write(int64_t dest, int64_t capacity,
                                       int64_t width, int64_t height);
 extern int64_t nw_overrun_destroy(int64_t handle);
 
+typedef struct { int64_t level, trials, working, adaptive, real_words; } syllogism_options;
+extern int64_t nw_syllogism_options_parse(int64_t, char **, syllogism_options *, int64_t);
+extern int64_t nw_syllogism_options_modify(syllogism_options *, int64_t, int64_t);
+extern int64_t nw_syllogism_options_save(const syllogism_options *);
+extern int64_t nw_syllogism_create(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_syllogism_destroy(int64_t);
+extern int64_t nw_syllogism_action(int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_syllogism_info(int64_t, int64_t);
+extern int64_t nw_syllogism_sdl_selftest(void);
+extern int64_t nw_syllogism_frame_write(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_syllogism_options_frame_write(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int64_t nw_syllogism_input_key(int64_t, int64_t, int64_t, int64_t, int64_t *);
+extern int64_t nw_syllogism_input_pointer(double, double, int64_t, int64_t);
+static int64_t create_syllogism(const syllogism_options *o) {
+    return nw_syllogism_create(o->level, o->trials, o->working, o->adaptive, o->real_words, 23);
+}
+
 #define FRAME_CAPACITY 65536
 #define MAX_COMMANDS   1024
 #define DEBUG_GLYPH_PX 8.0f   /* SDL_RenderDebugText's fixed 8x8 cell */
@@ -449,292 +467,48 @@ extern int64_t nw_overrun_destroy(int64_t handle);
 /* Reference space (y UP, origin bottom-left) -> window pixels (y DOWN), letterboxed. */
 typedef struct { float scale, offset_x, offset_y, height; } nw_view;
 
+extern void nw_sdl_view_setup(float *view, int width, int height);
+extern float nw_sdl_view_x(const float *view, float x);
+extern float nw_sdl_view_y(const float *view, float y);
 static nw_view view_for(int width, int height) {
     nw_view v;
-    float sx = (float)width / NW_REFERENCE_WIDTH;
-    float sy = (float)height / NW_REFERENCE_HEIGHT;
-    v.scale = sx < sy ? sx : sy;
-    v.offset_x = ((float)width - NW_REFERENCE_WIDTH * v.scale) * 0.5f;
-    v.offset_y = ((float)height - NW_REFERENCE_HEIGHT * v.scale) * 0.5f;
-    v.height = (float)height;
+    nw_sdl_view_setup(&v.scale, width, height);
     return v;
 }
-static float vx(const nw_view *v, float x) { return v->offset_x + x * v->scale; }
-static float vy(const nw_view *v, float y) { return v->height - v->offset_y - y * v->scale; }
-
-static void set_color(SDL_Renderer *r, uint32_t rgba) {
-    SDL_SetRenderDrawColor(r, (rgba >> 24) & 255, (rgba >> 16) & 255,
-                           (rgba >> 8) & 255, rgba & 255);
-}
-
-/* A filled rect in reference space. y is the BOTTOM edge there and the TOP edge
- * here, which is the whole of the flip for an axis-aligned box. */
-static SDL_FRect rect_of(const nw_view *v, float x, float y, float w, float h) {
-    SDL_FRect out;
-    out.x = vx(v, x);
-    out.y = vy(v, y + h);
-    out.w = w * v->scale;
-    out.h = h * v->scale;
-    return out;
-}
-
-static void fill_circle(SDL_Renderer *r, const nw_view *v, float cx, float cy,
-                        float radius, uint32_t color) {
-    enum { SEGMENTS = 48 };
-    SDL_Vertex verts[SEGMENTS + 1];
-    int indices[SEGMENTS * 3];
-    SDL_FColor c = { ((color >> 24) & 255) / 255.0f, ((color >> 16) & 255) / 255.0f,
-                     ((color >> 8) & 255) / 255.0f, (color & 255) / 255.0f };
-    verts[0].position.x = vx(v, cx);
-    verts[0].position.y = vy(v, cy);
-    verts[0].color = c;
-    verts[0].tex_coord.x = verts[0].tex_coord.y = 0.0f;
-    for (int i = 0; i < SEGMENTS; i++) {
-        float t = (float)i / SEGMENTS * 2.0f * SDL_PI_F;
-        verts[i + 1].position.x = vx(v, cx + SDL_cosf(t) * radius);
-        verts[i + 1].position.y = vy(v, cy + SDL_sinf(t) * radius);
-        verts[i + 1].color = c;
-        verts[i + 1].tex_coord.x = verts[i + 1].tex_coord.y = 0.0f;
-        indices[i * 3 + 0] = 0;
-        indices[i * 3 + 1] = i + 1;
-        indices[i * 3 + 2] = (i + 1) % SEGMENTS + 1;
-    }
-    SDL_RenderGeometry(r, NULL, verts, SEGMENTS + 1, indices, SEGMENTS * 3);
-}
-
-static void fill_triangle(SDL_Renderer *r, const nw_view *v, float x1, float y1,
-                          float x2, float y2, float x3, float y3, uint32_t color) {
-    SDL_FColor c = { ((color >> 24) & 255) / 255.0f, ((color >> 16) & 255) / 255.0f,
-                     ((color >> 8) & 255) / 255.0f, (color & 255) / 255.0f };
-    SDL_Vertex verts[3];
-    float xs[3] = { x1, x2, x3 }, ys[3] = { y1, y2, y3 };
-    for (int i = 0; i < 3; i++) {
-        verts[i].position.x = vx(v, xs[i]);
-        verts[i].position.y = vy(v, ys[i]);
-        verts[i].color = c;
-        verts[i].tex_coord.x = verts[i].tex_coord.y = 0.0f;
-    }
-    SDL_RenderGeometry(r, NULL, verts, 3, NULL, 0);
-}
-
-/* An arc as a polyline; SDL3 has no arc primitive. Angles are DEGREES, CCW,
- * matching the canvas shell. */
-static void stroke_arc(SDL_Renderer *r, const nw_view *v, float cx, float cy,
-                       float radius, float start_deg, float sweep_deg) {
-    enum { SEGMENTS = 48 };
-    float prev_x = 0, prev_y = 0;
-    for (int i = 0; i <= SEGMENTS; i++) {
-        float t = (start_deg + sweep_deg * (float)i / SEGMENTS) * SDL_PI_F / 180.0f;
-        float x = vx(v, cx + SDL_cosf(t) * radius);
-        float y = vy(v, cy + SDL_sinf(t) * radius);
-        if (i > 0) SDL_RenderLine(r, prev_x, prev_y, x, y);
-        prev_x = x; prev_y = y;
-    }
-}
-
-/* SDL_RenderDebugText draws at a fixed 8px cell, so the display list's font size
- * is applied with SDL_SetRenderScale and the position divided back out. The
- * anchor codes match display-list.js's ANCHORS table exactly. */
-static void draw_text(SDL_Renderer *r, const nw_view *v, const char *text,
-                      float x, float y, float size, uint32_t color, uint8_t anchor) {
-    size_t chars = strlen(text);
-    float px = size * v->scale / DEBUG_GLYPH_PX;   /* glyph scale factor */
-    float w = (float)chars * DEBUG_GLYPH_PX * px;
-    float h = DEBUG_GLYPH_PX * px;
-    float sx = vx(v, x), sy = vy(v, y);
-
-    switch (anchor % 3) {                 /* 0 left, 1 center, 2 right */
-        case 1: sx -= w * 0.5f; break;
-        case 2: sx -= w;        break;
-    }
-    switch (anchor / 3) {                 /* 0 bottom, 1 middle, 2 top */
-        case 0: sy -= h;        break;
-        case 1: sy -= h * 0.5f; break;
-    }
-
-    set_color(r, color);
-    SDL_SetRenderScale(r, px, px);
-    SDL_RenderDebugText(r, sx / px, sy / px, text);
-    SDL_SetRenderScale(r, 1.0f, 1.0f);
-}
-
 typedef struct { int verdict; int sounds; char last_marker[64]; } nw_events;
-
-static void render_frame(SDL_Renderer *r, const nw_view *v, const nw_frame *frame,
+extern void nw_sdl_render_frame(SDL_Renderer *, const float *, const nw_frame *, nw_events *);
+static void render_frame(SDL_Renderer *renderer, const nw_view *view, const nw_frame *frame,
                          nw_events *events) {
-    /* POLYGON announces a vertex count; the POLY_POINTs that follow are its
-     * vertices. Fanned from the first point, which is what the canvas shell's
-     * closePath+fill does for the convex shapes the core emits. */
-    int poly_remaining = 0;
-    uint32_t poly_color = 0;
-    float poly_x0 = 0, poly_y0 = 0, poly_prev_x = 0, poly_prev_y = 0;
-    int poly_seen = 0;
-    int poly_open = 0;   /* a MULTILINE run: stroked and open, not filled */
-    char text_buffer[4096];
+    nw_sdl_render_frame(renderer, &view->scale, frame, events);
+}
 
-    events->verdict = -1;
-    events->sounds = 0;
-    events->last_marker[0] = '\0';
-
-    for (uint32_t i = 0; i < frame->count; i++) {
-        const nw_cmd *cmd = &frame->commands[i];
-        switch (cmd->kind) {
-        case NW_RECT: {
-            /* `e`, `f` are the anchor inside the rectangle and `ref` carries
-             * the BITS of the angle about it. Both are zero for all but two
-             * screens, so the ordinary rectangle stays one FillRect. */
-            float turn = nw_bits_to_f32(cmd->ref);
-            if (turn == 0.0f && cmd->e == 0.0f && cmd->f == 0.0f) {
-                set_color(r, cmd->color);
-                SDL_FRect box = rect_of(v, cmd->a, cmd->b, cmd->c, cmd->d);
-                SDL_RenderFillRect(r, &box);
-                break;
-            }
-            /* Clockwise about the anchor, which is what pyglet's `rotation`
-             * means and what the recorder the core was checked against read
-             * back. Reference space is y-up, so clockwise is the NEGATIVE
-             * mathematical direction. */
-            float rad = turn * 3.14159265358979323846f / 180.0f;
-            float co = SDL_cosf(rad), si = SDL_sinf(rad);
-            float lx[4] = { -cmd->e, cmd->c - cmd->e, cmd->c - cmd->e, -cmd->e };
-            float ly[4] = { -cmd->f, -cmd->f, cmd->d - cmd->f, cmd->d - cmd->f };
-            float px[4], py[4];
-            for (int k = 0; k < 4; k++) {
-                px[k] = cmd->a + lx[k] * co + ly[k] * si;
-                py[k] = cmd->b - lx[k] * si + ly[k] * co;
-            }
-            fill_triangle(r, v, px[0], py[0], px[1], py[1], px[2], py[2], cmd->color);
-            fill_triangle(r, v, px[0], py[0], px[2], py[2], px[3], py[3], cmd->color);
-            break;
-        }
-        case NW_BORDERED_RECT: {
-            SDL_FRect box = rect_of(v, cmd->a, cmd->b, cmd->c, cmd->d);
-            set_color(r, cmd->color);
-            SDL_RenderFillRect(r, &box);
-            set_color(r, cmd->ref);          /* border colour rides in `ref` */
-            SDL_RenderRect(r, &box);
-            break;
-        }
-        case NW_BOX: {
-            set_color(r, cmd->color);
-            SDL_FRect box = rect_of(v, cmd->a, cmd->b, cmd->c, cmd->d);
-            SDL_RenderRect(r, &box);
-            break;
-        }
-        case NW_CIRCLE:
-            fill_circle(r, v, cmd->a, cmd->b, cmd->c, cmd->color);
-            break;
-        case NW_ARC:
-            set_color(r, cmd->color);
-            stroke_arc(r, v, cmd->a, cmd->b, cmd->c, cmd->e, cmd->f);
-            break;
-        case NW_LINE:
-            set_color(r, cmd->color);
-            SDL_RenderLine(r, vx(v, cmd->a), vy(v, cmd->b), vx(v, cmd->c), vy(v, cmd->d));
-            break;
-        case NW_TRIANGLE:
-            fill_triangle(r, v, cmd->a, cmd->b, cmd->c, cmd->d, cmd->e, cmd->f, cmd->color);
-            break;
-        case NW_POLYGON:
-            poly_remaining = (int)cmd->len;
-            poly_color = cmd->color;
-            poly_seen = 0;
-            poly_open = 0;
-            break;
-        case NW_MULTILINE:
-            /* The same header-and-points shape as a polygon, drawn as an OPEN
-             * stroked run. Thickness is not honoured: SDL_RenderLine draws one
-             * pixel, and a wide run wants a quad per segment. Named here
-             * rather than pretended away. */
-            poly_remaining = (int)cmd->len;
-            poly_color = cmd->color;
-            poly_seen = 0;
-            poly_open = 1;
-            break;
-        case NW_STAR: {
-            /* `spikes` points alternating outer and inner radius, the first
-             * one straight up and turned by `f` degrees -- pyglet's Star. */
-            int spikes = (int)(cmd->e + 0.5f);
-            if (spikes < 2) break;
-            float base = cmd->f * 3.14159265358979323846f / 180.0f;
-            float step = 3.14159265358979323846f / (float)spikes;
-            float prev_x = 0.0f, prev_y = 0.0f;
-            for (int k = 0; k <= spikes * 2; k++) {
-                float radius = (k % 2 == 0) ? cmd->c : cmd->d;
-                float turn = base + (float)k * step;
-                float px = cmd->a + radius * SDL_sinf(turn);
-                float py = cmd->b + radius * SDL_cosf(turn);
-                if (k > 0) {
-                    fill_triangle(r, v, cmd->a, cmd->b, prev_x, prev_y, px, py,
-                                  cmd->color);
-                }
-                prev_x = px; prev_y = py;
-            }
-            break;
-        }
-        case NW_POLY_POINT:
-            if (poly_remaining > 0) {
-                if (poly_open) {
-                    if (poly_seen > 0) {
-                        set_color(r, poly_color);
-                        SDL_RenderLine(r, vx(v, poly_prev_x), vy(v, poly_prev_y),
-                                       vx(v, cmd->a), vy(v, cmd->b));
-                    }
-                } else {
-                    if (poly_seen == 0) { poly_x0 = cmd->a; poly_y0 = cmd->b; }
-                    else if (poly_seen >= 2) {
-                        fill_triangle(r, v, poly_x0, poly_y0, poly_prev_x, poly_prev_y,
-                                      cmd->a, cmd->b, poly_color);
-                    }
-                }
-                poly_prev_x = cmd->a; poly_prev_y = cmd->b;
-                poly_seen++;
-                if (--poly_remaining == 0) { poly_seen = 0; poly_open = 0; }
-            }
-            break;
-        case NW_TEXT: {
-            const uint8_t *text;
-            uint32_t len = nw_text_of(frame, cmd, &text);
-            if (text && len < sizeof text_buffer) {
-                memcpy(text_buffer, text, len);
-                text_buffer[len] = '\0';
-                int rows = 1;
-                for (uint32_t j = 0; j < len; j++) if (text_buffer[j] == '\n') rows++;
-                int row = 0;
-                char *line = text_buffer;
-                for (uint32_t j = 0; j <= len; j++) {
-                    if (text_buffer[j] != '\n' && text_buffer[j] != '\0') continue;
-                    text_buffer[j] = '\0';
-                    float line_y = cmd->b + ((rows - 1) * 0.5f - row) * cmd->c * 1.25f;
-                    draw_text(r, v, line, cmd->a, line_y, cmd->c, cmd->color,
-                              NW_ANCHOR_OF(cmd));
-                    line = text_buffer + j + 1;
-                    row++;
-                }
-            }
-            break;
-        }
-        case NW_VERDICT:
-            events->verdict = (int)cmd->ref;
-            break;
-        case NW_SOUND:
-            events->sounds++;              /* audio is a later phase */
-            break;
-        case NW_MARKER: {
-            const uint8_t *text;
-            uint32_t len = nw_text_of(frame, cmd, &text);
-            if (text && len < sizeof events->last_marker) {
-                memcpy(events->last_marker, text, len);
-                events->last_marker[len] = '\0';
-            }
-            break;
-        }
-        case NW_SPRITE:
-        case NW_SPRITE_FIT:
-        default:
-            break;                          /* no atlas yet */
+/* A software surface verifies long text without creating a window. */
+static int selftest_long_text(void) {
+    if (!SDL_Init(0)) return 1;
+    SDL_Surface *surface = SDL_CreateSurface(912, 684, SDL_PIXELFORMAT_RGBA32);
+    SDL_Renderer *renderer = surface ? SDL_CreateSoftwareRenderer(surface) : NULL;
+    uint8_t *text = malloc(5000);
+    if (!renderer || !text) {
+        free(text); if (renderer) SDL_DestroyRenderer(renderer);
+        if (surface) SDL_DestroySurface(surface); SDL_Quit(); return 1;
+    }
+    memset(text, 'A', 5000);
+    nw_cmd command = { .kind = NW_TEXT, .color = 0xffffffffu, .a = 16, .b = 600,
+                       .c = 16, .ref = 0, .len = 5000 };
+    nw_frame frame = { .commands = &command, .count = 1, .pool = text, .pool_len = 5000 };
+    nw_events events = {0}; nw_view view = view_for(912, 684);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); SDL_RenderClear(renderer);
+    render_frame(renderer, &view, &frame, &events); SDL_RenderPresent(renderer);
+    bool painted = false;
+    for (int y = 0; y < 150 && !painted; y++) for (int x = 0; x < 160; x++) {
+        Uint8 red = 0, green = 0, blue = 0, alpha = 0;
+        if (SDL_ReadSurfacePixel(surface, x, y, &red, &green, &blue, &alpha) && (red || green || blue)) {
+            painted = true; break;
         }
     }
+    free(text); SDL_DestroyRenderer(renderer); SDL_DestroySurface(surface); SDL_Quit();
+    printf("SDL long text selftest: %s\n", painted ? "PASS" : "FAILED");
+    return painted ? 0 : 1;
 }
 
 /* Headless verification: decode N frames through the SAME code the window path
@@ -1448,6 +1222,9 @@ static int selftest_numberology(void) {
         printf("Numberology selftest: allocation failed\n");
         return 1;
     }
+    int64_t options_length = nw_numberology_options_frame_write((int64_t)(uintptr_t)buffer,
+        FRAME_CAPACITY, 0, 1, 10000, 3, 0);
+    if (options_length < 16 || memcmp(buffer, "NKIN", 4) != 0) bad++;
     if (nw_numberology_info(handle, 0) != 0) bad++;
     if (nw_numberology_action(handle, 0, 0, 0) != 1) bad++;
     if (nw_numberology_info(handle, 0) != 1) bad++;
@@ -1461,11 +1238,11 @@ static int selftest_numberology(void) {
     const char *exact = "96448543405967464215539390836603148782077915887889532192857920126483182449263992839";
     if (!handle) bad++;
     if (handle) {
-        if (nw_numberology_action(handle, 0, 0, 0) != 1 || nw_numberology_info(handle, 4) != 29 || nw_numberology_info(handle, 17) != 0) bad++;
+        if (nw_numberology_action(handle, 0, 0, 0) != 1 || nw_numberology_info(handle, 4) != 29 || nw_numberology_info(handle, 5) != -1 || nw_numberology_info(handle, 17) != -1) bad++;
         for (size_t i = 0; i < strlen(exact); i++)
             if (nw_numberology_action(handle, 1, (unsigned char)exact[i], 0) != 1) bad++;
         if (nw_numberology_action(handle, 3, 0, 0) != 1 || nw_numberology_info(handle, 8) != 1 ||
-            nw_numberology_info(handle, 15) != (int64_t)strlen(exact)) bad++;
+            nw_numberology_info(handle, 15) != (int64_t)strlen(exact) || nw_numberology_info(handle, 17) != 0) bad++;
         for (size_t i = 0; i < strlen(exact); i++)
             if (nw_numberology_value(handle, 2, (int64_t)i) != (unsigned char)exact[i]) bad++;
         if (nw_numberology_destroy(handle) != 0) bad++;
@@ -1772,369 +1549,29 @@ static int selftest_overrun(void) {
     return bad ? 1 : 0;
 }
 
-static bool value_in_set(int64_t value, const int64_t *allowed, size_t count) {
-    for (size_t index = 0; index < count; index++) {
-        if (allowed[index] == value) return true;
-    }
-    return false;
-}
-
 typedef struct {
     int64_t level, trials, show_mistakes, adaptive;
     const char *lexicon;
 } crossword_options;
 
-/* Python and SDL share this compact, validated settings file. */
-static bool crossword_settings_path(char *path, size_t capacity, bool create_dir) {
-    const char *override = getenv("NW_CROSSWORD_SETTINGS_PATH");
-    if (override && *override) return snprintf(path, capacity, "%s", override) < (int)capacity;
-#ifdef _WIN32
-    const char *base = getenv("APPDATA");
-    if (!base) base = getenv("USERPROFILE");
-    const char *folder = "/Neural Workshop";
-#else
-    const char *base = getenv("HOME");
-    const char *folder = "/.neural-workshop";
-#endif
-    if (!base) return false;
-    char directory[4096];
-    if (snprintf(directory, sizeof(directory), "%s%s", base, folder) >= (int)sizeof(directory)) return false;
-    if (create_dir && !SDL_CreateDirectory(directory)) return false;
-    return snprintf(path, capacity, "%s/crossword-options", directory) < (int)capacity;
-}
+extern int nw_task_settings_parse(int64_t, int64_t, char **, int64_t *, const char **, int64_t);
+extern int nw_task_settings_write(int64_t task, const int64_t *options);
+static bool crossword_write_settings(const crossword_options *options) { return nw_task_settings_write(0, &options->level) != 0; }
+static bool scrabble_write_settings(const crossword_options *options) { return nw_task_settings_write(1, &options->level) != 0; }
+static bool algebra_write_settings(const crossword_options *options) { return nw_task_settings_write(2, &options->level) != 0; }
+static bool scramble_write_settings(const crossword_options *options) { return nw_task_settings_write(3, &options->level) != 0; }
 
-static void crossword_read_settings(crossword_options *options) {
-    char path[4096], line[256];
-    if (!crossword_settings_path(path, sizeof(path), false)) return;
-    FILE *file = fopen(path, "r");
-    if (!file) return;
-    bool complete = fgets(line, sizeof(line), file) != NULL && fgetc(file) == EOF && !ferror(file);
-    fclose(file);
-    if (!complete) return;
-    long long fields[4];
-    char *cursor = line;
-    for (int i = 0; i < 4; i++) {
-        while (isspace((unsigned char)*cursor)) cursor++;
-        errno = 0;
-        char *end = NULL;
-        fields[i] = strtoll(cursor, &end, 10);
-        if (errno == ERANGE || end == cursor || (*end && !isspace((unsigned char)*end))) return;
-        cursor = end;
-    }
-    while (isspace((unsigned char)*cursor)) cursor++;
-    static const int64_t trial_choices[] = {1,2,3,5,8,10};
-    if (*cursor == '\0' && fields[0] >= 1 && fields[0] <= 10 &&
-        value_in_set(fields[1], trial_choices, 6) &&
-        (fields[2] == 0 || fields[2] == 1) && (fields[3] == 0 || fields[3] == 1)) {
-        options->level = fields[0]; options->trials = fields[1];
-        options->show_mistakes = fields[2]; options->adaptive = fields[3];
-    }
-}
-
-static bool crossword_write_settings(const crossword_options *options) {
-    char path[4096], temporary[4200];
-    if (!crossword_settings_path(path, sizeof(path), true) ||
-        snprintf(temporary, sizeof(temporary), "%s.%llu.tmp", path,
-                 (unsigned long long)SDL_GetTicksNS()) >= (int)sizeof(temporary)) return false;
-    FILE *file = fopen(temporary, "w");
-    if (!file) return false;
-    bool ok = fprintf(file, "%lld %lld %lld %lld\n", (long long)options->level,
-                      (long long)options->trials, (long long)options->show_mistakes,
-                      (long long)options->adaptive) > 0;
-    if (fclose(file) != 0) ok = false;
-#ifdef _WIN32
-    if (ok) ok = MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-#else
-    if (ok) ok = rename(temporary, path) == 0;
-#endif
-    if (!ok) remove(temporary);
-    return ok;
-}
-
-static bool scrabble_settings_path(char *path, size_t capacity, bool create_dir) {
-    const char *override = getenv("NW_SCRABBLE_SETTINGS_PATH");
-    if (override && *override) return snprintf(path, capacity, "%s", override) < (int)capacity;
-#ifdef _WIN32
-    const char *base = getenv("APPDATA");
-    if (!base) base = getenv("USERPROFILE");
-    const char *folder = "/Neural Workshop";
-#else
-    const char *base = getenv("HOME");
-    const char *folder = "/.neural-workshop";
-#endif
-    if (!base) return false;
-    char directory[4096];
-    if (snprintf(directory, sizeof(directory), "%s%s", base, folder) >= (int)sizeof(directory)) return false;
-    if (create_dir && !SDL_CreateDirectory(directory)) return false;
-    return snprintf(path, capacity, "%s/scrabble-options", directory) < (int)capacity;
-}
-
-static void scrabble_read_settings(crossword_options *options) {
-    char path[4096], line[256];
-    if (!scrabble_settings_path(path, sizeof(path), false)) return;
-    FILE *file = fopen(path, "r");
-    if (!file) return;
-    bool complete = fgets(line, sizeof(line), file) != NULL && fgetc(file) == EOF && !ferror(file);
-    fclose(file);
-    if (!complete) return;
-    long long fields[4];
-    char *cursor = line;
-    for (int i = 0; i < 4; i++) {
-        while (isspace((unsigned char)*cursor)) cursor++;
-        errno = 0;
-        char *end = NULL;
-        fields[i] = strtoll(cursor, &end, 10);
-        if (errno == ERANGE || end == cursor || (*end && !isspace((unsigned char)*end))) return;
-        cursor = end;
-    }
-    while (isspace((unsigned char)*cursor)) cursor++;
-    static const int64_t trial_choices[] = {1,2,3,5,8,10,15};
-    if (*cursor == '\0' && fields[0] >= 1 && fields[0] <= 10 &&
-        value_in_set(fields[1], trial_choices, 7) &&
-        (fields[2] == 0 || fields[2] == 1) && (fields[3] == 0 || fields[3] == 1)) {
-        options->level = fields[0]; options->trials = fields[1];
-        options->show_mistakes = fields[2]; options->adaptive = fields[3];
-    }
-}
-
-static bool scrabble_write_settings(const crossword_options *options) {
-    char path[4096], temporary[4200];
-    if (!scrabble_settings_path(path, sizeof(path), true) ||
-        snprintf(temporary, sizeof(temporary), "%s.%llu.tmp", path,
-                 (unsigned long long)SDL_GetTicksNS()) >= (int)sizeof(temporary)) return false;
-    FILE *file = fopen(temporary, "w");
-    if (!file) return false;
-    bool ok = fprintf(file, "%lld %lld %lld %lld\n", (long long)options->level,
-                      (long long)options->trials, (long long)options->show_mistakes,
-                      (long long)options->adaptive) > 0;
-    if (fclose(file) != 0) ok = false;
-#ifdef _WIN32
-    if (ok) ok = MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-#else
-    if (ok) ok = rename(temporary, path) == 0;
-#endif
-    if (!ok) remove(temporary);
-    return ok;
-}
-
-static bool numberology_settings_path(char *path, size_t capacity, bool create_dir) {
-    const char *override = getenv("NW_NUMBEROLOGY_SETTINGS_PATH");
-    if (override && *override) return snprintf(path, capacity, "%s", override) < (int)capacity;
-#ifdef _WIN32
-    const char *base = getenv("APPDATA");
-    if (!base) base = getenv("USERPROFILE");
-    const char *folder = "/Neural Workshop";
-#else
-    const char *base = getenv("HOME");
-    const char *folder = "/.neural-workshop";
-#endif
-    if (!base) return false;
-    char directory[4096];
-    if (snprintf(directory, sizeof(directory), "%s%s", base, folder) >= (int)sizeof(directory)) return false;
-    if (create_dir && !SDL_CreateDirectory(directory)) return false;
-    return snprintf(path, capacity, "%s/numberology-options", directory) < (int)capacity;
-}
-
-static void numberology_read_settings(crossword_options *options) {
-    char path[4096], line[256], *cursor;
-    if (!numberology_settings_path(path, sizeof(path), false)) return;
-    FILE *file = fopen(path, "r");
-    if (!file) return;
-    bool complete = fgets(line, sizeof(line), file) != NULL && fgetc(file) == EOF && !ferror(file);
-    fclose(file);
-    if (!complete) return;
-    long long fields[3]; cursor = line;
-    for (int i = 0; i < 3; i++) {
-        while (isspace((unsigned char)*cursor)) cursor++;
-        errno = 0; char *end = NULL; fields[i] = strtoll(cursor, &end, 10);
-        if (errno == ERANGE || end == cursor || (*end && !isspace((unsigned char)*end))) return;
-        cursor = end;
-    }
-    while (isspace((unsigned char)*cursor)) cursor++;
-    static const int64_t choices[] = {1,2,3,5,6,8,10,15};
-    if (!*cursor && fields[0] >= 1 && value_in_set(fields[1], choices, 8) && (fields[2] == 0 || fields[2] == 1)) {
-        options->level = fields[0]; options->trials = fields[1]; options->adaptive = fields[2];
-    }
-}
-
+extern int nw_numberology_settings_write(const int64_t *options);
 static bool numberology_write_settings(const crossword_options *options) {
-    char path[4096], temporary[4200];
-    if (!numberology_settings_path(path, sizeof(path), true) ||
-        snprintf(temporary, sizeof(temporary), "%s.%llu.tmp", path,
-                 (unsigned long long)SDL_GetTicksNS()) >= (int)sizeof(temporary)) return false;
-    FILE *file = fopen(temporary, "w");
-    if (!file) return false;
-    bool ok = fprintf(file, "%lld %lld %lld\n", (long long)options->level,
-                      (long long)options->trials, (long long)options->adaptive) > 0;
-    if (fclose(file) != 0) ok = false;
-#ifdef _WIN32
-    if (ok) ok = MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-#else
-    if (ok) ok = rename(temporary, path) == 0;
-#endif
-    if (!ok) remove(temporary);
-    return ok;
-}
-
-static bool algebra_settings_path(char *path, size_t capacity, bool create_dir) {
-    const char *override = getenv("NW_ALGEBRA_SETTINGS_PATH");
-    if (override && *override) return snprintf(path, capacity, "%s", override) < (int)capacity;
-#ifdef _WIN32
-    const char *base = getenv("APPDATA");
-    if (!base) base = getenv("USERPROFILE");
-    const char *folder = "/Neural Workshop";
-#else
-    const char *base = getenv("HOME");
-    const char *folder = "/.neural-workshop";
-#endif
-    if (!base) return false;
-    char directory[4096];
-    if (snprintf(directory, sizeof(directory), "%s%s", base, folder) >= (int)sizeof(directory)) return false;
-    if (create_dir && !SDL_CreateDirectory(directory)) return false;
-    return snprintf(path, capacity, "%s/algebra-options", directory) < (int)capacity;
-}
-
-static void algebra_read_settings(crossword_options *options) {
-    char path[4096], line[256];
-    if (!algebra_settings_path(path, sizeof(path), false)) return;
-    FILE *file = fopen(path, "r");
-    if (!file) return;
-    bool complete = fgets(line, sizeof(line), file) != NULL && fgetc(file) == EOF && !ferror(file);
-    fclose(file);
-    if (!complete) return;
-    long long fields[4];
-    char *cursor = line;
-    for (int i = 0; i < 4; i++) {
-        while (isspace((unsigned char)*cursor)) cursor++;
-        errno = 0;
-        char *end = NULL;
-        fields[i] = strtoll(cursor, &end, 10);
-        if (errno == ERANGE || end == cursor || (*end && !isspace((unsigned char)*end))) return;
-        cursor = end;
-    }
-    while (isspace((unsigned char)*cursor)) cursor++;
-    static const int64_t trial_choices[] = {1,2,3,5,6,8,10,15};
-    if (*cursor == '\0' && fields[0] >= 1 && fields[0] <= 12 &&
-        value_in_set(fields[1], trial_choices, 8) &&
-        (fields[2] == 0 || fields[2] == 1) && (fields[3] == 0 || fields[3] == 1)) {
-        options->level = fields[0]; options->trials = fields[1];
-        options->show_mistakes = fields[2]; options->adaptive = fields[3];
-    }
-}
-
-static bool algebra_write_settings(const crossword_options *options) {
-    char path[4096], temporary[4200];
-    if (!algebra_settings_path(path, sizeof(path), true) ||
-        snprintf(temporary, sizeof(temporary), "%s.%llu.tmp", path,
-                 (unsigned long long)SDL_GetTicksNS()) >= (int)sizeof(temporary)) return false;
-    FILE *file = fopen(temporary, "w");
-    if (!file) return false;
-    bool ok = fprintf(file, "%lld %lld %lld %lld\n", (long long)options->level,
-                      (long long)options->trials, (long long)options->show_mistakes,
-                      (long long)options->adaptive) > 0;
-    if (fclose(file) != 0) ok = false;
-#ifdef _WIN32
-    if (ok) ok = MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-#else
-    if (ok) ok = rename(temporary, path) == 0;
-#endif
-    if (!ok) remove(temporary);
-    return ok;
-}
-
-static bool scramble_settings_path(char *path, size_t capacity, bool create_dir) {
-    const char *override = getenv("NW_SCRAMBLE_SETTINGS_PATH");
-    if (override && *override) return snprintf(path, capacity, "%s", override) < (int)capacity;
-#ifdef _WIN32
-    const char *base = getenv("APPDATA");
-    if (!base) base = getenv("USERPROFILE");
-    const char *folder = "/Neural Workshop";
-#else
-    const char *base = getenv("HOME");
-    const char *folder = "/.neural-workshop";
-#endif
-    if (!base) return false;
-    char directory[4096];
-    if (snprintf(directory, sizeof(directory), "%s%s", base, folder) >= (int)sizeof(directory)) return false;
-    if (create_dir && !SDL_CreateDirectory(directory)) return false;
-    return snprintf(path, capacity, "%s/scramble-options", directory) < (int)capacity;
-}
-
-static void scramble_read_settings(crossword_options *options) {
-    char path[4096], line[256];
-    if (!scramble_settings_path(path, sizeof(path), false)) return;
-    FILE *file = fopen(path, "r");
-    if (!file) return;
-    bool complete = fgets(line, sizeof(line), file) != NULL && fgetc(file) == EOF && !ferror(file);
-    fclose(file);
-    if (!complete) return;
-    long long fields[4];
-    char *cursor = line;
-    for (int i = 0; i < 4; i++) {
-        while (isspace((unsigned char)*cursor)) cursor++;
-        errno = 0;
-        char *end = NULL;
-        fields[i] = strtoll(cursor, &end, 10);
-        if (errno == ERANGE || end == cursor || (*end && !isspace((unsigned char)*end))) return;
-        cursor = end;
-    }
-    while (isspace((unsigned char)*cursor)) cursor++;
-    static const int64_t trial_choices[] = {1,2,3,5,8,10,15};
-    if (*cursor == '\0' && fields[0] >= 1 && fields[0] <= 12 &&
-        value_in_set(fields[1], trial_choices, 7) &&
-        (fields[2] == 0 || fields[2] == 1) && (fields[3] == 0 || fields[3] == 1)) {
-        options->level = fields[0]; options->trials = fields[1];
-        options->show_mistakes = fields[2]; options->adaptive = fields[3];
-    }
-}
-
-static bool scramble_write_settings(const crossword_options *options) {
-    char path[4096], temporary[4200];
-    if (!scramble_settings_path(path, sizeof(path), true) ||
-        snprintf(temporary, sizeof(temporary), "%s.%llu.tmp", path,
-                 (unsigned long long)SDL_GetTicksNS()) >= (int)sizeof(temporary)) return false;
-    FILE *file = fopen(temporary, "w");
-    if (!file) return false;
-    bool ok = fprintf(file, "%lld %lld %lld %lld\n", (long long)options->level,
-                      (long long)options->trials, (long long)options->show_mistakes,
-                      (long long)options->adaptive) > 0;
-    if (fclose(file) != 0) ok = false;
-#ifdef _WIN32
-    if (ok) ok = MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-#else
-    if (ok) ok = rename(temporary, path) == 0;
-#endif
-    if (!ok) remove(temporary);
-    return ok;
+    return nw_numberology_settings_write(&options->level) != 0;
 }
 
 static int parse_crossword_options(int argc, char **argv, crossword_options *options, bool use_saved) {
-    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10};
-    static const int64_t trials[] = {1,2,3,5,8,10};
-    *options = (crossword_options){2, 3, 1, 1, NULL};
-    if (use_saved) crossword_read_settings(options);
-    for (int i = 1; i < argc; i++) {
-        const char *name = argv[i];
-        if (!strcmp(name, "--crossword-no-mistakes")) { options->show_mistakes = 0; continue; }
-        if (!strcmp(name, "--crossword-no-adaptive")) { options->adaptive = 0; continue; }
-        bool is_level = !strcmp(name, "--crossword-level");
-        bool is_trials = !strcmp(name, "--crossword-trials");
-        bool is_path = !strcmp(name, "--crossword-lexicon");
-        if (!is_level && !is_trials && !is_path) continue;
-        if (++i >= argc) { fprintf(stderr, "%s requires a value\n", name); return 2; }
-        if (is_path) { options->lexicon = argv[i]; continue; }
-        errno = 0;
-        char *end = NULL;
-        long long value = strtoll(argv[i], &end, 10);
-        const int64_t *allowed = is_level ? levels : trials;
-        size_t count = is_level ? sizeof(levels)/sizeof(*levels) : sizeof(trials)/sizeof(*trials);
-        if (errno == ERANGE || end == argv[i] || *end || !value_in_set(value, allowed, count)) {
-            fprintf(stderr, "invalid value for %s: %s\n", name, argv[i]); return 2;
-        }
-        if (is_level) options->level = value; else options->trials = value;
-    }
-    return 0;
+    return nw_task_settings_parse(0, argc, argv, &options->level, &options->lexicon, use_saved);
 }
+
+extern void *nw_sdl_read_corpus(const char *path, int64_t *length);
+extern int nw_sdl_corpus_path(char *, size_t, int64_t, int64_t);
 
 /* The controller owns its copy. A missing default index leaves the task ready
  * with its on-screen recovery message; an explicit bad path is an error. */
@@ -2142,37 +1579,18 @@ static int load_word_index(int64_t handle, const char *explicit_path, bool scrab
     char default_path[4096];
     const char *path = explicit_path;
     if (!path) {
-#ifdef _WIN32
-        const char *base = getenv("APPDATA");
-        const char *suffix = "/Brain Workshop/data/words/lexicon.tsv";
-#elif defined(__APPLE__)
-        const char *base = getenv("HOME");
-        const char *suffix = "/Library/Application Support/Brain Workshop/data/words/lexicon.tsv";
-#else
-        const char *base = getenv("HOME");
-        const char *suffix = "/.brainworkshop/data/words/lexicon.tsv";
-#endif
-        if (!base || snprintf(default_path, sizeof(default_path), "%s%s", base, suffix) >= (int)sizeof(default_path)) return 0;
+        if (!nw_sdl_corpus_path(default_path, sizeof(default_path), 0, 0)) return 0;
         path = default_path;
     }
-    FILE *file = fopen(path, "rb");
-    if (!file) {
-        if (explicit_path) fprintf(stderr, "Cannot open %s lexicon %s: %s\n", scrabble ? "Scrabble" : "Crossword", path, strerror(errno));
-        return explicit_path ? -1 : 0;
+    int64_t length = 0;
+    void *data = nw_sdl_read_corpus(path, &length);
+    if (!data) {
+        if (explicit_path || length < 0) SDL_Log("Cannot load %s lexicon: %s", scrabble ? "Scrabble" : "Crossword", path);
+        return explicit_path || length < 0 ? -1 : 0;
     }
-    if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return -1; }
-    long length = ftell(file);
-    if (length <= 0 || length > 67108864 || fseek(file, 0, SEEK_SET) != 0) {
-        fprintf(stderr, "Invalid %s lexicon size: %s\n", scrabble ? "Scrabble" : "Crossword", path); fclose(file); return -1;
-    }
-    void *data = malloc((size_t)length);
-    if (!data) { fclose(file); return -1; }
-    size_t read_count = fread(data, 1, (size_t)length, file);
-    fclose(file);
-    int64_t result = read_count == (size_t)length
-        ? (scrabble ? nw_scrabble_set_lexicon(handle, (int64_t)(uintptr_t)data, length)
-                    : nw_crossword_set_lexicon(handle, (int64_t)(uintptr_t)data, length)) : -1;
-    free(data);
+    int64_t result = scrabble ? nw_scrabble_set_lexicon(handle, (int64_t)(uintptr_t)data, length)
+                              : nw_crossword_set_lexicon(handle, (int64_t)(uintptr_t)data, length);
+    SDL_free(data);
     if (result != 0) { fprintf(stderr, "Invalid or unreadable %s lexicon: %s\n", scrabble ? "Scrabble" : "Crossword", path); return -1; }
     return 0;
 }
@@ -2187,27 +1605,7 @@ static int64_t create_crossword(const crossword_options *options) {
 }
 
 static int parse_scrabble_options(int argc, char **argv, crossword_options *options, bool use_saved) {
-    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10};
-    static const int64_t trials[] = {1,2,3,5,8,10,15};
-    *options = (crossword_options){3, 5, 1, 1, NULL};
-    if (use_saved) scrabble_read_settings(options);
-    for (int i = 1; i < argc; i++) {
-        const char *name = argv[i];
-        if (!strcmp(name, "--scrabble-no-premiums")) { options->show_mistakes = 0; continue; }
-        if (!strcmp(name, "--scrabble-no-adaptive")) { options->adaptive = 0; continue; }
-        bool level = !strcmp(name, "--scrabble-level"), count = !strcmp(name, "--scrabble-trials");
-        bool path = !strcmp(name, "--scrabble-lexicon");
-        if (!level && !count && !path) continue;
-        if (++i >= argc) { fprintf(stderr, "%s requires a value\n", name); return 2; }
-        if (path) { options->lexicon = argv[i]; continue; }
-        errno = 0; char *end = NULL; long long value = strtoll(argv[i], &end, 10);
-        if (errno == ERANGE || end == argv[i] || *end ||
-            !value_in_set(value, level ? levels : trials, level ? 10 : 7)) {
-            fprintf(stderr, "invalid value for %s: %s\n", name, argv[i]); return 2;
-        }
-        if (level) options->level = value; else options->trials = value;
-    }
-    return 0;
+    return nw_task_settings_parse(1, argc, argv, &options->level, &options->lexicon, use_saved);
 }
 
 static int64_t create_scrabble(const crossword_options *options) {
@@ -2219,134 +1617,98 @@ static int64_t create_scrabble(const crossword_options *options) {
     return handle;
 }
 
+extern int nw_numberology_options_parse(int64_t, char **, int64_t *, const char **, int64_t);
 static int parse_numberology_options(int argc, char **argv, crossword_options *options, bool use_saved) {
-    static const int64_t trials[] = {1,2,3,5,6,8,10,15};
-    *options = (crossword_options){1, 6, 0, 1, NULL};
-    if (use_saved) numberology_read_settings(options);
-    for (int i = 1; i < argc; i++) {
-        const char *name = argv[i];
-        if (!strcmp(name, "--numberology-no-adaptive")) { options->adaptive = 0; continue; }
-        bool level = !strcmp(name, "--numberology-level"), count = !strcmp(name, "--numberology-trials");
-        if (!level && !count) continue;
-        if (++i >= argc) { fprintf(stderr, "%s requires a value\n", name); return 2; }
-        errno = 0; char *end = NULL; long long value = strtoll(argv[i], &end, 10);
-        if (errno == ERANGE || end == argv[i] || *end || (level ? value < 1 : !value_in_set(value, trials, 8))) {
-            fprintf(stderr, "invalid value for %s: %s\n", name, argv[i]); return 2;
-        }
-        if (level) options->level = value; else options->trials = value;
-    }
-    return 0;
+    return nw_numberology_options_parse(argc, argv, &options->level, &options->lexicon, use_saved);
 }
 
 static int parse_algebra_options(int argc, char **argv, crossword_options *options, bool use_saved) {
-    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10,11,12};
-    static const int64_t trials[] = {1,2,3,5,6,8,10,15};
-    *options = (crossword_options){3, 6, 1, 1, NULL};
-    if (use_saved) algebra_read_settings(options);
-    for (int i = 1; i < argc; i++) {
-        const char *name = argv[i];
-        if (!strcmp(name, "--algebra-no-working")) { options->show_mistakes = 0; continue; }
-        if (!strcmp(name, "--algebra-no-adaptive")) { options->adaptive = 0; continue; }
-        bool level = !strcmp(name, "--algebra-level"), count = !strcmp(name, "--algebra-trials");
-        if (!level && !count) continue;
-        if (++i >= argc) { fprintf(stderr, "%s requires a value\n", name); return 2; }
-        errno = 0; char *end = NULL; long long value = strtoll(argv[i], &end, 10);
-        if (errno == ERANGE || end == argv[i] || *end ||
-            !value_in_set(value, level ? levels : trials, level ? 12 : 8)) {
-            fprintf(stderr, "invalid value for %s: %s\n", name, argv[i]); return 2;
-        }
-        if (level) options->level = value; else options->trials = value;
-    }
-    return 0;
+    return nw_task_settings_parse(2, argc, argv, &options->level, &options->lexicon, use_saved);
 }
 
 static int parse_scramble_options(int argc, char **argv, crossword_options *options, bool use_saved) {
-    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10,11,12};
-    static const int64_t trials[] = {1,2,3,5,8,10,15};
-    *options = (crossword_options){3, 5, 1, 1, NULL};
-    if (use_saved) scramble_read_settings(options);
-    for (int i = 1; i < argc; i++) {
-        const char *name = argv[i];
-        if (!strcmp(name, "--scramble-no-count")) { options->show_mistakes = 0; continue; }
-        if (!strcmp(name, "--scramble-no-adaptive")) { options->adaptive = 0; continue; }
-        bool level = !strcmp(name, "--scramble-level"), count = !strcmp(name, "--scramble-trials");
-        if (!level && !count) continue;
-        if (++i >= argc) { fprintf(stderr, "%s requires a value\n", name); return 2; }
-        errno = 0; char *end = NULL; long long value = strtoll(argv[i], &end, 10);
-        if (errno == ERANGE || end == argv[i] || *end ||
-            !value_in_set(value, level ? levels : trials, level ? 12 : 7)) {
-            fprintf(stderr, "invalid value for %s: %s\n", name, argv[i]); return 2;
-        }
-        if (level) options->level = value; else options->trials = value;
-    }
-    return 0;
-}
-
-static void *scramble_read_file(const char *path, long *length) {
-    FILE *file = fopen(path, "rb");
-    if (!file) return NULL;
-    if (fseek(file, 0, SEEK_END) != 0 || (*length = ftell(file)) <= 0 ||
-        *length > 67108864 || fseek(file, 0, SEEK_SET) != 0) { fclose(file); return NULL; }
-    void *data = malloc((size_t)*length);
-    if (!data) { fclose(file); return NULL; }
-    size_t read_count = fread(data, 1, (size_t)*length, file);
-    fclose(file);
-    if (read_count != (size_t)*length) { free(data); return NULL; }
-    return data;
+    return nw_task_settings_parse(3, argc, argv, &options->level, &options->lexicon, use_saved);
 }
 
 static int64_t create_scramble(const crossword_options *options, const char *explicit_index, const char *explicit_sentences) {
     int64_t handle = nw_scramble_create(options->level, options->trials, options->show_mistakes, options->adaptive, 17);
     if (handle <= 0) return 0;
     char index_path[4096], sentence_path[4096];
-#ifdef _WIN32
-    const char *base = getenv("APPDATA"), *folder = "/Brain Workshop/data/words";
-#elif defined(__APPLE__)
-    const char *base = getenv("HOME"), *folder = "/Library/Application Support/Brain Workshop/data/words";
-#else
-    const char *base = getenv("HOME"), *folder = "/.brainworkshop/data/words";
-#endif
-    if (!base) base = "";
-    if (snprintf(index_path, sizeof(index_path), "%s%s/lexicon.tsv", base, folder) >= (int)sizeof(index_path) ||
-        snprintf(sentence_path, sizeof(sentence_path), "%s%s/sentences.txt", base, folder) >= (int)sizeof(sentence_path)) {
+    if (!nw_sdl_corpus_path(index_path, sizeof(index_path), 0, 1) ||
+        !nw_sdl_corpus_path(sentence_path, sizeof(sentence_path), 1, 1)) {
         nw_scramble_destroy(handle); return 0;
     }
     const char *index = explicit_index ? explicit_index : index_path;
     const char *sentences = explicit_sentences ? explicit_sentences : sentence_path;
-    long index_length = 0, sentence_length = 0;
-    void *index_data = scramble_read_file(index, &index_length);
-    void *sentence_data = scramble_read_file(sentences, &sentence_length);
+    int64_t index_length = 0, sentence_length = 0;
+    void *index_data = nw_sdl_read_corpus(index, &index_length);
+    void *sentence_data = nw_sdl_read_corpus(sentences, &sentence_length);
+    if (!index_data) index_length = 0;
+    if (!sentence_data) sentence_length = 0;
     if ((!index_data && explicit_index) || (!sentence_data && explicit_sentences)) {
-        free(index_data); free(sentence_data);
+        SDL_free(index_data); SDL_free(sentence_data);
         fprintf(stderr, "Cannot load Scramble corpus: requested file must exist and be readable\n");
         nw_scramble_destroy(handle); return 0;
     }
     if (!explicit_sentences && sentence_data && sentence_length <= 4096) {
-        free(sentence_data); sentence_data = NULL; sentence_length = 0;
+        SDL_free(sentence_data); sentence_data = NULL; sentence_length = 0;
     }
     if (!index_data && !sentence_data) return handle;
     int64_t result = nw_scramble_set_corpus(handle, (int64_t)(uintptr_t)index_data, index_length,
                                             (int64_t)(uintptr_t)sentence_data, sentence_length);
-    free(index_data); free(sentence_data);
+    SDL_free(index_data); SDL_free(sentence_data);
     if (result != 0) { fprintf(stderr, "Invalid Scramble corpus\n"); nw_scramble_destroy(handle); return 0; }
     return handle;
 }
+
+extern int nw_numberology_page_at(float, float);
+#define numberology_page_at nw_numberology_page_at
+extern int64_t nw_sdl_option_row(float, float, int, int, int64_t);
 
 static void numberology_text(int64_t handle, const char *text, int64_t now_ms) {
     const unsigned char *at = (const unsigned char *)text;
     while (*at) nw_numberology_action(handle, 1, *at++, now_ms);
 }
 
-static void numberology_advance(int64_t handle, crossword_options *options) {
+static void numberology_advance(int64_t handle, crossword_options *options, nw_numberology_results *results) {
     int64_t before = nw_numberology_info(handle, 0);
     nw_numberology_action(handle, 0, 0, (int64_t)SDL_GetTicks());
-    if (before != 3 && nw_numberology_info(handle, 0) == 3 && options->adaptive) {
+    int64_t after = nw_numberology_info(handle, 0);
+    if ((before == 0 || before == 3) && after == 1)
+        nw_numberology_results_start(results, nw_numberology_info(handle, 1), nw_numberology_info(handle, 3), options->adaptive);
+    if (before == 2 && after == 3)
+        nw_numberology_results_finish(results, nw_numberology_info(handle, 10));
+    if (before == 2 && after == 3 && options->adaptive) {
         int64_t next = nw_numberology_info(handle, 13);
         if (next > options->level) {
             options->level = next;
             if (!numberology_write_settings(options)) SDL_Log("Could not save Numberology settings");
         }
     }
+}
+
+static void numberology_submit(int64_t handle, nw_numberology_results *results, int64_t now_ms) {
+    int64_t before = nw_numberology_info(handle, 0);
+    nw_numberology_action(handle, 3, 0, now_ms);
+    if (before == 1 && nw_numberology_info(handle, 0) == 2)
+        nw_numberology_results_judge(results, nw_numberology_info(handle, 2),
+                                    nw_numberology_info(handle, 1), nw_numberology_info(handle, 8) == 1);
+}
+
+static int selftest_numberology_result_lifecycle(void) {
+    nw_numberology_results results = {0};
+    crossword_options options = {1, 1, 0, 0, NULL};
+    int64_t handle = nw_numberology_create(1, 1, 0, 23);
+    if (!handle) return 1;
+    numberology_advance(handle, &options, &results);
+    numberology_text(handle, "9", 0); /* source oracle, level 1 / seed 23 */
+    numberology_submit(handle, &results, 0);
+    int bad = nw_numberology_info(handle, 8) != 1;
+    numberology_advance(handle, &options, &results);
+    bad |= nw_numberology_info(handle, 0) != 3;
+    nw_numberology_destroy(handle);
+    nw_numberology_results_close(&results);
+    return bad ? 1 : 0;
 }
 
 static void algebra_text(int64_t handle, const char *text, int64_t now_ms) {
@@ -2453,108 +1815,42 @@ static int selftest_scrabble(void) {
     return bad ? 1 : 0;
 }
 
+extern int nw_task_options_modify(int64_t, int64_t *, int64_t, int64_t);
+extern int64_t nw_task_options_pack(int64_t, const int64_t *);
 static void crossword_modify_option(crossword_options *draft, int selected, int step) {
-    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10};
-    static const int64_t trials[] = {1,2,3,5,8,10};
-    if (selected >= 2) {
-        if (selected == 2) draft->show_mistakes = !draft->show_mistakes;
-        else draft->adaptive = !draft->adaptive;
-        return;
-    }
-    const int64_t *choices = selected == 0 ? levels : trials;
-    int count = selected == 0 ? 10 : 6;
-    int64_t *value = selected == 0 ? &draft->level : &draft->trials;
-    int at = 0;
-    while (at < count && choices[at] != *value) at++;
-    *value = choices[(at + step + count) % count];
+    nw_task_options_modify(0, &draft->level, selected, step);
 }
-
 static int64_t crossword_pack_options(const crossword_options *options) {
-    static const int64_t trials[] = {1,2,3,5,8,10};
-    int at = 0;
-    while (at < 5 && trials[at] != options->trials) at++;
-    return options->level | ((int64_t)at << 4) | (options->show_mistakes << 7) | (options->adaptive << 8);
+    return nw_task_options_pack(0, &options->level);
 }
 
+extern void nw_numberology_edit_digit(int64_t *, unsigned char *, int64_t *, int);
+extern void nw_numberology_edit_backspace(int64_t *, unsigned char *, int64_t *);
+extern void nw_numberology_modify_option(int64_t *, int64_t, int64_t);
 static void numberology_edit_digit(crossword_options *draft, bool *editing, int64_t *value, int digit) {
-    int64_t current = *editing ? *value : 0;
-    if (digit < 0 || digit > 9 || current > (INT64_MAX - digit) / 10) return;
-    *value = current * 10 + digit;
-    draft->level = *value > 0 ? *value : 1;
-    *editing = true;
+    nw_numberology_edit_digit(&draft->level, (unsigned char *)editing, value, digit);
 }
-
 static void numberology_edit_backspace(crossword_options *draft, bool *editing, int64_t *value) {
-    int64_t current = *editing ? *value : draft->level;
-    *value = current / 10;
-    draft->level = *value > 0 ? *value : 1;
-    *editing = true;
+    nw_numberology_edit_backspace(&draft->level, (unsigned char *)editing, value);
 }
-
 static void numberology_modify_option(crossword_options *draft, int selected, int step) {
-    static const int64_t choices[] = {1, 2, 3, 5, 6, 8, 10, 15};
-    if (selected == 0) {
-        if (step < 0 && draft->level > 1) draft->level--;
-        if (step > 0 && draft->level < INT64_MAX) draft->level++;
-    } else if (selected == 1) {
-        int i = 0; while (i < 8 && choices[i] != draft->trials) i++;
-        draft->trials = choices[(i + (step < 0 ? 7 : 1)) % 8];
-    } else draft->adaptive = !draft->adaptive;
+    nw_numberology_modify_option(&draft->level, selected, step);
 }
 
 static void algebra_modify_option(crossword_options *draft, int selected, int step) {
-    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10,11,12};
-    static const int64_t trials[] = {1,2,3,5,6,8,10,15};
-    if (selected >= 2) {
-        if (selected == 2) draft->show_mistakes = !draft->show_mistakes;
-        else draft->adaptive = !draft->adaptive;
-        return;
-    }
-    const int64_t *choices = selected == 0 ? levels : trials;
-    int count = selected == 0 ? 12 : 8;
-    int64_t *value = selected == 0 ? &draft->level : &draft->trials;
-    int at = 0;
-    while (at < count && choices[at] != *value) at++;
-    *value = choices[(at + step + count) % count];
+    nw_task_options_modify(2, &draft->level, selected, step);
 }
 
 static void scramble_modify_option(crossword_options *draft, int selected, int step) {
-    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10,11,12};
-    static const int64_t trials[] = {1,2,3,5,8,10,15};
-    if (selected >= 2) {
-        if (selected == 2) draft->show_mistakes = !draft->show_mistakes;
-        else draft->adaptive = !draft->adaptive;
-        return;
-    }
-    const int64_t *choices = selected == 0 ? levels : trials;
-    int count = selected == 0 ? 12 : 7;
-    int64_t *value = selected == 0 ? &draft->level : &draft->trials;
-    int at = 0;
-    while (at < count && choices[at] != *value) at++;
-    *value = choices[(at + step + count) % count];
+    nw_task_options_modify(3, &draft->level, selected, step);
 }
 
 static void scrabble_modify_option(crossword_options *draft, int selected, int step) {
-    static const int64_t levels[] = {1,2,3,4,5,6,7,8,9,10};
-    static const int64_t trials[] = {1,2,3,5,8,10,15};
-    if (selected >= 2) {
-        if (selected == 2) draft->show_mistakes = !draft->show_mistakes;
-        else draft->adaptive = !draft->adaptive;
-        return;
-    }
-    const int64_t *choices = selected == 0 ? levels : trials;
-    int count = selected == 0 ? 10 : 7;
-    int64_t *value = selected == 0 ? &draft->level : &draft->trials;
-    int at = 0;
-    while (at < count && choices[at] != *value) at++;
-    *value = choices[(at + step + count) % count];
+    nw_task_options_modify(1, &draft->level, selected, step);
 }
 
 static int64_t scrabble_pack_options(const crossword_options *options) {
-    static const int64_t trials[] = {1,2,3,5,8,10,15};
-    int at = 0;
-    while (at < 6 && trials[at] != options->trials) at++;
-    return options->level | ((int64_t)at << 4) | (options->show_mistakes << 7) | (options->adaptive << 8);
+    return nw_task_options_pack(1, &options->level);
 }
 
 static bool shell_exit_key(SDL_Keycode key, bool crossword, bool crossed_wires) {
@@ -2602,6 +1898,7 @@ static int selftest_crossword(void) {
     return bad ? 1 : 0;
 }
 
+extern int nw_sdl_task_options_parse(int64_t, char **, int64_t *);
 static int parse_task_options(int argc, char **argv,
                               int64_t *sudoku_level, int64_t *sudoku_puzzles,
                               int64_t *sudoku_show_clashes,
@@ -2614,109 +1911,16 @@ static int parse_task_options(int argc, char **argv,
                               int64_t *crossed_wires_rounds,
                               int64_t *crossed_wires_adaptive,
                               int64_t *crossed_wires_show_grid) {
-    static const int64_t sudoku_levels[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
-    static const int64_t sudoku_trials[] = { 1, 2, 3, 5, 8, 10 };
-    static const int64_t jigsaw_sides[] = { 2, 3, 4, 5, 6, 7, 8, 10 };
-    static const int64_t jigsaw_trials[] = { 1, 2, 3, 5, 8, 12, 20 };
-    static const int64_t go_levels[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    static const int64_t go_trials_allowed[] = { 1, 3, 5, 8, 10, 15, 20, 30, 50 };
-    static const int64_t crossed_wires_levels[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
-    static const int64_t crossed_wires_round_choices[] = { 1, 2, 3, 5, 8, 10, 15, 20 };
-
-    *sudoku_level = 3;
-    *sudoku_puzzles = 3;
-    *sudoku_show_clashes = 1;
-    *sudoku_adaptive = 1;
-    *jigsaw_side = 3;
-    *jigsaw_puzzles = 3;
-    *jigsaw_adaptive = 1;
-    *jigsaw_preview = 1;
-    *jigsaw_mark_placed = 0;
-    *go_level = 1;
-    *go_trials = 10;
-    *crossed_wires_level = 3;
-    *crossed_wires_rounds = 5;
-    *crossed_wires_adaptive = 1;
-    *crossed_wires_show_grid = 1;
-
-    for (int index = 1; index < argc; index++) {
-        const char *name = argv[index];
-        int64_t *target = NULL;
-        const int64_t *allowed = NULL;
-        size_t allowed_count = 0;
-
-        if (strcmp(name, "--sudoku-level") == 0) {
-            target = sudoku_level;
-            allowed = sudoku_levels;
-            allowed_count = sizeof(sudoku_levels) / sizeof(sudoku_levels[0]);
-        } else if (strcmp(name, "--sudoku-puzzles") == 0) {
-            target = sudoku_puzzles;
-            allowed = sudoku_trials;
-            allowed_count = sizeof(sudoku_trials) / sizeof(sudoku_trials[0]);
-        } else if (strcmp(name, "--jigsaw-side") == 0) {
-            target = jigsaw_side;
-            allowed = jigsaw_sides;
-            allowed_count = sizeof(jigsaw_sides) / sizeof(jigsaw_sides[0]);
-        } else if (strcmp(name, "--jigsaw-puzzles") == 0) {
-            target = jigsaw_puzzles;
-            allowed = jigsaw_trials;
-            allowed_count = sizeof(jigsaw_trials) / sizeof(jigsaw_trials[0]);
-        } else if (strcmp(name, "--go-level") == 0) {
-            target = go_level;
-            allowed = go_levels;
-            allowed_count = sizeof(go_levels) / sizeof(go_levels[0]);
-        } else if (strcmp(name, "--go-trials") == 0) {
-            target = go_trials;
-            allowed = go_trials_allowed;
-            allowed_count = sizeof(go_trials_allowed) / sizeof(go_trials_allowed[0]);
-        } else if (strcmp(name, "--crossed-wires-level") == 0) {
-            target = crossed_wires_level;
-            allowed = crossed_wires_levels;
-            allowed_count = sizeof(crossed_wires_levels) / sizeof(crossed_wires_levels[0]);
-        } else if (strcmp(name, "--crossed-wires-rounds") == 0) {
-            target = crossed_wires_rounds;
-            allowed = crossed_wires_round_choices;
-            allowed_count = sizeof(crossed_wires_round_choices) / sizeof(crossed_wires_round_choices[0]);
-        } else if (strcmp(name, "--sudoku-no-clashes") == 0) {
-            *sudoku_show_clashes = 0;
-            continue;
-        } else if (strcmp(name, "--sudoku-no-adaptive") == 0) {
-            *sudoku_adaptive = 0;
-            continue;
-        } else if (strcmp(name, "--jigsaw-no-adaptive") == 0) {
-            *jigsaw_adaptive = 0;
-            continue;
-        } else if (strcmp(name, "--jigsaw-no-preview") == 0) {
-            *jigsaw_preview = 0;
-            continue;
-        } else if (strcmp(name, "--jigsaw-mark-placed") == 0) {
-            *jigsaw_mark_placed = 1;
-            continue;
-        } else if (strcmp(name, "--crossed-wires-no-adaptive") == 0) {
-            *crossed_wires_adaptive = 0;
-            continue;
-        } else if (strcmp(name, "--crossed-wires-no-grid") == 0) {
-            *crossed_wires_show_grid = 0;
-            continue;
-        } else {
-            continue;
-        }
-
-        if (index + 1 >= argc) {
-            fprintf(stderr, "%s requires a value\n", name);
-            return 2;
-        }
-        errno = 0;
-        char *end = NULL;
-        long long parsed = strtoll(argv[++index], &end, 10);
-        if (errno == ERANGE || end == argv[index] || *end != '\0' ||
-            !value_in_set((int64_t)parsed, allowed, allowed_count)) {
-            fprintf(stderr, "invalid value for %s: %s\n", name, argv[index]);
-            return 2;
-        }
-        *target = (int64_t)parsed;
-    }
-    return 0;
+    int64_t values[15];
+    int result = nw_sdl_task_options_parse(argc, argv, values);
+    *sudoku_level = values[0]; *sudoku_puzzles = values[1];
+    *sudoku_show_clashes = values[2]; *sudoku_adaptive = values[3];
+    *jigsaw_side = values[4]; *jigsaw_puzzles = values[5]; *jigsaw_adaptive = values[6];
+    *jigsaw_preview = values[7]; *jigsaw_mark_placed = values[8];
+    *go_level = values[9]; *go_trials = values[10];
+    *crossed_wires_level = values[11]; *crossed_wires_rounds = values[12];
+    *crossed_wires_adaptive = values[13]; *crossed_wires_show_grid = values[14];
+    return result;
 }
 
 static int selftest_algebra_options(void) {
@@ -2825,11 +2029,16 @@ static int selftest_task_options(void) {
     edit_value = INT64_MAX; numberology.level = INT64_MAX;
     numberology_edit_digit(&numberology, &editing, &edit_value, 9);
     if (numberology.level != INT64_MAX) bad++;
+    if (numberology_page_at(265, 365) != 4 || numberology_page_at(647, 365) != 5 ||
+        numberology_page_at(456, 365) != 0 || numberology_page_at(265, 400) != 0) bad++;
     printf("SDL task-options selftest: %s\n", bad ? "FAILED" : "PASS");
     return bad ? 1 : 0;
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--selftest-long-text") == 0) return selftest_long_text();
+    if (argc > 1 && strcmp(argv[1], "--selftest-syllogism") == 0) return (int)nw_syllogism_sdl_selftest();
+    if (argc > 1 && strcmp(argv[1], "--selftest-numberology-result-lifecycle") == 0) return selftest_numberology_result_lifecycle();
     if (argc > 1 && strcmp(argv[1], "--selftest-algebra-options") == 0) return selftest_algebra_options();
     if (argc > 1 && strcmp(argv[1], "--selftest-task-options") == 0) {
         return selftest_task_options();
@@ -2991,6 +2200,9 @@ int main(int argc, char **argv) {
     if (parse_crossword_options(argc, argv, &crossword_config, true)) return 2;
     crossword_options scrabble_config;
     if (parse_scrabble_options(argc, argv, &scrabble_config, true)) return 2;
+    nw_numberology_results numberology_results = {0};
+    syllogism_options syllogism_config;
+    if (nw_syllogism_options_parse(argc, argv, &syllogism_config, 1)) return 2;
     crossword_options numberology_config;
     if (parse_numberology_options(argc, argv, &numberology_config, true)) return 2;
     crossword_options algebra_config;
@@ -3064,6 +2276,10 @@ int main(int argc, char **argv) {
                        strcmp(argv[2], "reflex") == 0;
     bool algebra_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
                         strcmp(argv[2], "algebra") == 0;
+    bool syllogism_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
+                           strcmp(argv[2], "syllogism") == 0;
+    int64_t syllogism_handle = syllogism_mode ? create_syllogism(&syllogism_config) : 0;
+    if (syllogism_mode && !syllogism_handle) { SDL_Log("Syllogism controller creation failed"); return 1; }
     bool numberology_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
                             strcmp(argv[2], "numberology") == 0;
     bool jigsaw_mode = argc > 2 && strcmp(argv[1], "--screen") == 0 &&
@@ -3419,6 +2635,9 @@ int main(int argc, char **argv) {
     Uint64 last_marble_tick = SDL_GetTicks();
     bool playing = false, running = true;
     bool scrabble_options_open = false;
+    bool syllogism_options_open = false, syllogism_options_from_hub = false;
+    int64_t syllogism_selected = 0;
+    syllogism_options syllogism_draft = syllogism_config;
     bool numberology_options_open = false, numberology_options_from_hub = false, numberology_level_editing = false;
     int numberology_options_selected = 0;
     int64_t numberology_level_edit_value = 0;
@@ -3463,6 +2682,14 @@ int main(int argc, char **argv) {
             if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST && marble_mode)
                 marble_release_all(marble_handle);
             if (event.type == SDL_EVENT_KEY_DOWN) {
+                if (syllogism_mode && syllogism_options_open && event.key.key == SDLK_ESCAPE) {
+                    syllogism_options_open = false;
+                    if (syllogism_options_from_hub) {
+                        nw_syllogism_destroy(syllogism_handle); syllogism_handle = 0;
+                        syllogism_mode = false; syllogism_options_from_hub = false;
+                    }
+                    continue;
+                }
                 if (numberology_mode && numberology_options_open && event.key.key == SDLK_ESCAPE) {
                     numberology_options_open = false;
                     if (numberology_options_from_hub) {
@@ -3579,6 +2806,8 @@ int main(int argc, char **argv) {
                         algebra_handle = 0;
                         algebra_mode = false;
                         SDL_StopTextInput(window);
+                    } else if (taskhub_mode && syllogism_mode) {
+                        nw_syllogism_destroy(syllogism_handle); syllogism_handle = 0; syllogism_mode = false;
                     } else if (taskhub_mode && numberology_mode) {
                         nw_numberology_destroy(numberology_handle);
                         numberology_handle = 0;
@@ -3653,7 +2882,7 @@ int main(int argc, char **argv) {
                 if (taskhub_mode && !maze_mode && !sokoban_mode && !nback3d_mode &&
                     !marble_mode &&
                     !monkey_ladder_mode && !tetris_mode && !count_mode && !mr_time_mode &&
-                    !graph_mapping_mode && !matrix_reasoning_mode && !in_the_dark_mode && !fog_mode && !removals_mode && !custody_mode && !concentration_mode && !recognition_mode && !trivia_mode && !reflex_mode && !algebra_mode && !numberology_mode && !jigsaw_mode && !sudoku_mode && !go_mode && !crossed_wires_mode && !crossword_mode && !scrabble_mode && !scramble_mode && !ncup_monte_mode && !tracking_mode && !lookout_mode && !pursuit_mode && !out_of_sight_mode && !buzz_wire_mode && !donkey_mode && !two_hands_mode && !overrun_mode) {
+                    !graph_mapping_mode && !matrix_reasoning_mode && !in_the_dark_mode && !fog_mode && !removals_mode && !custody_mode && !concentration_mode && !recognition_mode && !trivia_mode && !reflex_mode && !algebra_mode && !numberology_mode && !syllogism_mode && !jigsaw_mode && !sudoku_mode && !go_mode && !crossed_wires_mode && !crossword_mode && !scrabble_mode && !scramble_mode && !ncup_monte_mode && !tracking_mode && !lookout_mode && !pursuit_mode && !out_of_sight_mode && !buzz_wire_mode && !donkey_mode && !two_hands_mode && !overrun_mode) {
                     if (event.key.key == SDLK_LEFT) category = (category + 6) % 7, selected = 0;
                     if (event.key.key == SDLK_RIGHT) category = (category + 1) % 7, selected = 0;
                     if (event.key.key == SDLK_UP) selected = selected > 0 ? selected - 1 : 0;
@@ -3666,6 +2895,14 @@ int main(int argc, char **argv) {
                             scrabble_options_selected = 0;
                             scrabble_options_open = true;
                             scrabble_options_from_hub = true;
+                        }
+                    }
+                    if (event.key.key == SDLK_C && category == 4 && selected == 11) {
+                        syllogism_handle = create_syllogism(&syllogism_config);
+                        syllogism_mode = syllogism_handle != 0;
+                        if (syllogism_mode) {
+                            syllogism_draft = syllogism_config; syllogism_selected = 0;
+                            syllogism_options_open = true; syllogism_options_from_hub = true;
                         }
                     }
                     if (event.key.key == SDLK_C && category == 4 && selected == 10) {
@@ -3754,6 +2991,9 @@ int main(int argc, char **argv) {
                             algebra_handle = nw_algebra_create_options(algebra_config.level, algebra_config.trials, algebra_config.show_mistakes, algebra_config.adaptive, 23);
                             algebra_mode = algebra_handle != 0;
                             if (algebra_mode) SDL_StartTextInput(window);
+                        } else if (category == 4 && selected == 11) {
+                            syllogism_handle = create_syllogism(&syllogism_config);
+                            syllogism_mode = syllogism_handle != 0;
                         } else if (category == 4 && selected == 10) {
                             numberology_handle = nw_numberology_create(numberology_config.level, numberology_config.trials, numberology_config.adaptive, 23);
                             numberology_mode = numberology_handle != 0;
@@ -4055,6 +3295,23 @@ int main(int argc, char **argv) {
                     } else if (event.key.key == SDLK_BACKSPACE) {
                         nw_algebra_action(algebra_handle, 2, 0, (int64_t)SDL_GetTicks());
                     }
+                } else if (syllogism_mode) {
+                    int64_t value = 0, phase = nw_syllogism_info(syllogism_handle, 0);
+                    int64_t action = nw_syllogism_input_key(event.key.key, phase, syllogism_options_open, syllogism_selected, &value);
+                    if (action >= 0 && action <= 6) nw_syllogism_action(syllogism_handle, action, value, SDL_GetTicks());
+                    else if (action == 101) syllogism_selected--;
+                    else if (action == 102) syllogism_selected++;
+                    else if (action == 103) nw_syllogism_options_modify(&syllogism_draft, syllogism_selected, value);
+                    else if (action == 105) { syllogism_draft = syllogism_config; syllogism_selected = 0; syllogism_options_open = true; }
+                    else if (action == 104) {
+                        int64_t fresh = create_syllogism(&syllogism_draft);
+                        if (fresh) { nw_syllogism_destroy(syllogism_handle); syllogism_handle = fresh;
+                            syllogism_config = syllogism_draft;
+                            if (!nw_syllogism_options_save(&syllogism_config)) SDL_Log("Could not save Syllogism settings"); }
+                        syllogism_options_open = false;
+                        if (syllogism_options_from_hub) { nw_syllogism_destroy(syllogism_handle); syllogism_handle = 0;
+                            syllogism_mode = false; syllogism_options_from_hub = false; }
+                    }
                 } else if (numberology_mode) {
                     int64_t now_ms = (int64_t)SDL_GetTicks();
                     int64_t phase = nw_numberology_info(numberology_handle, 0);
@@ -4083,10 +3340,12 @@ int main(int argc, char **argv) {
                     } else if (event.key.key == SDLK_O && phase != 1) {
                         numberology_draft = numberology_config; numberology_options_selected = 0;
                         numberology_level_editing = false; numberology_options_open = true;
-                    } else if (event.key.key == SDLK_SPACE && phase != 1)
-                        numberology_advance(numberology_handle, &numberology_config);
+                    } else if (event.key.key == SDLK_PAGEUP || event.key.key == SDLK_PAGEDOWN)
+                        nw_numberology_action(numberology_handle, event.key.key == SDLK_PAGEUP ? 4 : 5, 0, now_ms);
+                    else if (event.key.key == SDLK_SPACE && phase != 1)
+                        numberology_advance(numberology_handle, &numberology_config, &numberology_results);
                     else if (event.key.key == SDLK_RETURN && phase == 1)
-                        nw_numberology_action(numberology_handle, 3, 0, now_ms);
+                        numberology_submit(numberology_handle, &numberology_results, now_ms);
                     else if (event.key.key == SDLK_BACKSPACE || event.key.key == SDLK_DELETE)
                         nw_numberology_action(numberology_handle, 2, 0, now_ms);
                     else if (event.key.key == SDLK_V && phase == 1 &&
@@ -4492,51 +3751,70 @@ int main(int argc, char **argv) {
                         (int64_t)((py - event.button.y) * 1000000.0f / (float)py),
                         px, py, (int64_t)SDL_GetTicks());
             }
-            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && numberology_mode && event.button.button == SDL_BUTTON_LEFT) {
-                if (numberology_options_open) {
-                    int px = 0, py = 0; SDL_GetWindowSize(window, &px, &py);
-                    if (px > 0 && py > 0) {
-                        float x = event.button.x * 912.0f / px, y = (py - event.button.y) * 684.0f / py;
-                        for (int row = 0; row < 3; row++) {
-                            float center = 474.0f - row * 48.0f;
-                            if (x >= 102 && x <= 810 && y >= center - 18 && y <= center + 18) {
-                                if (row == numberology_options_selected) numberology_modify_option(&numberology_draft, row, 1);
-                                else numberology_options_selected = row;
-                                numberology_level_editing = false; break;
-                            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && syllogism_mode && event.button.button == SDL_BUTTON_LEFT) {
+                int w = 0, h = 0; SDL_GetWindowSize(window, &w, &h);
+                nw_view pointer_view = view_for(w, h);
+                if (pointer_view.scale > 0) {
+                    double x = (event.button.x - pointer_view.offset_x) / pointer_view.scale;
+                    double y = (pointer_view.height - pointer_view.offset_y - event.button.y) / pointer_view.scale;
+                    int64_t phase = nw_syllogism_info(syllogism_handle, 0);
+                    int64_t action = nw_syllogism_input_pointer(x, y, syllogism_options_open, phase);
+                    if (action == 0) nw_syllogism_action(syllogism_handle, 0, 0, SDL_GetTicks());
+                    else if (action >= 110 && action < 115) {
+                        int64_t row = action - 110;
+                        if (row == syllogism_selected) nw_syllogism_options_modify(&syllogism_draft, row, 1);
+                        else syllogism_selected = row;
+                    } else if (action == 100 || action == 104) {
+                        if (action == 104) {
+                            int64_t fresh = create_syllogism(&syllogism_draft);
+                            if (fresh) { nw_syllogism_destroy(syllogism_handle); syllogism_handle = fresh;
+                                syllogism_config = syllogism_draft;
+                                if (!nw_syllogism_options_save(&syllogism_config)) SDL_Log("Could not save Syllogism settings"); }
                         }
+                        syllogism_options_open = false;
+                        if (syllogism_options_from_hub) { nw_syllogism_destroy(syllogism_handle); syllogism_handle = 0;
+                            syllogism_mode = false; syllogism_options_from_hub = false; }
                     }
-                } else if (nw_numberology_info(numberology_handle, 0) != 1)
-                    numberology_advance(numberology_handle, &numberology_config);
+                }
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && numberology_mode && event.button.button == SDL_BUTTON_LEFT) {
+                int width = 0, height = 0; SDL_GetWindowSize(window, &width, &height);
+                if (numberology_options_open) {
+                    int row = (int)nw_sdl_option_row(event.button.x, event.button.y, width, height, 3);
+                    if (row >= 0) {
+                        if (row == numberology_options_selected) numberology_modify_option(&numberology_draft, row, 1);
+                        else numberology_options_selected = row;
+                        numberology_level_editing = false;
+                    }
+                } else {
+                    int64_t phase = nw_numberology_info(numberology_handle, 0);
+                    int page = 0;
+                    if (width > 0 && height > 0) {
+                        nw_view v = view_for(width, height);
+                        page = numberology_page_at((event.button.x - v.offset_x) / v.scale,
+                                                   (height - event.button.y - v.offset_y) / v.scale);
+                    }
+                    if ((phase == 1 || phase == 2) && nw_numberology_info(numberology_handle, 22) > 1 && page)
+                        nw_numberology_action(numberology_handle, page, 0, (int64_t)SDL_GetTicks());
+                    else if (phase != 1) numberology_advance(numberology_handle, &numberology_config, &numberology_results);
+                }
             }
             if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && algebra_mode && event.button.button == SDL_BUTTON_LEFT) {
                 if (algebra_options_open) {
-                    int px = 0, py = 0; SDL_GetWindowSize(window, &px, &py);
-                    if (px > 0 && py > 0) {
-                        float x = event.button.x * 912.0f / px, y = (py - event.button.y) * 684.0f / py;
-                        for (int row = 0; row < 4; row++) {
-                            float center = 474.0f - row * 48.0f;
-                            if (x >= 102 && x <= 810 && y >= center - 18 && y <= center + 18) {
-                                if (row == algebra_options_selected) algebra_modify_option(&algebra_draft, row, 1);
-                                else algebra_options_selected = row;
-                                break;
-                            }
-                        }
+                    int width = 0, height = 0; SDL_GetWindowSize(window, &width, &height);
+                    int row = (int)nw_sdl_option_row(event.button.x, event.button.y, width, height, 4);
+                    if (row >= 0) {
+                        if (row == algebra_options_selected) algebra_modify_option(&algebra_draft, row, 1);
+                        else algebra_options_selected = row;
                     }
                 } else if (nw_algebra_info(algebra_handle, 0) != 1) algebra_start(algebra_handle);
             }
             if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && scramble_mode && scramble_options_open && event.button.button == SDL_BUTTON_LEFT) {
-                int px = 0, py = 0; SDL_GetWindowSize(window, &px, &py);
-                if (px > 0 && py > 0) {
-                    float x = event.button.x * 912.0f / px, y = (py - event.button.y) * 684.0f / py;
-                    for (int row = 0; row < 4; row++) {
-                        float center = 474.0f - row * 48.0f;
-                        if (x >= 102 && x <= 810 && y >= center - 18 && y <= center + 18) {
-                            if (row == scramble_options_selected) scramble_modify_option(&scramble_draft, row, 1);
-                            else scramble_options_selected = row;
-                            break;
-                        }
-                    }
+                int width = 0, height = 0; SDL_GetWindowSize(window, &width, &height);
+                int row = (int)nw_sdl_option_row(event.button.x, event.button.y, width, height, 4);
+                if (row >= 0) {
+                    if (row == scramble_options_selected) scramble_modify_option(&scramble_draft, row, 1);
+                    else scramble_options_selected = row;
                 }
             }
             if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && scramble_mode && !scramble_options_open && event.button.button == SDL_BUTTON_LEFT &&
@@ -4552,15 +3830,10 @@ int main(int argc, char **argv) {
                 (event.button.button == SDL_BUTTON_LEFT || event.button.button == SDL_BUTTON_RIGHT)) {
                 int px = 0, py = 0; SDL_GetWindowSize(window, &px, &py);
                 if (px > 0 && py > 0 && scrabble_options_open && event.button.button == SDL_BUTTON_LEFT) {
-                    float x = event.button.x * 912.0f / px;
-                    float y = (py - event.button.y) * 684.0f / py;
-                    for (int row = 0; row < 4; row++) {
-                        float center = 474.0f - row * 48.0f;
-                        if (x >= 102 && x <= 810 && y >= center - 18 && y <= center + 18) {
-                            if (row == scrabble_options_selected) scrabble_modify_option(&scrabble_draft, row, 1);
-                            else scrabble_options_selected = row;
-                            break;
-                        }
+                    int row = (int)nw_sdl_option_row(event.button.x, event.button.y, px, py, 4);
+                    if (row >= 0) {
+                        if (row == scrabble_options_selected) scrabble_modify_option(&scrabble_draft, row, 1);
+                        else scrabble_options_selected = row;
                     }
                 } else if (px > 0 && py > 0 && !scrabble_options_open) {
                     int64_t phase = nw_scrabble_info(scrabble_handle, 0);
@@ -4580,18 +3853,12 @@ int main(int argc, char **argv) {
             }
             if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && crossword_mode &&
                 (event.button.button == SDL_BUTTON_LEFT || event.button.button == SDL_BUTTON_RIGHT)) {
-                int px = 0, py = 0;
-                SDL_GetWindowSize(window, &px, &py);
+                int px = 0, py = 0; SDL_GetWindowSize(window, &px, &py);
                 if (px > 0 && py > 0 && crossword_options_open && event.button.button == SDL_BUTTON_LEFT) {
-                    float x = event.button.x * 912.0f / px;
-                    float y = (py - event.button.y) * 684.0f / py;
-                    for (int row = 0; row < 4; row++) {
-                        float center = 474.0f - row * 48.0f;
-                        if (x >= 102 && x <= 810 && y >= center - 18 && y <= center + 18) {
-                            if (row == crossword_options_selected) crossword_modify_option(&crossword_draft, row, 1);
-                            else crossword_options_selected = row;
-                            break;
-                        }
+                    int row = (int)nw_sdl_option_row(event.button.x, event.button.y, px, py, 4);
+                    if (row >= 0) {
+                        if (row == crossword_options_selected) crossword_modify_option(&crossword_draft, row, 1);
+                        else crossword_options_selected = row;
                     }
                 } else if (px > 0 && py > 0 && !crossword_options_open)
                     nw_crossword_pointer(crossword_handle,
@@ -4693,7 +3960,11 @@ int main(int argc, char **argv) {
         SDL_GetWindowSizeInPixels(window, &width, &height);
         nw_view v = view_for(width, height);
 
-        int64_t length = numberology_mode && numberology_options_open
+        int64_t length = syllogism_mode && syllogism_options_open
+            ? nw_syllogism_options_frame_write(buffer, FRAME_CAPACITY, 0, syllogism_selected,
+                  syllogism_draft.level, syllogism_draft.trials, syllogism_draft.working, syllogism_draft.adaptive, syllogism_draft.real_words)
+            : syllogism_mode ? nw_syllogism_frame_write(buffer, FRAME_CAPACITY, syllogism_handle, 0, width, height)
+            : numberology_mode && numberology_options_open
             ? nw_numberology_options_frame_write(buffer, FRAME_CAPACITY, 0, numberology_options_selected,
                   numberology_draft.level, numberology_draft.trials, numberology_draft.adaptive)
             : algebra_mode && algebra_options_open
@@ -4853,7 +4124,9 @@ int main(int argc, char **argv) {
         if (trivia_handle) nw_trivia_destroy(trivia_handle);
     if (reflex_handle) nw_reflex_destroy(reflex_handle);
     if (algebra_handle) nw_algebra_destroy(algebra_handle);
+    if (syllogism_handle) nw_syllogism_destroy(syllogism_handle);
     if (numberology_handle) nw_numberology_destroy(numberology_handle);
+    nw_numberology_results_close(&numberology_results);
     if (jigsaw_handle) nw_jigsaw_destroy(jigsaw_handle);
     if (sudoku_handle) nw_sudoku_destroy(sudoku_handle);
     if (go_handle) nw_go_destroy(go_handle);

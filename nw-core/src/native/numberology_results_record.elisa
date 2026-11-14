@@ -1,0 +1,182 @@
+# Native-owned Numberology records. The shell sees only an opaque address.
+extern SDL_calloc(nmemb: usize, size: usize) -> mutable heap void&? can[Memory.Allocate]
+extern SDL_free(mem: heap void&) can[Memory.Release]
+extern SDL_GetCurrentTime(ticks: mutable i64&) -> bool can[Blocking.IO]
+
+module NumberologyResultsRecord:
+    struct Row:
+        trial: mutable i64
+        level: mutable i64
+        correct: mutable u8
+        judged: mutable f64
+
+    struct Record:
+        id: mutable u8[96]
+        started: mutable f64
+        level: mutable i64
+        trials: mutable i64
+        right: mutable i64
+        adaptive: mutable i32
+        completed: mutable i32
+        dirty: mutable i32
+        count: mutable i32
+        rows: mutable Row[15]
+        next: mutable usize
+
+    def create(level: i64, trials: i64, adaptive: i32, process: u64, serial: u64) -> i64:
+        can Memory.Allocate, Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+            allocated: mutable heap void&? = SDL_calloc(1.usize(), size_of(Record).usize())
+            return 0 if allocated == null
+            trusted Unsafe.PointerCast:
+                memory: mutable heap void& = allocated
+                record: mutable heap Record& = memory.cast[mutable heap Record&]
+                now: mutable i64 = 0
+                _ = SDL_GetCurrentTime(&now)
+                _ = SDL_snprintf(&record.id[0], 96.usize(), "numberology-%llu-%llu-%llu", now.u64(), process, serial)
+                record.started <- now.f64() / 1000000000.0
+                record.level <- level
+                record.trials <- trials
+                record.adaptive <- adaptive
+                return memory.uintptr().i64()
+
+    def destroy(address: i64):
+        can Memory.Release, Unsafe.PointerCast:
+            return if address == 0
+            trusted Unsafe.PointerCast:
+                SDL_free(address.uintptr().cast[heap void&])
+
+    def judge(address: i64, trial: i64, level: i64, correct: i32) -> i32:
+        can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+            return 0 if address == 0
+            trusted Unsafe.PointerCast:
+                record: mutable heap Record& = address.uintptr().cast[mutable heap Record&]
+                previous: mutable i64 = 0
+                previous <- record.rows[(record.count - 1.i32()).usize()].trial if record.count > 0.i32() and record.count <= 15.i32()
+                return 0 if numberology_results_accept(record.count, previous, trial) == 0.i32()
+                index: usize = record.count.usize()
+                record.rows[index].trial <- trial
+                record.rows[index].level <- level
+                record.rows[index].correct <- correct.u8()
+                now: mutable i64 = 0
+                _ = SDL_GetCurrentTime(&now)
+                record.rows[index].judged <- now.f64() / 1000000000.0
+                record.count <- record.count + 1.i32()
+                record.dirty <- 1
+                return 1
+
+    def finish(address: i64, right: i64):
+        can Unsafe.PointerCast:
+            return if address == 0
+            trusted Unsafe.PointerCast:
+                record: mutable heap Record& = address.uintptr().cast[mutable heap Record&]
+                record.completed <- 1
+                record.right <- right
+                record.dirty <- 1
+
+    def persist(address: i64, serial: u64) -> i32:
+        can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+            return 1 if address == 0
+            trusted Unsafe.PointerCast:
+                record: mutable heap Record& = address.uintptr().cast[mutable heap Record&]
+                return 1 if record.dirty == 0.i32() or record.count == 0.i32()
+                ok: i32 = numberology_results_persist(&record.id[0], record.started, record.level, record.trials, record.adaptive, record.count, record.completed, record.right,
+                    (&record.rows[0].trial).uintptr().i64(), (&record.rows[0].level).uintptr().i64(),
+                    (&record.rows[0].correct).uintptr().i64(), (&record.rows[0].judged).uintptr().i64(), size_of(Row).i64(), serial)
+                record.dirty <- 0 if ok != 0.i32()
+                return ok
+
+export fn nw_numberology_record_create(level: i64, trials: i64, adaptive: i32, process: u64, serial: u64) -> i64 = NumberologyResultsRecord::create
+export fn nw_numberology_record_destroy(address: i64) = NumberologyResultsRecord::destroy
+export fn nw_numberology_record_judge(address: i64, trial: i64, level: i64, correct: i32) -> i32 = NumberologyResultsRecord::judge
+export fn nw_numberology_record_finish(address: i64, right: i64) = NumberologyResultsRecord::finish
+export fn nw_numberology_record_persist(address: i64, serial: u64) -> i32 = NumberologyResultsRecord::persist
+
+extern SDL_rand_bits() -> u32
+
+module NumberologyResultsManager:
+    def retry(manager: mutable usize&?):
+        can Blocking.IO, Console.Write, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return if manager == null
+            trusted Unsafe.PointerCast:
+                pointer: mutable usize& = manager
+                slots: mutable heap usize& = pointer.cast[mutable heap usize&]
+                previous: mutable i64 = 0
+                current: mutable i64 = slots[1].i64()
+                while current != 0 |current, previous, slots|:
+                    record: mutable heap NumberologyResultsRecord::Record& = current.uintptr().cast[mutable heap NumberologyResultsRecord::Record&]
+                    next: i64 = record.next.i64()
+                    if NumberologyResultsRecord::persist(current, SDL_GetTicksNS()) != 0.i32():
+                        if previous == 0:
+                            slots[1] <- next.usize()
+                        else:
+                            prev: mutable heap NumberologyResultsRecord::Record& = previous.uintptr().cast[mutable heap NumberologyResultsRecord::Record&]
+                            prev.next <- next.usize()
+                        NumberologyResultsRecord::destroy(current)
+                    else:
+                        SDL_Log("Could not save Numberology results")
+                        previous <- current
+                    current <- next
+                if slots[0] != 0.usize():
+                    if NumberologyResultsRecord::persist(slots[0].i64(), SDL_GetTicksNS()) == 0.i32():
+                        SDL_Log("Could not save Numberology results")
+
+    def start(manager: mutable usize&?, level: i64, trials: i64, adaptive: i32):
+        can Memory.Allocate, Memory.Release, Blocking.IO, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return if manager == null
+            trusted Unsafe.PointerCast:
+                pointer: mutable usize& = manager
+                slots: mutable heap usize& = pointer.cast[mutable heap usize&]
+                if slots[0] != 0.usize():
+                    old: mutable heap NumberologyResultsRecord::Record& = slots[0].cast[mutable heap NumberologyResultsRecord::Record&]
+                    if old.dirty != 0.i32():
+                        old.next <- slots[1]
+                        slots[1] <- slots[0]
+                    else:
+                        NumberologyResultsRecord::destroy(slots[0].i64())
+                slots[0] <- 0.usize()
+                created: i64 = NumberologyResultsRecord::create(level, trials, adaptive, SDL_rand_bits().u64(), SDL_GetTicksNS())
+                if created == 0:
+                    SDL_Log("Could not allocate Numberology result")
+                    return
+                slots[0] <- created.usize()
+                retry(manager)
+
+    def judge(manager: mutable usize&?, trial: i64, level: i64, correct: i32):
+        can Memory.Release, Blocking.IO, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return if manager == null
+            trusted Unsafe.PointerCast:
+                pointer: mutable usize& = manager
+                slots: mutable heap usize& = pointer.cast[mutable heap usize&]
+                if NumberologyResultsRecord::judge(slots[0].i64(), trial, level, correct) != 0.i32():
+                    retry(manager)
+
+    def finish(manager: mutable usize&?, right: i64):
+        can Memory.Release, Blocking.IO, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return if manager == null
+            trusted Unsafe.PointerCast:
+                pointer: mutable usize& = manager
+                slots: mutable heap usize& = pointer.cast[mutable heap usize&]
+                return if slots[0] == 0.usize()
+                NumberologyResultsRecord::finish(slots[0].i64(), right)
+                retry(manager)
+
+    def close(manager: mutable usize&?):
+        can Memory.Release, Blocking.IO, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return if manager == null
+            retry(manager)
+            trusted Unsafe.PointerCast:
+                pointer: mutable usize& = manager
+                slots: mutable heap usize& = pointer.cast[mutable heap usize&]
+                NumberologyResultsRecord::destroy(slots[0].i64())
+                slots[0] <- 0.usize()
+                while slots[1] != 0.usize() |slots|:
+                    address: i64 = slots[1].i64()
+                    record: mutable heap NumberologyResultsRecord::Record& = address.uintptr().cast[mutable heap NumberologyResultsRecord::Record&]
+                    slots[1] <- record.next
+                    NumberologyResultsRecord::destroy(address)
+
+export fn nw_numberology_results_start(manager: mutable usize&?, level: i64, trials: i64, adaptive: i32) = NumberologyResultsManager::start
+export fn nw_numberology_results_judge(manager: mutable usize&?, trial: i64, level: i64, correct: i32) = NumberologyResultsManager::judge
+export fn nw_numberology_results_finish(manager: mutable usize&?, right: i64) = NumberologyResultsManager::finish
+export fn nw_numberology_results_retry(manager: mutable usize&?) = NumberologyResultsManager::retry
+export fn nw_numberology_results_close(manager: mutable usize&?) = NumberologyResultsManager::close

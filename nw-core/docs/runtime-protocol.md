@@ -653,14 +653,28 @@ answer-display flag, and adaptive flag. The controller-specific info fields
 also expose right/asked counts, highest correct level, elapsed seconds, and
 the raw grid/pellet/line options.
 
+Syllogism create options are level, trial count, disable-working,
+disable-adaptive, use-invented-words, and zero. The three boolean switches are
+zero by default, matching the source defaults of showing working, adapting, and
+using real words. Actions 0–5 start, submit, or move the selection; action 6
+selects and submits the zero-based option in `value`. The answer accessor is
+hidden until judgment. Info fields 9–13 expose best correct level, the three
+configured flags, and generation failure. The source changes require a fresh
+artifact before these fields and actions are available.
+
 Numberology's twelve common fields are phase (`READY=0`, `WORKING=1`,
 `JUDGED=2`, `DONE=3`), current level, trial, total trials, shown-term count,
 answer, typed numeric value, typed digit count, verdict (-1/0/1), adaptive
-flag, correct count, and rule complexity. The additive
-`nw_api_v1_numberology_info` accessor exposes the generated rule ID/parameters,
-the next adaptive level, and the source explanation fields; the term accessor
-returns each displayed sequence term without exposing a shell-owned answer
-table.
+flag, correct count, and rule complexity. The answer field is -1 until judgment;
+its i64 fit flag is likewise hidden until judgment. The additive
+`nw_api_v1_numberology_info` accessor exposes rule ID, complexity, next adaptive
+level, exact-text lengths and fit flags. `nw_api_v1_numberology_value` returns
+bytes for displayed terms and typed digits, and returns answer bytes only
+after judgment. The term accessor returns displayed terms as i64 values.
+Out-of-range legacy scalars return zero; exact decimal bytes avoid narrowing. Numberology actions 4 and 5 move
+between visible pages; info fields 21–24 report the current page, total pages,
+sequence pages, and revealed-answer pages. Answer pages exist only after an
+incorrect judgment.
 
 In the Dark's twelve common fields are phase (`READY=0`, `WALKING=1`,
 `ASKING=2`, `SCORED=3`, `DONE=4`), current rung, trial, total trials, lamp

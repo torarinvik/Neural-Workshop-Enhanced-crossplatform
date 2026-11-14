@@ -11,4 +11,6 @@ assert.match(source,/if \(isNumberologyTask\(\)\) destroyNumberologyRun\(\)/);
 const keyboard=source.slice(source.lastIndexOf('if (isNumberologyTask()) {'));
 assert.match(keyboard,/apiDispatchText\(handle, event\.key\)/);
 assert.match(keyboard,/NUMBEROLOGY_ACTION\.backspace/);
+assert.match(keyboard,/PageUp/);
+assert.match(keyboard,/NUMBEROLOGY_ACTION\.nextPage/);
 console.log('Numberology browser contract: route, exact-byte access, keyboard and cleanup present');

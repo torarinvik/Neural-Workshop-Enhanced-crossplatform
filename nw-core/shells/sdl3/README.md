@@ -35,6 +35,17 @@ src/native/sdl_exports.elisa. `nw_frame_alloc` returns a real native pointer
 Tetris uses the same controller kernel and display scene as the browser and
 Python adapters.
 
+## Elisa migration
+
+Syllogism option validation, command-line parsing and settings persistence now
+live in `src/native/syllogism_options*.elisa`. They call SDL3 through its native
+FFI for environment, clock and file operations; writes use an exclusive temporary
+file and atomic rename. `test/syllogism_sdl_options_test.py` compiles this unit
+with Stage0 and tests the C ABI directly through Python `ctypes`, without a C
+implementation or a window. The main SDL event loop, renderer, display-list
+decoder and Numberology results helper still contain C and remain to be ported.
+A fresh Stage1 product is required to verify the full SDL artifact.
+
 ## Coverage
 
 The decoder handles RECT, BORDERED_RECT, BOX, CIRCLE, ARC, LINE, TRIANGLE,
@@ -51,7 +62,7 @@ count as proof of a valid frame.
 1. Build against the real latest Stage1 core object on each supported desktop
    platform.
 2. Compare title frames against the browser at the same banner and theme.
-3. Keep test/display_decode.py and display_list.h line-comparable as the
+3. Keep test/display_decode.py and src/native/display_decode.elisa consistent as the
    display-list protocol evolves.
 
 The headless selftests prove ABI decoding, the Tetris lifecycle, and

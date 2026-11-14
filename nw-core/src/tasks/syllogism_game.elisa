@@ -5,6 +5,8 @@ module SyllogismGame:
     const TASK_ID: i64 = 199098354
     const MAX_TEXT: i64 = 32768
     const MAX_OPTIONS: i64 = 32
+    const MAX_LINES: i64 = 40
+    const MAX_WORKING: i64 = 64
     const READY: i64 = 0
     const ASKING: i64 = 1
     const JUDGED: i64 = 2
@@ -15,14 +17,21 @@ module SyllogismGame:
     const RIGHT: i64 = 3
     const UP: i64 = 4
     const DOWN: i64 = 5
+    const CHOOSE: i64 = 6
 
     struct Run:
         rng: mutable MT19937
         rung: mutable i64
+        start_rung: mutable i64
         trials: mutable i64
+        show_working: mutable bool
+        adaptive: mutable bool
+        real_words: mutable bool
+        best_rung: mutable i64
         trial: mutable i64
         right: mutable i64
         phase: mutable i64
+        generation_failed: mutable bool
         verdict: mutable i64
         choice: mutable i64
         answer: mutable i64
@@ -30,8 +39,12 @@ module SyllogismGame:
         option_count: mutable i64
         text: mutable u8[MAX_TEXT]
         used: mutable i64
-        premise_start: mutable i64
-        premise_len: mutable i64
+        line_count: mutable i64
+        line_start: mutable i64[MAX_LINES]
+        line_len: mutable i64[MAX_LINES]
+        working_count: mutable i64
+        working_start: mutable i64[MAX_WORKING]
+        working_len: mutable i64[MAX_WORKING]
         asked_start: mutable i64
         asked_len: mutable i64
         options_start: mutable i64[MAX_OPTIONS]
@@ -40,13 +53,13 @@ module SyllogismGame:
     def allowed_rung(value: i64) -> bool:
         return value >= 1 and value <= Syllogism::GRADE_COUNT
     def allowed_trials(value: i64) -> bool:
-        return value >= 1 and value <= 100
+        return value == 1 or value == 2 or value == 3 or value == 5 or value == 6 or value == 8 or value == 10 or value == 15
 
     def clear(run: mutable Run&):
         can Abort.Panic:
             run.used <- 0
-            run.premise_start <- 0
-            run.premise_len <- 0
+            run.line_count <- 0
+            run.working_count <- 0
             run.asked_start <- 0
             run.asked_len <- 0
             run.option_count <- 0
@@ -54,79 +67,102 @@ module SyllogismGame:
             run.answer <- -1
             run.family <- 0
 
-    def append_view(run: mutable Run&, view: sview) -> i64:
-        can Abort.Panic:
-            start: i64 = run.used
-            length: i64 = sview_len(view).i64()
-            for at in 0..<length |at, run, view, start|:
-                run.text[(start + at).usize()] <- sview_at(view, at.usize())
-            run.used <- start + length
-            return start
-
-    def deal(run: mutable Run&):
+    def deal(run: mutable Run&) -> bool:
         can Memory.Allocate, Abort.Panic:
+            success: mutable bool = false
+            seed: i64 = py_randbelow(&run.rng, 1073741824.u64()).i64()
             region question(67108864):
                 in question:
-                    grade: mutable Syllogism::Grade = Syllogism::grade_of(run.rung)
-                    names: mutable Syllogism::Names = Syllogism::Names()
                     work: mutable Syllogism::Work = Syllogism::Work()
                     q: mutable Syllogism::Question = Syllogism::Question()
-                    _ = Syllogism::deal_one(&grade, &run.rng, true, &work, &q)
-                    run.family <- q.family
-                    run.answer <- q.answer
-                    run.option_count <- q.option_count
-                    premise: mutable i64 = 0
-                    for line in 0..<q.line_count |line, q, run, premise|:
-                        if line > 0:
-                            run.text[run.used.usize()] <- 10.u8()
-                            run.used <- run.used + 1
-                        premise <- append_view(run, Syllogism::line_at(q, line))
-                    run.premise_start <- 0
-                    run.premise_len <- run.used
-                    run.asked_start <- append_view(run, Syllogism::slice(q, q.asked_start, q.asked_len))
-                    run.asked_len <- q.asked_len
-                    for option in 0..<q.option_count |option, q, run|:
-                        run.options_start[option.usize()] <- append_view(run, Syllogism::option_at(q, option))
-                        run.options_len[option.usize()] <- sview_len(Syllogism::option_at(q, option)).i64()
+                    success <- Syllogism::generate(run.rung, seed, not run.real_words, &work, &q)
+                    success <- false if q.used < 0 or q.used > MAX_TEXT or q.line_count < 0 or q.line_count > MAX_LINES or q.working_count < 0 or q.working_count > MAX_WORKING or q.option_count <= 0 or q.option_count > MAX_OPTIONS or q.answer < 0 or q.answer >= q.option_count
+                    if success:
+                        run.family <- q.family
+                        run.answer <- q.answer
+                        run.option_count <- q.option_count
+                        run.line_count <- q.line_count
+                        run.working_count <- q.working_count
+                        run.used <- q.used
+                        for at in 0..<q.used |at, q, run|:
+                            run.text[at.usize()] <- Bytes::at_ref(&q.text, at)
+                        run.asked_start <- q.asked_start
+                        run.asked_len <- q.asked_len
+                        for line in 0..<q.line_count |line, q, run|:
+                            run.line_start[line.usize()] <- Ints::at(q.lines, line * 2)
+                            run.line_len[line.usize()] <- Ints::at(q.lines, line * 2 + 1)
+                        for line in 0..<q.working_count |line, q, run|:
+                            run.working_start[line.usize()] <- Ints::at(q.working, line * 2)
+                            run.working_len[line.usize()] <- Ints::at(q.working, line * 2 + 1)
+                        for option in 0..<q.option_count |option, q, run|:
+                            run.options_start[option.usize()] <- Ints::at(q.options, option * 2)
+                            run.options_len[option.usize()] <- Ints::at(q.options, option * 2 + 1)
                 destroy question
+            return success
 
-    def initialize(run: mutable Run&, rung: i64, trials: i64, seed: i64):
+    def initialize(run: mutable Run&, rung: i64, trials: i64, show_working: bool,
+                   adaptive: bool, real_words: bool, seed: i64):
         can Abort.Panic:
             run.rng <- mt19937_new()
             mt_seed_int(&run.rng, seed.u64())
             run.rung <- rung
+            run.start_rung <- rung
             run.trials <- trials
+            run.show_working <- show_working
+            run.adaptive <- adaptive
+            run.real_words <- real_words
+            run.best_rung <- 0
             run.trial <- 0
             run.right <- 0
             run.phase <- READY
+            run.generation_failed <- false
             run.verdict <- -1
             clear(run)
 
     def apply(run: mutable Run&, action: i64, value: i64, now_ms: i64) -> i64:
         can Memory.Allocate, Abort.Panic:
-            _ = value
             _ = now_ms
             if action == START:
                 if run.phase == ASKING: return 2
-                if run.trial >= run.trials:
+                if run.phase == DONE:
+                    run.trial <- 0
+                    run.right <- 0
+                    run.best_rung <- 0
+                    run.rung <- run.start_rung
+                    run.generation_failed <- false
+                elif run.trial >= run.trials:
                     run.phase <- DONE
-                    return 2
+                    return 1
                 run.trial <- run.trial + 1
                 clear(run)
-                deal(run)
-                run.phase <- ASKING
+                if deal(run):
+                    run.phase <- ASKING
+                else:
+                    clear(run)
+                    run.generation_failed <- true
+                    run.phase <- DONE
                 run.verdict <- -1
                 return 1
             if run.phase != ASKING: return 2
             if action == LEFT or action == UP:
-                run.choice <- run.choice - 1 if run.choice > 0
+                run.choice <- run.choice - 1 if run.choice > 0 else run.option_count - 1
                 return 1
             if action == RIGHT or action == DOWN:
-                run.choice <- run.choice + 1 if run.choice + 1 < run.option_count
+                run.choice <- run.choice + 1 if run.choice + 1 < run.option_count else 0
                 return 1
-            if action == ANSWER:
+            if action == CHOOSE:
+                return 2 if value < 0 or value >= run.option_count
+                run.choice <- value
+            if action == ANSWER or action == CHOOSE:
                 run.verdict <- 1 if run.choice == run.answer else 0
-                if run.verdict == 1: run.right <- run.right + 1
+                if run.verdict == 1:
+                    run.right <- run.right + 1
+                    run.best_rung <- run.rung if run.rung > run.best_rung else run.best_rung
+                if run.adaptive:
+                    if run.verdict == 1 and run.rung < Syllogism::GRADE_COUNT:
+                        run.rung <- run.rung + 1
+                    elif run.verdict == 0 and run.rung > 1:
+                        run.rung <- run.rung - 1
                 run.phase <- JUDGED
                 return 1
             return 2
@@ -141,12 +177,40 @@ module SyllogismGame:
         if field == 6: return run.choice
         if field == 7: return run.verdict
         if field == 8: return run.right
+        if field == 9: return run.best_rung
+        if field == 10: return 1 if run.show_working else 0
+        if field == 11: return 1 if run.adaptive else 0
+        if field == 12: return 1 if run.real_words else 0
+        if field == 13: return 1 if run.generation_failed else 0
         return -1
 
     def value(run: Run&, field: i64, at: i64) -> i64:
-        if field == 0: return run.answer if at == 0 else -1
+        if field == 0: return run.answer if at == 0 and run.phase == JUDGED else -1
         if field == 1: return run.options_start[at.usize()] if at >= 0 and at < run.option_count else -1
         return -1
+
+    def family_hint(family: i64) -> sview:
+        if family == Syllogism::ORDER: return sview("no two of them are equal, so \"not more than\" means \"less than\"", 0, -1)
+        if family == Syllogism::PARITY: return sview("there are two ways to be and no third", 0, -1)
+        if family == Syllogism::PLANE: return sview("one square at a time; \"north and east\" means north of it and east of it", 0, -1)
+        if family == Syllogism::SPACE: return sview("one square at a time, in three directions", 0, -1)
+        if family == Syllogism::CATEGORICAL: return sview("\"every X is a Y\" does not say there are any X", 0, -1)
+        if family == Syllogism::META: return sview("the same kind means the same relation, not the same things", 0, -1)
+        return sview("a claim can be true, false, or not settled by the lines", 0, -1)
+
+    def grade_name(rung: i64) -> sview:
+        if rung == 1: return sview("same or opposite", 0, -1)
+        if rung == 2: return sview("more and less", 0, -1)
+        if rung == 3: return sview("a gap in the chain", 0, -1)
+        if rung == 4: return sview("not more than", 0, -1)
+        if rung == 5: return sview("all and at least one", 0, -1)
+        if rung == 6: return sview("which way from here", 0, -1)
+        if rung == 7: return sview("nine lines, and two that matter", 0, -1)
+        if rung == 8: return sview("three at once", 0, -1)
+        if rung == 9: return sview("up and down as well", 0, -1)
+        if rung == 10: return sview("the same kind of thing", 0, -1)
+        if rung == 11: return sview("two questions, one answer", 0, -1)
+        return sview("three questions, one answer", 0, -1)
 
     def render(run: Run&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
         can Memory.Allocate, Abort.Panic:
@@ -161,11 +225,37 @@ module SyllogismGame:
                     sx: f64 = width / Display::REFERENCE_WIDTH
                     sy: f64 = height / Display::REFERENCE_HEIGHT
                     paint: SceneSyllogism::Paint = SceneSyllogism::paint_of(black, width, height, sx, sy)
-                    premises: sview = string_view_slice(bytes_view(text), run.premise_start, run.premise_start + run.premise_len) if run.premise_len > 0 else sview("", 0, -1)
+                    premises: mutable dstr = []
+                    count: i64 = run.working_count if run.phase == JUDGED and run.show_working else run.line_count
+                    for line in 0..<count |line, run, text, premises|:
+                        if line > 0:
+                            premises.push(10.u8())
+                        start: i64 = run.working_start[line.usize()] if run.phase == JUDGED and run.show_working else run.line_start[line.usize()]
+                        length: i64 = run.working_len[line.usize()] if run.phase == JUDGED and run.show_working else run.line_len[line.usize()]
+                        dstr_append_sview(&premises, string_view_slice(bytes_view(text), start, start + length))
                     asked: sview = string_view_slice(bytes_view(text), run.asked_start, run.asked_start + run.asked_len) if run.asked_len > 0 else sview("", 0, -1)
-                    message: sview = sview("Press Space to start", 0, -1) if run.phase == READY else sview("Choose an answer", 0, -1)
+                    message: mutable dstr = []
+                    if run.generation_failed:
+                        dstr_append_cstr(&message, "No question could be built at this level")
+                    elif run.phase == READY:
+                        dstr_append_cstr(&message, "Press Space to start")
+                    elif run.phase == ASKING:
+                        dstr_append_sview(&message, grade_name(run.rung))
+                    elif run.phase == JUDGED:
+                        if run.verdict == 1:
+                            dstr_append_cstr(&message, "Right")
+                        else:
+                            dstr_append_cstr(&message, "No — it was \"")
+                            dstr_append_sview(&message, get options[run.answer.usize()] else sview("", 0, -1))
+                            dstr_append_cstr(&message, "\"")
+                    else:
+                        dstr_append_i64(&message, run.right)
+                        dstr_append_cstr(&message, " of ")
+                        dstr_append_i64(&message, run.trial)
+                        dstr_append_cstr(&message, " right, highest level ")
+                        dstr_append_i64(&message, run.best_rung)
                     SceneSyllogism::render(list, &paint, run.phase, run.option_count > 0,
-                        premises, 4, asked, sview("", 0, -1), options, run.choice,
-                        run.answer, run.trial, run.trials, message, run.verdict,
-                        sview("", 0, -1))
+                        bytes_view(premises), run.line_count, asked, family_hint(run.family), options, run.choice,
+                        run.choice if run.phase == JUDGED else -1, run.trial, run.trials, bytes_view(message), run.verdict,
+                        sview("Right", 0, -1) if run.verdict == 1 else sview("No", 0, -1))
                 destroy frame

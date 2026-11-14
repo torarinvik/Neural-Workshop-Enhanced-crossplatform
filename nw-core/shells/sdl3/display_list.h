@@ -53,60 +53,13 @@ typedef struct {
     uint32_t      pool_len;
 } nw_frame;
 
-static inline uint32_t nw_read_u32(const uint8_t *at) {
-    uint32_t v;                       /* the encoder writes little-endian */
-    memcpy(&v, at, 4);
-    return v;
-}
-
-static inline float nw_read_f32(const uint8_t *at) {
-    float v;
-    memcpy(&v, at, 4);
-    return v;
-}
-
-/* Decodes in place: `out->commands` is a view into `bytes`, valid as long as it
- * is. Returns 0 on a bad header rather than trusting the buffer. `scratch` must
- * hold at least `count` commands; the caller owns it. */
-static inline int nw_decode(const uint8_t *bytes, size_t length, nw_cmd *scratch,
-                            size_t scratch_count, nw_frame *out) {
-    if (length < 16) return 0;
-    if (nw_read_u32(bytes) != NW_DL_MAGIC) return 0;
-    if (nw_read_u32(bytes + 4) != NW_DL_VERSION) return 0;
-    uint32_t count = nw_read_u32(bytes + 8);
-    uint32_t pool_len = nw_read_u32(bytes + 12);
-    if (count > scratch_count) return 0;
-    if (16 + (size_t)count * NW_DL_CMD_SIZE + pool_len > length) return 0;
-
-    for (uint32_t i = 0; i < count; i++) {
-        const uint8_t *at = bytes + 16 + (size_t)i * NW_DL_CMD_SIZE;
-        scratch[i].kind  = at[0];
-        scratch[i].color = nw_read_u32(at + 4);
-        scratch[i].a = nw_read_f32(at + 8);
-        scratch[i].b = nw_read_f32(at + 12);
-        scratch[i].c = nw_read_f32(at + 16);
-        scratch[i].d = nw_read_f32(at + 20);
-        scratch[i].e = nw_read_f32(at + 24);
-        scratch[i].f = nw_read_f32(at + 28);
-        scratch[i].ref = nw_read_u32(at + 32);
-        scratch[i].len = nw_read_u32(at + 36);
-    }
-    out->commands = scratch;
-    out->count = count;
-    out->pool = bytes + 16 + (size_t)count * NW_DL_CMD_SIZE;
-    out->pool_len = pool_len;
-    return 1;
-}
+/* Implemented in Elisa; scratch and frame remain borrowed caller-owned storage. */
+int nw_decode(const uint8_t *bytes, size_t length, nw_cmd *scratch,
+              size_t scratch_count, nw_frame *out);
 
 /* Text/marker payload. Returns the length and points `text` at pool bytes --
  * NOT NUL-terminated, so callers copy before handing it to a C string API. */
-static inline uint32_t nw_text_of(const nw_frame *frame, const nw_cmd *cmd,
-                                  const uint8_t **text) {
-    uint32_t len = cmd->len & 0xffffffu;
-    if (cmd->ref + len > frame->pool_len) { *text = NULL; return 0; }
-    *text = frame->pool + cmd->ref;
-    return len;
-}
+uint32_t nw_text_of(const nw_frame *frame, const nw_cmd *cmd, const uint8_t **text);
 
 #define NW_ANCHOR_OF(cmd) (((cmd)->len >> 24) & 0xffu)
 

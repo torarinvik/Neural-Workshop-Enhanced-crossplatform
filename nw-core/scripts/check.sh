@@ -27,6 +27,13 @@ case "$STAGES" in
         ;;
 esac
 
+# Parse the Numberology sources independently before loading the selected
+# runtime. This distinguishes a source syntax regression from runtime/toolchain
+# incompatibility in the full Stage0 differential build.
+if [[ "${SUITE:-}" == numberology_exact && ( "$STAGES" == "stage0" || "$STAGES" == "both" ) ]]; then
+    python3 "$ROOT/test/numberology_syntax_test.py" || exit 1
+fi
+
 # Stage0 differential compiles may cause the selected compiler to emit its
 # generated fmt_*_probe.elisa fixtures. Establish freshness before that can
 # happen, then allow those generated probe mtimes during the Stage1 loop. This

@@ -27,6 +27,9 @@ state and lifecycle implementation.
 from __future__ import annotations
 
 import argparse
+import json
+import tempfile
+import uuid
 import math
 import os
 import sys
@@ -1357,9 +1360,183 @@ class AlgebraSession:
             self.handle = 0
 
 
+SYLLOGISM_TRIALS = (1, 2, 3, 5, 6, 8, 10, 15)
+
+
+def syllogism_settings_path() -> Path:
+    override = os.environ.get("NW_SYLLOGISM_SETTINGS_PATH")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA", str(Path.home()))) / "Neural Workshop" / "syllogism-options"
+    return Path.home() / ".neural-workshop" / "syllogism-options"
+
+
+def read_syllogism_settings() -> tuple[int, int, int, int, int]:
+    try:
+        fields = tuple(map(int, syllogism_settings_path().read_text(encoding="ascii").split()))
+        if len(fields) == 5 and 1 <= fields[0] <= 12 and fields[1] in SYLLOGISM_TRIALS and all(value in (0, 1) for value in fields[2:]):
+            return fields
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return (3, 6, 1, 1, 1)
+
+
+def write_syllogism_settings(values) -> bool:
+    path = syllogism_settings_path()
+    temporary = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=path.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write("%d %d %d %d %d\n" % tuple(values))
+        os.replace(temporary, path)
+        return True
+    except OSError as error:
+        print(f"Could not save Syllogism settings: {error}", file=sys.stderr)
+        return False
+    finally:
+        if temporary is not None:
+            try: temporary.unlink(missing_ok=True)
+            except OSError: pass
+
+
+class SyllogismSession:
+    """Python host for the shared generated Syllogisms controller."""
+    ACTION_START = 0
+    def __init__(self, core, args) -> None:
+        self.core, self.args = core, args
+        saved = read_syllogism_settings()
+        self.options = [getattr(args, 'syllogism_level', None) or saved[0],
+                        getattr(args, 'syllogism_trials', None) or saved[1],
+                        saved[2] if getattr(args, 'syllogism_no_working', None) is None else int(not args.syllogism_no_working),
+                        saved[3] if getattr(args, 'syllogism_no_adaptive', None) is None else int(not args.syllogism_no_adaptive),
+                        saved[4] if getattr(args, 'syllogism_invented_words', None) is None else int(not args.syllogism_invented_words)]
+        self.handle = core.syllogism_create(*self.options, args.seed)
+        if self.handle <= 0: raise SystemExit("native Syllogism rejected its options")
+        self.black_background = args.black_background
+        self.options_draft = None
+        self.options_selection = 0
+        self.options_from_hub = False
+
+    @property
+    def state(self):
+        return tuple(self.core.syllogism_info(self.handle, field) for field in range(14))
+
+    def frame_bytes(self, _core, width=912, height=684):
+        if self.options_draft is not None:
+            return self.core.syllogism_options_frame(int(self.black_background), self.options_selection, *self.options_draft)
+        return self.core.syllogism_frame(self.handle, int(self.black_background), width, height)
+
+    def describe(self, _frame):
+        state = self.state
+        phase = ("ready", "asking", "judged", "done")[state[0]] if 0 <= state[0] < 4 else "unknown"
+        return f"Syllogisms {phase} · question {state[2]}/{state[3]} · right {state[8]}"
+
+    def action(self, action, value=0):
+        self.core.syllogism_action(self.handle, action, value, int(time.monotonic() * 1000))
+
+    def modify_option(self, delta):
+        choices = (tuple(range(1, 13)), SYLLOGISM_TRIALS, (0, 1), (0, 1), (0, 1))
+        row = self.options_selection
+        values = choices[row]
+        self.options_draft[row] = values[(values.index(self.options_draft[row]) + delta) % len(values)]
+
+    def key(self, symbol, key):
+        if self.options_draft is not None:
+            if symbol == key.ESCAPE: self.options_draft = None
+            elif symbol == key.UP: self.options_selection = max(0, self.options_selection - 1)
+            elif symbol == key.DOWN: self.options_selection = min(4, self.options_selection + 1)
+            elif symbol in (key.LEFT, key.RIGHT, key.SPACE): self.modify_option(-1 if symbol == key.LEFT else 1)
+            elif symbol == key.RETURN: self.apply_options()
+            return
+        phase = self.state[0]
+        if symbol == key.O and phase != 1:
+            self.options_draft = list(self.options); self.options_selection = 0
+        elif symbol == key.SPACE:
+            self.action(1 if phase == 1 else 0)
+        elif symbol == key.RETURN and phase == 1: self.action(1)
+        elif phase == 1 and symbol in (key.LEFT, key.UP): self.action(2 if symbol == key.LEFT else 4)
+        elif phase == 1 and symbol in (key.RIGHT, key.DOWN): self.action(3 if symbol == key.RIGHT else 5)
+        elif phase == 1 and key._1 <= symbol <= key._9: self.action(6, symbol - key._1)
+
+    def apply_options(self):
+        if self.options_draft is None: return
+        fresh = self.core.syllogism_create(*self.options_draft, self.args.seed)
+        if fresh > 0:
+            self.core.syllogism_destroy(self.handle); self.handle = fresh
+            self.options = list(self.options_draft)
+            (self.args.syllogism_level, self.args.syllogism_trials) = self.options[:2]
+            self.args.syllogism_no_working = not self.options[2]
+            self.args.syllogism_no_adaptive = not self.options[3]
+            self.args.syllogism_invented_words = not self.options[4]
+            write_syllogism_settings(self.options)
+        self.options_draft = None
+
+    def pointer(self, x, y, width, height, button=0, _motion=False):
+        if button != 0: return
+        if self.options_draft is not None:
+            viewport = Viewport(width, height)
+            rx, ry = (x - viewport.offset_x) / viewport.scale, (y - viewport.offset_y) / viewport.scale
+            if 94 <= ry <= 132 and 170 <= rx <= 360:
+                self.options_draft = None
+                return
+            if 94 <= ry <= 132 and 552 <= rx <= 742:
+                self.apply_options()
+                return
+            row = round((474 - ry) / 48)
+            if 102 <= rx <= 810 and 0 <= row < 5 and abs(ry - (474 - row * 48)) <= 18:
+                if row == self.options_selection: self.modify_option(1)
+                else: self.options_selection = row
+        elif self.state[0] != 1: self.action(0)
+
+    def close(self):
+        if self.handle > 0:
+            self.core.syllogism_destroy(self.handle); self.handle = 0
+
+
+def numberology_page_at(x: float, y: float) -> int:
+    if not 342 <= y <= 388:
+        return 0
+    if 170 <= x <= 360:
+        return 4
+    if 552 <= x <= 742:
+        return 5
+    return 0
+
+
+def numberology_results_dir() -> Path:
+    override = os.environ.get("NW_NUMBEROLOGY_RESULTS_DIR")
+    return Path(override).expanduser() if override else numberology_settings_path().parent / "results" / "numberology"
+
+
+def write_numberology_result(record) -> bool:
+    """Atomically replace one session record; never truncate an existing result."""
+    directory = numberology_results_dir()
+    temporary = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, delete=False) as output:
+            temporary = Path(output.name)
+            json.dump(record, output, ensure_ascii=False, separators=(",", ":"))
+            output.write("\n")
+        os.replace(temporary, directory / (record["id"] + ".json"))
+        return True
+    except OSError as error:
+        print(f"Could not save Numberology result: {error}", file=sys.stderr)
+        return False
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 class NumberologySession:
     """Native Python adapter for source-backed Numberology."""
     ACTION_START, ACTION_WRITE, ACTION_BACKSPACE, ACTION_SUBMIT = 0, 1, 2, 3
+    ACTION_PREVIOUS_PAGE, ACTION_NEXT_PAGE = 4, 5
     INFO_PHASE, INFO_LEVEL, INFO_TRIAL, INFO_TOTAL = 0, 1, 2, 3
     INFO_SHOWN, INFO_TYPED, INFO_TYPED_LENGTH = 4, 5, 6
     INFO_VERDICT, INFO_RIGHT = 8, 10
@@ -1377,6 +1554,9 @@ class NumberologySession:
         self.options_from_hub = False
         self.level_editing = False
         self.level_edit_value = 0
+        self.result_record = None
+        self.result_pending = False
+        self.failed_results = []
         self.handle = core.numberology_create(*self.options, args.seed)
         if self.handle <= 0:
             raise SystemExit("native Numberology rejected its options")
@@ -1406,6 +1586,27 @@ class NumberologySession:
         phase = self.state[self.INFO_PHASE]
         self.core.numberology_action(self.handle, action, value, 0)
         current = self.state
+        if phase in (0, 3) and current[self.INFO_PHASE] == 1:
+            if self.result_pending and self.result_record is not None:
+                self.failed_results.append(self.result_record)
+            self.result_record = {"id": "numberology-" + uuid.uuid4().hex, "task": "numberology",
+                                  "started_at": time.time(), "options": list(self.options),
+                                  "results": [], "completed": False}
+            self.result_pending = False
+        if phase == 1 and current[self.INFO_PHASE] == 2 and self.result_record is not None:
+            self.result_record["results"].append({"trial": current[self.INFO_TRIAL],
+                                                  "level": str(current[self.INFO_LEVEL]),
+                                                  "correct": current[self.INFO_VERDICT] == 1,
+                                                  "judged_at": time.time()})
+            self.result_pending = True
+        if phase != 3 and current[self.INFO_PHASE] == 3 and self.result_record is not None:
+            self.result_record["completed"] = True
+            self.result_record["right"] = current[self.INFO_RIGHT]
+            self.result_pending = True
+        if self.result_pending:
+            self.result_pending = not write_numberology_result(self.result_record)
+        self.failed_results = [record for record in self.failed_results
+                               if not write_numberology_result(record)]
         if phase != 3 and current[self.INFO_PHASE] == 3 and self.options[2]:
             next_level = current[13]
             if next_level > self.options[0]:
@@ -1457,6 +1658,8 @@ class NumberologySession:
             self.options_draft = list(self.options)
             self.options_selection = 0
             self.level_editing = False
+        elif symbol == key.PAGEUP: self.action(self.ACTION_PREVIOUS_PAGE)
+        elif symbol == key.PAGEDOWN: self.action(self.ACTION_NEXT_PAGE)
         elif symbol == key.SPACE and phase != 1: self.action(self.ACTION_START)
         elif symbol == key.RETURN and phase == 1: self.action(self.ACTION_SUBMIT)
         elif symbol in (key.BACKSPACE, key.DELETE): self.action(self.ACTION_BACKSPACE)
@@ -1488,10 +1691,21 @@ class NumberologySession:
             if 102 <= x * 912 / width <= 810 and 0 <= row < 3 and abs(y * 684 / height - (474 - row * 48)) <= 18:
                 if row == self.options_selection: self.modify_option(1)
                 else: self.options_selection = row
-        elif self.state[self.INFO_PHASE] != 1:
-            self.action(self.ACTION_START)
+        else:
+            phase = self.state[self.INFO_PHASE]
+            viewport = Viewport(width, height)
+            page = numberology_page_at((x - viewport.offset_x) / viewport.scale,
+                                       (y - viewport.offset_y) / viewport.scale)
+            if phase in (1, 2) and self.core.numberology_info(self.handle, 22) > 1 and page:
+                self.action(page)
+            elif phase != 1:
+                self.action(self.ACTION_START)
 
     def close(self) -> None:
+        if self.result_pending:
+            self.result_pending = not write_numberology_result(self.result_record)
+        self.failed_results = [record for record in self.failed_results
+                               if not write_numberology_result(record)]
         if self.handle > 0:
             self.core.numberology_destroy(self.handle)
             self.handle = 0
@@ -2895,7 +3109,7 @@ class TaskHubSession:
         self.black_background = args.black_background
         self.category = 0
         self.selected = 0
-        self.child: NBack3DSession | MarbleMazeSession | YouAreHereSession | SokobanSession | MonkeyLadderSession | TetrisSession | CountSession | MrTimeSession | GraphMappingSession | InTheDarkSession | FogOfWarSession | RemovalsSession | CustodySession | ConcentrationSession | RecognitionSession | TriviaSession | ReflexSession | AlgebraSession | NumberologySession | JigsawSession | SudokuSession | GoSession | CrossedWiresSession | CrosswordSession | ScrabbleSession | NCupMonteSession | TrackingSession | LookoutSession | PursuitSession | OutOfSightSession | BuzzWireSession | DonkeySession | TwoHandsSession | OverrunSession | None = None
+        self.child: NBack3DSession | MarbleMazeSession | YouAreHereSession | SokobanSession | MonkeyLadderSession | TetrisSession | CountSession | MrTimeSession | GraphMappingSession | InTheDarkSession | FogOfWarSession | RemovalsSession | CustodySession | ConcentrationSession | RecognitionSession | TriviaSession | ReflexSession | AlgebraSession | NumberologySession | SyllogismSession | JigsawSession | SudokuSession | GoSession | CrossedWiresSession | CrosswordSession | ScrabbleSession | NCupMonteSession | TrackingSession | LookoutSession | PursuitSession | OutOfSightSession | BuzzWireSession | DonkeySession | TwoHandsSession | OverrunSession | None = None
         self.args = args
 
     @property
@@ -2918,14 +3132,19 @@ class TaskHubSession:
 
     def key(self, symbol, key) -> None:
         if self.child is not None:
-            if symbol == key.ESCAPE and not (isinstance(self.child, (CrosswordSession, ScrabbleSession, ScrambleSession, AlgebraSession, NumberologySession)) and self.child.options_draft is not None):
+            if symbol == key.ESCAPE and not (isinstance(self.child, (CrosswordSession, ScrabbleSession, ScrambleSession, AlgebraSession, NumberologySession, SyllogismSession)) and self.child.options_draft is not None):
                 self.child.close()
                 self.child = None
             else:
                 self.child.key(symbol, key)
-                if isinstance(self.child, (ScrabbleSession, ScrambleSession, AlgebraSession, NumberologySession)) and self.child.options_from_hub and self.child.options_draft is None:
+                if isinstance(self.child, (ScrabbleSession, ScrambleSession, AlgebraSession, NumberologySession, SyllogismSession)) and self.child.options_from_hub and self.child.options_draft is None:
                     self.child.close()
                     self.child = None
+            return
+        if symbol == key.C and self.category == 4 and self.selected == 11:
+            self.child = SyllogismSession(self.core, self.args)
+            self.child.options_from_hub = True
+            self.child.key(key.O, key)
             return
         if symbol == key.C and self.category == 4 and self.selected == 10:
             self.child = NumberologySession(self.core, self.args)
@@ -2998,6 +3217,8 @@ class TaskHubSession:
                 self.child = AlgebraSession(self.core, self.args)
             elif self.category == 4 and self.selected == 10:
                 self.child = NumberologySession(self.core, self.args)
+            elif self.category == 4 and self.selected == 11:
+                self.child = SyllogismSession(self.core, self.args)
             elif self.category == 4 and self.selected == 2:
                 self.child = JigsawSession(self.core, self.args)
             elif self.category == 4 and self.selected == 3:
@@ -3062,6 +3283,7 @@ SCREENS = {
     "reflex": ("reflex_create", None),
     "algebra": ("algebra_create", None),
     "numberology": ("numberology_create", None),
+    "syllogism": ("syllogism_create", None),
     "jigsaw": ("jigsaw_create", None),
     "sudoku": ("sudoku_create", None),
     "go": ("go_create", None),
@@ -3089,7 +3311,7 @@ def dump(core, session: TitleSession, trials: int) -> int:
         print(f"# state={session.state} bytes={len(blob)}")
         for line in canonical(decode(blob)):
             print("  " + line)
-        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, CountSession, MrTimeSession, GraphMappingSession, MatrixReasoningSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, ConcentrationSession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, JigsawSession, SudokuSession, GoSession, CrossedWiresSession, CrosswordSession, ScrabbleSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession, BuzzWireSession, DonkeySession, TwoHandsSession, OverrunSession)):
+        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, CountSession, MrTimeSession, GraphMappingSession, MatrixReasoningSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, ConcentrationSession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, SyllogismSession, JigsawSession, SudokuSession, GoSession, CrossedWiresSession, CrosswordSession, ScrabbleSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession, BuzzWireSession, DonkeySession, TwoHandsSession, OverrunSession)):
             session.action(session.ACTION_START)
         elif isinstance(session, TetrisSession):
             session.action(session.ACTION_SPACE)
@@ -3133,7 +3355,7 @@ def run_window(core, session: TitleSession, width: int, height: int,
                 marble_renderer = MarbleNativeRenderer()
             if not marble_session.native_physics:
                 marble_session.enable_native_physics()
-        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, JigsawSession, SudokuSession, GoSession, CrossedWiresSession, CrosswordSession, ScrabbleSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession, BuzzWireSession,
+        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, SyllogismSession, JigsawSession, SudokuSession, GoSession, CrossedWiresSession, CrosswordSession, ScrabbleSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession, BuzzWireSession,
                                 TetrisSession, CountSession, MrTimeSession, GraphMappingSession,
                                 MatrixReasoningSession, DonkeySession, TwoHandsSession, OverrunSession, TaskHubSession)):
             blob = session.frame_bytes(core, window.width, window.height)
@@ -3198,10 +3420,10 @@ def run_window(core, session: TitleSession, width: int, height: int,
             target.paste()
             draw_frame()
             return pyglet.event.EVENT_HANDLED
-        if symbol == key.ESCAPE and isinstance(session, (ScrambleSession, AlgebraSession, NumberologySession)) and session.options_draft is None:
+        if symbol == key.ESCAPE and isinstance(session, (ScrambleSession, AlgebraSession, NumberologySession, SyllogismSession)) and session.options_draft is None:
             window.close()
             return
-        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, ConcentrationSession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, JigsawSession, SudokuSession, GoSession, CrossedWiresSession, CrosswordSession, ScrabbleSession, ScrambleSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession,
+        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, ConcentrationSession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, SyllogismSession, JigsawSession, SudokuSession, GoSession, CrossedWiresSession, CrosswordSession, ScrabbleSession, ScrambleSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession,
                                 TetrisSession, DonkeySession, TwoHandsSession, OverrunSession, TaskHubSession)):
             session.key(symbol, key)
             draw_frame()
@@ -3242,8 +3464,11 @@ def run_window(core, session: TitleSession, width: int, height: int,
     @window.event
     def on_mouse_press(x, y, _button, _modifiers):
         target = session.child if isinstance(session, TaskHubSession) else session
-        if isinstance(target, (CrosswordSession, ScrabbleSession, ScrambleSession, AlgebraSession, NumberologySession)):
+        if isinstance(target, (CrosswordSession, ScrabbleSession, ScrambleSession, AlgebraSession, NumberologySession, SyllogismSession)):
             target.pointer(x, y, window.width, window.height, 2 if _button == 4 else 0)
+            if isinstance(session, TaskHubSession) and isinstance(target, SyllogismSession) and target.options_from_hub and target.options_draft is None:
+                target.close()
+                session.child = None
             draw_frame()
             return
         if isinstance(session, ReflexSession) or isinstance(session, JigsawSession) or isinstance(session, GoSession) or isinstance(session, NCupMonteSession) or isinstance(session, TrackingSession) or isinstance(session, PursuitSession):
@@ -3471,6 +3696,11 @@ def main(argv=None) -> int:
     parser.add_argument("--crossword-no-adaptive", action="store_true", default=None)
     parser.add_argument("--crossword-lexicon", metavar="PATH", help="clued Crossword lexicon.tsv")
     parser.add_argument("--scrabble-level", type=int, choices=range(1, 11))
+    parser.add_argument("--syllogism-level", type=int, choices=range(1, 13))
+    parser.add_argument("--syllogism-trials", type=int, choices=SYLLOGISM_TRIALS)
+    parser.add_argument("--syllogism-no-working", action="store_true", default=None)
+    parser.add_argument("--syllogism-no-adaptive", action="store_true", default=None)
+    parser.add_argument("--syllogism-invented-words", action="store_true", default=None)
     parser.add_argument("--numberology-level", type=parse_numberology_level)
     parser.add_argument("--numberology-trials", type=int, choices=NUMBEROLOGY_TRIALS)
     parser.add_argument("--numberology-no-adaptive", action="store_true", default=None)
@@ -3565,6 +3795,8 @@ def main(argv=None) -> int:
         session = AlgebraSession(core, args)
     elif args.screen == "numberology":
         session = NumberologySession(core, args)
+    elif args.screen == "syllogism":
+        session = SyllogismSession(core, args)
     elif args.screen == "jigsaw":
         session = JigsawSession(core, args)
     elif args.screen == "sudoku":

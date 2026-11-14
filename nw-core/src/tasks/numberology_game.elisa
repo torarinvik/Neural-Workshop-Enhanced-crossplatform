@@ -20,6 +20,9 @@ module NumberologyGame:
     const ACTION_WRITE: i64 = 1
     const ACTION_BACKSPACE: i64 = 2
     const ACTION_SUBMIT: i64 = 3
+    const ACTION_PREVIOUS_PAGE: i64 = 4
+    const ACTION_NEXT_PAGE: i64 = 5
+    const PAGE_BYTES: i64 = 48
 
     const INFO_PHASE: i64 = 0
     const INFO_LEVEL: i64 = 1
@@ -62,6 +65,7 @@ module NumberologyGame:
         text_capacity: mutable i64
         text_length: mutable i64
         answer_start: mutable i64
+        sequence_page: mutable i64
         typed_pointer: mutable i64
         typed_capacity: mutable i64
         right: mutable i64
@@ -91,6 +95,7 @@ module NumberologyGame:
             run.shown <- 0
             run.text_length <- 0
             run.answer_start <- 0
+            run.sequence_page <- 0
             run.answer <- -1
             run.rule_id <- 0
             run.rule_a <- 0
@@ -279,17 +284,70 @@ module NumberologyGame:
 
     def append_typed(out: mutable dstr&, run: NumberologyRun&):
         can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
-            if run.typed_negative: dstr_append_cstr(out, "-")
-            for at in 0..<run.typed_length |at, out, run|:
+            start: i64 = run.typed_length - 36 if run.typed_length > 36 else 0
+            if start > 0:
+                if run.typed_negative:
+                    dstr_append_cstr(out, "-...")
+                else:
+                    dstr_append_cstr(out, "...")
+            elif run.typed_negative:
+                dstr_append_cstr(out, "-")
+            for at in start..<run.typed_length |at, out, run|:
                 out.push(byte_at(run.typed_pointer, at).u8())
+
+    def sequence_page_count(run: NumberologyRun&) -> i64:
+        can Abort.Panic:
+            return (run.answer_start + PAGE_BYTES - 1) / PAGE_BYTES if run.answer_start > 0 else 1
+
+    def answer_page_count(run: NumberologyRun&) -> i64:
+        can Abort.Panic:
+            length: i64 = run.text_length - run.answer_start
+            return (length + PAGE_BYTES - 1) / PAGE_BYTES if run.phase == PHASE_JUDGED and run.verdict == 0 and length > 36 else 0
+
+    def page_count(run: NumberologyRun&) -> i64:
+        can Abort.Panic:
+            return sequence_page_count(run) + answer_page_count(run)
+
+    def append_page_byte(out: mutable dstr&, column: mutable i64&, byte: i64):
+        can Memory.Allocate, Abort.Panic:
+            if column >= 40:
+                out.push(10.u8())
+                column <- 0
+            out.push(byte.u8())
+            column <- column + 1
 
     def append_asked(out: mutable dstr&, run: NumberologyRun&):
         can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
-            for at in 0..<run.answer_start |at, out, run|:
+            if run.sequence_page >= sequence_page_count(run):
+                start: i64 = run.answer_start + (run.sequence_page - sequence_page_count(run)) * PAGE_BYTES
+                end: i64 = run.text_length if run.text_length < start + PAGE_BYTES else start + PAGE_BYTES
+                column: mutable i64 = 0
+                for at in start..<end |at, out, run, column|:
+                    append_page_byte(out, &column, byte_at(run.text_pointer, at))
+                return
+            if run.answer_start + 3 * run.shown + 1 <= 40:
+                for at in 0..<run.answer_start |at, out, run|:
+                    byte: i64 = byte_at(run.text_pointer, at)
+                    if byte == 10:
+                        dstr_append_cstr(out, ",   ")
+                    else:
+                        out.push(byte.u8())
+                dstr_append_cstr(out, "?")
+                return
+            start: i64 = run.sequence_page * PAGE_BYTES
+            end: i64 = run.answer_start if run.answer_start < start + PAGE_BYTES else start + PAGE_BYTES
+            column: mutable i64 = 0
+            for at in start..<end |at, out, run, column|:
                 byte: i64 = byte_at(run.text_pointer, at)
-                if byte == 10: dstr_append_cstr(out, ",   ")
-                else: out.push(byte.u8())
-            dstr_append_cstr(out, "?")
+                if byte == 10:
+                    append_page_byte(out, &column, 44)
+                    append_page_byte(out, &column, 32)
+                    append_page_byte(out, &column, 32)
+                    append_page_byte(out, &column, 32)
+                else:
+                    append_page_byte(out, &column, byte)
+            if end == run.answer_start:
+                append_page_byte(out, &column, 63)
 
     def append_answer(out: mutable dstr&, run: NumberologyRun&):
         can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
@@ -332,8 +390,11 @@ module NumberologyGame:
                 if run.verdict == 1:
                     dstr_append_cstr(out, "Right")
                 else:
-                    dstr_append_cstr(out, "No — the answer was ")
-                    append_answer(out, run)
+                    if answer_page_count(run) > 0:
+                        dstr_append_cstr(out, "No — see answer pages")
+                    else:
+                        dstr_append_cstr(out, "No — the answer was ")
+                        append_answer(out, run)
             else:
                 if run.generation_failed:
                     dstr_append_cstr(out, "Could not generate a sequence at this level")
@@ -369,8 +430,10 @@ module NumberologyGame:
     def erase(run: mutable NumberologyRun&) -> i64:
         can Abort.Panic:
             return 2 if run.phase != PHASE_WORKING or (run.typed_length == 0 and not run.typed_negative)
-            if run.typed_length > 0: run.typed_length <- run.typed_length - 1
-            else: run.typed_negative <- false
+            if run.typed_length > 0:
+                run.typed_length <- run.typed_length - 1
+            else:
+                run.typed_negative <- false
             return 1
 
     def matches(run: NumberologyRun&) -> bool:
@@ -417,37 +480,73 @@ module NumberologyGame:
                 return erase(run)
             elif action == ACTION_SUBMIT:
                 return submit_answer(run)
+            elif action == ACTION_PREVIOUS_PAGE:
+                return 2 if (run.phase != PHASE_WORKING and run.phase != PHASE_JUDGED) or run.sequence_page <= 0
+                run.sequence_page <- run.sequence_page - 1
+                return 1
+            elif action == ACTION_NEXT_PAGE:
+                return 2 if (run.phase != PHASE_WORKING and run.phase != PHASE_JUDGED) or run.sequence_page + 1 >= page_count(run)
+                run.sequence_page <- run.sequence_page + 1
+                return 1
             return -6
 
     def info(run: NumberologyRun&, field: i64) -> i64:
         can Abort.Panic, Unsafe.PointerCast:
-            if field == INFO_PHASE: return run.phase
-            if field == INFO_LEVEL: return run.level
-            if field == INFO_TRIAL: return run.trial
-            if field == INFO_TOTAL_TRIALS: return run.total_trials
-            if field == INFO_SHOWN: return run.shown
+            if field == INFO_PHASE:
+                return run.phase
+            if field == INFO_LEVEL:
+                return run.level
+            if field == INFO_TRIAL:
+                return run.trial
+            if field == INFO_TOTAL_TRIALS:
+                return run.total_trials
+            if field == INFO_SHOWN:
+                return run.shown
             if field == INFO_ANSWER:
-                return -1 if run.text_length <= run.answer_start
+                return -1 if run.phase != PHASE_JUDGED or run.text_length <= run.answer_start
                 neg: bool = byte_at(run.text_pointer, run.answer_start) == 45
                 return scalar(run.text_pointer, run.answer_start + (1 if neg else 0), run.text_length - run.answer_start - (1 if neg else 0), neg)
-            if field == INFO_TYPED_VALUE: return scalar(run.typed_pointer, 0, run.typed_length, run.typed_negative)
-            if field == INFO_TYPED_LENGTH: return run.typed_length
-            if field == INFO_VERDICT: return run.verdict
-            if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
-            if field == INFO_RIGHT: return run.right
-            if field == INFO_RULE: return run.rule_id
-            if field == INFO_COMPLEXITY: return run.complexity
-            if field == INFO_NEXT_LEVEL: return run.start_level
-            if field == 14: return run.answer_start
-            if field == 15: return run.text_length - run.answer_start if run.phase == PHASE_JUDGED else 0
-            if field == 16: return run.typed_length
+            if field == INFO_TYPED_VALUE:
+                return scalar(run.typed_pointer, 0, run.typed_length, run.typed_negative)
+            if field == INFO_TYPED_LENGTH:
+                return run.typed_length
+            if field == INFO_VERDICT:
+                return run.verdict
+            if field == INFO_ADAPTIVE:
+                return 1 if run.adaptive else 0
+            if field == INFO_RIGHT:
+                return run.right
+            if field == INFO_RULE:
+                return run.rule_id
+            if field == INFO_COMPLEXITY:
+                return run.complexity
+            if field == INFO_NEXT_LEVEL:
+                return run.start_level
+            if field == 14:
+                return run.answer_start
+            if field == 15:
+                return run.text_length - run.answer_start if run.phase == PHASE_JUDGED else 0
+            if field == 16:
+                return run.typed_length
             if field == 17:
+                return -1 if run.phase != PHASE_JUDGED
                 return 0 if run.text_length <= run.answer_start
                 neg: bool = byte_at(run.text_pointer, run.answer_start) == 45
                 return 1 if scalar_fits(run.text_pointer, run.answer_start + (1 if neg else 0), run.text_length - run.answer_start - (1 if neg else 0), neg) else 0
-            if field == 18: return 1 if scalar_fits(run.typed_pointer, 0, run.typed_length, run.typed_negative) else 0
-            if field == 19: return 1 if run.generation_failed else 0
-            if field == 20: return 1 if run.typed_negative else 0
+            if field == 18:
+                return 1 if scalar_fits(run.typed_pointer, 0, run.typed_length, run.typed_negative) else 0
+            if field == 19:
+                return 1 if run.generation_failed else 0
+            if field == 20:
+                return 1 if run.typed_negative else 0
+            if field == 21:
+                return run.sequence_page + 1
+            if field == 22:
+                return page_count(run)
+            if field == 23:
+                return sequence_page_count(run)
+            if field == 24:
+                return answer_page_count(run)
             return -1
 
     def term(run: NumberologyRun&, at: i64) -> i64:
@@ -456,20 +555,25 @@ module NumberologyGame:
             start: mutable i64 = 0
             row: mutable i64 = 0
             while row < at |row, at, start, run|:
-                while start < run.answer_start and byte_at(run.text_pointer, start) != 10 |start, run|: start <- start + 1
+                while start < run.answer_start and byte_at(run.text_pointer, start) != 10 |start, run|:
+                    start <- start + 1
                 start <- start + 1
                 row <- row + 1
             end: mutable i64 = start
-            while end < run.answer_start and byte_at(run.text_pointer, end) != 10 |end, run|: end <- end + 1
+            while end < run.answer_start and byte_at(run.text_pointer, end) != 10 |end, run|:
+                end <- end + 1
             neg: bool = byte_at(run.text_pointer, start) == 45
             return scalar(run.text_pointer, start + (1 if neg else 0), end - start - (1 if neg else 0), neg)
 
     def value(run: NumberologyRun&, field: i64, at: i64) -> i64:
         can Abort.Panic, Unsafe.PointerCast:
             return -1 if at < 0
-            if field == 0: return -1 if at >= run.answer_start else byte_at(run.text_pointer, at)
-            if field == 1: return -1 if at >= run.typed_length else byte_at(run.typed_pointer, at)
-            if field == 2: return -1 if run.phase != PHASE_JUDGED or at >= run.text_length - run.answer_start else byte_at(run.text_pointer, run.answer_start + at)
+            if field == 0:
+                return -1 if at >= run.answer_start else byte_at(run.text_pointer, at)
+            if field == 1:
+                return -1 if at >= run.typed_length else byte_at(run.typed_pointer, at)
+            if field == 2:
+                return -1 if run.phase != PHASE_JUDGED or at >= run.text_length - run.answer_start else byte_at(run.text_pointer, run.answer_start + at)
             return -1
 
     def render(run: NumberologyRun&, black_background: bool, width: f64, height: f64,
@@ -495,3 +599,21 @@ module NumberologyGame:
                 run.shown > 0, bytes_view(asked), bytes_view(rule),
                 bytes_view(typed), run.trial, run.total_trials,
                 bytes_view(message), run.verdict, bytes_view(verdict_text))
+            if (run.phase == PHASE_WORKING or run.phase == PHASE_JUDGED) and page_count(run) > 1:
+                indicator: mutable dstr = []
+                if run.sequence_page < sequence_page_count(run):
+                    dstr_append_cstr(&indicator, "Sequence page ")
+                    dstr_append_i64(&indicator, run.sequence_page + 1)
+                    dstr_append_cstr(&indicator, "/")
+                    dstr_append_i64(&indicator, sequence_page_count(run))
+                else:
+                    dstr_append_cstr(&indicator, "Answer page ")
+                    dstr_append_i64(&indicator, run.sequence_page - sequence_page_count(run) + 1)
+                    dstr_append_cstr(&indicator, "/")
+                    dstr_append_i64(&indicator, answer_page_count(run))
+                Display::draw_text_weight(list, bytes_view(indicator), 456.0, 365.0, 12.0,
+                                          paint.ink, Display::ANCHOR_CENTER_CENTER, false)
+                Display::draw_text_weight(list, sview("< Previous (Page Up)", 0, -1), 265.0, 365.0, 12.0,
+                                          paint.ink, Display::ANCHOR_CENTER_CENTER, false)
+                Display::draw_text_weight(list, sview("Next (Page Down) >", 0, -1), 647.0, 365.0, 12.0,
+                                          paint.ink, Display::ANCHOR_CENTER_CENTER, false)

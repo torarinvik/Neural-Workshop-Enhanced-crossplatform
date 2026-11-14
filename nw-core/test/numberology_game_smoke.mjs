@@ -1,6 +1,5 @@
 // Common-v1 lifecycle smoke for the source-backed Numberology controller.
-// The answer is inspected only to make the test able to exercise both wrong
-// and correct submissions; the browser never reads it for presentation.
+// Answers come from the source oracle; pre-judgment state must not reveal them.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -11,6 +10,8 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const wasm = process.env.NWCORE_WASM_PATH ?? `${root}/build/nwcore.wasm`;
 const { exports, instance } = await instantiateElisa(fs.readFileSync(wasm), { warn: false });
 
+const sourceSessions = JSON.parse(fs.readFileSync(new URL('./numberology_session_oracle.json', import.meta.url)));
+const sourceAnswer = seed => BigInt(sourceSessions.find(item => item.level === 1 && item.seed === seed).rows[0].answer);
 const TASK = BigInt(exports.nw_api_v1_task_numberology());
 const STATUS = Object.freeze({ accepted: 1n, ignored: 2n, badOptions: -3n });
 const EVENT = Object.freeze({ action: 1n, keyDown: 2n, text: 8n });
@@ -97,7 +98,10 @@ assert.ok(decode(workingFrame).some(({ kind, text }) =>
 // Invalid/empty submission is ignored, while a complete wrong answer enters
 // the source's judged state and reveals the generated rule/result.
 assert.equal(action(run, ACTION.submit, 1001, 1), STATUS.ignored);
-const wrong = values[INFO.answer] === 0n ? 1n : 0n;
+assert.equal(values[INFO.answer], -1n, "working state hides the answer");
+assert.equal(exports.nw_api_v1_numberology_info(run, 5n), -1n);
+assert.equal(exports.nw_api_v1_numberology_info(run, 17n), -1n);
+const wrong = sourceAnswer(17) + 1n;
 let cursor = writeAnswer(run, wrong, 2, 1002);
 assert.equal(event(run, EVENT.keyDown, cursor.timestamp, cursor.sequence,
   KEY.enter, 13n), STATUS.accepted);
@@ -127,7 +131,8 @@ assert.equal(exports.nw_api_v1_destroy(run), 0n);
 const perfect = create([1n, 1n, 1n, 0n, 0n, 0n], 23n);
 assert.equal(action(perfect, ACTION.start, 1, 0), STATUS.accepted);
 values = state(perfect);
-cursor = writeAnswer(perfect, values[INFO.answer], 1, 2);
+assert.equal(values[INFO.answer], -1n);
+cursor = writeAnswer(perfect, sourceAnswer(23), 1, 2);
 assert.equal(event(perfect, EVENT.keyDown, cursor.timestamp, cursor.sequence,
   KEY.enter, 13n), STATUS.accepted);
 assert.equal(state(perfect)[INFO.verdict], 1n);

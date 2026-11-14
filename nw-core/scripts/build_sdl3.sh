@@ -93,6 +93,7 @@ cc -O2 -std=c11 $SDL_CFLAGS \
 # corrupted exactly those while geometry stayed correct, so a check that counted
 # commands would have passed straight through that bug.
 "$ROOT/build/nw-sdl3" --selftest 180
+"$ROOT/build/nw-sdl3" --selftest-long-text
 "$ROOT/build/nw-sdl3" --selftest-3d-maze
 "$ROOT/build/nw-sdl3" --selftest-taskhub
 "$ROOT/build/nw-sdl3" --selftest-sokoban
@@ -112,8 +113,11 @@ cc -O2 -std=c11 $SDL_CFLAGS \
 "$ROOT/build/nw-sdl3" --selftest-trivia
 "$ROOT/build/nw-sdl3" --selftest-reflex
 "$ROOT/build/nw-sdl3" --selftest-algebra
+"$ROOT/build/nw-sdl3" --selftest-syllogism
 "$ROOT/build/nw-sdl3" --selftest-algebra-options
 "$ROOT/build/nw-sdl3" --selftest-numberology
+python3 "$ROOT/test/numberology_sdl_results_test.py" --binary "$ROOT/build/nw-sdl3"
+python3 "$ROOT/test/syllogism_sdl_options_test.py"
 "$ROOT/build/nw-sdl3" --selftest-jigsaw
 "$ROOT/build/nw-sdl3" --selftest-sudoku
 "$ROOT/build/nw-sdl3" --selftest-task-options

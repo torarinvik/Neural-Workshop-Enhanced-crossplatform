@@ -18,8 +18,8 @@ for (const example of cases) {
   assert.equal(action(run,0),1n,`start level ${example.level}`);
   assert.equal(info(run,4),BigInt(example.terms.length));
   const numeric=BigInt(example.answer);
-  assert.equal(info(run,17), numeric >= -(1n<<63n) && numeric <= (1n<<63n)-1n ? 1n : 0n,
-    'legacy scalar fit flag identifies values requiring exact text');
+  assert.equal(info(run,5),-1n, 'scalar answer is hidden while working');
+  assert.equal(info(run,17),-1n, 'answer fit flag is hidden while working');
   assert.equal(text(run,0,info(run,14)),example.terms.join('\n')+'\n',`terms level ${example.level}`);
   assert.equal(info(run,15),0n); assert.equal(value(run,2,0),-1n);
   const digits=example.answer === '0' ? '-000' : example.answer.startsWith('-') ? '-000'+example.answer.slice(1) : '000'+example.answer;
@@ -28,6 +28,10 @@ for (const example of cases) {
   assert.equal(info(run,18), numeric >= -(1n<<63n) && numeric <= (1n<<63n)-1n ? 1n : 0n);
   assert.equal(action(run,3),1n);
   assert.equal(info(run,8),1n,`exact answer level ${example.level}`);
+  assert.equal(info(run,17), numeric >= -(1n<<63n) && numeric <= (1n<<63n)-1n ? 1n : 0n,
+    'judged scalar fit flag identifies values requiring exact text');
+  assert.equal(info(run,5), numeric >= -(1n<<63n) && numeric <= (1n<<63n)-1n ? numeric : 0n,
+    'judged scalar answer is available when representable');
   assert.equal(text(run,2,info(run,15)),example.answer);
   const n=Number(e.nw_api_v1_render(run,BigInt(frame),1048576n,0n,912n,684n));
   assert.ok(n>0);

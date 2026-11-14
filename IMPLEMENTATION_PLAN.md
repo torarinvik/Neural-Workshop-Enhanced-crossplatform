@@ -6634,6 +6634,31 @@ limits, and open Stage0 and user-interface gaps.
 **Original UI:** `original-neural-workshop-enhanced/neural_workshop/ui/syllogism.py`.  
 **Original environment:** `original-neural-workshop-enhanced/nwenv/syllogism.py`.
 
+**Current feedback fix:** The source controller now hides its answer accessor
+until judgment and preserves the submitted selection in the judged frame. The
+existing promoted WASM still exposes the answer and highlights the correct
+option instead; `nw-core/test/syllogism_feedback_test.mjs` detects both and is
+part of the artifact gate. The controller source now also draws one per-question seed from the session
+RNG, defaults to real words, preserves source working and hints, wraps choice
+navigation, and tracks adaptive rung and summary. Source-derived fixtures cover
+all 12 levels and two questions each, with a separate adaptive replay. These
+changes and tests need a fresh compiled artifact. The web shell now supplies the
+five source options, saved settings, keyboard and pointer options controls, and
+direct number-key answers; its headless host tests pass. The Python shell now
+has the corresponding session, menu route and options in source, with headless
+host tests; SDL settings code shares its validated on-disk format. The native
+exports and full desktop routes still need a fresh build and verification. SDL
+controller routing is wired in source, including keyboard and pointer options;
+it still needs a fresh native build and end-to-end verification. Result
+persistence and other task-specific gates remain open.
+The Syllogism SDL settings helper has now been ported from C to Elisa, using
+SDL3 FFI for environment and file operations; the Stage0-compiled ABI is
+covered by direct headless tests. The rest of the SDL C shell and other C files
+remain to be migrated, and the complete Stage1 artifact remains unverified.
+The Numberology SDL results manager, serialization, and atomic file writes now
+run in Elisa through SDL FFI. Headless tests cover path selection, collisions,
+atomic replacement, duplicate notifications, and failed-save retry.
+
 **Reference discovery:** Read premise generation, askable relations, ordering, labels, and entailment rules. Read the environment wrapper's action mapping and compare it with the actual UI handlers; record any difference in the replay specification.
 
 **Implementation:** Generate actual premises/questions/options using ordered containers and source random draws. Grade inference from the generated relation model; render matching explanation.
