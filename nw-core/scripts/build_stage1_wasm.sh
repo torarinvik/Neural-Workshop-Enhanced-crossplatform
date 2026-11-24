@@ -16,16 +16,19 @@ OBJECT="${NW_STAGE1_WASM_OBJECT:-$ROOT/build/nwcore_stage1_wasm.o}"
 ARTIFACT="${NW_STAGE1_WASM_ARTIFACT:-$ROOT/build/nwcore-stage1.wasm}"
 mkdir -p "$(dirname -- "$OBJECT")" "$(dirname -- "$ARTIFACT")"
 python3 "$ROOT/test/wasm_runtime_include_test.py"
-WASM_SOURCE_TMP="$(mktemp "$ROOT/src/wasm/wasm_exports_stage1.XXXXXX")"
-WASM_SOURCE="${WASM_SOURCE_TMP}.elisa"
-mv -- "$WASM_SOURCE_TMP" "$WASM_SOURCE"
-trap 'rm -f -- "$WASM_SOURCE"' EXIT INT TERM HUP
-python3 "$ROOT/scripts/prepare_wasm_exports.py" \
-    "$ROOT/src/wasm/wasm_exports.elisa" "$WASM_SOURCE" "$ELISA_STAGE1_ROOT"
-"$ELISA_STAGE1_ROOT/scripts/elisac_stage1.sh" \
+# Materialize src/ with every runtime include pinned to the selected
+# compiler, as check.sh and build_sdl3.sh do: corpus modules include the
+# runtime too, not only the export surface.
+SOURCE_TREE_PARENT="$(mktemp -d "$ROOT/build/stage1-wasm-sources.XXXXXX")"
+SOURCE_TREE="$SOURCE_TREE_PARENT/source"
+trap 'rm -rf -- "$SOURCE_TREE_PARENT"' EXIT INT TERM HUP
+python3 "$ROOT/scripts/prepare_runtime_sources.py" "$ROOT" "$SOURCE_TREE" "$ELISA_STAGE1_ROOT"
+# The unit compiles the runtime from source without defining its arena, so
+# Stage1 is told the runtime is the trusted standard library.
+ELISA_STAGE1_RUNTIME_STD=1 "$ELISA_STAGE1_ROOT/scripts/elisac_stage1.sh" \
     -emit obj -O2 -target-triple wasm32-unknown-wasi \
-    -o "$OBJECT" "$WASM_SOURCE"
-rm -f -- "$WASM_SOURCE"
+    -o "$OBJECT" "$SOURCE_TREE/src/wasm/wasm_exports.elisa"
+rm -rf -- "$SOURCE_TREE_PARENT"
 trap - EXIT INT TERM HUP
 wasm-ld --no-entry --export-dynamic --allow-undefined --export=__heap_base -z stack-size=8388608 \
     -o "$ARTIFACT" "$OBJECT"

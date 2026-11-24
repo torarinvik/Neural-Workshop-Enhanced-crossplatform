@@ -1,0 +1,543 @@
+include "./browser_par.elisa"
+
+module Sheet:
+    # sheet.py: a table of orders, a question, and the tools to answer it
+    # -- category filters, sorting headers, sum buttons and a keypad. Screen
+    # units are those of Browser's 1000 by 640 page, y down.
+    const LEFT: f64 = 10.0
+    const FILTER_Y: f64 = 10.0
+    const FILTER_H: f64 = 34.0
+    const HEAD_Y: f64 = 54.0
+    const HEAD_H: f64 = 32.0
+    const ROWS_Y: f64 = 90.0
+    const ROW_H: f64 = 30.0
+    const VISIBLE: i64 = 13
+    const SUM_Y: f64 = 486.0
+    const SUM_H: f64 = 30.0
+    const STATUS_Y: f64 = 526.0
+    const PANEL_X: f64 = 790.0
+    const KEY_W: f64 = 60.0
+    const KEY_H: f64 = 50.0
+    const KEY_GAP: f64 = 10.0
+    const KEYPAD_Y: f64 = 130.0
+    const MOST_ROWS: i64 = 60
+    const MOST_TYPED: i64 = 7
+
+    # Columns, in COLUMNS order.
+    const ID: i64 = 0
+    const ITEM: i64 = 1
+    const CATEGORY: i64 = 2
+    const QTY: i64 = 3
+    const PRICE: i64 = 4
+    const TOTAL: i64 = 5
+
+    # Question kinds.
+    const LOOKUP: i64 = 0
+    const MAX: i64 = 1
+    const SUM: i64 = 2
+    const COUNT: i64 = 3
+    const WRONG: i64 = 4
+    const FIX: i64 = 5
+
+    # Action kinds; a filter's value is a CATEGORIES index or -1 for All, a
+    # key's is its digit or 10 for del.
+    const NONE: i64 = 0
+    const FILTER: i64 = 1
+    const SORT: i64 = 2
+    const STAT: i64 = 3
+    const KEY: i64 = 4
+    const SUBMIT: i64 = 5
+    const DELETE: i64 = 10
+
+    struct Grade:
+        rung: i64
+        rows: i64
+        kind_count: i64
+        kinds: i64[5]
+        categories: i64
+        slack: f64
+
+    struct Row:
+        id: mutable i64
+        # The item is WORDS[word], a space and THINGS[category * 5 + thing].
+        word: mutable i64
+        category: mutable i64
+        thing: mutable i64
+        qty: mutable i64
+        price: mutable i64
+        total: mutable i64
+
+    struct Action:
+        kind: i64
+        value: i64
+
+    struct Puzzle:
+        rung: mutable i64
+        row_count: mutable i64
+        rows: mutable Row[60]
+        category_count: mutable i64
+        categories: mutable i64[5]
+        kind: mutable i64
+        # The question's row (lookup), category (sum, count) and bar (count).
+        subject: mutable i64
+        bar: mutable i64
+        answer: mutable i64
+        tool_count: mutable i64
+        tools: mutable Action[2]
+
+    struct Rectangle:
+        x: f64
+        y: f64
+        width: f64
+        height: f64
+
+    struct Workbook:
+        puzzle: mutable Puzzle
+        filter: mutable i64
+        sort_column: mutable i64
+        sort_down: mutable bool
+        scroll: mutable i64
+        stat: mutable i64
+        typed_count: mutable i64
+        typed: mutable i64[7]
+        clicks: mutable i64
+        pointer: mutable BrowserSession::Pointer
+        submitted: mutable bool
+        answer: mutable i64
+
+    def category_name(category: i64) -> cstr:
+        names: array[cstr, 5] = ["Office", "Kitchen", "Garden", "Travel", "Tools"]
+        return names[category.usize()]
+
+    def word_name(word: i64) -> cstr:
+        names: array[cstr, 24] = ["Brava", "Corvo", "Delta", "Ember", "Fable", "Gilda", "Halo", "Iris", "Juno", "Kite",
+            "Lumen", "Mira", "Nova", "Orla", "Pico", "Quill", "Rhea", "Sol", "Tova", "Umbra", "Vela", "Wren", "Yara", "Zeno"]
+        return names[word.usize()]
+
+    def thing_name(category: i64, thing: i64) -> cstr:
+        names: array[cstr, 25] = ["stapler", "lamp", "chair", "binder", "desk", "kettle", "pan", "mixer", "toaster", "knife",
+            "hose", "rake", "planter", "shears", "bench", "suitcase", "pillow", "adapter", "bag", "flask",
+            "drill", "saw", "hammer", "level", "clamp"]
+        return names[(category * 5 + thing).usize()]
+
+    def column_label(column: i64) -> cstr:
+        names: array[cstr, 6] = ["ID", "Item", "Category", "Qty", "Price", "Total"]
+        return names[column.usize()]
+
+    def column_width(column: i64) -> f64:
+        widths: f64[6] = [70.0, 230.0, 140.0, 90.0, 110.0, 120.0]
+        return widths[column.usize()]
+
+    def column_x(column: i64) -> f64:
+        x: mutable f64 = LEFT
+        for index in 0..<column |x|:
+            x <- x + column_width(index)
+        return x
+
+    def numeric(column: i64) -> bool:
+        return column == QTY or column == PRICE or column == TOTAL
+
+    def item_text(row: Row&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_cstr(out, word_name(row.word))
+            dstr_append_cstr(out, " ")
+            dstr_append_cstr(out, thing_name(row.category, row.thing))
+
+    def grade(requested: i64) -> Grade:
+        r: i64 = requested if requested > 0 else 1
+        kinds: mutable i64[5] = [LOOKUP, 0, 0, 0, 0]
+        count: mutable i64 = 1
+        rows: mutable i64 = 8 + 2 * (r - 1)
+        if r >= 20:
+            rows <- 60
+            kinds <- [SUM, COUNT, WRONG, FIX, 0]
+            count <- 4
+        elif r >= 16:
+            rows <- 40
+            kinds <- [LOOKUP, MAX, SUM, COUNT, WRONG]
+            count <- 5
+        elif r >= 13:
+            rows <- 30
+            kinds[0] <- WRONG
+        elif r >= 10:
+            rows <- 30
+            kinds[0] <- COUNT
+        elif r >= 7:
+            rows <- 24
+            kinds[0] <- SUM
+        elif r >= 4:
+            rows <- 20
+            kinds[1] <- MAX
+            count <- 2
+        slack: f64 = (0.4 - 0.3 * (r - 1).f64() / 19.0) if r <= 20 else 0.1
+        return Grade{rung: r, rows: rows, kind_count: count, kinds: kinds,
+            categories: 3 if r < 7 else (4 if r < 16 else 5), slack: slack}
+
+    def action(kind: i64, value: i64) -> Action:
+        return Action{kind: kind, value: value}
+
+    # One attempt at seed; false when the highest Total is shared, which
+    # sends Python on to seed + 1.
+    def try_deal(level: Grade, seed: i64, out: mutable Puzzle&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, seed.u64())
+            out <- zeroed
+            out.rung <- level.rung
+            out.row_count <- level.rows
+            picked: darray[i64] = py_sample_range(&draw, 0, 4, level.categories)
+            out.category_count <- level.categories
+            for index in 0..<level.categories |out, picked|:
+                out.categories[index.usize()] <- picked[index.usize()]
+            ids: darray[i64] = py_sample_range(&draw, 101, 998, level.rows)
+            for k in 0..<level.rows |out, draw, ids|:
+                made: mutable Row = zeroed
+                made.id <- ids[k.usize()]
+                made.category <- out.categories[py_choice_index(&draw, out.category_count).usize()]
+                unique: mutable bool = false
+                while not unique |unique, made, out, draw, k|:
+                    made.word <- py_choice_index(&draw, 24)
+                    made.thing <- py_choice_index(&draw, 5)
+                    unique <- true
+                    for earlier in 0..<k |unique, made, out|:
+                        other: Row = out.rows[earlier.usize()]
+                        unique <- false if other.word == made.word and other.category == made.category and other.thing == made.thing
+                made.qty <- py_randint(&draw, 1, 12)
+                made.price <- py_randint(&draw, 2, 99)
+                made.total <- made.qty * made.price
+                out.rows[k.usize()] <- made
+            out.kind <- level.kinds[py_choice_index(&draw, level.kind_count).usize()]
+            out.tool_count <- 0
+            if out.kind == WRONG or out.kind == FIX:
+                k: i64 = py_randrange(&draw, 0, out.row_count)
+                sign: i64 = -1 if py_choice_index(&draw, 2) == 0 else 1
+                sizes: i64[5] = [1, 2, 5, 10, out.rows[k.usize()].price]
+                moved: i64 = out.rows[k.usize()].total + sign * sizes[py_choice_index(&draw, 5).usize()]
+                out.rows[k.usize()].total <- moved if moved > 1 else 1
+            if out.kind == LOOKUP:
+                out.subject <- py_choice_index(&draw, out.row_count)
+                out.answer <- out.rows[out.subject.usize()].total
+            elif out.kind == MAX:
+                best: mutable i64 = 0
+                for k in 1..<out.row_count |best, out|:
+                    best <- k if out.rows[k.usize()].total > out.rows[best.usize()].total
+                ties: mutable i64 = 0
+                for k in 0..<out.row_count |ties, out, best|:
+                    ties <- ties + 1 if out.rows[k.usize()].total == out.rows[best.usize()].total
+                return false if ties > 1
+                out.answer <- out.rows[best.usize()].id
+                out.tools[0] <- action(SORT, TOTAL)
+                out.tools[1] <- action(SORT, TOTAL)
+                out.tool_count <- 2
+            elif out.kind == SUM or out.kind == COUNT:
+                out.subject <- out.categories[py_choice_index(&draw, out.category_count).usize()]
+                out.bar <- py_randint(&draw, 3, 9) if out.kind == COUNT else 0
+                found: mutable i64 = 0
+                for k in 0..<out.row_count |found, out|:
+                    row: Row = out.rows[k.usize()]
+                    if row.category == out.subject:
+                        found <- found + (row.total if out.kind == SUM else (1 if row.qty > out.bar else 0))
+                out.answer <- found
+                out.tools[0] <- action(FILTER, out.subject)
+                out.tools[1] <- action(STAT, TOTAL) if out.kind == SUM else action(SORT, QTY)
+                out.tool_count <- 2
+            else:
+                for k in 0..<out.row_count |out|:
+                    row: Row = out.rows[k.usize()]
+                    if row.total != row.qty * row.price:
+                        out.answer <- row.id if out.kind == WRONG else row.qty * row.price
+                        break
+            return true
+
+    def deal_seeded(rung: i64, seed: i64) -> Puzzle:
+        can Memory.Allocate, Abort.Panic:
+            level: Grade = grade(rung)
+            out: mutable Puzzle = zeroed
+            attempt: mutable i64 = seed
+            while not try_deal(level, attempt, &out) |attempt, out, level|:
+                attempt <- attempt + 1
+            return out
+
+    def deal(rung: i64, run: mutable MT19937&) -> Puzzle:
+        can Memory.Allocate, Abort.Panic:
+            return deal_seeded(rung, py_randrange(run, 0, 1073741824))
+
+    def digits(value: i64) -> i64:
+        count: mutable i64 = 1
+        left: mutable i64 = value / 10
+        while left > 0 |count, left|:
+            count <- count + 1
+            left <- left / 10
+        return count
+
+    def fewest(puzzle: Puzzle&) -> i64:
+        return puzzle.tool_count + digits(puzzle.answer) + 1
+
+    def par(puzzle: Puzzle&) -> i64:
+        can Abort.Panic:
+            best: i64 = fewest(puzzle)
+            room: i64 = py_round_half_even(grade(puzzle.rung).slack * best.f64() * 2.0)
+            return best + (room if room > 3 else 3)
+
+    def start(puzzle: Puzzle) -> Workbook:
+        return Workbook{puzzle: puzzle, filter: -1, sort_column: -1, sort_down: false, scroll: 0, stat: -1, typed_count: 0,
+            typed: zeroed, clicks: 0, pointer: BrowserSession::Pointer{x: Browser::SCREEN_W / 2.0, y: Browser::SCREEN_H / 2.0},
+            submitted: false, answer: 0}
+
+    # A row's value in a numeric column.
+    def value(row: Row&, column: i64) -> i64:
+        return row.id if column == ID
+        return row.qty if column == QTY
+        return row.price if column == PRICE
+        return row.total
+
+    # Python's ordering of two rows by a column: -1, 0 or 1.
+    def compare(one: Row&, two: Row&, column: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            if column == ITEM or column == CATEGORY:
+                left: mutable dstr = []
+                right: mutable dstr = []
+                if column == ITEM:
+                    item_text(one, &left)
+                    item_text(two, &right)
+                else:
+                    dstr_append_cstr(&left, category_name(one.category))
+                    dstr_append_cstr(&right, category_name(two.category))
+                shorter: i64 = left.count.i64() if left.count < right.count else right.count.i64()
+                for at in 0..<shorter |left, right|:
+                    a: u8 = left[at.usize()]
+                    b: u8 = right[at.usize()]
+                    return -1 if a < b
+                    return 1 if a > b
+                return -1 if left.count < right.count
+                return 1 if left.count > right.count
+                return 0
+            a: i64 = value(one, column)
+            b: i64 = value(two, column)
+            return -1 if a < b
+            return 1 if a > b
+            return 0
+
+    # visible_rows: the filtered rows, sorted stably as Python's sort is, in
+    # both directions.
+    def visible_rows(state: Workbook&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            rows: mutable darray[i64] = []
+            for index in 0..<state.puzzle.row_count |rows, state|:
+                continue if state.filter >= 0 and state.puzzle.rows[index.usize()].category != state.filter
+                rows.push(index)
+                continue if state.sort_column < 0
+                j: mutable i64 = rows.count.i64() - 1
+                while j > 0 |j, rows, state, index|:
+                    order: i64 = compare(&state.puzzle.rows[rows[(j - 1).usize()].usize()], &state.puzzle.rows[index.usize()],
+                        state.sort_column)
+                    break if (order >= 0 if state.sort_down else order <= 0)
+                    rows[j.usize()] <- rows[(j - 1).usize()]
+                    rows[(j - 1).usize()] <- index
+                    j <- j - 1
+            return rows
+
+    def max_scroll(state: Workbook&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            extra: i64 = visible_rows(state).count.i64() - VISIBLE
+            return extra if extra > 0 else 0
+
+    # The filter chips: All, then the puzzle's categories.
+    def chip(state: Workbook&, index: i64) -> Rectangle:
+        x: f64 = LEFT + (0.0 if index == 0 else 100.0 + 120.0 * (index - 1).f64())
+        w: f64 = 100.0 if index == 0 else 120.0
+        return Rectangle{x: x, y: FILTER_Y, width: w - 6.0, height: FILTER_H}
+
+    def chip_filter(state: Workbook&, index: i64) -> i64:
+        can Abort.Panic:
+            return -1 if index == 0
+            return state.puzzle.categories[(index - 1).usize()]
+
+    def header(column: i64) -> Rectangle:
+        return Rectangle{x: column_x(column), y: HEAD_Y, width: column_width(column), height: HEAD_H}
+
+    def sum_button(column: i64) -> Rectangle:
+        return Rectangle{x: column_x(column) + 4.0, y: SUM_Y, width: column_width(column) - 8.0, height: SUM_H}
+
+    # The keypad's eleven keys in their order: 1-9, del, 0.
+    def key_label(index: i64) -> i64:
+        return index + 1 if index < 9
+        return DELETE if index == 9
+        return 0
+
+    def key_rectangle(index: i64) -> Rectangle:
+        r: i64 = index / 3
+        c: i64 = index % 3
+        return Rectangle{x: PANEL_X + c.f64() * (KEY_W + KEY_GAP), y: KEYPAD_Y + r.f64() * (KEY_H + KEY_GAP), width: KEY_W,
+            height: KEY_H}
+
+    def answer_box() -> Rectangle:
+        return Rectangle{x: PANEL_X, y: 70.0, width: 200.0, height: 44.0}
+
+    def submit_box() -> Rectangle:
+        return Rectangle{x: PANEL_X, y: KEYPAD_Y + 4.0 * (KEY_H + KEY_GAP), width: 200.0, height: 50.0}
+
+    def inside(place: Rectangle, x: f64, y: f64) -> bool:
+        return place.x <= x and x <= place.x + place.width and place.y <= y and y <= place.y + place.height
+
+    struct Stats:
+        sum: i64
+        count: i64
+        largest: i64
+
+    # stats: the chosen column over the visible rows.
+    def stats(state: Workbook&) -> Stats:
+        can Memory.Allocate, Abort.Panic:
+            total: mutable i64 = 0
+            largest: mutable i64 = 0
+            rows: darray[i64] = visible_rows(state)
+            for index in rows |total, largest, state|:
+                amount: i64 = value(&state.puzzle.rows[index.usize()], state.stat)
+                total <- total + amount
+                largest <- amount if amount > largest
+            return Stats{sum: total, count: rows.count.i64(), largest: largest}
+
+    # targets(), in its order, as (action, rectangle) pairs by index.
+    def target_count(state: Workbook&) -> i64:
+        return 1 + state.puzzle.category_count + 6 + 3 + 11 + 1
+
+    def target(state: Workbook&, index: i64, place: mutable Rectangle&) -> Action:
+        can Abort.Panic:
+            chips: i64 = 1 + state.puzzle.category_count
+            if index < chips:
+                place <- chip(state, index)
+                return action(FILTER, chip_filter(state, index))
+            at: i64 = index - chips
+            if at < 6:
+                place <- header(at)
+                return action(SORT, at)
+            if at < 9:
+                place <- sum_button(QTY + at - 6)
+                return action(STAT, QTY + at - 6)
+            if at < 20:
+                place <- key_rectangle(at - 9)
+                return action(KEY, key_label(at - 9))
+            place <- submit_box()
+            return action(SUBMIT, 0)
+
+    def target_at(state: Workbook&, x: f64, y: f64) -> Action:
+        can Abort.Panic:
+            for index in 0..<target_count(state) |state, x, y|:
+                place: mutable Rectangle = zeroed
+                found: Action = target(state, index, &place)
+                return found if inside(place, x, y)
+            return action(NONE, 0)
+
+    def place_of(state: Workbook&, wanted: Action) -> Rectangle:
+        can Abort.Panic:
+            for index in 0..<target_count(state) |state, wanted|:
+                place: mutable Rectangle = zeroed
+                found: Action = target(state, index, &place)
+                return place if found.kind == wanted.kind and found.value == wanted.value
+            return zeroed
+
+    def move_pointer(state: mutable Workbook&, dx: f64, dy: f64):
+        x: f64 = state.pointer.x + dx
+        y: f64 = state.pointer.y + dy
+        state.pointer.x <- Browser::SCREEN_W if x > Browser::SCREEN_W else (0.0 if x < 0.0 else x)
+        state.pointer.y <- Browser::SCREEN_H if y > Browser::SCREEN_H else (0.0 if y < 0.0 else y)
+
+    def wheel(state: mutable Workbook&, way: i64):
+        can Memory.Allocate, Abort.Panic:
+            moved: i64 = state.scroll + 3 * way
+            most: i64 = max_scroll(state)
+            state.scroll <- 0 if moved < 0 else (most if moved > most else moved)
+
+    def typed_value(state: Workbook&) -> i64:
+        number: mutable i64 = 0
+        for at in 0..<state.typed_count |number, state|:
+            number <- number * 10 + state.typed[at.usize()]
+        return number
+
+    def act(state: mutable Workbook&, wanted: Action):
+        if wanted.kind == FILTER:
+            state.filter <- wanted.value
+            state.scroll <- 0
+        elif wanted.kind == SORT:
+            if state.sort_column == wanted.value:
+                state.sort_down <- not state.sort_down
+            else:
+                state.sort_column <- wanted.value
+                state.sort_down <- false
+            state.scroll <- 0
+        elif wanted.kind == STAT:
+            state.stat <- wanted.value
+        elif wanted.kind == KEY:
+            if wanted.value == DELETE:
+                state.typed_count <- state.typed_count - 1 if state.typed_count > 0
+            elif state.typed_count < MOST_TYPED:
+                state.typed[state.typed_count.usize()] <- wanted.value
+                state.typed_count <- state.typed_count + 1
+        elif wanted.kind == SUBMIT and state.typed_count > 0:
+            state.submitted <- true
+            state.answer <- typed_value(state)
+
+    def click(state: mutable Workbook&):
+        can Abort.Panic:
+            state.clicks <- state.clicks + 1
+            act(state, target_at(state, state.pointer.x, state.pointer.y))
+
+    def click_at(state: mutable Workbook&, x: f64, y: f64):
+        can Abort.Panic:
+            state.pointer <- BrowserSession::Pointer{x: x, y: y}
+            click(state)
+
+    # A key from the keyboard: counted as a click, as the keypad is.
+    def press(state: mutable Workbook&, wanted: Action):
+        state.clicks <- state.clicks + 1
+        act(state, wanted)
+
+    def steer(state: mutable Workbook&, port: i64):
+        can Memory.Allocate, Abort.Panic:
+            if port >= 0 and port < BrowserSession::CLICK:
+                direction: i64 = port / 3
+                step: f64 = 80.0 if port % 3 == 0 else (20.0 if port % 3 == 1 else 5.0)
+                dx: f64 = -1.0 if direction == 2 else (1.0 if direction == 3 else 0.0)
+                dy: f64 = -1.0 if direction == 0 else (1.0 if direction == 1 else 0.0)
+                move_pointer(state, dx * step, dy * step)
+            elif port == BrowserSession::CLICK:
+                click(state)
+            elif port == BrowserSession::SCROLL_UP:
+                wheel(state, -1)
+            elif port == BrowserSession::SCROLL_DOWN:
+                wheel(state, 1)
+
+    # plan: the reference's clicks -- its tools, the answer's digits, Submit.
+    def plan(puzzle: Puzzle&) -> darray[Action]:
+        can Memory.Allocate, Abort.Panic:
+            steps: mutable darray[Action] = []
+            for index in 0..<puzzle.tool_count |steps, puzzle|:
+                steps.push(puzzle.tools[index.usize()])
+            count: i64 = digits(puzzle.answer)
+            for at in 0..<count |steps, puzzle, count|:
+                power: mutable i64 = 1
+                for _ in 0..<(count - 1 - at) |power|:
+                    power <- power * 10
+                steps.push(action(KEY, puzzle.answer / power % 10))
+            steps.push(action(SUBMIT, 0))
+            return steps
+
+    # reference_ports: the plan carried out from a fresh sheet, starting
+    # where the trial's pointer is.
+    def reference_ports(current: Workbook&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            state: mutable Workbook = start(current.puzzle)
+            state.pointer <- current.pointer
+            ports: mutable darray[i64] = []
+            for step in plan(&current.puzzle) |state, ports|:
+                place: Rectangle = place_of(&state, step)
+                aim: BrowserSession::Pointer = BrowserPar::click_point(BrowserSession::Rectangle{x: place.x, y: place.y,
+                    width: place.width, height: place.height})
+                moves: mutable darray[i64] = []
+                BrowserPar::moves_to(state.pointer, aim, &moves)
+                for port in moves |state, ports|:
+                    steer(&state, port)
+                    ports.push(port)
+                click(&state)
+                ports.push(BrowserSession::CLICK)
+            return ports

@@ -1,0 +1,423 @@
+include "./desktop_click.elisa"
+
+module DesktopPointer:
+    # The pointer: pressing, letting go (a click, or a drag that moves a
+    # window, resizes one or carries a file), the right button's menu,
+    # and popups arriving as clicks are spent.
+    const NONE: i64 = -1
+    # Right-click menu items.
+    const OPEN: i64 = 0
+    const CUT: i64 = 1
+    const COPY: i64 = 2
+    const DELETE: i64 = 3
+    const RESTORE: i64 = 4
+    const PASTE: i64 = 5
+    const VIEW: i64 = 6
+
+    def inside(rect: DesktopState::Rect, x: f64, y: f64) -> bool:
+        return DesktopState::inside(rect, x, y)
+
+    def overlay_open(desk: DesktopState::Desk&) -> bool:
+        overlay: DesktopState::Overlay = desk.overlay
+        return overlay.popup != NONE or overlay.dialog != NONE or overlay.menu_window != NONE or overlay.dropdown != NONE or overlay.start_open or overlay.has_context
+
+    def card_shown(desk: DesktopState::Desk&) -> bool:
+        return not desk.dealt.hide_card or desk.clicks == 0 or desk.picking.peeking
+
+    def move(desk: mutable DesktopState::Desk&, dx: f64, dy: f64):
+        desk.pointer.x <- fmax(0.0, fmin((Desktop::SCREEN_W - Desktop::GRID).f64(), desk.pointer.x + dx))
+        desk.pointer.y <- fmax(0.0, fmin((Desktop::SCREEN_H - Desktop::GRID).f64(), desk.pointer.y + dy))
+
+    # --- the right button --------------------------------------------------
+
+    def context(what: i64, node: i64, window: i64, x: f64, y: f64) -> DesktopState::Context:
+        return DesktopState::Context{what: what, node: node, window: window, x: x, y: y}
+
+    # The menu for what is under the pointer, if any (has_context says).
+    def context_for(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            desk.overlay.has_context <- false
+            return if y >= Desktop::WORK_H.f64()
+            window: i64 = DesktopView::window_at(desk, x, y)
+            if window == NONE:
+                key: i64 = DesktopView::icon_at(desk, x, y)
+                if key == NONE:
+                    desk.picking.picked <- NONE
+                    desk.overlay.context <- context(DesktopState::ON_FOLDER, Desktop::DESKTOP_DIR, NONE, x, y)
+                    desk.overlay.has_context <- true
+                    return
+                desk.picking.picked <- key
+                if key >= DesktopState::KEY_NODE:
+                    desk.overlay.context <- context(DesktopState::ON_NODE, key - DesktopState::KEY_NODE, NONE, x, y)
+                    desk.overlay.has_context <- true
+                return
+            DesktopView::raise_window(desk, window)
+            return if desk.windows[window.usize()].kind != Desktop::EXPLORER
+            tab: usize = desk.windows[window.usize()].browsing.current.usize()
+            icons: darray[DesktopView::Placed] = DesktopView::icon_rects(desk, window)
+            for icon in icons |desk, window, tab, x, y|:
+                if inside(icon.rect, x, y):
+                    desk.windows[window.usize()].browsing.places[tab].selected <- icon.node
+                    desk.overlay.context <- context(DesktopState::ON_NODE, icon.node, window, x, y)
+                    desk.overlay.has_context <- true
+                    return
+            win: DesktopState::Window = desk.windows[window.usize()]
+            if inside(DesktopState::grid_area(&win), x, y):
+                desk.windows[window.usize()].browsing.places[tab].selected <- NONE
+                desk.overlay.context <- context(DesktopState::ON_FOLDER, win.browsing.places[tab].path, window, x, y)
+                desk.overlay.has_context <- true
+
+    def right_click(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            return if desk.done or desk.pointer.held
+            desk.pointer.x <- x
+            desk.pointer.y <- y
+            desk.clicks <- desk.clicks + 1
+            desk.picking.previous <- desk.picking.last
+            desk.picking.last <- NONE
+            desk.picking.peeking <- false
+            if desk.overlay.popup == NONE and desk.overlay.dialog == NONE:
+                desk.overlay.menu_window <- NONE
+                desk.overlay.dropdown <- NONE
+                desk.overlay.start_open <- false
+                desk.overlay.start_all <- false
+                context_for(desk, x, y)
+            arrive(desk)
+
+    # The right-click menu's items, in order.
+    def context_names(desk: DesktopState::Desk&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            names: mutable darray[i64] = []
+            return names if not desk.overlay.has_context
+            shown: DesktopState::Context = desk.overlay.context
+            if shown.what == DesktopState::ON_NODE:
+                node: DesktopState::Node = desk.nodes[shown.node.usize()]
+                names.push(OPEN) if node.folder
+                names.push(CUT)
+                names.push(COPY)
+                if DesktopFiles::within(desk, shown.node, Desktop::TRASH):
+                    names.push(RESTORE) if node.origin != NONE and node.parent == Desktop::TRASH
+                else:
+                    names.push(DELETE)
+                return names
+            names.push(PASTE) if desk.picking.clipboard != NONE
+            names.push(VIEW) if shown.window != NONE
+            return names
+
+    def context_rect(desk: DesktopState::Desk&, count: i64, index: i64) -> DesktopState::Rect:
+        h: f64 = (count * Desktop::ITEM_H).f64()
+        left: f64 = fmin(desk.overlay.context.x, (Desktop::SCREEN_W - Desktop::CONTEXT_W - 2).f64())
+        top: f64 = fmin(desk.overlay.context.y, Desktop::WORK_H.f64() - h - 2.0)
+        return DesktopState::rect(left, top + (index * Desktop::ITEM_H).f64(), Desktop::CONTEXT_W.f64(), Desktop::ITEM_H.f64())
+
+    def context_item(desk: mutable DesktopState::Desk&, name: i64, shown: DesktopState::Context):
+        can Memory.Allocate, Abort.Panic:
+            if name == OPEN:
+                if shown.window == NONE:
+                    DesktopClick::open_icon(desk, DesktopState::KEY_NODE + shown.node)
+                else:
+                    tab: usize = desk.windows[shown.window.usize()].browsing.current.usize()
+                    DesktopFiles::navigate(&desk.windows[shown.window.usize()].browsing.places[tab], shown.node)
+            elif name == CUT or name == COPY:
+                desk.picking.clipboard <- shown.node
+                desk.picking.copying <- name == COPY
+            elif name == DELETE:
+                _ = DesktopFiles::move_file(desk, shown.node, Desktop::TRASH)
+            elif name == RESTORE:
+                _ = DesktopFiles::move_file(desk, shown.node, desk.nodes[shown.node.usize()].origin)
+            elif name == PASTE:
+                DesktopFiles::paste(desk, shown.node)
+            elif name == VIEW:
+                tab: usize = desk.windows[shown.window.usize()].browsing.current.usize()
+                desk.windows[shown.window.usize()].browsing.list_view <- not desk.windows[shown.window.usize()].browsing.list_view
+                desk.windows[shown.window.usize()].browsing.places[tab].scroll <- 0
+
+    def click_context(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            shown: DesktopState::Context = desk.overlay.context
+            names: darray[i64] = context_names(desk)
+            rects: mutable darray[DesktopState::Rect] = []
+            for index in 0..<names.count.i64() |desk, rects, names|:
+                rects.push(context_rect(desk, names.count.i64(), index))
+            desk.overlay.has_context <- false
+            for index in 0..<names.count.i64() |desk, names, rects, shown, x, y|:
+                if inside(rects[index.usize()], x, y):
+                    context_item(desk, names[index.usize()], shown)
+                    return
+
+    # A popup due by this click arrives now.
+    def arrive(desk: mutable DesktopState::Desk&):
+        can Abort.Panic:
+            due: i64 = desk.overlay.next_popup
+            return if desk.overlay.popup != NONE or due >= desk.dealt.popups.count.i64() or desk.done
+            return if desk.clicks < desk.dealt.popups[due.usize()].at
+            desk.overlay.popup <- due
+            desk.overlay.next_popup <- due + 1
+            desk.overlay.menu_window <- NONE
+            desk.overlay.dropdown <- NONE
+            desk.overlay.has_context <- false
+            desk.overlay.start_open <- false
+            desk.overlay.start_all <- false
+
+    # --- a click ----------------------------------------------------------
+
+    def click_dropdown(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            ident: i64 = desk.overlay.dropdown
+            desk.overlay.dropdown <- NONE
+            place: DesktopView::Spot = DesktopView::control_rect(desk, ident)
+            count: i64 = desk.controls[ident.usize()].count
+            for value in 0..<count |desk, place, count, ident, x, y|:
+                DesktopClick::set(desk, ident, value) if inside(DesktopState::dropdown_item(place.rect, count, value), x, y)
+
+    def click_at(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            desk.picking.previous <- desk.picking.last
+            desk.picking.last <- NONE
+            peeked: bool = desk.picking.peeking
+            desk.picking.peeking <- false
+            if desk.overlay.popup != NONE:
+                DesktopClick::click_popup(desk, x, y)
+            elif desk.overlay.dropdown != NONE:
+                click_dropdown(desk, x, y)
+            elif desk.overlay.dialog != NONE:
+                DesktopClick::click_dialog(desk, x, y)
+            elif desk.overlay.has_context:
+                click_context(desk, x, y)
+            elif desk.overlay.menu_window != NONE:
+                DesktopClick::click_menu(desk, x, y)
+            elif desk.overlay.start_open:
+                DesktopClick::click_start(desk, x, y)
+            elif y >= Desktop::WORK_H.f64():
+                if desk.dealt.hide_card and inside(DesktopState::peek_rect(), x, y):
+                    desk.picking.peeking <- not peeked
+                else:
+                    DesktopClick::click_taskbar(desk, x, y)
+            else:
+                window: i64 = DesktopView::window_at(desk, x, y)
+                if window == NONE:
+                    DesktopClick::click_desktop(desk, x, y)
+                else:
+                    DesktopClick::click_window(desk, window, x, y)
+
+    # --- pressing and dragging ----------------------------------------------
+
+    # An icon is picked the moment the button goes down.
+    def select_on_press(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            return if overlay_open(desk) or y >= Desktop::WORK_H.f64()
+            window: i64 = DesktopView::window_at(desk, x, y)
+            if window != NONE:
+                top: i64 = desk.order[(desk.order.count - 1.usize())]
+                return if desk.windows[window.usize()].kind != Desktop::EXPLORER or window != top
+                tab: usize = desk.windows[window.usize()].browsing.current.usize()
+                icons: darray[DesktopView::Placed] = DesktopView::icon_rects(desk, window)
+                for icon in icons |desk, window, tab, x, y|:
+                    desk.windows[window.usize()].browsing.places[tab].selected <- icon.node if inside(icon.rect, x, y)
+                return
+            key: i64 = DesktopView::icon_at(desk, x, y)
+            desk.picking.picked <- key if key != NONE
+
+    def press(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            return if desk.done
+            desk.pointer.x <- x
+            desk.pointer.y <- y
+            desk.pointer.held <- true
+            desk.pointer.held_x <- x
+            desk.pointer.held_y <- y
+            select_on_press(desk, x, y)
+
+    def on_title(win: DesktopState::Window&, x: f64, y: f64) -> bool:
+        return inside(DesktopState::title_rect(win), x, y) and not (inside(DesktopState::close_rect(win), x, y) or inside(DesktopState::minimise_rect(win), x, y))
+
+    # Whether a drag from here can move anything: a title bar, a window's
+    # corner, or a file or folder icon.
+    def draggable(desk: mutable DesktopState::Desk&, x: f64, y: f64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            return false if y >= Desktop::WORK_H.f64()
+            window: i64 = DesktopView::window_at(desk, x, y)
+            if window == NONE:
+                return DesktopView::icon_at(desk, x, y) >= DesktopState::KEY_NODE
+            win: DesktopState::Window = desk.windows[window.usize()]
+            if win.kind == Desktop::EXPLORER:
+                icons: darray[DesktopView::Placed] = DesktopView::icon_rects(desk, window)
+                for icon in icons |x, y|:
+                    return true if inside(icon.rect, x, y)
+            elif win.kind == Desktop::APP and inside(DesktopState::grip_rect(&win), x, y):
+                return true
+            return on_title(&win, x, y)
+
+    # The file or folder an icon drag starts from, if any.
+    def dragged(desk: mutable DesktopState::Desk&, x: f64, y: f64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            window: i64 = DesktopView::window_at(desk, x, y)
+            if window != NONE and desk.windows[window.usize()].kind == Desktop::EXPLORER:
+                icons: darray[DesktopView::Placed] = DesktopView::icon_rects(desk, window)
+                for icon in icons |desk, window, x, y|:
+                    if inside(icon.rect, x, y):
+                        DesktopView::raise_window(desk, window)
+                        return icon.node
+                return NONE
+            key: i64 = DesktopView::icon_at(desk, x, y)
+            return key - DesktopState::KEY_NODE if key >= DesktopState::KEY_NODE
+            return NONE
+
+    struct Target:
+        folder: i64
+        found: bool
+        rect: DesktopState::Rect
+
+    def target(folder: i64, rect: DesktopState::Rect) -> Target:
+        return Target{folder: folder, found: true, rect: rect}
+
+    def no_target() -> Target:
+        return Target{folder: NONE, found: false, rect: zeroed}
+
+    # The folder a drop here puts things in, if any, and what it was
+    # dropped on (the whole desktop for bare desktop).
+    def drop_target(desk: mutable DesktopState::Desk&, x: f64, y: f64) -> Target:
+        can Memory.Allocate, Abort.Panic:
+            return no_target() if y >= Desktop::WORK_H.f64()
+            window: i64 = DesktopView::window_at(desk, x, y)
+            if window != NONE:
+                return no_target() if desk.windows[window.usize()].kind != Desktop::EXPLORER
+                icons: darray[DesktopView::Placed] = DesktopView::icon_rects(desk, window)
+                for icon in icons |desk, x, y|:
+                    return target(icon.node if desk.nodes[icon.node.usize()].folder else NONE, icon.rect) if inside(icon.rect, x, y)
+                win: DesktopState::Window = desk.windows[window.usize()]
+                for index in 0..<Desktop::PLACE_COUNT |win, x, y|:
+                    return target(index, DesktopState::sidebar_rect(&win, index)) if inside(DesktopState::sidebar_rect(&win, index), x, y)
+                for index in 0..<win.browsing.places.count.i64() |win, x, y|:
+                    place: DesktopState::Rect = DesktopState::place_tab_rect(&win, index)
+                    return target(win.browsing.places[index.usize()].path, place) if inside(place, x, y)
+                area: DesktopState::Rect = DesktopState::grid_area(&win)
+                return target(win.browsing.places[win.browsing.current.usize()].path, area) if inside(area, x, y)
+                return no_target()
+            icons: darray[i64] = DesktopView::desktop_icons(desk)
+            for index in 0..<icons.count.i64() |desk, icons, x, y|:
+                place: DesktopState::Rect = DesktopState::desktop_icon_rect(index)
+                if inside(place, x, y):
+                    key: i64 = icons[index.usize()]
+                    return target(Desktop::TRASH, place) if key == DesktopState::KEY_TRASH
+                    if key >= DesktopState::KEY_NODE and desk.nodes[(key - DesktopState::KEY_NODE).usize()].folder:
+                        return target(key - DesktopState::KEY_NODE, place)
+                    return target(NONE, place)
+            return target(Desktop::DESKTOP_DIR, DesktopState::rect(0.0, 0.0, Desktop::SCREEN_W.f64(), Desktop::WORK_H.f64()))
+
+    def snapped(delta: f64) -> f64:
+        return (py_round_half_even(delta / Desktop::GRID.f64()) * Desktop::GRID).f64()
+
+    def clamp_scrolls(desk: mutable DesktopState::Desk&, window: i64):
+        can Abort.Panic:
+            win: DesktopState::Window = desk.windows[window.usize()]
+            for tab in 0..<win.tab_count |desk, win, window|:
+                kept: i64 = Desktop::imax(0, Desktop::imin(win.scroll[tab.usize()], win.per_tab - win.rows))
+                desk.windows[window.usize()].scroll[tab.usize()] <- kept
+
+    def drag(desk: mutable DesktopState::Desk&, from_x: f64, from_y: f64, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            return if from_y >= Desktop::WORK_H.f64()
+            source: i64 = dragged(desk, from_x, from_y)
+            if source != NONE:
+                dropped: Target = drop_target(desk, x, y)
+                if dropped.folder != NONE:
+                    _ = DesktopFiles::move_file(desk, source, dropped.folder)
+                return
+            window: i64 = DesktopView::window_at(desk, from_x, from_y)
+            return if window == NONE
+            DesktopView::raise_window(desk, window)
+            dx: f64 = snapped(x - from_x)
+            dy: f64 = snapped(y - from_y)
+            win: DesktopState::Window = desk.windows[window.usize()]
+            if win.kind == Desktop::APP and inside(DesktopState::grip_rect(&win), from_x, from_y):
+                rows: i64 = win.rows + py_round_half_even(dy / Desktop::ROW_H.f64())
+                desk.windows[window.usize()].rows <- Desktop::imax(1, Desktop::imin(DesktopState::most_rows(&win), rows))
+                clamp_scrolls(desk, window)
+                return
+            return if not on_title(&win, from_x, from_y)
+            desk.windows[window.usize()].x <- fmax(60.0 - win.w, fmin((Desktop::SCREEN_W - 60).f64(), win.x + dx))
+            desk.windows[window.usize()].y <- fmax(0.0, fmin((Desktop::WORK_H - Desktop::TITLE_H).f64(), win.y + dy))
+            moved: DesktopState::Window = desk.windows[window.usize()]
+            if moved.y + DesktopState::height(&moved) > Desktop::WORK_H.f64():
+                # A window dragged low keeps what fits.
+                room: f64 = Desktop::WORK_H.f64() - moved.y - DesktopState::chrome(&moved).f64()
+                desk.windows[window.usize()].rows <- Desktop::imax(1, floor(room / Desktop::ROW_H.f64()).i64())
+                clamp_scrolls(desk, window)
+
+    # Let go: a click where it was pressed, or a drag to here; either
+    # costs one.
+    def release(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            return if not desk.pointer.held or desk.done
+            desk.pointer.x <- x
+            desk.pointer.y <- y
+            from_x: f64 = desk.pointer.held_x
+            from_y: f64 = desk.pointer.held_y
+            desk.pointer.held <- false
+            desk.clicks <- desk.clicks + 1
+            still: bool = fabs(x - from_x) <= Desktop::STILL.f64() and fabs(y - from_y) <= Desktop::STILL.f64()
+            if still or overlay_open(desk) or not draggable(desk, from_x, from_y):
+                click_at(desk, from_x, from_y)
+            else:
+                drag(desk, from_x, from_y, x, y)
+            arrive(desk)
+
+    def click(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            press(desk, x, y)
+            release(desk, x, y)
+
+    # What letting go here would do while the button is held and the
+    # pointer has moved: carry an icon (to a folder, or nowhere), or move
+    # or resize a window to an outline.
+    const PREVIEW_NONE: i64 = 0
+    const PREVIEW_ICON: i64 = 1
+    const PREVIEW_MOVE: i64 = 2
+    const PREVIEW_RESIZE: i64 = 3
+
+    struct Preview:
+        kind: i64
+        node: i64
+        window: i64
+        dest: Target
+
+    def no_preview() -> Preview:
+        return Preview{kind: PREVIEW_NONE, node: NONE, window: NONE, dest: no_target()}
+
+    def outline(kind: i64, window: i64, rect: DesktopState::Rect) -> Preview:
+        return Preview{kind: kind, node: NONE, window: window, dest: target(NONE, rect)}
+
+    def drag_preview(desk: mutable DesktopState::Desk&) -> Preview:
+        can Memory.Allocate, Abort.Panic:
+            return no_preview() if not desk.pointer.held or overlay_open(desk)
+            from_x: f64 = desk.pointer.held_x
+            from_y: f64 = desk.pointer.held_y
+            x: f64 = desk.pointer.x
+            y: f64 = desk.pointer.y
+            return no_preview() if fabs(x - from_x) <= Desktop::STILL.f64() and fabs(y - from_y) <= Desktop::STILL.f64()
+            return no_preview() if not draggable(desk, from_x, from_y)
+            window: i64 = DesktopView::window_at(desk, from_x, from_y)
+            node: mutable i64 = NONE
+            if window == NONE:
+                node <- DesktopView::icon_at(desk, from_x, from_y) - DesktopState::KEY_NODE
+            elif desk.windows[window.usize()].kind == Desktop::EXPLORER:
+                icons: darray[DesktopView::Placed] = DesktopView::icon_rects(desk, window)
+                for icon in icons |node, from_x, from_y|:
+                    node <- icon.node if node == NONE and inside(icon.rect, from_x, from_y)
+            if node != NONE:
+                dropped: Target = drop_target(desk, x, y)
+                folder: i64 = dropped.folder
+                refused: bool = folder != NONE and (DesktopFiles::within(desk, folder, node) or desk.nodes[node.usize()].parent == folder or not desk.nodes[folder.usize()].folder)
+                kept: Target = Target{folder: NONE if refused else folder, found: dropped.found, rect: dropped.rect}
+                return Preview{kind: PREVIEW_ICON, node: node, window: NONE, dest: kept}
+            win: DesktopState::Window = desk.windows[window.usize()]
+            dx: f64 = snapped(x - from_x)
+            dy: f64 = snapped(y - from_y)
+            if win.kind == Desktop::APP and inside(DesktopState::grip_rect(&win), from_x, from_y):
+                rows: i64 = Desktop::imax(1, Desktop::imin(DesktopState::most_rows(&win), win.rows + py_round_half_even(dy / Desktop::ROW_H.f64())))
+                return outline(PREVIEW_RESIZE, window, DesktopState::rect(win.x, win.y, win.w,
+                    DesktopState::height(&win) + ((rows - win.rows) * Desktop::ROW_H).f64()))
+            left: f64 = fmax(60.0 - win.w, fmin((Desktop::SCREEN_W - 60).f64(), win.x + dx))
+            top: f64 = fmax(0.0, fmin((Desktop::WORK_H - Desktop::TITLE_H).f64(), win.y + dy))
+            return outline(PREVIEW_MOVE, window, DesktopState::rect(left, top, win.w, fmin(DesktopState::height(&win), Desktop::WORK_H.f64() - top)))

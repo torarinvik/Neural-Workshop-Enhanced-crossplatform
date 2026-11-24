@@ -1023,6 +1023,71 @@ export function createToneOfVoiceEnvironment(exports, context, createArchive, op
   }, options);
 }
 
+// Browser: 12 pointer moves, a click and two scrolls; port 15 starts a run.
+export function createBrowserEnvironment(exports, context, createArchive, options) {
+  return createRungEnvironment(exports, context, createArchive, {
+    name: "Browser", trials: 5, ports: 15, frameCapacity: 1048576n, clocked: true,
+    id: exports.nw_api_v1_task_browser,
+    driver: (handle, frameHz) => clockedDriver(handle, frameHz,
+      exports.nw_browser_agent_event, exports.nw_api_v1_browser_info, 15),
+  }, options);
+}
+
+// Spreadsheet: Browser's ports -- 12 pointer moves, a click and two
+// scrolls; port 15 starts a run.
+export function createSpreadsheetEnvironment(exports, context, createArchive, options) {
+  return createRungEnvironment(exports, context, createArchive, {
+    name: "Spreadsheet", trials: 5, ports: 15, frameCapacity: 1048576n, clocked: true,
+    id: exports.nw_api_v1_task_spreadsheet,
+    driver: (handle, frameHz) => clockedDriver(handle, frameHz,
+      exports.nw_spreadsheet_agent_event, exports.nw_api_v1_spreadsheet_info, 15),
+  }, options);
+}
+
+// Errands: Browser's ports -- 12 pointer moves, a click and two scrolls;
+// port 15 starts a run.
+export function createErrandsEnvironment(exports, context, createArchive, options) {
+  return createRungEnvironment(exports, context, createArchive, {
+    name: "Errands", trials: 3, ports: 15, frameCapacity: 1048576n, clocked: true,
+    id: exports.nw_api_v1_task_errands,
+    driver: (handle, frameHz) => clockedDriver(handle, frameHz,
+      exports.nw_errands_agent_event, exports.nw_api_v1_errands_info, 15),
+  }, options);
+}
+
+// Manual: 21 ports name places on the panel -- six switches, two to each
+// of four knobs (down, up), six buttons -- and Finish; port 21 starts a run.
+export function createManualEnvironment(exports, context, createArchive, options) {
+  return createRungEnvironment(exports, context, createArchive, {
+    name: "Manual", trials: 5, ports: 21, frameCapacity: 1048576n, clocked: true,
+    id: exports.nw_api_v1_task_manual,
+    driver: (handle, frameHz) => clockedDriver(handle, frameHz,
+      exports.nw_manual_agent_event, exports.nw_api_v1_manual_info, 21),
+  }, options);
+}
+
+// Forms: 46 ports, one per key -- a to z, 0 to 9, space, @ . - /, then
+// Backspace, Tab, Enter, Up and Down; port 46 starts a run.
+export function createFormsEnvironment(exports, context, createArchive, options) {
+  return createRungEnvironment(exports, context, createArchive, {
+    name: "Forms", trials: 5, ports: 46, frameCapacity: 1048576n, clocked: true,
+    id: exports.nw_api_v1_task_forms,
+    driver: (handle, frameHz) => clockedDriver(handle, frameHz,
+      exports.nw_forms_agent_event, exports.nw_api_v1_forms_info, 46),
+  }, options);
+}
+
+// Desktop: 17 ports -- the pointer up, down, left or right by a long,
+// medium or short step, then click, press, let go, Done and right-click.
+export function createDesktopEnvironment(exports, context, createArchive, options) {
+  return createRungEnvironment(exports, context, createArchive, {
+    name: "Desktop", trials: 5, ports: 17, frameCapacity: 1048576n, clocked: true,
+    id: exports.nw_api_v1_task_desktop,
+    driver: (handle, frameHz) => clockedDriver(handle, frameHz,
+      exports.nw_desktop_agent_event, exports.nw_api_v1_desktop_info, 17),
+  }, options);
+}
+
 export function createEmotionEnvironment(exports, context, createArchive, options) {
   return createRungEnvironment(exports, context, createArchive, {
     name: "Emotion", trials: 5, ports: 8, frameCapacity: 1048576n, clocked: true,

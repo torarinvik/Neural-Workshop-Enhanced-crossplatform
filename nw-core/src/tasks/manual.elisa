@@ -1,0 +1,502 @@
+include "../pyrandom.elisa"
+include "../strings.elisa"
+
+module Manual:
+    # manual.py: a control panel never seen before -- switches, knobs from
+    # 0 to TOP, buttons, lamps and a one-digit display, wired at random --
+    # and a written procedure to carry out on it. The round passes when
+    # every control stands where following the procedure leaves it.
+    const MOST_SWITCHES: i64 = 6
+    const MOST_KNOBS: i64 = 4
+    const MOST_BUTTONS: i64 = 6
+    const MOST_LAMPS: i64 = 4
+    const MOST_CONTROLS: i64 = 16
+    const MOST_STEPS: i64 = 10
+    const MOST_LOG: i64 = 256
+    const TOP: i64 = 4
+
+    # COLOURS, in manual.py's order: a lamp's sum modulo 3 indexes them.
+    const GREEN: i64 = 0
+    const RED: i64 = 1
+    const OFF: i64 = 2
+
+    # Kinds of step, as grade() adds them.
+    const SET: i64 = 0
+    const FLIP: i64 = 1
+    const KNOB: i64 = 2
+    const PRESS: i64 = 3
+    const IF: i64 = 4
+    const COUNT: i64 = 5
+    const COPY: i64 = 6
+    const UNTIL: i64 = 7
+    const RECALL: i64 = 8
+    const SKIP: i64 = 9
+    const MOST_KINDS: i64 = 10
+
+    # A logged action: what a reference does with its hands.
+    const SWITCH_ACTION: i64 = 0
+    const KNOB_ACTION: i64 = 1
+    const PRESS_ACTION: i64 = 2
+
+    struct Grade:
+        rung: i64
+        switches: i64
+        knobs: i64
+        buttons: i64
+        lamps: i64
+        steps: i64
+        kinds: i64[10]
+        kind_count: i64
+        shuffled: bool
+
+    def has_kind(level: Grade&, kind: i64) -> bool:
+        for index in 0..<level.kind_count |level, kind|:
+            return true if level.kinds[index.usize()] == kind
+        return false
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 1 else 1
+        kinds: mutable i64[10] = zeroed
+        count: mutable i64 = 0
+        for kind in 0..<MOST_KINDS |kinds, count, r|:
+            wanted: bool = (kind <= FLIP or (kind <= PRESS and r >= 2) or (kind == IF and r >= 5) or
+                ((kind == COUNT or kind == COPY) and r >= 9) or ((kind == UNTIL or kind == RECALL) and r >= 13) or
+                (kind == SKIP and r >= 20))
+            if wanted:
+                kinds[count.usize()] <- kind
+                count <- count + 1
+        return Grade{rung: r, switches: imin(MOST_SWITCHES, 2 + r / 3), knobs: imin(MOST_KNOBS, (r + 1) / 3),
+            buttons: imin(MOST_BUTTONS, 1 + r / 3), lamps: imin(MOST_LAMPS, 1 + r / 4), steps: imin(10, 1 + (r - 1) / 2),
+            kinds: kinds, kind_count: count, shuffled: r >= 17}
+
+    def imin(one: i64, two: i64) -> i64:
+        return one if one < two else two
+
+    # How the lamps and display read the controls: a weight per control
+    # (switches, then knobs, then button presses) for each.
+    struct Wiring:
+        lamps: mutable i64[64]
+        display: mutable i64[16]
+
+    struct Panel:
+        level: Grade
+        wiring: Wiring
+        switches: mutable bool[6]
+        knobs: mutable i64[4]
+        presses: mutable i64[6]
+        log_count: mutable i64
+        log: mutable i64[256]
+
+    def panel(level: Grade, wiring: Wiring, switches: bool[6], knobs: i64[4]) -> Panel:
+        return Panel{level: level, wiring: wiring, switches: switches, knobs: knobs, presses: zeroed, log_count: 0, log: zeroed}
+
+    # vector()'s entry at a control index.
+    def control(board: Panel&, at: i64) -> i64:
+        level: Grade = board.level
+        return (1 if board.switches[at.usize()] else 0) if at < level.switches
+        return board.knobs[(at - level.switches).usize()] if at < level.switches + level.knobs
+        return board.presses[(at - level.switches - level.knobs).usize()]
+
+    def controls(level: Grade&) -> i64:
+        return level.switches + level.knobs + level.buttons
+
+    # The weighted sum lamp `index` reads, or the display's for -1.
+    def weighted(board: Panel&, index: i64) -> i64:
+        total: mutable i64 = 0
+        for at in 0..<controls(&board.level) |total, board, index|:
+            weight: i64 = board.wiring.display[at.usize()] if index < 0 else board.wiring.lamps[(index * MOST_CONTROLS + at).usize()]
+            total <- total + weight * control(board, at)
+        return total
+
+    def lamp(board: Panel&, index: i64) -> i64:
+        return weighted(board, index) % 3
+
+    def display(board: Panel&) -> i64:
+        return weighted(board, -1) % 10
+
+    def same_state(one: Panel&, two: Panel&) -> bool:
+        for at in 0..<controls(&one.level) |one, two|:
+            return false if control(one, at) != control(two, at)
+        return true
+
+    def record(board: mutable Panel&, action: i64):
+        if board.log_count < MOST_LOG:
+            board.log[board.log_count.usize()] <- action
+            board.log_count <- board.log_count + 1
+
+    # An action as one number: kind, control, and for a knob the way.
+    def action(kind: i64, index: i64, up: bool) -> i64:
+        return kind * 64 + index * 2 + (1 if up else 0)
+
+    def toggle(board: mutable Panel&, index: i64) -> bool:
+        return false if index < 0 or index >= board.level.switches
+        board.switches[index.usize()] <- not board.switches[index.usize()]
+        record(board, action(SWITCH_ACTION, index, false))
+        return true
+
+    def turn(board: mutable Panel&, index: i64, way: i64) -> bool:
+        return false if index < 0 or index >= board.level.knobs
+        target: i64 = board.knobs[index.usize()] + (1 if way > 0 else -1)
+        return false if target < 0 or target > TOP
+        board.knobs[index.usize()] <- target
+        record(board, action(KNOB_ACTION, index, way > 0))
+        return true
+
+    def press(board: mutable Panel&, index: i64) -> bool:
+        return false if index < 0 or index >= board.level.buttons
+        board.presses[index.usize()] <- board.presses[index.usize()] + 1
+        record(board, action(PRESS_ACTION, index, false))
+        return true
+
+    def set_switch(board: mutable Panel&, index: i64, wanted: bool):
+        if board.switches[index.usize()] != wanted:
+            _ = toggle(board, index)
+
+    def set_knob(board: mutable Panel&, index: i64, target: i64):
+        while board.knobs[index.usize()] != target |board, index, target|:
+            _ = turn(board, index, 1 if target > board.knobs[index.usize()] else -1)
+
+    # _plain's step: a control moved, nothing read.
+    struct Plain:
+        kind: i64
+        index: i64
+        value: i64
+
+    # A step of the procedure. `yes` is a plain step's move, and an IF's
+    # move when the lamp shows `colour`; `no` the IF's move otherwise.
+    # `first` and `second` are a COPY's from and to, a COUNT's or UNTIL's
+    # button, or a RECALL's control; `on_knobs` says a COPY or RECALL works
+    # knobs, and `even` which displays a SKIP skips on.
+    struct Step:
+        kind: mutable i64
+        yes: mutable Plain
+        no: mutable Plain
+        lamp: mutable i64
+        colour: mutable i64
+        first: mutable i64
+        second: mutable i64
+        on_knobs: mutable bool
+        even: mutable bool
+
+    def same_plain(one: Plain, two: Plain) -> bool:
+        return one.kind == two.kind and one.index == two.index and one.value == two.value
+
+    # Two steps whose words match: the words follow from these fields.
+    def same_step(one: Step&, two: Step&) -> bool:
+        return false if one.kind != two.kind
+        return same_plain(one.yes, two.yes) if one.kind <= PRESS
+        return one.lamp == two.lamp and one.colour == two.colour and same_plain(one.yes, two.yes) and same_plain(one.no, two.no) if one.kind == IF
+        return one.first == two.first if one.kind == COUNT
+        return one.on_knobs == two.on_knobs and one.first == two.first and one.second == two.second if one.kind == COPY
+        return one.lamp == two.lamp and one.colour == two.colour and one.first == two.first if one.kind == UNTIL
+        return one.on_knobs == two.on_knobs and one.first == two.first if one.kind == RECALL
+        return one.even == two.even
+
+    def operate(board: mutable Panel&, plain: Plain):
+        if plain.kind == SET:
+            set_switch(board, plain.index, plain.value == 1)
+        elif plain.kind == FLIP:
+            _ = toggle(board, plain.index)
+        elif plain.kind == KNOB:
+            set_knob(board, plain.index, plain.value)
+        else:
+            for _ in 0..<plain.value |board, plain|:
+                _ = press(board, plain.index)
+
+    # A step's run(): true when the step after it is skipped.
+    def run(board: mutable Panel&, start: Panel&, step: Step&) -> bool:
+        kind: i64 = step.kind
+        if kind <= PRESS:
+            operate(board, step.yes)
+        elif kind == IF:
+            operate(board, step.yes if lamp(board, step.lamp) == step.colour else step.no)
+        elif kind == COUNT:
+            for _ in 0..<display(board) |board, step|:
+                _ = press(board, step.first)
+        elif kind == COPY:
+            if step.on_knobs:
+                set_knob(board, step.second, board.knobs[step.first.usize()])
+            else:
+                set_switch(board, step.second, board.switches[step.first.usize()])
+        elif kind == UNTIL:
+            while lamp(board, step.lamp) != step.colour |board, step|:
+                _ = press(board, step.first)
+        elif kind == RECALL:
+            if step.on_knobs:
+                set_knob(board, step.first, start.knobs[step.first.usize()])
+            else:
+                set_switch(board, step.first, start.switches[step.first.usize()])
+        else:
+            return (display(board) % 2 == 0) == step.even
+        return false
+
+    struct Deal:
+        seed: i64
+        level: Grade
+        wiring: Wiring
+        switches: bool[6]
+        knobs: i64[4]
+        step_count: mutable i64
+        steps: mutable Step[10]
+        # Where each control is drawn: slot -> control, per kind.
+        switch_slots: mutable i64[6]
+        knob_slots: mutable i64[4]
+        button_slots: mutable i64[6]
+
+    def start(dealt: Deal&) -> Panel:
+        return panel(dealt.level, dealt.wiring, dealt.switches, dealt.knobs)
+
+    # follow: the panel as the procedure leaves it, done exactly.
+    def follow(dealt: Deal&) -> Panel:
+        board: mutable Panel = start(dealt)
+        begun: Panel = start(dealt)
+        skip: mutable bool = false
+        for index in 0..<dealt.step_count |board, begun, skip, dealt|:
+            if skip:
+                skip <- false
+                continue
+            skip <- run(&board, &begun, &dealt.steps[index.usize()])
+        return board
+
+    # _plain: a step that only moves a control, of a kind among `kinds`.
+    def plain(level: Grade&, draw: mutable MT19937&, kinds: i64[4], kind_count: i64) -> Plain:
+        can Abort.Panic:
+            choices: mutable i64[4] = zeroed
+            count: mutable i64 = 0
+            for stage in 0..<3 |choices, count, level, kinds, kind_count|:
+                for at in 0..<kind_count |choices, count, level, kinds, stage|:
+                    kind: i64 = kinds[at.usize()]
+                    take: bool = ((kind == SET or kind == FLIP) if stage == 0 else
+                        (kind == KNOB and level.knobs > 0 if stage == 1 else kind == PRESS and level.buttons > 0))
+                    if take:
+                        choices[count.usize()] <- kind
+                        count <- count + 1
+            kind: i64 = choices[py_choice_index(draw, count).usize()]
+            if kind == SET:
+                index: i64 = py_randrange(draw, 0, level.switches)
+                return Plain{kind: SET, index: index, value: 1 if py_random(draw) < 0.5 else 0}
+            if kind == FLIP:
+                return Plain{kind: FLIP, index: py_randrange(draw, 0, level.switches), value: 0}
+            if kind == KNOB:
+                index: i64 = py_randrange(draw, 0, level.knobs)
+                return Plain{kind: KNOB, index: index, value: py_randint(draw, 0, TOP)}
+            index: i64 = py_randrange(draw, 0, level.buttons)
+            return Plain{kind: PRESS, index: index, value: py_randint(draw, 1, 3)}
+
+    def plain_step(made: Plain) -> Step:
+        return Step{kind: made.kind, yes: made, no: zeroed, lamp: 0, colour: 0, first: 0, second: 0, on_knobs: false, even: false}
+
+    # _step: a step of `kind`, or none (found false) when it cannot be.
+    def step(kind: i64, level: Grade&, wired: Wiring&, draw: mutable MT19937&, plain_kinds: i64[4], plain_count: i64, last: bool, found: mutable bool&) -> Step:
+        can Abort.Panic:
+            found <- true
+            made: mutable Step = plain_step(zeroed)
+            made.kind <- kind
+            if kind <= PRESS:
+                if kind == KNOB and level.knobs == 0:
+                    found <- false
+                    return made
+                only: i64[4] = [kind, 0, 0, 0]
+                return plain_step(plain(level, draw, only, 1))
+            if kind == IF:
+                made.lamp <- py_randrange(draw, 0, level.lamps)
+                made.colour <- py_choice_index(draw, 3)
+                made.yes <- plain(level, draw, plain_kinds, plain_count)
+                made.no <- plain(level, draw, plain_kinds, plain_count)
+                found <- not same_plain(made.yes, made.no)
+                return made
+            if kind == COUNT:
+                made.first <- py_randrange(draw, 0, level.buttons)
+                return made
+            if kind == COPY:
+                made.on_knobs <- level.knobs >= 2 and py_random(draw) < 0.5
+                pair: darray[i64] = py_sample_range(draw, 0, (level.knobs if made.on_knobs else level.switches) - 1, 2)
+                made.first <- pair[0]
+                made.second <- pair[1]
+                return made
+            if kind == UNTIL:
+                pairs: mutable darray[i64] = []
+                for at in 0..<level.lamps * level.buttons |pairs, level, wired|:
+                    lit: i64 = at / level.buttons
+                    button: i64 = at % level.buttons
+                    pairs.push(at) if wired.lamps[(lit * MOST_CONTROLS + level.switches + level.knobs + button).usize()] % 3 != 0
+                if pairs.count == 0:
+                    found <- false
+                    return made
+                chosen: i64 = pairs[py_choice_index(draw, pairs.count.i64()).usize()]
+                made.lamp <- chosen / level.buttons
+                made.first <- chosen % level.buttons
+                made.colour <- py_choice_index(draw, 3)
+                return made
+            if kind == RECALL:
+                made.on_knobs <- level.knobs > 0 and py_random(draw) < 0.5
+                made.first <- py_randrange(draw, 0, level.knobs if made.on_knobs else level.switches)
+                return made
+            if last:
+                found <- false
+                return made
+            made.even <- py_random(draw) < 0.5
+            return made
+
+    def wiring(level: Grade&, draw: mutable MT19937&) -> Wiring:
+        can Abort.Panic:
+            out: mutable Wiring = zeroed
+            count: i64 = controls(level)
+            for _ in 0..<200 |out, level, draw, count|:
+                every: mutable bool = true
+                for lit in 0..<level.lamps |out, draw, count, every|:
+                    any: mutable bool = false
+                    for at in 0..<count |out, draw, lit, any|:
+                        weight: i64 = py_randint(draw, 0, 2)
+                        out.lamps[(lit * MOST_CONTROLS + at).usize()] <- weight
+                        any <- any or weight != 0
+                    every <- every and any
+                break if every
+            for at in 0..<count |out, draw|:
+                out.display[at.usize()] <- py_randint(draw, 0, 9)
+            return out
+
+    def deal_seeded(rung: i64, seed: i64) -> Deal:
+        can Memory.Allocate, Abort.Panic:
+            level: Grade = grade(rung)
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, seed.u64())
+            wired: Wiring = wiring(&level, &draw)
+            switches: mutable bool[6] = zeroed
+            for at in 0..<level.switches |switches, draw|:
+                switches[at.usize()] <- py_random(&draw) < 0.5
+            knobs: mutable i64[4] = zeroed
+            for at in 0..<level.knobs |knobs, draw|:
+                knobs[at.usize()] <- py_randint(&draw, 0, TOP)
+            plain_kinds: mutable i64[4] = zeroed
+            plain_count: mutable i64 = 0
+            for at in 0..<level.kind_count |plain_kinds, plain_count, level|:
+                if level.kinds[at.usize()] <= PRESS:
+                    plain_kinds[plain_count.usize()] <- level.kinds[at.usize()]
+                    plain_count <- plain_count + 1
+            newest: darray[i64] = newest_kinds(&level)
+            trial: mutable Deal = Deal{seed: seed, level: level, wiring: wired, switches: switches, knobs: knobs, step_count: 0,
+                steps: zeroed, switch_slots: zeroed, knob_slots: zeroed, button_slots: zeroed}
+            for _ in 0..<100 |trial, level, wired, draw, plain_kinds, plain_count, newest|:
+                trial.step_count <- 0
+                forced: i64 = py_randrange(&draw, 0, imax(1, level.steps - 1)) if newest.count > 0 else -1
+                tries: mutable i64 = 0
+                while trial.step_count < level.steps |trial, level, wired, draw, plain_kinds, plain_count, newest, forced, tries|:
+                    last: bool = trial.step_count == level.steps - 1
+                    tries <- tries + 1
+                    kind: i64 = pick_kind(&draw, &level, &newest, trial.step_count == forced and tries < 200)
+                    found: mutable bool = false
+                    made: Step = step(kind, &level, &wired, &draw, plain_kinds, plain_count, last, &found)
+                    if found and not repeated(&trial, &made):
+                        trial.steps[trial.step_count.usize()] <- made
+                        trial.step_count <- trial.step_count + 1
+                # Doing nothing must not already be right.
+                done: Panel = follow(&trial)
+                untouched: Panel = start(&trial)
+                break if not same_state(&done, &untouched)
+            trial.switch_slots <- slots_of(&draw, level.switches, level.shuffled)
+            trial.knob_slots <- knob_slots_of(&draw, level.knobs, level.shuffled)
+            trial.button_slots <- slots_of(&draw, level.buttons, level.shuffled)
+            return trial
+
+    def imax(one: i64, two: i64) -> i64:
+        return one if one > two else two
+
+    def repeated(trial: Deal&, made: Step&) -> bool:
+        for at in 0..<trial.step_count |trial, made|:
+            return true if same_step(&trial.steps[at.usize()], made)
+        return false
+
+    # The kinds this rung adds over four rungs down, the steps ones first.
+    def newest_kinds(level: Grade&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[i64] = []
+            return out if level.rung <= 4
+            older: Grade = grade(level.rung - 4)
+            for stage in 0..<2 |out, level, older|:
+                for at in 0..<level.kind_count |out, level, older, stage|:
+                    kind: i64 = level.kinds[at.usize()]
+                    if not has_kind(&older, kind) and (kind > PRESS) == (stage == 0):
+                        out.push(kind)
+                # Only when no step kind is new do the plain ones stand in.
+                break if out.count > 0
+            return out
+
+    def pick_kind(draw: mutable MT19937&, level: Grade&, newest: darray[i64]&, forced: bool) -> i64:
+        can Abort.Panic:
+            return newest[py_choice_index(draw, newest.count.i64()).usize()] if forced
+            total: i64 = level.kind_count + newest.count.i64() * 2
+            at: i64 = py_choice_index(draw, total)
+            return level.kinds[at.usize()] if at < level.kind_count
+            return newest[((at - level.kind_count) % newest.count.i64()).usize()]
+
+    def slots_of(draw: mutable MT19937&, count: i64, shuffled: bool) -> i64[6]:
+        can Memory.Allocate, Abort.Panic:
+            order: mutable darray[i64] = []
+            for at in 0..<count |order|:
+                order.push(at)
+            py_shuffle_i64(draw, &order) if shuffled
+            out: mutable i64[6] = zeroed
+            for at in 0..<count |out, order|:
+                out[at.usize()] <- order[at.usize()]
+            return out
+
+    def knob_slots_of(draw: mutable MT19937&, count: i64, shuffled: bool) -> i64[4]:
+        can Memory.Allocate, Abort.Panic:
+            wide: i64[6] = slots_of(draw, count, shuffled)
+            out: mutable i64[4] = zeroed
+            for at in 0..<count |out, wide|:
+                out[at.usize()] <- wide[at.usize()]
+            return out
+
+    def deal(rung: i64, run: mutable MT19937&) -> Deal:
+        can Memory.Allocate, Abort.Panic:
+            return deal_seeded(rung, py_randrange(run, 0, 1073741824))
+
+    # ui/manual.py's ports name places on the panel, not controls: 0-5
+    # flip the switches in drawn order, 6-13 turn the knobs (down, then
+    # up, two to a knob), 14-19 press the buttons, 20 is Finish.
+    const KNOB_PORT: i64 = MOST_SWITCHES
+    const BUTTON_PORT: i64 = KNOB_PORT + 2 * MOST_KNOBS
+    const FINISH_PORT: i64 = BUTTON_PORT + MOST_BUTTONS
+    const PORTS: i64 = FINISH_PORT + 1
+
+    # A panel port's move; false when the port names an empty place, a
+    # knob at its end, or Finish.
+    def steer(board: mutable Panel&, dealt: Deal&, port: i64) -> bool:
+        level: Grade = dealt.level
+        return false if port < 0
+        if port < KNOB_PORT:
+            return port < level.switches and toggle(board, dealt.switch_slots[port.usize()])
+        if port < BUTTON_PORT:
+            slot: i64 = (port - KNOB_PORT) / 2
+            return slot < level.knobs and turn(board, dealt.knob_slots[slot.usize()], 1 if (port - KNOB_PORT) % 2 == 1 else -1)
+        if port < FINISH_PORT:
+            return port - BUTTON_PORT < level.buttons and press(board, dealt.button_slots[(port - BUTTON_PORT).usize()])
+        return false
+
+    def slot_of(slots: i64[6], count: i64, index: i64) -> i64:
+        for slot in 0..<count |slots, index|:
+            return slot if slots[slot.usize()] == index
+        return -1
+
+    def wide(slots: i64[4]) -> i64[6]:
+        return [slots[0], slots[1], slots[2], slots[3], 0, 0]
+
+    # reference_ports: the procedure carried out exactly, then Finish.
+    def reference_ports(dealt: Deal&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            done: Panel = follow(dealt)
+            ports: mutable darray[i64] = []
+            for at in 0..<done.log_count |ports, done, dealt|:
+                logged: i64 = done.log[at.usize()]
+                kind: i64 = logged / 64
+                index: i64 = (logged % 64) / 2
+                if kind == SWITCH_ACTION:
+                    ports.push(slot_of(dealt.switch_slots, dealt.level.switches, index))
+                elif kind == KNOB_ACTION:
+                    ports.push(KNOB_PORT + 2 * slot_of(wide(dealt.knob_slots), dealt.level.knobs, index) + logged % 2)
+                else:
+                    ports.push(BUTTON_PORT + slot_of(dealt.button_slots, dealt.level.buttons, index))
+            ports.push(FINISH_PORT)
+            return ports

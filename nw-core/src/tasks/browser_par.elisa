@@ -1,0 +1,199 @@
+include "./browser_session.elisa"
+
+module BrowserPar:
+    # browser.py's par: the fewest clicks that buy exactly the targets and
+    # check out, a thorough shopper's clicks, and the share of the
+    # difference a rung allows. Then the pointer moves that carry out the
+    # fewest-clicks path, the reference an agent is measured against.
+
+    # A search node is a page and which targets the cart holds. Pages are
+    # numbered home, cart, the lists (department, page of at most three,
+    # order), then the products.
+    const LIST_PAGES: i64 = 45
+    const PAGE_COUNT: i64 = 167
+    const NODE_COUNT: i64 = 1336
+
+    struct Path:
+        count: i64
+        actions: darray[BrowserPages::Action]
+
+    struct Search:
+        parent: mutable i64[1336]
+        via: mutable BrowserPages::Action[1336]
+        seen: mutable bool[1336]
+        queue: mutable i64[1336]
+
+    def page_number(page: BrowserPages::Action&) -> i64:
+        return 0 if page.kind == BrowserPages::HOME
+        return 1 if page.kind == BrowserPages::CART
+        return 2 + (page.department * 3 + page.number) * 3 + page.sort if page.kind == BrowserPages::LIST
+        return 2 + LIST_PAGES + page.index
+
+    def page_of(number: i64) -> BrowserPages::Action:
+        return BrowserPages::action(BrowserPages::HOME) if number == 0
+        return BrowserPages::action(BrowserPages::CART) if number == 1
+        return BrowserPages::indexed(BrowserPages::ITEM, number - 2 - LIST_PAGES) if number >= 2 + LIST_PAGES
+        list: i64 = number - 2
+        return BrowserPages::list_page(list / 9, (list % 9) / 3, list % 3)
+
+    # The cart a mask of targets stands for, in sorted order as Python's
+    # tuple(sorted(...)) keeps it.
+    def cart_of(dealt: Browser::Deal&, mask: i64) -> BrowserPages::Cart:
+        can Abort.Panic:
+            cart: mutable BrowserPages::Cart = zeroed
+            for goal in 0..<dealt.goal_count |cart, dealt, mask|:
+                if (mask >> goal) & 1 == 1:
+                    product: i64 = dealt.targets[goal.usize()]
+                    slot: mutable i64 = cart.count
+                    while slot > 0 and cart.items[(slot - 1).usize()] > product |slot, cart|:
+                        cart.items[slot.usize()] <- cart.items[(slot - 1).usize()]
+                        slot <- slot - 1
+                    cart.items[slot.usize()] <- product
+                    cart.count <- cart.count + 1
+            return cart
+
+    def goal_of(dealt: Browser::Deal&, product: i64) -> i64:
+        can Abort.Panic:
+            for goal in 0..<dealt.goal_count |dealt, product|:
+                return goal if dealt.targets[goal.usize()] == product
+            return -1
+
+    def trace(search: Search&, node: i64, last: BrowserPages::Action) -> Path:
+        can Memory.Allocate, Abort.Panic:
+            backwards: mutable darray[BrowserPages::Action] = [last]
+            at: mutable i64 = node
+            while search.parent[at.usize()] >= 0 |at, backwards, search|:
+                backwards.push(search.via[at.usize()])
+                at <- search.parent[at.usize()]
+            actions: mutable darray[BrowserPages::Action] = []
+            for index in 0..<backwards.count.i64() |actions, backwards|:
+                actions.push(backwards[(backwards.count.i64() - 1 - index).usize()])
+            return Path{count: actions.count.i64(), actions: actions}
+
+    # The node a link leads to, or -1 when the search does not follow it.
+    def follow(dealt: Browser::Deal&, page: i64, mask: i64, link: BrowserPages::Action&) -> i64:
+        can Abort.Panic:
+            kind: i64 = link.kind
+            if kind == BrowserPages::ADD:
+                goal: i64 = goal_of(dealt, link.index)
+                return -1 if goal < 0 or (mask >> goal) & 1 == 1
+                return page * 8 + (mask | (1 << goal))
+            return -1 if kind == BrowserPages::REMOVE or kind == BrowserPages::CHECKOUT or kind == BrowserPages::NONE
+            return page_number(link) * 8 + mask
+
+    # fewest: a breadth-first search over pages and carts, following the
+    # links in the order a page lists them (Home and Cart first).
+    def fewest(dealt: Browser::Deal&) -> Path:
+        can Memory.Allocate, Abort.Panic:
+            search: mutable Search = zeroed
+            full: i64 = (1 << dealt.goal_count) - 1
+            search.seen[0] <- true
+            search.parent[0] <- -1
+            taken: mutable i64 = 0
+            queued: mutable i64 = 1
+            while taken < queued |taken, queued, search, dealt, full|:
+                node: i64 = search.queue[taken.usize()]
+                taken <- taken + 1
+                page: i64 = node / 8
+                mask: i64 = node % 8
+                here: BrowserPages::Action = page_of(page)
+                cart: BrowserPages::Cart = cart_of(dealt, mask)
+                shown: BrowserPages::Layout = BrowserPages::layout(dealt, &here, &cart, BrowserPages::QUIET)
+                for index in -2..<shown.count |shown, search, dealt, node, page, mask, full, queued|:
+                    link: mutable BrowserPages::Action = BrowserPages::action(BrowserPages::HOME)
+                    if index == -1:
+                        link <- BrowserPages::action(BrowserPages::CART)
+                    elif index >= 0:
+                        link <- shown.elements[index.usize()].action
+                    continue if link.kind == BrowserPages::NONE
+                    return trace(&search, node, link) if link.kind == BrowserPages::CHECKOUT and mask == full
+                    next: i64 = follow(dealt, page, mask, &link)
+                    continue if next < 0 or search.seen[next.usize()]
+                    search.seen[next.usize()] <- true
+                    search.parent[next.usize()] <- node
+                    search.via[next.usize()] <- link
+                    search.queue[queued.usize()] <- next
+                    queued <- queued + 1
+            return Path{count: 0, actions: []}
+
+    # thorough: the fewest clicks, plus opening every product of each
+    # department shopped and coming back, plus turning every list page.
+    def thorough(dealt: Browser::Deal&, best: i64) -> i64:
+        can Abort.Panic:
+            extra: mutable i64 = 0
+            for goal in 0..<dealt.goal_count |extra, dealt|:
+                department: i64 = dealt.goal_departments[goal.usize()]
+                extra <- extra + 2 * BrowserPages::department_size(dealt, department) + BrowserPages::pages_of(dealt, department) - 1
+            return best + extra
+
+    def par(dealt: Browser::Deal&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            best: i64 = fewest(dealt).count
+            return best + py_round_half_even(dealt.level.slack * (thorough(dealt, best) - best).f64())
+
+    # click_point: a point inside a rectangle on the pointer's five-unit
+    # grid.
+    def click_point(rectangle: BrowserSession::Rectangle) -> BrowserSession::Pointer:
+        can Abort.Panic:
+            x: mutable f64 = 5.0 * py_round_half_even((rectangle.x + rectangle.width / 2.0) / 5.0).f64()
+            y: mutable f64 = 5.0 * py_round_half_even((rectangle.y + rectangle.height / 2.0) / 5.0).f64()
+            if not (rectangle.x <= x and x <= rectangle.x + rectangle.width):
+                x <- 5.0 * (rectangle.x / 5.0 + 1.0).i64().f64()
+            if not (rectangle.y <= y and y <= rectangle.y + rectangle.height):
+                y <- 5.0 * (rectangle.y / 5.0 + 1.0).i64().f64()
+            return BrowserSession::Pointer{x: x, y: y}
+
+    # moves_to: pointer ports that carry it from one point to another,
+    # the long steps first, x before y.
+    def moves_to(origin: BrowserSession::Pointer, aim: BrowserSession::Pointer, ports: mutable darray[i64]&):
+        can Memory.Allocate, Abort.Panic:
+            for axis in 0..<2 |origin, aim, ports|:
+                gap: i64 = py_round_half_even((aim.x - origin.x) if axis == 0 else (aim.y - origin.y))
+                direction: i64 = (3 if gap > 0 else 2) if axis == 0 else (1 if gap > 0 else 0)
+                left: mutable i64 = gap if gap >= 0 else -gap
+                for size_index in 0..<3 |left, ports, direction|:
+                    size: i64 = 80 if size_index == 0 else (20 if size_index == 1 else 5)
+                    while left >= size |left, ports, direction, size, size_index|:
+                        ports.push(direction * 3 + size_index)
+                        left <- left - size
+
+    # reference_ports: the ports that walk the fewest-clicks path from the
+    # start of a round -- scroll each action into view, move onto it,
+    # click. Like Python's, it walks a fresh whole-screen browser on the
+    # same deal, from the round's pointer.
+    def reference_ports(start: BrowserSession::Session&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            session: mutable BrowserSession::Session = BrowserSession::start(&start.deal, 0.0)
+            session.pointer <- start.pointer
+            path: Path = fewest(&start.deal)
+            ports: mutable darray[i64] = []
+            for step in path.actions |session, ports|:
+                target: mutable BrowserSession::Rectangle = zeroed
+                if step.kind == BrowserPages::HOME:
+                    target <- BrowserSession::chrome_rectangle(&session, 1)
+                elif step.kind == BrowserPages::CART:
+                    target <- BrowserSession::chrome_rectangle(&session, 2)
+                else:
+                    shown: BrowserPages::Layout = BrowserSession::elements(&session)
+                    element: mutable BrowserPages::Element = zeroed
+                    for index in 0..<shown.count |shown, element, step|:
+                        if BrowserPages::same(shown.elements[index.usize()].action, step):
+                            element <- shown.elements[index.usize()]
+                            break
+                    guard: mutable i64 = 0
+                    while not BrowserSession::visible(&session, &element) and guard < 64 |session, ports, element, guard|:
+                        top: f64 = session.view_top + element.y - session.scroll
+                        way: i64 = 1 if top + element.height > Browser::SCREEN_H else -1
+                        BrowserSession::wheel(&session, way)
+                        ports.push(BrowserSession::SCROLL_DOWN if way > 0 else BrowserSession::SCROLL_UP)
+                        guard <- guard + 1
+                    target <- BrowserSession::on_screen(&session, &element)
+                aim: BrowserSession::Pointer = click_point(target)
+                moves: mutable darray[i64] = []
+                moves_to(session.pointer, aim, &moves)
+                for port in moves |session, ports|:
+                    BrowserSession::steer(&session, port)
+                    ports.push(port)
+                _ = BrowserSession::click(&session)
+                ports.push(BrowserSession::CLICK)
+            return ports

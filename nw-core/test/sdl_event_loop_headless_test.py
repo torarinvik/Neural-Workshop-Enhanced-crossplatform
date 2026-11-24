@@ -3134,7 +3134,7 @@ int64_t nw_test_frame(int64_t dest, int64_t cap, const int64_t *handles, const i
     }
     if (!rendered) {
         int slot = env_int("NW_TEST_SLOT"), option_slot = env_int("NW_TEST_OPTION_SLOT");
-        int good = hub == !env_int("NW_TEST_DIRECT") && slot >= -1 && slot < 136 && (slot < 0 || handles[slot] != 0) &&
+        int good = hub == !env_int("NW_TEST_DIRECT") && slot >= -1 && slot < 142 && (slot < 0 || handles[slot] != 0) &&
                    (option_slot < 0 || options[option_slot] == env_int("NW_TEST_OPTION"));
         if (good && getenv("NW_TEST_SOKOBAN3D_ROUTE")) {
             int64_t handle = handles[slot];

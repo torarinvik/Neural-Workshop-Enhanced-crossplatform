@@ -1,0 +1,214 @@
+include "../scene_browser.elisa"
+include "./sdl_agent_pixels.elisa"
+
+# The desktop shell's Browser: BrowserGame behind the SDL key, pointer, wheel
+# and options plumbing every RungTask screen shares.
+module SDLBrowser:
+    const SCREEN: i64 = 140
+    const SPACE: i64 = 32
+    const BACKSPACE: i64 = 8
+
+    struct Session:
+        game: mutable BrowserGame::Session
+        options_row: mutable i64
+        from_hub: mutable bool
+        draft: mutable i64[3]
+
+    def read_settings(data: heap u8&, size: i64, selected: mutable i64&):
+        can Abort.Panic, Unsafe.PointerCast:
+            rung: i64 = sdl_config_option(data, size, "BROWSER_RUNG", 0, -1)
+            trials: i64 = sdl_config_option(data, size, "BROWSER_TRIALS", 0, -1)
+            adaptive: i64 = sdl_config_option(data, size, "BROWSER_ADAPTIVE", 1, -1)
+            selected[0] <- rung if BrowserGame::allowed_rung(rung)
+            selected[1] <- trials if BrowserGame::allowed_total(trials)
+            selected[2] <- adaptive if adaptive == 0 or adaptive == 1
+
+    # A run with the saved options: the shared config, then the profile's own.
+    def open(seed: i64) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            selected: mutable i64[3] = [1, 5, 1]
+            size: mutable i64 = 0
+            if sdl_media_config(&size) is raw:
+                trusted Unsafe.PointerCast:
+                    read_settings(raw.cast[heap u8&], size, &selected[0])
+                SDL_free(raw)
+            path: mutable u8[4096] = zeroed
+            if sdl_task_profile_sidecar(&path[0], ".browser-options"):
+                if sdl_read_corpus(&path[0], &size) is raw:
+                    trusted Unsafe.PointerCast:
+                        read_settings(raw.cast[heap u8&], size, &selected[0])
+                    SDL_free(raw)
+            return create(selected[0], selected[1], selected[2], seed)
+
+    def create(rung: i64, trials: i64, adaptive: i64, seed: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if rung < 1 or trials < 1 or (adaptive != 0 and adaptive != 1)
+            if malloc(size_of(Session).usize()) is memory:
+                trusted Unsafe.PointerCast:
+                    session: mutable heap Session& = memory.cast[mutable heap Session&]
+                    session.game <- BrowserGame::initialize(rung, trials, adaptive == 1, seed)
+                    session.options_row <- -1
+                    session.from_hub <- false
+                    return memory.uintptr().i64()
+            return 0
+
+    def close(handle: i64):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            if handle > 0:
+                trusted Unsafe.PointerCast:
+                    session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                    BrowserGame::close(&session.game)
+                    free(session.cast[heap void&])
+
+    # Space starts a run; during one, Up and Down scroll and Backspace goes
+    # back.
+    def key(handle: i64, symbol: i64, now_ms: i64) -> bool:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return false if session.options_row >= 0
+                return BrowserGame::start(&session.game, now_ms.f64() / 1000.0) if symbol == SPACE
+                return BrowserGame::scroll(&session.game, -1) if symbol == SDLTaskKeys::UP
+                return BrowserGame::scroll(&session.game, 1) if symbol == SDLTaskKeys::DOWN
+                return BrowserGame::back(&session.game) if symbol == BACKSPACE
+                return false
+
+    # A left press starts a run or clicks the page; motion does nothing.
+    def pointer(handle: i64, x: f32, y: f32, width: i32, height: i32, motion: i64, button: i64, now_ms: i64) -> bool:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0 or width <= 0.i32() or height <= 0.i32()
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if session.options_row >= 0:
+                    return false if motion != 0 or button != 1
+                    row: i64 = sdl_option_row(x, y, width, height, 3)
+                    if row >= 0:
+                        if row == session.options_row:
+                            change_option(session, 1)
+                        session.options_row <- row
+                    return true
+                return false if motion != 0 or button != 1
+                view: mutable f32[4] = zeroed
+                SDLGeometry::setup(&view[0], width, height)
+                return false if view[0] <= 0.0.f32()
+                rx: f64 = ((x - view[1]) / view[0]).f64()
+                ry: f64 = ((height.f32() - y - view[2]) / view[0]).f64()
+                return BrowserGame::press(&session.game, rx, ry, now_ms.f64() / 1000.0)
+
+    # A wheel turn: away from the user scrolls up, as pyglet's scroll_y > 0.
+    def wheel(handle: i64, amount: f64):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return if handle <= 0 or amount == 0.0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return if session.options_row >= 0
+                _ = BrowserGame::scroll(&session.game, -1 if amount > 0.0 else 1)
+
+    def advance(handle: i64, now_ms: i64) -> bool:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return false if session.options_row >= 0
+                return BrowserGame::advance(&session.game, now_ms.f64() / 1000.0)
+
+    def info(handle: i64, field: i64) -> i64:
+        can Abort.Panic, Unsafe.PointerCast:
+            return -1 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                return BrowserGame::info(&session.game, field)
+
+    def frame_write(dest: i64, capacity: i64, handle: i64, black: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if dest <= 0 or capacity <= 0 or handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                region scratch(2097152):
+                    in scratch:
+                        list: mutable Display::DisplayList = Display::DisplayList()
+                        if session.options_row >= 0:
+                            sdl_grid_options_frame(&list, black != 0, SCREEN, session.options_row, (&session.draft[0]).cast[i64&])
+                        else:
+                            SceneBrowser::render(&list, &session.game, black != 0)
+                        encoded: darray[u8] = Display::encode_binary(&list)
+                        length: i64 = encoded.count.i64()
+                        return 0 if length <= 0 or length > capacity
+                        memcpy(dest.uintptr().cast[mutable void&], (&encoded[0]).cast[void&], length.usize())
+                        return length
+
+    # Steps a row's value to the next one the options offer, wrapping.
+    def change_option(session: mutable Session&, direction: i64):
+        can Abort.Panic:
+            row: i64 = session.options_row
+            if row == 2:
+                session.draft[2] <- 1 - session.draft[2]
+                return
+            limit: i64 = 30 if row == 0 else 12
+            value: mutable i64 = session.draft[row.usize()]
+            while true |value, session, row, direction, limit|:
+                value <- (value + direction + limit - 1) % limit + 1
+                if (BrowserGame::allowed_rung(value) if row == 0 else BrowserGame::allowed_total(value)):
+                    session.draft[row.usize()] <- value
+                    return
+
+    def save_options(session: Session&) -> bool:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            data: mutable u8[192] = zeroed
+            length: i32 = SDL_snprintf(&data[0], 192.usize(),
+                "[DEFAULT]\nBROWSER_RUNG = %lld\nBROWSER_TRIALS = %lld\nBROWSER_ADAPTIVE = %s\n",
+                session.draft[0], session.draft[1], "True" if session.draft[2] == 1 else "False")
+            return length > 0.i32() and length < 192.i32() and sdl_save_profile_sidecar(".browser-options", &data[0], length.usize())
+
+    # 0: not for the options; 1: handled; 2: handled, and back to the hub.
+    def options_key(handle: i64, key: i64, from_hub: bool = false) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return 0 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if session.options_row < 0:
+                    return 0 if key != 99 or (session.game.phase != BrowserGame::READY and session.game.phase != BrowserGame::DONE)
+                    session.draft[0] <- session.game.start_rung
+                    session.draft[1] <- session.game.total
+                    session.draft[2] <- 1 if session.game.adaptive else 0
+                    session.options_row <- 0
+                    session.from_hub <- from_hub
+                    return 1
+                apply: bool = SDLTaskKeys::enter(key)
+                if apply:
+                    if not save_options(session):
+                        SDL_Log("Could not save Browser options")
+                        return 1
+                    _ = BrowserGame::reconfigure(&session.game, session.draft[0], session.draft[1], session.draft[2] == 1)
+                if apply or key == 27:
+                    session.options_row <- -1
+                    return 2 if session.from_hub else 1
+                session.options_row <- SDLTaskKeys::option_row(key, session.options_row, 3)
+                if key == SDLTaskKeys::LEFT or key == SDLTaskKeys::RIGHT or key == SPACE:
+                    change_option(session, -1 if key == SDLTaskKeys::LEFT else 1)
+                return 1
+
+    def agent_event(handle: i64, now: f64, port: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return BrowserGame::agent_input(&session.game, now, port)
+
+    def rgba_write(output: mutable u8&?, capacity: i64, handle: i64, black: i64, width: i32, height: i32) -> i64:
+        can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return 0 if output == null or handle <= 0 or width <= 0.i32() or height <= 0.i32() or width > 536870911.i32()
+            bytes: i64 = width.i64() * height.i64() * 4
+            return 0 if capacity < bytes
+            pixels: mutable u8& = output
+            drawn: mutable i64 = 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                region scratch(2097152):
+                    in scratch:
+                        list: mutable Display::DisplayList = Display::DisplayList()
+                        SceneBrowser::render(&list, &session.game, black != 0)
+                        encoded: darray[u8] = Display::encode_binary(&list)
+                        drawn <- SDLAgentPixels::draw(pixels, (&encoded[0]).uintptr().i64(), encoded.count.i64(), bytes, black, width, height)
+            return drawn

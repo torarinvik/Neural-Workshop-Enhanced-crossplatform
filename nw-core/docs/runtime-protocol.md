@@ -2783,6 +2783,216 @@ for `--screen tone-of-voice`, reads `VOICE_RUNG`, `VOICE_TRIALS` and
 `.tone-of-voice-options` sidecar. The native library exports
 `nw_tone_of_voice_agent_{create,act,publish,destroy}`.
 
+### Desktop
+
+Desktop is the first card under Computer use. It uses task ID
+`3716188083`. Create options 0–2 are starting rung (1–6, 8, 11, 13, 15,
+16, 18, 20, 25 or 30), rounds per run (1, 3, 5, 8 or 12) and adaptive
+difficulty. Options 3–5 are zero. State fields 0–8 are phase (0 ready,
+1 working, 2 judged, 3 done), rung, round, rounds per run, passes,
+highest rung passed, starting rung, adaptive, and the round's verdict
+(0 under way, 1 passed, 2 failed). Fields 9–15 are clicks, par in
+tenths, the click budget, settings and files on the card that hold, the
+card's goal count, whether everything on the card holds, and whether the
+mouse button is held. Outside a round fields 9–15 are 0.
+
+Each round deals a desktop from desktop.py's ladder: windows with
+switches, dropdowns and fields to set, and from later rungs tabs,
+scrolling, menus and dialogs, overlapping and minimised windows,
+greyed-out controls, Apply buttons, popups, sticky notes, windows off
+the screen or closed, submenus, a file explorer with files to move,
+delete, restore or copy, list views, and a card that hides. Par is the
+clicks desktop.py's reference takes on the same deal (two more when the
+card hides), times a factor that falls from 2 at rung 1 to 1 at rung 12
+and below 1 from rung 21, plus slack; the budget is three times par plus
+20 clicks. A round
+passes when every setting and file on the card holds in no more clicks
+than par, and it ends when Done is pressed or the budget is spent. The
+verdict stays up for 2.2 seconds.
+
+Space or a primary click starts the run. During a round the mouse moves
+the pointer; a primary press and release is a click, or a drag when the
+two are apart by more than 6 reference pixels (a release closer than
+that is taken at the press point); a secondary press right-clicks.
+Arrows step the pointer: Shift a long step (80), none a medium one (20),
+Alt a short one (5). Space clicks, Enter presses Done, and the text
+events `r`/`R` right-click and `d`/`D` press or let go. Moving is free;
+each click, right-click and drag costs one. Actions 0–11 move the
+pointer up, down, left and right by a long, medium or short step (port
+= direction × 3 + size), 12 clicks, 13 presses, 14 lets go, 15 presses
+Done, 16 right-clicks and 17 starts a run.
+`nw_desktop_options_note` gives the starting rung's note. The web factory
+is `createDesktopEnvironment`; its agent entry uses 17 to start and −1 to
+advance. SDL uses screen 145 for `--screen desktop`, reads
+`DESKTOP_RUNG`, `DESKTOP_TRIALS` and `DESKTOP_ADAPTIVE`, and saves
+changes to the profile's `.desktop-options` sidecar. There, `r` and `d`
+arrive as keys, and SDL's button-up events reach Desktop alone. The
+native library exports `nw_desktop_agent_{create,act,publish,destroy}`.
+
+### Forms
+
+Forms is the second card under Computer use, after Desktop. It uses task ID
+`2143393500`. Create options 0–2 are starting rung (1, 2, 4, 6, 8, 10,
+12, 14, 16, 18, 20 or 25), forms per run (1, 3, 5, 8 or 12) and adaptive
+difficulty; option 3 permits positive integer dials beyond the menu when
+set to 1. Options 4 and 5 are zero. State fields 0–8 are phase (0 ready,
+1 filling, 2 judged, 3 done), rung, form, forms per run, passes, highest
+rung passed, starting rung, adaptive, and the form's verdict (0 under
+way, 1 right and within par, 2 not). Fields 9–14 are keys pressed, pages
+sent back, the page in view, the field in focus (forms.py's order: first
+name, last name, city, email, date of birth, phone, country, plan,
+newsletter, company checkbox, company name; −1 for none), cost (keys
+plus the rung's penalty per page sent back), and par in tenths.
+
+Each form is dealt from a person on a card: one field at rung 1, up to
+twelve from rung 22, with dates to rewrite (rung 4), phone numbers to
+strip to digits (5), a country list that completes as it is typed (6),
+checkboxes and radio buttons (8), a company name that appears only when
+its checkbox is ticked (10), two pages and then three (12, 18), and the
+card written as a letter (14) that mentions a sister's details too (16).
+Par is the keys forms.py's reference typist presses on the same form,
+times a factor that falls to 1 by rung 21, plus slack. Space or a
+primary click starts the run. Characters arrive as text events (letters,
+digits, space and `@ . - /`; anything else is ignored); Backspace, Tab,
+Enter, Up and Down arrive as keys, and Space as a key does nothing while
+a form is being filled. A primary press on a field's row moves the focus
+there for one key. A page with an empty field, a malformed date, a phone
+number that is not 6–12 digits or a malformed email comes back with
+those fields framed red. The verdict stays up for three seconds. Actions
+0–45 are ui/forms.py's keys (a–z, 0–9, space, `@`, `.`, `-`, `/`,
+Backspace, Tab, Enter, Up, Down) and 46 starts a run.
+`nw_forms_options_note` gives the starting rung's note. The web factory
+is `createFormsEnvironment`; its agent entry uses 46 to start and −1 to
+advance. SDL uses screen 144 for `--screen forms`, reads `FORMS_RUNG`,
+`FORMS_TRIALS` and `FORMS_ADAPTIVE`, saves changes to the profile's
+`.forms-options` sidecar, and starts SDL text input when Forms opens.
+The native library exports `nw_forms_agent_{create,act,publish,destroy}`.
+
+### Manual
+
+Manual is the third card under Computer use, after Forms. It uses task ID
+`563151331`. Create options 0–2 are starting rung (1, 2, 5, 9, 13, 17,
+20, 25 or 30), procedures per run (1, 3, 5, 8 or 12) and adaptive
+difficulty; option 3 permits positive integer dials beyond the menu when
+set to 1. Options 4 and 5 are zero. State fields 0–8 are phase, rung,
+procedure, procedures per run, passes, highest rung passed, starting
+rung, adaptive, and the procedure's verdict (0 under way, 1 done exactly
+as written, 2 not). Fields 9–11 are the procedure's step count, the
+moves made so far, and the digit the display shows.
+
+Each procedure deals a panel never seen before -- switches, knobs from 0
+to 4, buttons, coloured lamps and a one-digit display, wired at random
+so the lamps and display answer the controls -- and up to ten written
+steps: set or flip a switch, turn a knob, press a button, and at higher
+rungs steps that depend on a lamp, read the display, copy one control
+to another, press until a lamp changes, put a control back as it
+started, or skip the next step. From rung 17 the controls are drawn in
+shuffled order. Finish passes when every control stands exactly where
+following the procedure leaves it. Space or a primary click starts the
+run; a press on a switch flips it, on a knob's minus or plus turns it a
+step, and on a button presses it; Enter or a press on Finish ends the
+procedure. A judged procedure outlines every control left wrong in red,
+and its verdict stays up for 2.5 seconds. Actions 0–5 flip the
+switches in drawn order, 6–13 turn the knobs (down, then up, two to a
+knob), 14–19 press the buttons, 20 is Finish and 21 starts a run.
+`nw_manual_options_note` gives the starting rung's note. The web factory
+is `createManualEnvironment`; its agent entry uses 21 to start and −1 to
+advance. SDL uses screen 143 for `--screen manual`, reads `MANUAL_RUNG`,
+`MANUAL_TRIALS` and `MANUAL_ADAPTIVE`, and saves changes to the
+profile's `.manual-options` sidecar. The native library exports
+`nw_manual_agent_{create,act,publish,destroy}`.
+
+### Browser
+
+Browser is the fourth card under Computer use, after Manual. It uses task ID
+`122887567`. Create options 0–2 are starting rung (1, 3, 6, 9, 12, 15,
+18, 21, 25 or 30), shopping trips per run (1, 3, 5, 8 or 12) and
+adaptive difficulty; option 3 permits positive integer dials beyond the
+menu when set to 1. Options 4 and 5 are zero. State fields 0–8 are
+phase, rung, trip, trips per run, passes, highest rung passed, starting
+rung, adaptive, and the trip's verdict (0 under way, 1 bought within
+par, 2 the right things over par, 3 the wrong things). Fields 9–15 are
+clicks, par, the page kind, items in the cart, the in-page pointer's x
+and y, and the scroll offset, all in the 1000 by 640 page's units.
+
+Each trip deals a small shop and a shopping list; a trip passes when
+checkout buys exactly the list in no more clicks than par, which allows
+a share of a thorough shopper's extra clicks that shrinks with the rung.
+Space or a primary click starts the run. A pointer press on the page
+clicks there; the wheel and Up/Down scroll; Backspace goes back and
+counts as a click. A verdict stays up for 2.5 seconds. Actions 0–14 are
+the agent ports (twelve pointer moves, a click, scroll up, scroll down)
+and 15 starts a run. `nw_browser_options_note` gives the starting
+rung's note. The web factory is `createBrowserEnvironment`; its agent
+entry uses 15 to start and −1 to advance. SDL uses screen 140 for
+`--screen browser`, reads `BROWSER_RUNG`, `BROWSER_TRIALS` and
+`BROWSER_ADAPTIVE`, and saves changes to the profile's `.browser-options`
+sidecar. The native library exports
+`nw_browser_agent_{create,act,publish,destroy}`.
+
+### Errands
+
+Errands is the fifth card under Computer use, after Browser. It uses
+task ID `1095090106`. Create options 0–2 are starting rung (1, 3, 6, 9,
+12, 15, 18, 21, 25 or 30), errand days per run (1, 3, 5 or 8) and
+adaptive difficulty; option 3 permits positive integer dials beyond the
+menu when set to 1. Options 4 and 5 are zero. State fields 0–8 are
+phase, rung, day, days per run, passes, highest rung passed, starting
+rung, adaptive, and the day's verdict (0 under way, 1 all done within
+par, 2 all done over par, 3 not done). Fields 9–15 are clicks, par, the
+app in front (0 Mail, 1 Shop, 2 Expenses), claims filed, the in-page
+pointer's x and y, and orders placed, in the 1000 by 640 page's units.
+
+Each day deals an inbox: receipts to claim, orders to place in
+Browser's shop (each bought on its own, then claimed), a policy mail
+that sets the categories, a later mail that changes a request, and mail
+that needs nothing. An app strip switches between Mail, Shop and
+Expenses, whose claim form takes an order number and an amount from an
+on-screen keypad, a category and Submit. Done ends the day; it passes
+when every claim is right, nothing wrong was bought or claimed, and the
+clicks are within par. Space or a primary click starts the run. A
+pointer press on the page clicks there; the wheel and Up/Down scroll
+the shop; digits and Backspace type into the claim form while Expenses
+is in front and count as clicks. A verdict stays up for 2.5 seconds.
+Actions 0–14 are Browser's agent ports and 15 starts a run.
+`nw_errands_options_note` gives the starting rung's note. The web
+factory is `createErrandsEnvironment`; its agent entry uses 15 to start
+and −1 to advance. SDL uses screen 142 for `--screen errands`, reads
+`ERRANDS_RUNG`, `ERRANDS_TRIALS` and `ERRANDS_ADAPTIVE`, and saves
+changes to the profile's `.errands-options` sidecar. The native library
+exports `nw_errands_agent_{create,act,publish,destroy}`.
+
+### Spreadsheet
+
+Spreadsheet is the sixth card under Computer use, after Errands. It
+uses task ID `36128217`. Create options 0–2 are starting rung (1, 4, 7,
+10, 13, 16, 20, 25 or 30), questions per run (1, 3, 5, 10 or 20) and
+adaptive difficulty; option 3 permits positive integer dials beyond the
+menu when set to 1. Options 4 and 5 are zero. State fields 0–8 are
+phase, rung, question, questions per run, passes, highest rung passed,
+starting rung, adaptive, and the question's verdict (0 under way, 1
+right within par, 2 right over par, 3 wrong). Fields 9–15 are clicks,
+par, the number typed so far, how many digits it has, the in-page
+pointer's x and y, and the first visible row, in the 1000 by 640 page's
+units.
+
+Each question deals a table of orders: look up a total, find the
+highest, sum or count a category, or find or correct the one wrong
+total. Category filters, sortable headers, Sum buttons under Qty, Price
+and Total, and a keypad with Submit are the tools; Submit takes one
+answer, and a question passes when it is right in no more clicks than
+par. Space or a primary click starts the run. A pointer press on the
+page clicks there; the wheel and Up/Down scroll the rows; digits,
+Backspace and Enter work the keypad and count as clicks. A verdict
+stays up for 2.5 seconds. Actions 0–14 are Browser's agent ports and 15
+starts a run. `nw_spreadsheet_options_note` gives the starting rung's
+note. The web factory is `createSpreadsheetEnvironment`; its agent entry
+uses 15 to start and −1 to advance. SDL uses screen 141 for
+`--screen spreadsheet`, reads `SPREADSHEET_RUNG`, `SPREADSHEET_TRIALS`
+and `SPREADSHEET_ADAPTIVE`, and saves changes to the profile's
+`.spreadsheet-options` sidecar. The native library exports
+`nw_spreadsheet_agent_{create,act,publish,destroy}`.
+
 ### Social Sense
 
 Social Sense is the second card under Social, after Between the Lines.

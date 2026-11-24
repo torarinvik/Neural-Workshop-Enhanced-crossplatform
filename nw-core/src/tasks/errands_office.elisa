@@ -1,0 +1,307 @@
+include "./errand_shop.elisa"
+
+module ErrandsOffice:
+    # errands.py's Office: the whole computer -- which app is up, the mail
+    # read, the shop, the claim form and the claims filed. Python's claims
+    # are unbounded; MOST_CLAIMS are kept and any more are only counted,
+    # which judging treats as claims that should not be there.
+    const MOST_CLAIMS: i64 = 64
+    const MOST_TYPED: i64 = 7
+    const INBOX_TOP: f64 = 100.0
+    const ROW_H: f64 = 44.0
+    const KEY: f64 = 64.0
+    const DELETE: i64 = 10
+
+    # Apps.
+    const MAIL: i64 = 0
+    const SHOP: i64 = 1
+    const EXPENSES: i64 = 2
+
+    # Step kinds; a step's value is the app, mail, field, key or category,
+    # and a SHOP step carries the shop's own action.
+    const NONE: i64 = 0
+    const APP: i64 = 1
+    const DONE: i64 = 2
+    const OPEN: i64 = 3
+    const INBOX: i64 = 4
+    const IN_SHOP: i64 = 5
+    const FIELD: i64 = 6
+    const PRESS: i64 = 7
+    const CATEGORY: i64 = 8
+    const SUBMIT: i64 = 9
+
+    # Fields of the claim form.
+    const ORDER_FIELD: i64 = 0
+    const AMOUNT_FIELD: i64 = 1
+
+    # The notice under Submit.
+    const QUIET: i64 = 0
+    const FILED: i64 = 1
+    const INCOMPLETE: i64 = 2
+
+    struct Step:
+        kind: i64
+        value: i64
+        shop: BrowserPages::Action
+
+    struct Rectangle:
+        x: f64
+        y: f64
+        width: f64
+        height: f64
+
+    # Digits typed into a field, as Python's string of them.
+    struct Digits:
+        count: mutable i64
+        digits: mutable i64[7]
+
+    struct Claim:
+        order: Digits
+        amount: Digits
+        category: i64
+
+    struct Form:
+        fields: mutable Digits[2]
+        focus: mutable i64
+        category: mutable i64
+        claim_count: mutable i64
+        claims: mutable Claim[64]
+
+    struct Office:
+        deal: mutable Errands::Deal
+        app: mutable i64
+        reading: mutable i64
+        read: mutable i64
+        shop: mutable ErrandShop::Shop
+        form: mutable Form
+        pointer: mutable BrowserSession::Pointer
+        clicks: mutable i64
+        done: mutable bool
+        notice: mutable i64
+
+    def step(kind: i64, value: i64) -> Step:
+        return Step{kind: kind, value: value, shop: BrowserPages::action(BrowserPages::NONE)}
+
+    def shop_step(action: BrowserPages::Action) -> Step:
+        return Step{kind: IN_SHOP, value: 0, shop: action}
+
+    def same(one: Step, two: Step) -> bool:
+        return one.kind == two.kind and one.value == two.value and BrowserPages::same(one.shop, two.shop)
+
+    def rectangle(x: f64, y: f64, width: f64, height: f64) -> Rectangle:
+        return Rectangle{x: x, y: y, width: width, height: height}
+
+    def start(dealt: Errands::Deal&) -> Office:
+        can Abort.Panic:
+            shop: ErrandShop::Shop = ErrandShop::start(&dealt.shop, dealt.numbers) if dealt.shopping else zeroed
+            form: Form = Form{fields: zeroed, focus: ORDER_FIELD, category: -1, claim_count: 0, claims: zeroed}
+            return Office{deal: dealt, app: MAIL, reading: -1, read: 0, shop: shop, form: form,
+                pointer: BrowserSession::Pointer{x: Browser::SCREEN_W / 2.0, y: Browser::SCREEN_H / 2.0}, clicks: 0,
+                done: false, notice: QUIET}
+
+    # TABS, in apps() order: Mail, Shop when there is one, Expenses.
+    def tab(app: i64) -> Rectangle:
+        return rectangle(10.0, 5.0, 130.0, 30.0) if app == MAIL
+        return rectangle(150.0, 5.0, 130.0, 30.0) if app == SHOP
+        return rectangle(290.0, 5.0, 150.0, 30.0)
+
+    def app_count(office: Office&) -> i64:
+        return 3 if office.deal.shopping else 2
+
+    def app_at(office: Office&, index: i64) -> i64:
+        return index if office.deal.shopping or index == 0 else EXPENSES
+
+    def done_box() -> Rectangle:
+        return rectangle(880.0, 5.0, 110.0, 30.0)
+
+    def mail_row(index: i64) -> Rectangle:
+        return rectangle(20.0, INBOX_TOP + index.f64() * ROW_H, 960.0, ROW_H - 4.0)
+
+    def inbox_link() -> Rectangle:
+        return rectangle(20.0, Errands::STRIP + 14.0, 200.0, 30.0)
+
+    def field_box(field: i64) -> Rectangle:
+        return rectangle(200.0, Errands::STRIP + (70.0 if field == ORDER_FIELD else 130.0), 260.0, 40.0)
+
+    # The keypad's eleven keys in their order: 1-9, del, 0.
+    def key_label(index: i64) -> i64:
+        return index + 1 if index < 9
+        return DELETE if index == 9
+        return 0
+
+    def key_box(index: i64) -> Rectangle:
+        return rectangle(520.0 + (index % 3).f64() * (KEY + 8.0), Errands::STRIP + 70.0 + (index / 3).f64() * (KEY + 8.0), KEY,
+            KEY)
+
+    def category_box(category: i64) -> Rectangle:
+        return rectangle(200.0, Errands::STRIP + 200.0 + category.f64() * 48.0, 260.0, 40.0)
+
+    def submit_box() -> Rectangle:
+        return rectangle(40.0, Errands::STRIP + 470.0, 220.0, 50.0)
+
+    # targets(), in its order.
+    def target_count(office: Office&) -> i64:
+        apps: i64 = app_count(office) + 1
+        return apps + (office.deal.mail_count if office.reading < 0 else 1) if office.app == MAIL
+        return apps + 2 + 11 + Errands::CATEGORY_COUNT + 1 if office.app == EXPENSES
+        return apps
+
+    def target(office: Office&, index: i64, place: mutable Rectangle&) -> Step:
+        can Abort.Panic:
+            apps: i64 = app_count(office)
+            if index < apps:
+                place <- tab(app_at(office, index))
+                return step(APP, app_at(office, index))
+            if index == apps:
+                place <- done_box()
+                return step(DONE, 0)
+            at: i64 = index - apps - 1
+            if office.app == MAIL:
+                if office.reading >= 0:
+                    place <- inbox_link()
+                    return step(INBOX, 0)
+                place <- mail_row(at)
+                return step(OPEN, at)
+            if at < 2:
+                place <- field_box(at)
+                return step(FIELD, at)
+            if at < 13:
+                place <- key_box(at - 2)
+                return step(PRESS, key_label(at - 2))
+            if at < 13 + Errands::CATEGORY_COUNT:
+                place <- category_box(at - 13)
+                return step(CATEGORY, at - 13)
+            place <- submit_box()
+            return step(SUBMIT, 0)
+
+    def inside(place: Rectangle, x: f64, y: f64) -> bool:
+        return place.x <= x and x <= place.x + place.width and place.y <= y and y <= place.y + place.height
+
+    def target_at(office: Office&, x: f64, y: f64) -> Step:
+        can Memory.Allocate, Abort.Panic:
+            for index in 0..<target_count(office) |office, x, y|:
+                place: mutable Rectangle = zeroed
+                found: Step = target(office, index, &place)
+                return found if inside(place, x, y)
+            if office.app == SHOP and y >= Errands::STRIP:
+                found: BrowserPages::Action = ErrandShop::target_at(&office.shop, x, y)
+                return shop_step(found) if found.kind != BrowserPages::NONE
+            return step(NONE, 0)
+
+    def move_pointer(office: mutable Office&, dx: f64, dy: f64):
+        x: f64 = office.pointer.x + dx
+        y: f64 = office.pointer.y + dy
+        office.pointer.x <- Browser::SCREEN_W if x > Browser::SCREEN_W else (0.0 if x < 0.0 else x)
+        office.pointer.y <- Browser::SCREEN_H if y > Browser::SCREEN_H else (0.0 if y < 0.0 else y)
+
+    def wheel(office: mutable Office&, way: i64):
+        can Memory.Allocate, Abort.Panic:
+            ErrandShop::wheel(&office.shop, way) if office.app == SHOP
+
+    def type_digit(field: Digits, digit: i64) -> Digits:
+        can Abort.Panic:
+            out: mutable Digits = field
+            if digit == DELETE:
+                out.count <- out.count - 1 if out.count > 0
+            elif out.count < MOST_TYPED:
+                out.digits[out.count.usize()] <- digit
+                out.count <- out.count + 1
+            return out
+
+    def submit(office: mutable Office&):
+        can Abort.Panic:
+            form: mutable Form = office.form
+            if form.fields[0].count == 0 or form.fields[1].count == 0 or form.category < 0:
+                office.notice <- INCOMPLETE
+                return
+            if form.claim_count < MOST_CLAIMS:
+                form.claims[form.claim_count.usize()] <- Claim{order: form.fields[0], amount: form.fields[1],
+                    category: form.category}
+            form.claim_count <- form.claim_count + 1
+            form.fields <- zeroed
+            form.focus <- ORDER_FIELD
+            form.category <- -1
+            office.form <- form
+            office.notice <- FILED
+
+    def act(office: mutable Office&, wanted: Step):
+        can Abort.Panic:
+            office.notice <- QUIET
+            kind: i64 = wanted.kind
+            if kind == APP:
+                office.app <- wanted.value
+            elif kind == DONE:
+                office.done <- true
+            elif kind == OPEN:
+                office.reading <- wanted.value
+                office.read <- office.read | (1 << wanted.value)
+            elif kind == INBOX:
+                office.reading <- -1
+            elif kind == IN_SHOP:
+                ErrandShop::act(&office.shop, wanted.shop)
+            elif kind == FIELD:
+                office.form.focus <- wanted.value
+            elif kind == PRESS:
+                focus: usize = office.form.focus.usize()
+                office.form.fields[focus] <- type_digit(office.form.fields[focus], wanted.value)
+            elif kind == CATEGORY:
+                office.form.category <- wanted.value
+            elif kind == SUBMIT:
+                submit(office)
+
+    # click: at the pointer, counted whether or not it hits anything;
+    # nothing once Done is pressed.
+    def click(office: mutable Office&) -> Step:
+        can Memory.Allocate, Abort.Panic:
+            return step(NONE, 0) if office.done
+            office.clicks <- office.clicks + 1
+            found: Step = target_at(office, office.pointer.x, office.pointer.y)
+            act(office, found) if found.kind != NONE
+            return found
+
+    def click_at(office: mutable Office&, x: f64, y: f64) -> Step:
+        can Memory.Allocate, Abort.Panic:
+            return step(NONE, 0) if office.done
+            office.pointer <- BrowserSession::Pointer{x: x, y: y}
+            return click(office)
+
+    def steer(office: mutable Office&, port: i64):
+        can Memory.Allocate, Abort.Panic:
+            if port >= 0 and port < BrowserSession::CLICK:
+                direction: i64 = port / 3
+                size: f64 = 80.0 if port % 3 == 0 else (20.0 if port % 3 == 1 else 5.0)
+                dx: f64 = -1.0 if direction == 2 else (1.0 if direction == 3 else 0.0)
+                dy: f64 = -1.0 if direction == 0 else (1.0 if direction == 1 else 0.0)
+                move_pointer(office, dx * size, dy * size)
+            elif port == BrowserSession::CLICK:
+                _ = click(office)
+            elif port == BrowserSession::SCROLL_UP:
+                wheel(office, -1)
+            elif port == BrowserSession::SCROLL_DOWN:
+                wheel(office, 1)
+
+    def digits_of(value: i64) -> Digits:
+        can Abort.Panic:
+            out: mutable Digits = zeroed
+            count: mutable i64 = 1
+            left: mutable i64 = value / 10
+            while left > 0 |count, left|:
+                count <- count + 1
+                left <- left / 10
+            rest: mutable i64 = value
+            for at in 0..<count |out, rest, count|:
+                out.digits[(count - 1 - at).usize()] <- rest % 10
+                rest <- rest / 10
+            out.count <- count
+            return out
+
+    def same_digits(one: Digits, two: Digits) -> bool:
+        can Abort.Panic:
+            return false if one.count != two.count
+            for at in 0..<one.count |one, two|:
+                return false if one.digits[at.usize()] != two.digits[at.usize()]
+            return true
+
+    def same_claim(one: Claim, two: Claim) -> bool:
+        can Abort.Panic:
+            return one.category == two.category and same_digits(one.order, two.order) and same_digits(one.amount, two.amount)

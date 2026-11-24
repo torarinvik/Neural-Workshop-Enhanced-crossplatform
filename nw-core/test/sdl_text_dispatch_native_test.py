@@ -13,7 +13,7 @@ from base64 import b64decode
 
 from public_outcome_fixture import evidence_samples, samples
 
-TASK_SLOTS = 136
+TASK_SLOTS = 142
 
 if len(sys.argv) == 3:
     with tempfile.TemporaryDirectory() as tmp:

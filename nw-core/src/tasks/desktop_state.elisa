@@ -1,0 +1,401 @@
+include "./desktop_deal.elisa"
+
+module DesktopState:
+    # desktop.py's Desktop as data: controls, windows, files and what is
+    # open, every reference an index. Windows are the settings windows in
+    # deal order, then the explorer when the rung has one, then the notes.
+    const NONE: i64 = -1
+    # Icon keys: what a desktop or explorer click picked.
+    const KEY_EXPLORER: i64 = 1
+    const KEY_TRASH: i64 = 2
+    const KEY_APP: i64 = 2000000
+    const KEY_NODE: i64 = 3000000
+    const KEY_EX: i64 = 4000000
+    # Right-click menus: on a file or folder, or on a folder's space.
+    const ON_NODE: i64 = 0
+    const ON_FOLDER: i64 = 1
+
+    struct Rect:
+        x: f64
+        y: f64
+        w: f64
+        h: f64
+
+    struct Control:
+        spec: i64
+        kind: i64
+        count: i64
+        value: mutable i64
+        shown: mutable i64
+        start: i64
+        # The control it needs set, and to what; NONE when it needs none.
+        other: mutable i64
+        wanted: mutable i64
+        window: i64
+        dialog: i64
+        tab: i64
+        row: i64
+
+    # One explorer tab: where it is, where it has been, what is picked.
+    struct Place:
+        path: mutable i64
+        history: mutable darray[i64]
+        scroll: mutable i64
+        selected: mutable i64
+
+    # The explorer's tabs, which is showing, and whether it lists names
+    # instead of a grid of icons.
+    struct Browsing:
+        places: mutable darray[Place]
+        current: mutable i64
+        list_view: mutable bool
+
+    struct Window:
+        kind: i64
+        title: i64
+        x: mutable f64
+        y: mutable f64
+        w: f64
+        rows: mutable i64
+        active: mutable i64
+        scroll: mutable i64[3]
+        tab_count: i64
+        per_tab: i64
+        menus: i64
+        apply: bool
+        note_text: i64
+        minimised: mutable bool
+        closed: mutable bool
+        browsing: mutable Browsing
+
+    struct Node:
+        name: DesktopDeal::Name
+        folder: bool
+        kind: i64
+        parent: mutable i64
+        origin: mutable i64
+        # When it joined its folder: children are in this order.
+        stamp: mutable i64
+
+    struct Context:
+        what: i64
+        node: i64
+        window: i64
+        x: f64
+        y: f64
+
+    # What is open over the windows.
+    struct Overlay:
+        dialog: mutable i64
+        # (window, menu, open submenu item) while a menu is open.
+        menu_window: mutable i64
+        menu_index: mutable i64
+        menu_sub: mutable i64
+        dropdown: mutable i64
+        start_open: mutable bool
+        start_all: mutable bool
+        popup: mutable i64
+        next_popup: mutable i64
+        context: mutable Context
+        has_context: mutable bool
+
+    struct Pointer:
+        x: mutable f64
+        y: mutable f64
+        held: mutable bool
+        held_x: mutable f64
+        held_y: mutable f64
+
+    struct Picking:
+        picked: mutable i64
+        last: mutable i64
+        previous: mutable i64
+        clipboard: mutable i64
+        copying: mutable bool
+        peeking: mutable bool
+
+    struct Desk:
+        dealt: DesktopDeal::Deal
+        controls: mutable darray[Control]
+        windows: mutable darray[Window]
+        app_count: i64
+        explorer: i64
+        nodes: mutable darray[Node]
+        stamps: mutable i64
+        order: mutable darray[i64]
+        pinned: mutable darray[i64]
+        overlay: mutable Overlay
+        pointer: mutable Pointer
+        picking: mutable Picking
+        clicks: mutable i64
+        done: mutable bool
+
+    # --- building it ---------------------------------------------------
+
+    def place(path: i64) -> Place:
+        return Place{path: path, history: [], scroll: 0, selected: NONE}
+
+    def app_window(dealt: DesktopDeal::Deal&, index: i64) -> Window:
+        level: Desktop::Grade = dealt.level
+        return Window{kind: Desktop::APP, title: dealt.titles[index.usize()], x: dealt.layout.x[index.usize()].f64(),
+            y: dealt.layout.y[index.usize()].f64(), w: Desktop::WINDOW_W.f64(), rows: level.rows, active: 0, scroll: zeroed,
+            tab_count: level.tabs, per_tab: level.per_tab, menus: DesktopDeal::menu_count(&level),
+            apply: dealt.applies[index.usize()], note_text: NONE, minimised: dealt.layout.minimised[index.usize()],
+            closed: dealt.layout.closed[index.usize()], browsing: Browsing{places: [], current: 0, list_view: false}}
+
+    def explorer_window(dealt: DesktopDeal::Deal&) -> Window:
+        can Memory.Allocate:
+            places: mutable darray[Place] = []
+            for _ in 0..<dealt.level.files.ex_tabs |places|:
+                places.push(place(Desktop::HOME))
+            places[1].path <- Desktop::DOCUMENTS if places.count > 1.usize()
+            return Window{kind: Desktop::EXPLORER, title: NONE, x: dealt.layout.explorer_x.f64(),
+                y: dealt.layout.explorer_y.f64(), w: Desktop::EXPLORER_W.f64(), rows: 1, active: 0, scroll: zeroed, tab_count: 1,
+                per_tab: 0, menus: 0, apply: false, note_text: NONE, minimised: false,
+                closed: dealt.level.files.explorer_closed,
+                browsing: Browsing{places: places, current: 0, list_view: dealt.list_view}}
+
+    def note_window(note: DesktopDeal::NoteSpec&) -> Window:
+        return Window{kind: Desktop::NOTE, title: NONE, x: note.x.f64(), y: note.y.f64(), w: Desktop::NOTE_W.f64(), rows: 2,
+            active: 0, scroll: zeroed, tab_count: 1, per_tab: 0, menus: 0, apply: false, note_text: note.text,
+            minimised: false, closed: false, browsing: Browsing{places: [], current: 0, list_view: false}}
+
+    def control(spec: DesktopDeal::Spec&, index: i64, window: i64, dialog: i64, tab: i64, row: i64) -> Control:
+        return Control{spec: index, kind: spec.kind, count: spec.count, value: spec.value, shown: spec.value,
+            start: spec.value, other: NONE, wanted: 0, window: window, dialog: dialog, tab: tab, row: row}
+
+    def start(dealt: DesktopDeal::Deal) -> Desk:
+        can Memory.Allocate, Abort.Panic:
+            level: Desktop::Grade = dealt.level
+            controls: mutable darray[Control] = []
+            blank: Control = Control{spec: NONE, kind: 0, count: 0, value: 0, shown: 0, start: 0, other: NONE, wanted: 0,
+                window: NONE, dialog: NONE, tab: 0, row: 0}
+            for index in 0..<dealt.specs.count.i64() |controls, blank|:
+                controls.push(blank)
+            for window in 0..<level.windows |dealt, level, controls|:
+                for tab in 0..<level.tabs |dealt, level, controls, window|:
+                    for row in 0..<level.per_tab |dealt, controls, window, tab|:
+                        ident: i64 = dealt.tabs[DesktopDeal::tab_slot(window, tab, row).usize()]
+                        controls[ident.usize()] <- control(&dealt.specs[ident.usize()], ident, window, NONE, tab, row)
+            for dialog in 0..<dealt.dialogs.count.i64() |dealt, controls|:
+                made: DesktopDeal::DialogSpec = dealt.dialogs[dialog.usize()]
+                for row in 0..<3 |dealt, controls, made, dialog|:
+                    ident: i64 = made.members[row.usize()]
+                    controls[ident.usize()] <- control(&dealt.specs[ident.usize()], ident, made.window, dialog, 0, row)
+            for need in dealt.requires |controls|:
+                controls[need.ident.usize()].other <- need.other
+                controls[need.ident.usize()].wanted <- need.value
+            windows: mutable darray[Window] = []
+            for index in 0..<level.windows |dealt, windows|:
+                windows.push(app_window(&dealt, index))
+            explorer: i64 = level.windows if level.files.explorer else NONE
+            windows.push(explorer_window(&dealt)) if level.files.explorer
+            notes_from: i64 = windows.count.i64()
+            for note in dealt.notes |windows|:
+                windows.push(note_window(&note))
+            nodes: mutable darray[Node] = []
+            for entry in dealt.files |nodes|:
+                nodes.push(Node{name: entry.name, folder: entry.folder, kind: entry.kind, parent: entry.parent, origin: NONE,
+                    stamp: nodes.count.i64()})
+            for goal in dealt.moves |nodes|:
+                nodes[goal.first.usize()].origin <- goal.second if nodes[goal.first.usize()].parent == Desktop::TRASH
+            order: mutable darray[i64] = []
+            for index in dealt.layout.order |order|:
+                order.push(index)
+            for index in notes_from..<windows.count.i64() |order|:
+                order.push(index)
+            pinned: mutable darray[i64] = []
+            pinned.push(explorer) if explorer != NONE
+            for index in dealt.pinned |pinned|:
+                pinned.push(index)
+            overlay: Overlay = Overlay{dialog: NONE, menu_window: NONE, menu_index: 0, menu_sub: NONE, dropdown: NONE, start_open: false,
+                start_all: false, popup: NONE, next_popup: 0, context: zeroed, has_context: false}
+            pointer: Pointer = Pointer{x: Desktop::START_X.f64(), y: Desktop::START_Y.f64(), held: false, held_x: 0.0, held_y: 0.0}
+            picking: Picking = Picking{picked: NONE, last: NONE, previous: NONE, clipboard: NONE, copying: false, peeking: false}
+            stamps: i64 = nodes.count.i64()
+            return Desk{dealt: dealt, controls: controls, windows: windows, app_count: level.windows, explorer: explorer,
+                nodes: nodes, stamps: stamps, order: order, pinned: pinned, overlay: overlay, pointer: pointer, picking: picking,
+                clicks: 0, done: false}
+
+    # --- windows -------------------------------------------------------
+
+    def shown(win: Window&) -> bool:
+        return not (win.minimised or win.closed)
+
+    def pinned_note(win: Window&) -> bool:
+        return win.kind == Desktop::NOTE
+
+    def chrome(win: Window&) -> i64:
+        menu: i64 = Desktop::MENU_H if win.menus > 0 else 0
+        tabs: i64 = Desktop::TAB_H if win.tab_count > 1 else 0
+        apply: i64 = Desktop::APPLY_H if win.apply else 0
+        return Desktop::TITLE_H + menu + tabs + apply + 8
+
+    def height(win: Window&) -> f64:
+        return Desktop::EXPLORER_H.f64() if win.kind == Desktop::EXPLORER else (chrome(win) + win.rows * Desktop::ROW_H).f64()
+
+    # The most rows it can be resized to show.
+    def most_rows(win: Window&) -> i64:
+        can Abort.Panic:
+            longest: i64 = Desktop::imax(1, win.per_tab)
+            room: i64 = floor((Desktop::WORK_H.f64() - win.y - chrome(win).f64()) / Desktop::ROW_H.f64()).i64()
+            return Desktop::imax(1, Desktop::imin(longest, room))
+
+    def content_top(win: Window&) -> f64:
+        menu: i64 = Desktop::MENU_H if win.menus > 0 else 0
+        tabs: i64 = Desktop::TAB_H if win.tab_count > 1 else 0
+        return win.y + (Desktop::TITLE_H + menu + tabs).f64()
+
+    def scrolls(win: Window&) -> bool:
+        return win.per_tab > win.rows
+
+    def box(win: Window&) -> Rect:
+        return Rect{x: win.x, y: win.y, w: win.w, h: height(win)}
+
+    def inside(rect: Rect, x: f64, y: f64) -> bool:
+        return rect.x <= x and x < rect.x + rect.w and rect.y <= y and y < rect.y + rect.h
+
+    def rect(x: f64, y: f64, w: f64, h: f64) -> Rect:
+        return Rect{x: x, y: y, w: w, h: h}
+
+    # --- layout --------------------------------------------------------
+
+    def title_rect(win: Window&) -> Rect:
+        return rect(win.x, win.y, win.w, Desktop::TITLE_H.f64())
+
+    def close_rect(win: Window&) -> Rect:
+        return rect(win.x + win.w - 30.0, win.y + 4.0, 24.0, (Desktop::TITLE_H - 8).f64())
+
+    def minimise_rect(win: Window&) -> Rect:
+        return rect(win.x + win.w - 58.0, win.y + 4.0, 24.0, (Desktop::TITLE_H - 8).f64())
+
+    def grip_rect(win: Window&) -> Rect:
+        return rect(win.x + win.w - 18.0, win.y + height(win) - 18.0, 18.0, 18.0)
+
+    def menu_rect(win: Window&, index: i64) -> Rect:
+        return rect(win.x + 8.0 + (index * 72).f64(), win.y + Desktop::TITLE_H.f64(), 68.0, Desktop::MENU_H.f64())
+
+    def tab_rect(win: Window&, index: i64) -> Rect:
+        top: f64 = win.y + Desktop::TITLE_H.f64() + (Desktop::MENU_H.f64() if win.menus > 0 else 0.0)
+        return rect(win.x + 8.0 + (index * 104).f64(), top + 2.0, 100.0, (Desktop::TAB_H - 2).f64())
+
+    # The up (0) and down (1) scroll buttons.
+    def scroll_rect(win: Window&, which: i64) -> Rect:
+        top: f64 = content_top(win)
+        x: f64 = win.x + win.w - 30.0
+        if win.rows == 1:
+            return rect(x - 28.0, top + 6.0, 24.0, 24.0) if which == 0 else rect(x, top + 6.0, 24.0, 24.0)
+        return rect(x, top + 2.0, 24.0, 24.0) if which == 0 else rect(x, top + (win.rows * Desktop::ROW_H - 26).f64(), 24.0, 24.0)
+
+    def apply_rect(win: Window&) -> Rect:
+        return rect(win.x + win.w - 104.0, content_top(win) + (win.rows * Desktop::ROW_H + 4).f64(), 92.0,
+            (Desktop::APPLY_H - 8).f64())
+
+    def widget_rect(left: f64, top: f64, width: f64) -> Rect:
+        return rect(left + width * 0.42, top + 5.0, width * 0.5 - 36.0, (Desktop::ROW_H - 10).f64())
+
+    def part_count(kind: i64, count: i64) -> i64:
+        return 1 if kind == Desktop::TOGGLE or kind == Desktop::DROPDOWN else (2 if kind == Desktop::STEPPER else count)
+
+    # parts(): where clicking does something, the index-th of them.
+    def part(kind: i64, count: i64, place: Rect, index: i64) -> Rect:
+        return rect(place.x, place.y, 56.0, place.h) if kind == Desktop::TOGGLE
+        return rect(place.x, place.y, place.w * 0.7, place.h) if kind == Desktop::DROPDOWN
+        return rect(place.x + (0.0 if index == 0 else 84.0), place.y, 28.0, place.h) if kind == Desktop::STEPPER
+        cell: f64 = place.w / count.f64()
+        return rect(place.x + index.f64() * cell, place.y, cell, place.h)
+
+    def dropdown_item(place: Rect, count: i64, index: i64) -> Rect:
+        top: Rect = part(Desktop::DROPDOWN, count, place, 0)
+        if top.y + top.h + (count * 28).f64() > Desktop::WORK_H.f64():
+            # No room below: the list opens upwards, as a real one does.
+            return rect(top.x, top.y - ((count - index) * 28).f64(), top.w, 28.0)
+        return rect(top.x, top.y + top.h + (index * 28).f64(), top.w, 28.0)
+
+    def tool_rect(win: Window&, which: i64) -> Rect:
+        x: mutable f64 = win.x + 8.0
+        for index in 0..<which |x|:
+            x <- x + (Desktop::tool_width(index) + 6).f64()
+        return rect(x, win.y + (Desktop::TITLE_H + 3).f64(), Desktop::tool_width(which).f64(), 24.0)
+
+    def place_tab_rect(win: Window&, index: i64) -> Rect:
+        return rect(win.x + 8.0 + (index * 124).f64(), win.y + (Desktop::TITLE_H + 31).f64(), 120.0, 26.0)
+
+    def plus_rect(win: Window&) -> Rect:
+        return rect(win.x + 8.0 + (win.browsing.places.count.i64() * 124).f64(), win.y + (Desktop::TITLE_H + 31).f64(), 26.0, 26.0)
+
+    def path_rect(win: Window&) -> Rect:
+        return rect(win.x + 136.0, win.y + (Desktop::TITLE_H + 60).f64(), win.w - 144.0, 22.0)
+
+    def sidebar_rect(win: Window&, index: i64) -> Rect:
+        return rect(win.x + 8.0, win.y + (Desktop::TITLE_H + 86 + index * 30).f64(), 120.0, 28.0)
+
+    def grid_area(win: Window&) -> Rect:
+        top: f64 = win.y + (Desktop::TITLE_H + 86).f64()
+        return rect(win.x + 136.0, top, win.w - 136.0 - 36.0, win.y + height(win) - 8.0 - top)
+
+    def columns(win: Window&) -> i64:
+        return 1 if win.browsing.list_view else Desktop::COLUMNS
+
+    def cell_width(win: Window&) -> f64:
+        return grid_area(win).w if win.browsing.list_view else grid_area(win).w / Desktop::COLUMNS.f64()
+
+    def cell_height(win: Window&) -> f64:
+        return Desktop::LIST_H.f64() if win.browsing.list_view else grid_area(win).w / Desktop::COLUMNS.f64()
+
+    def grid_rows(win: Window&) -> i64:
+        can Abort.Panic:
+            return Desktop::imax(1, floor(grid_area(win).h / cell_height(win)).i64())
+
+    def ex_scroll_rect(win: Window&, which: i64) -> Rect:
+        area: Rect = grid_area(win)
+        x: f64 = win.x + win.w - 30.0
+        return rect(x, area.y + 2.0, 24.0, 24.0) if which == 0 else rect(x, area.y + area.h - 26.0, 24.0, 24.0)
+
+    # START_PANEL, DONE_RECT, START_RECT, POPUP_RECT and PEEK_RECT.
+    def start_panel() -> Rect:
+        return rect(6.0, (Desktop::WORK_H - 330).f64(), 360.0, 330.0)
+
+    def done_rect() -> Rect:
+        return rect((Desktop::SCREEN_W - 130).f64(), (Desktop::WORK_H + 6).f64(), 120.0, (Desktop::TASKBAR_H - 12).f64())
+
+    def start_rect() -> Rect:
+        return rect(6.0, (Desktop::WORK_H + 6).f64(), 70.0, (Desktop::TASKBAR_H - 12).f64())
+
+    def popup_rect() -> Rect:
+        return rect(300.0, 180.0, 400.0, 150.0)
+
+    def peek_rect() -> Rect:
+        return rect((Desktop::SCREEN_W - 216).f64(), (Desktop::WORK_H + 6).f64(), 80.0, (Desktop::TASKBAR_H - 12).f64())
+
+    def start_tile(index: i64) -> Rect:
+        panel: Rect = start_panel()
+        return rect(panel.x + 12.0 + ((index % 3) * (Desktop::TILE_W + 8)).f64(),
+            panel.y + 44.0 + ((index / 3) * (Desktop::TILE_H + 8)).f64(), Desktop::TILE_W.f64(), Desktop::TILE_H.f64())
+
+    def all_apps_rect() -> Rect:
+        panel: Rect = start_panel()
+        return rect(panel.x + panel.w - 130.0, panel.y + 8.0, 120.0, 28.0)
+
+    def start_row(index: i64) -> Rect:
+        panel: Rect = start_panel()
+        return rect(panel.x + 10.0, panel.y + 44.0 + (index * Desktop::ITEM_H).f64(), panel.w - 20.0, Desktop::ITEM_H.f64())
+
+    def desktop_icon_rect(index: i64) -> Rect:
+        column: i64 = index / Desktop::ICONS_PER_COLUMN
+        row: i64 = index % Desktop::ICONS_PER_COLUMN
+        return rect((8 + column * Desktop::ICON_W).f64(), (8 + row * Desktop::ICON_H).f64(), (Desktop::ICON_W - 4).f64(),
+            (Desktop::ICON_H - 4).f64())
+
+    # The safe button (0), then the one that resets the window (1).
+    def popup_button(safe_left: bool, which: i64) -> Rect:
+        box: Rect = popup_rect()
+        left: Rect = rect(box.x + 40.0, box.y + box.h - 46.0, 140.0, 34.0)
+        right: Rect = rect(box.x + box.w - 180.0, box.y + box.h - 46.0, 140.0, 34.0)
+        return (left if which == 0 else right) if safe_left else (right if which == 0 else left)
+
+    def centre_x(place: Rect) -> f64:
+        return place.x + place.w / 2.0
+
+    def centre_y(place: Rect) -> f64:
+        return place.y + place.h / 2.0

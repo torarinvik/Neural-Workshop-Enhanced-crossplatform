@@ -1,0 +1,367 @@
+include "./tasks/forms_game.elisa"
+include "./display.elisa"
+include "./scene_verdict.elisa"
+include "./verdict.elisa"
+include "./geometry.elisa"
+include "./textmetrics.elisa"
+
+module SceneForms:
+    # ui/forms.py's drawing: the form on the left -- a row per field
+    # showing, the field in focus framed blue, fields sent back framed
+    # red, and a list's matches under the rows -- and the card on the
+    # right. A click on a row moves the focus there.
+    const WIDTH: f64 = 912.0
+    const HEIGHT: f64 = 684.0
+    const FOCUS: u32 = 0x285adcff
+    const MARKED: u32 = 0xd6403aff
+    const BOX_LIGHT: u32 = 0xffffffff
+    const BOX_DARK: u32 = 0x282c34ff
+    const PANEL_LIGHT: u32 = 0xeceff4ff
+    const PANEL_DARK: u32 = 0x1e2228ff
+    const CARD_LIGHT: u32 = 0xfcf6dcff
+    const PICK: u32 = 0xc4d8faff
+    const GREY: u32 = 0x969aa2ff
+    const WHITE: u32 = 0xffffffff
+    const BLACK: u32 = 0x000000ff
+    # List items shown under a list field at most.
+    const SHOWN: i64 = 6
+
+    struct Area:
+        left: f64
+        bottom: f64
+        width: f64
+        height: f64
+
+    # _area: the playing area under the chrome.
+    def area() -> Area:
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(HEIGHT, 116.0).f64()
+            bottom: f64 = Verdict::above_the_band(HEIGHT, Geometry::from_bottom_edge(HEIGHT, 58.0).f64()).f64()
+            width: f64 = WIDTH * 0.92
+            return Area{left: (WIDTH - width) / 2.0, bottom: bottom, width: width, height: fmax(40.0, top - bottom)}
+
+    def font(size: f64) -> f64:
+        can Abort.Panic:
+            return Geometry::calc_fontsize(HEIGHT, size)
+
+    def form_area(whole: Area) -> Area:
+        split: f64 = whole.left + whole.width * 0.58
+        return Area{left: whole.left, bottom: whole.bottom, width: split - whole.left - whole.width * 0.02, height: whole.height}
+
+    def card_area(whole: Area) -> Area:
+        split: f64 = whole.left + whole.width * 0.58
+        return Area{left: split + whole.width * 0.02, bottom: whole.bottom,
+            width: whole.left + whole.width - split - whole.width * 0.02, height: whole.height}
+
+    # The form's rows: each field's band, from the top.
+    struct Rows:
+        size: f64
+        row: f64
+        top: f64
+
+    def rows(place: Area, shown: i64) -> Rows:
+        can Abort.Panic:
+            size: f64 = font(12.0)
+            count: i64 = (shown if shown > 1 else 1) + 1
+            row: f64 = fmin((place.height - size * 3.0) / count.f64(), size * 5.2)
+            return Rows{size: size, row: row, top: place.bottom + place.height - size * 2.6}
+
+    # _click over self.hits: the index of the row under a press, or -1.
+    def hit(session: FormsGame::Session&, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            return -1 if session.phase != FormsGame::FILLING
+            place: Area = form_area(area())
+            shown: i64 = FormsFill::visible_count(&session.form, session.form.page)
+            bands: Rows = rows(place, shown)
+            for index in 0..<shown |place, bands, x, y|:
+                high: f64 = bands.top - index.f64() * bands.row
+                return index if place.left <= x and x <= place.left + place.width and high - bands.row <= y and y <= high
+            return -1
+
+    def text(list: mutable Display::DisplayList&, words: sview, x: f64, y: f64, size: f64, ink: u32, anchor: u32 = 3,
+            bold: bool = false):
+        can Abort.Panic, Memory.Allocate:
+            Display::draw_text_weight(list, words, x, y, fmax(6.0, size), ink, anchor, bold)
+
+    # text() for words held as a cstr.
+    def named_text(list: mutable Display::DisplayList&, words: cstr, x: f64, y: f64, size: f64, ink: u32, anchor: u32 = 3,
+            bold: bool = false):
+        can Abort.Panic, Memory.Allocate:
+            spelled: mutable dstr = []
+            dstr_append_cstr(&spelled, words)
+            text(list, bytes_view(spelled), x, y, size, ink, anchor, bold)
+
+    # _box: a fill, then a border when there is one.
+    def box(list: mutable Display::DisplayList&, place: Area, fill: u32, edge: u32, thickness: f64 = 2.0):
+        can Abort.Panic, Memory.Allocate:
+            Display::draw_rect(list, place.left, place.bottom, place.width, place.height, fill)
+            Display::draw_box(list, place.left, place.bottom, place.width, place.height, edge, thickness) if edge != 0.u32()
+
+    def spelled(out: mutable dstr&, value: Forms::Text&):
+        can Memory.Allocate, Abort.Panic:
+            for at in 0..<value.count |out, value|:
+                out.push(value.bytes[at.usize()])
+
+    # A row's value: what is typed, or the item chosen from a list.
+    def value_words(session: FormsGame::Session&, key: i64, focused: bool, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            form: FormsFill::Filling = session.form
+            if Forms::kind_of(key) == Forms::CHOICE:
+                pick: i64 = form.picks[key.usize()]
+                if focused or pick < 0:
+                    spelled(out, &form.query)
+                else:
+                    dstr_append_cstr(out, Forms::option_name(key, pick))
+            else:
+                spelled(out, &form.values[key.usize()])
+            out.push(124.u8()) if focused and session.phase == FormsGame::FILLING
+
+    def field_row(list: mutable Display::DisplayList&, session: FormsGame::Session&, place: Area, bands: Rows, index: i64,
+            key: i64, focus: i64, ink: u32, face: u32):
+        can Abort.Panic, Memory.Allocate:
+            size: f64 = bands.size
+            y_mid: f64 = bands.top - index.f64() * bands.row - bands.row / 2.0
+            kind: i64 = Forms::kind_of(key)
+            named_text(list, Forms::label(key), place.left + 14.0, y_mid, size, ink) if kind != Forms::CHECK
+            if key == Forms::BORN or key == Forms::PHONE or key == Forms::COUNTRY:
+                words: mutable dstr = []
+                dstr_append_cstr(&words, "(")
+                dstr_append_cstr(&words, Forms::hint(key))
+                dstr_append_cstr(&words, ")")
+                text(list, bytes_view(words), place.left + 14.0, y_mid - size * 1.3, size * 0.75, GREY)
+            label_width: f64 = place.width * 0.36
+            fx: f64 = place.left + label_width
+            fw: f64 = place.width - label_width - 18.0
+            fh: f64 = fmin(bands.row * 0.62, size * 2.6)
+            frame: u32 = MARKED if session.form.marked[key.usize()] else (FOCUS if key == focus else ink)
+            thick: f64 = 3.0 if frame != ink else 1.0
+            if kind == Forms::CHECK:
+                # A checkbox goes before its words, as on any form.
+                side: f64 = fh * 0.8
+                bx: f64 = place.left + 14.0
+                box(list, Area{left: bx, bottom: y_mid - side / 2.0, width: side, height: side}, face, frame, thick)
+                if session.form.picks[key.usize()] != 0:
+                    text(list, "✓", bx + side / 2.0, y_mid, side * 0.5, ink, Display::ANCHOR_CENTER_CENTER, true)
+                named_text(list, Forms::label(key), bx + side * 1.4, y_mid, size, ink)
+            elif kind == Forms::RADIO:
+                gap: f64 = fw / Forms::PLAN_COUNT.f64()
+                for option in 0..<Forms::PLAN_COUNT |list, session, size, key, frame, fx, fh, gap, y_mid, ink|:
+                    cx: f64 = fx + option.f64() * gap + fh * 0.3
+                    Display::draw_circle(list, cx, y_mid, fh * 0.28, frame if option == session.form.picks[key.usize()] else GREY)
+                    named_text(list, Forms::plan_name(option), cx + fh * 0.45, y_mid, size * 0.9, ink)
+            else:
+                box(list, Area{left: fx, bottom: y_mid - fh / 2.0, width: fw, height: fh}, face, frame, thick)
+                words: mutable dstr = []
+                value_words(session, key, key == focus, &words)
+                text(list, bytes_view(words), fx + 8.0, y_mid, size, ink) if words.count > 0
+
+    # A list field in focus shows what matches below the form's rows, so
+    # it never hides another field.
+    def matches(list: mutable Display::DisplayList&, session: FormsGame::Session&, place: Area, bands: Rows, shown: i64,
+            ink: u32, face: u32):
+        can Abort.Panic, Memory.Allocate:
+            form: FormsFill::Filling = session.form
+            size: f64 = bands.size
+            found: i64 = FormsFill::match_count(&form.query)
+            lit: i64 = imin(form.lit, imax(0, found - 1))
+            first: i64 = imax(0, lit - SHOWN + 1)
+            item_height: f64 = size * 1.8
+            lx: f64 = place.left + place.width * 0.36
+            lw: f64 = place.width - place.width * 0.36 - 18.0
+            ly: f64 = bands.top - shown.f64() * bands.row - size * 0.4
+            for n in 0..<imin(SHOWN, found - first) |list, form, place, size, lit, first, item_height, lx, lw, ly, ink, face|:
+                iy: f64 = ly - (n + 1).f64() * item_height
+                break if iy < place.bottom + 4.0
+                box(list, Area{left: lx, bottom: iy, width: lw, height: item_height}, PICK if first + n == lit else face, ink, 1.0)
+                item: i64 = FormsFill::match_at(&form.query, first + n)
+                named_text(list, Forms::country_name(item), lx + 8.0, iy + item_height / 2.0, size * 0.9, ink)
+            text(list, "no match", lx + 8.0, ly - item_height / 2.0, size * 0.9, MARKED) if found == 0
+
+    def imin(one: i64, two: i64) -> i64:
+        return one if one < two else two
+
+    def imax(one: i64, two: i64) -> i64:
+        return one if one > two else two
+
+    def draw_form(list: mutable Display::DisplayList&, session: FormsGame::Session&, place: Area, dark: bool, ink: u32):
+        can Abort.Panic, Memory.Allocate:
+            face: u32 = BOX_DARK if dark else BOX_LIGHT
+            box(list, place, PANEL_DARK if dark else PANEL_LIGHT, ink)
+            form: FormsFill::Filling = session.form
+            shown: i64 = FormsFill::visible_count(&form, form.page)
+            focus: i64 = FormsFill::focused(&form)
+            bands: Rows = rows(place, shown)
+            pages: i64 = form.dealt.level.pages
+            if pages > 1:
+                words: mutable dstr = []
+                dstr_append_cstr(&words, "Page ")
+                dstr_append_i64(&words, form.page + 1)
+                dstr_append_cstr(&words, " of ")
+                dstr_append_i64(&words, pages)
+                text(list, bytes_view(words), place.left + place.width - 12.0, place.bottom + place.height - bands.size * 1.4,
+                    bands.size * 0.9, ink, Display::ANCHOR_RIGHT_CENTER)
+            for index in 0..<shown |list, session, place, form, focus, bands, ink, face|:
+                field_row(list, session, place, bands, index, FormsFill::visible_key(&form, form.page, index), focus, ink, face)
+            if focus == Forms::COUNTRY and form.query.count > 0 and session.phase == FormsGame::FILLING:
+                matches(list, session, place, bands, shown, ink, face)
+            if session.phase == FormsGame::JUDGED:
+                reveal(list, session, place, bands.size)
+
+    # The answers to what was wrong, under the form, four at most.
+    def reveal(list: mutable Display::DisplayList&, session: FormsGame::Session&, place: Area, size: f64):
+        can Abort.Panic, Memory.Allocate:
+            wrong: bool[11] = FormsFill::wrong(&session.form).fields
+            n: mutable i64 = 0
+            for at in 0..<session.form.dealt.field_count |list, session, place, size, wrong, n|:
+                key: i64 = session.form.dealt.fields[at.usize()].key
+                if wrong[key.usize()] and n < 4:
+                    words: mutable dstr = []
+                    dstr_append_cstr(&words, "should be ")
+                    dstr_append_cstr(&words, Forms::label(key))
+                    dstr_append_cstr(&words, ": ")
+                    shown_answer(&session.form.dealt.who, key, &words)
+                    text(list, bytes_view(words), place.left + 14.0, place.bottom + size * (1.5 + 1.6 * n.f64()), size * 0.9, MARKED)
+                    n <- n + 1
+
+    # _shown_answer.
+    def shown_answer(who: Forms::Person&, key: i64, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            kind: i64 = Forms::kind_of(key)
+            answer: i64 = Forms::answer_index(who, key)
+            if kind == Forms::CHOICE or kind == Forms::RADIO:
+                dstr_append_cstr(out, Forms::option_name(key, answer))
+            elif kind == Forms::CHECK:
+                dstr_append_cstr(out, "ticked" if answer == 1 else "not ticked")
+            else:
+                value: Forms::Text = Forms::answer_text(who, key)
+                spelled(out, &value)
+
+    # _draw_card: the card, shrunk until its longest line fits.
+    def draw_card(list: mutable Display::DisplayList&, session: FormsGame::Session&, place: Area, dark: bool, ink: u32):
+        can Abort.Panic, Memory.Allocate:
+            box(list, place, PANEL_DARK if dark else CARD_LIGHT, ink)
+            dealt: Forms::Deal = session.form.dealt
+            longest: mutable i64 = 0
+            for at in 0..<dealt.card_count |dealt, longest|:
+                longest <- dealt.card[at.usize()].count if dealt.card[at.usize()].count > longest
+            size: mutable f64 = font(12.0)
+            room: f64 = place.width - 28.0
+            while TextMetrics::text_width(size, longest).f64() > room and size > 7.0 |size, longest, room|:
+                size <- size - 0.5
+            lines: i64 = dealt.card_count if dealt.card_count > 1 else 1
+            line: f64 = fmin(size * 2.0, (place.height - size * 3.0) / lines.f64())
+            top: f64 = place.bottom + place.height
+            text(list, "The card", place.left + 14.0, top - size * 1.4, size, ink, Display::ANCHOR_LEFT_CENTER, true)
+            for at in 0..<dealt.card_count |list, dealt, place, ink, size, line, top|:
+                words: mutable dstr = []
+                spelled(&words, &dealt.card[at.usize()])
+                text(list, bytes_view(words), place.left + 14.0, top - size * 3.2 - at.f64() * line, size, ink) if words.count > 0
+
+    def message(session: FormsGame::Session&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if session.phase == FormsGame::READY:
+                dstr_append_cstr(out, "Press Space or click to start")
+            elif session.phase == FormsGame::DONE:
+                dstr_append_i64(out, session.ladder.wins)
+                dstr_append_cstr(out, " of ")
+                dstr_append_i64(out, session.ladder.trial)
+                dstr_append_cstr(out, " right and under par   highest rung passed ")
+                dstr_append_i64(out, session.ladder.best_rung)
+            elif session.phase == FormsGame::JUDGED:
+                verdict_words(session, out)
+            else:
+                dstr_append_cstr(out, "Fill in the form in ")
+                dstr_append_points(out, session.par)
+                dstr_append_cstr(out, " keys or fewer")
+
+    def verdict_words(session: FormsGame::Session&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            found: FormsFill::Mistakes = FormsFill::wrong(&session.form)
+            count: i64 = found.count
+            wrong: bool[11] = found.fields
+            if count == 0:
+                dstr_append_cstr(out, "All right in ")
+                dstr_append_points(out, FormsFill::spent(&session.form).f64())
+                dstr_append_cstr(out, " keys against a par of ")
+                dstr_append_points(out, session.par)
+                return
+            dstr_append_cstr(out, "Sent with ")
+            dstr_append_i64(out, count)
+            dstr_append_cstr(out, " wrong: ")
+            named: mutable i64 = 0
+            for at in 0..<session.form.dealt.field_count |out, session, wrong, named|:
+                key: i64 = session.form.dealt.fields[at.usize()].key
+                if wrong[key.usize()]:
+                    dstr_append_cstr(out, ", ") if named > 0
+                    dstr_append_cstr(out, Forms::label(key))
+                    named <- named + 1
+
+    def facts(session: FormsGame::Session&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            form: FormsFill::Filling = session.form
+            dstr_append_cstr(out, "rung ")
+            dstr_append_i64(out, form.dealt.level.rung)
+            dstr_append_cstr(out, "  ")
+            dstr_append_i64(out, session.ladder.trial)
+            dstr_append_cstr(out, "/")
+            dstr_append_i64(out, session.ladder.total)
+            dstr_append_cstr(out, "  keys ")
+            dstr_append_i64(out, form.keys)
+            dstr_append_cstr(out, "  a page sent back costs ")
+            dstr_append_i64(out, form.dealt.level.penalty)
+            if form.bounced > 0:
+                dstr_append_cstr(out, "  sent back ")
+                dstr_append_i64(out, form.bounced)
+
+    def centred_label(list: mutable Display::DisplayList&, words: sview, y: f64, size: f64, ink: u32, bold: bool = false):
+        can Abort.Panic, Memory.Allocate:
+            Display::draw_text_weight(list, words, WIDTH / 2.0, y, size, ink, Display::ANCHOR_CENTER_CENTER, bold)
+
+    def render(list: mutable Display::DisplayList&, session: FormsGame::Session&, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            ink: u32 = WHITE if dark else BLACK
+            centred_label(list, "Forms", Geometry::from_top_edge(HEIGHT, 36.0).f64(), font(22.0), ink, true)
+            status: mutable dstr = []
+            message(session, &status)
+            centred_label(list, bytes_view(status), Geometry::from_top_edge(HEIGHT, 70.0).f64(), font(14.0), ink)
+            centred_label(list, "type   Tab: next field   Enter: send   Up/Down: lists and radios   Space: tick   Esc: menu",
+                Geometry::from_bottom_edge(HEIGHT, 26.0).f64(), font(11.0), ink)
+            if FormsGame::live(session):
+                line: mutable dstr = []
+                facts(session, &line)
+                centred_label(list, bytes_view(line), Geometry::from_top_edge(HEIGHT, 96.0).f64(), font(12.0), ink)
+                whole: Area = area()
+                draw_form(list, session, form_area(whole), dark, ink)
+                draw_card(list, session, card_area(whole), dark, ink)
+            # The last verdict stays up after the run ends, as _finish
+            # leaves it.
+            if session.verdict != FormsGame::LIVE and (session.phase == FormsGame::JUDGED or session.phase == FormsGame::DONE):
+                caption: mutable dstr = []
+                verdict_words(session, &caption)
+                SceneVerdict::put(list, WIDTH, HEIGHT, 1.0, 1.0, session.verdict == FormsGame::RIGHT, bytes_view(caption), 60.0,
+                    16.0)
+
+    def option_note(rung: i64, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            level: Forms::Grade = Forms::grade(rung)
+            dstr_append_cstr(out, "Rung ")
+            dstr_append_i64(out, level.rung)
+            dstr_append_cstr(out, ": up to ")
+            dstr_append_i64(out, level.fields)
+            dstr_append_cstr(out, " fields on ")
+            dstr_append_i64(out, level.pages)
+            dstr_append_cstr(out, " page(s).")
+            found: mutable i64 = 0
+            named: bool[7] = [level.dates, level.digits, level.choices, level.checks, level.conditional, level.letter, level.decoys]
+            for at in 0..<7 |out, named, found|:
+                if named[at.usize()]:
+                    dstr_append_cstr(out, "  With " if found == 0 else ", ")
+                    dstr_append_cstr(out, feature_words(at))
+                    found <- found + 1
+            dstr_append_cstr(out, ".") if found > 0
+            dstr_append_cstr(out, "  Par is the reference typist exactly.") if level.factor <= 1.0
+
+    def feature_words(at: i64) -> cstr:
+        words: array[cstr, 7] = ["dates to reformat", "phone numbers", "lists that complete", "checkboxes and radio buttons",
+            "fields that appear", "a letter to read", "other people's details"]
+        return words[at.usize()]

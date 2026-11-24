@@ -1110,7 +1110,7 @@ The current Stage1 runtime object was rebuilt with `Elisa-compiler/scripts/build
 The Stage0 compiler source also contains a focused ownership-analysis correction discovered while rerunning the newest compiler gates. Packed enum match-arm binders now retain an affine ownership alias to the actual scrutinee field, including refined packed-variant views; consumption is propagated only for real match binders, so ordinary immutable locals are not incorrectly treated as aliases. The focused packed-enum, branch, destructure, move/rebind, and double-consumption regressions pass, and the complete `test/semantic` package passes. The broader compiler `go test ./...` run passed the modified semantic/backend/parser/interpreter packages but timed out in the unrelated aggregate `elisacore/src` runtime harness after ten minutes under host contention; this remains an explicitly unverified slow upstream harness, not a semantic test failure.
 
 The compiler regression that previously caused Stage1 to accept a region-erasing typed field-reference return is fixed in the current Stage1 semantic checker. `test/parity/sview_region_tie_smoke.sh` passes at O0 and O2 for both compiler generations after rebuilding the current Stage0 oracle; it verifies legal direct forwarding, explicit lifetime preservation, rejection of erased/mismatched view lifetimes, opaque callback forwarding, and no LLVM output for the invalid typed field-reference case. The completed driver acceptance evidence for the stabilized current compiler reports bare mode `2 disagreements (0 accept-gap, 2 reject-gap)` within ratchet 6 and with-stdlib `0 disagreements`; the broader upstream compiler gate remains a separate scope item. This issue is therefore fixed in the compiler, not hidden with a port-side Elisa workaround.
-Location: repository root, `IMPLEMENTATION_PLAN.md`.
+Location: `nw-core/docs/implementation-plan.md`.
 
 **Fresh hard-trace confirmation on the promoted artifact (2026-09-26):**
 `NW_MARBLE_PLAY_CASE=16:0 bash nw-core/scripts/test_marble_source_play_parity.sh`
@@ -5022,7 +5022,7 @@ Dependency order: M0 precedes confidence in M1; M1 provides the protocol for M2;
 
 ### 4.1 First ten concrete work items
 
-- [x] BASE-001: inventory dirty files, compiler roots, binary hashes, reference interpreter/dependencies. Snapshot: [`nw-core/docs/port-status.md`](nw-core/docs/port-status.md), including unresolved stage0 commit and stage1 dirty-source provenance mismatches.
+- [x] BASE-001: inventory dirty files, compiler roots, binary hashes, reference interpreter/dependencies. Snapshot: [`nw-core/docs/port-status.md`](port-status.md), including unresolved stage0 commit and stage1 dirty-source provenance mismatches.
 - [x] TEST-001: correct command/byte comparison in `task_game_input_smoke.mjs`; prove deliberate identical frames fail. The generic smoke retains raw bytes separately from decoded commands and self-tests the identical-frame rejection branch; the live Sokoban replay asserts a reached playing frame differs from its actual ready frame. Monkey Ladder and Sokoban controller replays cover ignored inputs and real verdict transitions.
 - [x] TEST-002: make checker exit codes and expected counts mandatory; prove a process printing PASS then exiting nonzero fails. `check_result.py` requires compile/link/checker statuses, rejects missing/zero case counts and nonzero exits, and the unit test launches a real child process that prints `PASS: 12 cases identical` before exiting 7.
 - [x] TEST-003: isolate oracle files and output directories; test interruption and concurrency handling. `check.sh` gives each run a private output directory and serializes official checker runs with a per-user lock in `TMPDIR`, shared across worktrees. `check_harness_test.sh` covers ownerless and stale/reused-PID locks, SIGTERM while waiting behind a live owner, and two builds concurrently running a fixed-oracle expressions suite with distinct results.
@@ -16262,7 +16262,7 @@ intentional worktree change. The source-fresh Stage1 validation product is
 `-O2`/`-O3` seeds exceeded the existing 4 GiB guard and were not published.
 Because no port Elisa source changed, this fix does not rebuild or relabel the
 current WASM artifact. See
-[`nw-core/docs/compiler-issues.md`](nw-core/docs/compiler-issues.md).
+[`nw-core/docs/compiler-issues.md`](compiler-issues.md).
 
 ### Compiler acceptance follow-up — 2026-09-20
 

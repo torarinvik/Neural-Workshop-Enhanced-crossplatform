@@ -1,0 +1,276 @@
+include "./desktop_view.elisa"
+
+module DesktopClick:
+    # What a click does, from whatever is open on top down to the desktop.
+    const NONE: i64 = -1
+
+    def inside(rect: DesktopState::Rect, x: f64, y: f64) -> bool:
+        return DesktopState::inside(rect, x, y)
+
+    def set(desk: mutable DesktopState::Desk&, ident: i64, value: i64):
+        can Abort.Panic:
+            control: DesktopState::Control = desk.controls[ident.usize()]
+            desk.controls[ident.usize()].shown <- value
+            if control.dialog == NONE and not desk.windows[control.window.usize()].apply:
+                desk.controls[ident.usize()].value <- value
+
+    def click_control(desk: mutable DesktopState::Desk&, ident: i64, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            place: DesktopView::Spot = DesktopView::control_rect(desk, ident)
+            return if not place.found or not DesktopView::enabled(desk, ident)
+            control: DesktopState::Control = desk.controls[ident.usize()]
+            for value in 0..<DesktopState::part_count(control.kind, control.count) |desk, control, place, ident, x, y|:
+                if inside(DesktopState::part(control.kind, control.count, place.rect, value), x, y):
+                    if control.kind == Desktop::TOGGLE:
+                        set(desk, ident, 1 - control.shown)
+                    elif control.kind == Desktop::DROPDOWN:
+                        desk.overlay.dropdown <- ident
+                    elif control.kind == Desktop::STEPPER:
+                        step: i64 = -1 if value == 0 else 1
+                        set(desk, ident, Desktop::imax(0, Desktop::imin(control.count - 1, control.shown + step)))
+                    else:
+                        set(desk, ident, value)
+                    return
+
+    # The controls a window holds, on its tabs and in its dialogs.
+    def window_controls(desk: DesktopState::Desk&, window: i64) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            found: mutable darray[i64] = []
+            for index in 0..<desk.controls.count.i64() |desk, found, window|:
+                found.push(index) if desk.controls[index.usize()].window == window
+            return found
+
+    def open_app(desk: mutable DesktopState::Desk&, window: i64):
+        can Memory.Allocate, Abort.Panic:
+            desk.windows[window.usize()].closed <- false
+            desk.windows[window.usize()].minimised <- false
+            DesktopView::raise_window(desk, window)
+
+    def open_dialog(desk: mutable DesktopState::Desk&, dialog: i64):
+        can Abort.Panic:
+            made: DesktopDeal::DialogSpec = desk.dealt.dialogs[dialog.usize()]
+            for ident in made.members |desk|:
+                desk.controls[ident.usize()].shown <- desk.controls[ident.usize()].value
+            desk.overlay.dialog <- dialog
+
+    def click_dialog(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            made: DesktopDeal::DialogSpec = desk.dealt.dialogs[desk.overlay.dialog.usize()]
+            if inside(DesktopView::dialog_button(1), x, y):
+                for ident in made.members |desk|:
+                    desk.controls[ident.usize()].value <- desk.controls[ident.usize()].shown
+                desk.overlay.dialog <- NONE
+            elif inside(DesktopView::dialog_button(0), x, y):
+                for ident in made.members |desk|:
+                    desk.controls[ident.usize()].shown <- desk.controls[ident.usize()].value
+                desk.overlay.dialog <- NONE
+            else:
+                for ident in made.members |desk, x, y|:
+                    click_control(desk, ident, x, y)
+
+    def click_menu(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            window: i64 = desk.overlay.menu_window
+            menu: i64 = desk.overlay.menu_index
+            for which in 0..<DesktopView::submenu_items(desk) |desk, window, menu, x, y|:
+                if inside(DesktopView::submenu_item(desk, which), x, y):
+                    owner: i64 = desk.overlay.menu_sub
+                    desk.overlay.menu_window <- NONE
+                    open_dialog(desk, DesktopView::dialog_at(desk, window, menu, owner, which))
+                    return
+            for which in 0..<DesktopView::menu_items(desk) |desk, window, menu, x, y|:
+                if inside(DesktopView::menu_item(desk, which), x, y):
+                    if DesktopView::is_submenu(desk, which):
+                        desk.overlay.menu_sub <- which
+                    else:
+                        desk.overlay.menu_window <- NONE
+                        open_dialog(desk, DesktopView::dialog_at(desk, window, menu, which, NONE))
+                    return
+            desk.overlay.menu_window <- NONE
+
+    def click_start(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            if inside(DesktopState::all_apps_rect(), x, y):
+                desk.overlay.start_all <- not desk.overlay.start_all
+                return
+            listed: darray[i64] = DesktopView::start_windows(desk)
+            for index in 0..<listed.count.i64() |desk, listed, x, y|:
+                if inside(DesktopView::start_item(desk, index), x, y):
+                    open_app(desk, listed[index.usize()])
+                    desk.overlay.start_open <- false
+                    desk.overlay.start_all <- false
+                    return
+            if not inside(DesktopState::start_panel(), x, y):
+                desk.overlay.start_open <- false
+                desk.overlay.start_all <- false
+
+    def click_taskbar(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            if inside(DesktopState::done_rect(), x, y):
+                desk.done <- true
+                return
+            if inside(DesktopState::start_rect(), x, y):
+                desk.overlay.start_open <- true
+                desk.overlay.start_all <- false
+                return
+            listed: darray[i64] = DesktopView::taskbar_windows(desk)
+            for position in 0..<listed.count.i64() |desk, listed, x, y|:
+                if inside(DesktopView::taskbar_rect(position), x, y):
+                    desk.windows[listed[position.usize()].usize()].minimised <- false
+                    DesktopView::raise_window(desk, listed[position.usize()])
+                    return
+
+    # A desktop icon opened: an app, the explorer, the Trash or a folder.
+    def open_icon(desk: mutable DesktopState::Desk&, key: i64):
+        can Memory.Allocate, Abort.Panic:
+            if key >= DesktopState::KEY_APP and key < DesktopState::KEY_NODE:
+                open_app(desk, key - DesktopState::KEY_APP)
+                return
+            node: i64 = key - DesktopState::KEY_NODE if key >= DesktopState::KEY_NODE else NONE
+            return if node != NONE and not desk.nodes[node.usize()].folder
+            open_app(desk, desk.explorer)
+            tab: usize = desk.windows[desk.explorer.usize()].browsing.current.usize()
+            if key == DesktopState::KEY_TRASH:
+                DesktopFiles::navigate(&desk.windows[desk.explorer.usize()].browsing.places[tab], Desktop::TRASH)
+            elif node != NONE:
+                DesktopFiles::navigate(&desk.windows[desk.explorer.usize()].browsing.places[tab], node)
+
+    def click_desktop(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            key: i64 = DesktopView::icon_at(desk, x, y)
+            if key == NONE:
+                desk.picking.picked <- NONE
+                return
+            open_icon(desk, key) if desk.picking.picked == key and desk.picking.previous == key
+            desk.picking.picked <- key
+            desk.picking.last <- key
+
+    def click_tool(desk: mutable DesktopState::Desk&, window: i64, tool: i64):
+        can Memory.Allocate, Abort.Panic:
+            tab: usize = desk.windows[window.usize()].browsing.current.usize()
+            place: DesktopState::Place = desk.windows[window.usize()].browsing.places[tab]
+            if tool == Desktop::BACK and place.history.count > 0.usize():
+                back: i64 = place.history[(place.history.count - 1.usize())]
+                desk.windows[window.usize()].browsing.places[tab].history.pop()
+                desk.windows[window.usize()].browsing.places[tab].path <- back
+                desk.windows[window.usize()].browsing.places[tab].scroll <- 0
+                desk.windows[window.usize()].browsing.places[tab].selected <- NONE
+            elif tool == Desktop::UP and desk.nodes[place.path.usize()].parent != NONE:
+                DesktopFiles::navigate(&desk.windows[window.usize()].browsing.places[tab], desk.nodes[place.path.usize()].parent)
+            elif (tool == Desktop::CUT or tool == Desktop::COPY) and place.selected != NONE:
+                desk.picking.clipboard <- place.selected
+                desk.picking.copying <- tool == Desktop::COPY
+            elif tool == Desktop::PASTE and desk.picking.clipboard != NONE:
+                DesktopFiles::paste(desk, place.path)
+            elif tool == Desktop::VIEW:
+                desk.windows[window.usize()].browsing.list_view <- not desk.windows[window.usize()].browsing.list_view
+                desk.windows[window.usize()].browsing.places[tab].scroll <- 0
+            elif tool == Desktop::DELETE and place.selected != NONE and not DesktopFiles::within(desk, place.selected, Desktop::TRASH):
+                _ = DesktopFiles::move_file(desk, place.selected, Desktop::TRASH)
+
+    def click_explorer(desk: mutable DesktopState::Desk&, window: i64, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            win: DesktopState::Window = desk.windows[window.usize()]
+            tab: usize = win.browsing.current.usize()
+            for tool in 0..<7 |desk, win, window, x, y|:
+                if inside(DesktopState::tool_rect(&win, tool), x, y):
+                    click_tool(desk, window, tool)
+                    return
+            for index in 0..<win.browsing.places.count.i64() |desk, win, window, x, y|:
+                if inside(DesktopState::place_tab_rect(&win, index), x, y):
+                    desk.windows[window.usize()].browsing.current <- index
+                    return
+            if win.browsing.places.count.i64() < Desktop::MOST_TABS and inside(DesktopState::plus_rect(&win), x, y):
+                desk.windows[window.usize()].browsing.places.push(DesktopState::place(Desktop::HOME))
+                desk.windows[window.usize()].browsing.current <- win.browsing.places.count.i64()
+                return
+            for index in 0..<Desktop::PLACE_COUNT |desk, win, window, tab, x, y|:
+                if inside(DesktopState::sidebar_rect(&win, index), x, y):
+                    DesktopFiles::navigate(&desk.windows[window.usize()].browsing.places[tab], index)
+                    return
+            if DesktopView::ex_scrolls(desk, window):
+                if inside(DesktopState::ex_scroll_rect(&win, 0), x, y):
+                    scroll: i64 = desk.windows[window.usize()].browsing.places[tab].scroll
+                    desk.windows[window.usize()].browsing.places[tab].scroll <- Desktop::imax(0, scroll - 1)
+                    return
+                if inside(DesktopState::ex_scroll_rect(&win, 1), x, y):
+                    desk.windows[window.usize()].browsing.places[tab].scroll <- win.browsing.places[tab].scroll + 1
+                    _ = DesktopView::icon_rects(desk, window)
+                    return
+            icons: darray[DesktopView::Placed] = DesktopView::icon_rects(desk, window)
+            for icon in icons |desk, window, tab, x, y|:
+                if inside(icon.rect, x, y):
+                    key: i64 = DesktopState::KEY_EX + icon.node
+                    place: DesktopState::Place = desk.windows[window.usize()].browsing.places[tab]
+                    if place.selected == icon.node and desk.picking.previous == key and desk.nodes[icon.node.usize()].folder:
+                        DesktopFiles::navigate(&desk.windows[window.usize()].browsing.places[tab], icon.node)
+                    else:
+                        desk.windows[window.usize()].browsing.places[tab].selected <- icon.node
+                        desk.picking.last <- key
+                    return
+            if inside(DesktopState::grid_area(&win), x, y):
+                desk.windows[window.usize()].browsing.places[tab].selected <- NONE
+
+    # A click on an app window's own parts.
+    def click_app(desk: mutable DesktopState::Desk&, window: i64, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            win: DesktopState::Window = desk.windows[window.usize()]
+            for index in 0..<win.menus |desk, win, window, x, y|:
+                if inside(DesktopState::menu_rect(&win, index), x, y):
+                    desk.overlay.menu_window <- window
+                    desk.overlay.menu_index <- index
+                    desk.overlay.menu_sub <- NONE
+                    return
+            if win.tab_count > 1:
+                for index in 0..<win.tab_count |desk, win, window, x, y|:
+                    if inside(DesktopState::tab_rect(&win, index), x, y):
+                        desk.windows[window.usize()].active <- index
+                        return
+            tab: i64 = win.active
+            if DesktopState::scrolls(&win):
+                most: i64 = win.per_tab - win.rows
+                if inside(DesktopState::scroll_rect(&win, 0), x, y):
+                    desk.windows[window.usize()].scroll[tab.usize()] <- Desktop::imax(0, win.scroll[tab.usize()] - 1)
+                    return
+                if inside(DesktopState::scroll_rect(&win, 1), x, y):
+                    desk.windows[window.usize()].scroll[tab.usize()] <- Desktop::imin(most, win.scroll[tab.usize()] + 1)
+                    return
+            if win.apply and inside(DesktopState::apply_rect(&win), x, y):
+                for index in 0..<desk.controls.count.i64() |desk, window|:
+                    if desk.controls[index.usize()].window == window and desk.controls[index.usize()].dialog == NONE:
+                        desk.controls[index.usize()].value <- desk.controls[index.usize()].shown
+                return
+            for row in 0..<win.per_tab |desk, window, tab, x, y|:
+                click_control(desk, desk.dealt.tabs[DesktopDeal::tab_slot(window, tab, row).usize()], x, y)
+
+    # A click on a window: its buttons, then what kind it is.
+    def click_window(desk: mutable DesktopState::Desk&, window: i64, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            DesktopView::raise_window(desk, window)
+            win: DesktopState::Window = desk.windows[window.usize()]
+            if inside(DesktopState::close_rect(&win), x, y):
+                # Closing throws away whatever it had not applied.
+                for index in 0..<desk.controls.count.i64() |desk, window|:
+                    if desk.controls[index.usize()].window == window:
+                        desk.controls[index.usize()].shown <- desk.controls[index.usize()].value
+                desk.windows[window.usize()].closed <- true
+                return
+            if inside(DesktopState::minimise_rect(&win), x, y):
+                desk.windows[window.usize()].minimised <- true
+                return
+            if win.kind == Desktop::EXPLORER:
+                click_explorer(desk, window, x, y)
+            elif win.kind == Desktop::APP:
+                click_app(desk, window, x, y)
+
+    def click_popup(desk: mutable DesktopState::Desk&, x: f64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            popup: DesktopDeal::PopupSpec = desk.dealt.popups[desk.overlay.popup.usize()]
+            if inside(DesktopState::popup_button(popup.safe_left, 0), x, y):
+                desk.overlay.popup <- NONE
+            elif inside(DesktopState::popup_button(popup.safe_left, 1), x, y):
+                for index in 0..<desk.controls.count.i64() |desk, popup|:
+                    if desk.controls[index.usize()].window == popup.window:
+                        desk.controls[index.usize()].value <- desk.controls[index.usize()].start
+                        desk.controls[index.usize()].shown <- desk.controls[index.usize()].start
+                desk.overlay.popup <- NONE

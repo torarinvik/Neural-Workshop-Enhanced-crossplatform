@@ -1,0 +1,187 @@
+include "./errands_office.elisa"
+
+module ErrandsPar:
+    # errands.py's judging (expected, mistakes), its reference path (plan),
+    # par, and ui/errands.py's reference_ports.
+
+    # mistakes(): the wrong things bought, or the claims missing (by order
+    # number) and how many claims should not be there.
+    struct Mistakes:
+        wrong_buys: mutable bool
+        missing_count: mutable i64
+        missing: mutable ErrandsOffice::Digits[3]
+        extra: mutable i64
+
+    def claim_of(number: i64, amount: i64, category: i64) -> ErrandsOffice::Claim:
+        can Abort.Panic:
+            return ErrandsOffice::Claim{order: ErrandsOffice::digits_of(number), amount: ErrandsOffice::digits_of(amount),
+                category: category}
+
+    # The goal a product is the target of, or -1.
+    def goal_of(dealt: Errands::Deal&, product: i64) -> i64:
+        can Abort.Panic:
+            for goal in 0..<dealt.shop.goal_count |dealt, product|:
+                return goal if dealt.shop.targets[goal.usize()] == product
+            return -1
+
+    # expected(): false when the buying itself was wrong.
+    def expected(office: ErrandsOffice::Office&, wanted: mutable darray[ErrandsOffice::Claim]&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            dealt: Errands::Deal = office.deal
+            if not dealt.shopping:
+                wanted.push(claim_of(dealt.receipt.number, dealt.receipt.amount, dealt.receipt.category))
+                return true
+            shop: ErrandShop::Shop = office.shop
+            return false if shop.order_count != dealt.shop.goal_count
+            bought: mutable i64 = 0
+            for index in 0..<shop.order_count |bought, shop, dealt|:
+                order: ErrandShop::Order = shop.orders[index.usize()]
+                return false if order.items.count != 1
+                goal: i64 = goal_of(&dealt, order.items.items[0])
+                return false if goal < 0 or (bought & (1 << goal)) != 0
+                bought <- bought | (1 << goal)
+            for index in 0..<shop.order_count |wanted, shop, dealt|:
+                order: ErrandShop::Order = shop.orders[index.usize()]
+                goal: i64 = goal_of(&dealt, order.items.items[0])
+                wanted.push(claim_of(order.number, order.total, dealt.categories[goal.usize()]))
+            return true
+
+    def mistakes(office: ErrandsOffice::Office&) -> Mistakes:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable Mistakes = zeroed
+            wanted: mutable darray[ErrandsOffice::Claim] = []
+            if not expected(office, &wanted):
+                out.wrong_buys <- true
+                return out
+            stored: i64 = office.form.claim_count if office.form.claim_count < ErrandsOffice::MOST_CLAIMS else ErrandsOffice::MOST_CLAIMS
+            used: mutable i64 = 0
+            matched: mutable i64 = 0
+            for claim in wanted |out, used, matched, office, stored|:
+                found: mutable i64 = -1
+                for index in 0..<stored |found, used, office, claim|:
+                    if found < 0 and (used & (1 << index)) == 0 and ErrandsOffice::same_claim(office.form.claims[index.usize()], claim):
+                        found <- index
+                if found >= 0:
+                    used <- used | (1 << found)
+                    matched <- matched + 1
+                else:
+                    out.missing[out.missing_count.usize()] <- claim.order
+                    out.missing_count <- out.missing_count + 1
+            out.extra <- office.form.claim_count - matched
+            return out
+
+    def passed(found: Mistakes) -> bool:
+        return not found.wrong_buys and found.missing_count == 0 and found.extra == 0
+
+    def claim_steps(steps: mutable darray[ErrandsOffice::Step]&, number: i64, amount: i64, category: i64):
+        can Memory.Allocate, Abort.Panic:
+            steps.push(ErrandsOffice::step(ErrandsOffice::APP, ErrandsOffice::EXPENSES))
+            for field in 0..<2 |steps, number, amount|:
+                steps.push(ErrandsOffice::step(ErrandsOffice::FIELD, field))
+                typed: ErrandsOffice::Digits = ErrandsOffice::digits_of(number if field == 0 else amount)
+                for at in 0..<typed.count |steps, typed|:
+                    steps.push(ErrandsOffice::step(ErrandsOffice::PRESS, typed.digits[at.usize()]))
+            steps.push(ErrandsOffice::step(ErrandsOffice::CATEGORY, category))
+            steps.push(ErrandsOffice::step(ErrandsOffice::SUBMIT, 0))
+
+    # The shop on its own goal k, for Browser's fewest.
+    def one_goal(shop: Browser::Deal&, goal: i64) -> Browser::Deal:
+        can Abort.Panic:
+            out: mutable Browser::Deal = shop
+            out.goal_count <- 1
+            out.goal_criteria[0] <- shop.goal_criteria[goal.usize()]
+            out.goal_departments[0] <- shop.goal_departments[goal.usize()]
+            out.targets[0] <- shop.targets[goal.usize()]
+            return out
+
+    # plan: read, buy, file, Done; a thorough worker reads every mail and
+    # opens every product of each department it shops.
+    def plan(dealt: Errands::Deal&, thorough: bool) -> darray[ErrandsOffice::Step]:
+        can Memory.Allocate, Abort.Panic:
+            steps: mutable darray[ErrandsOffice::Step] = []
+            reading: mutable darray[i64] = []
+            for index in 0..<dealt.mail_count |reading, dealt, thorough|:
+                reading.push(index) if thorough or Errands::is_work(&dealt.mails[index.usize()])
+            for k in 0..<reading.count.i64() |steps, reading|:
+                steps.push(ErrandsOffice::step(ErrandsOffice::OPEN, reading[k.usize()]))
+                steps.push(ErrandsOffice::step(ErrandsOffice::INBOX, 0)) if k + 1 < reading.count.i64()
+            if not dealt.shopping:
+                claim_steps(&steps, dealt.receipt.number, dealt.receipt.amount, dealt.receipt.category)
+            for k in 0..<(dealt.shop.goal_count if dealt.shopping else 0) |steps, dealt, thorough|:
+                one: Browser::Deal = one_goal(&dealt.shop, k)
+                path: BrowserPar::Path = BrowserPar::fewest(&one)
+                steps.push(ErrandsOffice::step(ErrandsOffice::APP, ErrandsOffice::SHOP))
+                steps.push(ErrandsOffice::shop_step(BrowserPages::action(BrowserPages::HOME))) if k > 0
+                if thorough:
+                    for product in Browser::in_department(&dealt.shop, dealt.shop.goal_departments[k.usize()]) |steps|:
+                        steps.push(ErrandsOffice::shop_step(BrowserPages::indexed(BrowserPages::ITEM, product)))
+                        steps.push(ErrandsOffice::shop_step(BrowserPages::action(BrowserPages::BACK)))
+                for action in path.actions |steps|:
+                    steps.push(ErrandsOffice::shop_step(action))
+                product: Browser::Product = dealt.shop.products[dealt.shop.targets[k.usize()].usize()]
+                claim_steps(&steps, dealt.numbers[k.usize()], product.price + product.shipping, dealt.categories[k.usize()])
+            steps.push(ErrandsOffice::step(ErrandsOffice::DONE, 0))
+            return steps
+
+    def fewest(dealt: Errands::Deal&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return plan(dealt, false).count.i64()
+
+    def thorough(dealt: Errands::Deal&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            count: mutable i64 = plan(dealt, true).count.i64()
+            for goal in 0..<(dealt.shop.goal_count if dealt.shopping else 0) |count, dealt|:
+                count <- count + BrowserPages::pages_of(&dealt.shop, dealt.shop.goal_departments[goal.usize()]) - 1
+            return count
+
+    def par(dealt: Errands::Deal&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            best: i64 = fewest(dealt)
+            room: f64 = (thorough(dealt) - best).f64() + 0.3 * best.f64()
+            return best + py_round_half_even(dealt.level.slack * room)
+
+    # Where a step is clicked, from the office as it stands; shop links are
+    # scrolled into view first, with the scroll ports added to `ports`.
+    def place_of(office: mutable ErrandsOffice::Office&, wanted: ErrandsOffice::Step,
+            ports: mutable darray[i64]&) -> BrowserSession::Rectangle:
+        can Memory.Allocate, Abort.Panic:
+            if wanted.kind == ErrandsOffice::IN_SHOP:
+                kind: i64 = wanted.shop.kind
+                if kind == BrowserPages::BACK or kind == BrowserPages::HOME or kind == BrowserPages::CART:
+                    which: i64 = 0 if kind == BrowserPages::BACK else (1 if kind == BrowserPages::HOME else 2)
+                    return BrowserSession::chrome_rectangle(&office.shop.session, which)
+                shown: BrowserPages::Layout = ErrandShop::elements(&office.shop)
+                for index in 0..<shown.count |shown, office, ports, wanted|:
+                    element: BrowserPages::Element = shown.elements[index.usize()]
+                    continue if not BrowserPages::same(element.action, wanted.shop)
+                    while not BrowserSession::visible(&office.shop.session, &element) |office, ports, element|:
+                        top: f64 = office.shop.session.view_top + element.y - office.shop.session.scroll
+                        way: i64 = 1 if top + element.height > Browser::SCREEN_H else -1
+                        ErrandShop::wheel(&office.shop, way)
+                        ports.push(BrowserSession::SCROLL_DOWN if way > 0 else BrowserSession::SCROLL_UP)
+                    return BrowserSession::on_screen(&office.shop.session, &element)
+                return zeroed
+            for index in 0..<ErrandsOffice::target_count(office) |office, wanted|:
+                place: mutable ErrandsOffice::Rectangle = zeroed
+                found: ErrandsOffice::Step = ErrandsOffice::target(office, index, &place)
+                if ErrandsOffice::same(found, wanted):
+                    return BrowserSession::Rectangle{x: place.x, y: place.y, width: place.width, height: place.height}
+            return zeroed
+
+    # reference_ports: the plan carried out from a fresh office, starting
+    # where the round's pointer is.
+    def reference_ports(current: ErrandsOffice::Office&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            office: mutable ErrandsOffice::Office = ErrandsOffice::start(&current.deal)
+            office.pointer <- current.pointer
+            ports: mutable darray[i64] = []
+            for wanted in plan(&current.deal, false) |office, ports|:
+                place: BrowserSession::Rectangle = place_of(&office, wanted, &ports)
+                moves: mutable darray[i64] = []
+                BrowserPar::moves_to(office.pointer, BrowserPar::click_point(place), &moves)
+                for port in moves |office, ports|:
+                    ErrandsOffice::steer(&office, port)
+                    ports.push(port)
+                _ = ErrandsOffice::click(&office)
+                ports.push(BrowserSession::CLICK)
+            return ports

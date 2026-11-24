@@ -1,0 +1,140 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/scene_sheet.elisa"
+
+# Spreadsheet runs played through the game layer, with the scene's chrome
+# text and the drawn sheet dumped at each step; sheet_scene_diff.py draws
+# the same with ui/sheet.py.
+extern dprintf(fd: i32, format: cstr, ...) -> i32 can[Console.Write]
+
+def hex_text(list: Display::DisplayList&, cmd: Display::DrawCmd&):
+    can Console.Write, Abort.Panic:
+        for i in 0..<(cmd.len & 0xffffff.u32()).i64() |cmd, list|:
+            _ = dprintf(1.i32(), "%02x", list.pool[(cmd.ref.i64() + i).usize()].i32())
+        _ = dprintf(1.i32(), "\n")
+
+def dump(list: Display::DisplayList&, texts_only: bool):
+    can Console.Write, Abort.Panic:
+        for cmd in list.commands |list, texts_only|:
+            if cmd.kind == Display::CMD_TEXT:
+                _ = dprintf(1.i32(), "text %u %.9g %.9g %.9g %.9g %u ", cmd.color, cmd.a.f64(), cmd.b.f64(), cmd.c.f64(),
+                    cmd.d.f64(), cmd.len >> 24.u32())
+                hex_text(list, &cmd)
+            elif texts_only:
+                continue
+            elif cmd.kind == Display::CMD_RECT:
+                _ = dprintf(1.i32(), "rect %u %.9g %.9g %.9g %.9g\n", cmd.color, cmd.a.f64(), cmd.b.f64(), cmd.c.f64(), cmd.d.f64())
+            elif cmd.kind == Display::CMD_BORDERED_RECT:
+                _ = dprintf(1.i32(), "bordered %u %.9g %.9g %.9g %.9g %u %.9g\n", cmd.color, cmd.a.f64(), cmd.b.f64(),
+                    cmd.c.f64(), cmd.d.f64(), cmd.ref, cmd.e.f64())
+            elif cmd.kind == Display::CMD_LINE:
+                _ = dprintf(1.i32(), "line %u %.9g %.9g %.9g %.9g %.9g\n", cmd.color, cmd.a.f64(), cmd.b.f64(), cmd.c.f64(),
+                    cmd.d.f64(), cmd.e.f64())
+            elif cmd.kind == Display::CMD_TRIANGLE:
+                _ = dprintf(1.i32(), "triangle %u %.9g %.9g %.9g %.9g %.9g %.9g\n", cmd.color, cmd.a.f64(), cmd.b.f64(),
+                    cmd.c.f64(), cmd.d.f64(), cmd.e.f64(), cmd.f.f64())
+            else:
+                _ = dprintf(1.i32(), "other %u\n", cmd.kind.u32())
+
+def frame(game: SheetGame::Session&, label: i64):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        _ = dprintf(1.i32(), "frame %lld %lld %lld %lld %lld %lld %lld\n", label, game.phase, game.ladder.rung,
+            game.ladder.trial, game.ladder.wins, game.ladder.best_rung, game.verdict)
+        whole: mutable Display::DisplayList = Display::DisplayList()
+        SceneSheet::render(&whole, game, false)
+        dump(&whole, true)
+        if game.phase == SheetGame::PLAYING or game.phase == SheetGame::JUDGED:
+            _ = dprintf(1.i32(), "sheet\n")
+            drawn: mutable Display::DisplayList = Display::DisplayList()
+            SceneSheet::sheet(&drawn, &game.sheet)
+            dump(&drawn, false)
+        _ = dprintf(1.i32(), "end\n")
+
+# A click at the middle of a page rectangle, through the display frame.
+def press(game: mutable SheetGame::Session&, place: Sheet::Rectangle, now: f64):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        at: BrowserGame::Frame = BrowserGame::frame()
+        _ = SheetGame::click(game, at.left + (place.x + place.width / 2.0) * at.scale,
+            at.top - (place.y + place.height / 2.0) * at.scale, now)
+        frame(game, 2)
+
+def digits_of(value: i64) -> darray[i64]:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable darray[i64] = []
+        count: i64 = Sheet::digits(value)
+        for at in 0..<count |out, value, count|:
+            power: mutable i64 = 1
+            for _ in 0..<(count - 1 - at) |power|:
+                power <- power * 10
+            out.push(value / power % 10)
+        return out
+
+def run(rung: i64, seed: i64):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        _ = dprintf(1.i32(), "run %lld %lld\n", rung, seed)
+        game: mutable SheetGame::Session = SheetGame::initialize(rung, 3, true, seed)
+        frame(&game, 0)
+        _ = SheetGame::start(&game, 0.0)
+        frame(&game, 1)
+        now: mutable f64 = 0.0
+        for trial in 0..<3 |game, now|:
+            if trial == 1:
+                # Detours the reference does not take: a scroll, a sort
+                # both ways, every Sum button, a typed digit taken back.
+                _ = SheetGame::scroll(&game, 1)
+                frame(&game, 3)
+                press(&game, Sheet::header(Sheet::ITEM if seed == 3 else Sheet::CATEGORY), now)
+                press(&game, Sheet::header(Sheet::ITEM if seed == 3 else Sheet::CATEGORY), now)
+                for column in Sheet::QTY..<6 |game, now|:
+                    press(&game, Sheet::sum_button(column), now)
+                press(&game, Sheet::chip(&game.sheet, 1), now)
+                _ = SheetGame::type_key(&game, 7, now)
+                frame(&game, 4)
+                _ = SheetGame::type_key(&game, Sheet::DELETE, now)
+                _ = SheetGame::scroll(&game, 1)
+                frame(&game, 4)
+                press(&game, Sheet::chip(&game.sheet, 0), now)
+            if trial == 2:
+                # A wrong answer from the keyboard, Enter on nothing first.
+                _ = SheetGame::type_key(&game, -1, now)
+                for digit in digits_of(game.sheet.puzzle.answer + 1) |game, now|:
+                    now <- now + 0.25
+                    _ = SheetGame::type_key(&game, digit, now)
+                    frame(&game, 5)
+                _ = SheetGame::type_key(&game, -1, now)
+            if game.phase == SheetGame::PLAYING:
+                ports: darray[i64] = Sheet::reference_ports(&game.sheet)
+                for index in 0..<ports.count.i64() |game, now, ports|:
+                    port: i64 = ports[index.usize()]
+                    now <- now + 0.25
+                    _ = SheetGame::steer(&game, port, now)
+                    frame(&game, 10) if port >= BrowserSession::CLICK or index % 9 == 0
+                    break if game.phase != SheetGame::PLAYING
+            frame(&game, 6)
+            now <- now + 3.0
+            _ = SheetGame::advance(&game, now)
+            frame(&game, 7)
+        _ = dprintf(1.i32(), "over\n")
+
+# The options note for every rung the options offer.
+def note_cases():
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        for rung in [1, 4, 7, 10, 13, 16, 20, 25, 30]:
+            note: mutable dstr = []
+            SceneSheet::option_note(rung, &note)
+            _ = dprintf(1.i32(), "note %lld ", rung)
+            for i in 0..<note.count.i64() |note|:
+                _ = dprintf(1.i32(), "%02x", note[i.usize()].i32())
+            _ = dprintf(1.i32(), "\n")
+
+def main() -> i32:
+    can Console.Write, Memory.Allocate, Memory.Release, Abort.Panic:
+        region fixtures(268435456)
+        in fixtures:
+            for rung in [1, 4, 7, 10, 13, 16, 20, 25]:
+                for seed in [3, 11] |rung|:
+                    run(rung, seed)
+            note_cases()
+        destroy fixtures
+        return 0.i32()

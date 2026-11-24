@@ -1,0 +1,386 @@
+include "./scene_desktop_overlays.elisa"
+include "./scene_verdict.elisa"
+include "./textmetrics.elisa"
+
+module SceneDesktop:
+    # ui/desktop.py's screen: the desktop in the left two thirds, drawn
+    # group by group as pyglet does, the card on the right, the labels
+    # above and the pointer on top.
+    const WIDTH: f64 = SceneDesktopDraw::WIDTH
+    const HEIGHT: f64 = SceneDesktopDraw::HEIGHT
+    const NONE: i64 = -1
+    const WHITE: u32 = 0xffffffff
+    const BLACK: u32 = 0x000000ff
+
+    struct Point:
+        x: f64
+        y: f64
+        inside: bool
+
+    # _on_screen(to_model): a pixel in screen units, if it is on the screen.
+    def model_point(px: f64, py: f64) -> Point:
+        can Abort.Panic:
+            drawing: SceneDesktopDraw::Pen = SceneDesktopDraw::pen(0)
+            x: f64 = (px - drawing.left) / drawing.scale
+            y: f64 = (drawing.top - py) / drawing.scale
+            inside: bool = x >= 0.0 and x < Desktop::SCREEN_W.f64() and y >= 0.0 and y < Desktop::SCREEN_H.f64()
+            return Point{x: x, y: y, inside: inside}
+
+    # --- input, as ui/desktop.py's handlers take it ----------------------
+
+    # Pixels a mouse may slip between press and release and still click.
+    const JITTER: f64 = 6.0
+    const LEFT: i64 = 0
+    const RIGHT: i64 = 2
+
+    # on_mouse_press: the left button starts a run or presses; the right
+    # one right-clicks.
+    def mouse_down(session: mutable DesktopGame::Session&, button: i64, px: f64, py: f64, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            if session.phase == DesktopGame::READY or session.phase == DesktopGame::DONE:
+                return (DesktopGame::start(session, now) can Global{Read,Write}) if button == LEFT
+                return false
+            point: Point = model_point(px, py)
+            return false if not point.inside or not DesktopGame::point_at(session, point.x, point.y, now)
+            if button == RIGHT:
+                return DesktopGame::right_click(session, now)
+            return false if button != LEFT
+            session.pressed_x <- px
+            session.pressed_y <- py
+            return DesktopGame::press(session, now)
+
+    # on_mouse_motion: the pointer follows the mouse while it is on the screen.
+    def mouse_move(session: mutable DesktopGame::Session&, px: f64, py: f64, now: f64) -> bool:
+        can Abort.Panic:
+            point: Point = model_point(px, py)
+            return false if not point.inside
+            return DesktopGame::point_at(session, point.x, point.y, now)
+
+    # on_mouse_release: a hand slips a few pixels while it clicks.
+    def mouse_up(session: mutable DesktopGame::Session&, button: i64, px: f64, py: f64, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if button != LEFT
+            slipped: bool = fabs(px - session.pressed_x) <= JITTER and fabs(py - session.pressed_y) <= JITTER
+            point: Point = model_point(session.pressed_x if slipped else px, session.pressed_y if slipped else py)
+            return DesktopGame::release_at(session, point.x, point.y, now)
+
+    # on_key_press's arrows: Shift a long step, Alt a short one.
+    def arrow(session: mutable DesktopGame::Session&, direction: i64, shift: bool, alt: bool, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            size: i64 = 0 if shift else (2 if alt else 1)
+            return DesktopGame::steer(session, direction * 3 + size, now)
+
+    # D: press, or let go when held.
+    def hold(session: mutable DesktopGame::Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return DesktopGame::release(session, now) if session.desk.pointer.held
+            return DesktopGame::press(session, now)
+
+    def font(size: f64) -> f64:
+        can Abort.Panic:
+            return Geometry::calc_fontsize(HEIGHT, size)
+
+    def centred_label(list: mutable Display::DisplayList&, words: sview, y: f64, size: f64, ink: u32, bold: bool = false):
+        can Abort.Panic, Memory.Allocate:
+            Display::draw_text_weight(list, words, WIDTH / 2.0, y, size, ink, Display::ANCHOR_CENTER_CENTER, bold)
+
+    # --- the card ------------------------------------------------------------
+
+    struct Line:
+        words: dstr
+        x: f64
+        y: f64
+        size: f64
+        scale: f64
+
+    def left_label(list: mutable Display::DisplayList&, words: sview, x: f64, y: f64, size: f64, ink: u32, bold: bool = false):
+        can Abort.Panic, Memory.Allocate:
+            Display::draw_text_weight(list, words, x, y, size, ink, Display::ANCHOR_LEFT_CENTER, bold)
+
+    def width_of(words: dstr&, size: f64) -> f64:
+        can Abort.Panic:
+            return TextMetrics::text_width(size, SceneDesktopOverlays::characters(words)).f64()
+
+    # _card_line: shrunk until it fits the window.
+    def card_line(words: dstr, x: f64, y: f64, size: f64, scale: f64 = 1.0) -> Line:
+        can Abort.Panic:
+            room: f64 = WIDTH - x - 8.0
+            fitted: mutable f64 = size
+            while width_of(&words, fitted) > room and fitted > 6.0 |fitted, words, room|:
+                fitted <- fitted - 0.5
+            return Line{words: words, x: x, y: y, size: fitted, scale: scale}
+
+    def mark(done: bool) -> cstr:
+        return "✓ " if done else "•  "
+
+    def goal_line(desk: DesktopState::Desk&, index: i64) -> dstr:
+        can Memory.Allocate, Abort.Panic:
+            goal: DesktopDeal::Pair = desk.dealt.goals[index.usize()]
+            control: DesktopState::Control = desk.controls[goal.first.usize()]
+            out: mutable dstr = dstr_of_cstr(mark(DesktopFiles::met(desk, index)))
+            if control.dialog != NONE:
+                dstr_append_cstr(&out, Desktop::dialog_name(desk.dealt.dialogs[control.dialog.usize()].title))
+            else:
+                dstr_append_cstr(&out, DesktopView::title_text(desk, control.window))
+            dstr_append_cstr(&out, " › ")
+            name: dstr = SceneDesktopDraw::label(desk, goal.first)
+            dstr_append_dstr(&out, name)
+            dstr_append_cstr(&out, ": ")
+            value: dstr = SceneDesktopDraw::word(desk, goal.first, goal.second)
+            dstr_append_dstr(&out, value)
+            return out
+
+    def move_line(desk: DesktopState::Desk&, node: i64, dest: i64) -> dstr:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable dstr = dstr_of_cstr(mark(desk.nodes[node.usize()].parent == dest))
+            name: dstr = SceneDesktopDraw::node_name(desk, node)
+            if dest == Desktop::TRASH:
+                dstr_append_cstr(&out, "Delete ")
+                dstr_append_dstr(&out, name)
+                return out
+            dstr_append_cstr(&out, "Restore " if desk.nodes[node.usize()].parent == Desktop::TRASH else "Move ")
+            dstr_append_dstr(&out, name)
+            dstr_append_cstr(&out, " → ")
+            path: dstr = SceneDesktopWindows::short_path(desk, dest)
+            dstr_append_dstr(&out, path)
+            return out
+
+    def where_line(desk: DesktopState::Desk&, opening: cstr, node: i64, closing: cstr) -> dstr:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable dstr = dstr_of_cstr(opening)
+            path: dstr = SceneDesktopWindows::short_path(desk, desk.nodes[node.usize()].parent)
+            dstr_append_dstr(&out, path)
+            dstr_append_cstr(&out, closing)
+            return out
+
+    def copy_line(desk: DesktopState::Desk&, index: i64) -> dstr:
+        can Memory.Allocate, Abort.Panic:
+            goal: DesktopDeal::Pair = desk.dealt.copies[index.usize()]
+            out: mutable dstr = dstr_of_cstr(mark(DesktopFiles::copied(desk, index)))
+            dstr_append_cstr(&out, "Copy ")
+            name: dstr = SceneDesktopDraw::node_name(desk, goal.first)
+            dstr_append_dstr(&out, name)
+            dstr_append_cstr(&out, " → ")
+            path: dstr = SceneDesktopWindows::short_path(desk, goal.second)
+            dstr_append_dstr(&out, path)
+            return out
+
+    # The file lines: two each, what to do and where the file is now.
+    def file_lines(desk: DesktopState::Desk&, x: f64, top: f64, line: f64, size: f64) -> darray[Line]:
+        can Memory.Allocate, Abort.Panic:
+            lines: mutable darray[Line] = []
+            first: f64 = desk.dealt.goals.count.i64().f64()
+            for index in 0..<desk.dealt.moves.count.i64() |lines, desk, x, top, line, size, first|:
+                goal: DesktopDeal::Pair = desk.dealt.moves[index.usize()]
+                y: f64 = top - line * (first + 1.5) - line * 1.75 * index.f64()
+                lines.push(card_line(move_line(desk, goal.first, goal.second), x, y, size))
+                if desk.nodes[goal.first.usize()].parent != goal.second:
+                    lines.push(card_line(where_line(desk, "now in ", goal.first, ""), x + size * 2.2, y - line * 0.6, size * 0.8,
+                        0.8))
+            for number in 0..<desk.dealt.copies.count.i64() |lines, desk, x, top, line, size, first|:
+                index: i64 = desk.dealt.moves.count.i64() + number
+                y: f64 = top - line * (first + 1.5) - line * 1.75 * index.f64()
+                lines.push(card_line(copy_line(desk, number), x, y, size))
+                node: i64 = desk.dealt.copies[number.usize()].first
+                lines.push(card_line(where_line(desk, "in ", node, ", and leave it there"), x + size * 2.2, y - line * 0.6,
+                    size * 0.8, 0.8))
+            return lines
+
+    # _draw_card.
+    def card(list: mutable Display::DisplayList&, desk: DesktopState::Desk&, ink: u32):
+        can Abort.Panic, Memory.Allocate:
+            drawing: SceneDesktopDraw::Pen = SceneDesktopDraw::pen(0)
+            x: f64 = drawing.left + Desktop::SCREEN_W.f64() * drawing.scale + WIDTH * 0.02
+            size: mutable f64 = font(11.0)
+            line: mutable f64 = size * 2.1
+            units: f64 = 1.5 + desk.dealt.goals.count.i64().f64() + 1.75 * (desk.dealt.moves.count + desk.dealt.copies.count).i64().f64()
+            room: f64 = drawing.top - Geometry::from_bottom_edge(HEIGHT, 48.0).f64()
+            if line * units > room:
+                line <- room / units
+                size <- line / 2.1
+            top: f64 = drawing.top
+            if not DesktopPointer::card_shown(desk):
+                hidden: array[cstr, 3] = ["The card is hidden.", "Card on the taskbar shows it", "until the next click."]
+                for row in 0..<3 |list, hidden, x, top, line, size, ink|:
+                    shown: dstr = dstr_of_cstr(hidden[row.usize()])
+                    left_label(list, bytes_view(shown), x, top - line * (0.5 + row.f64()), size, ink)
+                return
+            left_label(list, "Set these:", x, top - line * 0.5, font(13.0), ink, true)
+            for index in 0..<desk.dealt.goals.count.i64() |list, desk, x, top, line, size, ink|:
+                words: dstr = goal_line(desk, index)
+                y: f64 = top - line * (index.f64() + 1.5)
+                left_label(list, bytes_view(words), x, y, size, ink)
+                goal: DesktopDeal::Pair = desk.dealt.goals[index.usize()]
+                spec: DesktopDeal::Spec = desk.dealt.specs[goal.first.usize()]
+                if spec.kind == Desktop::COLOUR:
+                    chip: f64 = size * 1.2
+                    Display::draw_rect(list, x + width_of(&words, size) + 8.0, y - chip / 2.0, chip, chip,
+                        Desktop::colour_rgba(spec.words[goal.second.usize()]))
+            lines: darray[Line] = file_lines(desk, x, top, line, size)
+            least: mutable f64 = 1000000.0
+            for each in lines |least|:
+                least <- fmin(least, each.size / each.scale)
+            for each in lines |list, least, ink|:
+                left_label(list, bytes_view(each.words), each.x, each.y, least * each.scale, ink)
+
+    # --- the labels ----------------------------------------------------------
+
+    def message(session: DesktopGame::Session&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if session.phase == DesktopGame::READY:
+                dstr_append_cstr(out, "Press Space or click to start")
+            elif session.phase == DesktopGame::DONE:
+                dstr_append_i64(out, session.ladder.wins)
+                dstr_append_cstr(out, " of ")
+                dstr_append_i64(out, session.ladder.trial)
+                dstr_append_cstr(out, " under par   highest rung passed ")
+                dstr_append_i64(out, session.ladder.best_rung)
+            elif session.phase == DesktopGame::JUDGED:
+                verdict_words(session, out)
+            else:
+                dstr_append_cstr(out, "Reach the settings on the card in ")
+                dstr_append_points(out, session.par)
+                dstr_append_cstr(out, " clicks or fewer, then Done")
+
+    def verdict_words(session: DesktopGame::Session&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_i64(out, DesktopGame::held_goals(&session.desk))
+            dstr_append_cstr(out, " of ")
+            dstr_append_i64(out, session.desk.dealt.goals.count.i64())
+            dstr_append_cstr(out, " settings in ")
+            dstr_append_i64(out, session.desk.clicks)
+            dstr_append_cstr(out, " clicks; par was ")
+            dstr_append_points(out, session.par)
+
+    def facts(session: DesktopGame::Session&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_cstr(out, "rung ")
+            dstr_append_i64(out, session.desk.dealt.level.rung)
+            dstr_append_cstr(out, "  ")
+            dstr_append_i64(out, session.ladder.trial)
+            dstr_append_cstr(out, "/")
+            dstr_append_i64(out, session.ladder.total)
+            dstr_append_cstr(out, "  clicks ")
+            dstr_append_i64(out, session.desk.clicks)
+            dstr_append_cstr(out, "  par ")
+            dstr_append_points(out, session.par)
+            dstr_append_cstr(out, "  out of clicks at ")
+            dstr_append_i64(out, session.budget)
+
+    # _place_pointer: the arrow, and its dark edge under it.
+    def pointer(list: mutable Display::DisplayList&, desk: DesktopState::Desk&):
+        can Abort.Panic, Memory.Allocate:
+            drawing: SceneDesktopDraw::Pen = SceneDesktopDraw::pen(0)
+            px: f64 = drawing.left + desk.pointer.x * drawing.scale
+            py: f64 = drawing.top - desk.pointer.y * drawing.scale
+            size: f64 = fmax(10.0, 22.0 * drawing.scale) * (0.8 if desk.pointer.held else 1.0)
+            for stage in 0..<2 |list, px, py, size|:
+                grow: f64 = 3.0 if stage == 0 else 0.0
+                Display::draw_triangle(list, px - grow * 0.6, py + grow, px - grow * 0.6, py - size - grow * 1.6,
+                    px + size * 0.62 + grow * 1.4, py - size * 0.62 - grow * 0.4,
+                    SceneDesktopDraw::INK if stage == 0 else SceneDesktopDraw::WHITE)
+
+    # --- the whole screen ----------------------------------------------------
+
+    def passes(list: mutable Display::DisplayList&, desk: mutable DesktopState::Desk&, part: i64):
+        can Abort.Panic, Memory.Allocate:
+            for stage in 0..<3 |list, desk, part|:
+                drawing: SceneDesktopDraw::Pen = SceneDesktopDraw::pen(stage)
+                if part == 0:
+                    SceneDesktopDraw::desktop_icons(list, drawing, desk)
+                elif part == 1:
+                    SceneDesktopWindows::taskbar(list, drawing, desk)
+                elif part == 2:
+                    SceneDesktopOverlays::menu(list, drawing, desk)
+                elif part == 3:
+                    SceneDesktopOverlays::start(list, drawing, desk)
+                elif part == 4:
+                    SceneDesktopOverlays::dialog(list, drawing, desk)
+                elif part == 5:
+                    SceneDesktopOverlays::context(list, drawing, desk)
+                elif part == 6:
+                    SceneDesktopOverlays::dropdown(list, drawing, desk)
+                else:
+                    SceneDesktopOverlays::popup(list, drawing, desk)
+
+    # _redraw's desktop, from the back to the front.
+    def draw_desk(list: mutable Display::DisplayList&, desk: mutable DesktopState::Desk&):
+        can Abort.Panic, Memory.Allocate:
+            SceneDesktopDraw::rect(list, SceneDesktopDraw::pen(0), 0, DesktopState::rect(0.0, 0.0, Desktop::SCREEN_W.f64(),
+                Desktop::SCREEN_H.f64()), SceneDesktopDraw::DESK)
+            passes(list, desk, 0)
+            order: darray[i64] = desk.order
+            for index in order |list, desk|:
+                win: DesktopState::Window = desk.windows[index.usize()]
+                if DesktopState::shown(&win):
+                    for stage in 0..<3 |list, desk, index|:
+                        SceneDesktopWindows::window(list, SceneDesktopDraw::pen(stage), desk, index)
+            passes(list, desk, 1)
+            preview: DesktopPointer::Preview = DesktopPointer::drag_preview(desk)
+            if preview.kind != DesktopPointer::PREVIEW_NONE:
+                for stage in 0..<3 |list, desk, preview|:
+                    SceneDesktopOverlays::drag(list, SceneDesktopDraw::pen(stage), desk, preview)
+            passes(list, desk, 2) if desk.overlay.menu_window != NONE
+            passes(list, desk, 3) if desk.overlay.start_open
+            passes(list, desk, 4) if desk.overlay.dialog != NONE
+            passes(list, desk, 5) if desk.overlay.has_context
+            passes(list, desk, 6) if desk.overlay.dropdown != NONE
+            passes(list, desk, 7) if desk.overlay.popup != NONE
+
+    def render(list: mutable Display::DisplayList&, session: mutable DesktopGame::Session&, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            ink: u32 = WHITE if dark else BLACK
+            centred_label(list, "Desktop", Geometry::from_top_edge(HEIGHT, 36.0).f64(), font(22.0), ink, true)
+            status: mutable dstr = []
+            message(session, &status)
+            centred_label(list, bytes_view(status), Geometry::from_top_edge(HEIGHT, 70.0).f64(), font(14.0), ink)
+            centred_label(list, "arrows: pointer (+Shift/+Alt)   Space: click   R: right-click   D: hold / let go   Enter: done   Esc",
+                Geometry::from_bottom_edge(HEIGHT, 26.0).f64(), font(11.0), ink)
+            if DesktopGame::live(session):
+                line: mutable dstr = []
+                facts(session, &line)
+                centred_label(list, bytes_view(line), Geometry::from_top_edge(HEIGHT, 96.0).f64(), font(12.0), ink)
+                draw_desk(list, &session.desk)
+                card(list, &session.desk, ink)
+                pointer(list, &session.desk) if session.phase == DesktopGame::WORKING
+            # The last verdict stays up after the run ends.
+            if session.verdict != DesktopGame::LIVE and (session.phase == DesktopGame::JUDGED or session.phase == DesktopGame::DONE):
+                caption: mutable dstr = []
+                verdict_words(session, &caption)
+                SceneVerdict::put(list, WIDTH, HEIGHT, 1.0, 1.0, session.verdict == DesktopGame::PASSED, bytes_view(caption), 60.0,
+                    16.0)
+
+    def option_note(rung: i64, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            level: Desktop::Grade = Desktop::grade(rung)
+            dstr_append_cstr(out, "Rung ")
+            dstr_append_i64(out, level.rung)
+            dstr_append_cstr(out, ": ")
+            dstr_append_i64(out, level.windows)
+            dstr_append_cstr(out, " window(s), ")
+            dstr_append_i64(out, level.goals)
+            dstr_append_cstr(out, " setting(s) to reach.")
+            h: Desktop::Hiding = level.hiding
+            f: Desktop::Files = level.files
+            named: bool[20] = [level.tabs > 1, level.rows < level.per_tab, level.dialogs > 0, level.windows > 1,
+                level.depends > 0, level.applies > 0, h.popups > 0, h.minimised > 0, h.notes > 0, h.offscreen > 0, h.closed > 0,
+                level.submenus, f.explorer, f.ex_tabs > 1, f.deletes > 0, f.explorer_closed, f.restores > 0, f.copies > 0,
+                f.list_view, f.hide_card]
+            found: mutable i64 = 0
+            for at in 0..<20 |out, named, found, f|:
+                if named[at.usize()]:
+                    dstr_append_cstr(out, "  With " if found == 0 else ", ")
+                    dstr_append_cstr(out, feature_words(at))
+                    if at == 12:
+                        dstr_append_i64(out, f.moves)
+                        dstr_append_cstr(out, " file(s) to move")
+                    found <- found + 1
+            dstr_append_cstr(out, ".") if found > 0
+            dstr_append_cstr(out, "  You must beat the reference.") if level.factor < 1.0
+
+    def feature_words(at: i64) -> cstr:
+        words: array[cstr, 20] = ["tabs", "scrolling", "menus and dialogs", "overlapping windows", "greyed-out controls",
+            "Apply buttons", "popups", "minimised windows", "sticky notes", "a window off the screen", "closed windows",
+            "submenus", "a file explorer with ", "explorer tabs", "deleting", "the explorer closed", "restoring from the Trash",
+            "copying", "list views", "a card that hides"]
+        return words[at.usize()]

@@ -1,0 +1,364 @@
+include "./forms.elisa"
+
+module FormsFill:
+    # forms.py's Filling: a form being filled in, key by key, and the
+    # reference typist that par is measured against.
+    #
+    # A text-like field's value is in `values`; a list's chosen item, a
+    # radio's index and a checkbox's 1/0 are in `picks`, where a list with
+    # nothing chosen holds -1. Only Country is a list, so the typed query
+    # and the item lit are single.
+    struct Filling:
+        dealt: Forms::Deal
+        values: mutable Forms::Text[11]
+        picks: mutable i64[11]
+        query: mutable Forms::Text
+        lit: mutable i64
+        page: mutable i64
+        focus: mutable i64
+        keys: mutable i64
+        bounced: mutable i64
+        marked: mutable bool[11]
+        sent: mutable bool
+
+    def start(dealt: Forms::Deal) -> Filling:
+        picks: mutable i64[11] = zeroed
+        picks[Forms::COUNTRY.usize()] <- -1
+        return Filling{dealt: dealt, values: zeroed, picks: picks, query: zeroed, lit: 0, page: 0, focus: 0, keys: 0,
+            bounced: 0, marked: zeroed, sent: false}
+
+    # --- what is showing ------------------------------------------------
+
+    # Company shows only while "signing up for a company" is ticked.
+    def showing(form: Filling&, key: i64) -> bool:
+        return key != Forms::COMPANY or form.picks[Forms::WORK.usize()] == 1
+
+    def visible_count(form: Filling&, page: i64) -> i64:
+        count: mutable i64 = 0
+        for at in 0..<form.dealt.field_count |form, page, count|:
+            field: Forms::Field = form.dealt.fields[at.usize()]
+            count <- count + 1 if field.page == page and showing(form, field.key)
+        return count
+
+    # The key of the n-th field showing on a page, or -1.
+    def visible_key(form: Filling&, page: i64, n: i64) -> i64:
+        seen: mutable i64 = 0
+        for at in 0..<form.dealt.field_count |form, page, n, seen|:
+            field: Forms::Field = form.dealt.fields[at.usize()]
+            if field.page == page and showing(form, field.key):
+                return field.key if seen == n
+                seen <- seen + 1
+        return -1
+
+    # The field in focus, or -1 when the page shows none.
+    def focused(form: Filling&) -> i64:
+        shown: i64 = visible_count(form, form.page)
+        return -1 if shown == 0
+        return visible_key(form, form.page, form.focus if form.focus < shown else shown - 1)
+
+    # --- lists ----------------------------------------------------------
+
+    def starts_folded(item: Forms::Text&, query: Forms::Text&) -> bool:
+        return false if query.count > item.count
+        for at in 0..<query.count |item, query|:
+            return false if Forms::lower(item.bytes[at.usize()]) != Forms::lower(query.bytes[at.usize()])
+        return true
+
+    # matches(): the countries starting with the query, in list order.
+    def match_count(query: Forms::Text&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            count: mutable i64 = 0
+            for index in 0..<Forms::COUNTRY_COUNT |query, count|:
+                item: Forms::Text = Forms::said(Forms::country_name(index))
+                count <- count + 1 if starts_folded(&item, query)
+            return count
+
+    def match_at(query: Forms::Text&, n: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            seen: mutable i64 = 0
+            for index in 0..<Forms::COUNTRY_COUNT |query, n, seen|:
+                item: Forms::Text = Forms::said(Forms::country_name(index))
+                if starts_folded(&item, query):
+                    return index if seen == n
+                    seen <- seen + 1
+            return -1
+
+    # The item lit, clamped to what matches; -1 when nothing does.
+    def lit_item(form: Filling&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            found: i64 = match_count(&form.query)
+            return -1 if found == 0
+            return match_at(&form.query, form.lit if form.lit < found else found - 1)
+
+    # --- keys -----------------------------------------------------------
+
+    # One key: a character's byte, or one of the named keys.
+    def press(form: mutable Filling&, key: i64):
+        can Memory.Allocate, Abort.Panic:
+            return if form.sent
+            form.keys <- form.keys + 1
+            field: i64 = focused(form)
+            if key == Forms::TAB:
+                leave(form)
+                shown: i64 = visible_count(form, form.page)
+                form.focus <- (form.focus + 1) % (shown if shown > 1 else 1)
+                return
+            if key == Forms::ENTER:
+                leave(form)
+                send(form)
+                return
+            return if field < 0
+            kind: i64 = Forms::kind_of(field)
+            slot: usize = field.usize()
+            if key == Forms::UP or key == Forms::DOWN:
+                step: i64 = -1 if key == Forms::UP else 1
+                if kind == Forms::RADIO:
+                    form.picks[slot] <- (form.picks[slot] + step + Forms::PLAN_COUNT) % Forms::PLAN_COUNT
+                elif kind == Forms::CHOICE:
+                    found: i64 = match_count(&form.query)
+                    if found > 0:
+                        moved: i64 = form.lit + step
+                        form.lit <- 0 if moved < 0 else (found - 1 if moved > found - 1 else moved)
+                return
+            if key == Forms::BACKSPACE:
+                if kind == Forms::CHOICE:
+                    form.query.count <- form.query.count - 1 if form.query.count > 0
+                    form.lit <- 0
+                    form.picks[slot] <- -1
+                elif kind <= Forms::DIGITS:
+                    form.values[slot].count <- form.values[slot].count - 1 if form.values[slot].count > 0
+                return
+            return if key < 0
+            if kind == Forms::CHECK:
+                form.picks[slot] <- 1 - form.picks[slot] if key == 32
+                return
+            return if kind == Forms::RADIO
+            if kind == Forms::CHOICE:
+                Forms::push(&form.query, key.u8())
+                form.lit <- 0
+                form.picks[slot] <- -1
+                return
+            Forms::push(&form.values[slot], key.u8())
+
+    # A click on the index-th field showing: it takes the focus, for a key.
+    def focus_on(form: mutable Filling&, index: i64):
+        can Memory.Allocate, Abort.Panic:
+            leave(form)
+            form.keys <- form.keys + 1
+            form.focus <- index
+
+    # Leaving a list field picks the item lit, if anything was typed.
+    def leave(form: mutable Filling&):
+        can Memory.Allocate, Abort.Panic:
+            field: i64 = focused(form)
+            return if field != Forms::COUNTRY or form.query.count == 0
+            item: i64 = lit_item(form)
+            form.picks[field.usize()] <- item if item >= 0
+
+    def send(form: mutable Filling&):
+        can Memory.Allocate, Abort.Panic:
+            bad: mutable bool[11] = zeroed
+            any_bad: mutable bool = false
+            for n in 0..<visible_count(form, form.page) |form, bad, any_bad|:
+                key: i64 = visible_key(form, form.page, n)
+                if not valid(form, key):
+                    bad[key.usize()] <- true
+                    any_bad <- true
+            form.marked <- bad
+            if any_bad:
+                form.bounced <- form.bounced + 1
+                return
+            later: mutable bool = false
+            for at in 0..<form.dealt.field_count |form, later|:
+                later <- true if form.dealt.fields[at.usize()].page > form.page
+            if form.page + 1 < form.dealt.level.pages and later:
+                form.page <- form.page + 1
+                form.focus <- 0
+                return
+            form.sent <- true
+
+    # --- what a form can check: shape, not truth -------------------------
+
+    def digit(byte: u8) -> bool:
+        return byte >= 48.u8() and byte <= 57.u8()
+
+    def two_digits(text: Forms::Text&, at: i64) -> i64:
+        return (text.bytes[at.usize()] - 48.u8()).i64() * 10 + (text.bytes[(at + 1).usize()] - 48.u8()).i64()
+
+    def valid_date(text: Forms::Text&) -> bool:
+        return false if text.count != 10
+        for at in 0..<10 |text|:
+            slash: bool = at == 2 or at == 5
+            return false if slash and text.bytes[at.usize()] != 47.u8()
+            return false if not slash and not digit(text.bytes[at.usize()])
+        day: i64 = two_digits(text, 0)
+        month: i64 = two_digits(text, 3)
+        return day >= 1 and day <= 31 and month >= 1 and month <= 12
+
+    # [^@\s]+@[^@\s]+\.[^@\s]+ in full: one @ with something before it,
+    # no spaces, and a dot after it that is neither first nor last.
+    def valid_email(text: Forms::Text&) -> bool:
+        at_sign: mutable i64 = -1
+        for at in 0..<text.count |text, at_sign|:
+            byte: u8 = text.bytes[at.usize()]
+            return false if byte == 32.u8()
+            if byte == 64.u8():
+                return false if at_sign >= 0
+                at_sign <- at
+        return false if at_sign < 1
+        dotted: mutable bool = false
+        for at in at_sign + 2..<text.count - 1 |text, dotted|:
+            dotted <- true if text.bytes[at.usize()] == 46.u8()
+        return dotted
+
+    def valid(form: Filling&, key: i64) -> bool:
+        kind: i64 = Forms::kind_of(key)
+        return true if kind == Forms::CHECK or kind == Forms::RADIO
+        return form.picks[key.usize()] >= 0 if kind == Forms::CHOICE
+        text: Forms::Text = form.values[key.usize()]
+        return false if text.count == 0
+        return valid_date(&text) if kind == Forms::DATE
+        if kind == Forms::DIGITS:
+            for at in 0..<text.count |text|:
+                return false if not digit(text.bytes[at.usize()])
+            return text.count >= 6 and text.count <= 12
+        return valid_email(&text) if key == Forms::EMAIL
+        return true
+
+    # --- the verdict ----------------------------------------------------
+
+    # A value with spaces stripped from both ends, in lower case.
+    def stripped(text: Forms::Text&) -> Forms::Text:
+        first: mutable i64 = 0
+        last: mutable i64 = text.count
+        while first < last and text.bytes[first.usize()] == 32.u8() |text, first, last|:
+            first <- first + 1
+        while last > first and text.bytes[(last - 1).usize()] == 32.u8() |text, first, last|:
+            last <- last - 1
+        out: mutable Forms::Text = zeroed
+        for at in first..<last |text, out|:
+            Forms::push(&out, Forms::lower(text.bytes[at.usize()]))
+        return out
+
+    def right(form: Filling&, key: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            if Forms::kind_of(key) <= Forms::DIGITS:
+                have: Forms::Text = stripped(&form.values[key.usize()])
+                want: Forms::Text = Forms::lowered(Forms::answer_text(&form.dealt.who, key))
+                return Forms::same_text(&have, &want)
+            return form.picks[key.usize()] == Forms::answer_index(&form.dealt.who, key)
+
+    # Fields showing and not right, across every page.
+    # What the verdict found: each field left wrong, by key, and how many.
+    struct Mistakes:
+        fields: mutable bool[11]
+        count: mutable i64
+
+    def wrong(form: Filling&) -> Mistakes:
+        can Memory.Allocate, Abort.Panic:
+            found: mutable Mistakes = zeroed
+            for at in 0..<form.dealt.field_count |form, found|:
+                key: i64 = form.dealt.fields[at.usize()].key
+                if showing(form, key) and not right(form, key):
+                    found.fields[key.usize()] <- true
+                    found.count <- found.count + 1
+            return found
+
+    def spent(form: Filling&) -> i64:
+        return form.keys + form.dealt.level.penalty * form.bounced
+
+    # --- the reference --------------------------------------------------
+
+    # keys_for() on the list: the shortest start of the answer's name
+    # that leaves it in reach, as letters * 256 + Downs.
+    def list_plan(answer: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            name: Forms::Text = Forms::said(Forms::country_name(answer))
+            best: mutable i64 = -1
+            for size in 1..<name.count + 1 |name, best, answer|:
+                prefix: mutable Forms::Text = name
+                prefix.count <- size
+                steps: mutable i64 = 0
+                for index in 0..<answer |prefix, steps|:
+                    item: Forms::Text = Forms::said(Forms::country_name(index))
+                    steps <- steps + 1 if starts_folded(&item, &prefix)
+                best <- size * 256 + steps if best < 0 or size + steps < best / 256 + best % 256
+                break if steps == 0
+            return best
+
+    def all_right(form: Filling&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            for n in 0..<visible_count(form, form.page) |form|:
+                return false if not right(form, visible_key(form, form.page, n))
+            return true
+
+    # reference_keys(): the reference's next key, or NO_KEY once sent.
+    def reference_key(form: Filling&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return Forms::NO_KEY if form.sent
+            field: i64 = focused(form)
+            if field >= 0 and not finished(form, field):
+                kind: i64 = Forms::kind_of(field)
+                if kind <= Forms::DIGITS:
+                    typed: Forms::Text = Forms::lowered(form.values[field.usize()])
+                    want: Forms::Text = Forms::lowered(Forms::answer_text(&form.dealt.who, field))
+                    return Forms::BACKSPACE if not starts_folded(&want, &typed) or typed.count >= want.count
+                    return want.bytes[typed.count.usize()].i64()
+                if kind == Forms::CHOICE:
+                    return list_key(form, Forms::answer_index(&form.dealt.who, field))
+                return 32 if kind == Forms::CHECK
+                here: i64 = form.picks[field.usize()]
+                want_index: i64 = Forms::answer_index(&form.dealt.who, field)
+                down: i64 = (want_index - here + Forms::PLAN_COUNT) % Forms::PLAN_COUNT
+                up: i64 = (here - want_index + Forms::PLAN_COUNT) % Forms::PLAN_COUNT
+                return Forms::DOWN if down <= up else Forms::UP
+            return Forms::ENTER if all_right(form)
+            return Forms::TAB
+
+    # Whether the reference counts the focused field as done.
+    def finished(form: Filling&, field: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            return right(form, field) if Forms::kind_of(field) != Forms::CHOICE
+            answer: i64 = Forms::answer_index(&form.dealt.who, field)
+            return true if form.picks[field.usize()] == answer
+            return form.query.count > 0 and lit_item(form) == answer
+
+    # The list's next key: letters of the plan, Backspace off a wrong
+    # start, then Down to the answer.
+    def list_key(form: Filling&, answer: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            plan: i64 = list_plan(answer)
+            size: i64 = plan / 256
+            letters: mutable Forms::Text = Forms::lowered(Forms::said(Forms::country_name(answer)))
+            letters.count <- size
+            typed: Forms::Text = Forms::lowered(form.query)
+            return Forms::BACKSPACE if typed.count > size or not starts_folded(&letters, &typed)
+            return letters.bytes[typed.count.usize()].i64() if typed.count < size
+            return Forms::DOWN
+
+    def reference_form(dealt: Forms::Deal) -> Filling:
+        can Memory.Allocate, Abort.Panic:
+            form: mutable Filling = start(dealt)
+            for _ in 0..<2000 |form|:
+                key: i64 = reference_key(&form)
+                break if key == Forms::NO_KEY
+                press(&form, key)
+            return form
+
+    def par(dealt: Forms::Deal) -> f64:
+        can Memory.Allocate, Abort.Panic:
+            typist: Filling = reference_form(dealt)
+            return typist.keys.f64() * dealt.level.factor + dealt.level.slack
+
+    # ui/forms.py's KEYS, one port each: a-z, 0-9, space, @ . - /, then
+    # Backspace, Tab, Enter, Up and Down. NO_KEY past the end.
+    const PORTS: i64 = 46
+
+    def port_key(port: i64) -> i64:
+        return Forms::NO_KEY if port < 0 or port >= PORTS
+        return 97 + port if port < 26
+        return 48 + port - 26 if port < 36
+        symbols: i64[5] = [32, 64, 46, 45, 47]
+        return symbols[(port - 36).usize()] if port < 41
+        named: i64[5] = [Forms::BACKSPACE, Forms::TAB, Forms::ENTER, Forms::UP, Forms::DOWN]
+        return named[(port - 41).usize()]

@@ -18,7 +18,7 @@ CORE_HUB = ROOT / "nw-core/src/taskhub_tasks.elisa"
 WEB_SHELL = ROOT / "nw-core/shells/web/index.html"
 PYTHON_SHELL = ROOT / "nw-core/shells/python/app.py"
 SDL_SHELL = ROOT / "nw-core/shells/sdl3/main.c"
-IMPLEMENTATION_PLAN = ROOT / "IMPLEMENTATION_PLAN.md"
+IMPLEMENTATION_PLAN = ROOT / "nw-core" / "docs" / "implementation-plan.md"
 sys.path.insert(0, str(ROOT / "nw-core/scripts"))
 from generate_task_registry import hub_categories, hub_groups
 
@@ -295,6 +295,17 @@ def parse_core_menu():
         ordered = [cards[index] for index in range(len(cards))]
         ordered.insert(int(position), name)
         tasks[int(category)] = dict(enumerate(ordered))
+    # The later categories hold only cards behind a flag, each at the
+    # position after the flagged cards before it, so source order is card
+    # order; an offset expression there is not one the patterns above read.
+    flagged: dict[int, list[str]] = {}
+    for name, category in re.findall(
+        r'^        return "([^"]+)" if has_\w+ and category == (\d+) and position == ', source, re.M,
+    ):
+        if int(category) >= 8:
+            flagged.setdefault(int(category), []).append(name)
+    for category, names in flagged.items():
+        tasks[category] = dict(enumerate(names))
     cipher_card = re.search(r'^        return "([^"]+)" if has_cipher_abyss and category == 4', source, re.M)
     if cipher_card:
         cards = list(tasks[4].values())

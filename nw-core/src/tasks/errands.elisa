@@ -1,0 +1,203 @@
+include "./browser_par.elisa"
+
+module Errands:
+    # errands.py: work that runs across three apps on one small computer --
+    # Mail, Shop (Browser's shop) and Expenses. The mail asks for things to
+    # be bought and claimed back; units are those of Browser's 1000 by 640
+    # screen, y down. The words live in ErrandsText.
+    const STRIP: f64 = 40.0
+    const MOST_MAILS: i64 = 12
+    const MOST_ERRANDS: i64 = 3
+    const NUMBERS: i64 = 8
+
+    # Claim categories, in CATEGORIES order.
+    const OFFICE: i64 = 0
+    const KITCHEN: i64 = 1
+    const TRAVEL: i64 = 2
+    const OUTDOOR: i64 = 3
+    const ELECTRONICS: i64 = 4
+    const CATEGORY_COUNT: i64 = 5
+
+    # Mail kinds: the work, then what is not work.
+    const RECEIPT: i64 = 0
+    const POLICY: i64 = 1
+    const ORDER: i64 = 2
+    const CHANGE: i64 = 3
+    const NEWSLETTER: i64 = 4
+    const LUNCH: i64 = 5
+    const PAID: i64 = 6
+    const THANKS: i64 = 7
+
+    struct Grade:
+        rung: i64
+        errands: i64
+        shopping: bool
+        shop_rung: i64
+        noise: i64
+        policy: bool
+        amend: bool
+        slack: f64
+
+    # A mail: its kind, who sent it, and what fills its words in. `goal` is
+    # the shop goal an ORDER or CHANGE asks for; an ORDER that is later
+    # changed asks for `decoy` instead -- the cheapest thing in that
+    # department, or "two of them" when it is -1.
+    struct Mail:
+        kind: mutable i64
+        person: mutable i64
+        reason: mutable i64
+        goal: mutable i64
+        changed: mutable bool
+        decoy: mutable i64
+        number: mutable i64
+        minutes: mutable i64
+
+    struct Receipt:
+        number: i64
+        amount: i64
+        category: i64
+
+    struct Deal:
+        seed: mutable i64
+        level: mutable Grade
+        shopping: mutable bool
+        shop: mutable Browser::Deal
+        mail_count: mutable i64
+        mails: mutable Mail[12]
+        receipt: mutable Receipt
+        categories: mutable i64[3]
+        numbers: mutable i64[8]
+
+    def category_name(category: i64) -> cstr:
+        names: array[cstr, 5] = ["Office", "Kitchen", "Travel", "Outdoor", "Electronics"]
+        return names[category.usize()]
+
+    # CATEGORY_OF: Browser's kinds, in KINDS order.
+    def category_of(kind: i64) -> i64:
+        categories: i64[8] = [KITCHEN, OFFICE, OFFICE, TRAVEL, ELECTRONICS, OUTDOOR, KITCHEN, OFFICE]
+        return categories[kind.usize()]
+
+    def person_name(person: i64) -> cstr:
+        names: array[cstr, 8] = ["Dana", "Kofi", "Mira", "Tomas", "Ines", "Arjun", "Lena", "Yusuf"]
+        return names[person.usize()]
+
+    def reason_words(reason: i64) -> cstr:
+        names: array[cstr, 6] = ["the new starter", "the meeting room", "the team trip", "the front desk", "the workshop",
+            "my desk"]
+        return names[reason.usize()]
+
+    def grade(requested: i64) -> Grade:
+        r: i64 = requested if requested > 0 else 1
+        noise: i64 = 1 + (r - 2) / 4
+        late: f64 = 0.3 - 0.025 * (r - 20).f64()
+        return Grade{rung: r, errands: 1 if r < 15 else (2 if r < 21 else 3), shopping: r >= 3,
+            shop_rung: 1 if r < 6 else (r - 3 if r - 3 < 30 else 30), noise: 0 if r < 2 else (noise if noise < 6 else 6),
+            policy: r >= 9, amend: r >= 12,
+            slack: (1.0 - 0.7 * (r - 1).f64() / 19.0) if r <= 20 else (late if late > 0.05 else 0.05)}
+
+    def is_work(mail: Mail&) -> bool:
+        return mail.kind <= CHANGE
+
+    # stamp: the clock moves on three to forty minutes for each mail.
+    def stamp(draw: mutable MT19937&, clock: mutable i64&) -> i64:
+        can Abort.Panic:
+            clock[0] <- clock[0] + py_randint(draw, 3, 40)
+            return clock[0]
+
+    def mail(kind: i64, person: i64, minutes: i64) -> Mail:
+        return Mail{kind: kind, person: person, reason: 0, goal: -1, changed: false, decoy: -1, number: 0, minutes: minutes}
+
+    # _noise: mail that is not work.
+    def noise(draw: mutable MT19937&, people: darray[i64]&, minutes: i64) -> Mail:
+        can Abort.Panic:
+            kind: i64 = py_randrange(draw, 0, 4)
+            name: i64 = people[py_choice_index(draw, 8).usize()]
+            made: mutable Mail = mail(NEWSLETTER + kind, name, minutes)
+            made.number <- py_randint(draw, 10000, 99999) if kind == 2
+            return made
+
+    def receipt_mail(draw: mutable MT19937&, out: mutable Deal&, person: i64, clock: mutable i64&):
+        can Abort.Panic:
+            category: i64 = py_choice_index(draw, CATEGORY_COUNT)
+            amount: i64 = py_randint(draw, 12, 260)
+            out.receipt <- Receipt{number: out.numbers[0], amount: amount, category: category}
+            made: mutable Mail = mail(RECEIPT, person, stamp(draw, clock))
+            made.number <- out.numbers[0]
+            out.mails[out.mail_count.usize()] <- made
+            out.mail_count <- out.mail_count + 1
+
+    def push(out: mutable Deal&, made: Mail):
+        can Abort.Panic:
+            out.mails[out.mail_count.usize()] <- made
+            out.mail_count <- out.mail_count + 1
+
+    # The shop's errands: one ORDER each, the first changed by a later mail
+    # from rung 12.
+    def order_mails(draw: mutable MT19937&, out: mutable Deal&, people: darray[i64]&, clock: mutable i64&):
+        can Memory.Allocate, Abort.Panic:
+            for k in 0..<out.shop.goal_count |draw, out, people, clock|:
+                person: i64 = people[k.usize()]
+                department: i64 = out.shop.goal_departments[k.usize()]
+                out.categories[k.usize()] <- category_of(out.shop.kinds[department.usize()])
+                if out.level.amend and k == 0:
+                    others: mutable darray[i64] = []
+                    for candidate in 0..<out.shop.level.departments |others, out|:
+                        taken: mutable bool = false
+                        for goal in 0..<out.shop.goal_count |taken, out, candidate|:
+                            taken <- true if out.shop.goal_departments[goal.usize()] == candidate
+                        others.push(candidate) if not taken
+                    decoy: i64 = others[py_choice_index(draw, others.count.i64()).usize()] if others.count > 0 else department
+                    first: mutable Mail = mail(ORDER, person, stamp(draw, clock))
+                    first.reason <- py_choice_index(draw, 6)
+                    first.goal <- k
+                    first.changed <- true
+                    first.decoy <- decoy if decoy != department else -1
+                    push(out, first)
+                    later: mutable Mail = mail(CHANGE, person, stamp(draw, clock))
+                    later.goal <- k
+                    push(out, later)
+                else:
+                    asked: mutable Mail = mail(ORDER, person, stamp(draw, clock))
+                    asked.reason <- py_choice_index(draw, 6)
+                    asked.goal <- k
+                    push(out, asked)
+
+    def deal_seeded(rung: i64, seed: i64) -> Deal:
+        can Memory.Allocate, Abort.Panic:
+            level: Grade = grade(rung)
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, seed.u64())
+            out: mutable Deal = zeroed
+            out.seed <- seed
+            out.level <- level
+            out.shopping <- level.shopping
+            numbers: darray[i64] = py_sample_range(&draw, 10000, 99998, NUMBERS)
+            for index in 0..<NUMBERS |out, numbers|:
+                out.numbers[index.usize()] <- numbers[index.usize()]
+            people: darray[i64] = py_sample_range(&draw, 0, 7, 8)
+            clock: mutable i64[1] = [540 + py_randint(&draw, 0, 40)]
+            if not level.shopping:
+                receipt_mail(&draw, &out, people[0], &clock[0])
+            else:
+                base: Browser::Grade = Browser::grade(level.shop_rung)
+                shop_level: mutable Browser::Grade = base
+                shop_level.buys <- level.errands
+                wanted: i64 = level.errands + (1 if level.amend else 0)
+                shop_level.departments <- base.departments if base.departments > wanted else wanted
+                out.shop <- Browser::deal_seeded(shop_level, py_randrange(&draw, 0, 1073741824))
+                if level.policy:
+                    push(&out, mail(POLICY, -1, stamp(&draw, &clock[0])))
+                order_mails(&draw, &out, &people, &clock[0])
+            for _ in 0..<level.noise |draw, out, people, clock|:
+                minutes: i64 = stamp(&draw, &clock[0])
+                push(&out, noise(&draw, &people, minutes))
+            # Newest at the top, as an inbox has it: the clock only runs on.
+            sorted: mutable Mail[12] = out.mails
+            for index in 0..<out.mail_count |sorted, out|:
+                sorted[index.usize()] <- out.mails[(out.mail_count - 1 - index).usize()]
+            out.mails <- sorted
+            return out
+
+    def deal(rung: i64, run: mutable MT19937&) -> Deal:
+        can Memory.Allocate, Abort.Panic:
+            return deal_seeded(rung, py_randrange(run, 0, 1073741824))

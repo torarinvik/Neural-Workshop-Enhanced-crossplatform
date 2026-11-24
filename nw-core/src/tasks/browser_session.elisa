@@ -1,0 +1,213 @@
+include "./browser_text.elisa"
+
+module BrowserSession:
+    # browser.py's Session: a browser on a deal -- the page, the history,
+    # the cart, the scroll and the pointer. Python's history and cart are
+    # unbounded lists; here they hold MOST_HISTORY pages and MOST_CART
+    # items, far past what a round's clicks reach. A full history forgets
+    # its oldest page; a full cart takes no more.
+    const MOST_HISTORY: i64 = 256
+    # Agent ports: 0-11 move the pointer, 12 clicks, 13 and 14 scroll.
+    const CLICK: i64 = 12
+    const SCROLL_UP: i64 = 13
+    const SCROLL_DOWN: i64 = 14
+    const PORTS: i64 = 15
+
+    struct Pointer:
+        x: mutable f64
+        y: mutable f64
+
+    struct History:
+        count: mutable i64
+        pages: mutable BrowserPages::Action[256]
+
+    struct Session:
+        deal: mutable Browser::Deal
+        # How far down the screen the browser starts: 0 when it is the
+        # whole screen, more when it is one app among others.
+        offset: mutable f64
+        view_top: mutable f64
+        view_h: mutable f64
+        page: mutable BrowserPages::Action
+        history: mutable History
+        cart: mutable BrowserPages::Cart
+        scroll: mutable f64
+        pointer: mutable Pointer
+        clicks: mutable i64
+        notice: mutable i64
+        checked_out: mutable bool
+
+    struct Rectangle:
+        x: f64
+        y: f64
+        width: f64
+        height: f64
+
+    def start(dealt: Browser::Deal&, offset: f64) -> Session:
+        view_top: f64 = Browser::VIEW_TOP + offset
+        return Session{deal: dealt, offset: offset, view_top: view_top, view_h: Browser::SCREEN_H - view_top,
+            page: BrowserPages::action(BrowserPages::HOME), history: zeroed, cart: zeroed, scroll: 0.0,
+            pointer: Pointer{x: Browser::SCREEN_W / 2.0, y: Browser::SCREEN_H / 2.0}, clicks: 0,
+            notice: BrowserPages::QUIET, checked_out: false}
+
+    def elements(session: Session&) -> BrowserPages::Layout:
+        can Memory.Allocate, Abort.Panic:
+            return BrowserPages::layout(&session.deal, &session.page, &session.cart, session.notice)
+
+    def max_scroll(session: Session&) -> f64:
+        can Memory.Allocate, Abort.Panic:
+            shown: BrowserPages::Layout = elements(session)
+            return max_scroll_of(session, &shown)
+
+    # max_scroll_of: for a page whose elements are `shown`.
+    def max_scroll_of(session: Session&, shown: BrowserPages::Layout&) -> f64:
+        can Abort.Panic:
+            most: f64 = BrowserPages::page_height(shown) - session.view_h
+            return most if most > 0.0 else 0.0
+
+    def visible(session: Session&, element: BrowserPages::Element&) -> bool:
+        top: f64 = session.view_top + element.y - session.scroll
+        return top >= session.view_top and top + element.height <= Browser::SCREEN_H
+
+    def on_screen(session: Session&, element: BrowserPages::Element&) -> Rectangle:
+        return Rectangle{x: element.x, y: session.view_top + element.y - session.scroll, width: element.width,
+            height: element.height}
+
+    # chrome: the toolbar's Back, Home and Cart, in screen units.
+    def chrome_rectangle(session: Session&, which: i64) -> Rectangle:
+        return Rectangle{x: 10.0, y: 38.0 + session.offset, width: 70.0, height: 30.0} if which == 0
+        return Rectangle{x: 88.0, y: 38.0 + session.offset, width: 70.0, height: 30.0} if which == 1
+        return Rectangle{x: 880.0, y: 38.0 + session.offset, width: 110.0, height: 30.0}
+
+    def chrome_action(which: i64) -> BrowserPages::Action:
+        return BrowserPages::action(BrowserPages::BACK) if which == 0
+        return BrowserPages::action(BrowserPages::HOME) if which == 1
+        return BrowserPages::action(BrowserPages::CART)
+
+    def inside(rectangle: Rectangle, x: f64, y: f64) -> bool:
+        return rectangle.x <= x and x <= rectangle.x + rectangle.width and rectangle.y <= y and y <= rectangle.y + rectangle.height
+
+    # target_at: what a click at (x, y) would do; NONE when nothing.
+    def target_at(session: Session&, x: f64, y: f64) -> BrowserPages::Action:
+        can Memory.Allocate, Abort.Panic:
+            shown: BrowserPages::Layout = elements(session)
+            return target_in(session, &shown, x, y)
+
+    # target_in: target_at for a page whose elements are `shown`.
+    def target_in(session: Session&, shown: BrowserPages::Layout&, x: f64, y: f64) -> BrowserPages::Action:
+        can Abort.Panic:
+            for which in 0..<3 |session, x, y|:
+                return chrome_action(which) if inside(chrome_rectangle(session, which), x, y)
+            return BrowserPages::action(BrowserPages::NONE) if y < session.view_top
+            for index in 0..<shown.count |shown, session, x, y|:
+                element: BrowserPages::Element = shown.elements[index.usize()]
+                continue if element.action.kind == BrowserPages::NONE or not visible(session, &element)
+                return element.action if inside(on_screen(session, &element), x, y)
+            return BrowserPages::action(BrowserPages::NONE)
+
+    def move_pointer(session: mutable Session&, dx: f64, dy: f64):
+        x: f64 = session.pointer.x + dx
+        y: f64 = session.pointer.y + dy
+        session.pointer.x <- Browser::SCREEN_W if x > Browser::SCREEN_W else (0.0 if x < 0.0 else x)
+        session.pointer.y <- Browser::SCREEN_H if y > Browser::SCREEN_H else (0.0 if y < 0.0 else y)
+
+    def wheel(session: mutable Session&, way: i64):
+        can Memory.Allocate, Abort.Panic:
+            wheel_within(session, way, max_scroll(session))
+
+    # wheel_within: a wheel turn on a page that scrolls at most `most`.
+    def wheel_within(session: mutable Session&, way: i64, most: f64):
+        moved: f64 = session.scroll + way.f64() * Browser::SCROLL
+        low: f64 = moved if moved > 0.0 else 0.0
+        session.scroll <- most if most < low else low
+
+    def go(session: mutable Session&, page: BrowserPages::Action):
+        can Abort.Panic:
+            if not BrowserPages::same(page, session.page):
+                if session.history.count >= MOST_HISTORY:
+                    for index in 1..<MOST_HISTORY |session|:
+                        session.history.pages[(index - 1).usize()] <- session.history.pages[index.usize()]
+                    session.history.count <- MOST_HISTORY - 1
+                session.history.pages[session.history.count.usize()] <- session.page
+                session.history.count <- session.history.count + 1
+            session.page <- page
+            session.scroll <- 0.0
+            session.notice <- BrowserPages::QUIET
+
+    def remove_slot(cart: mutable BrowserPages::Cart&, slot: i64):
+        can Abort.Panic:
+            for index in (slot + 1)..<cart.count |cart|:
+                cart.items[(index - 1).usize()] <- cart.items[index.usize()]
+            cart.count <- cart.count - 1
+
+    def act(session: mutable Session&, action: BrowserPages::Action):
+        can Abort.Panic:
+            kind: i64 = action.kind
+            if kind == BrowserPages::BACK:
+                if session.history.count > 0:
+                    session.history.count <- session.history.count - 1
+                    session.page <- session.history.pages[session.history.count.usize()]
+                    session.scroll <- 0.0
+                    session.notice <- BrowserPages::QUIET
+            elif kind == BrowserPages::HOME or kind == BrowserPages::CART:
+                go(session, BrowserPages::action(kind))
+            elif kind == BrowserPages::LIST or kind == BrowserPages::ITEM:
+                go(session, action)
+            elif kind == BrowserPages::ADD:
+                if session.deal.products[action.index.usize()].stock:
+                    if session.cart.count < BrowserPages::MOST_CART:
+                        session.cart.items[session.cart.count.usize()] <- action.index
+                        session.cart.count <- session.cart.count + 1
+                    session.notice <- BrowserPages::ADDED
+                else:
+                    session.notice <- BrowserPages::SOLD_OUT
+            elif kind == BrowserPages::REMOVE:
+                remove_slot(&session.cart, action.index) if action.index >= 0 and action.index < session.cart.count
+            elif kind == BrowserPages::CHECKOUT:
+                session.checked_out <- true if session.cart.count > 0
+
+    # click: at the pointer, counted whether or not it hits anything.
+    def click(session: mutable Session&) -> BrowserPages::Action:
+        can Memory.Allocate, Abort.Panic:
+            return BrowserPages::action(BrowserPages::NONE) if session.checked_out
+            session.clicks <- session.clicks + 1
+            found: BrowserPages::Action = target_at(session, session.pointer.x, session.pointer.y)
+            act(session, found) if found.kind != BrowserPages::NONE
+            return found
+
+    def click_at(session: mutable Session&, x: f64, y: f64) -> BrowserPages::Action:
+        can Memory.Allocate, Abort.Panic:
+            return BrowserPages::action(BrowserPages::NONE) if session.checked_out
+            session.pointer <- Pointer{x: x, y: y}
+            return click(session)
+
+    # right: the cart holds exactly the targets, in any order.
+    def right(session: Session&) -> bool:
+        can Abort.Panic:
+            return false if session.cart.count != session.deal.goal_count
+            for goal in 0..<session.deal.goal_count |session|:
+                wanted: i64 = session.deal.targets[goal.usize()]
+                needed: mutable i64 = 0
+                held: mutable i64 = 0
+                for other in 0..<session.deal.goal_count |needed, session, wanted|:
+                    needed <- needed + 1 if session.deal.targets[other.usize()] == wanted
+                for slot in 0..<session.cart.count |held, session, wanted|:
+                    held <- held + 1 if session.cart.items[slot.usize()] == wanted
+                return false if needed != held
+            return true
+
+    # steer: one agent port during play.
+    def steer(session: mutable Session&, port: i64):
+        can Memory.Allocate, Abort.Panic:
+            if port >= 0 and port < CLICK:
+                direction: i64 = port / 3
+                step: f64 = 80.0 if port % 3 == 0 else (20.0 if port % 3 == 1 else 5.0)
+                dx: f64 = -1.0 if direction == 2 else (1.0 if direction == 3 else 0.0)
+                dy: f64 = -1.0 if direction == 0 else (1.0 if direction == 1 else 0.0)
+                move_pointer(session, dx * step, dy * step)
+            elif port == CLICK:
+                _ = click(session)
+            elif port == SCROLL_UP:
+                wheel(session, -1)
+            elif port == SCROLL_DOWN:
+                wheel(session, 1)

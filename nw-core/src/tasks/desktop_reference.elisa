@@ -1,0 +1,258 @@
+include "./desktop_pointer.elisa"
+
+module DesktopReference:
+    # desktop.py's reference: the first thing on the card that does not
+    # hold yet, taken all the way home before anything else is looked at.
+    # It sets par, and the agent's teacher follows it.
+    const NONE: i64 = -1
+    # What an action is.
+    const DONE: i64 = 0
+    const CLICK: i64 = 1
+    const DRAG: i64 = 2
+    # When nothing the reference can do helps.
+    const STUCK: i64 = 3
+    const MOST_STEPS: i64 = 3000
+
+    struct Action:
+        kind: i64
+        x: i64
+        y: i64
+        to_x: i64
+        to_y: i64
+
+    # A click there; STUCK when no point of it can be reached (desktop.py
+    # would click None).
+    def clicking(spot: DesktopView::Point) -> Action:
+        return Action{kind: STUCK, x: 0, y: 0, to_x: 0, to_y: 0} if not spot.found
+        return Action{kind: CLICK, x: spot.x, y: spot.y, to_x: 0, to_y: 0}
+
+    def click_rect(desk: DesktopState::Desk&, rect: DesktopState::Rect) -> Action:
+        can Memory.Allocate, Abort.Panic:
+            return clicking(DesktopView::reachable(desk, rect, NONE))
+
+    def stuck() -> Action:
+        return Action{kind: STUCK, x: 0, y: 0, to_x: 0, to_y: 0}
+
+    # A click that only closes what is open: the empty taskbar.
+    def anywhere_else() -> Action:
+        return Action{kind: CLICK, x: Desktop::SCREEN_W - 200, y: Desktop::WORK_H + Desktop::TASKBAR_H / 2 / Desktop::GRID * Desktop::GRID,
+            to_x: 0, to_y: 0}
+
+    def pinned_note(desk: DesktopState::Desk&, window: i64) -> bool:
+        can Abort.Panic:
+            return desk.windows[window.usize()].kind == Desktop::NOTE
+
+    # A point on the title bar, clear of its two buttons.
+    def title_point(desk: DesktopState::Desk&, window: i64) -> DesktopView::Point:
+        can Memory.Allocate, Abort.Panic:
+            win: DesktopState::Window = desk.windows[window.usize()]
+            bar: DesktopState::Rect = DesktopState::title_rect(&win)
+            return DesktopView::reachable(desk, DesktopState::rect(bar.x, bar.y, bar.w - 62.0, bar.h), window)
+
+    # The topmost shown window that is not a note.
+    def top_app(desk: DesktopState::Desk&) -> i64:
+        can Abort.Panic:
+            found: mutable i64 = NONE
+            for window in desk.order |desk, found|:
+                win: DesktopState::Window = desk.windows[window.usize()]
+                found <- window if DesktopState::shown(&win) and win.kind != Desktop::NOTE
+            return found
+
+    def taskbar_click(desk: DesktopState::Desk&, window: i64) -> Action:
+        can Memory.Allocate, Abort.Panic:
+            return click_rect(desk, DesktopView::taskbar_button(desk, window).rect)
+
+    # Click rect on the window -- or first do what makes that possible.
+    def ensure(desk: DesktopState::Desk&, window: i64, rect: DesktopState::Rect) -> Action:
+        can Memory.Allocate, Abort.Panic:
+            spot: DesktopView::Point = DesktopView::reachable(desk, rect, window)
+            return clicking(spot) if spot.found
+            win: DesktopState::Window = desk.windows[window.usize()]
+            if rect.x >= (Desktop::SCREEN_W - Desktop::GRID).f64():
+                # Off the edge of the screen: drag the window back by its title.
+                grip: DesktopView::Point = title_point(desk, window)
+                top: i64 = top_app(desk)
+                if not grip.found and top != NONE and top != window:
+                    if DesktopView::taskbar_button(desk, window).found:
+                        return taskbar_click(desk, window)
+                if grip.found:
+                    shift: i64 = (win.x + win.w).i64() - (Desktop::SCREEN_W - 10)
+                    back: i64 = floor((shift + Desktop::GRID - 1).f64() / Desktop::GRID.f64()).i64() * Desktop::GRID
+                    return Action{kind: DRAG, x: grip.x, y: grip.y, to_x: Desktop::imax(0, grip.x - back), to_y: grip.y}
+            centre_x: f64 = DesktopState::centre_x(rect)
+            blocker: i64 = DesktopView::window_at(desk, fmin(centre_x, (Desktop::SCREEN_W - 1).f64()), DesktopState::centre_y(rect))
+            if blocker != NONE and pinned_note(desk, blocker):
+                blocking: DesktopState::Window = desk.windows[blocker.usize()]
+                away: DesktopView::Point = DesktopView::reachable(desk, DesktopState::minimise_rect(&blocking), blocker)
+                return clicking(away) if away.found
+            grip: DesktopView::Point = title_point(desk, window)
+            return clicking(grip) if grip.found
+            # The title bar is buried: the taskbar raises it as well.
+            top: i64 = top_app(desk)
+            if top != NONE and top != window and DesktopView::taskbar_button(desk, window).found:
+                return taskbar_click(desk, window)
+            # What is in the way is a sticky note: put it away.
+            for note in desk.app_count + (1 if desk.explorer != NONE else 0)..<desk.windows.count.i64() |desk|:
+                shown: DesktopState::Window = desk.windows[note.usize()]
+                if DesktopState::shown(&shown):
+                    away: DesktopView::Point = DesktopView::reachable(desk, DesktopState::minimise_rect(&shown), note)
+                    return clicking(away) if away.found
+            return stuck()
+
+    # With Start open: the app's tile, or All apps and then its row.
+    def open_from_start(desk: DesktopState::Desk&, window: i64) -> Action:
+        can Memory.Allocate, Abort.Panic:
+            listed: darray[i64] = DesktopView::start_windows(desk)
+            for index in 0..<listed.count.i64() |desk, listed, window|:
+                return click_rect(desk, DesktopView::start_item(desk, index)) if listed[index.usize()] == window
+            return click_rect(desk, DesktopState::all_apps_rect())
+
+    def click_value(desk: DesktopState::Desk&, ident: i64, value: i64, window: i64) -> Action:
+        can Memory.Allocate, Abort.Panic:
+            control: DesktopState::Control = desk.controls[ident.usize()]
+            place: DesktopState::Rect = DesktopView::control_rect(desk, ident).rect
+            index: mutable i64 = value
+            if control.kind == Desktop::TOGGLE or control.kind == Desktop::DROPDOWN:
+                index <- 0
+            elif control.kind == Desktop::STEPPER:
+                index <- 1 if control.shown < value else 0
+            part: DesktopState::Rect = DesktopState::part(control.kind, control.count, place, index)
+            return click_rect(desk, part) if window == NONE
+            return ensure(desk, window, part)
+
+    def in_menu(desk: DesktopState::Desk&, ident: i64) -> Action:
+        can Memory.Allocate, Abort.Panic:
+            dialog: i64 = desk.controls[ident.usize()].dialog
+            return anywhere_else() if dialog == NONE
+            made: DesktopDeal::DialogSpec = desk.dealt.dialogs[dialog.usize()]
+            return anywhere_else() if made.window != desk.overlay.menu_window or made.menu != desk.overlay.menu_index
+            return click_rect(desk, DesktopView::menu_item(desk, made.item)) if made.sub == NONE
+            return click_rect(desk, DesktopView::submenu_item(desk, made.sub)) if desk.overlay.menu_sub == made.item
+            return click_rect(desk, DesktopView::menu_item(desk, made.item))
+
+    def towards(desk: DesktopState::Desk&, ident: i64, value: i64) -> Action:
+        can Memory.Allocate, Abort.Panic:
+            control: DesktopState::Control = desk.controls[ident.usize()]
+            if not DesktopView::enabled(desk, ident) and control.value != value:
+                return towards(desk, control.other, control.wanted) if desk.controls[control.other.usize()].value != control.wanted
+            window: i64 = control.window
+            win: DesktopState::Window = desk.windows[window.usize()]
+            if desk.overlay.dropdown != NONE:
+                if desk.overlay.dropdown == ident and control.shown != value:
+                    place: DesktopState::Rect = DesktopView::control_rect(desk, ident).rect
+                    return click_rect(desk, DesktopState::dropdown_item(place, control.count, value))
+                return anywhere_else()
+            if desk.overlay.start_open:
+                return open_from_start(desk, window) if win.closed
+                return anywhere_else()
+            return in_menu(desk, ident) if desk.overlay.menu_window != NONE
+            if desk.overlay.dialog != NONE:
+                return click_value(desk, ident, value, NONE) if desk.overlay.dialog == control.dialog and control.shown != value
+                return click_rect(desk, DesktopView::dialog_button(1))
+            return click_rect(desk, DesktopState::start_rect()) if win.closed
+            return taskbar_click(desk, window) if win.minimised
+            if control.dialog != NONE:
+                return ensure(desk, window, DesktopState::menu_rect(&win, desk.dealt.dialogs[control.dialog.usize()].menu))
+            return ensure(desk, window, DesktopState::apply_rect(&win)) if control.shown == value
+            return ensure(desk, window, DesktopState::tab_rect(&win, control.tab)) if win.active != control.tab
+            scroll: i64 = win.scroll[control.tab.usize()]
+            return ensure(desk, window, DesktopState::scroll_rect(&win, 0)) if control.row < scroll
+            return ensure(desk, window, DesktopState::scroll_rect(&win, 1)) if control.row >= scroll + win.rows
+            return click_value(desk, ident, value, window)
+
+    # Click node's icon -- scrolling to it first if it is not showing.
+    def show(desk: mutable DesktopState::Desk&, node: i64) -> Action:
+        can Memory.Allocate, Abort.Panic:
+            window: i64 = desk.explorer
+            place: DesktopState::Place = DesktopView::current(desk, window)
+            listed: darray[i64] = DesktopFiles::listing(desk, place.path)
+            win: DesktopState::Window = desk.windows[window.usize()]
+            row: i64 = DesktopFiles::index_of(&listed, node) / DesktopState::columns(&win)
+            return ensure(desk, window, DesktopState::ex_scroll_rect(&win, 0)) if row < place.scroll
+            return ensure(desk, window, DesktopState::ex_scroll_rect(&win, 1)) if row >= place.scroll + DesktopState::grid_rows(&win)
+            icons: darray[DesktopView::Placed] = DesktopView::icon_rects(desk, window)
+            for icon in icons |desk, window, node|:
+                return ensure(desk, window, icon.rect) if icon.node == node
+            return stuck()
+
+    def navigate(desk: mutable DesktopState::Desk&, target: i64) -> Action:
+        can Memory.Allocate, Abort.Panic:
+            path: i64 = DesktopView::current(desk, desk.explorer).path
+            chain: darray[i64] = DesktopFiles::chain(desk, target)
+            at: i64 = DesktopFiles::index_of(&chain, path)
+            return show(desk, chain[(at + 1).usize()]) if at != NONE
+            # From the side: the place the target is under, then down.
+            top: i64 = chain[1] if chain.count > 1.usize() and chain[0] == Desktop::HOME else chain[0]
+            win: DesktopState::Window = desk.windows[desk.explorer.usize()]
+            return ensure(desk, desk.explorer, DesktopState::sidebar_rect(&win, top))
+
+    # Open the folder it is in, pick it, Cut, open the folder it goes to,
+    # Paste; a file for the Trash is picked and Deleted instead.
+    def file_towards(desk: mutable DesktopState::Desk&, node: i64, dest: i64, copy: bool) -> Action:
+        can Memory.Allocate, Abort.Panic:
+            window: i64 = desk.explorer
+            win: DesktopState::Window = desk.windows[window.usize()]
+            overlay: DesktopState::Overlay = desk.overlay
+            return anywhere_else() if overlay.dropdown != NONE or overlay.menu_window != NONE or overlay.has_context
+            return click_rect(desk, DesktopView::dialog_button(1)) if overlay.dialog != NONE
+            if overlay.start_open:
+                return open_from_start(desk, window) if win.closed
+                return anywhere_else()
+            return click_rect(desk, DesktopState::start_rect()) if win.closed
+            return taskbar_click(desk, window) if win.minimised
+            place: DesktopState::Place = DesktopView::current(desk, window)
+            if desk.picking.clipboard == node and desk.picking.copying == copy:
+                return ensure(desk, window, DesktopState::tool_rect(&win, Desktop::PASTE)) if place.path == dest
+                return navigate(desk, dest)
+            parent: i64 = desk.nodes[node.usize()].parent
+            return navigate(desk, parent) if place.path != parent
+            return show(desk, node) if place.selected != node
+            return ensure(desk, window, DesktopState::tool_rect(&win, Desktop::DELETE)) if dest == Desktop::TRASH and not copy
+            return ensure(desk, window, DesktopState::tool_rect(&win, Desktop::COPY if copy else Desktop::CUT))
+
+    # What the reference does next; DONE when it would press Done.
+    def action(desk: mutable DesktopState::Desk&) -> Action:
+        can Memory.Allocate, Abort.Panic:
+            if desk.overlay.popup != NONE:
+                popup: DesktopDeal::PopupSpec = desk.dealt.popups[desk.overlay.popup.usize()]
+                return click_rect(desk, DesktopState::popup_button(popup.safe_left, 0))
+            for index in 0..<desk.dealt.goals.count.i64() |desk|:
+                goal: DesktopDeal::Pair = desk.dealt.goals[index.usize()]
+                return towards(desk, goal.first, goal.second) if not DesktopFiles::met(desk, index)
+            for index in 0..<desk.dealt.moves.count.i64() |desk|:
+                goal: DesktopDeal::Pair = desk.dealt.moves[index.usize()]
+                return file_towards(desk, goal.first, goal.second, false) if desk.nodes[goal.first.usize()].parent != goal.second
+            for index in 0..<desk.dealt.copies.count.i64() |desk|:
+                goal: DesktopDeal::Pair = desk.dealt.copies[index.usize()]
+                return file_towards(desk, goal.first, goal.second, true) if not DesktopFiles::copied(desk, index)
+            return Action{kind: DONE, x: 0, y: 0, to_x: 0, to_y: 0}
+
+    def act(desk: mutable DesktopState::Desk&, step: Action):
+        can Memory.Allocate, Abort.Panic:
+            if step.kind == CLICK:
+                DesktopPointer::click(desk, step.x.f64(), step.y.f64())
+            elif step.kind == DRAG:
+                DesktopPointer::press(desk, step.x.f64(), step.y.f64())
+                DesktopPointer::release(desk, step.to_x.f64(), step.to_y.f64())
+
+    def round(dealt: DesktopDeal::Deal) -> DesktopState::Desk:
+        can Memory.Allocate, Abort.Panic:
+            desk: mutable DesktopState::Desk = DesktopState::start(dealt)
+            for _ in 0..<MOST_STEPS |desk|:
+                step: Action = action(&desk)
+                break if step.kind == DONE or step.kind == STUCK
+                act(&desk, step)
+            desk.done <- true
+            return desk
+
+    # The clicks a round must come in at or under to pass: two peeks at
+    # a hidden card are allowed for.
+    def par(dealt: DesktopDeal::Deal) -> f64:
+        can Memory.Allocate, Abort.Panic:
+            level: Desktop::Grade = dealt.level
+            peeks: i64 = 2 if level.files.hide_card else 0
+            return (round(dealt).clicks + peeks).f64() * level.factor + level.slack
+
+    # Clicks allowed before the round ends on its own.
+    def budget(par_clicks: f64) -> i64:
+        return (par_clicks * 3.0).i64() + 20

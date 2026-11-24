@@ -44,10 +44,12 @@ The first latest-Stage1 browser build then exposed a distinct port integration
 bug: `nw-core/src/wasm/wasm_exports.elisa` selected runtime files by a hard-coded
 `Elisa-compiler-latest` sibling path, while the build selected a newer Stage1
 tree. The old runtime lacked explicit `Unsafe.PointerCast` grants now required
-by Stage1. The source now uses `@ELISA_STAGE1_ROOT@` markers;
-`prepare_wasm_exports.py` resolves them from the selected compiler root, and
-both Stage0 and Stage1 WASM build scripts run its focused regression. No shared
-compiler checkout was changed.
+by Stage1. The source now uses `@ELISA_STAGE1_ROOT@` markers. Corpus
+modules carry them too, so both WASM build scripts materialize the whole
+source tree with `prepare_runtime_sources.py`, as `check.sh` and
+`build_sdl3.sh` do, and compile the export surface from that copy;
+`prepare_wasm_exports.py` and its focused regression remain for the Python
+module build. No shared compiler checkout was changed.
 
 The final-name artifact `nw-core/build/nwcore.wasm` was built with matching
 Stage0 `6a0628cc48a7e019ed023c835b379fb55522ff1e`, patched Stage1 above, and
@@ -362,7 +364,7 @@ fetched `origin/main`, and refuses to build if any compiler source becomes
 newer than the selected product. The complete artifact gate and a fresh
 headed Marble success smoke passed against this artifact. The known 21
 declined concurrency-runtime bodies remain a broader compiler-gate limitation.
-See `docs/port-status.md` and the root `IMPLEMENTATION_PLAN.md` for the full
+See `docs/port-status.md` and `implementation-plan.md` for the full
 current provenance and remaining compiler-gate caveats.
 
 **Historical refresh superseded by the authoritative record above (2026-09-16):** the

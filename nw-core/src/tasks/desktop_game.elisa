@@ -1,0 +1,293 @@
+include "./desktop_reference.elisa"
+
+module DesktopGame:
+    # ui/desktop.py: a run of rounds on a ladder, each judged when Done is
+    # pressed or the clicks run out -- passed when every setting and file
+    # on the card holds in no more clicks than par. Agent ports move the
+    # pointer by a long, medium or short step, then click, press, let go,
+    # press Done or right-click.
+    const READY: i64 = 0
+    const WORKING: i64 = 1
+    const JUDGED: i64 = 2
+    const DONE: i64 = 3
+    const FEEDBACK: f64 = 2.2
+    const CLICK: i64 = 12
+    const PRESS: i64 = 13
+    const RELEASE: i64 = 14
+    const FINISH: i64 = 15
+    const RIGHT: i64 = 16
+    const PORTS: i64 = 17
+    const START: i64 = PORTS
+
+    # How a round ended.
+    const LIVE: i64 = 0
+    const PASSED: i64 = 1
+    const FAILED: i64 = 2
+    # How many fields info reports.
+    const INFO_FIELDS: i64 = 16
+
+    struct Ladder:
+        start_rung: mutable i64
+        total: mutable i64
+        adaptive: mutable bool
+        rung: mutable i64
+        trial: mutable i64
+        wins: mutable i64
+        best_rung: mutable i64
+        clicks: mutable i64
+
+    struct Session:
+        rng: mutable MT19937
+        # A copy of rng that par deals its own desk from.
+        par_rng: mutable MT19937
+        ladder: mutable Ladder
+        phase: mutable i64
+        time: mutable f64
+        deadline: mutable f64
+        desk: mutable DesktopState::Desk
+        par: mutable f64
+        budget: mutable i64
+        verdict: mutable i64
+        # Owns the desk's buffers from one round to the next.
+        owner: mutable Arena
+        # Where the mouse went down, in pixels: a release this close is a
+        # click there.
+        pressed_x: mutable f64
+        pressed_y: mutable f64
+
+    def initialize(rung: i64, trials: i64, adaptive: bool, seed: i64) -> Session:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            rng: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&rng, magnitude)
+            initial: i64 = rung if rung > 0 else 1
+            ladder: Ladder = Ladder{start_rung: initial, total: trials, adaptive: adaptive, rung: initial, trial: 0, wins: 0,
+                best_rung: 0, clicks: 0}
+            # No desk until the first round: nothing reads it before then.
+            return Session{rng: rng, par_rng: rng, ladder: ladder, phase: READY, time: 0.0, deadline: 0.0, desk: zeroed, par: 0.0,
+                budget: 0, verdict: LIVE, owner: zeroed, pressed_x: 0.0, pressed_y: 0.0}
+
+    def allowed_rung(rung: i64) -> bool:
+        return (rung >= 1 and rung <= 6) or rung == 8 or rung == 11 or rung == 13 or rung == 15 or rung == 16 or rung == 18 or rung == 20 or rung == 25 or rung == 30
+
+    def allowed_total(total: i64) -> bool:
+        return total == 1 or total == 3 or total == 5 or total == 8 or total == 12
+
+    def valid_time(session: Session&, now: f64) -> bool:
+        return now >= session.time and now <= 9007199254740.0
+
+    def live(session: Session&) -> bool:
+        return session.phase == WORKING or session.phase == JUDGED
+
+    # _next_trial: the next desktop and its par, or the end of the run.
+    def next_trial(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            session.time <- now
+            if session.ladder.trial >= session.ladder.total:
+                session.phase <- DONE
+                return true
+            session.ladder.trial <- session.ladder.trial + 1
+            # par plays a desk of its own: the same deal, dealt again from
+            # a copy of the stream. Each goes in as a temporary: a named
+            # deal passed by value shares its buffers and frees them on
+            # leaving scope.
+            session.par_rng <- session.rng
+            session.par <- DesktopReference::par(DesktopDeal::deal(session.ladder.rung, &session.par_rng))
+            session.budget <- DesktopReference::budget(session.par)
+            # The last round's desk goes, and its arena with it.
+            session.desk <- zeroed
+            arena_free(&session.owner) can Atomics{Exchange,Load,Store}, Unsafe{Alias,PointerCast,RawExtern,UncheckedIndex}, Global{Read,Write}
+            owner: mutable Arena& = &session.owner
+            in owner:
+                session.desk <- DesktopState::start(DesktopDeal::deal(session.ladder.rung, &session.rng))
+            session.verdict <- LIVE
+            session.phase <- WORKING
+            return true
+
+    def start(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if (session.phase != READY and session.phase != DONE) or session.ladder.total < 1
+            return false if not valid_time(session, now)
+            session.ladder.rung <- session.ladder.start_rung
+            session.ladder.trial <- 0
+            session.ladder.wins <- 0
+            session.ladder.best_rung <- 0
+            session.ladder.clicks <- 0
+            return next_trial(session, now) can Global{Read,Write}
+
+    def held_goals(desk: DesktopState::Desk&) -> i64:
+        can Abort.Panic:
+            count: mutable i64 = 0
+            for index in 0..<desk.dealt.goals.count.i64() |desk, count|:
+                count <- count + 1 if DesktopFiles::met(desk, index)
+            return count
+
+    # _judge: Done pressed, or out of clicks.
+    def judge(session: mutable Session&, now: f64):
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            session.desk.done <- true
+            passed: bool = DesktopFiles::solved(&session.desk) and session.desk.clicks.f64() <= session.par + 0.000000001
+            session.verdict <- PASSED if passed else FAILED
+            ladder: mutable Ladder = session.ladder
+            ladder.clicks <- ladder.clicks + session.desk.clicks
+            if passed:
+                ladder.wins <- ladder.wins + 1
+                ladder.best_rung <- ladder.rung if ladder.rung > ladder.best_rung
+            if ladder.adaptive:
+                ladder.rung <- ladder.rung + 1 if passed and ladder.rung < 9223372036854775807
+                ladder.rung <- ladder.rung - 1 if not passed and ladder.rung > 1
+            session.ladder <- ladder
+            session.deadline <- now + FEEDBACK
+            session.phase <- JUDGED
+
+    def after(session: mutable Session&, now: f64):
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            judge(session, now) if session.desk.done or session.desk.clicks >= session.budget
+
+    def working(session: Session&, now: f64) -> bool:
+        return session.phase == WORKING and valid_time(session, now)
+
+    # The pointer moved to a point on the screen (logical units).
+    def point_at(session: mutable Session&, x: f64, y: f64, now: f64) -> bool:
+        return false if not working(session, now)
+        return false if x < 0.0 or x >= Desktop::SCREEN_W.f64() or y < 0.0 or y >= Desktop::SCREEN_H.f64()
+        session.time <- now
+        session.desk.pointer.x <- x
+        session.desk.pointer.y <- y
+        return true
+
+    def click(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not working(session, now)
+            session.time <- now
+            # What a click builds lives as long as the desk does.
+            owner: mutable Arena& = &session.owner
+            in owner:
+                DesktopPointer::click(&session.desk, session.desk.pointer.x, session.desk.pointer.y)
+            after(session, now)
+            return true
+
+    def press(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not working(session, now)
+            session.time <- now
+            # What a click builds lives as long as the desk does.
+            owner: mutable Arena& = &session.owner
+            in owner:
+                DesktopPointer::press(&session.desk, session.desk.pointer.x, session.desk.pointer.y)
+            return true
+
+    def release(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not working(session, now) or not session.desk.pointer.held
+            session.time <- now
+            # What a click builds lives as long as the desk does.
+            owner: mutable Arena& = &session.owner
+            in owner:
+                DesktopPointer::release(&session.desk, session.desk.pointer.x, session.desk.pointer.y)
+            after(session, now)
+            return true
+
+    # A mouse release at a point, kept on the screen.
+    def release_at(session: mutable Session&, x: f64, y: f64, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not working(session, now) or not session.desk.pointer.held
+            session.desk.pointer.x <- fmax(0.0, fmin((Desktop::SCREEN_W - 1).f64(), x))
+            session.desk.pointer.y <- fmax(0.0, fmin((Desktop::SCREEN_H - 1).f64(), y))
+            return release(session, now)
+
+    def right_click(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not working(session, now) or session.desk.pointer.held
+            session.time <- now
+            # What a click builds lives as long as the desk does.
+            owner: mutable Arena& = &session.owner
+            in owner:
+                DesktopPointer::right_click(&session.desk, session.desk.pointer.x, session.desk.pointer.y)
+            after(session, now)
+            return true
+
+    def finish_round(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not working(session, now)
+            session.time <- now
+            judge(session, now)
+            return true
+
+    def step_size(index: i64) -> f64:
+        return 80.0 if index == 0 else (20.0 if index == 1 else 5.0)
+
+    # One agent port.
+    def steer(session: mutable Session&, port: i64, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if port < 0 or port >= PORTS or not working(session, now)
+            if port < CLICK:
+                direction: i64 = port / 3
+                step: f64 = step_size(port % 3)
+                dx: f64 = -step if direction == 2 else (step if direction == 3 else 0.0)
+                dy: f64 = -step if direction == 0 else (step if direction == 1 else 0.0)
+                session.time <- now
+                DesktopPointer::move(&session.desk, dx, dy)
+                return true
+            return click(session, now) if port == CLICK
+            return press(session, now) if port == PRESS
+            return release(session, now) if port == RELEASE
+            return right_click(session, now) if port == RIGHT
+            return finish_round(session, now)
+
+    # One agent event: START begins a run, -1 is a frame (it steps past a
+    # verdict), and anything else is a port.
+    def agent_input(session: mutable Session&, now: f64, port: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not valid_time(session, now)
+            if port == START:
+                return start(session, now) can Global{Read,Write}
+            return steer(session, port, now) if port != -1
+            if session.phase == JUDGED:
+                return advance(session, now, true) can Global{Read,Write}
+            return false if session.phase != WORKING
+            session.time <- now
+            return true
+
+    def advance(session: mutable Session&, now: f64, stepped: bool = false) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not valid_time(session, now)
+            return false if session.phase != JUDGED
+            return false if not stepped and now < session.deadline
+            return next_trial(session, now) can Global{Read,Write}
+
+    def reconfigure(session: mutable Session&, rung: i64, total: i64, adaptive: bool) -> bool:
+        return false if session.phase != READY and session.phase != DONE
+        return false if not allowed_rung(rung) or not allowed_total(total)
+        session.ladder <- Ladder{start_rung: rung, total: total, adaptive: adaptive, rung: rung, trial: 0, wins: 0, best_rung: 0,
+            clicks: 0}
+        session.phase <- READY
+        return true
+
+    # Leaving the task: the desk and its arena go.
+    def close(session: mutable Session&):
+        can Abort.Panic, Memory.Release:
+            session.phase <- READY
+            session.desk <- zeroed
+            arena_free(&session.owner) can Atomics{Exchange,Load,Store}, Unsafe{Alias,PointerCast,RawExtern,UncheckedIndex}, Global{Read,Write}
+
+    def info(session: Session&, field: i64) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return session.phase if field == 0
+            return session.ladder.rung if field == 1
+            return session.ladder.trial if field == 2
+            return session.ladder.total if field == 3
+            return session.ladder.wins if field == 4
+            return session.ladder.best_rung if field == 5
+            return session.ladder.start_rung if field == 6
+            return (1 if session.ladder.adaptive else 0) if field == 7
+            return session.verdict if field == 8
+            on: bool = live(session)
+            return (session.desk.clicks if on else 0) if field == 9
+            return ((session.par * 10.0 + 0.5).i64() if on else 0) if field == 10
+            return (session.budget if on else 0) if field == 11
+            return (held_goals(&session.desk) if on else 0) if field == 12
+            return (session.desk.dealt.goals.count.i64() if on else 0) if field == 13
+            return ((1 if DesktopFiles::solved(&session.desk) else 0) if on else 0) if field == 14
+            return ((1 if session.desk.pointer.held else 0) if on else 0) if field == 15
+            return -1

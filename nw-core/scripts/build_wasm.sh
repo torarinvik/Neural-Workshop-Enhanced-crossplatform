@@ -18,15 +18,16 @@ mkdir -p "$(dirname -- "$OBJECT")" "$(dirname -- "$ARTIFACT")" \
     "$(dirname -- "$BINDINGS_OUT")"
 
 python3 "$ROOT/test/wasm_runtime_include_test.py"
-WASM_SOURCE_TMP="$(mktemp "$ROOT/src/wasm/wasm_exports_stage0.XXXXXX")"
-WASM_SOURCE="${WASM_SOURCE_TMP}.elisa"
-mv -- "$WASM_SOURCE_TMP" "$WASM_SOURCE"
-trap 'rm -f -- "$WASM_SOURCE"' EXIT INT TERM HUP
-python3 "$ROOT/scripts/prepare_wasm_exports.py" \
-    "$ROOT/src/wasm/wasm_exports.elisa" "$WASM_SOURCE" "$ELISA_STAGE1_ROOT"
+# Materialize src/ with every runtime include pinned to the selected
+# compiler, as check.sh and build_sdl3.sh do: corpus modules include the
+# runtime too, not only the export surface.
+SOURCE_TREE_PARENT="$(mktemp -d "$ROOT/build/wasm-sources.XXXXXX")"
+SOURCE_TREE="$SOURCE_TREE_PARENT/source"
+trap 'rm -rf -- "$SOURCE_TREE_PARENT"' EXIT INT TERM HUP
+python3 "$ROOT/scripts/prepare_runtime_sources.py" "$ROOT" "$SOURCE_TREE" "$ELISA_STAGE1_ROOT"
 "$ELISACORE_BIN" -emit obj -O2 -target-triple wasm32-unknown-wasi \
-    -o "$OBJECT" "$WASM_SOURCE"
-rm -f -- "$WASM_SOURCE"
+    -o "$OBJECT" "$SOURCE_TREE/src/wasm/wasm_exports.elisa"
+rm -rf -- "$SOURCE_TREE_PARENT"
 trap - EXIT INT TERM HUP
 
 # --export-dynamic keeps the `export fn` symbols; -O2 gives everything else

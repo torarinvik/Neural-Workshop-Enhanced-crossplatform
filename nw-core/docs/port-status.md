@@ -1,5 +1,51 @@
 # Neural Workshop port status snapshot
 
+## Computer use ports — 2026-11-24
+
+All six Computer use tasks are ported: Desktop, Forms, Manual, Browser,
+Errands and Spreadsheet, shown in the hub in Python's order. Each has a
+model diff and a scene diff against the Python reference under
+`SUITE=<name> scripts/check.sh stage1`, a WASM smoke in
+`scripts/test_wasm_artifact.sh`, a web controller with an options form
+and agent environment, and an SDL3 screen with options and an agent
+kind.
+
+| Task | Suites | Diff coverage | SDL screen |
+| --- | --- | --- | --- |
+| Desktop | `desktop`, `desktop_scene` | 328 deals, 74,309 reference clicks, par, 46,526 seeded actions; 12 runs, about 322k drawn shapes and labels, the pointer grid, 15 options notes | 145 |
+| Forms | `forms`, `forms_scene` | 248 deals, the reference typist and par, seeded typing; 20 runs, about 40k drawn shapes and labels, 19,950 grid presses | 144 |
+| Manual | `manual`, `manual_scene` | 183 deals, `follow()`, reference ports, seeded play; 18 runs, 320 frames, 3,958 grid presses | 143 |
+| Errands | `errands`, `errands_scene` | the office, shop and par; 16 runs, 2,593 frames | 142 |
+| Spreadsheet | `sheet`, `sheet_scene` | sheets, questions and keypad; scenes | 141 |
+| Browser | `browser`, `browser_scene` | pages, sessions and par; scenes | 140 |
+
+Negative controls (a one-word text change, and for Forms a changed
+penalty) make each Manual and Forms suite fail. Two deliberate limits:
+a Forms value holds 64 bytes, and further characters are dropped (no
+answer is longer than 24); and Forms' `_points` rounds par to one place
+from the exact binary value, as Python's `%.1f` does, rather than through
+`dstr_append_fixed`, which rounds the product with ten.
+
+The native desktop shell routes SDL text events to Forms, so a layout's
+`@` arrives as `@`; the Space that starts a run is not typed into the
+first field.
+
+Each Desktop session owns an arena, and a round's desk lives in it. A
+session reached by casting a slot address (the WASM protocol's `run`,
+SDL's handle) gets an inferred region only as long as the calling
+function; Stage0 rejects that call, Stage1 accepts it and frees the
+region on return. So every protocol and SDL call that can grow the desk
+runs inside `in owner:` on the session's arena, and the arena is freed
+between rounds. Without it, a click's new window order dangles and the
+next frame traps (natively it is a silent use-after-free). Drawing only
+reads the desk: the explorer's scroll is clamped by the model, never by
+the scene. Negative controls (a changed colour in the scene) make the
+scene suite fail.
+
+`sdl_active_handle` accepted only rows below 140, so Forms' native slot
+(row 140) never received keys, text or pointer events; the bound is now
+142, which covers Forms and Desktop (row 141).
+
 ## Fresh Stage1 application and host artifacts — 2026-11-09
 
 The source-fresh selected Elisa Stage1 product is
@@ -474,7 +520,7 @@ The current WASM root no longer builds or exports the legacy non-3D N-back
 scenes, generic session/batch renderers, or old configurable N-back menu. The
 3D N-back route remains the only N-back task. This was checked by the complete
 artifact gate on the promoted `dfaeb45c` build, not only in a private
-candidate. See the latest dated checkpoint in `IMPLEMENTATION_PLAN.md` for
+candidate. See the latest dated checkpoint in `implementation-plan.md` for
 compiler and test evidence.
 
 Historical: stripped shipping candidate — 2026-10-03: diagnostic instrumentation removed
@@ -550,7 +596,7 @@ patch chain, retained receipts, artifact identities, and current process
 handoff. Earlier dated "current" sections below are historical and superseded.
 
 Snapshot date: 2026-09-30 (Europe/Oslo). This is an evidence inventory, not a
-release certification. Consult `IMPLEMENTATION_PLAN.md` for acceptance
+release certification. Consult `implementation-plan.md` for acceptance
 criteria and the dated evidence ledger for test scope. Historical candidate
 claims in this snapshot are superseded by the current optimized checkpoint and
 the Current Out of Sight slice recorded later in this document.
@@ -666,7 +712,7 @@ physics manifest; cross-renderer pixel figures remain diagnostic only.
 Additional rung/state combinations, multi-step/responsive resizing, and
 reviewed acceptance thresholds remain open. A live resize after the rung-16
 input replay now has a strict source/native pair and matching recorded
-initial/final window sizes in `IMPLEMENTATION_PLAN.md` and the physics
+initial/final window sizes in `implementation-plan.md` and the physics
 manifest.
 
 **Native full-window READY captures (2026-09-21):** corrected the shell's
@@ -694,7 +740,7 @@ materials, and all three marble states (one marble falling while two continue
 rolling). The synchronized DPR-2 pair has a 99.8762% exact 1714×842 stage and
 passes live metadata plus scene-state validation. Pixel scores remain
 diagnostic-only; opposing-key overlap and broader theme/viewport coverage are
-still open. See the dated evidence in `IMPLEMENTATION_PLAN.md`.
+still open. See the dated evidence in `implementation-plan.md`.
 
 **Marble Maze opposing-key browser replay (2026-09-20):** ArrowRight+ArrowLeft
 and ArrowUp+ArrowDown were each held concurrently for 30 fixed frames after
@@ -720,7 +766,7 @@ remained running and the tray reversed direction as expected. This complements
 the 138-scenario / 14,959-state source/native-versus-browser/WASM trajectory
 oracle. It is an input-path replay, not a rendered image pair; visual acceptance
 limits remain open. The still-open visual threshold and paired-image gaps are
-tracked in `IMPLEMENTATION_PLAN.md`.
+tracked in `implementation-plan.md`.
 
 **Marble Maze high-DPI compositor and capture-integrity corrections
 (2026-09-20):** a fresh source-derived lost-state replay found and fixed a
@@ -740,7 +786,7 @@ exited 0 after registering that test; it included 80 held-input sessions,
 three multi-trial/adaptive sessions, all 80 board/MJCF cases, and 134
 trajectory scenarios / 14,796 per-frame states. The focused renderer contract
 and browser physics tests also pass. Visual state/theme/viewport coverage and
-reviewed pixel limits remain open; see `IMPLEMENTATION_PLAN.md`.
+reviewed pixel limits remain open; see `implementation-plan.md`.
 
 **Marble Maze live WebGL status overlay (2026-09-20):** a freshly captured,
 source-synchronized won frame showed that the browser painted the live
@@ -1502,7 +1548,7 @@ The current root-tree inventory, captured before adding this report, is:
 `marble_board_abi_test.mjs`, `marble_maze_mujoco_test.mjs`,
 `task_game_input_smoke.mjs`, and `wasm_diff.mjs`.
 
-**Untracked work:** root `IMPLEMENTATION_PLAN.md`; `nw-core/docs/compiler-issues.md`,
+**Untracked work:** root `IMPLEMENTATION_PLAN.md` (now `nw-core/docs/implementation-plan.md`); `nw-core/docs/compiler-issues.md`,
 `docs/port-status.md`, and `docs/runtime-protocol.md`; `res/Logo/logo-dark.png`;
 `scripts/build_stage1_wasm.sh`, `scripts/build_latest_stage1_wasm.sh`,
 `scripts/stage1_glyphs_memory_smoke.sh`, and
@@ -2358,7 +2404,7 @@ the stage1 native backend smoke (511/511). This is strong targeted evidence,
 not a full stage1 artifact build or full compiler-gate result.
 
 The schema-v2 catalog fixture joins all 45 stable IDs to the kernel/scene
-anchors in `IMPLEMENTATION_PLAN.md` and to audited controller/export/host
+anchors in `implementation-plan.md` and to audited controller/export/host
 coverage. The current source catalog has 36 stateless browser task-frame cards
 and nine stateful web lifecycle controllers (Monkey Ladder, Sokoban, Count,
 Marble Maze, Tower of Hanoi, Maze, N-in-a-row, Numberology, and In the Dark)
@@ -2382,7 +2428,7 @@ BASE-001 and CAT-001 are inventoried/audited; TEST-001 through TEST-003 have
 dedicated regressions. The source/binary provenance mismatch described above
 remains unresolved. API-001, most controller implementations, cross-shell
 integration, Marble Maze source-engine certification, the full gate, desktop
-packaging, and release evidence remain open. See `IMPLEMENTATION_PLAN.md` for
+packaging, and release evidence remain open. See `implementation-plan.md` for
 the per-task acceptance criteria; do not infer complete gameplay from a menu
 card, stateless frame, or artifact smoke.
 
@@ -4639,7 +4685,7 @@ synchronized scene-state comparator pass. The 1714×842 stage is 99.9789% exact
 (MAE `0.00465`, RMSE `0.41358`); the full frame is 99.0716% exact (MAE
 `1.12468`, RMSE `14.2659`). These are diagnostic metrics only, not approved
 acceptance thresholds. Artifacts and the full evidence caveat are recorded in
-`IMPLEMENTATION_PLAN.md`; MM-003/MM-005 coverage and reviewed
+`implementation-plan.md`; MM-003/MM-005 coverage and reviewed
 cross-rasterizer pixel limits remain open.
 
 ## Marble generated held-play coverage — 2026-09-21
@@ -6272,7 +6318,7 @@ Verification used newest `origin/main` commits Stage0
 both. The private Stage1 candidate is not promoted, and the production WASM
 remains untouched. This closes the specific pit/wall-overlap defect only;
 strict whole-game parity to the original MuJoCo remains unresolved. See
-`IMPLEMENTATION_PLAN.md` and `nw-core/docs/marble-physics-manifest.json` for
+`implementation-plan.md` and `nw-core/docs/marble-physics-manifest.json` for
 the detailed invariant, seeds, binary hashes and verification limits.
 
 #### Exact current-build dark/tilted Marble parity — 2026-10-04

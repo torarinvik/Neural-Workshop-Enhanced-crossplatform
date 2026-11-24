@@ -1,0 +1,184 @@
+include "./desktop_state.elisa"
+
+module DesktopFiles:
+    # desktop.py's Node and the file moves: folders, what is in them, and
+    # cutting, copying, pasting and deleting.
+    const NONE: i64 = -1
+
+    # Whether node is other or somewhere inside it.
+    def within(desk: DesktopState::Desk&, node: i64, other: i64) -> bool:
+        can Abort.Panic:
+            at: mutable i64 = node
+            while at != NONE |at, desk, other|:
+                return true if at == other
+                at <- desk.nodes[at.usize()].parent
+            return false
+
+    # From the top folder down to node.
+    def chain(desk: DesktopState::Desk&, node: i64) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            upwards: mutable darray[i64] = []
+            at: mutable i64 = node
+            while at != NONE |at, desk, upwards|:
+                upwards.push(at)
+                at <- desk.nodes[at.usize()].parent
+            found: mutable darray[i64] = []
+            for index in 0..<upwards.count.i64() |found, upwards|:
+                found.push(upwards[(upwards.count.i64() - 1 - index).usize()])
+            return found
+
+    # What is in folder, in the order it arrived.
+    def children(desk: DesktopState::Desk&, folder: i64) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            found: mutable darray[i64] = []
+            for index in 0..<desk.nodes.count.i64() |desk, found, folder|:
+                if desk.nodes[index.usize()].parent == folder:
+                    # Insertion by stamp: a node that moved in arrived last.
+                    found.push(index)
+                    at: mutable i64 = found.count.i64() - 1
+                    while at > 0 and desk.nodes[found[(at - 1).usize()].usize()].stamp > desk.nodes[index.usize()].stamp |at, found, desk, index|:
+                        found[at.usize()] <- found[(at - 1).usize()]
+                        at <- at - 1
+                    found[at.usize()] <- index
+            return found
+
+    def sorted_by_name(desk: DesktopState::Desk&, nodes: darray[i64]&, folders: bool) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            found: mutable darray[i64] = []
+            for node in nodes |desk, found, folders|:
+                if desk.nodes[node.usize()].folder == folders:
+                    # Stable: equal names keep their order.
+                    found.push(node)
+                    at: mutable i64 = found.count.i64() - 1
+                    while at > 0 and DesktopDeal::name_before(&desk.nodes[node.usize()].name, &desk.nodes[found[(at - 1).usize()].usize()].name) |at, found, desk, node|:
+                        found[at.usize()] <- found[(at - 1).usize()]
+                        at <- at - 1
+                    found[at.usize()] <- node
+            return found
+
+    # listing(): folders first, then files, each by name.
+    def listing(desk: DesktopState::Desk&, folder: i64) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            inside: darray[i64] = children(desk, folder)
+            found: mutable darray[i64] = sorted_by_name(desk, &inside, true)
+            files: darray[i64] = sorted_by_name(desk, &inside, false)
+            for node in files |found|:
+                found.push(node)
+            return found
+
+    def index_of(values: darray[i64]&, wanted: i64) -> i64:
+        for index in 0..<values.count.i64() |values, wanted|:
+            return index if values[index.usize()] == wanted
+        return NONE
+
+    def navigate(place: mutable DesktopState::Place&, node: i64):
+        can Memory.Allocate:
+            return if place.path == node
+            place.history.push(place.path)
+            place.path <- node
+            place.scroll <- 0
+            place.selected <- NONE
+
+    # Put node in dest, unless that is where it is or inside it.
+    def move_file(desk: mutable DesktopState::Desk&, node: i64, dest: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            moving: DesktopState::Node = desk.nodes[node.usize()]
+            return false if not desk.nodes[dest.usize()].folder or within(desk, dest, node) or moving.parent == dest
+            return false if node < Desktop::PLACE_COUNT
+            desk.nodes[node.usize()].origin <- moving.parent if dest == Desktop::TRASH
+            desk.nodes[node.usize()].parent <- dest
+            desk.nodes[node.usize()].stamp <- desk.stamps
+            desk.stamps <- desk.stamps + 1
+            desk.picking.clipboard <- NONE if desk.picking.clipboard == node
+            if desk.explorer != NONE:
+                for index in 0..<desk.windows[desk.explorer.usize()].browsing.places.count.i64() |desk, node|:
+                    if desk.windows[desk.explorer.usize()].browsing.places[index.usize()].selected == node:
+                        desk.windows[desk.explorer.usize()].browsing.places[index.usize()].selected <- NONE
+            return true
+
+    def taken(desk: DesktopState::Desk&, dest: i64, name: DesktopDeal::Name&) -> bool:
+        for node in desk.nodes |dest, name|:
+            return true if node.parent == dest and DesktopDeal::same_name(&node.name, name)
+        return false
+
+    # "stem - Copy.ext", or "stem - Copy (number).ext" past the first.
+    def copy_name(name: DesktopDeal::Name&, folder: bool, number: i64) -> DesktopDeal::Name:
+        can Memory.Allocate, Abort.Panic:
+            dot: mutable i64 = NONE
+            for at in 0..<name.count |dot, name|:
+                dot <- at if name.bytes[at.usize()] == 46.u8()
+            plain: bool = dot == NONE or folder or dot == name.count - 1
+            stem_end: i64 = name.count if dot == NONE or folder else dot
+            out: mutable DesktopDeal::Name = zeroed
+            for at in 0..<stem_end |out, name|:
+                DesktopDeal::push(&out, name.bytes[at.usize()])
+            DesktopDeal::put(&out, " - Copy")
+            if number > 1:
+                DesktopDeal::put(&out, " (")
+                DesktopDeal::put_number(&out, number)
+                DesktopDeal::put(&out, ")")
+            if not plain:
+                for at in dot..<name.count |out, name|:
+                    DesktopDeal::push(&out, name.bytes[at.usize()])
+            return out
+
+    def clone(desk: mutable DesktopState::Desk&, source: i64, parent: i64, called: DesktopDeal::Name):
+        can Memory.Allocate, Abort.Panic:
+            twin: i64 = desk.nodes.count.i64()
+            original: DesktopState::Node = desk.nodes[source.usize()]
+            desk.nodes.push(DesktopState::Node{name: called, folder: original.folder, kind: original.kind, parent: parent,
+                origin: NONE, stamp: desk.stamps})
+            desk.stamps <- desk.stamps + 1
+            inside: darray[i64] = children(desk, source)
+            for child in inside |desk, twin|:
+                clone(desk, child, twin, desk.nodes[child.usize()].name)
+
+    # A copy of node, and all inside it, in dest.
+    def copy_file(desk: mutable DesktopState::Desk&, node: i64, dest: i64):
+        can Memory.Allocate, Abort.Panic:
+            return if not desk.nodes[dest.usize()].folder or within(desk, dest, node) or within(desk, dest, Desktop::TRASH)
+            source: DesktopState::Node = desk.nodes[node.usize()]
+            name: mutable DesktopDeal::Name = source.name
+            if taken(desk, dest, &name):
+                name <- copy_name(&source.name, source.folder, 1)
+                number: mutable i64 = 2
+                while taken(desk, dest, &name) |desk, dest, name, number, source|:
+                    name <- copy_name(&source.name, source.folder, number)
+                    number <- number + 1
+            clone(desk, node, dest, name)
+
+    def paste(desk: mutable DesktopState::Desk&, dest: i64):
+        can Memory.Allocate, Abort.Panic:
+            held: i64 = desk.picking.clipboard
+            return if held == NONE
+            if desk.picking.copying:
+                copy_file(desk, held, dest)
+            elif move_file(desk, held, dest):
+                desk.picking.clipboard <- NONE
+
+    # copies[index]: node still where it was, and its twin in dest.
+    def copied(desk: DesktopState::Desk&, index: i64) -> bool:
+        can Abort.Panic:
+            goal: DesktopDeal::Pair = desk.dealt.copies[index.usize()]
+            node: DesktopState::Node = desk.nodes[goal.first.usize()]
+            return false if node.parent != desk.dealt.files[goal.first.usize()].parent
+            for at in 0..<desk.nodes.count.i64() |desk, goal, node|:
+                other: DesktopState::Node = desk.nodes[at.usize()]
+                if at != goal.first and other.parent == goal.second and other.folder == node.folder:
+                    return true if DesktopDeal::same_name(&other.name, &node.name)
+            return false
+
+    def met(desk: DesktopState::Desk&, index: i64) -> bool:
+        can Abort.Panic:
+            goal: DesktopDeal::Pair = desk.dealt.goals[index.usize()]
+            return desk.controls[goal.first.usize()].value == goal.second
+
+    def solved(desk: DesktopState::Desk&) -> bool:
+        can Abort.Panic:
+            for index in 0..<desk.dealt.goals.count.i64() |desk|:
+                return false if not met(desk, index)
+            for goal in desk.dealt.moves |desk|:
+                return false if desk.nodes[goal.first.usize()].parent != goal.second
+            for index in 0..<desk.dealt.copies.count.i64() |desk|:
+                return false if not copied(desk, index)
+            return true

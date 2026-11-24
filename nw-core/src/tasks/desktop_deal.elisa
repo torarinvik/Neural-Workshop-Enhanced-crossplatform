@@ -1,0 +1,434 @@
+include "./desktop.elisa"
+
+module DesktopDeal:
+    # desktop.py's deal(): the windows, their controls and dialogs, where
+    # everything starts, the files, and the card -- drawn from the random
+    # stream in exactly the order desktop.py draws them.
+    const MOST_WINDOWS: i64 = 6
+    const MOST_TABS: i64 = 3
+    const MOST_PER_TAB: i64 = 8
+    const NAME_BYTES: i64 = 48
+
+    # A file or folder's name.
+    struct Name:
+        bytes: mutable u8[48]
+        count: mutable i64
+
+    def push(name: mutable Name&, byte: u8):
+        if name.count < NAME_BYTES:
+            name.bytes[name.count.usize()] <- byte
+            name.count <- name.count + 1
+
+    def put(name: mutable Name&, words: cstr):
+        can Memory.Allocate, Abort.Panic:
+            spelled: mutable dstr = []
+            dstr_append_cstr(&spelled, words)
+            for byte in spelled |name|:
+                push(name, byte)
+
+    def put_number(name: mutable Name&, value: i64):
+        can Memory.Allocate, Abort.Panic:
+            spelled: mutable dstr = []
+            dstr_append_i64(&spelled, value)
+            for byte in spelled |name|:
+                push(name, byte)
+
+    def named(words: cstr) -> Name:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable Name = zeroed
+            put(&out, words)
+            return out
+
+    def same_name(one: Name&, two: Name&) -> bool:
+        return false if one.count != two.count
+        for at in 0..<one.count |one, two|:
+            return false if one.bytes[at.usize()] != two.bytes[at.usize()]
+        return true
+
+    # Python's str ordering: by byte, a prefix first.
+    def name_before(one: Name&, two: Name&) -> bool:
+        shorter: i64 = one.count if one.count < two.count else two.count
+        for at in 0..<shorter |one, two|:
+            a: u8 = one.bytes[at.usize()]
+            b: u8 = two.bytes[at.usize()]
+            return a < b if a != b
+        return one.count < two.count
+
+    # A control: its label, kind, how many values, where it starts, and
+    # its words (WORDS indices for choices and dropdowns, COLOURS indices
+    # for colour rows).
+    struct Spec:
+        label: i64
+        kind: i64
+        count: i64
+        value: i64
+        words: i64[6]
+
+    # A dialog: its title, its three controls, and where its menu item is.
+    struct DialogSpec:
+        title: i64
+        members: i64[3]
+        window: i64
+        menu: i64
+        item: i64
+        # The submenu item it sits under, or -1 when the menu opens it.
+        sub: i64
+
+    struct Entry:
+        name: Name
+        folder: bool
+        kind: i64
+        parent: mutable i64
+
+    struct Pair:
+        first: i64
+        second: i64
+
+    # A greyed-out control and the setting it needs.
+    struct Require:
+        ident: i64
+        other: i64
+        value: i64
+
+    struct NoteSpec:
+        text: i64
+        x: i64
+        y: i64
+
+    struct PopupSpec:
+        at: i64
+        window: i64
+        safe_left: bool
+
+    # Where everything starts.
+    struct Layout:
+        x: mutable i64[6]
+        y: mutable i64[6]
+        order: mutable darray[i64]
+        minimised: mutable bool[6]
+        closed: mutable bool[6]
+        explorer_x: i64
+        explorer_y: i64
+
+    struct Deal:
+        level: Desktop::Grade
+        titles: mutable i64[6]
+        specs: mutable darray[Spec]
+        # tabs[window * 24 + tab * 8 + row]: a spec index.
+        tabs: mutable i64[144]
+        dialogs: mutable darray[DialogSpec]
+        applies: mutable bool[6]
+        layout: mutable Layout
+        notes: mutable darray[NoteSpec]
+        popups: mutable darray[PopupSpec]
+        requires: mutable darray[Require]
+        goals: mutable darray[Pair]
+        files: mutable darray[Entry]
+        moves: mutable darray[Pair]
+        pinned: mutable darray[i64]
+        shortcuts: mutable darray[i64]
+        copies: mutable darray[Pair]
+        list_view: mutable bool
+        hide_card: bool
+
+    def tab_slot(window: i64, tab: i64, row: i64) -> i64:
+        return window * 24 + tab * 8 + row
+
+    # make(): one control, its label the last of the window's shuffled
+    # labels.
+    def make(level: Desktop::Grade&, labels: mutable darray[i64]&, specs: mutable darray[Spec]&, draw: mutable MT19937&) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            kind: i64 = Desktop::kind_at(level, py_choice_index(draw, level.kind_count))
+            count: mutable i64 = 2
+            words: mutable i64[6] = zeroed
+            if kind == Desktop::CHOICE or kind == Desktop::DROPDOWN:
+                count <- py_randint(draw, 3, 4) if kind == Desktop::CHOICE else py_randint(draw, 3, 6)
+                first: i64 = py_randrange(draw, 0, 6 - count + 1)
+                for at in 0..<count |words, first|:
+                    words[at.usize()] <- first + at
+            elif kind == Desktop::COLOUR:
+                count <- py_randint(draw, 4, 6)
+                picked: darray[i64] = py_sample_range(draw, 0, Desktop::COLOUR_COUNT - 1, count)
+                for at in 0..<count |words, picked|:
+                    words[at.usize()] <- picked[at.usize()]
+            elif kind == Desktop::SLIDER:
+                count <- py_randint(draw, 4, 6)
+            elif kind == Desktop::STEPPER:
+                count <- py_randint(draw, 5, 9)
+            label: i64 = labels[(labels.count - 1.usize())]
+            labels.pop()
+            specs.push(Spec{label: label, kind: kind, count: count, value: py_randrange(draw, 0, count), words: words})
+            return specs.count.i64() - 1
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Deal:
+        can Memory.Allocate, Abort.Panic:
+            level: Desktop::Grade = Desktop::grade(rung)
+            out: mutable Deal = Deal{level: level, titles: zeroed, specs: [], tabs: zeroed, dialogs: [], applies: zeroed,
+                layout: Layout{x: zeroed, y: zeroed, order: [], minimised: zeroed, closed: zeroed,
+                    explorer_x: Desktop::SCREEN_W - Desktop::EXPLORER_W - 10, explorer_y: 160}, notes: [], popups: [],
+                requires: [], goals: [], files: [], moves: [], pinned: [], shortcuts: [], copies: [], list_view: false,
+                hide_card: level.files.hide_card}
+            titles: darray[i64] = py_sample_range(draw, 0, Desktop::TITLE_COUNT - 1, level.windows)
+            for index in 0..<level.windows |out, titles|:
+                out.titles[index.usize()] <- titles[index.usize()]
+            dialog_titles: mutable darray[i64] = py_sample_range(draw, 0, Desktop::DIALOG_COUNT - 1, level.windows * level.dialogs)
+            controls(&out, &level, &dialog_titles, draw)
+            places(&out, &level, draw)
+            grow_files(&out, &level, draw)
+            cards(&out, &level, draw)
+            return out
+
+    # The windows' tabs and dialogs: labels shuffled anew for each window.
+    def controls(out: mutable Deal&, level: Desktop::Grade&, dialog_titles: mutable darray[i64]&, draw: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            for window in 0..<level.windows |out, level, dialog_titles, draw|:
+                labels: mutable darray[i64] = py_sample_range(draw, 0, Desktop::LABEL_COUNT - 1, Desktop::LABEL_COUNT)
+                for tab in 0..<level.tabs |out, level, draw, labels, window|:
+                    for row in 0..<level.per_tab |out, level, draw, labels, window, tab|:
+                        out.tabs[tab_slot(window, tab, row).usize()] <- make(level, &labels, &out.specs, draw)
+                for made in 0..<level.dialogs |out, level, dialog_titles, draw, labels, window|:
+                    title: i64 = dialog_titles[(dialog_titles.count - 1.usize())]
+                    dialog_titles.pop()
+                    members: mutable i64[3] = zeroed
+                    for at in 0..<3 |members, level, labels, out, draw|:
+                        members[at.usize()] <- make(level, &labels, &out.specs, draw)
+                    # With submenus the first dialog opens from the menu and
+                    # the rest cascade from its More item; without, they
+                    # deal round the menus in turn.
+                    menus: i64 = menu_count(level)
+                    menu: i64 = 0 if level.submenus else made % menus
+                    item: i64 = (0 if made == 0 else 1) if level.submenus else made / menus
+                    sub: i64 = (made - 1 if made > 0 else -1) if level.submenus else -1
+                    out.dialogs.push(DialogSpec{title: title, members: members, window: window, menu: menu, item: item,
+                        sub: sub})
+
+    # How many menus a window's menu bar has.
+    def menu_count(level: Desktop::Grade&) -> i64:
+        return 0 if level.dialogs == 0
+        return 1 if level.submenus else Desktop::imax(1, (level.dialogs + 1) / 2)
+
+    # Where the windows start, their stacking, which hide, which hang off
+    # the edge, and which are pinned to Start or have a shortcut.
+    def places(out: mutable Deal&, level: Desktop::Grade&, draw: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            applying: darray[i64] = py_sample_range(draw, 0, level.windows - 1, Desktop::imin(level.applies, level.windows))
+            for index in applying |out|:
+                out.applies[index.usize()] <- true
+            if level.windows == 1:
+                left: i64 = 100 if level.files.explorer else (Desktop::SCREEN_W - Desktop::WINDOW_W) / 2
+                out.layout.x[0] <- left / Desktop::GRID * Desktop::GRID
+                out.layout.y[0] <- 60
+            else:
+                for index in 0..<level.windows |out|:
+                    out.layout.x[index.usize()] <- 100 + index * 80
+                    out.layout.y[index.usize()] <- 30 + index * 56
+            apps: i64 = level.windows + (1 if level.files.explorer else 0)
+            for index in 0..<apps |out|:
+                out.layout.order.push(index)
+            py_shuffle_i64(draw, &out.layout.order)
+            hiding: Desktop::Hiding = level.hiding
+            hidden: darray[i64] = py_sample_range(draw, 0, level.windows - 1,
+                Desktop::imin(level.windows - 1, hiding.minimised + hiding.closed))
+            for at in 0..<hidden.count.i64() |out, hidden, hiding|:
+                window: usize = hidden[at.usize()].usize()
+                if at < hiding.closed:
+                    out.layout.closed[window] <- true
+                else:
+                    out.layout.minimised[window] <- true
+            showing: mutable darray[i64] = []
+            for index in 0..<level.windows |out, showing|:
+                showing.push(index) if not out.layout.closed[index.usize()] and not out.layout.minimised[index.usize()]
+            off: darray[i64] = py_sample_range(draw, 0, showing.count.i64() - 1,
+                Desktop::imin(hiding.offscreen, level.windows - hidden.count.i64()))
+            for pick in off |out, showing|:
+                # Hanging off the right edge until it is dragged back.
+                out.layout.x[showing[pick.usize()].usize()] <- Desktop::SCREEN_W - 220
+            pinned: darray[i64] = py_sample_range(draw, 0, level.windows - 1, Desktop::imin(level.files.pinned, level.windows))
+            out.pinned <- sorted(&pinned)
+            shortcuts: darray[i64] = py_sample_range(draw, 0, level.windows - 1, Desktop::imin(2, level.windows))
+            out.shortcuts <- sorted(&shortcuts)
+
+    def sorted(values: darray[i64]&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[i64] = []
+            for value in values |out|:
+                out.push(value)
+            for pass_index in 0..<out.count.i64() |out|:
+                for at in 1..<out.count.i64() - pass_index |out|:
+                    if out[(at - 1).usize()] > out[at.usize()]:
+                        swapped: i64 = out[at.usize()]
+                        out[at.usize()] <- out[(at - 1).usize()]
+                        out[(at - 1).usize()] <- swapped
+            return out
+
+    # A value of the spec's other than the one it starts at.
+    def other_value(spec: Spec&, draw: mutable MT19937&) -> i64:
+        can Abort.Panic:
+            pick: i64 = py_choice_index(draw, spec.count - 1)
+            return pick if pick < spec.value else pick + 1
+
+    def contains(values: darray[i64]&, wanted: i64) -> bool:
+        for value in values |wanted|:
+            return true if value == wanted
+        return false
+
+    # The card: files to move, delete and restore; settings to change;
+    # greyed-out controls; sticky notes; popups; then files to copy.
+    def cards(out: mutable Deal&, level: Desktop::Grade&, draw: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            loose: mutable darray[i64] = []
+            folders: mutable darray[i64] = []
+            for at in 0..<out.files.count.i64() |out, loose, folders|:
+                entry: Entry = out.files[at.usize()]
+                if not entry.folder:
+                    loose.push(at)
+                elif at != Desktop::HOME and at != Desktop::TRASH:
+                    folders.push(at)
+            py_shuffle_i64(draw, &loose)
+            file_goals(out, level, &loose, &folders, draw)
+            goals(out, level, draw)
+            notes_and_popups(out, level, draw)
+            for _ in 0..<Desktop::imin(level.files.copies, loose.count.i64()) |out, loose, folders, draw|:
+                node: i64 = loose[(loose.count - 1.usize())]
+                loose.pop()
+                parent: i64 = out.files[node.usize()].parent
+                choices: mutable darray[i64] = []
+                for folder in folders |choices, parent|:
+                    choices.push(folder) if folder != parent and folder != Desktop::TRASH
+                out.copies.push(Pair{first: node, second: choices[py_choice_index(draw, choices.count.i64()).usize()]})
+            out.list_view <- level.files.list_view and py_random(draw) < 0.5
+
+    # Settings to change, across every window and dialog, and the
+    # greyed-out controls that need a setting nobody asked for.
+    def goals(out: mutable Deal&, level: Desktop::Grade&, draw: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            pool: mutable darray[i64] = []
+            for window in 0..<level.windows |out, level, pool|:
+                for tab in 0..<level.tabs |out, level, pool, window|:
+                    for row in 0..<level.per_tab |out, pool, window, tab|:
+                        pool.push(out.tabs[tab_slot(window, tab, row).usize()])
+            in_dialogs: mutable darray[i64] = []
+            for dialog in out.dialogs |in_dialogs, pool|:
+                for member in dialog.members |in_dialogs, pool|:
+                    in_dialogs.push(member)
+                    pool.push(member)
+            picks: darray[i64] = py_sample_range(draw, 0, pool.count.i64() - 1, Desktop::imin(level.goals, pool.count.i64()))
+            chosen: mutable darray[i64] = []
+            for pick in picks |chosen, pool|:
+                chosen.push(pool[pick.usize()])
+            for ident in chosen |out, draw|:
+                spec: Spec = out.specs[ident.usize()]
+                out.goals.push(Pair{first: ident, second: other_value(&spec, draw)})
+            free: mutable darray[i64] = []
+            for ident in pool |free, chosen|:
+                free.push(ident) if not contains(&chosen, ident)
+            py_shuffle_i64(draw, &free)
+            for goal in out.goals |out, level, free, in_dialogs, draw|:
+                break if out.requires.count.i64() >= level.depends or free.count == 0.usize()
+                if not contains(&in_dialogs, goal.first):
+                    other: i64 = free[(free.count - 1.usize())]
+                    free.pop()
+                    spec: Spec = out.specs[other.usize()]
+                    out.requires.push(Require{ident: goal.first, other: other, value: other_value(&spec, draw)})
+
+    def notes_and_popups(out: mutable Deal&, level: Desktop::Grade&, draw: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            noted: darray[i64] = py_sample_range(draw, 0, level.windows - 1, Desktop::imin(level.hiding.notes, level.windows))
+            for index in noted |out, level, draw|:
+                x: i64 = out.layout.x[index.usize()]
+                menu: i64 = Desktop::MENU_H if level.dialogs > 0 else 0
+                tabs: i64 = Desktop::TAB_H if level.tabs > 1 else 0
+                top: i64 = out.layout.y[index.usize()] + Desktop::TITLE_H + menu + tabs
+                text: i64 = py_randrange(draw, 0, Desktop::NOTE_TEXT_COUNT)
+                left: i64 = Desktop::imin(Desktop::SCREEN_W - Desktop::NOTE_W, x + 150) / Desktop::GRID * Desktop::GRID
+                out.notes.push(NoteSpec{text: text, x: left, y: top / Desktop::GRID * Desktop::GRID})
+            at: mutable i64 = 0
+            for _ in 0..<level.hiding.popups |out, level, draw, at|:
+                at <- at + py_randint(draw, 2, 3 + level.goals)
+                window: i64 = py_randrange(draw, 0, level.windows)
+                out.popups.push(PopupSpec{at: at, window: window, safe_left: py_random(draw) < 0.5})
+
+    # --- the files -------------------------------------------------------
+
+    def entry(name: Name, folder: bool, kind: i64, parent: i64) -> Entry:
+        return Entry{name: name, folder: folder, kind: kind, parent: parent}
+
+    def name_used(files: darray[Entry]&, name: Name&) -> bool:
+        for entry in files |name|:
+            return true if not entry.folder and same_name(&entry.name, name)
+        return false
+
+    # file_in(): a file of one of `place`'s kinds, its name made unique.
+    def file_in(files: mutable darray[Entry]&, parent: i64, place: i64, draw: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            kind: i64 = Desktop::holds_at(place, py_choice_index(draw, Desktop::holds_count(place)))
+            ext: i64 = py_choice_index(draw, Desktop::extension_count(kind))
+            base: i64 = py_choice_index(draw, Desktop::FILE_WORD_COUNT)
+            name: mutable Name = named(Desktop::file_word(base))
+            put(&name, Desktop::extension(kind, ext))
+            number: mutable i64 = 2
+            while name_used(files, &name) |name, files, number, base, kind, ext|:
+                name <- named(Desktop::file_word(base))
+                put_number(&name, number)
+                put(&name, Desktop::extension(kind, ext))
+                number <- number + 1
+            files.push(entry(name, false, kind, parent))
+
+    # grow(): files, then folders -- wide near the top, a thread below.
+    def grow(files: mutable darray[Entry]&, level: Desktop::Grade&, parent: i64, depth: i64, place: i64, draw: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            for _ in 0..<py_randint(draw, 1, 3) |files, parent, place, draw|:
+                file_in(files, parent, place, draw)
+            return if depth > level.files.depth
+            count: mutable i64 = 1
+            if depth == 1:
+                count <- py_randint(draw, 1, 3)
+            elif depth == 2:
+                count <- py_randint(draw, 1, 2)
+            else:
+                count <- 2 if py_random(draw) < 0.25 else 1
+            picked: darray[i64] = py_sample_range(draw, 0, Desktop::FOLDER_NAME_COUNT - 1, count)
+            for pick in picked |files, level, depth, place, draw|:
+                files.push(entry(named(Desktop::folder_name(pick)), true, Desktop::FOLDER, parent))
+                grow(files, level, files.count.i64() - 1, depth + 1, place, draw)
+
+    def grow_files(out: mutable Deal&, level: Desktop::Grade&, draw: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            for place in 0..<Desktop::PLACE_COUNT |out|:
+                top: bool = place == Desktop::HOME or place == Desktop::TRASH
+                out.files.push(entry(named(Desktop::place_name(place)), true, Desktop::FOLDER, -1 if top else Desktop::HOME))
+            return if not level.files.explorer
+            for place in 2..<6 |out, level, draw|:
+                grow(&out.files, level, place, 1, place, draw)
+            for _ in 0..<level.files.desktop_files |out, draw|:
+                file_in(&out.files, Desktop::DESKTOP_DIR, Desktop::DESKTOP_DIR, draw)
+
+    # Files to move, to delete and to bring back from the Trash, in an
+    # order shuffled afterwards.
+    def file_goals(out: mutable Deal&, level: Desktop::Grade&, loose: mutable darray[i64]&, folders: darray[i64]&,
+            draw: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            made: mutable darray[Pair] = []
+            for _ in 0..<Desktop::imin(level.files.moves, loose.count.i64()) |out, loose, folders, draw, made|:
+                node: i64 = loose[(loose.count - 1.usize())]
+                loose.pop()
+                parent: i64 = out.files[node.usize()].parent
+                choices: mutable darray[i64] = []
+                for folder in folders |choices, parent|:
+                    choices.push(folder) if folder != parent
+                made.push(Pair{first: node, second: choices[py_choice_index(draw, choices.count.i64()).usize()]})
+            for _ in 0..<Desktop::imin(level.files.deletes, loose.count.i64()) |loose, made|:
+                made.push(Pair{first: loose[(loose.count - 1.usize())], second: Desktop::TRASH})
+                loose.pop()
+            for _ in 0..<Desktop::imin(level.files.restores, loose.count.i64()) |out, loose, made|:
+                node: i64 = loose[(loose.count - 1.usize())]
+                loose.pop()
+                home: i64 = out.files[node.usize()].parent
+                out.files[node.usize()].parent <- Desktop::TRASH
+                made.push(Pair{first: node, second: home})
+            order: mutable darray[i64] = []
+            for at in 0..<made.count.i64() |order|:
+                order.push(at)
+            py_shuffle_i64(draw, &order)
+            for at in order |out, made|:
+                out.moves.push(made[at.usize()])

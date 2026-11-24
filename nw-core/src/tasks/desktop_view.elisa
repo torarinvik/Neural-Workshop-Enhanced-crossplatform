@@ -1,0 +1,339 @@
+include "./desktop_files.elisa"
+
+module DesktopView:
+    # Where things are now: rows, dialogs, menus, the taskbar, Start, the
+    # desktop's icons and the explorer's, and which window is on top.
+    const NONE: i64 = -1
+
+    struct Spot:
+        found: bool
+        rect: DesktopState::Rect
+
+    struct Point:
+        found: bool
+        x: i64
+        y: i64
+
+    struct Placed:
+        node: i64
+        rect: DesktopState::Rect
+
+    def nowhere() -> Spot:
+        return Spot{found: false, rect: zeroed}
+
+    def at(rect: DesktopState::Rect) -> Spot:
+        return Spot{found: true, rect: rect}
+
+    def point(x: i64, y: i64) -> Point:
+        return Point{found: true, x: x, y: y}
+
+    # --- controls and dialogs ------------------------------------------
+
+    def dialog_rect() -> DesktopState::Rect:
+        h: i64 = Desktop::TITLE_H + 3 * Desktop::ROW_H + 50
+        return DesktopState::rect((Desktop::SCREEN_W - Desktop::DIALOG_W).f64() / 2.0, (Desktop::WORK_H - h).f64() / 2.0,
+            Desktop::DIALOG_W.f64(), h.f64())
+
+    # Cancel (0), then OK (1).
+    def dialog_button(which: i64) -> DesktopState::Rect:
+        box: DesktopState::Rect = dialog_rect()
+        return DesktopState::rect(box.x + box.w - 200.0, box.y + box.h - 42.0, 88.0, 32.0) if which == 0
+        return DesktopState::rect(box.x + box.w - 104.0, box.y + box.h - 42.0, 92.0, 32.0)
+
+    # Where a control's row is now, if it is showing.
+    def row_rect(desk: DesktopState::Desk&, ident: i64) -> Spot:
+        can Abort.Panic:
+            control: DesktopState::Control = desk.controls[ident.usize()]
+            if control.dialog != NONE:
+                return nowhere() if desk.overlay.dialog != control.dialog
+                box: DesktopState::Rect = dialog_rect()
+                return at(DesktopState::rect(box.x, box.y + (Desktop::TITLE_H + control.row * Desktop::ROW_H).f64(),
+                    Desktop::DIALOG_W.f64(), Desktop::ROW_H.f64()))
+            win: DesktopState::Window = desk.windows[control.window.usize()]
+            return nowhere() if not DesktopState::shown(&win) or win.active != control.tab
+            shown: i64 = control.row - win.scroll[control.tab.usize()]
+            return nowhere() if shown < 0 or shown >= win.rows
+            return at(DesktopState::rect(win.x, DesktopState::content_top(&win) + (shown * Desktop::ROW_H).f64(), win.w,
+                Desktop::ROW_H.f64()))
+
+    def control_rect(desk: DesktopState::Desk&, ident: i64) -> Spot:
+        can Abort.Panic:
+            row: Spot = row_rect(desk, ident)
+            return row if not row.found
+            control: DesktopState::Control = desk.controls[ident.usize()]
+            width: f64 = Desktop::DIALOG_W.f64() if control.dialog != NONE else desk.windows[control.window.usize()].w
+            return at(DesktopState::widget_rect(row.rect.x, row.rect.y, width))
+
+    def enabled(desk: DesktopState::Desk&, ident: i64) -> bool:
+        can Abort.Panic:
+            control: DesktopState::Control = desk.controls[ident.usize()]
+            return control.other == NONE or desk.controls[control.other.usize()].value == control.wanted
+
+    # --- menus -----------------------------------------------------------
+
+    def submenus(desk: DesktopState::Desk&) -> bool:
+        return desk.dealt.level.submenus
+
+    def item_count(desk: DesktopState::Desk&, window: i64, menu: i64) -> i64:
+        can Abort.Panic:
+            return 2 if submenus(desk)
+            count: mutable i64 = 0
+            for made in desk.dealt.dialogs |count, window, menu|:
+                count <- count + 1 if made.window == window and made.menu == menu and made.sub == NONE
+            return count
+
+    def sub_count(desk: DesktopState::Desk&) -> i64:
+        return desk.dealt.level.dialogs - 1
+
+    # Whether a menu item opens a submenu rather than a dialog.
+    def is_submenu(desk: DesktopState::Desk&, item: i64) -> bool:
+        return submenus(desk) and item == 1
+
+    # The dialog at a window's menu, item and submenu item (NONE for one
+    # the menu opens itself).
+    def dialog_at(desk: DesktopState::Desk&, window: i64, menu: i64, item: i64, sub: i64) -> i64:
+        can Abort.Panic:
+            for index in 0..<desk.dealt.dialogs.count.i64() |desk, window, menu, item, sub|:
+                made: DesktopDeal::DialogSpec = desk.dealt.dialogs[index.usize()]
+                return index if made.window == window and made.menu == menu and made.item == item and made.sub == sub
+            return NONE
+
+    def menu_item(desk: DesktopState::Desk&, which: i64) -> DesktopState::Rect:
+        can Abort.Panic:
+            win: DesktopState::Window = desk.windows[desk.overlay.menu_window.usize()]
+            top: DesktopState::Rect = DesktopState::menu_rect(&win, desk.overlay.menu_index)
+            return DesktopState::rect(top.x, top.y + top.h + (which * Desktop::ITEM_H).f64(), Desktop::ITEM_W.f64(),
+                Desktop::ITEM_H.f64())
+
+    def menu_items(desk: DesktopState::Desk&) -> i64:
+        can Abort.Panic:
+            return 0 if desk.overlay.menu_window == NONE
+            return item_count(desk, desk.overlay.menu_window, desk.overlay.menu_index)
+
+    def submenu_item(desk: DesktopState::Desk&, which: i64) -> DesktopState::Rect:
+        can Abort.Panic:
+            owner: DesktopState::Rect = menu_item(desk, desk.overlay.menu_sub)
+            return DesktopState::rect(owner.x + owner.w, owner.y + (which * Desktop::ITEM_H).f64(), Desktop::ITEM_W.f64(),
+                Desktop::ITEM_H.f64())
+
+    def submenu_items(desk: DesktopState::Desk&) -> i64:
+        return 0 if desk.overlay.menu_window == NONE or desk.overlay.menu_sub == NONE
+        return sub_count(desk)
+
+    # --- the taskbar and Start -------------------------------------------
+
+    def taskbar_rect(position: i64) -> DesktopState::Rect:
+        return DesktopState::rect((84 + position * 100).f64(), (Desktop::WORK_H + 6).f64(), 94.0,
+            (Desktop::TASKBAR_H - 12).f64())
+
+    # A button for each app that is open, minimised or not.
+    def taskbar_windows(desk: DesktopState::Desk&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            found: mutable darray[i64] = []
+            for index in 0..<apps(desk) |desk, found|:
+                found.push(index) if not desk.windows[index.usize()].closed
+            return found
+
+    def taskbar_button(desk: DesktopState::Desk&, window: i64) -> Spot:
+        can Memory.Allocate, Abort.Panic:
+            found: darray[i64] = taskbar_windows(desk)
+            position: i64 = DesktopFiles::index_of(&found, window)
+            return nowhere() if position == NONE
+            return at(taskbar_rect(position))
+
+    def apps(desk: DesktopState::Desk&) -> i64:
+        return desk.app_count + (1 if desk.explorer != NONE else 0)
+
+    def title_text(desk: DesktopState::Desk&, window: i64) -> cstr:
+        can Abort.Panic:
+            win: DesktopState::Window = desk.windows[window.usize()]
+            return "Explorer" if win.kind == Desktop::EXPLORER
+            return "Note" if win.kind == Desktop::NOTE
+            return Desktop::title_name(win.title)
+
+    def title_before(desk: DesktopState::Desk&, one: i64, two: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            first: DesktopDeal::Name = DesktopDeal::named(title_text(desk, one))
+            second: DesktopDeal::Name = DesktopDeal::named(title_text(desk, two))
+            return DesktopDeal::name_before(&first, &second)
+
+    # The Start panel's apps: pinned tiles, or every app by name.
+    def start_windows(desk: DesktopState::Desk&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            found: mutable darray[i64] = []
+            return found if not desk.overlay.start_open
+            if not desk.overlay.start_all:
+                for window in desk.pinned |found|:
+                    found.push(window) if found.count < 6.usize()
+                return found
+            for window in 0..<apps(desk) |desk, found|:
+                found.push(window)
+                at: mutable i64 = found.count.i64() - 1
+                while at > 0 and title_before(desk, window, found[(at - 1).usize()]) |at, found, desk, window|:
+                    found[at.usize()] <- found[(at - 1).usize()]
+                    at <- at - 1
+                found[at.usize()] <- window
+            return found
+
+    def start_item(desk: DesktopState::Desk&, index: i64) -> DesktopState::Rect:
+        return DesktopState::start_row(index) if desk.overlay.start_all
+        return DesktopState::start_tile(index)
+
+    # --- the desktop's icons and the explorer's --------------------------
+
+    # What lies on the desktop, as icon keys: the explorer, the Trash,
+    # shortcuts, and what is saved there.
+    def desktop_icons(desk: DesktopState::Desk&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            found: mutable darray[i64] = []
+            return found if desk.explorer == NONE
+            found.push(DesktopState::KEY_EXPLORER)
+            found.push(DesktopState::KEY_TRASH)
+            for window in desk.dealt.shortcuts |found|:
+                found.push(DesktopState::KEY_APP + window)
+            saved: darray[i64] = DesktopFiles::listing(desk, Desktop::DESKTOP_DIR)
+            for node in saved |found|:
+                found.push(DesktopState::KEY_NODE + node)
+            return found
+
+    def icon_at(desk: DesktopState::Desk&, x: f64, y: f64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return NONE if y >= Desktop::WORK_H.f64() or window_at(desk, x, y) != NONE
+            icons: darray[i64] = desktop_icons(desk)
+            for index in 0..<icons.count.i64() |icons, x, y|:
+                return icons[index.usize()] if DesktopState::inside(DesktopState::desktop_icon_rect(index), x, y)
+            return NONE
+
+    def current(desk: DesktopState::Desk&, window: i64) -> DesktopState::Place:
+        can Abort.Panic:
+            win: DesktopState::Window = desk.windows[window.usize()]
+            return win.browsing.places[win.browsing.current.usize()]
+
+    def rows_needed(count: i64, columns: i64) -> i64:
+        return (count + columns - 1) / columns
+
+    # The explorer's icons that are showing, and where; clamps the scroll.
+    # The model's layout keeps an explorer's scroll inside its listing, as
+    # desktop.py's does; drawing only reads it, through placed_icons.
+    def icon_rects(desk: mutable DesktopState::Desk&, window: i64) -> darray[Placed]:
+        can Memory.Allocate, Abort.Panic:
+            win: DesktopState::Window = desk.windows[window.usize()]
+            tab: usize = win.browsing.current.usize()
+            scroll: i64 = clamped_scroll(desk, window)
+            if scroll != win.browsing.places[tab].scroll:
+                desk.windows[window.usize()].browsing.places[tab].scroll <- scroll
+            return placed_icons(desk, window)
+
+    def clamped_scroll(desk: DesktopState::Desk&, window: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            win: DesktopState::Window = desk.windows[window.usize()]
+            tab: usize = win.browsing.current.usize()
+            listed: darray[i64] = DesktopFiles::listing(desk, win.browsing.places[tab].path)
+            most: i64 = Desktop::imax(0, rows_needed(listed.count.i64(), DesktopState::columns(&win)) - DesktopState::grid_rows(&win))
+            return Desktop::imax(0, Desktop::imin(win.browsing.places[tab].scroll, most))
+
+    # Where an explorer's icons sit, scrolled as far as its listing allows.
+    def placed_icons(desk: DesktopState::Desk&, window: i64) -> darray[Placed]:
+        can Memory.Allocate, Abort.Panic:
+            win: DesktopState::Window = desk.windows[window.usize()]
+            tab: usize = win.browsing.current.usize()
+            listed: darray[i64] = DesktopFiles::listing(desk, win.browsing.places[tab].path)
+            rows: i64 = DesktopState::grid_rows(&win)
+            columns: i64 = DesktopState::columns(&win)
+            scroll: i64 = clamped_scroll(desk, window)
+            area: DesktopState::Rect = DesktopState::grid_area(&win)
+            width: f64 = DesktopState::cell_width(&win)
+            height: f64 = DesktopState::cell_height(&win)
+            found: mutable darray[Placed] = []
+            first: i64 = scroll * columns
+            last: i64 = Desktop::imin(listed.count.i64(), first + rows * columns)
+            for index in first..<last |found, listed, area, width, height, first, columns|:
+                row: i64 = (index - first) / columns
+                column: i64 = (index - first) % columns
+                found.push(Placed{node: listed[index.usize()], rect: DesktopState::rect(area.x + column.f64() * width,
+                    area.y + row.f64() * height, width, height)})
+            return found
+
+    def ex_scrolls(desk: DesktopState::Desk&, window: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            win: DesktopState::Window = desk.windows[window.usize()]
+            listed: darray[i64] = DesktopFiles::listing(desk, current(desk, window).path)
+            return rows_needed(listed.count.i64(), DesktopState::columns(&win)) > DesktopState::grid_rows(&win)
+
+    # --- on top -------------------------------------------------------------
+
+    def window_at(desk: DesktopState::Desk&, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            return NONE if y >= Desktop::WORK_H.f64()
+            for back in 0..<desk.order.count.i64() |desk, x, y|:
+                index: i64 = desk.order[(desk.order.count.i64() - 1 - back).usize()]
+                win: DesktopState::Window = desk.windows[index.usize()]
+                return index if DesktopState::shown(&win) and DesktopState::inside(DesktopState::box(&win), x, y)
+            return NONE
+
+    # Whether a popup, menu, list or dialog is over this point.
+    def overlay_at(desk: DesktopState::Desk&, x: f64, y: f64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            return true if desk.overlay.popup != NONE and DesktopState::inside(DesktopState::popup_rect(), x, y)
+            return true if desk.overlay.dialog != NONE and DesktopState::inside(dialog_rect(), x, y)
+            for which in 0..<menu_items(desk) |desk, x, y|:
+                return true if DesktopState::inside(menu_item(desk, which), x, y)
+            for which in 0..<submenu_items(desk) |desk, x, y|:
+                return true if DesktopState::inside(submenu_item(desk, which), x, y)
+            return true if desk.overlay.start_open and DesktopState::inside(DesktopState::start_panel(), x, y)
+            if desk.overlay.dropdown != NONE:
+                place: Spot = control_rect(desk, desk.overlay.dropdown)
+                if place.found:
+                    count: i64 = desk.controls[desk.overlay.dropdown.usize()].count
+                    for value in 0..<count |place, count, x, y|:
+                        return true if DesktopState::inside(DesktopState::dropdown_item(place.rect, count, value), x, y)
+            return false
+
+    def grid_start(low: f64) -> i64:
+        can Abort.Panic:
+            return Desktop::imax(0, floor((low + (Desktop::GRID - 1).f64()) / Desktop::GRID.f64()).i64() * Desktop::GRID)
+
+    # A grid point in rect a click would reach -- on screen, and on the
+    # window and under nothing when one is given -- nearest its middle.
+    def reachable(desk: DesktopState::Desk&, rect: DesktopState::Rect, window: i64) -> Point:
+        can Memory.Allocate, Abort.Panic:
+            centre_x: f64 = rect.x + rect.w / 2.0
+            centre_y: f64 = rect.y + rect.h / 2.0
+            best: mutable Point = Point{found: false, x: 0, y: 0}
+            best_gap: mutable f64 = 0.0
+            bottom: i64 = fmin(rect.y + rect.h, Desktop::SCREEN_H.f64()).i64()
+            right: i64 = fmin(rect.x + rect.w, Desktop::SCREEN_W.f64()).i64()
+            grid_y: mutable i64 = grid_start(rect.y)
+            while grid_y < bottom |grid_y, best, best_gap, desk, rect, window, right, centre_x, centre_y|:
+                grid_x: mutable i64 = grid_start(rect.x)
+                while grid_x < right |grid_x, grid_y, best, best_gap, desk, rect, window, centre_x, centre_y|:
+                    x: f64 = grid_x.f64()
+                    y: f64 = grid_y.f64()
+                    fits: bool = DesktopState::inside(rect, x, y)
+                    clear: bool = fits and (window == NONE or (window_at(desk, x, y) == window and not overlay_at(desk, x, y)))
+                    if clear:
+                        gap: f64 = (x - centre_x) * (x - centre_x) + (y - centre_y) * (y - centre_y)
+                        if not best.found or gap < best_gap:
+                            best <- point(grid_x, grid_y)
+                            best_gap <- gap
+                    grid_x <- grid_x + Desktop::GRID
+                grid_y <- grid_y + Desktop::GRID
+            return best
+
+    def raise_window(desk: mutable DesktopState::Desk&, window: i64):
+        can Memory.Allocate, Abort.Panic:
+            rest: mutable darray[i64] = []
+            for index in desk.order |rest, window|:
+                rest.push(index) if index != window
+            note: bool = desk.windows[window.usize()].kind == Desktop::NOTE
+            first_note: mutable i64 = rest.count.i64()
+            for at in 0..<rest.count.i64() |desk, rest, first_note|:
+                if desk.windows[rest[at.usize()].usize()].kind == Desktop::NOTE and first_note == rest.count.i64():
+                    first_note <- at
+            spot: i64 = rest.count.i64() if note else first_note
+            order: mutable darray[i64] = []
+            for at in 0..<rest.count.i64() |order, rest, spot, window|:
+                order.push(window) if at == spot
+                order.push(rest[at.usize()])
+            order.push(window) if spot == rest.count.i64()
+            desk.order <- order
