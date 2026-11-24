@@ -1,0 +1,303 @@
+include "./ints.elisa"
+include "./pyset.elisa"
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module Inside:
+    const STRIDE: i64 = 33
+    const CELLS: i64 = 1089
+
+    struct Grade:
+        rung: i64
+        kind: i64
+        size: i64
+        pair: bool
+        decoys: i64
+
+    # A connected region of at most 31² cells has at most 2*cells+2 edges.
+    struct Puzzle:
+        level: Grade
+        seed: i64
+        loop: mutable i64[1924]
+        count: mutable i64
+        region: mutable bool[1089]
+        dots: mutable i64[2]
+        answer: mutable i64
+        decoy_rng: mutable MT19937
+
+    struct Point:
+        x: f64
+        y: f64
+
+    struct Stroke:
+        points: mutable Point[7]
+        count: i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        size: mutable i64 = 15
+        if r < 7:
+            size <- 26
+        elif r < 10:
+            size <- 9
+        elif r < 13:
+            size <- 13
+        elif r >= 20:
+            size <- 31 if r >= 27 else 15 + 2 * (r - 19)
+        return Grade{rung: r, kind: 0 if r < 4 else (1 if r < 7 else 2), size: size,
+            pair: (r >= 13 and r < 16) or (r >= 20 and r % 2 == 1),
+            decoys: 0 if r < 16 else 3 + (r - 16) / 2}
+
+    def key(x: i64, y: i64) -> i64:
+        return (x + 1) * STRIDE + y + 1
+
+    def x_of(cell: i64) -> i64:
+        return cell / STRIDE - 1
+
+    def y_of(cell: i64) -> i64:
+        return cell % STRIDE - 1
+
+    def bounded(x: i64, y: i64, lo: i64, hi: i64) -> bool:
+        return x >= lo and y >= lo and x <= hi and y <= hi
+
+    def has(side: PySet::Table&, x: i64, y: i64) -> bool:
+        can Abort.Panic:
+            return bounded(x, y, -1, 31) and PySet::contains(side, key(x, y))
+
+    def uniform(rng: mutable MT19937&, a: f64, b: f64) -> f64:
+        return a + (b - a) * py_random(rng)
+
+    def blob(region: mutable PySet::Table&, n: i64, rng: mutable MT19937&, fingers: bool):
+        can Abort.Panic:
+            c: f64 = (n - 1).f64() / 2.0
+            base: f64 = n.f64() * 0.34
+            k: f64 = (2 + py_randbelow(rng, 3.u64()).i64()).f64()
+            phase: f64 = uniform(rng, 0.0, 6.3)
+            amplitude: f64 = uniform(rng, 0.05, 0.15)
+            finger_k: f64 = (4 + py_randbelow(rng, 3.u64()).i64()).f64() if fingers else 0.0
+            finger_phase: f64 = uniform(rng, 0.0, 6.3) if fingers else 0.0
+            for x in 0..<n |n, c, base, k, phase, amplitude, finger_k, finger_phase, fingers, region|:
+                for y in 0..<n |x, c, base, k, phase, amplitude, finger_k, finger_phase, fingers, region|:
+                    dx: f64 = x.f64() - c
+                    dy: f64 = y.f64() - c
+                    angle: f64 = atan2(dy, dx)
+                    waves: f64 = amplitude * sin(k * angle + phase)
+                    extra: f64 = 0.42 * sin(finger_k * angle + finger_phase) if fingers else 0.0
+                    if py_hypot(dx, dy) <= base * (1.0 + (waves + extra)):
+                        PySet::add(region, key(x, y))
+
+    def maze(region: mutable PySet::Table&, n: i64, rng: mutable MT19937&):
+        can Abort.Panic:
+            frontier: mutable i64[256] = zeroed
+            x0: i64 = 2 * py_randbelow(rng, (n / 2).u64()).i64()
+            y0: i64 = 2 * py_randbelow(rng, (n / 2).u64()).i64()
+            start: i64 = key(x0, y0)
+            PySet::add(region, start)
+            frontier[0.usize()] <- start
+            count: mutable i64 = 1
+            target: i64 = ((n * n).f64() * 0.42).i64()
+            dx: i64[4] = [2, -2, 0, 0]
+            dy: i64[4] = [0, 0, 2, -2]
+            while count > 0 and region.used < target |frontier, count, region, rng, n, target, dx, dy|:
+                at: i64 = count - 1 if py_random(rng) < 0.75 else py_randbelow(rng, count.u64()).i64()
+                cell: i64 = frontier[at.usize()]
+                options: mutable i64[4] = zeroed
+                available: mutable i64 = 0
+                for dir in 0..<4 |cell, n, region, dx, dy, options, available|:
+                    x: i64 = x_of(cell) + dx[dir.usize()]
+                    y: i64 = y_of(cell) + dy[dir.usize()]
+                    if bounded(x, y, 0, n - 1) and not has(region, x, y):
+                        options[available.usize()] <- key(x, y)
+                        available <- available + 1
+                if available == 0:
+                    count <- count - 1
+                    for i in at..<count |frontier|:
+                        frontier[i.usize()] <- frontier[(i + 1).usize()]
+                else:
+                    next: i64 = options[py_randbelow(rng, available.u64()).usize()]
+                    PySet::add(region, (next + cell) / 2)
+                    PySet::add(region, next)
+                    frontier[count.usize()] <- next
+                    count <- count + 1
+
+    def flood(region: PySet::Table&, seen: mutable PySet::Table&, start: i64, n: i64, inner: bool):
+        can Abort.Panic:
+            todo: mutable i64[1089] = zeroed
+            todo[0.usize()] <- start
+            count: mutable i64 = 1
+            PySet::add(seen, start)
+            dx: i64[4] = [1, -1, 0, 0]
+            dy: i64[4] = [0, 0, 1, -1]
+            while count > 0 |count, todo, region, seen, n, inner, dx, dy|:
+                count <- count - 1
+                cell: i64 = todo[count.usize()]
+                for dir in 0..<4 |cell, count, todo, region, seen, n, inner, dx, dy|:
+                    x: i64 = x_of(cell) + dx[dir.usize()]
+                    y: i64 = y_of(cell) + dy[dir.usize()]
+                    continue if not bounded(x, y, -1, n)
+                    next: i64 = key(x, y)
+                    if PySet::contains(region, next) == inner and not PySet::contains(seen, next):
+                        PySet::add(seen, next)
+                        todo[count.usize()] <- next
+                        count <- count + 1
+
+    def boundary(region: PySet::Table&, loop: mutable i64[1924]&) -> i64:
+        can Abort.Panic:
+            outgoing: mutable i64[2178] = zeroed
+            counts: mutable i64[1089] = zeroed
+            corner_x: i64[4] = [0, 1, 1, 0]
+            corner_y: i64[4] = [0, 0, 1, 1]
+            neighbor_x: i64[4] = [0, 1, 0, -1]
+            neighbor_y: i64[4] = [-1, 0, 1, 0]
+            start: mutable i64 = -1
+            edges: mutable i64 = 0
+            for slot in 0..<(region.mask + 1) |region, outgoing, counts, corner_x, corner_y, neighbor_x, neighbor_y, start, edges|:
+                cell: i64 = Ints::at(region.slots, slot)
+                continue if cell < 0
+                x: i64 = x_of(cell)
+                y: i64 = y_of(cell)
+                for dir in 0..<4 |x, y, region, outgoing, counts, corner_x, corner_y, neighbor_x, neighbor_y, start, edges|:
+                    continue if has(region, x + neighbor_x[dir.usize()], y + neighbor_y[dir.usize()])
+                    after: usize = ((dir + 1) % 4).usize()
+                    a: i64 = key(x + corner_x[dir.usize()], y + corner_y[dir.usize()])
+                    b: i64 = key(x + corner_x[after], y + corner_y[after])
+                    if start < 0:
+                        start <- a
+                    index: usize = a.usize()
+                    outgoing[(a * 2 + counts[index]).usize()] <- b
+                    counts[index] <- counts[index] + 1
+                    edges <- edges + 1
+            current: mutable i64 = start
+            for i in 0..<edges |current, start, counts, outgoing, loop, edges|:
+                index: usize = current.usize()
+                loop[i.usize()] <- current
+                counts[index] <- counts[index] - 1
+                current <- outgoing[(current * 2 + counts[index]).usize()]
+                return edges if current == start and i + 1 == edges
+                return 0 if current == start
+            return 0
+
+    def tightness(side: PySet::Table&, x: i64, y: i64) -> i64:
+        can Abort.Panic:
+            tight: mutable i64 = 0
+            for dx in -1..<2 |side, x, y, tight|:
+                for dy in -1..<2 |side, x, y, tight, dx|:
+                    if not has(side, x + dx, y + dy):
+                        tight <- tight + 1
+            return tight
+
+    def candidates(side: PySet::Table&, pool: mutable darray[i64]&, level: Grade) -> i64:
+        can Abort.Panic:
+            cells: mutable i64[961] = zeroed
+            scores: mutable i64[961] = zeroed
+            count: mutable i64 = 0
+            for slot in 0..<(side.mask + 1) |side, level, cells, scores, count|:
+                cell: i64 = Ints::at(side.slots, slot)
+                continue if cell < 0 or not bounded(x_of(cell), y_of(cell), 0, level.size - 1)
+                cells[count.usize()] <- cell
+                scores[count.usize()] <- tightness(side, x_of(cell), y_of(cell))
+                count <- count + 1
+            limit: i64 = (count / 3 if count >= 9 else 3) if level.kind != 0 else count
+            first: i64 = 0 if level.kind == 0 else 8
+            written: mutable i64 = 0
+            for bin in 0..<(first + 1) |cells, scores, pool, count, limit, first, written|:
+                for i in 0..<count |cells, scores, pool, limit, first, bin, written|:
+                    continue if scores[i.usize()] != first - bin
+                    Ints::put(pool, written, cells[i.usize()])
+                    written <- written + 1
+                    return written if written == limit
+            return written
+
+    def decoy(n: i64, rng: mutable MT19937&) -> Stroke:
+        can Abort.Panic:
+            x: mutable f64 = uniform(rng, 0.0, n.f64())
+            y: mutable f64 = uniform(rng, 0.0, n.f64())
+            angle: mutable f64 = uniform(rng, 0.0, 6.3)
+            steps: i64 = 3 + py_randbelow(rng, 4.u64()).i64()
+            stroke: mutable Stroke = Stroke{points: zeroed, count: steps + 1}
+            stroke.points[0.usize()] <- Point{x: x, y: y}
+            for i in 1..<(steps + 1) |stroke, x, y, n, angle, rng|:
+                angle <- angle + uniform(rng, -1.2, 1.2)
+                tx: f64 = x + cos(angle) * uniform(rng, 1.0, 3.0)
+                ty: f64 = y + sin(angle) * uniform(rng, 1.0, 3.0)
+                x <- 0.0 if tx < 0.0 else (n.f64() if tx > n.f64() else tx)
+                y <- 0.0 if ty < 0.0 else (n.f64() if ty > n.f64() else ty)
+                stroke.points[i.usize()] <- Point{x: x, y: y}
+            return stroke
+
+    def distant(pool: mutable darray[i64]&, count: i64, first: i64, distance: i64) -> i64:
+        can Abort.Panic:
+            written: mutable i64 = 0
+            for i in 0..<count |pool, first, distance, written|:
+                cell: i64 = Ints::at(pool, i)
+                dx: i64 = x_of(cell) - x_of(first)
+                dy: i64 = y_of(cell) - y_of(first)
+                if (dx if dx >= 0 else -dx) + (dy if dy >= 0 else -dy) > distance:
+                    Ints::put(pool, written, cell)
+                    written <- written + 1
+            return written
+
+    def deal(rung: i64, seed: i64) -> Puzzle:
+        can Memory.Allocate, Abort.Panic:
+            level: Grade = grade(rung)
+            n: i64 = level.size
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            region: mutable PySet::Table = PySet::new(CELLS)
+            outside: mutable PySet::Table = PySet::new(CELLS)
+            seen: mutable PySet::Table = PySet::new(CELLS)
+            hashes: mutable darray[u64] = []
+            for cell in 0..<CELLS |hashes|:
+                x: i64 = x_of(cell)
+                y: i64 = y_of(cell)
+                hash: u64 = PyPoint::hash_of(-2 if x == -1 else x, -2 if y == -1 else y)
+                hashes.push(1546275796.u64() if hash == 18446744073709551615.u64() else hash)
+            region.hashes <- hashes
+            outside.hashes <- hashes
+            inner: mutable darray[i64] = Ints::zeros(n * n)
+            outer: mutable darray[i64] = Ints::zeros(n * n)
+            puzzle: mutable Puzzle = Puzzle{level: level, seed: seed, loop: zeroed,
+                count: 0, region: zeroed, dots: zeroed, answer: -1, decoy_rng: zeroed}
+            for _attempt in 0..<200 |puzzle, n, level, rng, region, outside, seen, inner, outer|:
+                PySet::reset(&region)
+                if level.kind == 2:
+                    maze(&region, n, &rng)
+                else:
+                    blob(&region, n, &rng, level.kind == 1)
+                continue if region.used == 0
+                if level.kind != 2:
+                    PySet::reset(&seen)
+                    start: mutable i64 = 0
+                    while Ints::at(region.slots, start) < 0 |region, start|:
+                        start <- start + 1
+                    flood(&region, &seen, Ints::at(region.slots, start), n, true)
+                    continue if seen.used != region.used
+                PySet::reset(&outside)
+                flood(&region, &outside, key(-1, -1), n, false)
+                continue if outside.used + region.used != (n + 2) * (n + 2)
+                puzzle.count <- boundary(&region, &puzzle.loop)
+                continue if puzzle.count == 0
+                ic: i64 = candidates(&region, &inner, level)
+                oc: i64 = candidates(&outside, &outer, level)
+                continue if ic == 0 or oc == 0
+                puzzle.decoy_rng <- rng
+                for _line in 0..<level.decoys |n, rng|:
+                    _ = decoy(n, &rng)
+                same: bool = py_random(&rng) < 0.5 if level.pair else false
+                inside: bool = py_random(&rng) < 0.5
+                first: i64 = Ints::at(inner, py_randbelow(&rng, ic.u64()).i64()) if inside else Ints::at(outer, py_randbelow(&rng, oc.u64()).i64())
+                puzzle.dots[0.usize()] <- first
+                if level.pair:
+                    second_inside: bool = inside == same
+                    count: i64 = distant(&inner, ic, first, n / 3) if second_inside else distant(&outer, oc, first, n / 3)
+                    continue if count == 0
+                    pick: i64 = py_randbelow(&rng, count.u64()).i64()
+                    puzzle.dots[1.usize()] <- Ints::at(inner, pick) if second_inside else Ints::at(outer, pick)
+                puzzle.answer <- 0 if (same if level.pair else inside) else 1
+                for slot in 0..<(region.mask + 1) |region, puzzle|:
+                    cell: i64 = Ints::at(region.slots, slot)
+                    if cell >= 0:
+                        puzzle.region[cell.usize()] <- true
+                return puzzle
+            puzzle.count <- 0
+            return puzzle

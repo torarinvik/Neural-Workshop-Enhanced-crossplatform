@@ -1,0 +1,255 @@
+include "./morning_round.elisa"
+
+module MorningRoundRules:
+    const ATOM: i64 = 0
+    const NOT: i64 = 1
+    const AND: i64 = 2
+    const OR: i64 = 3
+    const OPPOSITE: i64 = 4
+    const ALTERNATE: i64 = 5
+    const SAME: i64 = 6
+
+    const BLUE: i64 = 0
+    const RED: i64 = 1
+    const GREEN: i64 = 2
+    const YELLOW: i64 = 3
+    const POINTED: i64 = 4
+    const DOG: i64 = 5
+    const FLAG: i64 = 6
+    const LIGHTS: i64 = 7
+    const CAT: i64 = 8
+    const LEFT_SIDE: i64 = 9
+    const EVEN: i64 = 10
+    const THREE: i64 = 11
+    const CHURCH: i64 = 12
+    const STAR: i64 = 13
+
+    struct Node:
+        op: i64
+        a: i64
+        b: i64
+
+    # Nodes are stored in postorder, with the root at count - 1.
+    struct Rule:
+        nodes: mutable Node[43]
+        count: mutable i64
+
+    struct Votes:
+        low: mutable u64
+        high: mutable u64
+        count: mutable i64
+        meaningful: mutable bool
+
+    struct Book:
+        rules: Rule[6]
+        votes: Votes[6]
+        count: i64
+
+    struct Street:
+        layout: MorningRound::Layout
+        book: Book
+        active: i64[8]
+        want: Votes
+        traffic: MorningRound::Traffic
+        papers: i64
+        seconds: f64
+
+    struct Candidate:
+        valid: bool
+        street: Street
+
+    def append(rule: mutable Rule&, op: i64, a: i64 = 0, b: i64 = 0) -> i64:
+        can Abort.Panic:
+            index: i64 = rule.count
+            rule.nodes[index.usize()] <- Node{op: op, a: a, b: b}
+            rule.count <- index + 1
+            return index
+
+    def grow(rule: mutable Rule&, n: i64, level: MorningRound::Grade, draw: mutable MT19937&) -> i64:
+        can Abort.Panic:
+            root: mutable i64 = 0
+            if n <= 1:
+                if level.state and py_random(draw) < 0.12:
+                    return append(rule, SAME)
+                atom: i64 = py_choice_index(draw, level.pool)
+                root <- append(rule, ATOM, atom)
+                if level.rung >= 3 and py_random(draw) < 0.3:
+                    root <- append(rule, NOT, root)
+            else:
+                split: i64 = py_randrange(draw, 1, n)
+                op: i64 = AND if py_choice_index(draw, 2) == 0 else OR
+                a: i64 = grow(rule, split, level, draw)
+                b: i64 = grow(rule, n - split, level, draw)
+                root <- append(rule, op, a, b)
+            if level.state and py_random(draw) < 0.2:
+                op: i64 = OPPOSITE if py_choice_index(draw, 2) == 0 else ALTERNATE
+                root <- append(rule, op, root)
+            return root
+
+    def pick(votes: Votes, i: i64) -> bool:
+        return ((votes.low >> i) & 1.u64()) != 0.u64() if i < 64 else ((votes.high >> (i - 64)) & 1.u64()) != 0.u64()
+
+    def mark(votes: mutable Votes&, i: i64):
+        if i < 64:
+            votes.low <- votes.low | (1.u64() << i)
+        else:
+            votes.high <- votes.high | (1.u64() << (i - 64))
+        votes.count <- votes.count + 1
+
+    def equal(a: Votes, b: Votes) -> bool:
+        return a.low == b.low and a.high == b.high
+
+    def feature(layout: MorningRound::Layout&, h: MorningRound::House, atom: i64) -> bool:
+        can Abort.Panic:
+            return h.door == (1 - atom if atom < 2 else atom) if atom <= YELLOW
+            return h.pointed if atom == POINTED
+            return h.dog if atom == DOG
+            return h.flag if atom == FLAG
+            return h.lights if atom == LIGHTS
+            return h.cat if atom == CAT
+            return h.side < 0 if atom == LEFT_SIDE
+            return h.number % 2 == 0 if atom == EVEN
+            return h.number % 3 == 0 if atom == THREE
+            return layout.blocks[h.block.usize()].landmark == 0 if atom == CHURCH
+            return h.sign
+
+    def evaluate(layout: MorningRound::Layout&, rule: Rule&) -> Votes:
+        can Abort.Panic:
+            values: mutable Votes[43] = zeroed
+            for k in 0..<rule.count |rule, layout, values|:
+                node: Node = rule.nodes[k.usize()]
+                a: Votes = values[node.a.usize()]
+                b: Votes = values[node.b.usize()]
+                out: mutable Votes = zeroed
+                alternating: mutable i64[8] = zeroed
+                for i in 0..<layout.count |layout, node, a, b, out, alternating|:
+                    h: MorningRound::House = layout.houses[i.usize()]
+                    yes: mutable bool = false
+                    if node.op == ATOM:
+                        yes <- feature(layout, h, node.a)
+                    elif node.op == SAME:
+                        yes <- i >= 2 and h.door == layout.houses[(i - 2).usize()].door
+                    elif node.op == NOT:
+                        yes <- not pick(a, i)
+                    elif node.op == AND:
+                        yes <- pick(a, i) and pick(b, i)
+                    elif node.op == OR:
+                        yes <- pick(a, i) or pick(b, i)
+                    elif node.op == OPPOSITE:
+                        yes <- pick(a, i ^ 1)
+                    elif pick(a, i):
+                        block: usize = h.block.usize()
+                        yes <- alternating[block] % 2 == 0
+                        alternating[block] <- alternating[block] + 1
+                    mark(&out, i) if yes
+                if node.op == ATOM or node.op == SAME:
+                    out.meaningful <- out.count > 0 and out.count < layout.count
+                elif node.op == AND or node.op == OR:
+                    out.meaningful <- a.meaningful and b.meaningful and not equal(a, out) and not equal(b, out)
+                else:
+                    out.meaningful <- a.meaningful and not equal(a, out) and (node.op != NOT or rule.nodes[node.a.usize()].op != NOT)
+                values[k.usize()] <- out
+            return values[(rule.count - 1).usize()]
+
+    def duplicate(votes: Votes[6]&, count: i64, candidate: Votes) -> bool:
+        can Abort.Panic:
+            for i in 0..<count |votes, candidate|:
+                return true if equal(votes[i.usize()], candidate)
+            return false
+
+    def rulebook(layout: mutable MorningRound::Layout&, draw: mutable MT19937&) -> Book:
+        can Abort.Panic:
+            rules: mutable Rule[6] = zeroed
+            votes: mutable Votes[6] = zeroed
+            count: mutable i64 = 0
+            level: MorningRound::Grade = layout.level
+            if level.mode == MorningRound::MARKED:
+                for i in 0..<layout.count |layout, draw|:
+                    layout.houses[i.usize()].sign <- py_random(draw) < 0.5
+                rule: mutable Rule = zeroed
+                _ = append(&rule, ATOM, STAR)
+                rules[0] <- rule
+                votes[0] <- evaluate(layout, &rule)
+                count <- 1
+            else:
+                for _ in 0..<60 |layout, draw, level, rules, votes, count|:
+                    break if count >= level.deck
+                    low: i64 = level.atoms - 1 if level.atoms > 1 else 1
+                    n: i64 = py_randrange(draw, low, level.atoms + 1)
+                    rule: mutable Rule = zeroed
+                    _ = grow(&rule, n, level, draw)
+                    choice: Votes = evaluate(layout, &rule)
+                    ratio: f64 = choice.count.f64() / layout.count.f64()
+                    if ratio >= 0.25 and ratio <= 0.7 and choice.meaningful and not duplicate(&votes, count, choice):
+                        rules[count.usize()] <- rule
+                        votes[count.usize()] <- choice
+                        count <- count + 1
+            return Book{rules: rules, votes: votes, count: count}
+
+    def active(level: MorningRound::Grade, draw: mutable MT19937&) -> i64[8]:
+        can Abort.Panic:
+            out: mutable i64[8] = zeroed
+            changed: mutable bool = false
+            for b in 1..<level.blocks |level, draw, changed, out|:
+                previous: i64 = out[(b - 1).usize()]
+                out[b.usize()] <- previous
+                if level.deck > 1 and (level.mode == MorningRound::SIGN or py_random(draw) < 0.5):
+                    selected: i64 = py_choice_index(draw, level.deck - 1)
+                    out[b.usize()] <- selected + (1 if selected >= previous else 0)
+                    changed <- true
+            if level.blocks > 1 and not changed and (level.mode == MorningRound::SIGN or level.mode == MorningRound::HIDDEN):
+                out[(level.blocks - 1).usize()] <- 1 % level.deck
+            return out
+
+    def wanted(layout: MorningRound::Layout&, book: Book&, rules: i64[8]&) -> Votes:
+        can Abort.Panic:
+            out: mutable Votes = zeroed
+            for i in 0..<layout.count |layout, book, rules, out|:
+                block: usize = layout.houses[i.usize()].block.usize()
+                mark(&out, i) if pick(book.votes[rules[block].usize()], i)
+            return out
+
+    def different(a: Votes, b: Votes, start: i64, end: i64) -> i64:
+        can Abort.Panic:
+            count: mutable i64 = 0
+            for i in start..<end |a, b, count|:
+                count <- count + 1 if pick(a, i) != pick(b, i)
+            return count
+
+    def distinguish(book: Book&, start: i64, end: i64) -> bool:
+        can Abort.Panic:
+            for a in 0..<book.count |book, start, end|:
+                for b in (a + 1)..<book.count |book, start, end, a|:
+                    return false if different(book.votes[a.usize()], book.votes[b.usize()], start, end) < 2
+            return true
+
+    def viable(layout: MorningRound::Layout&, book: Book&, want: Votes) -> bool:
+        can Abort.Panic:
+            level: MorningRound::Grade = layout.level
+            size: i64 = 2 * level.houses
+            for b in 0..<level.blocks |size, book, want|:
+                start: i64 = b * size
+                end: i64 = start + size
+                got: mutable i64 = 0
+                for i in start..<end |want, got|:
+                    got <- got + 1 if pick(want, i)
+                return false if got < 2 or got > size - 2 or not distinguish(book, start, end)
+            return false if layout.count - want.count <= level.slack + 1 or want.count <= level.slack + 1
+            if level.mode == MorningRound::SIGN or level.mode == MorningRound::HIDDEN:
+                return different(book.votes[0], want, 0, layout.count) > level.slack + 1
+            return true
+
+    def build(level: MorningRound::Grade, draw: mutable MT19937&) -> Candidate:
+        can Abort.Panic:
+            layout: mutable MorningRound::Layout = MorningRound::layout(level, draw)
+            book: Book = rulebook(&layout, draw)
+            return Candidate{valid: false, street: zeroed} if book.count < level.deck
+            selected: i64[8] = active(level, draw)
+            want: Votes = wanted(&layout, &book, &selected)
+            return Candidate{valid: false, street: zeroed} if not viable(&layout, &book, want)
+            objects: MorningRound::Traffic = MorningRound::traffic(level, layout.length, draw)
+            extra: i64 = layout.count / 5
+            seconds: f64 = level.brief + layout.length / (0.55 * level.speed) + 10.0
+            street: Street = Street{layout: layout, book: book, active: selected, want: want, traffic: objects,
+                papers: want.count + (extra if extra > 3 else 3), seconds: py_round_decimal(seconds, 10.0)}
+            return Candidate{valid: true, street: street}

@@ -1,0 +1,288 @@
+include "./sokobanlive.elisa"
+
+module SokobanLiveSearch:
+    const CELLS: i64 = SokobanLive::MOST_CELLS
+    const BUDGET: i64 = 60000
+    const SET_SLOTS: i64 = 8
+    const NO_CELL: i64 = -1
+
+    # Four crates fit in CPython's eight-slot frozenset table. Each byte
+    # holds a cell plus one so a zero byte is an empty slot.
+    def crate(slots: u64, index: i64) -> i64:
+        return ((slots >> (index * 8).u64()) & 255.u64()).i64() - 1
+
+    def insert(slots: u64, cell: i64) -> u64:
+        can Abort.Panic:
+            perturb: mutable i64 = cell
+            index: mutable i64 = cell & (SET_SLOTS - 1)
+            while crate(slots, index) != NO_CELL |slots, perturb, index|:
+                perturb <- perturb >> 5
+                index <- (index * 5 + 1 + perturb) & (SET_SLOTS - 1)
+            return slots | ((cell + 1).u64() << (index * 8).u64())
+
+    def moved(slots: u64, old: i64, new: i64) -> u64:
+        can Abort.Panic:
+            result: mutable u64 = 0.u64()
+            for i in 0..<SET_SLOTS |slots, old, result|:
+                cell: i64 = crate(slots, i)
+                if cell != NO_CELL and cell != old:
+                    result <- insert(result, cell)
+            return insert(result, new)
+
+    def key(slots: u64) -> u64:
+        can Abort.Panic:
+            ordered: mutable i64[4] = [CELLS, CELLS, CELLS, CELLS]
+            for i in 0..<SET_SLOTS |slots, ordered|:
+                value: i64 = crate(slots, i)
+                continue if value == NO_CELL
+                carry: mutable i64 = value
+                for j in 0..<4 |ordered, carry|:
+                    if carry < ordered[j.usize()]:
+                        displaced: i64 = ordered[j.usize()]
+                        ordered[j.usize()] <- carry
+                        carry <- displaced
+            return ordered[0].u64() | (ordered[1].u64() << 8) | (ordered[2].u64() << 16) | (ordered[3].u64() << 24)
+
+    def flags(slots: u64) -> bool[CELLS]:
+        can Abort.Panic:
+            result: mutable bool[CELLS] = zeroed
+            for i in 0..<SET_SLOTS |slots, result|:
+                cell: i64 = crate(slots, i)
+                result[cell.usize()] <- true if cell >= 0
+            return result
+
+    struct Region:
+        reached: bool[CELLS]
+        previous: i64[CELLS]
+        direction: i64[CELLS]
+        anchor: mutable i64
+
+    # Ordered walking flood. The anchor canonicalizes all standing places
+    # that can reach one another without pushing a crate.
+    def reachable(floor: SokobanLive::Warehouse&, boxes: bool[CELLS]&, player: i64, stop: i64 = -1) -> Region:
+        can Abort.Panic:
+            area: mutable Region = zeroed
+            queue: mutable i64[CELLS] = zeroed
+            area.anchor <- player
+            area.reached[player.usize()] <- true
+            queue[0] <- player
+            end: mutable i64 = 1
+            head: mutable i64 = 0
+            width: i64 = floor.level.width
+            while head < end |floor, boxes, area, queue, width, head, end, stop|:
+                at: i64 = queue[head.usize()]
+                break if at == stop
+                for d in 0..<4 |floor, boxes, area, queue, width, at, end|:
+                    cell: i64 = at + Sokoban::step_of(width, d)
+                    k: usize = cell.usize()
+                    continue if area.reached[k] or floor.walls[k] or boxes[k]
+                    area.reached[k] <- true
+                    area.previous[k] <- at
+                    area.direction[k] <- d
+                    area.anchor <- cell if cell < area.anchor
+                    queue[end.usize()] <- cell
+                    end <- end + 1
+                head <- head + 1
+            return area
+
+    def distances(floor: SokobanLive::Warehouse&) -> i64[CELLS]:
+        can Abort.Panic:
+            queue: mutable i64[CELLS] = zeroed
+            dist: mutable i64[CELLS] = zeroed
+            end: mutable i64 = 0
+            width: i64 = floor.level.width
+            cells: i64 = width * floor.level.height
+            for i in 0..<cells |floor, dist, queue, end|:
+                dist[i.usize()] <- 99
+                if floor.goals[i.usize()]:
+                    dist[i.usize()] <- 0
+                    queue[end.usize()] <- i
+                    end <- end + 1
+            head: mutable i64 = 0
+            while head < end |floor, dist, queue, width, cells, head, end|:
+                at: i64 = queue[head.usize()]
+                for d in 0..<4 |floor, dist, queue, width, cells, at, end|:
+                    stride: i64 = Sokoban::step_of(width, d)
+                    cell: i64 = at + stride
+                    back: i64 = at + 2 * stride
+                    continue if back < 0 or back >= cells
+                    continue if floor.walls[cell.usize()] or floor.walls[back.usize()] or dist[cell.usize()] != 99
+                    dist[cell.usize()] <- dist[at.usize()] + 1
+                    queue[end.usize()] <- cell
+                    end <- end + 1
+                head <- head + 1
+            return dist
+
+    def score(slots: u64, dist: i64[CELLS]&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for i in 0..<SET_SLOTS |slots, dist, total|:
+                cell: i64 = crate(slots, i)
+                total <- total + dist[cell.usize()] if cell >= 0
+            return total
+
+    struct Node:
+        slots: u64
+        key: u64
+        player: i64
+        parent: i64
+        behind: i64
+        direction: i64
+        score: i64
+        stamp: i64
+
+    struct Search:
+        nodes: mutable darray[Node]
+        frontier: mutable darray[i64]
+        index: mutable darray[i64]
+        heap_count: mutable i64
+
+    def create() -> Search:
+        can Abort.Panic, Memory.Allocate:
+            return Search{nodes: [], frontier: [], index: Ints::zeros(1024), heap_count: 0}
+
+    def location(search: Search&, target: u64) -> i64:
+        can Abort.Panic:
+            mask: u64 = (search.index.count.i64() - 1).u64()
+            value: u64 = ((target ^ (target >> 17)) * 11400714819323198485.u64()) ^ (target >> 5)
+            at: mutable i64 = ((value ^ (value >> 32)) & mask).i64()
+            while search.index[at.usize()] != 0 |search, target, at, mask|:
+                node: i64 = search.index[at.usize()] - 1
+                return at if search.nodes[node.usize()].key == target
+                at <- ((at + 1).u64() & mask).i64()
+            return at
+
+    def append(search: mutable Search&, node: Node) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            index: i64 = search.nodes.count.i64()
+            at: i64 = location(search, node.key)
+            return -1 if search.index[at.usize()] != 0
+            search.nodes.push(node)
+            if (index + 1) * 2 >= search.index.count.i64():
+                search.index <- Ints::zeros(search.index.count.i64() * 2)
+                for i in 0..<(index + 1) |search|:
+                    dest: i64 = location(search, search.nodes[i.usize()].key)
+                    search.index[dest.usize()] <- i + 1
+            else:
+                search.index[at.usize()] <- index + 1
+            return index
+
+    def earlier(search: Search&, left: i64, right: i64) -> bool:
+        can Abort.Panic:
+            a: Node = search.nodes[left.usize()]
+            b: Node = search.nodes[right.usize()]
+            # Equal-sized distinct frozensets are incomparable. Python's
+            # tuple comparison stops there when score and stamp are equal.
+            return a.score < b.score or (a.score == b.score and a.stamp < b.stamp)
+
+    def sift_towards_root(search: mutable Search&, from_index: i64, item: i64):
+        can Abort.Panic:
+            at: mutable i64 = from_index
+            while at > 0 |search, at, item|:
+                parent: i64 = (at - 1) / 2
+                old: i64 = search.frontier[parent.usize()]
+                break if not earlier(search, item, old)
+                search.frontier[at.usize()] <- old
+                at <- parent
+            search.frontier[at.usize()] <- item
+
+    def queue(search: mutable Search&, item: i64):
+        can Abort.Panic, Memory.Allocate:
+            at: i64 = search.heap_count
+            if at == search.frontier.count.i64():
+                search.frontier.push(item)
+            search.heap_count <- at + 1
+            sift_towards_root(search, at, item)
+
+    def pop(search: mutable Search&) -> i64:
+        can Abort.Panic:
+            result: i64 = search.frontier[0]
+            search.heap_count <- search.heap_count - 1
+            return result if search.heap_count == 0
+            item: i64 = search.frontier[search.heap_count.usize()]
+            at: mutable i64 = 0
+            child: mutable i64 = 1
+            while child < search.heap_count |search, at, child|:
+                right: i64 = child + 1
+                if right < search.heap_count and not earlier(search, search.frontier[child.usize()], search.frontier[right.usize()]):
+                    child <- right
+                search.frontier[at.usize()] <- search.frontier[child.usize()]
+                at <- child
+                child <- 2 * at + 1
+            sift_towards_root(search, at, item)
+            return result
+
+    def clear(search: mutable Search&):
+        can Abort.Panic:
+            for i in 0..<search.index.count.i64() |search|:
+                search.index[i.usize()] <- 0
+            search.nodes.clear()
+            search.heap_count <- 0
+
+    def expand(floor: SokobanLive::Warehouse&, search: mutable Search&, dist: i64[CELLS]&, index: i64, stamp: i64):
+        can Abort.Panic, Memory.Allocate:
+            node: Node = search.nodes[index.usize()]
+            boxes: bool[CELLS] = flags(node.slots)
+            area: Region = reachable(floor, &boxes, node.player)
+            width: i64 = floor.level.width
+            for i in 0..<SET_SLOTS |floor, search, dist, node, boxes, area, width, index, stamp|:
+                box: i64 = crate(node.slots, i)
+                continue if box == NO_CELL
+                for d in 0..<4 |floor, search, dist, node, boxes, area, width, index, stamp, box|:
+                    stride: i64 = Sokoban::step_of(width, d)
+                    behind: i64 = box - stride
+                    ahead: i64 = box + stride
+                    continue if (not area.reached[behind.usize()] or floor.walls[ahead.usize()] or
+                        boxes[ahead.usize()] or not floor.alive[ahead.usize()])
+                    slots: u64 = moved(node.slots, box, ahead)
+                    moved_boxes: bool[CELLS] = flags(slots)
+                    next_area: Region = reachable(floor, &moved_boxes, box)
+                    next: Node = Node{slots: slots, key: (key(slots) << 8) | next_area.anchor.u64(),
+                        player: box, parent: index, behind: behind, direction: d,
+                        score: score(slots, dist), stamp: stamp * 10 + d}
+                    dest: i64 = append(search, next)
+                    if dest >= 0:
+                        queue(search, dest)
+
+    def recover(floor: SokobanLive::Warehouse&, search: Search&, goal: i64, out: mutable darray[i64]&):
+        can Abort.Panic, Memory.Allocate:
+            cursor: mutable i64 = goal
+            # Construct the route backwards, then reverse it once.
+            while search.nodes[cursor.usize()].parent >= 0 |floor, search, cursor, out|:
+                node: Node = search.nodes[cursor.usize()]
+                parent: Node = search.nodes[node.parent.usize()]
+                out.push(node.direction)
+                boxes: bool[CELLS] = flags(parent.slots)
+                area: Region = reachable(floor, &boxes, parent.player, node.behind)
+                standing: mutable i64 = node.behind
+                while standing != parent.player |area, parent, standing, out|:
+                    out.push(area.direction[standing.usize()])
+                    standing <- area.previous[standing.usize()]
+                cursor <- node.parent
+            count: i64 = out.count.i64()
+            for i in 0..<(count / 2) |out, count|:
+                last: usize = (count - i - 1).usize()
+                item: i64 = out[i.usize()]
+                out[i.usize()] <- out[last]
+                out[last] <- item
+
+    def solve(floor: SokobanLive::Warehouse&, search: mutable Search&, dist: i64[CELLS]&,
+              slots: u64, player: i64, out: mutable darray[i64]&) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            clear(search)
+            out.clear()
+            boxes: bool[CELLS] = flags(slots)
+            area: Region = reachable(floor, &boxes, player)
+            start: Node = Node{slots: slots, key: (key(slots) << 8) | area.anchor.u64(),
+                player: player, parent: -1, behind: -1, direction: -1, score: score(slots, dist), stamp: 0}
+            root: i64 = append(search, start)
+            queue(search, root)
+            for expanded in 0..<(BUDGET + 1) |floor, search, dist, out|:
+                return false if search.heap_count == 0
+                index: i64 = pop(search)
+                if search.nodes[index.usize()].score == 0:
+                    recover(floor, search, index, out)
+                    return true
+                break if expanded == BUDGET
+                expand(floor, search, dist, index, expanded + 1)
+            return false

@@ -47,14 +47,14 @@ function action(name, value = 0) {
     BigInt(sequence++), ACTION[name], BigInt(value), 0n, 0n, 0n, 0n, 0n);
 }
 
-function controllerMessage() {
+function controllerText() {
   const framePtr = Number(exports.nw_frame_alloc(1048576n));
   const length = Number(exports.nw_api_v1_render(handle, BigInt(framePtr),
     1048576n, 0n, 912n, 684n));
   assert.ok(length > 0);
   const bytes = new Uint8Array(exports.memory.buffer, framePtr, length).slice();
-  return decode(bytes).filter(command => command.kind === Kind.TEXT)
-    .map(command => command.text);
+  exports.nw_frame_free(BigInt(framePtr));
+  return decode(bytes).filter(command => command.kind === Kind.TEXT);
 }
 
 function compare(expected, index) {
@@ -89,11 +89,21 @@ function compare(expected, index) {
     assert.equal(info(INFO.captured), expected.captured,
       `${context}: captured stone count`);
   }
+  const text = controllerText();
+  const verdicts = text.filter(command => command.color === 0x40ff40ff || command.color === 0xff4040ff);
+  if (expected.verdictText === null) {
+    assert.equal(verdicts.length, 0, `${context}: no colored verdict before answering`);
+  } else {
+    assert.equal(verdicts.length, 1, `${context}: one colored verdict`);
+    assert.equal(verdicts[0].color, expected.verdict ? 0x40ff40ff : 0xff4040ff, context);
+    assert.equal(verdicts[0].text, expected.verdictText, context);
+    assert.equal(verdicts[0].b, 60, `${context}: verdict in the bottom band`);
+  }
   if (phase === 2 || phase === 3) {
     const displayMessage = phase === 3
       ? `${expected.message} — difficulty ${expected.difficulty}/10`
       : expected.message;
-    assert.ok(controllerMessage().includes(displayMessage),
+    assert.ok(text.some(command => command.text === displayMessage),
       `${context}: display list should show source feedback ${JSON.stringify(displayMessage)}`);
   }
 }

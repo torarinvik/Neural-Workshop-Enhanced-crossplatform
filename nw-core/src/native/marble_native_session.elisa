@@ -1,0 +1,74 @@
+# Synchronize the host-owned MuJoCo state with the shared trial controller.
+module MarbleNativeSession:
+    struct Physics:
+        engine: mutable MarbleMuJoCo::Engine
+        tray: mutable MarbleMaze::MarbleTray
+        generation: mutable i64
+
+    def close(physics: mutable Physics&):
+        can Memory.Release:
+            MarbleMuJoCo::close(&physics.engine)
+            physics.generation <- 0
+
+    def sync(run: mutable MarbleMazeGame::MarbleRun&, physics: mutable Physics&) -> bool:
+        can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            phase: i64 = run.phase
+            # The final board stays visible behind the completed-run summary.
+            return true if phase == MarbleMazeGame::PHASE_DONE
+            if phase != MarbleMazeGame::PHASE_RUNNING and phase != MarbleMazeGame::PHASE_FEEDBACK and phase != MarbleMazeGame::PHASE_PREPARING:
+                close(physics)
+                return true
+            if physics.engine.data == 0.usize() or physics.generation != run.board_generation:
+                work: mutable MarbleMaze::MarbleWork = MarbleMaze::MarbleWork()
+                tray: mutable MarbleMaze::MarbleTray = MarbleMaze::MarbleTray()
+                MarbleMaze::deal(run.rung, run.board_seed, 24, &work, &tray)
+                return false if not MarbleMuJoCo::open(&physics.engine, &tray)
+                physics.tray <- tray
+                physics.generation <- run.board_generation
+            if phase == MarbleMazeGame::PHASE_PREPARING:
+                return MarbleMazeGame::action(run, MarbleMazeGame::ACTION_BOARD_READY, 0, 0) == 1
+            return true
+
+    def key_action(run: mutable MarbleMazeGame::MarbleRun&, physics: mutable Physics&, kind: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            status: i64 = MarbleMazeGame::action(run, kind, 0, 0)
+            return false if status < 0
+            if status == 1:
+                if kind == MarbleMazeGame::ACTION_RESTART:
+                    close(physics)
+                elif kind == MarbleMazeGame::ACTION_LEVEL:
+                    MarbleMuJoCo::level(&physics.engine)
+            return sync(run, physics)
+
+    def commit(run: mutable MarbleMazeGame::MarbleRun&, physics: Physics&, settled: bool) -> bool:
+        can Abort.Panic:
+            elapsed: i64 = py_round_half_even(physics.engine.motion[0] * 1000.0)
+            time: i64 = MarbleMazeGame::MAX_SETTLE_MS if elapsed > MarbleMazeGame::MAX_SETTLE_MS else elapsed
+            return false if MarbleMazeGame::action(run, MarbleMazeGame::ACTION_SYNC_SETTLE_TIME, time, 0) != 1
+            clean: bool = physics.engine.lost == 0
+            if settled:
+                won: bool = physics.engine.home == physics.engine.count
+                bits: i64 = (1 if won else 0) + (2 if clean else 0)
+                par: i64 = py_round_half_even((physics.tray.route.f32().f64() / 0.25 + 2.5 * physics.engine.count.f64()) * 1000.0)
+                return false if MarbleMazeGame::action(run, MarbleMazeGame::ACTION_REPORT, bits, par) != 1
+            else:
+                return false if MarbleMazeGame::action(run, MarbleMazeGame::ACTION_SCORE, 1 if clean else 0, 0) != 1
+            return MarbleMazeGame::action(run, MarbleMazeGame::ACTION_RECORD_RESULT, physics.engine.home, physics.engine.lost) == 1
+
+    def advance(run: mutable MarbleMazeGame::MarbleRun&, physics: mutable Physics&, elapsed_ms: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            phase: i64 = run.phase
+            if phase == MarbleMazeGame::PHASE_RUNNING:
+                return false if not sync(run, physics)
+                state: mutable f64[105] = zeroed
+                _ = MarbleMuJoCo::advance(&physics.engine, elapsed_ms.f64() / 1000.0, run.held_mask, &state[0], 105)
+                if physics.engine.home + physics.engine.lost == physics.engine.count:
+                    return commit(run, physics, true)
+                delta: i64 = (state[0] * 1000.0).i64()
+                if delta > run.elapsed_ms:
+                    _ = MarbleMazeGame::advance(run, delta - run.elapsed_ms)
+                if run.phase == MarbleMazeGame::PHASE_FEEDBACK:
+                    return commit(run, physics, false)
+            elif phase == MarbleMazeGame::PHASE_FEEDBACK:
+                _ = MarbleMazeGame::advance(run, elapsed_ms)
+            return sync(run, physics)

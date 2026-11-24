@@ -1,0 +1,243 @@
+include "./pianotuner.elisa"
+include "./drshape_audio.elisa"
+
+# The Piano Tuner screen's run of strings, on ClockedTask's clock: every
+# advance steps the try in hundred-and-twentieths of a second with the
+# agent's port for that frame if one came, else the held keys as
+# PianoTuner._held reads them -- Up or W, then Down or S, each slowly while
+# Shift is down. Done (Enter, Space, or port 4) is an event: it acts at once.
+# A drag with the primary button turns the pin slowly, 0.4 cents a pixel up.
+module PianoTunerGame:
+    const READY: i64 = 0
+    const PLAYING: i64 = 1
+    const JUDGED: i64 = 2
+    const DONE: i64 = 3
+    const START: i64 = PianoTuner::PORTS
+    const FEEDBACK: f64 = 2.5
+    # Held key bits: Up 1, W 2, Down 4, S 8, Shift 16.
+    const SHIFT: i64 = 16
+
+    struct Session:
+        rng: mutable MT19937
+        start_rung: mutable i64
+        total: mutable i64
+        adaptive: mutable bool
+        rung: mutable i64
+        trial: mutable i64
+        wins: mutable i64
+        best_rung: mutable i64
+        phase: mutable i64
+        time: mutable f64
+        deadline: mutable f64
+        run: mutable PianoTuner::Run
+        owner: mutable Arena
+        held_keys: mutable i64
+        pulse: mutable i64
+        dragging: mutable bool
+        drag_y: mutable f64
+
+    def initialize(rung: i64, trials: i64, adaptive: bool, seed: i64) -> Session:
+        rng: mutable MT19937 = zeroed
+        magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+        mt_seed_int(&rng, magnitude)
+        initial: i64 = PianoTuner::grade(rung).rung
+        return Session{rng: rng, start_rung: initial, total: trials, adaptive: adaptive,
+            rung: initial, trial: 0, wins: 0, best_rung: 0, phase: READY, time: 0.0,
+            deadline: 0.0, run: zeroed, owner: zeroed, held_keys: 0, pulse: -1, dragging: false, drag_y: 0.0}
+
+    def close(session: mutable Session&):
+        can Abort.Panic, Memory.Release:
+            session.run <- zeroed
+            session.phase <- READY
+            session.held_keys <- 0
+            session.pulse <- -1
+            session.dragging <- false
+            arena_free(&session.owner) can Atomics{Exchange,Load,Store}, Unsafe{Alias,PointerCast,RawExtern,UncheckedIndex}, Global{Read,Write}
+
+    def allowed_rung(rung: i64) -> bool:
+        return rung == 1 or rung == 4 or rung == 7 or rung == 10 or rung == 13 or rung == 16 or rung == 20 or rung == 25 or rung == 30
+
+    def allowed_total(trials: i64) -> bool:
+        return trials == 1 or trials == 3 or trials == 5 or trials == 10 or trials == 20
+
+    def reconfigure(session: mutable Session&, rung: i64, trials: i64, adaptive: bool) -> bool:
+        can Abort.Panic, Memory.Release:
+            return false if session.phase != READY and session.phase != DONE
+            return false if not allowed_rung(rung) or not allowed_total(trials)
+            close(session) can Global{Read,Write}
+            session.start_rung <- rung
+            session.rung <- rung
+            session.total <- trials
+            session.adaptive <- adaptive
+            session.trial <- 0
+            session.wins <- 0
+            session.best_rung <- 0
+            return true
+
+    # Room in the session's arena for `steps` more settings of the sound
+    # tracks and `notes` more notes, so that pushes during a step or an event
+    # never reallocate into a region that is let go after it.
+    def reserve(session: mutable Session&, steps: i64, notes: i64):
+        can Abort.Panic, Memory.Allocate:
+            run: mutable PianoTuner::Run& = &session.run
+            more: usize = run.times.count + steps.usize()
+            _ = arena_da_reserve[f64](&session.owner, &run.times, more) can Global{Read,Write}
+            _ = arena_da_reserve[f64](&session.owner, &run.ref_f, more) can Global{Read,Write}
+            _ = arena_da_reserve[f64](&session.owner, &run.string_f, more) can Global{Read,Write}
+            _ = arena_da_reserve[f64](&session.owner, &run.gain, more) can Global{Read,Write}
+            _ = arena_da_reserve[f64](&session.owner, &run.ref_ph, more) can Global{Read,Write}
+            _ = arena_da_reserve[f64](&session.owner, &run.string_ph, more) can Global{Read,Write}
+            _ = arena_da_reserve[DrShapeDeal::Note](&session.owner, &run.notes, run.notes.count + notes.usize()) can Global{Read,Write}
+
+    def next_trial(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            session.time <- now
+            session.pulse <- -1
+            if session.trial >= session.total:
+                session.phase <- DONE
+                return true
+            job: PianoTuner::Job = PianoTuner::deal(session.rung, &session.rng)
+            keys: i64 = session.held_keys
+            close(session) can Global{Read,Write}
+            session.held_keys <- keys
+            owner: mutable Arena& = &session.owner
+            in owner:
+                session.run <- PianoTuner::begin(job)
+            session.trial <- session.trial + 1
+            session.phase <- PLAYING
+            return true
+
+    def valid_time(session: Session&, now: f64) -> bool:
+        return now >= session.time and now <= 9007199254740.0
+
+    def start(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if (session.phase != READY and session.phase != DONE) or session.total < 1
+            return false if not valid_time(session, now)
+            session.rung <- session.start_rung
+            session.trial <- 0
+            session.wins <- 0
+            session.best_rung <- 0
+            return next_trial(session, now) can Global{Read,Write}
+
+    # ClockedTask.steer: done acts at once; any other port turns the pin for
+    # the frame it is sent in.
+    def input(session: mutable Session&, port: i64) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            return false if session.phase != PLAYING or port < 0 or port >= PianoTuner::PORTS
+            if port == PianoTuner::DONE:
+                return false if session.run.result != PianoTuner::LIVE
+                reserve(session, 2, 1) can Global{Read,Write}
+                PianoTuner::done(&session.run)
+                return true
+            session.pulse <- port
+            return true
+
+    # A primary press starts a run; during one, a drag with the primary
+    # button down turns the pin, 0.4 cents a pixel up. Reference framebuffer
+    # coordinates with a bottom-left origin; kind 1 is a press, 0 a move, 2 a
+    # release; *pressed* is whether the primary button is down on a move.
+    def pointer(session: mutable Session&, y: f64, kind: i64, now: f64, pressed: bool) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            if kind == 1 and (session.phase == READY or session.phase == DONE):
+                return (start(session, now) can Global{Read,Write})
+            if kind == 1:
+                session.dragging <- true
+                session.drag_y <- y
+                return false
+            if kind != 0 or not pressed or not session.dragging:
+                session.dragging <- false if kind == 2 or not pressed
+                return false
+            dy: f64 = y - session.drag_y
+            session.drag_y <- y
+            return false if session.phase != PLAYING or session.run.result != PianoTuner::LIVE
+            session.run.pitch <- session.run.pitch * PianoTuner::power2(0.4 * dy / 1200.0)
+            return true
+
+    # PianoTuner._held: Up or W turns it up, else Down or S down; slowly
+    # while Shift is held.
+    def held(session: Session&) -> i64:
+        keys: i64 = session.held_keys
+        fine: bool = (keys & SHIFT) != 0
+        return (PianoTuner::UP_FINE if fine else PianoTuner::UP) if (keys & 3) != 0
+        return (PianoTuner::DOWN_FINE if fine else PianoTuner::DOWN) if (keys & 12) != 0
+        return -1
+
+    def judge(session: mutable Session&, now: f64):
+        passed: bool = session.run.result == PianoTuner::IN_TUNE
+        if passed:
+            session.wins <- session.wins + 1
+            session.best_rung <- session.rung if session.rung > session.best_rung
+        if session.adaptive:
+            session.rung <- session.rung + 1 if passed and session.rung < 9223372036854775807
+            session.rung <- session.rung - 1 if not passed and session.rung > 1
+        session.deadline <- now + FEEDBACK
+        session.phase <- JUDGED
+
+    def advance(session: mutable Session&, now: f64, stepped: bool = false) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not valid_time(session, now)
+            if session.phase == JUDGED:
+                return false if not stepped and now < session.deadline
+                return next_trial(session, now) can Global{Read,Write}
+            return false if session.phase != PLAYING
+            if session.run.result != PianoTuner::LIVE:
+                judge(session, now)
+                return true
+            dt: f64 = fmin(0.1, now - session.time)
+            session.time <- now
+            control: i64 = session.pulse if session.pulse >= 0 else held(session)
+            session.pulse <- -1
+            steps: i64 = fmax(1.0, ceil(dt / (1.0 / 120.0))).i64()
+            quantum: f64 = dt / steps.f64()
+            reserve(session, steps, 1) can Global{Read,Write}
+            for _ in 0..<steps |session, quantum, control|:
+                PianoTuner::step(&session.run, quantum, control)
+                break if session.run.result != PianoTuner::LIVE
+            if session.run.result != PianoTuner::LIVE:
+                judge(session, now)
+            return true
+
+    def agent_event(session: mutable Session&, now: f64, port: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not valid_time(session, now)
+            return (start(session, now) can Global{Read,Write}) if port == START
+            return (advance(session, now, true) can Global{Read,Write}) if port == -1
+            return (input(session, port) can Global{Read,Write})
+
+    # Up 1, W 2, Down 4, S 8, Shift 16.
+    def hold_key(session: mutable Session&, key_bit: i64, down: bool) -> bool:
+        return false if key_bit <= 0 or key_bit > 16 or (key_bit & (key_bit - 1)) != 0
+        return false if down and session.phase != PLAYING
+        before: i64 = session.held_keys
+        session.held_keys <- before | key_bit if down else before & (31 ^ key_bit)
+        return session.held_keys != before
+
+    def clear_controls(session: mutable Session&) -> bool:
+        changed: bool = session.held_keys != 0 or session.pulse >= 0 or session.dragging
+        session.held_keys <- 0
+        session.pulse <- -1
+        session.dragging <- false
+        return changed
+
+    def info(session: Session&, field: i64) -> i64:
+        can Abort.Panic:
+            return session.phase if field == 0
+            return session.rung if field == 1
+            return session.trial if field == 2
+            return session.total if field == 3
+            return session.wins if field == 4
+            return session.best_rung if field == 5
+            return session.start_rung if field == 6
+            return (1 if session.adaptive else 0) if field == 7
+            return session.run.result if field == 8
+            return py_round_half_even(session.run.t * 1000.0) if field == 9
+            return session.run.k if field == 10
+            return session.run.job.level.strings if field == 11
+            return session.run.count if field == 12
+            return py_round_half_even(PianoTuner::cents_off(&session.run) * 1000.0) if field == 13
+            return py_round_half_even(PianoTuner::pin(&session.run) * 1000.0) if field == 14
+            return session.held_keys if field == 15
+            return py_round_half_even(session.run.job.level.tol * 1000.0) if field == 16
+            return session.run.job.plan[session.run.k.usize()].interval if field == 17
+            return -1

@@ -33,4 +33,17 @@ for selected in range(5):
     frame=app.decode(core.syllogism_options_frame(0,selected,3,6,1,1,1))
     texts=[cmd['text'] for cmd in frame if cmd['kind']=='text']
     assert 'Syllogism options' in texts and 'Name things after real words' in texts
+timed = core.syllogism_create(1,1,1,0,1,17)
+assert timed > 0
+try:
+    assert core.syllogism_action(timed,0,0,1000)==1
+    assert core.syllogism_action(timed,6,0,2750)==1
+    assert core.syllogism_info(timed,14)==1 and core.syllogism_info(timed,15)==1
+    assert core.syllogism_value(timed,2,0)==1 and core.syllogism_value(timed,4,0)==1750
+    assert core.syllogism_action(timed,0,0,3000)==1
+    assert core.syllogism_action(timed,0,0,4000)==1
+    assert core.syllogism_info(timed,14)==0 and core.syllogism_info(timed,15)==0
+    assert core.syllogism_value(timed,2,0)==-1
+finally:
+    core.syllogism_destroy(timed)
 print('Syllogism native Python: all source sessions, working and options render match')

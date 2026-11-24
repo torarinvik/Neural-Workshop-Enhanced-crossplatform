@@ -469,6 +469,10 @@ class SokobanSession:
         return self.core.sokoban_frame(
             self.handle, 1 if self.black_background else 0, width, height)
 
+    def describe(self, _frame) -> str:
+        phase, pushes, moves = self.state
+        return f"Sokoban · phase {phase} · pushes {pushes} · moves {moves}"
+
     def action(self, action: int, now_ms: int = 0) -> None:
         self.core.sokoban_action(self.handle, action, now_ms)
 
@@ -1401,6 +1405,35 @@ def write_syllogism_settings(values) -> bool:
             except OSError: pass
 
 
+def syllogism_results_dir() -> Path:
+    override = os.environ.get("NW_SYLLOGISM_RESULTS_DIR")
+    return Path(override).expanduser() if override else syllogism_settings_path().parent / "results" / "syllogism"
+
+
+def write_session_result(record, directory: Path) -> bool:
+    """Atomically replace a complete session record without truncating the prior file."""
+    temporary = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, delete=False) as output:
+            temporary = Path(output.name)
+            json.dump(record, output, ensure_ascii=False, separators=(",", ":"))
+            output.write("\n")
+        os.replace(temporary, directory / (record["id"] + ".json"))
+        return True
+    except OSError as error:
+        print(f"Could not save {record['task']} result: {error}", file=sys.stderr)
+        return False
+    finally:
+        if temporary is not None:
+            try: temporary.unlink(missing_ok=True)
+            except OSError: pass
+
+
+def write_syllogism_result(record) -> bool:
+    return write_session_result(record, syllogism_results_dir())
+
+
 class SyllogismSession:
     """Python host for the shared generated Syllogisms controller."""
     ACTION_START = 0
@@ -1418,6 +1451,9 @@ class SyllogismSession:
         self.options_draft = None
         self.options_selection = 0
         self.options_from_hub = False
+        self.result_record = None
+        self.result_pending = False
+        self.failed_results = []
 
     @property
     def state(self):
@@ -1433,8 +1469,42 @@ class SyllogismSession:
         phase = ("ready", "asking", "judged", "done")[state[0]] if 0 <= state[0] < 4 else "unknown"
         return f"Syllogisms {phase} · question {state[2]}/{state[3]} · right {state[8]}"
 
+    def _flush_results(self):
+        if self.result_pending and self.result_record is not None:
+            self.result_pending = not write_syllogism_result(self.result_record)
+        self.failed_results = [record for record in self.failed_results if not write_syllogism_result(record)]
+
+    def _retain_failed_result(self):
+        if self.result_pending and self.result_record is not None:
+            self.failed_results.append(self.result_record)
+        self.result_record = None
+        self.result_pending = False
+
     def action(self, action, value=0):
+        before = self.core.syllogism_info(self.handle, 0)
         self.core.syllogism_action(self.handle, action, value, int(time.monotonic() * 1000))
+        after = self.core.syllogism_info(self.handle, 0)
+        if before in (0, 3) and after == 1:
+            self._retain_failed_result()
+            self.result_record = {"id": "syllogism-" + uuid.uuid4().hex, "task": "syllogism",
+                                  "started_at": time.time(), "options": list(self.options),
+                                  "results": [], "completed": False}
+        if before == 1 and after == 2 and self.result_record is not None:
+            count = self.core.syllogism_info(self.handle, 15)
+            if count > 0:
+                index = count - 1
+                self.result_record["results"].append({"trial": count,
+                    "level": self.core.syllogism_value(self.handle, 2, index),
+                    "correct": self.core.syllogism_value(self.handle, 3, index) == 1,
+                    "elapsed_ms": self.core.syllogism_value(self.handle, 4, index),
+                    "judged_at": time.time()})
+                self.result_pending = True
+        if before != 3 and after == 3 and self.result_record is not None:
+            self.result_record.update(completed=True, right=self.core.syllogism_info(self.handle, 8),
+                                      best_level=self.core.syllogism_info(self.handle, 9),
+                                      seconds=self.core.syllogism_info(self.handle, 14))
+            self.result_pending = True
+        self._flush_results()
 
     def modify_option(self, delta):
         choices = (tuple(range(1, 13)), SYLLOGISM_TRIALS, (0, 1), (0, 1), (0, 1))
@@ -1464,6 +1534,8 @@ class SyllogismSession:
         if self.options_draft is None: return
         fresh = self.core.syllogism_create(*self.options_draft, self.args.seed)
         if fresh > 0:
+            self._flush_results()
+            self._retain_failed_result()
             self.core.syllogism_destroy(self.handle); self.handle = fresh
             self.options = list(self.options_draft)
             (self.args.syllogism_level, self.args.syllogism_trials) = self.options[:2]
@@ -1491,6 +1563,7 @@ class SyllogismSession:
         elif self.state[0] != 1: self.action(0)
 
     def close(self):
+        self._flush_results()
         if self.handle > 0:
             self.core.syllogism_destroy(self.handle); self.handle = 0
 
@@ -1511,26 +1584,7 @@ def numberology_results_dir() -> Path:
 
 
 def write_numberology_result(record) -> bool:
-    """Atomically replace one session record; never truncate an existing result."""
-    directory = numberology_results_dir()
-    temporary = None
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, delete=False) as output:
-            temporary = Path(output.name)
-            json.dump(record, output, ensure_ascii=False, separators=(",", ":"))
-            output.write("\n")
-        os.replace(temporary, directory / (record["id"] + ".json"))
-        return True
-    except OSError as error:
-        print(f"Could not save Numberology result: {error}", file=sys.stderr)
-        return False
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+    return write_session_result(record, numberology_results_dir())
 
 
 class NumberologySession:
@@ -2162,6 +2216,8 @@ def read_scramble_clipboard() -> str:
 
 class ScrambleSession:
     """Native text input and lifecycle for the source-backed Scramble game."""
+    ACTION_START = 0
+
     def __init__(self, core, args):
         self.core = core
         self.args = args
@@ -3099,7 +3155,7 @@ class TaskHubSession:
         ("Long-term memory", ("Concentration", "Seen It Before?", "Trivia")),
         ("Attention", ("Reflex", "N-Cup Monte", "Moving Targets", "Lookout", "Pursuit", "Buzz Wire", "Out of Sight", "Donkey", "Two Hands", "Overrun", "Marble Maze")),
         ("Perception", ("Count", "Mr. Time")),
-        ("Reasoning", ("Graph Mapping", "Matrix Reasoning", "Jigsaw Puzzle", "Sudoku", "Find the Winning Move", "Crossed Wires", "Crossword", "Scrabble", "Scramble", "Algebra", "Numberology", "Syllogisms", "Winning Move", "Verbal Reasoning")),
+        ("Reasoning", ("Graph Mapping", "Matrix Reasoning", "Jigsaw Puzzle", "Video Jigsaw", "Sudoku", "Find the Winning Move", "Crossed Wires", "Crossword", "Scrabble", "Scramble", "Algebra", "Numberology", "Syllogisms", "Winning Move", "Verbal Reasoning")),
         ("Planning", ("Tower of Hanoi", "Traveling Salesman", "Sokoban", "Maze", "3D Maze", "3D Sokoban", "Freeform Tetris", "N-in-a-row")),
         ("Self-control", ("Cookie Thief",)),
     )
@@ -3141,27 +3197,27 @@ class TaskHubSession:
                     self.child.close()
                     self.child = None
             return
-        if symbol == key.C and self.category == 4 and self.selected == 11:
+        if symbol == key.C and self.category == 4 and self.selected == 12:
             self.child = SyllogismSession(self.core, self.args)
             self.child.options_from_hub = True
             self.child.key(key.O, key)
             return
-        if symbol == key.C and self.category == 4 and self.selected == 10:
+        if symbol == key.C and self.category == 4 and self.selected == 11:
             self.child = NumberologySession(self.core, self.args)
             self.child.options_from_hub = True
             self.child.key(key.O, key)
             return
-        if symbol == key.C and self.category == 4 and self.selected == 9:
+        if symbol == key.C and self.category == 4 and self.selected == 10:
             self.child = AlgebraSession(self.core, self.args)
             self.child.options_from_hub = True
             self.child.key(key.O, key)
             return
-        if symbol == key.C and self.category == 4 and self.selected == 7:
+        if symbol == key.C and self.category == 4 and self.selected == 8:
             self.child = ScrabbleSession(self.core, self.args)
             self.child.options_from_hub = True
             self.child.key(key.C, key)
             return
-        if symbol == key.C and self.category == 4 and self.selected == 8:
+        if symbol == key.C and self.category == 4 and self.selected == 9:
             self.child = ScrambleSession(self.core, self.args)
             self.child.options_from_hub = True
             self.child.key(key.O, key)
@@ -3213,25 +3269,25 @@ class TaskHubSession:
                 self.child = TriviaSession(self.core, self.args)
             elif self.category == 2 and self.selected == 0:
                 self.child = ReflexSession(self.core, self.args)
-            elif self.category == 4 and self.selected == 9:
-                self.child = AlgebraSession(self.core, self.args)
             elif self.category == 4 and self.selected == 10:
-                self.child = NumberologySession(self.core, self.args)
+                self.child = AlgebraSession(self.core, self.args)
             elif self.category == 4 and self.selected == 11:
+                self.child = NumberologySession(self.core, self.args)
+            elif self.category == 4 and self.selected == 12:
                 self.child = SyllogismSession(self.core, self.args)
             elif self.category == 4 and self.selected == 2:
                 self.child = JigsawSession(self.core, self.args)
-            elif self.category == 4 and self.selected == 3:
-                self.child = SudokuSession(self.core, self.args)
             elif self.category == 4 and self.selected == 4:
-                self.child = GoSession(self.core, self.args)
+                self.child = SudokuSession(self.core, self.args)
             elif self.category == 4 and self.selected == 5:
-                self.child = CrossedWiresSession(self.core, self.args)
+                self.child = GoSession(self.core, self.args)
             elif self.category == 4 and self.selected == 6:
-                self.child = CrosswordSession(self.core, self.args)
+                self.child = CrossedWiresSession(self.core, self.args)
             elif self.category == 4 and self.selected == 7:
-                self.child = ScrabbleSession(self.core, self.args)
+                self.child = CrosswordSession(self.core, self.args)
             elif self.category == 4 and self.selected == 8:
+                self.child = ScrabbleSession(self.core, self.args)
+            elif self.category == 4 and self.selected == 9:
                 self.child = ScrambleSession(self.core, self.args)
             elif self.category == 2 and self.selected == 1:
                 self.child = NCupMonteSession(self.core, self.args)
@@ -3311,7 +3367,7 @@ def dump(core, session: TitleSession, trials: int) -> int:
         print(f"# state={session.state} bytes={len(blob)}")
         for line in canonical(decode(blob)):
             print("  " + line)
-        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, CountSession, MrTimeSession, GraphMappingSession, MatrixReasoningSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, ConcentrationSession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, SyllogismSession, JigsawSession, SudokuSession, GoSession, CrossedWiresSession, CrosswordSession, ScrabbleSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession, BuzzWireSession, DonkeySession, TwoHandsSession, OverrunSession)):
+        if isinstance(session, (NBack3DSession, MarbleMazeSession, YouAreHereSession, SokobanSession, MonkeyLadderSession, CountSession, MrTimeSession, GraphMappingSession, MatrixReasoningSession, InTheDarkSession, FogOfWarSession, RemovalsSession, CustodySession, ConcentrationSession, RecognitionSession, TriviaSession, ReflexSession, AlgebraSession, NumberologySession, SyllogismSession, JigsawSession, SudokuSession, GoSession, CrossedWiresSession, CrosswordSession, ScrabbleSession, ScrambleSession, NCupMonteSession, TrackingSession, LookoutSession, PursuitSession, OutOfSightSession, BuzzWireSession, DonkeySession, TwoHandsSession, OverrunSession)):
             session.action(session.ACTION_START)
         elif isinstance(session, TetrisSession):
             session.action(session.ACTION_SPACE)
@@ -3332,7 +3388,13 @@ def run_window(core, session: TitleSession, width: int, height: int,
     # dark clear made every light-theme task render black text on charcoal.
     pyglet.gl.glClearColor(*window_background_rgba(session))
 
-    renderer = Renderer(Viewport.from_window(window),
+    logo_dir = Path(__file__).resolve().parents[2] / "res" / "Logo"
+    assets = {
+        asset: pyglet.image.load(str(path))
+        for asset, filename in ((1, "logo.png"), (2, "logo-dark.png"))
+        if (path := logo_dir / filename).is_file()
+    }
+    renderer = Renderer(Viewport.from_window(window), assets=assets,
                         font_name=SOURCE_FONT_FAMILIES)
     marble_renderer = None
 

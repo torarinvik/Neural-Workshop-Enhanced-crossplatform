@@ -1,0 +1,100 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/tasks/dispatch_game.elisa"
+
+extern printf(format: cstr, ...) -> i32 can[Console.Write]
+
+def summary(world: DispatchWorld::World&):
+    can Console.Write:
+        _ = printf("end %.17g %.17g %lld %lld %lld\n", world.time, world.damage,
+            world.saved, world.lost, world.false_alarms)
+
+def replay(deal: Dispatch::Deal, policy: bool):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        world: mutable DispatchWorld::World = DispatchWorld::initialize(deal)
+        cycle: mutable i64 = 0
+        while not world.over |world, cycle, policy|:
+            if policy:
+                selected: DispatchReference::Orders = DispatchReference::orders(&world)
+                for i in 0..<selected.count |selected, world, cycle|:
+                    order: DispatchReference::Order = selected.values[i.usize()]
+                    _ = printf("order %lld %lld %lld %lld\n", cycle, order.unit, order.kind, order.index)
+                    _ = DispatchWorld::send(&world, order.unit, order.kind, order.index)
+                for _ in 0..<5 |world|:
+                    DispatchWorld::step(&world, DispatchWorld::SIM_DT)
+            else:
+                unit: i64 = cycle % world.unit_count
+                kind: i64 = [DispatchWorld::INCIDENT, DispatchWorld::STATION, DispatchWorld::REFIT][(cycle % 3).usize()]
+                index: i64 = (cycle / 3) % (Dispatch::SLOTS if kind == DispatchWorld::INCIDENT else 3)
+                accepted: bool = DispatchWorld::send(&world, unit, kind, index)
+                _ = printf("sent %lld %lld\n", cycle, 1 if accepted else 0)
+                DispatchWorld::step(&world, 0.43 if cycle % 2 == 0 else 0.31)
+            events: darray[DispatchWorld::Event] = DispatchWorld::take_events(&world)
+            for event in events |cycle|:
+                _ = printf("event %lld %lld %.17g %.17g\n", cycle, event.kind, event.x, event.y)
+            cycle <- cycle + 1
+        summary(&world)
+
+def emit(rung: i64, rng: mutable MT19937&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        deal: Dispatch::Deal = Dispatch::deal(rung, rng)
+        level: Dispatch::Grade = deal.level
+        _ = printf("%lld %lld %d %.17g %.17g %.17g %.17g %.17g %.17g %lld %.17g %.17g %.17g %.17g %.17g %.17g %.17g %lld\n",
+            level.rung, level.crews, 1.i32() if level.scout else 0.i32(), level.false_rate, level.size_error,
+            level.growth_low, level.growth_high, level.need_low, level.need_high, level.burst,
+            level.lull_low, level.lull_high, level.length, level.refit, level.factor, level.grace,
+            Dispatch::longest_life(level), deal.reports.count.i64())
+        for report in deal.reports:
+            _ = printf("%.17g %.17g %.17g %.17g %.17g %d %.17g\n", report.at, report.x, report.y,
+                report.need, report.growth, 1.i32() if report.false_alarm else 0.i32(), report.factor)
+
+        replay(deal, true)
+        replay(deal, false)
+        idle: DispatchWorld::World = DispatchReference::idle_round(deal)
+        summary(&idle)
+        _ = printf("par %.17g\n", DispatchReference::par(deal))
+
+def controller():
+    can Console.Write, Memory.Allocate, Memory.Release, Abort.Panic:
+        session: mutable DispatchGame::Session = DispatchGame::initialize(8, 2, true, -17, true)
+        _ = DispatchGame::input(&session, DispatchGame::START, 0) can Global{Read,Write}
+        now_ms: mutable i64 = 0
+        for trial in 0..<2 |session, now_ms|:
+            _ = printf("trial %lld %lld %.17g\n", session.rung, session.trial, session.par)
+            while session.phase == DispatchGame::RUNNING |session, now_ms, trial|:
+                if trial == 0:
+                    selection: DispatchReference::Orders = DispatchReference::orders(&session.round.world)
+                    for i in 0..<selection.count |selection, session, now_ms|:
+                        order: DispatchReference::Order = selection.values[i.usize()]
+                        offset: i64 = DispatchGame::FIRST_SLOT if order.kind == DispatchWorld::INCIDENT else DispatchGame::FIRST_REFIT
+                        _ = DispatchGame::input(&session, order.unit, now_ms) can Global{Read,Write}
+                        _ = DispatchGame::input(&session, offset + order.index, now_ms) can Global{Read,Write}
+                now_ms <- now_ms + 250
+                _ = DispatchGame::advance(&session, now_ms, 0.43) can Global{Read,Write}
+                _ = printf("update %lld %lld %.17g %lld\n", session.phase, session.round.coach_kind,
+                    session.round.world.time, session.selected)
+            _ = printf("score %lld %lld %.17g %lld %lld\n", session.rung, session.wins,
+                DispatchGame::mean_damage(&session), session.verdict_saved, session.verdict_lost)
+            early: bool = DispatchGame::advance(&session, now_ms + DispatchGame::FEEDBACK_MS - 1, 0.0) can Global{Read,Write}
+            _ = printf("early %lld\n", 1 if early else 0)
+            now_ms <- now_ms + DispatchGame::FEEDBACK_MS
+            _ = DispatchGame::advance(&session, now_ms, 0.0) can Global{Read,Write}
+        _ = printf("done %lld %lld %.17g %lld\n", session.phase, session.best_rung, DispatchGame::mean_damage(&session),
+            session.round.world.dealt.reports.count.i64())
+        _ = DispatchGame::input(&session, DispatchGame::START, now_ms) can Global{Read,Write}
+        _ = printf("restart %lld %lld %.17g\n", session.rung, session.trial, DispatchGame::mean_damage(&session))
+        DispatchGame::close(&session) can Global{Read,Write}
+
+def main() -> i32:
+    can Console.Write, Memory.Allocate, Memory.Release, Abort.Panic:
+        rungs: i64[14] = [0, 1, 3, 4, 5, 6, 8, 12, 15, 20, 21, 25, 30, 512]
+        for index in 0..<4 |rungs|:
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, (17 + index * 421).u64())
+            for rung in rungs |rng|:
+                region scratch(1048576):
+                    in scratch:
+                        emit(rung, &rng)
+        controller() can Global{Read,Write}
+        return 0.i32()

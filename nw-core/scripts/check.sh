@@ -148,10 +148,10 @@ SOURCE_ROOT="$RUN_DIR/source"
 python3 "$ROOT/scripts/prepare_runtime_sources.py" \
     "$ROOT" "$SOURCE_ROOT" "$ELISA_STAGE1_ROOT"
 
-SUITES=(pyset scheduling timing board grid nback pyrandom stimulus stats sessionscore readouttext trialuitext matching display config gamemode decimal session sessionapp maze fogworld numberology ninarow inthedark crossedwires cookiethief custody donkey tetris removals sokoban sokoban_game go go_rules twohands buzzwire marblemaze syllogism title menu menurow sudoku youarehere hanoi monkeyladder ncupmonte reflex salesman counting tracking concentration recognition lookout pursuit outofsight overrun mrtime jigsaw sokoban3d verbal scramble scrabble trivia crossword graphmapping ravens chess bigfrac expressions algebra glyphs scene_removals scene_monkeyladder scene_hanoi scene_go scene_ninarow scene_crossedwires scene_ncupmonte scene_sudoku scene_chess scene_algebra scene_numberology scene_verbal scene_scramble scene_trivia scene_tracking scene_sokoban scene_salesman scene_counting scene_syllogism scene_maze scene_inthedark scene_overrun scene_crossword scene_lookout scene_pursuit scene_reflex scene_recognition scene_concentration scene_jigsaw scene_donkey scene_custody scene_cookiethief scene_youarehere scene_sokoban3d scene_scrabble scene_mrtime scene_graphmapping scene_outofsight scene_tetris scene_twohands scene_ravens scene_marblemaze scene_buzzwire scene_taskhub scene_fogofwar scene_trialui scene_notice scene_hud scene_readouts scene_graph scene_field scene_menuchrome trialphase textmetrics screen hudtext)
+SUITES=(pyset scheduling timing board grid nback pyrandom stimulus stats sessionscore readouttext trialuitext matching display config gamemode decimal session sessionapp maze fogworld numberology ninarow inthedark crossedwires cookiethief cookiethief_game custody donkey tetris removals sokoban sokoban_game go go_rules twohands buzzwire marblemaze syllogism title menu menurow sudoku youarehere hanoi monkeyladder ncupmonte reflex salesman counting tracking concentration recognition lookout pursuit outofsight overrun mrtime jigsaw sokoban3d verbal scramble scrabble trivia crossword graphmapping hidden_rule hidden_wiring ravens chess bigfrac expressions algebra glyphs scene_removals scene_monkeyladder scene_hanoi scene_go scene_ninarow scene_crossedwires scene_ncupmonte scene_sudoku scene_chess scene_algebra scene_numberology scene_verbal scene_scramble scene_trivia scene_tracking scene_sokoban scene_salesman scene_counting scene_syllogism scene_maze scene_inthedark scene_overrun scene_crossword scene_lookout scene_pursuit scene_reflex scene_recognition scene_concentration scene_jigsaw scene_donkey scene_custody scene_cookiethief scene_youarehere scene_sokoban3d scene_scrabble scene_mrtime scene_graphmapping scene_outofsight scene_tetris scene_twohands scene_ravens scene_marblemaze scene_buzzwire scene_taskhub scene_fogofwar scene_trialui scene_notice scene_hud scene_readouts scene_graph scene_field scene_menuchrome trialphase textmetrics screen hudtext)
 
 # One suite by name, for the inner loop.
-SUITES+=(crossword_capacity crossword_lexicon)
+SUITES+=(crossword_capacity crossword_lexicon hold_it hold_it_audio notebook rooms nearer mirror pov inside touching crossings time_it balance juggler lander beat beat_audio glider catch catch_audio echo_cave echo_cave_audio drone_hoops drone_hoops_sound drone_hoops_audio field_manual field_manual_audio safecracker safecracker_audio stagehand stagehand_audio loading_dock loading_dock_audio gunslinger gunslinger_audio camera camera_render what_next falls sfm drshape drshape_audio drshape_game tuner tuner_audio tuner_recordings tuner_game shadow_play shadow_play_scene captcha captcha_scene signals fold fold_scene beliefs beliefs_scene damkeeper damkeeper_scene sonar sonar_scene gamble gamble_scene dispatch dispatch_scene bluff bluff_scene crossroads crossroads_scene railyard railyard_scene airtraffic airtraffic_scene escort escort_scene sokobanlive sokobanlive_scene kitchen kitchen_scene crane crane_scene ferry ferry_scene docking docking_scene docking_audio rover rover_game rover_audio rover_scene unicycle unicycle_scene unicycle_audio morning_round morning_round_rules morning_round_ride morning_round_words morning_round_audio morning_round_scene heavier heavier_audio heavier_scene full_stop full_stop_audio full_stop_scene missing_word missing_word_audio proofreader proofreader_audio figures_of_speech reading_quiz_audio crazy_cog crazy_cog_audio crazy_cog_scene cipher_lang cipher_abyss_family cipher_abyss_round cipher_abyss_play potter potter_scene conductor conductor_scene tightrope tightrope_scene signpainter signpainter_scene bartender bartender_scene lockpick lockpick_scene airhockey airhockey_scene semaphore semaphore_scene shadowpuppets shadowpuppets_scene nightwatch nightwatch_scene kerbside kerbside_scene steadicam steadicam_scene freekick freekick_scene glove glove_scene byear byear_scene pianotuner pianotuner_scene pianotuner_audio crickethunt crickethunt_scene crickethunt_audio clawmachine clawmachine_scene betweenlines secondthoughts badargument socialsense whichfeeling howstrongly readingpeople whytheyfeel toneofvoice emotionfaces)
 # The exact suite uses the current runtime BigInt intrinsics; the pinned
 # Stage0 runtime is not yet compatible with that runtime source.
 if [[ "${SUITE:-}" == numberology_exact ]]; then
@@ -184,6 +184,8 @@ fi
 # the first:
 #   scripts/elisac_stage1.sh -emit exe -O2 -o /tmp/cfg test/config_sweep.elisa
 STAGE0_ONLY=()
+# These fixtures depend on current Stage1 display, synth, or region support.
+STAGE1_ONLY=(docking_scene docking_audio rover_game rover_audio rover_scene unicycle_scene unicycle_audio morning_round_words morning_round_audio morning_round_scene heavier_audio heavier_scene full_stop full_stop_audio full_stop_scene missing_word missing_word_audio proofreader proofreader_audio figures_of_speech reading_quiz_audio crazy_cog crazy_cog_audio crazy_cog_scene cipher_lang cipher_abyss_family cipher_abyss_round cipher_abyss_play potter potter_scene conductor conductor_scene tightrope tightrope_scene signpainter signpainter_scene bartender bartender_scene lockpick lockpick_scene airhockey airhockey_scene semaphore semaphore_scene shadowpuppets shadowpuppets_scene nightwatch nightwatch_scene kerbside kerbside_scene steadicam steadicam_scene freekick freekick_scene glove glove_scene byear byear_scene pianotuner pianotuner_scene pianotuner_audio crickethunt crickethunt_scene crickethunt_audio clawmachine clawmachine_scene betweenlines secondthoughts badargument socialsense whichfeeling howstrongly readingpeople whytheyfeel toneofvoice emotionfaces)
 
 failures=0
 run_suite() {
@@ -194,9 +196,16 @@ run_suite() {
     local stderr_log="$RUN_DIR/${suite}_${stage}.stderr.log"
     local result_json="$RUN_DIR/${suite}_${stage}.result.json"
     local compile_exit=-1 link_exit=-1 checker_exit=-1
+    local -a precision=()
+    # Dial ticks are emitted at integral crossings. Match the Python
+    # reference without contraction rounding across that boundary.
+    # Recorded audio also uses separate multiplies and additions in Python.
+    if [[ "$suite" == safecracker || "$suite" == safecracker_audio || "$suite" == tuner_recordings || "$suite" == docking || "$suite" == docking_scene || "$suite" == docking_audio || "$suite" == rover || "$suite" == rover_game || "$suite" == rover_audio || "$suite" == rover_scene || "$suite" == unicycle || "$suite" == unicycle_scene || "$suite" == unicycle_audio || "$suite" == morning_round || "$suite" == morning_round_rules || "$suite" == morning_round_ride || "$suite" == morning_round_words || "$suite" == morning_round_audio || "$suite" == morning_round_scene || "$suite" == heavier || "$suite" == heavier_audio || "$suite" == heavier_scene || "$suite" == full_stop || "$suite" == full_stop_audio || "$suite" == full_stop_scene || "$suite" == missing_word || "$suite" == missing_word_audio || "$suite" == proofreader || "$suite" == proofreader_audio || "$suite" == figures_of_speech || "$suite" == reading_quiz_audio || "$suite" == crazy_cog || "$suite" == crazy_cog_audio || "$suite" == crazy_cog_scene || "$suite" == cipher_abyss_play || "$suite" == potter || "$suite" == potter_scene || "$suite" == conductor || "$suite" == conductor_scene || "$suite" == tightrope || "$suite" == tightrope_scene || "$suite" == signpainter || "$suite" == signpainter_scene || "$suite" == bartender || "$suite" == bartender_scene || "$suite" == lockpick || "$suite" == lockpick_scene || "$suite" == airhockey || "$suite" == airhockey_scene || "$suite" == semaphore || "$suite" == semaphore_scene || "$suite" == shadowpuppets || "$suite" == shadowpuppets_scene || "$suite" == kerbside || "$suite" == steadicam || "$suite" == steadicam_scene || "$suite" == freekick || "$suite" == freekick_scene || "$suite" == glove || "$suite" == glove_scene || "$suite" == byear || "$suite" == byear_scene || "$suite" == pianotuner || "$suite" == pianotuner_scene || "$suite" == pianotuner_audio || "$suite" == crickethunt || "$suite" == crickethunt_scene || "$suite" == crickethunt_audio || "$suite" == clawmachine || "$suite" == clawmachine_scene || "$suite" == betweenlines || "$suite" == secondthoughts || "$suite" == badargument || "$suite" == socialsense || "$suite" == whichfeeling || "$suite" == howstrongly || "$suite" == readingpeople || "$suite" == whytheyfeel || "$suite" == toneofvoice || "$suite" == emotionfaces || "$suite" == kerbside_scene || "$suite" == nightwatch || "$suite" == nightwatch_scene ]]; then
+        precision=(env ELISACORE_STRICT_FP=1)
+    fi
 
     if [[ "$stage" == "stage0" ]]; then
-        if "$ELISACORE_BIN" -emit obj -O2 -o "$RUN_DIR/${suite}_${stage}.o" \
+        if ${precision[@]+"${precision[@]}"} "$ELISACORE_BIN" -emit obj -O2 -o "$RUN_DIR/${suite}_${stage}.o" \
                 "$SOURCE_ROOT/test/${suite}_sweep.elisa" >"$compile_log" 2>&1; then
             compile_exit=0
         else
@@ -215,7 +224,7 @@ run_suite() {
             fi
         fi
     else
-        if ELISA_ALLOW_STALE_STAGE1=1 "$ELISA_STAGE1_ROOT/scripts/elisac_stage1.sh" -emit exe -O2 -o "$binary" \
+        if ELISA_ALLOW_STALE_STAGE1=1 ${precision[@]+"${precision[@]}"} "$ELISA_STAGE1_ROOT/scripts/elisac_stage1.sh" -emit exe -O2 -o "$binary" \
                 "$SOURCE_ROOT/test/${suite}_sweep.elisa" >"$compile_log" 2>&1; then
             compile_exit=0
             link_exit=0
@@ -268,6 +277,10 @@ for stage in stage0 stage1; do
         # ${empty_array[*]} as an unbound variable rather than an empty string.
         if [[ "$stage" == "stage1" ]] && [[ " ${STAGE0_ONLY[*]:-} " == *" $suite "* ]]; then
             echo "  ${suite} [${stage}]: SKIPPED (stage1 cannot build this suite)"
+            continue
+        fi
+        if [[ "$stage" == "stage0" ]] && [[ " ${STAGE1_ONLY[*]} " == *" $suite "* ]]; then
+            echo "  ${suite} [${stage}]: SKIPPED (requires current Stage1 runtime modules)"
             continue
         fi
         run_suite "$suite" "$stage" || failures=$((failures + 1))

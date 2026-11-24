@@ -1,0 +1,226 @@
+include "./tasks/rooms.elisa"
+
+module RoomsView:
+    struct Vec:
+        x: f64
+        y: f64
+        z: f64
+
+    struct Point:
+        x: f64
+        y: f64
+
+    struct Camera:
+        eye: Vec
+        forward: Vec
+        right: Vec
+        up: Vec
+
+    struct Polygon:
+        points: mutable Point[6]
+        count: i64
+        colour: u32
+        depth: f64
+        cell: i64
+
+    struct Picture:
+        polygons: mutable Polygon[86]
+        count: mutable i64
+
+    struct Bounds:
+        left: mutable f64
+        bottom: mutable f64
+        right: mutable f64
+        top: mutable f64
+
+    def vec(x: f64, y: f64, z: f64) -> Vec:
+        return Vec{x: x, y: y, z: z}
+
+    def add(a: Vec, b: Vec) -> Vec:
+        return vec(a.x + b.x, a.y + b.y, a.z + b.z)
+
+    def sub(a: Vec, b: Vec) -> Vec:
+        return vec(a.x - b.x, a.y - b.y, a.z - b.z)
+
+    def mul(a: Vec, k: f64) -> Vec:
+        return vec(a.x * k, a.y * k, a.z * k)
+
+    def dot(a: Vec, b: Vec) -> f64:
+        return a.x * b.x + a.y * b.y + a.z * b.z
+
+    def cross(a: Vec, b: Vec) -> Vec:
+        return vec(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x)
+
+    def unit(a: Vec) -> Vec:
+        can Abort.Panic:
+            length: f64 = sqrt(dot(a, a))
+            return vec(a.x / length, a.y / length, a.z / length)
+
+    def yaw(a: Vec, cosine: f64, sine: f64) -> Vec:
+        return vec(cosine * a.x + sine * a.z, a.y, -sine * a.x + cosine * a.z)
+
+    def camera(cols: i64, rows: i64, angle: f64) -> Camera:
+        can Abort.Panic:
+            mid_x: f64 = cols.f64() / 2.0
+            mid_z: f64 = rows.f64() / 2.0
+            back: f64 = mid_z + 4.2
+            eye: Vec = vec(mid_x - back * sin(angle), 5.2 + 0.25 * cols.f64(), mid_z - back * cos(angle))
+            forward: Vec = unit(sub(vec(mid_x, 0.0, mid_z + 0.2), eye))
+            right: Vec = unit(cross(forward, vec(0.0, 1.0, 0.0)))
+            return Camera{eye: eye, forward: forward, right: right, up: cross(right, forward)}
+
+    def project(cam: Camera&, world: Vec) -> Point:
+        delta: Vec = sub(world, cam.eye)
+        z: f64 = dot(delta, cam.forward)
+        return Point{x: dot(delta, cam.right) / z, y: dot(delta, cam.up) / z}
+
+    def bounds(cam: Camera&, cols: i64, rows: i64) -> Bounds:
+        can Abort.Panic:
+            first: Point = project(cam, vec(0.0, 0.0, 0.0))
+            out: mutable Bounds = Bounds{left: first.x, bottom: first.y, right: first.x, top: first.y}
+            for corner in 1..<8 |out, cam, cols, rows|:
+                p: Point = project(cam, vec(cols.f64() if (corner & 1) != 0 else 0.0,
+                    1.2 if (corner & 2) != 0 else 0.0, rows.f64() if (corner & 4) != 0 else 0.0))
+                out.left <- p.x if p.x < out.left
+                out.right <- p.x if p.x > out.right
+                out.bottom <- p.y if p.y < out.bottom
+                out.top <- p.y if p.y > out.top
+            return out
+
+    def tint(colour: u32, shade: f64) -> u32:
+        can Abort.Panic:
+            red: u32 = ((colour >> 24.u32()).f64() * shade).u32()
+            green: u32 = (((colour >> 16.u32()) & 255.u32()).f64() * shade).u32()
+            blue: u32 = (((colour >> 8.u32()) & 255.u32()).f64() * shade).u32()
+            return (red << 24.u32()) | (green << 16.u32()) | (blue << 8.u32()) | 255.u32()
+
+    def polygon(cam: Camera&, vertices: Vec[6]&, count: i64, anchor: Vec, colour: u32, cell: i64) -> Polygon:
+        can Abort.Panic:
+            delta: Vec = sub(anchor, cam.eye)
+            out: mutable Polygon = Polygon{points: zeroed, count: count, colour: colour,
+                depth: sqrt(dot(delta, delta)), cell: cell}
+            for i in 0..<count |cam, vertices, out|:
+                out.points[i.usize()] <- project(cam, vertices[i.usize()])
+            return out
+
+    def insert(view: mutable Picture&, face: Polygon, start: i64):
+        can Abort.Panic:
+            at: mutable i64 = view.count
+            while at > start |at, view, start, face|:
+                previous: Polygon = view.polygons[(at - 1).usize()]
+                break if previous.depth >= face.depth
+                view.polygons[at.usize()] <- previous
+                at <- at - 1
+            view.polygons[at.usize()] <- face
+            view.count <- view.count + 1
+
+    def floor_cell(cam: Camera&, cols: i64, cell: i64, colour: u32) -> Polygon:
+        can Abort.Panic:
+            x: f64 = (cell % cols).f64()
+            z: f64 = (cell / cols).f64()
+            flat: Vec = vec(0.0, 0.0, 0.0)
+            corners: Vec[6] = [vec(x, 0.0, z), vec(x + 1.0, 0.0, z), vec(x + 1.0, 0.0, z + 1.0),
+                vec(x, 0.0, z + 1.0), flat, flat]
+            shade: f64 = 1.0 if (cell % cols + cell / cols) % 2 == 0 else 0.93
+            return polygon(cam, &corners, 4, vec(x + 0.5, 0.0, z + 0.5), tint(colour, shade), cell)
+
+    struct Solid:
+        centre: Vec
+        size: f64
+        height: f64
+        angle: f64
+        cell: i64
+        colour: u32
+
+    def face(view: mutable Picture&, cam: Camera&, solid: Solid&, start: i64, vertices: Vec[6]&, count: i64, normal: Vec):
+        can Abort.Panic:
+            return if dot(normal, sub(cam.eye, vertices[0])) <= 0.000000001
+            light: Vec = unit(vec(-0.4, 0.8, -0.6))
+            strength: f64 = dot(normal, light)
+            colour: u32 = tint(solid.colour, 0.48 + 0.52 * (strength if strength > 0.0 else 0.0))
+            insert(view, polygon(cam, vertices, count, solid.centre, colour, solid.cell), start)
+
+    def box(view: mutable Picture&, cam: Camera&, solid: Solid&, start: i64, tall: bool):
+        can Abort.Panic:
+            width: f64 = solid.size * (0.7 if tall else 1.0)
+            c: f64 = cos(solid.angle)
+            s: f64 = sin(solid.angle)
+            directions: Vec[6] = [vec(1.0, 0.0, 0.0), vec(-1.0, 0.0, 0.0),
+                vec(0.0, 1.0, 0.0), vec(0.0, -1.0, 0.0), vec(0.0, 0.0, 1.0), vec(0.0, 0.0, -1.0)]
+            for side in 0..<6 |view, cam, solid, directions, c, s, width, start|:
+                n: Vec = directions[side.usize()]
+                helper: Vec = vec(0.0, 0.0, 1.0) if side == 2 or side == 3 else vec(0.0, 1.0, 0.0)
+                right: Vec = unit(cross(helper, n))
+                up: Vec = cross(n, right)
+                vertices: mutable Vec[6] = zeroed
+                for i in 0..<4 |vertices, n, right, up, width, c, s, solid|:
+                    a: f64 = -0.5 if i == 0 or i == 3 else 0.5
+                    b: f64 = -0.5 if i < 2 else 0.5
+                    p: Vec = add(mul(n, 0.5), add(mul(right, a), mul(up, b)))
+                    vertices[i.usize()] <- add(solid.centre, yaw(vec(p.x * width, p.y * solid.height, p.z * width), c, s))
+                face(view, cam, solid, start, &vertices, 4, yaw(n, c, s))
+
+    def prism(view: mutable Picture&, cam: Camera&, solid: Solid&, start: i64, pyramid: bool):
+        can Abort.Panic:
+            sides: i64 = 4 if pyramid else 6
+            radius: f64 = solid.size * (0.62 if pyramid else 0.55)
+            top: f64 = solid.centre.y + solid.height / 2.0
+            bottom: f64 = solid.centre.y - solid.height / 2.0
+            base: mutable Vec[6] = zeroed
+            tips: mutable Vec[6] = zeroed
+            underside: mutable Vec[6] = zeroed
+            for i in 0..<sides |sides, solid, radius, base, tips, underside, top, bottom|:
+                angle: f64 = solid.angle + 6.283185307179586 * i.f64() / sides.f64()
+                x: f64 = solid.centre.x + radius * cos(angle)
+                z: f64 = solid.centre.z + radius * sin(angle)
+                base[i.usize()] <- vec(x, bottom, z)
+                tips[i.usize()] <- vec(x, top, z)
+                underside[(sides - 1 - i).usize()] <- base[i.usize()]
+            for i in 0..<sides |sides, solid, base, tips, view, cam, start, top, pyramid|:
+                j: usize = ((i + 1) % sides).usize()
+                first: Vec = base[i.usize()]
+                second: Vec = vec(solid.centre.x, top, solid.centre.z) if pyramid else tips[i.usize()]
+                last: Vec = base[j]
+                points: Vec[6] = [first, second, last if pyramid else tips[j], last, last, last]
+                normal: Vec = unit(cross(sub(second, first), sub(last, first)))
+                outward: Vec = mul(normal, -1.0) if dot(normal, sub(first, solid.centre)) < 0.0 else normal
+                face(view, cam, solid, start, &points, 3 if pyramid else 4, outward)
+            face(view, cam, solid, start, &underside, sides, vec(0.0, -1.0, 0.0))
+            if not pyramid:
+                face(view, cam, solid, start, &tips, sides, vec(0.0, 1.0, 0.0))
+
+    def scene(cam: Camera&, cols: i64, rows: i64, room: Rooms::Room&) -> Picture:
+        can Abort.Panic:
+            view: mutable Picture = zeroed
+            cells: i64 = cols * rows
+            for cell in 0..<cells |cam, cols, room, view|:
+                insert(&view, floor_cell(cam, cols, cell, Rooms::tint(room.tint)), 0)
+            for i in 0..<room.count |room, cols, view, cam, cells|:
+                thing: Rooms::Thing = room.things[i.usize()]
+                height: f64 = thing.size * (1.5 if thing.kind == 1 else 1.0)
+                solid: Solid = Solid{centre: vec((thing.cell % cols).f64() + 0.5, height / 2.0, (thing.cell / cols).f64() + 0.5),
+                    size: thing.size, height: height, angle: thing.yaw, cell: thing.cell, colour: Rooms::colour(thing.colour)}
+                if thing.kind < 2:
+                    box(&view, cam, &solid, cells, thing.kind == 1)
+                else:
+                    prism(&view, cam, &solid, cells, thing.kind == 2)
+            return view
+
+    def inside(p: Polygon&, x: f64, y: f64) -> bool:
+        can Abort.Panic:
+            hit: mutable bool = false
+            previous: mutable Point = p.points[(p.count - 1).usize()]
+            for i in 0..<p.count |hit, p, previous, x, y|:
+                current: Point = p.points[i.usize()]
+                if (previous.y > y) != (current.y > y):
+                    if x < previous.x + (y - previous.y) * (current.x - previous.x) / (current.y - previous.y):
+                        hit <- not hit
+                previous <- current
+            return hit
+
+    def pick(view: Picture&, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            for i in 0..<view.count |view, x, y|:
+                p: Polygon& = &view.polygons[(view.count - 1 - i).usize()]
+                return p.cell if inside(p, x, y)
+            return -1

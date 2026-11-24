@@ -1,0 +1,150 @@
+include "./hidden_rule.elisa"
+
+module HiddenRuleReference:
+    const NEGLIGIBLE: f64 = 0.000001
+    const MAX_TIERS: i64 = 7
+
+    struct Belief:
+        words: i64
+        lights: darray[i64]
+        known: darray[i64]
+        tiers: mutable darray[i64]
+        weights: darray[f64]
+        depth: i64
+
+    # CPython's float sum keeps the lost low bits. They affect both the
+    # stop threshold and which of two almost balanced tests comes first.
+    struct Sum:
+        total: mutable f64
+        correction: mutable f64
+
+    def add(sum: mutable Sum&, value: f64):
+        next: f64 = sum.total + value
+        if sum.total >= value:
+            sum.correction <- sum.correction + ((sum.total - next) + value)
+        else:
+            sum.correction <- sum.correction + ((value - next) + sum.total)
+        sum.total <- next
+
+    def sum_value(sum: Sum&) -> f64:
+        return sum.total + sum.correction
+
+    def count(bits: i64) -> i64:
+        x: u64 = bits.u64()
+        pairs: u64 = x - ((x >> 1.u64()) & 6148914691236517205.u64())
+        fours: u64 = (pairs & 3689348814741910323.u64()) + ((pairs >> 2.u64()) & 3689348814741910323.u64())
+        bytes: u64 = (fours + (fours >> 4.u64())) & 1085102592571150095.u64()
+        halves: u64 = bytes + (bytes >> 8.u64())
+        quarters: u64 = halves + (halves >> 16.u64())
+        return ((quarters + (quarters >> 32.u64())) & 127.u64()).i64()
+
+    def initialize(level: HiddenRule::Grade&, world: HiddenRule::Space&, dealt: HiddenRule::Deal&) -> Belief:
+        can Memory.Allocate, Abort.Panic:
+            words: i64 = (world.count + 63) / 64
+            lights: mutable darray[i64] = Ints::zeros(level.items * words)
+            known: mutable darray[i64] = Ints::zeros(words)
+            # Only rules consistent with the two free examples ever enter
+            # the posterior. Keep their original indices in the mask.
+            for rule in 0..<world.count |rule, world, dealt, lights, known, words, level|:
+                continue if not HiddenRule::lit(world, rule, dealt.seeds[0]) or HiddenRule::lit(world, rule, dealt.seeds[1])
+                word: i64 = rule / 64
+                bit: i64 = (1.u64() << (rule % 64).u64()).i64()
+                Ints::put(&known, word, Ints::at_ref(&known, word) | bit)
+                for item in 0..<level.items |item, rule, world, lights, words, word, bit|:
+                    if HiddenRule::lit(world, rule, item):
+                        offset: i64 = item * words + word
+                        Ints::put(&lights, offset, Ints::at_ref(&lights, offset) | bit)
+            weights: mutable darray[f64] = Floats::zeros(MAX_TIERS)
+            Floats::put(&weights, 0, 1.0)
+            odds: f64 = level.noise / (1.0 - level.noise)
+            depth: mutable i64 = 1
+            for tier in 1..<MAX_TIERS |tier, odds, weights, depth|:
+                weight: f64 = pow(odds, tier.f64())
+                break if weight < NEGLIGIBLE
+                Floats::put(&weights, tier, weight)
+                depth <- depth + 1
+            tiers: mutable darray[i64] = Ints::zeros(depth * words)
+            for word in 0..<words |word, tiers, known|:
+                Ints::put(&tiers, word, Ints::at_ref(&known, word))
+            return Belief{words: words, lights: lights, known: known, tiers: tiers, weights: weights, depth: depth}
+
+    def see(belief: mutable Belief&, item: i64, shown: bool):
+        can Abort.Panic:
+            words: i64 = belief.words
+            remaining: mutable bool = false
+            for word in 0..<words |word, belief, item, shown, words, remaining|:
+                light: i64 = Ints::at_view(&belief.lights, item * words + word)
+                agree: i64 = light if shown else ~light
+                tier: mutable i64 = belief.depth - 1
+                while tier >= 0 |tier, belief, words, word, agree, remaining|:
+                    offset: i64 = tier * words + word
+                    from_prior: i64 = Ints::at_ref(&belief.tiers, offset - words) & ~agree if tier > 0 else 0
+                    next: i64 = (Ints::at_ref(&belief.tiers, offset) & agree) | from_prior
+                    Ints::put(&belief.tiers, offset, next)
+                    remaining <- true if next != 0
+                    tier <- tier - 1
+            if not remaining:
+                for word in 0..<words |word, belief|:
+                    Ints::put(&belief.tiers, word, Ints::at_view(&belief.known, word))
+
+    def probabilities(belief: Belief&, items: i64, chances: mutable darray[f64]&):
+        can Abort.Panic:
+            total: mutable Sum = zeroed
+            for tier in 0..<belief.depth |tier, belief, total|:
+                size: mutable i64 = 0
+                for word in 0..<belief.words |word, tier, belief, size|:
+                    size <- size + count(Ints::at_view(&belief.tiers, tier * belief.words + word))
+                add(&total, Floats::at(belief.weights, tier) * size.f64())
+            denominator: f64 = sum_value(&total)
+            for item in 0..<items |item, belief, chances, denominator|:
+                probability: mutable Sum = zeroed
+                for tier in 0..<belief.depth |tier, belief, item, probability|:
+                    size: mutable i64 = 0
+                    for word in 0..<belief.words |word, tier, belief, item, size|:
+                        mask: i64 = Ints::at_view(&belief.tiers, tier * belief.words + word)
+                        size <- size + count(mask & Ints::at_view(&belief.lights, item * belief.words + word))
+                    add(&probability, Floats::at(belief.weights, tier) * size.f64())
+                Floats::put(chances, item, sum_value(&probability) / denominator)
+
+    def next_test(level: HiddenRule::Grade&, chances: mutable darray[f64]&) -> i64:
+        can Abort.Panic:
+            bright: mutable Sum = zeroed
+            missed: mutable Sum = zeroed
+            false_calls: mutable Sum = zeroed
+            split: mutable f64 = 0.5
+            best: mutable i64 = -1
+            for item in 0..<level.items |item, chances, bright, missed, false_calls, split, best|:
+                chance: f64 = Floats::at_ref(chances, item)
+                add(&bright, chance)
+                if chance < 0.5:
+                    add(&missed, chance)
+                else:
+                    add(&false_calls, 1.0 - chance)
+                distance: f64 = 0.5 - chance if chance < 0.5 else chance - 0.5
+                if distance < split:
+                    split <- distance
+                    best <- item
+            lit: f64 = sum_value(&bright)
+            dark: f64 = level.items.f64() - lit
+            doubt: f64 = (0.5 * sum_value(&missed) / lit if lit > 0.0 else 0.0) + (0.5 * sum_value(&false_calls) / dark if dark > 0.0 else 0.0)
+            return -1 if level.exam.f64() * level.penalty.f64() * doubt <= 1.0 or split >= 0.5 - 0.000000000001
+            return best
+
+    def play(level: HiddenRule::Grade&, world: HiddenRule::Space&, dealt: HiddenRule::Deal&, round: mutable HiddenRule::Round&):
+        can Memory.Allocate, Abort.Panic:
+            belief: mutable Belief = initialize(level, world, dealt)
+            chances: mutable darray[f64] = Floats::zeros(level.items)
+            probabilities(&belief, level.items, &chances)
+            while round.test_count < HiddenRule::BUDGET |round, level, dealt, belief, chances|:
+                item: i64 = next_test(level, &chances)
+                break if item < 0
+                shown: i64 = HiddenRule::test(round, level, dealt, item)
+                see(&belief, item, shown == 1)
+                probabilities(&belief, level.items, &chances)
+            _ = HiddenRule::start_exam(round)
+            while not round.over |round, level, dealt, chances|:
+                item: i64 = HiddenRule::question(round, dealt)
+                _ = HiddenRule::answer(round, level, dealt, Floats::at_ref(&chances, item) >= 0.5)
+
+    def par(level: HiddenRule::Grade&, round: HiddenRule::Round&) -> f64:
+        return HiddenRule::cost(round, level).f64() * level.factor + level.slack

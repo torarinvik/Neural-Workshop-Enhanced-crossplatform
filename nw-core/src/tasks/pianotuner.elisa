@@ -1,0 +1,285 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+extern strtod(text: u8&, end: u8&?) -> f64
+
+# pianotuner.py: turn the pin until the string stops beating. A reference
+# note sounds, and with it a string that is out of tune; the two beat, faster
+# the further apart they are. Turn the pin until the beating stops, then say
+# done. For an interval the string is tuned to where one of its partials
+# meets one of the reference's. From rung 10 a second string is tuned to the
+# first; from rung 13 the strings are stiff and their partials run sharp.
+# Ports 0 and 1 turn the pin up and down quickly, 2 and 3 slowly, for the
+# step they are sent in; port 4 says the string is in tune, at once.
+module PianoTuner:
+    const UP: i64 = 0
+    const DOWN: i64 = 1
+    const UP_FINE: i64 = 2
+    const DOWN_FINE: i64 = 3
+    const DONE: i64 = 4
+    const PORTS: i64 = 5
+    const COARSE: f64 = 60.0
+    const FINE: f64 = 5.0
+    const MOST: i64 = 4
+
+    # The intervals, by index: unison, octave, fifth, fourth, major third.
+    const UNISON: i64 = 0
+    const OCTAVE: i64 = 1
+    const FIFTH: i64 = 2
+    const FOURTH: i64 = 3
+    const THIRD: i64 = 4
+
+    const LIVE: i64 = 0
+    const IN_TUNE: i64 = 1
+    const SHARP: i64 = 2
+    const FLAT: i64 = 3
+    const OUT_OF_TIME: i64 = 4
+
+    struct Grade:
+        rung: mutable i64
+        intervals: mutable i64[5]
+        count: mutable i64
+        strings: mutable i64
+        tol: mutable f64
+        stiff: mutable f64
+        seconds: mutable f64
+
+    struct Plan:
+        interval: mutable i64
+        off: mutable f64
+        pin: mutable f64
+
+    struct Job:
+        level: mutable Grade
+        ref: mutable f64
+        plan: mutable Plan[4]
+
+    struct Run:
+        job: mutable Job
+        t: mutable f64
+        k: mutable i64
+        tuned: mutable f64[4]
+        count: mutable i64
+        since: mutable f64
+        pitch: mutable f64
+        end: mutable f64
+        result: mutable i64
+        # The error the verdict was given at, in cents.
+        said: mutable f64
+        notes: mutable darray[DrShapeDeal::Note]
+        # livesound's two tracks, the reference and the string, are always
+        # set together: when, the pitch of each, and their loudness (both
+        # ears alike), and the phase each track has reached there.
+        times: mutable darray[f64]
+        ref_f: mutable darray[f64]
+        string_f: mutable darray[f64]
+        gain: mutable darray[f64]
+        ref_ph: mutable darray[f64]
+        string_ph: mutable darray[f64]
+
+    # 2.0 ** x by the C library's pow, as CPython takes it. A base the
+    # optimizer can see is 2 makes it call exp2, which can be an ulp off, so
+    # the base is read from the text "2", which it cannot see through.
+    def power2(x: f64) -> f64:
+        can Abort.Panic:
+            digits: u8[2] = [50.u8(), 0.u8()]
+            two: f64 = strtod(&digits[0], null)
+            return pow(two, x)
+
+    def py_min(a: f64, b: f64) -> f64:
+        return b if b < a else a
+
+    def py_max(a: f64, b: f64) -> f64:
+        return b if b > a else a
+
+    def ratio(interval: i64) -> i64[2]:
+        return [1, 1] if interval == UNISON else ([2, 1] if interval == OCTAVE else ([3, 2] if interval == FIFTH else
+            ([4, 3] if interval == FOURTH else [5, 4])))
+
+    def grade(rung: i64) -> Grade:
+        can Abort.Panic:
+            r: i64 = rung if rung > 1 else 1
+            level: mutable Grade = zeroed
+            level.rung <- r
+            level.strings <- 1
+            level.seconds <- 60.0
+            level.count <- 1
+            if r < 4:
+                level.intervals[0] <- UNISON
+                tols: f64[3] = [20.0, 12.0, 8.0]
+                level.tol <- tols[(r - 1).usize()]
+            elif r < 7:
+                level.intervals[0] <- OCTAVE if r == 4 else FIFTH
+                tols: f64[3] = [10.0, 8.0, 6.0]
+                level.tol <- tols[(r - 4).usize()]
+            elif r < 10:
+                level.intervals[0] <- FOURTH if r == 7 else THIRD
+                tols: f64[3] = [6.0, 6.0, 5.0]
+                level.tol <- tols[(r - 7).usize()]
+            elif r < 13:
+                level.intervals <- [UNISON, OCTAVE, FIFTH, 0, 0]
+                level.count <- 3
+                level.strings <- 2
+                tols: f64[3] = [5.0, 4.0, 4.0]
+                level.tol <- tols[(r - 10).usize()]
+            else:
+                level.intervals <- [UNISON, OCTAVE, FIFTH, FOURTH, THIRD]
+                level.count <- 5
+                more: i64 = 2 + (r - 13) / 3
+                level.strings <- 4 if 4 < more else more
+                level.tol <- 4.0 * pow(0.92, (r - 12).f64())
+                level.stiff <- py_min(0.004, 0.0004 * (r - 12).f64())
+            return level
+
+    # How far partial n of a stiff string runs sharp.
+    def stretch(n: i64, b: f64) -> f64:
+        return sqrt(1.0 + b * n.f64() * n.f64())
+
+    # The string's fundamental at which it does not beat with ref: its
+    # partial den meets the reference's partial num.
+    def target(ref: f64, interval: i64, b: f64) -> f64:
+        r: i64[2] = ratio(interval)
+        return ref * r[0].f64() * stretch(r[0], b) / (r[1].f64() * stretch(r[1], b))
+
+    # 1200 * math.log(a / b, 2), which CPython works out as log(a / b) / log(2).
+    def cents(a: f64, b: f64) -> f64:
+        return 1200.0 * (log(a / b) / log(2.0))
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Job:
+        can Abort.Panic:
+            job: mutable Job = zeroed
+            job.level <- grade(rung)
+            job.ref <- py_uniform(draw, 196.0, 262.0)
+            strings: i64 = job.level.strings
+            for s in 0..<strings |job, draw|:
+                low: f64 = py_max(40.0, 3.0 * job.level.tol)
+                size: f64 = py_uniform(draw, low, 150.0)
+                off: f64 = size * (-1.0 if py_choice_index(draw, 2) == 0 else 1.0)
+                interval: i64 = job.level.intervals[py_choice_index(draw, job.level.count).usize()]
+                pin: f64 = py_uniform(draw, 0.0, 360.0)
+                job.plan[s.usize()] <- Plan{interval: interval, off: off, pin: pin}
+            return job
+
+    # What the string now being tuned is tuned against.
+    def anchor(run: Run&) -> f64:
+        can Abort.Panic:
+            return run.tuned[(run.count - 1).usize()] if run.count > 0 else run.job.ref
+
+    def goal(run: Run&) -> f64:
+        can Abort.Panic:
+            return target(anchor(run), run.job.plan[run.k.usize()].interval, run.job.level.stiff)
+
+    # Cents the string is off, sharp positive.
+    def cents_off(run: Run&) -> f64:
+        can Abort.Panic:
+            return cents(run.pitch, goal(run))
+
+    # Python's float %: the remainder takes the divisor's sign.
+    def py_mod(x: f64, m: f64) -> f64:
+        r: f64 = fmod(x, m)
+        return 0.0 if r == 0.0 else (r + m if (r < 0.0) != (m < 0.0) else r)
+
+    # The pin's angle on screen: turns with the pitch, from anywhere.
+    def pin(run: Run&) -> f64:
+        can Abort.Panic:
+            return py_mod(run.job.plan[run.k.usize()].pin + 3.0 * cents_off(run), 360.0)
+
+    # Track.set on both tracks at once: the same moment set again keeps the
+    # last word; a new one carries each phase on by the mean pitch.
+    def sound(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            s1: f64 = stretch(1, run.job.level.stiff)
+            g: f64 = 0.0 if run.result != LIVE else 0.16
+            rf: f64 = anchor(run) * s1
+            sf: f64 = run.pitch * s1
+            n: i64 = run.times.count.i64()
+            if n > 0 and run.t <= run.times[(n - 1).usize()] + 1e-9:
+                run.ref_f[(n - 1).usize()] <- rf
+                run.string_f[(n - 1).usize()] <- sf
+                run.gain[(n - 1).usize()] <- g
+                return
+            rph: mutable f64 = 0.0
+            sph: mutable f64 = 0.0
+            if n > 0:
+                last: usize = (n - 1).usize()
+                span: f64 = run.t - run.times[last]
+                rph <- run.ref_ph[last] + 0.5 * (run.ref_f[last] + rf) * span
+                sph <- run.string_ph[last] + 0.5 * (run.string_f[last] + sf) * span
+            run.times.push(run.t)
+            run.ref_f.push(rf)
+            run.string_f.push(sf)
+            run.gain.push(g)
+            run.ref_ph.push(rph)
+            run.string_ph.push(sph)
+
+    def note(run: mutable Run&, f: f64, voice: i64, gain: f64):
+        can Abort.Panic, Memory.Allocate:
+            run.notes.push(DrShapeDeal::Note{t: run.t, dur: 0.3, freq: f, pan: 0.0, pan2: 0.0, gain: gain, gain2: gain,
+                bright: 0.8, voice: voice, seed: run.notes.count.i64() + 1, who: -1, room: 0.0})
+
+    def start_string(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            run.pitch <- goal(run) * power2(run.job.plan[run.k.usize()].off / 1200.0)
+            run.since <- run.t
+            sound(run)
+
+    def begin(job: Job) -> Run:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = Run{job: job, t: 0.0, k: 0, tuned: [0.0, 0.0, 0.0, 0.0], count: 0, since: 0.0, pitch: 0.0,
+                end: 0.0, result: LIVE, said: 0.0, notes: [], times: [], ref_f: [], string_f: [], gain: [], ref_ph: [],
+                string_ph: []}
+            start_string(&run)
+            run.end <- job.level.seconds * job.level.strings.f64() + 2.0
+            return run
+
+    def step(run: mutable Run&, dt: f64, control: i64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            run.t <- run.t + dt
+            up: f64 = 1.0 if control == UP else 0.0
+            down: f64 = 1.0 if control == DOWN else 0.0
+            up_fine: f64 = 1.0 if control == UP_FINE else 0.0
+            down_fine: f64 = 1.0 if control == DOWN_FINE else 0.0
+            rate: f64 = COARSE * (up - down) + FINE * (up_fine - down_fine)
+            run.pitch <- run.pitch * power2(rate * dt / 1200.0)
+            if run.t - run.since > run.job.level.seconds:
+                run.result <- OUT_OF_TIME
+                run.said <- cents_off(run)
+                note(run, 110.0, 1, 0.3)
+            sound(run)
+
+    def done(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            e: f64 = cents_off(run)
+            if fabs(e) > run.job.level.tol:
+                run.result <- SHARP if e > 0.0 else FLAT
+                run.said <- e
+                note(run, 110.0, 1, 0.3)
+                sound(run)
+                return
+            run.tuned[run.count.usize()] <- run.pitch
+            run.count <- run.count + 1
+            note(run, 1320.0, 0, 0.2)
+            if run.count == run.job.level.strings:
+                run.result <- IN_TUNE
+                run.said <- e
+                sound(run)
+                return
+            run.k <- run.k + 1
+            start_string(run)
+
+    def act(run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate:
+            done(run) if port == DONE
+
+    # The reference autopilot: coarse while far off, fine when near, then
+    # done. -1 is no port.
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            e: f64 = cents_off(run)
+            return (DOWN if e > 0.0 else UP) if fabs(e) > 12.0
+            return (DOWN_FINE if e > 0.0 else UP_FINE) if fabs(e) > run.job.level.tol * 0.3
+            return DONE

@@ -100,6 +100,8 @@ def _fill(cmd, kind, color, a, b, c, d, e, f, ref, ln):
         # `d` is the weight. A shell written before it existed reads nothing
         # there and draws at normal weight, which is what it drew anyway.
         cmd.update(x=a, y=b, size=c, color=color, bold=bool(d))
+        if f:
+            cmd.update(rotation=e, face=int(f) - 1)
     elif kind == 12:
         cmd.update(verdict=ref)
     elif kind == 13:

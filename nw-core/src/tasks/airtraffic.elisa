@@ -1,0 +1,617 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module AirTraffic:
+    const PI: f64 = 3.141592653589793
+    const WORLD_W: f64 = 160.0
+    const WORLD_H: f64 = 100.0
+    const SEPARATION: f64 = 3.5
+    const WARNING: f64 = 9.0
+    const TURN_RATE: f64 = 50.0
+    const HOLD_RATE: f64 = 70.0
+    const FIX: f64 = 30.0
+    const SLOTS: i64 = 8
+    const PORTS: i64 = 12
+    const MOST_PLANES: i64 = 12
+    const MOST_STORMS: i64 = 3
+    const MOST_RUNWAYS: i64 = 2
+    const HOLD: i64 = 0
+    const LEFT: i64 = 1
+    const RIGHT: i64 = 2
+    const LAND: i64 = 3
+
+    struct Grade:
+        rung: i64
+        planes: i64
+        interval: f64
+        speed: f64
+        runways: i64
+        storms: i64
+        fuel: f64
+        closure: bool
+        wind_shift: bool
+        occupy: f64
+
+    struct Point:
+        x: f64
+        y: f64
+
+    struct Runway:
+        point: Point
+        heading: f64
+        length: f64
+
+    struct Arrival:
+        due: f64
+        point: Point
+        heading: f64
+        runway: i64
+        fuel: f64
+
+    struct Storm:
+        x: mutable f64
+        y: mutable f64
+        vx: mutable f64
+        vy: mutable f64
+        radius: f64
+
+    struct Sky:
+        level: Grade
+        runways: Runway[MOST_RUNWAYS]
+        arrivals: Arrival[MOST_PLANES]
+        storms: Storm[MOST_STORMS]
+        closed_runway: mutable i64
+        closed_from: mutable f64
+        closed_until: mutable f64
+        shift: mutable f64
+        seconds: mutable f64
+
+    def grade(rung: i64) -> Grade:
+        can Abort.Panic:
+            r: i64 = rung if rung > 0 else 1
+            top: i64 = r - 20 if r > 20 else 0
+            return Grade{rung: r, planes: 3 if r < 4 else (5 if r < 10 else (6 if r < 20 else (7 + top / 2 if top < 10 else 12))),
+                interval: 14.0 if r < 4 else (12.0 if r < 10 else (11.0 if r < 20 else fmax(5.0, 9.0 - 0.35 * top.f64()))),
+                speed: 6.0 if r < 10 else (7.0 if r < 20 else fmin(9.5, 7.5 + 0.2 * top.f64())),
+                runways: 1 if r < 4 else 2, storms: 0 if r < 7 else (1 if r < 13 else (2 if r < 20 else 3)),
+                fuel: -1.0 if r < 10 else (125.0 if r < 20 else fmax(70.0, 105.0 - 3.5 * top.f64())),
+                closure: r >= 13, wind_shift: r >= 16, occupy: 3.0}
+
+    def radians(degrees: f64) -> f64:
+        return degrees * (PI / 180.0)
+
+    def heading_to(x: f64, y: f64) -> f64:
+        return atan2(y, x) * (180.0 / PI)
+
+    def entry(draw: mutable MT19937&, due: f64, runway: i64, fuel: f64) -> Arrival:
+        can Abort.Panic:
+            side: i64 = py_randbelow(draw, 4.u64()).i64()
+            x: f64 = 2.0 if side == 0 else (WORLD_W - 2.0 if side == 1 else py_uniform(draw, 20.0, WORLD_W - 20.0))
+            y: f64 = py_uniform(draw, 15.0, WORLD_H - 15.0) if side < 2 else (2.0 if side == 2 else WORLD_H - 2.0)
+            aim: f64 = heading_to(WORLD_W / 2.0 - x, WORLD_H / 2.0 - y)
+            return Arrival{due: due, point: Point{x: x, y: y}, heading: aim + py_uniform(draw, -25.0, 25.0),
+                runway: runway, fuel: fuel}
+
+    def deal_seed(rung: i64, seed: i64) -> Sky:
+        can Abort.Panic:
+            draw: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&draw, magnitude)
+            level: Grade = grade(rung)
+            sky: mutable Sky = Sky{level: level, runways: zeroed, arrivals: zeroed, storms: zeroed,
+                closed_runway: -1, closed_from: 0.0, closed_until: 0.0, shift: -1.0, seconds: 0.0}
+            headings: f64[6] = [0.0, 180.0, 30.0, 210.0, -30.0, 150.0]
+            heading: f64 = headings[py_randbelow(&draw, 6.u64()).usize()]
+            angle: f64 = radians(heading + 90.0)
+            for i in 0..<level.runways |sky, level, heading, angle|:
+                side: f64 = 0.0 if level.runways == 1 else (2 * i - 1).f64()
+                sky.runways[i.usize()] <- Runway{point: Point{x: WORLD_W / 2.0 + cos(angle) * 9.0 * side,
+                    y: WORLD_H / 2.0 + sin(angle) * 9.0 * side}, heading: heading, length: 16.0}
+            time: mutable f64 = py_uniform(&draw, 1.0, 3.0)
+            previous: mutable Point = zeroed
+            for i in 0..<level.planes |sky, level, draw, time, previous|:
+                due: f64 = py_round_decimal(time, 100.0)
+                plan: mutable Arrival = zeroed
+                for _ in 0..<20 |plan, i, due, level, draw, previous|:
+                    plan <- entry(&draw, due, i % level.runways, level.fuel)
+                    break if i == 0 or py_hypot(plan.point.x - previous.x, plan.point.y - previous.y) > 40.0
+                previous <- plan.point
+                sky.arrivals[i.usize()] <- plan
+                time <- time + level.interval * py_uniform(&draw, 0.75, 1.25)
+            for i in 0..<level.storms |sky, draw|:
+                west: f64 = py_uniform(&draw, 15.0, 50.0)
+                east: f64 = py_uniform(&draw, 110.0, 145.0)
+                x: f64 = west if py_randbelow(&draw, 2.u64()) == 0.u64() else east
+                y: f64 = py_uniform(&draw, 20.0, WORLD_H - 20.0)
+                angle: f64 = py_uniform(&draw, 0.0, 2.0 * PI)
+                sky.storms[i.usize()] <- Storm{x: x, y: y, vx: cos(angle) * 0.9, vy: sin(angle) * 0.9,
+                    radius: py_uniform(&draw, 6.0, 8.5)}
+            last: f64 = sky.arrivals[(level.planes - 1).usize()].due
+            sky.seconds <- py_round_decimal(last + 70.0 + 10.0 * level.planes.f64() / 2.0, 10.0)
+            if level.closure:
+                sky.closed_from <- py_uniform(&draw, 0.25, 0.5) * last + 5.0
+                sky.closed_runway <- py_randbelow(&draw, level.runways.u64()).i64()
+                sky.closed_until <- sky.closed_from + 20.0
+            if level.wind_shift:
+                sky.shift <- py_uniform(&draw, 0.4, 0.7) * last + 8.0
+            return sky
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Sky:
+        can Abort.Panic:
+            return deal_seed(rung, py_randbelow(rng, 1073741824.u64()).i64())
+
+    const FREE: i64 = 0
+    const HOLDING: i64 = 1
+    const APPROACH: i64 = 2
+    const FINAL: i64 = 3
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const TIMEOUT: i64 = 2
+    const FUEL_LOSS: i64 = 3
+    const AIRSPACE_LOSS: i64 = 4
+    const STORM_LOSS: i64 = 5
+    const COLLISION: i64 = 6
+
+    const LANDED: i64 = 0
+    const WIND_CHANGE: i64 = 1
+    const MISSED_RUNWAY: i64 = 2
+    const RUNWAY_CLOSED: i64 = 3
+    const RUNWAY_BUSY: i64 = 4
+    const NOT_ALIGNED: i64 = 5
+    const NOTICES: i64 = 6
+
+    struct Plane:
+        number: i64
+        slot: i64
+        runway: i64
+        x: mutable f64
+        y: mutable f64
+        heading: mutable f64
+        target: mutable f64
+        fuel: mutable f64
+        mode: mutable i64
+        cleared: mutable bool
+
+    struct Notice:
+        time: f64
+        why: i64
+        point: Point
+
+    struct Run:
+        sky: Sky
+        elapsed: mutable f64
+        waiting: mutable i64
+        planes: Plane[SLOTS]
+        active: mutable i64
+        landed: i64[MOST_PLANES]
+        landed_count: mutable i64
+        storms: Storm[MOST_STORMS]
+        busy_until: f64[MOST_RUNWAYS]
+        selected: mutable i64
+        result: mutable i64
+        loss: mutable Point
+        first_slot: mutable i64
+        second_slot: mutable i64
+        notices: Notice[NOTICES]
+        notice_count: mutable i64
+        flipped: mutable bool
+
+    def initialize(sky: Sky&) -> Run:
+        return Run{sky: sky[0], elapsed: 0.0, waiting: 0, planes: zeroed, active: 0, landed: zeroed,
+            landed_count: 0, storms: sky.storms, busy_until: zeroed, selected: -1, result: LIVE,
+            loss: zeroed, first_slot: -1, second_slot: -1, notices: zeroed, notice_count: 0, flipped: false}
+
+    def wrap(angle: f64) -> f64:
+        can Abort.Panic:
+            value: f64 = fmod(angle + 180.0, 360.0)
+            return (value + 360.0 if value < 0.0 else value) - 180.0
+
+    def runway_heading(run: Run&, k: i64) -> f64:
+        can Abort.Panic:
+            return run.sky.runways[k.usize()].heading + (180.0 if run.flipped else 0.0)
+
+    def threshold(run: Run&, k: i64) -> Point:
+        can Abort.Panic:
+            rw: Runway = run.sky.runways[k.usize()]
+            h: f64 = radians(runway_heading(run, k))
+            return Point{x: rw.point.x - cos(h) * rw.length / 2.0, y: rw.point.y - sin(h) * rw.length / 2.0}
+
+    def fix(run: Run&, k: i64) -> Point:
+        can Abort.Panic:
+            p: Point = threshold(run, k)
+            h: f64 = radians(runway_heading(run, k))
+            return Point{x: p.x - cos(h) * FIX, y: p.y - sin(h) * FIX}
+
+    def closed(run: Run&, k: i64) -> bool:
+        return run.sky.closed_runway == k and run.elapsed >= run.sky.closed_from and run.elapsed < run.sky.closed_until
+
+    def plane_in(run: Run&, slot: i64) -> i64:
+        can Abort.Panic:
+            for i in 0..<run.active |run, slot|:
+                return i if run.planes[i.usize()].slot == slot
+            return -1
+
+    def apply(run: mutable Run&, port: i64) -> bool:
+        can Abort.Panic:
+            return false if port < 0 or port >= PORTS or run.result != LIVE
+            slot: i64 = port if port < SLOTS else run.selected
+            i: i64 = plane_in(run, slot)
+            return false if i < 0
+            if port < SLOTS:
+                run.selected <- slot
+                return true
+            p: mutable Plane& = &run.planes[i.usize()]
+            order: i64 = port - SLOTS
+            p.cleared <- order == LAND
+            if order == HOLD:
+                p.mode <- HOLDING
+            elif order == LAND:
+                p.mode <- APPROACH
+            else:
+                base: f64 = p.target if p.mode == FREE else p.heading
+                p.target <- base + (45.0 if order == LEFT else -45.0)
+                p.mode <- FREE
+            return true
+
+    def notice(run: mutable Run&, p: Plane, why: i64):
+        can Abort.Panic:
+            run.notices[(run.notice_count % NOTICES).usize()] <- Notice{time: run.elapsed, why: why,
+                point: Point{x: p.x, y: p.y}}
+            run.notice_count <- run.notice_count + 1
+
+    def discontinue(p: mutable Plane&):
+        p.mode <- FREE
+        p.cleared <- false
+        p.target <- p.heading
+
+    def go_around(run: mutable Run&, i: i64, why: i64):
+        can Abort.Panic:
+            discontinue(&run.planes[i.usize()])
+            notice(run, run.planes[i.usize()], why)
+
+    def lose(run: mutable Run&, p: Plane, why: i64):
+        run.result <- why
+        run.loss <- Point{x: p.x, y: p.y}
+        run.first_slot <- p.slot
+
+    def touch_down(run: mutable Run&, i: i64) -> bool:
+        can Abort.Panic:
+            p: Plane = run.planes[i.usize()]
+            k: i64 = p.runway
+            why: i64 = RUNWAY_CLOSED if closed(run, k) else (RUNWAY_BUSY if run.elapsed < run.busy_until[k.usize()] else
+                (NOT_ALIGNED if fabs(wrap(p.heading - runway_heading(run, k))) >= 35.0 else LANDED))
+            if why != LANDED:
+                go_around(run, i, why)
+                return false
+            run.busy_until[k.usize()] <- run.elapsed + run.sky.level.occupy
+            run.landed[run.landed_count.usize()] <- p.number
+            run.landed_count <- run.landed_count + 1
+            notice(run, p, LANDED)
+            run.selected <- -1 if run.selected == p.slot
+            for at in i..<(run.active - 1) |run|:
+                run.planes[at.usize()] <- run.planes[(at + 1).usize()]
+            run.active <- run.active - 1
+            return true
+
+    def turned(heading: f64, want: f64, dt: f64) -> f64:
+        can Abort.Panic:
+            most: f64 = TURN_RATE * dt
+            return heading + fmax(-most, fmin(most, wrap(want - heading)))
+
+    # A removed plane is reported to the caller so the next one can be
+    # advanced at the same array index, preserving Python's arrival order.
+    def fly(run: mutable Run&, i: i64, dt: f64) -> bool:
+        can Abort.Panic:
+            p: mutable Plane = run.planes[i.usize()]
+            if p.mode == HOLDING:
+                p.heading <- p.heading + HOLD_RATE * dt
+            elif p.mode == FREE:
+                p.heading <- turned(p.heading, p.target, dt)
+            elif p.mode == APPROACH:
+                target: Point = fix(run, p.runway)
+                p.heading <- turned(p.heading, heading_to(target.x - p.x, target.y - p.y), dt)
+                p.mode <- FINAL if py_hypot(target.x - p.x, target.y - p.y) < 4.0
+            elif p.mode == FINAL:
+                target: Point = threshold(run, p.runway)
+                h: f64 = radians(runway_heading(run, p.runway))
+                ux: f64 = cos(h)
+                uy: f64 = sin(h)
+                along: f64 = (p.x - target.x) * ux + (p.y - target.y) * uy
+                aim: f64 = fmin(along + 11.0, 0.5)
+                p.heading <- turned(p.heading, heading_to(target.x + ux * aim - p.x, target.y + uy * aim - p.y), dt)
+                if py_hypot(target.x - p.x, target.y - p.y) < 2.5:
+                    run.planes[i.usize()] <- p
+                    return touch_down(run, i)
+                if along > 4.0:
+                    discontinue(&p)
+                    notice(run, p, MISSED_RUNWAY)
+            h: f64 = radians(p.heading)
+            speed: f64 = run.sky.level.speed
+            p.x <- p.x + cos(h) * speed * dt
+            p.y <- p.y + sin(h) * speed * dt
+            if run.sky.level.fuel >= 0.0:
+                p.fuel <- p.fuel - dt
+            run.planes[i.usize()] <- p
+            if run.sky.level.fuel >= 0.0 and p.fuel <= 0.0:
+                lose(run, p, FUEL_LOSS)
+                return false
+            if p.x < -1.0 or p.x > WORLD_W + 1.0 or p.y < -1.0 or p.y > WORLD_H + 1.0:
+                lose(run, p, AIRSPACE_LOSS)
+                return false
+            for j in 0..<run.sky.level.storms |run, p|:
+                storm: Storm = run.storms[j.usize()]
+                if py_hypot(p.x - storm.x, p.y - storm.y) < storm.radius:
+                    lose(run, p, STORM_LOSS)
+                    return false
+            return false
+
+    def separation(run: mutable Run&):
+        can Abort.Panic:
+            for i in 0..<run.active |run|:
+                a: Plane = run.planes[i.usize()]
+                for j in (i + 1)..<run.active |run, a|:
+                    b: Plane = run.planes[j.usize()]
+                    if py_hypot(a.x - b.x, a.y - b.y) < SEPARATION:
+                        run.loss <- Point{x: (a.x + b.x) / 2.0, y: (a.y + b.y) / 2.0}
+                        run.first_slot <- a.slot
+                        run.second_slot <- b.slot
+                        run.result <- COLLISION
+                        return
+
+    def spawn(run: mutable Run&):
+        can Abort.Panic:
+            used: mutable i64 = 0
+            for i in 0..<run.active |run, used|:
+                used <- used | (1 << run.planes[i.usize()].slot)
+            while run.active < SLOTS and run.waiting < run.sky.level.planes |run, used|:
+                arrival: Arrival = run.sky.arrivals[run.waiting.usize()]
+                break if arrival.due > run.elapsed
+                slot: mutable i64 = 0
+                while (used & (1 << slot)) != 0 |used, slot|:
+                    slot <- slot + 1
+                run.planes[run.active.usize()] <- Plane{number: run.waiting, slot: slot, runway: arrival.runway,
+                    x: arrival.point.x, y: arrival.point.y, heading: arrival.heading,
+                    target: arrival.heading, fuel: arrival.fuel, mode: FREE, cleared: false}
+                run.waiting <- run.waiting + 1
+                run.active <- run.active + 1
+                used <- used | (1 << slot)
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic:
+            return if run.result != LIVE
+            run.elapsed <- run.elapsed + dt
+            if run.sky.shift >= 0.0 and not run.flipped and run.elapsed >= run.sky.shift:
+                run.flipped <- true
+                for i in 0..<run.active |run|:
+                    mode: i64 = run.planes[i.usize()].mode
+                    if mode == APPROACH or mode == FINAL:
+                        go_around(run, i, WIND_CHANGE)
+            spawn(run)
+            for i in 0..<run.sky.level.storms |run, dt|:
+                storm: mutable Storm& = &run.storms[i.usize()]
+                storm.x <- storm.x + storm.vx * dt
+                storm.y <- storm.y + storm.vy * dt
+                storm.vx <- -storm.vx if storm.x <= storm.radius or storm.x >= WORLD_W - storm.radius
+                storm.vy <- -storm.vy if storm.y <= storm.radius or storm.y >= WORLD_H - storm.radius
+            i: mutable i64 = 0
+            while i < run.active |run, dt, i|:
+                removed: bool = fly(run, i, dt)
+                return if run.result != LIVE
+                i <- i + 1 if not removed
+            separation(run)
+            return if run.result != LIVE
+            if run.active == 0 and run.waiting == run.sky.level.planes:
+                run.result <- CLEAR
+            elif run.elapsed >= run.sky.seconds:
+                run.result <- TIMEOUT
+
+    struct Track:
+        samples: Point[12]
+
+    struct Conflict:
+        first: i64
+        second: i64
+
+    struct Instruction:
+        slot: i64
+        order: i64
+
+    def storm_axis(value: f64, low: f64, high: f64) -> f64:
+        can Abort.Panic:
+            span: f64 = high - low
+            raw: f64 = fmod(value - low, 2.0 * span)
+            offset: f64 = raw + (2.0 * span if raw < 0.0 else 0.0)
+            return low + (offset if offset <= span else 2.0 * span - offset)
+
+    def storm_at(storm: Storm, later: f64) -> Point:
+        can Abort.Panic:
+            return Point{x: storm_axis(storm.x + storm.vx * later, storm.radius, WORLD_W - storm.radius),
+                y: storm_axis(storm.y + storm.vy * later, storm.radius, WORLD_H - storm.radius)}
+
+    def threatened(run: Run&, x: f64, y: f64, margin: f64) -> i64:
+        can Abort.Panic:
+            for i in 0..<run.sky.level.storms |run, x, y, margin|:
+                storm: Storm = run.storms[i.usize()]
+                for j in 0..<5 |storm, x, y, margin, i|:
+                    p: Point = storm_at(storm, 8.0 * j.f64() / 4.0)
+                    if py_hypot(x - p.x, y - p.y) < storm.radius + margin:
+                        return i
+            return -1
+
+    def future(run: Run&, p: Plane) -> Track:
+        can Abort.Panic:
+            track: mutable Track = zeroed
+            x: mutable f64 = p.x
+            y: mutable f64 = p.y
+            h: mutable f64 = p.heading
+            for i in 0..<12 |track, x, y, h, p, run|:
+                if p.mode == HOLDING:
+                    h <- h + HOLD_RATE * 0.5
+                elif p.mode == FREE:
+                    h <- turned(h, p.target, 0.5)
+                else:
+                    goal: Point = fix(run, p.runway) if p.mode == APPROACH else threshold(run, p.runway)
+                    h <- turned(h, heading_to(goal.x - x, goal.y - y), 0.5)
+                x <- x + cos(radians(h)) * run.sky.level.speed * 0.5
+                y <- y + sin(radians(h)) * run.sky.level.speed * 0.5
+                track.samples[i.usize()] <- Point{x: x, y: y}
+            return track
+
+    def conflict(run: Run&) -> Conflict:
+        can Abort.Panic:
+            tracks: mutable Track[SLOTS] = zeroed
+            for i in 0..<run.active |run, tracks|:
+                tracks[i.usize()] <- future(run, run.planes[i.usize()])
+            worst: mutable f64 = SEPARATION + 3.0
+            first: mutable i64 = -1
+            second: mutable i64 = -1
+            for i in 0..<run.active |run, tracks, worst, first, second|:
+                a: Plane = run.planes[i.usize()]
+                for j in (i + 1)..<run.active |run, tracks, a, i, worst, first, second|:
+                    b: Plane = run.planes[j.usize()]
+                    close: mutable f64 = py_hypot(a.x - b.x, a.y - b.y)
+                    for k in 0..<12 |i, j, tracks, close|:
+                        ap: Point = tracks[i.usize()].samples[k.usize()]
+                        bp: Point = tracks[j.usize()].samples[k.usize()]
+                        close <- fmin(close, py_hypot(ap.x - bp.x, ap.y - bp.y))
+                    if close < worst:
+                        worst <- close
+                        first <- i
+                        second <- j
+            return Conflict{first: first, second: second}
+
+    def near_segment(px: f64, py: f64, a: Point, b: Point) -> f64:
+        can Abort.Panic:
+            dx: f64 = b.x - a.x
+            dy: f64 = b.y - a.y
+            span: f64 = dx * dx + dy * dy
+            share: f64 = 0.0 if span == 0.0 else fmax(0.0, fmin(1.0, ((px - a.x) * dx + (py - a.y) * dy) / span))
+            return py_hypot(px - (a.x + share * dx), py - (a.y + share * dy))
+
+    def path_clear(run: Run&, p: Plane, radius: f64) -> bool:
+        can Abort.Panic:
+            origin: Point = Point{x: p.x, y: p.y}
+            approach: Point = fix(run, p.runway)
+            strip: Point = threshold(run, p.runway)
+            gone: mutable f64 = 0.0
+            for leg in 0..<2 |run, p, radius, origin, approach, strip, gone|:
+                a: Point = origin if leg == 0 else approach
+                b: Point = approach if leg == 0 else strip
+                for i in 0..<run.active |run, p, radius, a, b|:
+                    other: Plane = run.planes[i.usize()]
+                    continue if other.number == p.number
+                    reach: f64 = radius * 2.0 + SEPARATION + 2.0 if other.mode == HOLDING else SEPARATION + 6.0
+                    return false if near_segment(other.x, other.y, a, b) < reach
+                length: f64 = py_hypot(b.x - a.x, b.y - a.y)
+                for k in 0..<(floor(length / 4.0).i64() + 1) |run, a, b, length, gone|:
+                    f: f64 = fmin(1.0, k.f64() * 4.0 / fmax(length, 0.000001))
+                    p: Point = Point{x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f}
+                    when: f64 = (gone + f * length) / run.sky.level.speed + 2.0
+                    for j in 0..<run.sky.level.storms |run, p, when|:
+                        storm: Storm = run.storms[j.usize()]
+                        at: Point = storm_at(storm, when)
+                        return false if py_hypot(p.x - at.x, p.y - at.y) < storm.radius + 5.0
+                gone <- gone + length
+            return true
+
+    def no_instruction() -> Instruction:
+        return Instruction{slot: -1, order: -1}
+
+    def steer(p: Plane, want: f64) -> Instruction:
+        can Abort.Panic:
+            base: f64 = p.target if p.mode == FREE else p.heading
+            diff: f64 = wrap(want - base)
+            if p.mode != FREE or fabs(diff) > 25.0:
+                return Instruction{slot: p.slot, order: LEFT if diff > 0.0 else RIGHT}
+            return no_instruction()
+
+    def priority(p: Plane) -> i64:
+        return (2 if p.cleared else 0) + (1 if p.mode == HOLDING else 0)
+
+    def dodge(run: Run&, clash: Conflict, radius: f64) -> Instruction:
+        can Abort.Panic:
+            return no_instruction() if clash.first < 0
+            a: Plane = run.planes[clash.first.usize()]
+            b: Plane = run.planes[clash.second.usize()]
+            swap: bool = priority(a) > priority(b) or (priority(a) == priority(b) and a.number < b.number)
+            mover: Plane = b if swap else a
+            other: Plane = a if swap else b
+            away: f64 = heading_to(mover.x - other.x, mover.y - other.y)
+            if mover.mode == FREE and not mover.cleared and fabs(wrap(mover.heading - away)) > 90.0:
+                room: f64 = radius * 2.0 + 1.5
+                if room < mover.x and mover.x < WORLD_W - room and room < mover.y and mover.y < WORLD_H - room:
+                    return Instruction{slot: mover.slot, order: HOLD}
+                center: f64 = heading_to(WORLD_W / 2.0 - mover.x, WORLD_H / 2.0 - mover.y)
+                return steer(mover, (away + center) / 2.0 if fabs(wrap(away - center)) < 150.0 else center)
+            return steer(mover, away) if mover.mode == HOLDING
+            return no_instruction()
+
+    def shelter(run: Run&, radius: f64) -> Instruction:
+        can Abort.Panic:
+            margin: f64 = radius * 2.0 + 5.0
+            for i in 0..<run.active |run, radius, margin|:
+                p: Plane = run.planes[i.usize()]
+                storm_i: i64 = threatened(run, p.x, p.y, margin)
+                if storm_i >= 0 and (not p.cleared or not path_clear(run, p, radius)):
+                    storm: Storm = run.storms[storm_i.usize()]
+                    ax: f64 = p.x - storm.x
+                    ay: f64 = p.y - storm.y
+                    cx: f64 = WORLD_W / 2.0 - p.x
+                    cy: f64 = WORLD_H / 2.0 - p.y
+                    n: f64 = py_hypot(ax, ay)
+                    m: f64 = py_hypot(cx, cy)
+                    dn: f64 = n if n > 0.0 else 1.0
+                    dm: f64 = m if m > 0.0 else 1.0
+                    away: f64 = heading_to(ax / dn + 0.7 * cx / dm, ay / dn + 0.7 * cy / dm)
+                    dodge_order: Instruction = steer(p, away)
+                    return dodge_order if dodge_order.slot >= 0
+                    continue
+                continue if p.cleared or p.mode != FREE
+                room: f64 = radius * 2.6
+                inside: bool = room < p.x and p.x < WORLD_W - room and room < p.y and p.y < WORLD_H - room
+                if inside:
+                    crowded: mutable bool = false
+                    for j in 0..<run.active |run, p, i, radius, crowded|:
+                        other: Plane = run.planes[j.usize()]
+                        if i != j and py_hypot(p.x - other.x, p.y - other.y) < radius * 2.4 + 3.0:
+                            crowded <- true
+                            break
+                    return Instruction{slot: p.slot, order: HOLD} if not crowded
+                else:
+                    center: f64 = heading_to(WORLD_W / 2.0 - p.x, WORLD_H / 2.0 - p.y)
+                    return steer(p, center) if fabs(wrap(p.target - center)) > 70.0
+            return no_instruction()
+
+    def clear_for_landing(run: Run&, radius: f64) -> Instruction:
+        can Abort.Panic:
+            return no_instruction() if run.sky.shift >= 0.0 and not run.flipped and run.elapsed + 25.0 > run.sky.shift
+            for k in 0..<run.sky.level.runways |run, radius|:
+                continue if closed(run, k)
+                continue if run.sky.closed_runway == k and run.elapsed < run.sky.closed_from and run.elapsed + 25.0 > run.sky.closed_from
+                busy: mutable bool = false
+                for i in 0..<run.active |run, k, busy|:
+                    p: Plane = run.planes[i.usize()]
+                    if p.cleared and p.runway == k:
+                        busy <- true
+                        break
+                continue if busy
+                best: mutable i64 = -1
+                fuel: mutable f64 = 0.0
+                for i in 0..<run.active |run, k, radius, best, fuel|:
+                    p: Plane = run.planes[i.usize()]
+                    continue if p.runway != k or p.cleared or (p.mode != FREE and p.mode != HOLDING)
+                    # Active planes preserve arrival order, so equal fuel keeps the oldest.
+                    if (best < 0 or p.fuel < fuel) and path_clear(run, p, radius):
+                        best <- p.slot
+                        fuel <- p.fuel
+                return Instruction{slot: best, order: LAND} if best >= 0
+            return no_instruction()
+
+    def autopilot(run: Run&) -> Instruction:
+        can Abort.Panic:
+            radius: f64 = run.sky.level.speed / radians(HOLD_RATE)
+            avoiding: Instruction = dodge(run, conflict(run), radius)
+            return avoiding if avoiding.slot >= 0
+            holding: Instruction = shelter(run, radius)
+            return holding if holding.slot >= 0
+            return clear_for_landing(run, radius)

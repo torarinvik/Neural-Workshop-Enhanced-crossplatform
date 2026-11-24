@@ -1,0 +1,112 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/tasks/nightwatch_audio.elisa"
+
+extern printf(format: cstr, ...) -> i32 can[Console.Write]
+
+# Night Watch against nightwatch.py, for nightwatch_diff.py: the grade
+# table, dealt nights, and every step of play -- the reference autopilot at
+# nine rungs, nobody at all, clicks on the empty floor until the whistle is
+# gone, a hand that goes for the guard and the cat, and the view turned
+# left and right along a wide floor.
+
+def pcm(run: NightWatch::Run&, bank: DrShapeAudio::Bank&, start: f64):
+    can Console.Write, Memory.Allocate, Memory.Release, Abort.Panic:
+        region audio(524288):
+            in audio:
+                bytes: mutable u8[8824] = zeroed
+                used: i64 = NightWatchAudio::render(run, bank, start, start + 0.1, &bytes[0], 8824)
+                _ = printf("audio %.17g\n", start)
+                for j in 0..<used |bytes|:
+                    _ = printf("%02x", bytes[j.usize()].i32())
+                _ = printf("\n")
+
+# Mode 3: put the torch on whoever is not a thief, and click.
+def wrong(run: NightWatch::Run&) -> i64:
+    can Abort.Panic:
+        return -1 if run.result != NightWatch::LIVE
+        return HandView::RELEASE if run.hand.down
+        best: mutable i64 = -1
+        nearest: mutable f64 = 0.0
+        for k in 0..<run.night.count |run, best, nearest|:
+            continue if run.night.walkers[k.usize()].kind == NightWatch::THIEF
+            q: NightWatch::Spot = NightWatch::spot(run, k)
+            continue if not q.valid
+            d: f64 = py_hypot(q.x - run.hand.x, q.y - run.hand.y)
+            if best < 0 or d < nearest:
+                best <- k
+                nearest <- d
+        return -1 if best < 0
+        return HandView::PRESS if NightWatch::under(run) == best
+        q: NightWatch::Spot = NightWatch::spot(run, best)
+        return HandView::toward(&run.hand, q.x, q.y, 6.0)
+
+# The player for each mode: 0 the autopilot, 1 nobody, 2 clicks at the top
+# edge, 3 the wrong people, 4 the view turned left and right.
+def player(run: NightWatch::Run&, mode: i64, n: i64) -> i64:
+    can Abort.Panic:
+        return NightWatch::pilot(run) if mode == 0
+        return -1 if mode == 1
+        if mode == 2:
+            script: i64[6] = [0, 0, 0, 0, 12, 13]
+            return script[(n % 6).usize()]
+        return wrong(run) if mode == 3
+        return -1 if n % 3 != 0
+        return NightWatch::LEFT if (n / 30) % 2 == 0 else NightWatch::RIGHT
+
+def replay(rung: i64, seed: i64, mode: i64):
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        region trial(8388608):
+            in trial:
+                draw: mutable MT19937 = zeroed
+                mt_seed_int(&draw, seed.u64())
+                night: NightWatch::Night = NightWatch::deal(rung, &draw)
+                _ = printf("night %lld %lld %lld %lld %d %u %lld %lld %lld\n", mode, rung, seed, night.seed,
+                    1 if night.valid else 0, py_getrandbits(&draw, 32).u32(), night.thief, night.guard, night.count)
+                for k in 0..<night.count |night|:
+                    w: NightWatch::Walker = night.walkers[k.usize()]
+                    _ = printf("walker %lld %lld %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n", w.kind, w.colour, w.enters,
+                        w.start_x, w.start_z, w.goal_x, w.goal_z, w.speed, w.phase)
+                run: mutable NightWatch::Run = NightWatch::begin(night)
+                n: mutable i64 = 0
+                while run.result == NightWatch::LIVE |run, mode, n|:
+                    port: i64 = player(&run, mode, n)
+                    NightWatch::act(&run, port)
+                    NightWatch::step(&run, 1.0 / 60.0)
+                    _ = printf("%lld %lld %.17g %.17g %d %.17g %.17g %lld %lld %lld %.17g %.17g %lld %lld", port, run.result,
+                        run.hand.x, run.hand.y, 1 if run.hand.down else 0, run.time, run.cam, run.caught, run.strikes,
+                        run.blasts, run.left_until, run.right_until, NightWatch::under(&run), run.wrong)
+                    for k in 0..<night.count |run|:
+                        at: NightWatch::Spot = NightWatch::where(&run, k)
+                        if at.valid:
+                            _ = printf(" %.17g %.17g", at.x, at.y)
+                        else:
+                            _ = printf(" n n")
+                        _ = printf(" %d %.17g %d", 1 if run.gone[k.usize()] else 0, run.step_at[k.usize()],
+                            1 if NightWatch::lit(&run, k) else 0)
+                    _ = printf("\n")
+                    n <- n + 1
+                _ = printf("end %lld %lld %lld\n", run.result, run.caught, run.wrong)
+                _ = printf("notes %lld\n", run.notes.count.i64())
+                for cue in run.notes:
+                    _ = printf("%lld %lld %.17g %.17g %.17g %.17g %.17g\n",
+                        cue.seed, cue.voice, cue.t, cue.dur, cue.freq, cue.gain, cue.pan)
+                bank: DrShapeAudio::Bank = NightWatchAudio::patches()
+                pcm(&run, &bank, 2.0)
+                pcm(&run, &bank, 4.0)
+                pcm(&run, &bank, run.time - 0.04)
+
+def main() -> i32:
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        for rung in 0..<81:
+            g: NightWatch::Grade = NightWatch::grade(rung)
+            _ = printf("grade %lld %lld %lld %.17g %.17g %.17g %d %d %.17g %lld %.17g\n", g.rung, g.thieves, g.others,
+                g.half, g.cross, g.beam, 1 if g.fixed else 0, 1 if g.telling else 0, g.weave, g.strikes, g.seconds)
+        for rung in [1.i64(), 4.i64(), 7.i64(), 10.i64(), 13.i64(), 16.i64(), 20.i64(), 25.i64(), 30.i64()]:
+            replay(rung, 17, 0)
+        replay(1, 19, 1)
+        replay(1, 19, 2)
+        replay(4, 19, 3)
+        replay(7, 19, 4)
+        return 0

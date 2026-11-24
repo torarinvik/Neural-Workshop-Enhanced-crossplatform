@@ -1,0 +1,195 @@
+include "./reading_quiz.elisa"
+
+module HowStrongly:
+    # howstrongly.py: an EQ-Bench dialogue and four emotions; first which
+    # is felt most, then how strongly each is felt, on 0, 2, ..., 10, the
+    # four answers together within the rung's tolerance.
+    const SCALE_SIZE: i64 = 6
+
+    struct Grade:
+        rung: i64
+        strongest: bool
+        tolerance: f64
+        seconds: f64
+        items: i64
+
+    struct Dialogue:
+        text: dstr
+        who: dstr
+        emotions: darray[dstr]
+        scores: darray[f64]
+
+    struct Corpus:
+        dialogues: mutable darray[Dialogue]
+
+    struct Round:
+        level: Grade
+        quiz: ReadingQuiz::Round
+
+    def grade(requested: i64) -> Grade:
+        r: i64 = requested if requested > 0 else 1
+        tolerance: mutable f64 = 0.0
+        if r >= 4:
+            raw: f64 = 8.0 - 2.0 * ((r - 3) / 2).f64()
+            tolerance <- raw if raw > 0.0 else 0.0
+        raw_seconds: f64 = 60.0 - 2.0 * (r - 1).f64()
+        seconds: f64 = raw_seconds if raw_seconds > 20.0 else 20.0
+        return Grade{rung: r, strongest: r < 4, tolerance: tolerance, seconds: seconds, items: 8 if r < 4 else 6}
+
+    def scale(index: i64) -> f64:
+        return (2 * index).f64()
+
+    # _nearest: the scale point closest to v, the lower one on a tie.
+    def nearest(v: f64) -> i64:
+        best: mutable i64 = 0
+        for k in 1..<SCALE_SIZE |best, v|:
+            best <- k if fabs(scale(k) - v) < fabs(scale(best) - v)
+        return best
+
+    # _chance: how often answering at random comes within the tolerance.
+    def chance(answers: darray[i64]&, tolerance: f64) -> f64:
+        can Abort.Panic, Memory.Allocate:
+            n: i64 = answers.count.i64()
+            picks: mutable darray[i64] = []
+            for _ in 0..<n |picks|:
+                picks.push(0)
+            hits: mutable i64 = 0
+            total: mutable i64 = 0
+            while true |picks, hits, total, n, answers, tolerance|:
+                total <- total + 1
+                err: mutable f64 = 0.0
+                for i in 0..<n |err, picks, answers|:
+                    err <- err + fabs(scale(picks[i.usize()]) - scale(answers[i.usize()]))
+                hits <- hits + 1 if err <= tolerance
+                # itertools.product: the last position turns fastest.
+                position: mutable i64 = n - 1
+                while position >= 0 and picks[position.usize()] == SCALE_SIZE - 1 |position, picks|:
+                    picks[position.usize()] <- 0
+                    position <- position - 1
+                break if position < 0
+                picks[position.usize()] <- picks[position.usize()] + 1
+            return hits.f64() / total.f64()
+
+    def comb(n: i64, k: i64) -> f64:
+        result: mutable i64 = 1
+        for i in 0..<k |result, n|:
+            result <- result * (n - i) / (i + 1)
+        return result.f64()
+
+    # feelings.need_for: the fewest right of n that guessing at chance
+    # reaches no more than 3% of the time.
+    def need_for(n: i64, chance: f64) -> i64:
+        for need in 0..<(n + 1) |n, chance|:
+            p: mutable f64 = 0.0
+            for j in need..<(n + 1) |p, n, chance|:
+                p <- p + comb(n, j) * pow(chance, j.f64()) * pow(1.0 - chance, (n - j).f64())
+            return need if p <= 0.03
+        return n
+
+    def text_of(words: cstr) -> dstr:
+        can Abort.Panic, Memory.Allocate:
+            result: mutable dstr = []
+            dstr_append_cstr(&result, words)
+            return result
+
+    def strongest_item(level: Grade, dialogue: Dialogue&) -> ReadingQuiz::Item:
+        can Abort.Panic, Memory.Allocate:
+            count: i64 = dialogue.scores.count.i64()
+            top: mutable f64 = dialogue.scores[0]
+            for score in dialogue.scores |top|:
+                top <- score if score > top
+            # sorted(scores)[-2]: the largest once the first top is set aside.
+            k: mutable i64 = -1
+            second: mutable f64 = -1.0e308
+            for i in 0..<count |k, second, dialogue, top|:
+                score: f64 = dialogue.scores[i.usize()]
+                if k < 0 and score == top:
+                    k <- i
+                elif score > second:
+                    second <- score
+            return zeroed if second > top - 2.0
+            ask: mutable dstr = []
+            dstr_append_cstr(&ask, "At the end, what does ")
+            dstr_append_dstr(&ask, dialogue.who)
+            dstr_append_cstr(&ask, " feel most?")
+            options: mutable darray[dstr] = []
+            for emotion in dialogue.emotions |options|:
+                options.push(emotion)
+            steps: darray[ReadingQuiz::Step] = [ReadingQuiz::Step{ask: ask, options: options, answer: k, wide: false, values: []}]
+            return ReadingQuiz::Item{prompt: dialogue.text, steps: steps, seconds: level.seconds, title: "A dialogue",
+                truth: dialogue.emotions[k.usize()], tolerance: 0.0, scored: false}
+
+    def intensity_item(level: Grade, dialogue: Dialogue&, worst: mutable f64&) -> ReadingQuiz::Item:
+        can Abort.Panic, Memory.Allocate:
+            steps: mutable darray[ReadingQuiz::Step] = []
+            answers: mutable darray[i64] = []
+            labels: mutable darray[dstr] = []
+            values: mutable darray[f64] = []
+            for k in 0..<SCALE_SIZE |labels, values|:
+                label: mutable dstr = []
+                dstr_append_i64(&label, 2 * k)
+                labels.push(label)
+                values.push(scale(k))
+            for i in 0..<dialogue.emotions.count.i64() |steps, answers, dialogue, labels, values|:
+                ask: mutable dstr = []
+                dstr_append_cstr(&ask, "How strongly does ")
+                dstr_append_dstr(&ask, dialogue.who)
+                dstr_append_cstr(&ask, " feel: ")
+                dstr_append_dstr(&ask, dialogue.emotions[i.usize()])
+                dstr_append_cstr(&ask, "?")
+                answer: i64 = nearest(dialogue.scores[i.usize()])
+                answers.push(answer)
+                steps.push(ReadingQuiz::Step{ask: ask, options: labels, answer: answer, wide: false, values: values})
+            # No one answer given to all four may pass.
+            for c in 0..<SCALE_SIZE |answers, level|:
+                err: mutable f64 = 0.0
+                for answer in answers |err, c|:
+                    err <- err + fabs(scale(c) - scale(answer))
+                return zeroed if err <= level.tolerance
+            odds: f64 = chance(&answers, level.tolerance)
+            worst <- odds if odds > worst
+            truth: mutable dstr = []
+            for i in 0..<answers.count.i64() |truth, dialogue, answers|:
+                dstr_append_cstr(&truth, ", ") if i > 0
+                dstr_append_dstr(&truth, dialogue.emotions[i.usize()])
+                dstr_append_cstr(&truth, " ")
+                dstr_append_i64(&truth, 2 * answers[i.usize()])
+            return ReadingQuiz::Item{prompt: dialogue.text, steps: steps, seconds: level.seconds, title: "A dialogue",
+                truth: truth, tolerance: level.tolerance, scored: true}
+
+    def build(level: Grade, draw: mutable MT19937&, corpus: Corpus&) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            count: i64 = corpus.dialogues.count.i64()
+            return zeroed if count == 0
+            # pool * max(1, ceil(30 / len(pool))): few may come round again.
+            copies: i64 = (30 + count - 1) / count
+            pool: mutable darray[i64] = []
+            for copy in 0..<(copies if copies > 1 else 1) |pool, count|:
+                for i in 0..<count |pool|:
+                    pool.push(i)
+            py_shuffle_i64(draw, &pool)
+            items: mutable darray[ReadingQuiz::Item] = []
+            worst: mutable f64 = 0.0
+            for index in pool |items, worst, level, corpus|:
+                break if items.count.i64() >= level.items
+                dialogue: Dialogue = corpus.dialogues[index.usize()]
+                item: ReadingQuiz::Item = strongest_item(level, &dialogue) if level.strongest else intensity_item(level, &dialogue, &worst)
+                items.push(item) if item.steps.count > 0.usize()
+            return zeroed if items.count.i64() < level.items
+            odds: f64 = 0.25 if level.strongest else worst
+            chance_need: i64 = need_for(level.items, odds)
+            # ceil(0.75 * 8) and ceil(0.67 * 6)
+            skill_need: i64 = 6 if level.strongest else 5
+            need: i64 = chance_need if chance_need > skill_need else skill_need
+            return Round{level: level, quiz: ReadingQuiz::Round{items: items, need: need}}
+
+    def deal(level: Grade, draw: mutable MT19937&, corpus: Corpus&) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            for _ in 0..<40 |level, draw, corpus|:
+                next: mutable MT19937 = zeroed
+                mt_seed_int(&next, py_getrandbits(draw, 32))
+                round: Round = build(level, &next, corpus)
+                # The reference player answers every dialogue right away, so
+                # every built round clears the score and time checks.
+                return round if round.quiz.items.count > 0.usize()
+            return zeroed

@@ -1,0 +1,126 @@
+include "./drshape_audio.elisa"
+include "./pianotuner.elisa"
+
+# livesound.py for Piano Tuner: two continuous tracks, the reference and the
+# string, each six partials of a stiff string, set once a step and sliding in
+# a straight line between settings, its phase the integral of its pitch,
+# played by table lookup; then the run's synth notes (bell, wood), and the
+# whole cut to 16-bit stereo. The run keeps every setting and the phase each
+# track had reached there, as Track.set does.
+module PianoTunerAudio:
+    const RATE: i64 = 22050
+    const TABLE: i64 = 4096
+    const MASK: i64 = 4095
+    const HOLD: f64 = 0.25
+    const PI: f64 = 3.141592653589793
+
+    struct Bank:
+        patches: DrShapeAudio::Bank
+        # livesound's _SIN, an array('f'): kept at single precision, as the
+        # reference keeps it.
+        sine: darray[f64]
+
+    @inline(never)
+    def sine(angle: f64) -> f64:
+        return sin(angle)
+
+    def bank() -> Bank:
+        can Abort.Panic, Memory.Allocate:
+            patches: mutable DrShapeAudio::Bank = zeroed
+            patches.count <- 2
+            voices: i64[2] = [DrShapeAudio::BELL, DrShapeAudio::WOOD]
+            draw: mutable MT19937 = zeroed
+            for i in 0..<2 |patches, draw, voices|:
+                mt_seed_int(&draw, (i + 1).u64())
+                patches.patches[i.usize()] <- DrShapeAudio::make_patch(voices[i.usize()], &draw, 0.0)
+            table: mutable darray[f64] = []
+            for i in 0..<TABLE |table|:
+                table.push(sine(2.0 * PI * i.f64() / TABLE.f64()).f32().f64())
+            return Bank{patches: patches, sine: table}
+
+    def segment_at(times: darray[f64]&, t: f64) -> i64:
+        can Abort.Panic:
+            low: mutable i64 = 0
+            high: mutable i64 = times.count.i64()
+            while low < high |times, t, low, high|:
+                middle: i64 = (low + high) / 2
+                if t < times[middle.usize()]:
+                    high <- middle
+                else:
+                    low <- middle + 1
+            return low - 1 if low > 0 else 0
+
+    # Track.render for one track (0 the reference, 1 the string).
+    def render_track(out: mutable darray[f64]&, run: PianoTuner::Run&, bank: Bank&, track: i64, t0: f64, n: i64):
+        can Abort.Panic:
+            times: darray[f64]& = &run.times
+            freqs: darray[f64]& = &run.ref_f if track == 0 else &run.string_f
+            phases: darray[f64]& = &run.ref_ph if track == 0 else &run.string_ph
+            count: i64 = times.count.i64()
+            return if count == 0
+            b: f64 = run.job.level.stiff
+            weights: f64[6] = [1.0, 0.55, 0.4, 0.28, 0.2, 0.14]
+            mults: mutable f64[6] = zeroed
+            for p in 0..<6 |mults, b|:
+                mults[p.usize()] <- (p + 1).f64() * PianoTuner::stretch(p + 1, b) / PianoTuner::stretch(1, b)
+            end: f64 = times[(count - 1).usize()] + HOLD
+            k: mutable i64 = segment_at(times, t0)
+            i: mutable i64 = ceil((times[0] - t0) * RATE.f64()).i64()
+            i <- 0 if i < 0
+            while i < n and k < count |out, run, bank, times, freqs, phases, count, k, i, t0, n, end, mults, weights|:
+                ta: f64 = times[k.usize()]
+                last: bool = k + 1 >= count
+                tb: f64 = end if last else times[(k + 1).usize()]
+                stop_at: i64 = ceil((tb - t0) * RATE.f64()).i64()
+                stop: i64 = n if n < stop_at else stop_at
+                if stop > i:
+                    width: f64 = tb - ta
+                    span: f64 = width if width > 1e-9 else 1e-9
+                    f0: f64 = freqs[k.usize()]
+                    f1: f64 = f0 if last else freqs[(k + 1).usize()]
+                    l0: f64 = run.gain[k.usize()]
+                    l1: f64 = 0.0 if last else run.gain[(k + 1).usize()]
+                    if fmax(l0, l1) >= 1e-4:
+                        ph0: f64 = phases[k.usize()]
+                        slope: f64 = (f1 - f0) / span
+                        for j in i..<stop |out, bank, t0, ta, span, l0, l1, ph0, f0, slope, mults, weights|:
+                            s: f64 = t0 + j.f64() / RATE.f64() - ta
+                            continue if s < 0.0
+                            w: f64 = s / span
+                            g: f64 = l0 + (l1 - l0) * w
+                            continue if g <= 1e-5
+                            turn: f64 = ph0 + f0 * s + 0.5 * slope * s * s
+                            v: mutable f64 = 0.0
+                            for p in 0..<6 |bank, turn, mults, weights, v|:
+                                index: i64 = (turn * mults[p.usize()] * TABLE.f64()).i64() & MASK
+                                v <- v + weights[p.usize()] * bank.sine[index.usize()]
+                            out[(2 * j).usize()] <- out[(2 * j).usize()] + v * g
+                            out[(2 * j + 1).usize()] <- out[(2 * j + 1).usize()] + v * g
+                    i <- stop
+                k <- k + 1
+
+    # livesound.mix: the tracks, then the notes, cut to 16-bit stereo.
+    def render(run: PianoTuner::Run&, bank: Bank&, begin: f64, end: f64, output: mutable u8&, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 0 if not (end > begin)
+            n: i64 = py_round_half_even((end - begin) * RATE.f64())
+            return 0 if n <= 0 or n > capacity / 4
+            out: mutable darray[f64] = TonePcm::empty(n)
+            for track in 0..<2 |out, run, bank, begin, n|:
+                render_track(&out, run, bank, track, begin, n)
+            if run.notes.count > 0:
+                raw: mutable darray[u8] = []
+                for _ in 0..<(4 * n) |raw|:
+                    raw.push(0.u8())
+                written: i64 = DrShapeAudio::write(&run.notes, &bank.patches, begin, end, &raw[0], 4 * n)
+                for j in 0..<(written / 2) |out, raw|:
+                    word: i64 = raw[(2 * j).usize()].i64() + 256 * raw[(2 * j + 1).usize()].i64()
+                    sample: i64 = word - 65536 if word >= 32768 else word
+                    out[j.usize()] <- out[j.usize()] + sample.f64() / 32768.0
+            for j in 0..<(2 * n) |out, output|:
+                v: f64 = out[j.usize()]
+                clipped: f64 = 1.0 if v > 1.0 else (-1.0 if v < -1.0 else v)
+                pcm: u16 = (clipped * 30000.0).i16().u16()
+                output[(2 * j).usize()] <- (pcm & 255.u16()).u8()
+                output[(2 * j + 1).usize()] <- (pcm >> 8).u8()
+            return 4 * n

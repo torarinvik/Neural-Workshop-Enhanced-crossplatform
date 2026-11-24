@@ -1,3 +1,6 @@
+include "../jigsaw_photo_assets.elisa"
+include "../jigsaw_layout.elisa"
+
 # Jigsaw Puzzle: put a scrambled photograph back together.
 #
 # Port of the portable half of neural_workshop/ui/jigsaw.py
@@ -26,10 +29,6 @@ module Jigsaw:
     const SMALLEST_SIDE: i64 = 2
     const LARGEST_SIDE: i64 = 10
 
-    # The gap ruled between tiles, in pixels. Wide enough that tile edges never
-    # fuse into a finished-looking picture before it is finished.
-    const SEAM: f64 = 2.0
-
     # How efficient a solution has to be before an adaptive run grows the grid,
     # and how far below that it falls before the grid shrinks. Efficiency is
     # the minimum number of swaps over the number used, so one is perfect.
@@ -38,7 +37,10 @@ module Jigsaw:
 
     const FEEDBACK_SECONDS: f64 = 1.6
 
-    const MOST_TILES: i64 = 100
+    const PIECE_OPTION_BASE: i64 = 2500
+
+    def tile_limit(video: bool) -> i64:
+        return JigsawPhotoAssets::MAX_VIDEO_TILES if video else JigsawPhotoAssets::MAX_PHOTO_TILES
     const MOST_PUZZLES: i64 = 64
 
     const PHASE_READY: i64 = 0
@@ -51,6 +53,39 @@ module Jigsaw:
             capped: i64 = LARGEST_SIDE if side > LARGEST_SIDE else side
             return SMALLEST_SIDE if capped < SMALLEST_SIDE else capped
 
+    # Round sqrt(pieces * aspect) using the half-integer boundaries.
+    def bounded_pieces(pieces: i64, video: bool) -> i64:
+        limit: i64 = tile_limit(video)
+        return limit if pieces > limit else pieces
+
+    def piece_columns(pieces: i64, video: bool = false) -> i64:
+        numerator: i64 = bounded_pieces(pieces, video) * (16 if video else 4)
+        denominator: i64 = 3 if video else 1
+        columns: mutable i64 = 1
+        while numerator > denominator * (2 * columns + 1) * (2 * columns + 1) |columns, numerator, denominator|:
+            columns <- columns + 1
+        return columns
+
+    def piece_rows(pieces: i64, columns: i64, video: bool = false) -> i64:
+        rows: i64 = (bounded_pieces(pieces, video) + columns - 1) / columns
+        return JigsawPhotoAssets::VIDEO_HEIGHT if video and rows > JigsawPhotoAssets::VIDEO_HEIGHT else rows
+
+    def piece_count(pieces: i64, video: bool = false) -> i64:
+        columns: i64 = piece_columns(pieces, video)
+        return columns * piece_rows(pieces, columns, video)
+
+    def allowed_pieces(pieces: i64) -> bool:
+        return pieces >= 2
+
+    def adjacent_piece_grid(pieces: i64, delta: i64, video: bool = false) -> i64:
+        can Abort.Panic:
+            count: i64 = piece_count(pieces, video)
+            next: mutable i64 = count + delta
+            limit: i64 = tile_limit(video)
+            while next > 2 and next < limit and piece_count(next, video) != next |next, delta, video, limit|:
+                next <- next + delta
+            return next if next >= 2 and next <= limit and piece_count(next, video) == next else pieces
+
     def is_solved(order: mutable darray[i64]&, count: i64) -> bool:
         can Abort.Panic:
             for position in 0..<count |order, position|:
@@ -59,9 +94,9 @@ module Jigsaw:
 
     # A shuffle of the grid's tiles, never the solved one. `order[position]` is
     # the tile shown at `position`.
-    def scramble(order: mutable darray[i64]&, side: i64, rng: mutable MT19937&):
+    def scramble(order: mutable darray[i64]&, side: i64, rng: mutable MT19937&, rows: i64 = 0):
         can Abort.Panic:
-            count: i64 = side * side
+            count: i64 = side * (rows if rows > 0 else side)
             for position in 0..<count |order|:
                 Ints::put(order, position, position)
             # The identity always passes the test, so the shuffle runs at least
@@ -137,28 +172,41 @@ module Jigsaw:
 
     # Tiles are laid TOP-DOWN: position 0 is the top-left corner, so a row is
     # measured down from the board's top edge rather than up from its bottom.
-    def tile_rect(window_width: f64, window_height: f64, preview: bool, side: i64, position: i64) -> Rect:
+    def tile_rect(window_width: f64, window_height: f64, preview: bool, side: i64, position: i64, rows: i64 = 0) -> Rect:
         can Abort.Panic:
             board: Square = board_rect(window_width, window_height, preview)
-            span: f64 = (board.size - SEAM * (side - 1).f64()) / side.f64()
+            height_count: i64 = rows if rows > 0 else side
+            spans: JigsawLayout::TileSpans = JigsawLayout::spans(board.size, side, height_count)
             row: f64 = (position / side).f64()
             column: f64 = (position % side).f64()
-            left: f64 = board.left + column * (span + SEAM)
-            top: f64 = board.bottom + board.size - row * (span + SEAM)
-            return Rect{left: left, bottom: top - span, width: span, height: span}
+            left: f64 = board.left + column * (spans.width + spans.seam)
+            top: f64 = board.bottom + board.size - row * (spans.height + spans.seam)
+            return Rect{left: left, bottom: top - spans.height, width: spans.width, height: spans.height}
 
-    def tile_at(window_width: f64, window_height: f64, preview: bool, side: i64, x: f64, y: f64) -> i64:
+    def tile_at(window_width: f64, window_height: f64, preview: bool, side: i64, x: f64, y: f64, rows: i64 = 0, video: bool = false) -> i64:
         can Abort.Panic:
-            for position in 0..<(side * side) |window_width, window_height, preview, side, x, y|:
-                box: Rect = tile_rect(window_width, window_height, preview, side, position)
-                inside: bool = box.left <= x and x <= box.left + box.width and box.bottom <= y and y <= box.bottom + box.height
-                return position if inside
-            return -1
+            view: JigsawKernelCanvas = canvas(window_width, window_height)
+            aspect: f64 = 4.0 / 3.0 if video else 1.0
+            room: f64 = view.width * (0.72 if preview else 1.0)
+            width: f64 = room if room < view.height * aspect else view.height * aspect
+            height: f64 = width / aspect
+            left: f64 = view.left + (room - width) / 2.0
+            bottom: f64 = view.bottom + (view.height - height) / 2.0
+            return -1 if width <= 0.0 or x < left or x > left + width or y < bottom or y > bottom + height
+            height_count: i64 = rows if rows > 0 else side
+            spans: JigsawLayout::TileSpans = JigsawLayout::spans_for(width, height, side, height_count)
+            column: i64 = ((x - left) / (spans.width + spans.seam)).i64()
+            row: i64 = ((bottom + height - y) / (spans.height + spans.seam)).i64()
+            return (height_count - 1 if row >= height_count else row) * side + (side - 1 if column >= side else column)
 
     # --- a run -----------------------------------------------------------
 
     struct JigsawKernelRun:
+        video: mutable bool
         start_side: mutable i64
+        start_pieces: mutable i64
+        pieces: mutable i64
+        trial_rows: mutable i64
         total_puzzles: mutable i64
         adaptive: mutable bool
         preview: mutable bool
@@ -176,17 +224,19 @@ module Jigsaw:
         verdict: mutable i64
         result_count: mutable i64
         result_side: mutable darray[i64]
+        result_pieces: mutable darray[i64]
         result_efficiency: mutable darray[f64]
         result_took: mutable darray[f64]
 
-    def new_run() -> JigsawKernelRun:
+    def new_run(tile_capacity: i64 = LARGEST_SIDE * LARGEST_SIDE) -> JigsawKernelRun:
         can Memory.Allocate, Abort.Panic:
-            return JigsawKernelRun{start_side: SMALLEST_SIDE, total_puzzles: 0, adaptive: false,
+            return JigsawKernelRun{video: false, start_side: SMALLEST_SIDE, start_pieces: 0, pieces: 0, trial_rows: SMALLEST_SIDE, total_puzzles: 0, adaptive: false,
                        preview: false, side: SMALLEST_SIDE, trial_side: SMALLEST_SIDE,
-                       puzzle: 0, order: Ints::zeros(MOST_TILES), seen: Ints::zeros(MOST_TILES),
+                       puzzle: 0, order: Ints::zeros(tile_capacity), seen: Ints::zeros(tile_capacity),
                        par: 0, swaps: 0, picked: -1, started_at: 0.0, feedback_until: 0.0,
                        phase: PHASE_READY, verdict: -1, result_count: 0,
                        result_side: Ints::zeros(MOST_PUZZLES),
+                       result_pieces: Ints::zeros(MOST_PUZZLES),
                        result_efficiency: Floats::zeros(MOST_PUZZLES),
                        result_took: Floats::zeros(MOST_PUZZLES)}
 
@@ -208,9 +258,14 @@ module Jigsaw:
                 finish(run)
                 return
             run.puzzle <- run.puzzle + 1
-            run.trial_side <- run.side
-            scramble(&run.order, run.trial_side, rng)
-            run.par <- minimum_swaps(&run.order, run.trial_side * run.trial_side, &run.seen)
+            run.trial_side <- piece_columns(run.pieces, run.video) if run.pieces > 0 else run.side
+            run.trial_rows <- piece_rows(run.pieces, run.trial_side, run.video) if run.pieces > 0 else run.trial_side
+            deal(run, now, rng)
+
+    def deal(run: mutable JigsawKernelRun&, now: f64, rng: mutable MT19937&):
+        can Abort.Panic:
+            scramble(&run.order, run.trial_side, rng, run.trial_rows)
+            run.par <- minimum_swaps(&run.order, run.trial_side * run.trial_rows, &run.seen)
             run.swaps <- 0
             run.picked <- -1
             run.verdict <- -1
@@ -220,7 +275,8 @@ module Jigsaw:
     def start_run(run: mutable JigsawKernelRun&, now: f64, rng: mutable MT19937&):
         can Abort.Panic:
             reset(run)
-            run.side <- clamped(run.start_side)
+            run.side <- run.start_side if run.start_pieces > 0 else clamped(run.start_side)
+            run.pieces <- run.start_pieces
             next_puzzle(run, now, rng)
 
     def solved(run: mutable JigsawKernelRun&, now: f64):
@@ -229,10 +285,17 @@ module Jigsaw:
             divisor: i64 = run.swaps if run.swaps > run.par else run.par
             efficiency: f64 = run.par.f64() / divisor.f64()
             Ints::put(&run.result_side, run.result_count, run.trial_side)
+            Ints::put(&run.result_pieces, run.result_count, run.trial_side * run.trial_rows)
             Floats::put(&run.result_efficiency, run.result_count, efficiency)
             Floats::put(&run.result_took, run.result_count, took)
             run.result_count <- run.result_count + 1
-            if run.adaptive:
+            if run.adaptive and run.pieces > 0:
+                if efficiency >= GROW_AT:
+                    run.pieces <- adjacent_piece_grid(run.pieces, 1, run.video)
+                elif efficiency < SHRINK_AT:
+                    run.pieces <- adjacent_piece_grid(run.pieces, -1, run.video)
+                run.side <- piece_columns(run.pieces, run.video)
+            elif run.adaptive:
                 if efficiency >= GROW_AT:
                     run.side <- clamped(run.side + 1)
                 else:
@@ -251,7 +314,7 @@ module Jigsaw:
     # index nothing is at would corrupt the permutation rather than fail.
     def pick(run: mutable JigsawKernelRun&, position: i64, now: f64):
         can Abort.Panic:
-            count: i64 = run.trial_side * run.trial_side
+            count: i64 = run.trial_side * run.trial_rows
             return if run.phase != PHASE_SOLVING or position < 0 or position >= count
             if run.picked < 0:
                 run.picked <- position
@@ -277,6 +340,7 @@ module Jigsaw:
         efficiency: i64
         mean_seconds: f64
         best_side: i64
+        most_pieces: i64
 
     # How the run went, on both of its axes. Efficiency is reported beside the
     # time because they trade against each other: swapping fast and loose
@@ -286,15 +350,18 @@ module Jigsaw:
             total_efficiency: mutable f64 = 0.0
             total_seconds: mutable f64 = 0.0
             best_side: mutable i64 = 0
-            for at in 0..<run.result_count |run, total_efficiency, total_seconds, best_side|:
+            most_pieces: mutable i64 = 0
+            for at in 0..<run.result_count |run, total_efficiency, total_seconds, best_side, most_pieces|:
                 total_efficiency <- total_efficiency + Floats::at_ref(&run.result_efficiency, at)
                 total_seconds <- total_seconds + Floats::at_ref(&run.result_took, at)
                 side: i64 = Ints::at_ref(&run.result_side, at)
                 best_side <- side if side > best_side
+                pieces: i64 = Ints::at_ref(&run.result_pieces, at)
+                most_pieces <- pieces if pieces > most_pieces
             efficiency: mutable i64 = 0
             mean_seconds: mutable f64 = 0.0
             if run.result_count > 0:
                 efficiency <- py_round_half_even(100.0 * total_efficiency / run.result_count.f64())
                 mean_seconds <- total_seconds / run.result_count.f64()
             return JigsawScore{puzzles: run.result_count, efficiency: efficiency,
-                         mean_seconds: mean_seconds, best_side: best_side}
+                         mean_seconds: mean_seconds, best_side: best_side, most_pieces: most_pieces}

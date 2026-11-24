@@ -11,14 +11,18 @@ module TaskSettings:
         return (value == 0 or value == 1) if row == 2 or row == 3 else false
 
     def path(out: i64, task: i64, create: bool) -> i64:
-        can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
             return -1 if task < 0 or task > 3
             variable: cstr = "NW_CROSSWORD_SETTINGS_PATH" if task == 0 else ("NW_SCRABBLE_SETTINGS_PATH" if task == 1 else ("NW_ALGEBRA_SETTINGS_PATH" if task == 2 else "NW_SCRAMBLE_SETTINGS_PATH"))
             suffix: cstr = "/crossword-options" if task == 0 else ("/scrabble-options" if task == 1 else ("/algebra-options" if task == 2 else "/scramble-options"))
             trusted Unsafe.PointerCast:
                 if getenv(variable) is override:
                     if override != 0.u8():
-                        return SyllogismOptionsHost::append(out, 4096, 0, override.cast[cstr])
+                        return SyllogismOptionsHost::settings_override(out, 4096, override.cast[cstr], create)
+                named: i64 = sdl_named_task_settings_path(out, 4096, suffix, create)
+                return named if named != -2
+                selected: i64 = SyllogismOptionsHost::data_settings_path(out, 4096, suffix, create)
+                return selected if selected != -2
                 platform: heap u8& = SDL_GetPlatform().cast[heap u8&]
                 windows: bool = platform[0] == 87.u8() and platform[1] == 105.u8() and platform[2] == 110.u8()
                 base: mutable i64 = 0
@@ -47,23 +51,8 @@ module TaskSettings:
             trusted Unsafe.PointerCast:
                 bytes: heap u8& = data.uintptr().cast[heap u8&]
                 for row in 0..<4 |row, values, at, length, bytes, task|:
-                    while at < length and SyllogismOptions::whitespace(bytes[at.usize()].i64()) |at, length, bytes|:
-                        at <- at + 1
-                    return 0 if at >= length
-                    negative: mutable bool = false
-                    if bytes[at.usize()] == 43.u8() or bytes[at.usize()] == 45.u8():
-                        negative <- bytes[at.usize()] == 45.u8()
-                        at <- at + 1
-                    first: i64 = at
-                    value: mutable i64 = 0
-                    while at < length |at, length, bytes, value|:
-                        digit: i64 = bytes[at.usize()].i64() - 48
-                        break if digit < 0 or digit > 9
-                        return 0 if value > 15
-                        value <- value * 10 + digit
-                        at <- at + 1
-                    return 0 if at == first or (negative and value != 0) or not allowed(task, row, value)
-                    return 0 if at < length and not SyllogismOptions::whitespace(bytes[at.usize()].i64())
+                    value: i64 = SyllogismOptions::saved_integer(bytes, length, &at)
+                    return 0 if not allowed(task, row, value)
                     values[row.usize()] <- value
                 while at < length and SyllogismOptions::whitespace(bytes[at.usize()].i64()) |at, length, bytes|:
                     at <- at + 1
@@ -75,7 +64,7 @@ module TaskSettings:
                 return 1
 
     def read(task: i64, output: mutable i64&?):
-        can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
             return if output == null
             path_buffer: mutable u8[4096] = zeroed
             data: mutable u8[256] = zeroed
@@ -92,7 +81,7 @@ module TaskSettings:
                 _ = decode((&data[0]).uintptr().i64(), length.i64(), task, output)
 
     def write(task: i64, output: i64&?) -> i32:
-        can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
             return 0 if output == null
             path_buffer: mutable u8[4096] = zeroed
             temporary: mutable u8[4200] = zeroed
@@ -114,8 +103,8 @@ export fn nw_task_settings_read(task: i64, output: mutable i64&?) = TaskSettings
 export fn nw_task_settings_write(task: i64, output: i64&?) -> i32 = TaskSettings::write
 
 # The CLI shares exactly the same allowed values as the saved options.
-def task_settings_parse(task: i64, argc: i64, argv: usize&?, output: mutable i64&?, lexicon: mutable usize&?, saved: i64) -> i32:
-    can Blocking.IO, Console.Write, Abort.Panic, Unsafe.PointerCast:
+def task_settings_parse(task: i64, argc: i64, argv: usize&?, output: mutable i64&?, lexicon: mutable usize&?, saved: i64, ini: usize = 0.usize()) -> i32:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
         return 2 if task < 0 or task > 3 or argc < 1 or argv == null or output == null or lexicon == null
         trusted Unsafe.PointerCast:
             args_pointer: usize& = argv
@@ -128,6 +117,7 @@ def task_settings_parse(task: i64, argc: i64, argv: usize&?, output: mutable i64
             values[2] <- 1
             values[3] <- 1
             path_out[0] <- 0.usize()
+            sdl_apply_task_ini_defaults(values, ini, 4)
             TaskSettings::read(task, output) if saved != 0
             option_level: cstr = "--crossword-level" if task == 0 else ("--scrabble-level" if task == 1 else ("--algebra-level" if task == 2 else "--scramble-level"))
             option_trials: cstr = "--crossword-trials" if task == 0 else ("--scrabble-trials" if task == 1 else ("--algebra-trials" if task == 2 else "--scramble-trials"))
@@ -161,7 +151,11 @@ def task_settings_parse(task: i64, argc: i64, argv: usize&?, output: mutable i64
                 at <- at + 1
             return 0
 
-export fn nw_task_settings_parse(task: i64, argc: i64, argv: usize&?, output: mutable i64&?, lexicon: mutable usize&?, saved: i64) -> i32 = task_settings_parse
+def task_settings_parse_legacy(task: i64, argc: i64, argv: usize&?, output: mutable i64&?, lexicon: mutable usize&?, saved: i64) -> i32:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return task_settings_parse(task, argc, argv, output, lexicon, saved)
+
+export fn nw_task_settings_parse(task: i64, argc: i64, argv: usize&?, output: mutable i64&?, lexicon: mutable usize&?, saved: i64) -> i32 = task_settings_parse_legacy
 
 def task_options_modify(task: i64, output: mutable i64&?, row: i64, step: i64) -> i32:
     can Abort.Panic, Unsafe.PointerCast:

@@ -1,0 +1,216 @@
+include "./missing_word.elisa"
+include "./passage_corpus.elisa"
+include "./pyset.elisa"
+
+extend MissingWord:
+    struct RankedWord:
+        word: Passages::Word
+        rank: i64
+
+    struct Vocabulary:
+        ordered: darray[RankedWord]
+        indices: darray[i64]
+
+    struct Offer:
+        words: mutable Passages::Word[4]
+        count: mutable i64
+
+    def word_less(a: Passages::Word, b: Passages::Word) -> bool:
+        can Abort.Panic:
+            end: i64 = a.length if a.length < b.length else b.length
+            for i in 0..<end |a, b|:
+                first: i64 = Passages::letter(a, i)
+                second: i64 = Passages::letter(b, i)
+                return first < second if first != second
+            return a.length < b.length
+
+    def rank_less(a: RankedWord, b: RankedWord) -> bool:
+        can Abort.Panic:
+            return a.rank < b.rank if a.rank != b.rank
+            return word_less(a.word, b.word)
+
+    def word_hash(w: Passages::Word) -> u64:
+        return Passages::mix(w.low ^ Passages::mix(w.high))
+
+    def vocabulary(cache: sview) -> Vocabulary:
+        can Memory.Allocate, Abort.Panic:
+            ordered: mutable darray[RankedWord] = []
+            if sview_len(cache) == 0.usize():
+                bank: Passages::Bank = PassageSeed::vocabulary()
+                for i in 0..<bank.words.count.i64() |bank, ordered|:
+                    ordered.push(RankedWord{word: bank.words[i.usize()], rank: i + 1})
+            else:
+                size: i64 = sview_len(cache).i64()
+                at: mutable i64 = 0
+                while at < size |at, size, cache, ordered|:
+                    row: CrosswordLexicon::CrosswordIndexRow = CrosswordLexicon::row_at(cache, at, size)
+                    at <- row.next
+                    continue if not row.valid or row.rank > 60000 or row.word_length > 15
+                    word: mutable Passages::Word = zeroed
+                    for j in row.word_at..<(row.word_at + row.word_length) |word, cache|:
+                        Passages::push_letter(&word, sview_at(cache, j.usize()).i64())
+                    ordered.push(RankedWord{word: word, rank: row.rank})
+                ordered.sort(rank_less)
+            size: mutable i64 = 2
+            while size < 2 * ordered.count.i64() |size, ordered|:
+                size <- size * 2
+            indices: mutable darray[i64] = []
+            _ = indices.reserve(size.usize())
+            for _ in 0..<size |indices|:
+                indices.push(-1)
+            for i in 0..<ordered.count.i64() |ordered, indices, size|:
+                word: Passages::Word = ordered[i.usize()].word
+                at: mutable i64 = (word_hash(word) & (size - 1).u64()).i64()
+                while indices[at.usize()] >= 0 |at, indices, size|:
+                    at <- (at + 1) & (size - 1)
+                indices[at.usize()] <- i
+            return Vocabulary{ordered: ordered, indices: indices}
+
+    def word_position(vocab: Vocabulary&, word: Passages::Word) -> i64:
+        can Abort.Panic:
+            size: i64 = vocab.indices.count.i64()
+            at: mutable i64 = (word_hash(word) & (size - 1).u64()).i64()
+            while true |at, vocab, word, size|:
+                i: i64 = vocab.indices[at.usize()]
+                return -1 if i < 0
+                candidate: Passages::Word = vocab.ordered[i.usize()].word
+                return i if candidate.low == word.low and candidate.high == word.high
+                at <- (at + 1) & (size - 1)
+
+    def word_tail(word: Passages::Word, cut: i64, suffix: sview) -> Passages::Word:
+        can Abort.Panic:
+            result: mutable Passages::Word = zeroed
+            count: i64 = sview_len(suffix).i64()
+            prefix: i64 = word.length - cut
+            return result if prefix < 0 or prefix + count > 16
+            for i in 0..<prefix |word, result|:
+                Passages::push_letter(&result, Passages::letter(word, i))
+            for i in 0..<count |result, suffix|:
+                Passages::push_letter(&result, sview_at(suffix, i.usize()).i64())
+            return result
+
+    def ends_with(word: Passages::Word, suffix: sview) -> bool:
+        can Abort.Panic:
+            n: i64 = sview_len(suffix).i64()
+            return false if n > word.length
+            for i in 0..<n |word, suffix, n|:
+                return false if Passages::letter(word, word.length - n + i) != sview_at(suffix, i.usize()).i64()
+            return true
+
+    def add_word(words: mutable darray[Passages::Word]&, word: Passages::Word):
+        can Memory.Allocate, Abort.Panic:
+            for current in words:
+                return if same_word(current, word)
+            words.push(word)
+
+    def family_from_base(words: mutable darray[Passages::Word]&, vocab: Vocabulary&, base: Passages::Word, target: Passages::Word):
+        can Memory.Allocate, Abort.Panic:
+            return if base.length < 3 or word_position(vocab, target) < 0
+            index: i64 = word_position(vocab, base)
+            return if index < 0 or vocab.ordered[index.usize()].rank > 25000
+            forms: mutable Passages::Word[9] = [base, word_tail(base, 0, "s"), word_tail(base, 0, "es"),
+                word_tail(base, 0, "ed"), word_tail(base, 0, "d"), word_tail(base, 0, "ing"),
+                zeroed, zeroed, zeroed]
+            forms[6] <- word_tail(base, 1, "ing") if ends_with(base, "e")
+            if ends_with(base, "y"):
+                forms[7] <- word_tail(base, 1, "ies")
+                forms[8] <- word_tail(base, 1, "ied")
+            contains: mutable bool = false
+            for form in forms:
+                contains <- contains or same_word(form, target)
+            return if not contains
+            for form in forms:
+                if form.length > 0 and word_position(vocab, form) >= 0 and not same_word(form, target):
+                    add_word(words, form)
+
+    def other_forms(vocab: Vocabulary&, target: Passages::Word) -> darray[Passages::Word]:
+        can Memory.Allocate, Abort.Panic:
+            words: mutable darray[Passages::Word] = []
+            family_from_base(&words, vocab, target, target)
+            for suffix in [sview("s", 0, -1), sview("es", 0, -1), sview("ed", 0, -1), sview("d", 0, -1), sview("ing", 0, -1)] |words, vocab, target|:
+                if ends_with(target, suffix):
+                    family_from_base(&words, vocab, word_tail(target, sview_len(suffix).i64(), ""), target)
+            if ends_with(target, "ing"):
+                family_from_base(&words, vocab, word_tail(target, 3, "e"), target)
+            if ends_with(target, "ies") or ends_with(target, "ied"):
+                family_from_base(&words, vocab, word_tail(target, 3, "y"), target)
+            for group in [sview("a an the", 0, -1), sview("is are was were be been", 0, -1), sview("has have had", 0, -1), sview("do does did", 0, -1),
+                    sview("this these that those", 0, -1), sview("much many", 0, -1), sview("it its", 0, -1), sview("there their", 0, -1),
+                    sview("than then", 0, -1), sview("to too", 0, -1)] |words, target|:
+                parsed: Passages::Bank = Passages::read(group, false, true)
+                includes: mutable bool = false
+                for word in parsed.words:
+                    includes <- includes or same_word(word, target)
+                if includes:
+                    for word in parsed.words:
+                        add_word(&words, word) if not same_word(word, target)
+            words.sort(word_less)
+            return words
+
+    def near_words(vocab: Vocabulary&, lower: Passages::Word, forms: darray[Passages::Word]&, close: bool,
+            draw: mutable MT19937&, count: i64) -> darray[Passages::Word]:
+        can Memory.Allocate, Abort.Panic:
+            rank: i64 = word_position(vocab, lower)
+            center: i64 = rank if rank >= 0 else vocab.ordered.count.i64() / 2
+            span: i64 = 300 if close else 6000
+            low: i64 = center - span if center > span else 0
+            high: i64 = center + span if center + span < vocab.ordered.count.i64() else vocab.ordered.count.i64() - 1
+            near: mutable darray[Passages::Word] = []
+            for _ in 0..<200 |near, vocab, low, high, lower, draw, forms, count|:
+                word: Passages::Word = vocab.ordered[py_randrange(draw, low, high + 1).usize()].word
+                continue if word.length <= 1 or same_word(word, lower)
+                blocked: mutable bool = false
+                for form in forms:
+                    blocked <- blocked or same_word(word, form)
+                continue if blocked
+                add_word(&near, word)
+                break if near.count.i64() == count
+            return near
+
+    # CPython hashes the three nonnegative integers as tuple lanes and seeds
+    # Random with the absolute value of the resulting signed hash.
+    def offer_seed(seed: u64, first: i64, second: i64) -> u64:
+        acc: mutable u64 = PyPoint::XXPRIME_5
+        for lane in [seed, first.u64(), second.u64()] |acc|:
+            acc <- PyPoint::rotate(acc + lane * PyPoint::XXPRIME_2) * PyPoint::XXPRIME_1
+        acc <- acc + (3.u64() ^ (PyPoint::XXPRIME_5 ^ 3527539.u64()))
+        acc <- 1546275796.u64() if acc == 0xffffffffffffffff.u64()
+        return 0.u64() - acc if (acc >> 63.u64()) != 0.u64() else acc
+
+    def offer(machine: Machine&, a: Token, b: Token, sources: Sources&, vocab: Vocabulary&) -> Offer:
+        can Memory.Allocate, Abort.Panic:
+            result: mutable Offer = zeroed
+            if sources.common.count == 0.usize() or vocab.ordered.count == 0.usize():
+                return result
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, offer_seed(machine.seed, a.id, b.id))
+            truth: mutable Passages::Word = truth_between(machine, a, b)
+            truth <- sources.common[py_choice_index(&draw, sources.common.count.i64()).usize()] if truth.length == 0
+            lower: mutable Passages::Word = truth
+            lower.capitals <- 0.u64()
+            forms: darray[Passages::Word] = other_forms(vocab, lower)
+            indices: mutable darray[i64] = []
+            for i in 0..<forms.count.i64() |indices|:
+                indices.push(i)
+            py_shuffle_i64(&draw, &indices)
+            picked: mutable darray[Passages::Word] = []
+            if indices.count > 0.usize():
+                picked.push(forms[indices[0].usize()])
+            near: darray[Passages::Word] = near_words(vocab, lower, &forms, machine.level.close, &draw, 3)
+            for word in near:
+                picked.push(word)
+            words: mutable Passages::Word[4] = zeroed
+            words[0] <- truth
+            result.count <- 1
+            for word in picked:
+                break if result.count == 4
+                if not same_word(word, truth):
+                    words[result.count.usize()] <- word
+                    result.count <- result.count + 1
+            indices.clear()
+            for i in 0..<result.count |indices|:
+                indices.push(i)
+            py_shuffle_i64(&draw, &indices)
+            for i in 0..<result.count |result, words, indices|:
+                result.words[i.usize()] <- words[indices[i.usize()].usize()]
+            return result

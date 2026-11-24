@@ -1,0 +1,782 @@
+def sdl_jigsaw_option_label(row: i64) -> cstr:
+    return "Pieces" if row == 0
+    return "Puzzles per run" if row == 1
+    return "Adaptive grid" if row == 2
+    return "Show finished picture" if row == 3
+    return "Outline placed tiles"
+
+def sdl_jigsaw_option_change(row: i64, current: i64, direction: i64) -> i64:
+    can Abort.Panic:
+        return 1 - current if row >= 2
+        pieces: i64[18] = [2, 4, 6, 9, 12, 16, 25, 36, 49, 64, 100, 144, 225, 400, 625, 900, 1600, 2500]
+        puzzles: i64[7] = [1, 2, 3, 5, 8, 12, 20]
+        count: i64 = 18 if row == 0 else 7
+        start: i64 = 0 if direction > 0 else count - 1
+        for at in 0..<count |at, count, row, current, direction, pieces, puzzles|:
+            index: i64 = at if direction > 0 else count - 1 - at
+            candidate: i64 = pieces[index.usize()] if row == 0 else puzzles[index.usize()]
+            return candidate if (candidate - current) * direction > 0
+        return pieces[start.usize()] if row == 0 else puzzles[start.usize()]
+
+def sdl_read_jigsaw_options(output: mutable i64&, video: bool = false):
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        path: mutable u8[4096] = zeroed
+        data: mutable u8[128] = zeroed
+        trusted Unsafe.PointerCast:
+            target: mutable u8& = (&path[0]).uintptr().cast[mutable u8&]
+            return if not sdl_task_profile_sidecar(target, ".video-jigsaw-options" if video else ".jigsaw-options")
+            if SDL_IOFromFile(target.cast[cstr], "rb") is stream:
+                raw: heap u8& = (&data[0]).uintptr().cast[heap u8&]
+                length: usize = SDL_ReadIO(stream, (&data[0]).cast[mutable void&], 128.usize())
+                status: i32 = SDL_GetIOStatus(stream)
+                closed: bool = SDL_CloseIO(stream)
+                return if not closed or status != 2.i32() or length == 0.usize() or length >= 128.usize()
+                values: mutable i64[5] = zeroed
+                at: mutable i64 = 0
+                for row in 0..<5 |row, values, at, raw, length|:
+                    values[row.usize()] <- SyllogismOptions::saved_integer(raw, length.i64(), &at)
+                while at < length.i64() and SyllogismOptions::whitespace(raw[at.usize()].i64()) |at, raw, length|:
+                    at <- at + 1
+                return if at != length.i64()
+                pieces: i64 = values[0]
+                return if not Jigsaw::allowed_pieces(pieces)
+                return if not JigsawGame::allowed_puzzles(values[1])
+                return if not JigsawGame::allowed_flag(values[2]) or not JigsawGame::allowed_flag(values[3]) or not JigsawGame::allowed_flag(values[4])
+                output[4] <- Jigsaw::PIECE_OPTION_BASE + Jigsaw::bounded_pieces(pieces, video)
+                for row in 1..<5 |row, output, values|:
+                    output[(4 + row).usize()] <- values[row.usize()]
+
+def sdl_save_jigsaw_options(draft: i64&, video: bool = false) -> bool:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        data: mutable u8[128] = zeroed
+        length: i32 = SDL_snprintf(&data[0], 128.usize(), "%lld %lld %lld %lld %lld\n",
+            draft[0], draft[1], draft[2], draft[3], draft[4])
+        return length > 0.i32() and length < 128.i32() and sdl_save_profile_sidecar(".video-jigsaw-options" if video else ".jigsaw-options", &data[0], length.usize())
+
+# Return 2 when an options menu opened from the hub closes.
+def sdl_jigsaw_options_key(handle: i64, key: i64, tasks: usize, from_hub: bool = false) -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return 0 if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: mutable heap JigsawGame::JigsawRun& = handle.uintptr().cast[mutable heap JigsawGame::JigsawRun&]
+            draft: mutable i64& = (&run.options_draft[0]).uintptr().cast[mutable i64&]
+            if run.options_row < 0:
+                return 0 if key != 99 or (run.phase != JigsawGame::PHASE_READY and run.phase != JigsawGame::PHASE_DONE)
+                draft[0] <- run.start_pieces if run.start_pieces > 0 else run.start_side * run.start_side
+                draft[1] <- run.total_puzzles
+                draft[2] <- 1 if run.adaptive else 0
+                draft[3] <- 1 if run.preview else 0
+                draft[4] <- 1 if run.mark_placed else 0
+                run.options_from_hub <- from_hub
+                run.options_row <- 0
+                return 1
+            if SDLTaskKeys::enter(key) or key == 27:
+                if SDLTaskKeys::enter(key):
+                    run.start_pieces <- draft[0]
+                    run.pieces <- draft[0]
+                    run.start_side <- Jigsaw::piece_columns(draft[0], run.video)
+                    run.side <- run.start_side
+                    run.trial_side <- run.start_side
+                    run.trial_rows <- Jigsaw::piece_rows(draft[0], run.trial_side, run.video)
+                    run.total_puzzles <- draft[1]
+                    run.adaptive <- draft[2] != 0
+                    run.preview <- draft[3] != 0
+                    run.mark_placed <- draft[4] != 0
+                    run.phase <- JigsawGame::PHASE_READY
+                    run.puzzle <- 0
+                    run.result_count <- 0
+                    run.picked <- -1
+                    run.cursor <- 0
+                    run.hovered <- -1
+                    for tile in 0..<(run.trial_side * run.trial_rows) |tile, run|:
+                        run.order[tile.usize()] <- 0
+                        run.seen[tile.usize()] <- 0
+                    if tasks != 0.usize() and not sdl_save_jigsaw_options(draft, run.video):
+                        SDL_Log("Could not save Jigsaw options")
+                    if tasks != 0.usize() and not run.video:
+                        selected: mutable i64& = tasks.cast[mutable i64&]
+                        selected[4] <- Jigsaw::PIECE_OPTION_BASE + draft[0]
+                        for row in 1..<5 |row, selected, draft|:
+                            selected[(4 + row).usize()] <- draft[row.usize()]
+                run.options_row <- -1
+                return 2 if run.options_from_hub else 1
+            run.options_row <- SDLTaskKeys::option_row(key, run.options_row, 5)
+            if key == SDLTaskKeys::LEFT or key == SDLTaskKeys::RIGHT or key == 32:
+                row: i64 = run.options_row
+                draft[row.usize()] <- sdl_jigsaw_option_change(row, draft[row.usize()], -1 if key == SDLTaskKeys::LEFT else 1)
+            return 1
+
+def sdl_grid_options_frame(list: mutable Display::DisplayList&, black: bool, screen: i64, selection: i64, draft: i64&):
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        ink: u32 = Display::rgba(255, 255, 255, 255) if black else Display::rgba(20, 24, 32, 255)
+        title: mutable sview = "Jigsaw Puzzle options" if screen == 23 else ("Sudoku options" if screen == 24 else ("Find the Winning Move options" if screen == 25 else "Crossed Wires options"))
+        title <- "Video Jigsaw options" if screen == 45
+        title <- "Video Sequence options" if screen == 46
+        title <- "Hidden Rule options" if screen == 47
+        title <- "Hidden Wiring options" if screen == 48
+        title <- "Triage options" if screen == 49
+        title <- "Delay options" if screen == 50
+        title <- "Stop & Switch options" if screen == 51
+        title <- "Hold It options" if screen == 52
+        title <- "Time It options" if screen == 61
+        title <- "Balance options" if screen == 62
+        title <- "Juggler options" if screen == 63
+        title <- "Lander options" if screen == 64
+        title <- "Keep the Beat options" if screen == 65
+        title <- "Glider options" if screen == 66
+        title <- "Catch options" if screen == 67
+        title <- "Echo Cave options" if screen == 68
+        title <- "Drone Hoops options" if screen == 69
+        title <- "Field Manual options" if screen == 70
+        title <- "Safecracker options" if screen == 71
+        title <- "Stagehand options" if screen == 72
+        title <- "Loading Dock options" if screen == 73
+        title <- "Gunslinger options" if screen == 74
+        title <- "Camera options" if screen == 75
+        title <- "What Happens Next options" if screen == 76
+        title <- "Will It Fall? options" if screen == 77
+        title <- "Shape from Motion options" if screen == 78
+        title <- "Dr Shape options" if screen == 79
+        title <- "Tuner options" if screen == 80
+        title <- "Shadow Play options" if screen == 81
+        title <- "Captcha options" if screen == 82
+        title <- "Signals options" if screen == 83
+        title <- "Fold It options" if screen == 84
+        title <- "Who Knows What? options" if screen == 85
+        title <- "Dam Keeper options" if screen == 86
+        title <- "Sonar options" if screen == 87
+        title <- "Gamble options" if screen == 88
+        title <- "Dispatch options" if screen == 89
+        title <- "Bluff options" if screen == 90
+        title <- "Explore or Exploit options" if screen == 91
+        title <- "Firebreak options" if screen == 92
+        title <- "Crossroads options" if screen == 93
+        title <- "Rail Yard options" if screen == 94
+        title <- "Air Traffic options" if screen == 95
+        title <- "Escort options" if screen == 96
+        title <- "Sokoban Live options" if screen == 97
+        title <- "Kitchen options" if screen == 98
+        title <- "Crane options" if screen == 99
+        title <- "Ferry options" if screen == 100
+        title <- "Docking options" if screen == 101
+        title <- "Rover options" if screen == 102
+        title <- "Unicycle options" if screen == 103
+        title <- "Morning Round options" if screen == 104
+        title <- "Heavier options" if screen == 105
+        title <- "Full Stop options" if screen == 106
+        title <- "The Missing Word options" if screen == 107
+        title <- "The Proofreader options" if screen == 108
+        title <- "Figures of Speech options" if screen == 109
+        title <- "Which Feeling options" if screen == 134
+        title <- "How Strongly options" if screen == 135
+        title <- "Why They Feel options" if screen == 137
+        title <- "Tone of Voice options" if screen == 138
+        title <- "Emotion options" if screen == 139
+        title <- "Reading People options" if screen == 136
+        title <- "Social Sense options" if screen == 133
+        title <- "Bad Argument options" if screen == 132
+        title <- "Second Thoughts options" if screen == 131
+        title <- "Between the Lines options" if screen == 130
+        title <- "Crazy Cog options" if screen == 110
+        title <- "The Cipher Abyss options" if screen == 111
+        title <- "Potter's Wheel options" if screen == 112
+        title <- "Conductor options" if screen == 113
+        title <- "Tightrope options" if screen == 114
+        title <- "Sign Painter options" if screen == 115
+        title <- "Bartender options" if screen == 116
+        title <- "Lock Pick options" if screen == 117
+        title <- "Air Hockey options" if screen == 118
+        title <- "Semaphore options" if screen == 119
+        title <- "Shadow Puppets options" if screen == 120
+        title <- "Night Watch options" if screen == 121
+        title <- "Kerbside options" if screen == 122
+        title <- "Steadicam options" if screen == 123
+        title <- "Free Kick options" if screen == 124
+        title <- "Glove options" if screen == 125
+        title <- "By Ear options" if screen == 126
+        title <- "Piano Tuner options" if screen == 127
+        title <- "Cricket Hunt options" if screen == 128
+        title <- "Claw Machine options" if screen == 129
+        title <- "Notebook options" if screen == 53
+        title <- "Point of View options" if screen == 57
+        title <- "Inside or Out? options" if screen == 58
+        title <- "Touching? options" if screen == 59
+        title <- "Crossings options" if screen == 60
+        title <- "Same or Mirror? options" if screen == 56
+        title <- "Which Is Nearer? options" if screen == 55
+        title <- "Where Was It? options" if screen == 54
+        title <- "Tower of Hanoi options" if screen == 39
+        title <- "Traveling Salesman options" if screen == 40
+        title <- "N-in-a-row options" if screen == 41
+        title <- "Maze options" if screen == 42
+        title <- "3D Sokoban options" if screen == 43
+        Display::draw_text_weight(list, title, 456.0, 566.0, 26.0, ink, Display::ANCHOR_CENTER_CENTER, true)
+        count: i64 = 7 if screen == 41 else (5 if screen == 23 or screen == 43 or screen == 45 else (2 if screen == 25 else (3 if screen == 39 or screen == 47 or screen == 48 or screen == 49 or screen == 50 or screen == 51 or screen == 52 or screen == 53 or screen == 54 or screen == 55 or screen == 56 or screen == 57 or screen == 58 or screen == 59 or screen == 60 or screen == 61 or screen == 62 or screen == 63 or screen == 64 or screen == 65 or screen == 66 or screen == 67 or screen == 68 or screen == 69 or screen == 70 or screen == 71 or screen == 72 or screen == 73 or screen == 74 or screen == 75 or screen == 76 or screen == 77 or screen == 78 or screen == 79 or screen == 80 or screen == 81 or screen == 82 or screen == 83 or screen == 84 or screen == 85 or screen == 86 or screen == 87 or screen == 88 or screen == 89 or screen == 90 or screen == 91 or screen == 92 or screen == 93 or screen == 94 or screen == 95 or screen == 96 or screen == 97 or screen == 98 or screen == 99 or screen == 100 or screen == 101 or screen == 102 or screen == 103 or screen == 104 or screen == 105 or screen == 106 or screen == 107 or screen == 108 or screen == 109 or screen == 134 or screen == 135 or screen == 137 or screen == 138 or screen == 139 or screen == 136 or screen == 133 or screen == 132 or screen == 131 or screen == 130 or screen == 110 or screen == 111 or screen == 112 or screen == 113 or screen == 114 or screen == 115 or screen == 116 or screen == 117 or screen == 118 or screen == 119 or screen == 120 or screen == 121 or screen == 122 or screen == 123 or screen == 124 or screen == 125 or screen == 126 or screen == 127 or screen == 128 or screen == 129 else 4)))
+        for row in 0..<count |row, list, screen, selection, draft, ink, count|:
+            y: f64 = sdl_option_center(row, count)
+            half: f64 = sdl_option_half_height(count)
+            selected: bool = row == selection
+            if selected:
+                Display::draw_rect(list, 102.0, y - half, 708.0, 2.0 * half, Display::rgba(70, 120, 180, 96))
+            trusted Unsafe.PointerCast:
+                label: mutable cstr = sdl_jigsaw_option_label(row) if screen == 23 or screen == 45 else sdl_sudoku_option_label(row)
+                label <- "Positions per run" if screen == 25 and row == 1
+                if screen == 26:
+                    label <- "Rounds per run" if row == 1
+                    label <- "Climb a level after a clean round" if row == 2
+                    label <- "Draw the cell lines" if row == 3
+                if screen == 47 or screen == 48 or screen == 49 or screen == 50:
+                    label <- "Starting rung" if row == 0
+                    label <- ("Runs" if screen == 50 else "Rounds per run") if row == 1
+                    label <- ("Climb a rung at par, drop one under" if screen >= 49 else "Climb a rung under par, drop one over") if row == 2
+                if screen == 54 or screen == 55 or screen == 56 or screen == 57 or screen == 58 or screen == 59 or screen == 60 or screen == 61 or screen == 62 or screen == 63 or screen == 64 or screen == 65 or screen == 66 or screen == 67 or screen == 68 or screen == 69 or screen == 70 or screen == 71 or screen == 72 or screen == 73 or screen == 74:
+                    label <- "Starting rung" if row == 0
+                    label <- ("Shots per run" if screen == 61 else ("Courses per run" if screen == 62 else ("Acts per run" if screen == 63 else ("Landings per run" if screen == 64 else ("Songs per run" if screen == 65 else ("Flights per run" if screen == 66 else ("Duels per run" if screen == 74 else "Docks per run" if screen == 73 else "Shows per run" if screen == 72 else "Safes per run" if screen == 71 else "Machines per run" if screen == 70 else "Flights per run" if screen == 68 or screen == 69 else "Rounds per run" if screen == 67 else "Puzzles per run"))))))) if screen >= 58 and row == 1
+                    label <- ("Tables per run" if screen == 57 else ("Figures per run" if screen == 56 else ("Scenes per run" if screen == 55 else "Visits per run"))) if row == 1 and screen < 58
+                    label <- "Climb when right, drop when wrong" if row == 2
+                if screen == 53:
+                    label <- "Starting rung" if row == 0
+                    label <- "Rounds per run" if row == 1
+                    label <- "Climb a rung when all right" if row == 2
+                if screen == 51 or screen == 52:
+                    label <- "Starting rung" if row == 0
+                    label <- ("Holds per run" if screen == 52 else "Blocks per run") if row == 1
+                    label <- "Climb after a pass, drop after a fail" if row == 2
+                if screen == 46:
+                    label <- "Pieces per clip" if row == 0
+                    label <- "Clips per run" if row == 1
+                    label <- "Add a piece after an efficient solve" if row == 2
+                    label <- "Outline pieces already in place" if row == 3
+                if screen == 39:
+                    label <- "Disks to start with" if row == 0
+                    label <- "Towers per run" if row == 1
+                    label <- "Grow the tower after an efficient solve" if row == 2
+                if screen == 40:
+                    label <- "Cities to start with" if row == 0
+                    label <- "Routes per run" if row == 1
+                    label <- "Add a city after an efficient route" if row == 2
+                    label <- "Show the shortest route" if row == 3
+                if screen == 43:
+                    label <- "Warehouses per run" if row == 1
+                    label <- "Adaptive difficulty" if row == 2
+                    label <- "Show goal rings in the corridors" if row == 3
+                    label <- "Show trap squares on the plan" if row == 4
+                if screen == 42:
+                    label <- "Mazes per run" if row == 1
+                    label <- "Mark where you have been" if row == 2
+                    label <- "Climb a level when you get out near the minimum" if row == 3
+                if screen == 41:
+                    label <- "Starting level" if row == 0
+                    label <- "Positions per run" if row == 1
+                    label <- "Grid size (0 follows level)" if row == 2
+                    label <- "Pellets (0 follows level)" if row == 3
+                    label <- "Line length (0 follows level)" if row == 4
+                    label <- "Mark the winning cell" if row == 5
+                    label <- "Adaptive level" if row == 6
+                if screen == 75:
+                    label <- "Starting rung" if row == 0 else ("Photographs per run" if row == 1 else "Climb a rung on a match, drop one on a miss")
+                if screen == 77:
+                    label <- "Starting rung" if row == 0 else ("Scenes per run" if row == 1 else "Climb a rung when right, drop one when wrong")
+                if screen == 78:
+                    label <- "Starting rung" if row == 0 else ("Clouds per run" if row == 1 else "Climb a rung when right, drop one when wrong")
+                if screen == 79:
+                    label <- "Starting rung" if row == 0 else ("Shapes per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 80 or screen == 81 or screen == 82:
+                    label <- "Starting rung" if row == 0 else ("Trials per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 83:
+                    label <- "Starting rung" if row == 0 else ("Games per run" if row == 1 else "Climb a rung at par, drop one under")
+                if screen == 84:
+                    label <- "Starting rung" if row == 0 else ("Nets per run" if row == 1 else "Climb a rung when right, drop one when wrong")
+                if screen == 85:
+                    label <- "Starting rung" if row == 0 else ("Stories per run" if row == 1 else "Climb a rung when right, drop one when wrong")
+                if screen == 86:
+                    label <- "Starting rung" if row == 0 else ("Valleys per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 87:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung under par, drop one over")
+                if screen == 88:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung at par, drop one under")
+                if screen == 90:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung at par, drop one under")
+                if screen == 91:
+                    label <- "Starting rung" if row == 0 else ("Runs" if row == 1 else "Climb a rung at par, drop one under")
+                if screen == 92:
+                    label <- "Starting rung" if row == 0 else ("Fires per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 93:
+                    label <- "Starting rung" if row == 0 else ("Shifts per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 94:
+                    label <- "Starting rung" if row == 0 else ("Yards per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 95:
+                    label <- "Starting rung" if row == 0 else ("Skies per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 96:
+                    label <- "Starting rung" if row == 0 else ("Temples per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 97:
+                    label <- "Starting rung" if row == 0 else ("Warehouses per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 98:
+                    label <- "Starting rung" if row == 0 else ("Shifts per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 99:
+                    label <- "Starting rung" if row == 0 else ("Yards per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 100:
+                    label <- "Starting rung" if row == 0 else ("Rivers per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 101:
+                    label <- "Starting rung" if row == 0 else ("Dockings per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 102:
+                    label <- "Starting rung" if row == 0 else ("Drives per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 103:
+                    label <- "Starting rung" if row == 0 else ("Rides per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 104:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 105:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 106:
+                    label <- "Starting rung" if row == 0 else ("Runs per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 107 or screen == 108:
+                    label <- "Starting rung" if row == 0 else ("Passages per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 109:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 134:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 135:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 137:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 138:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 139:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 136:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 133:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 132:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 131:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 130:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 110:
+                    label <- "Starting rung" if row == 0 else ("Machines per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 111:
+                    label <- "Starting rung" if row == 0 else ("Machines per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 112:
+                    label <- "Starting rung" if row == 0 else ("Pots per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 113:
+                    label <- "Starting rung" if row == 0 else ("Pieces per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 114:
+                    label <- "Starting rung" if row == 0 else ("Crossings per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 115:
+                    label <- "Starting rung" if row == 0 else ("Signs per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 116:
+                    label <- "Starting rung" if row == 0 else ("Nights per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 117:
+                    label <- "Starting rung" if row == 0 else ("Locks per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 118:
+                    label <- "Starting rung" if row == 0 else ("Games per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 119:
+                    label <- "Starting rung" if row == 0 else ("Messages per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 120:
+                    label <- "Starting rung" if row == 0 else ("Figures per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 121:
+                    label <- "Starting rung" if row == 0 else ("Nights per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 122:
+                    label <- "Starting rung" if row == 0 else ("Crossings per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 123:
+                    label <- "Starting rung" if row == 0 else ("Takes per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 124:
+                    label <- "Starting rung" if row == 0 else ("Kicks per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 125:
+                    label <- "Starting rung" if row == 0 else ("Innings per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 126:
+                    label <- "Starting rung" if row == 0 else ("Melodies per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 127:
+                    label <- "Starting rung" if row == 0 else ("Strings per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 128:
+                    label <- "Starting rung" if row == 0 else ("Hunts per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 129:
+                    label <- "Starting rung" if row == 0 else ("Drops per run" if row == 1 else "Climb a rung on a pass, drop one on a fail")
+                if screen == 89:
+                    label <- "Starting rung" if row == 0 else ("Rounds per run" if row == 1 else "Climb a rung under par, drop one over")
+                if screen == 76:
+                    label <- "Starting rung" if row == 0 else ("Clips per run" if row == 1 else "Climb a rung when right, drop one when wrong")
+                Display::draw_text_weight(list, sview(label, 0, -1), 120.0, y, 18.0, ink, Display::ANCHOR_LEFT_CENTER, selected)
+            value: mutable dstr = []
+            if row < (5 if screen == 41 else 2):
+                dstr_append_i64(&value, draft[row.usize()])
+            else:
+                dstr_append_cstr(&value, "On" if draft[row.usize()] != 0 else "Off")
+            Display::draw_text_weight(list, bytes_view(value), 760.0, y, 18.0, ink, Display::ANCHOR_CENTER_CENTER, selected)
+        if screen == 25:
+            sdl_go_options_note(list, ink, draft[0], draft[1])
+        elif screen == 26:
+            sdl_wires_options_note(list, ink, draft[0], draft[2] != 0)
+        elif screen == 39:
+            sdl_hanoi_options_note(list, ink, draft[0], draft[2] != 0)
+        elif screen == 40:
+            sdl_salesman_options_note(list, ink, draft[0], draft[2] != 0)
+        elif screen == 41:
+            sdl_ninarow_options_note(list, ink, draft)
+        elif screen == 42:
+            sdl_maze2d_options_note(list, ink, draft)
+        elif screen == 43:
+            sdl_sokoban3d_options_note(list, ink, draft[0])
+        elif screen == 49:
+            level: Triage::Grade = Triage::grade(draft[0])
+            for line in 0..<3 |list, level, ink|:
+                note: mutable dstr = []
+                SceneTriage::option_note(&level, line, &note)
+                if note.count > 0.usize():
+                    Display::draw_text(list, bytes_view(note), 456.0, 280.0 - 30.0 * line.f64(),
+                        16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 77:
+            note: mutable dstr = []
+            SceneFalls::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 78:
+            note: mutable dstr = []
+            SceneShapeFromMotion::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 79:
+            note: mutable dstr = []
+            SceneDrShape::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 80:
+            note: mutable dstr = []
+            SceneTuner::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 81:
+            note: mutable dstr = []
+            SceneShadowPlay::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 82:
+            note: mutable dstr = []
+            Captcha::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 83:
+            note: mutable dstr = []
+            SceneSignals::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 84:
+            note: mutable dstr = []
+            SceneFold::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 85:
+            note: mutable dstr = []
+            BeliefsText::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 86:
+            note: mutable dstr = []
+            SceneDamKeeper::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 87:
+            note: mutable dstr = []
+            SceneSonar::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 88:
+            note: mutable dstr = []
+            SceneGamble::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 89:
+            note: mutable dstr = []
+            SceneDispatch::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 90:
+            note: mutable dstr = []
+            SceneBluff::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 91:
+            note: mutable dstr = []
+            SceneBandit::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 92:
+            note: mutable dstr = []
+            SceneFirebreak::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 93:
+            note: mutable dstr = []
+            SceneCrossroads::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 94:
+            note: mutable dstr = []
+            SceneRailYard::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 95:
+            note: mutable dstr = []
+            SceneAirTraffic::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 96:
+            note: mutable dstr = []
+            SceneEscort::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 97:
+            note: mutable dstr = []
+            SceneSokobanLive::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 98:
+            note: mutable dstr = []
+            SceneKitchen::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 99:
+            note: mutable dstr = []
+            SceneCrane::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 100:
+            note: mutable dstr = []
+            SceneFerry::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 101:
+            note: mutable dstr = []
+            SceneDocking::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 102:
+            note: mutable dstr = []
+            SceneRover::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 103:
+            note: mutable dstr = []
+            SceneUnicycle::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 104:
+            note: mutable dstr = []
+            SceneMorningRound::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 105:
+            note: mutable dstr = []
+            SceneHeavier::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 106:
+            note: mutable dstr = []
+            SceneFullStop::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 107:
+            note: mutable dstr = []
+            SceneMissingWord::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 108:
+            note: mutable dstr = []
+            SceneProofreader::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 109:
+            note: mutable dstr = []
+            SceneFigures::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 134:
+            note: mutable dstr = []
+            SceneWhichFeeling::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 135:
+            note: mutable dstr = []
+            SceneHowStrongly::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 137:
+            note: mutable dstr = []
+            SceneWhyTheyFeel::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 138:
+            note: mutable dstr = []
+            SceneToneOfVoice::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 139:
+            note: mutable dstr = []
+            SceneEmotionFaces::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 136:
+            note: mutable dstr = []
+            SceneReadingPeople::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 133:
+            note: mutable dstr = []
+            SceneSocialSense::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 132:
+            note: mutable dstr = []
+            SceneBadArgument::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 131:
+            note: mutable dstr = []
+            SceneSecondThoughts::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 130:
+            note: mutable dstr = []
+            SceneBetweenLines::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 110:
+            note: mutable dstr = []
+            SceneCrazyCog::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 111:
+            note: mutable dstr = []
+            SceneCipherAbyss::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 112:
+            note: mutable dstr = []
+            ScenePotter::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 113:
+            note: mutable dstr = []
+            SceneConductor::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 114:
+            note: mutable dstr = []
+            SceneTightrope::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 115:
+            note: mutable dstr = []
+            SceneSignPainter::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 116:
+            note: mutable dstr = []
+            SceneBartender::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 117:
+            note: mutable dstr = []
+            SceneLockPick::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 118:
+            note: mutable dstr = []
+            SceneAirHockey::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 119:
+            note: mutable dstr = []
+            SceneSemaphore::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 120:
+            note: mutable dstr = []
+            SceneShadowPuppets::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 121:
+            note: mutable dstr = []
+            SceneNightWatch::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 122:
+            note: mutable dstr = []
+            SceneKerbside::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 123:
+            note: mutable dstr = []
+            SceneSteadicam::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 124:
+            note: mutable dstr = []
+            SceneFreeKick::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 125:
+            note: mutable dstr = []
+            SceneGlove::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 126:
+            note: mutable dstr = []
+            SceneByEar::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 127:
+            note: mutable dstr = []
+            ScenePianoTuner::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 128:
+            note: mutable dstr = []
+            SceneCricketHunt::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 129:
+            note: mutable dstr = []
+            SceneClawMachine::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 57:
+            note: mutable dstr = []
+            ScenePointOfView::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 58:
+            note: mutable dstr = []
+            SceneInside::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 59:
+            note: mutable dstr = []
+            SceneTouching::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 60:
+            note: mutable dstr = []
+            SceneCrossings::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 56:
+            note: mutable dstr = []
+            SceneMirror::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 55:
+            note: mutable dstr = []
+            SceneNearer::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 54:
+            note: mutable dstr = []
+            SceneRooms::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 53:
+            note: mutable dstr = []
+            SceneNotebook::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 61:
+            note: mutable dstr = []
+            SceneTimeIt::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 62:
+            note: mutable dstr = []
+            SceneBalance::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 63:
+            note: mutable dstr = []
+            SceneJuggler::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 64:
+            note: mutable dstr = []
+            SceneLander::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 65:
+            note: mutable dstr = []
+            SceneBeat::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 66:
+            note: mutable dstr = []
+            SceneGlider::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 67:
+            note: mutable dstr = []
+            SceneCatch::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 68:
+            note: mutable dstr = []
+            SceneEchoCave::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 69:
+            note: mutable dstr = []
+            SceneDroneHoops::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 70:
+            note: mutable dstr = []
+            SceneFieldManual::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 71:
+            note: mutable dstr = []
+            SceneSafecracker::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 72:
+            note: mutable dstr = []
+            SceneStagehand::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 73:
+            note: mutable dstr = []
+            SceneLoadingDock::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 74:
+            note: mutable dstr = []
+            SceneGunslinger::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 52:
+            note: mutable dstr = []
+            SceneHoldIt::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 51:
+            note: mutable dstr = []
+            SceneStopSwitch::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 12.0, ink, Display::ANCHOR_CENTER_CENTER)
+        elif screen == 50:
+            note: mutable dstr = []
+            SceneDelay::option_note(draft[0], &note)
+            Display::draw_text(list, bytes_view(note), 456.0, 280.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        Display::draw_text_weight(list, "Arrows or click: change options    Enter: apply    Esc: cancel",
+            456.0, 108.0 if screen == 41 else 168.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER, false)

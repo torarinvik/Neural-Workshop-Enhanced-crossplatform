@@ -40,30 +40,48 @@ extern SDL_RenderLine(renderer: mutable void&, x1: f32, y1: f32, x2: f32, y2: f3
 extern SDL_cosf(value: f32) -> f32
 extern SDL_sinf(value: f32) -> f32
 
+extern SDL_SetRenderDrawColorFloat(renderer: mutable void&, red: f32, green: f32, blue: f32, alpha: f32) -> bool
+
 def sdl_set_color(renderer: mutable void&?, rgba: u32):
     return if renderer == null
     target: mutable void& = renderer
-    _ = SDL_SetRenderDrawColor(target, (rgba >> 24).u8(), (rgba >> 16).u8(), (rgba >> 8).u8(), rgba.u8())
+    _ = SDL_SetRenderDrawColorFloat(target, (rgba >> 24).f32() / 255.0.f32(),
+        ((rgba >> 16) & 255.u32()).f32() / 255.0.f32(),
+        ((rgba >> 8) & 255.u32()).f32() / 255.0.f32(), (rgba & 255.u32()).f32() / 255.0.f32())
 
-def sdl_stroke_arc(renderer: mutable void&?, view: f32&?, cx: f32, cy: f32, radius: f32, start: f32, sweep: f32):
+# Match Pyglet's segment count for the radius in framebuffer pixels.
+def sdl_round_segments(radius_pixels: f32) -> i64:
+    return 14 if radius_pixels < 17.5.f32()
+    return 4096 if radius_pixels >= 5120.0.f32()
+    return (radius_pixels / 1.25.f32()).i64()
+
+def sdl_stroke_arc(renderer: mutable void&?, view: f32&?, cx: f32, cy: f32, radius: f32, start: f32, sweep: f32, color: u32):
     can Abort.Panic, Unsafe.PointerCast:
-        return if renderer == null or view == null
+        return if renderer == null or view == null or radius <= 0.0.f32() or sweep == 0.0.f32()
         target: mutable void& = renderer
-        previous_x: mutable f32 = 0.0.f32()
-        previous_y: mutable f32 = 0.0.f32()
-        index: mutable i32 = 0
-        while index <= 48.i32() |index, start, sweep, cx, cy, radius, view, target, previous_x, previous_y|:
-            angle: f32 = (start + sweep * index.f32() / 48.0.f32()) * 3.14159265358979323846.f32() / 180.0.f32()
-            x: f32 = SDLGeometry::x(view, cx + SDL_cosf(angle) * radius)
-            y: f32 = SDLGeometry::y(view, cy + SDL_sinf(angle) * radius)
-            if index > 0.i32():
-                _ = SDL_RenderLine(target, previous_x, previous_y, x, y)
-            previous_x <- x
-            previous_y <- y
-            index <- index + 1.i32()
+        viewport: f32& = view
+        scale: f32 = viewport[0]
+        return if scale <= 0.0.f32()
+        segments: i64 = sdl_round_segments(radius * scale)
+        radians: f32 = 3.14159265358979323846.f32() / 180.0.f32()
+        step: f32 = sweep * radians / segments.f32()
+        # Pyglet's default stroke is one framebuffer pixel. Radial offsets
+        # give adjacent arc segments the same miter at their shared vertex.
+        half_width: f32 = 0.5.f32() / (scale * SDL_cosf(step * 0.5.f32()))
+        first_angle: f32 = start * radians
+        for index in 0..<segments |index, target, viewport, cx, cy, radius, first_angle, step, half_width, color|:
+            a: f32 = first_angle + step * index.f32()
+            b: f32 = first_angle + step * (index + 1).f32()
+            ax: f32 = SDL_cosf(a)
+            ay: f32 = SDL_sinf(a)
+            bx: f32 = SDL_cosf(b)
+            by: f32 = SDL_sinf(b)
+            sdl_stroke_quad(target, viewport, cx + ax * radius, cy + ay * radius,
+                            cx + bx * radius, cy + by * radius,
+                            ax * half_width, ay * half_width, bx * half_width, by * half_width, color)
 
 export fn nw_sdl_set_color(renderer: mutable void&?, rgba: u32) = sdl_set_color
-export fn nw_sdl_stroke_arc(renderer: mutable void&?, view: f32&?, cx: f32, cy: f32, radius: f32, start: f32, sweep: f32) = sdl_stroke_arc
+export fn nw_sdl_stroke_arc(renderer: mutable void&?, view: f32&?, cx: f32, cy: f32, radius: f32, start: f32, sweep: f32, color: u32) = sdl_stroke_arc
 
 # SDL_Vertex is eight consecutive floats: position, RGBA and texture point.
 extern SDL_RenderGeometry(renderer: mutable void&, texture: void&?, vertices: void&, vertex_count: i32, indices: i32&?, index_count: i32) -> bool
@@ -93,33 +111,168 @@ def sdl_fill_triangle(renderer: mutable void&?, view: f32&?, x1: f32, y1: f32, x
         trusted Unsafe.PointerCast:
             _ = SDL_RenderGeometry(target, null, (&vertices[0]).cast[void&], 3.i32(), null, 0.i32())
 
+extern SDL_sqrtf(value: f32) -> f32
+
+def sdl_stroke_quad(renderer: mutable void&, view: f32&, x1: f32, y1: f32, x2: f32, y2: f32, nx1: f32, ny1: f32, nx2: f32, ny2: f32, color: u32):
+    can Abort.Panic, Unsafe.PointerCast:
+        vertices: mutable f32[32] = zeroed
+        indices: i32[6] = [0, 1, 2, 0, 2, 3]
+        sdl_vertex(&vertices[0], 0, SDLGeometry::x(view, x1 + nx1), SDLGeometry::y(view, y1 + ny1), color)
+        sdl_vertex(&vertices[0], 1, SDLGeometry::x(view, x1 - nx1), SDLGeometry::y(view, y1 - ny1), color)
+        sdl_vertex(&vertices[0], 2, SDLGeometry::x(view, x2 - nx2), SDLGeometry::y(view, y2 - ny2), color)
+        sdl_vertex(&vertices[0], 3, SDLGeometry::x(view, x2 + nx2), SDLGeometry::y(view, y2 + ny2), color)
+        trusted Unsafe.PointerCast:
+            _ = SDL_RenderGeometry(renderer, null, (&vertices[0]).cast[void&], 4.i32(), (&indices[0]).uintptr().cast[i32&], 6.i32())
+
+def sdl_stroke_segment(renderer: mutable void&, view: f32&, x1: f32, y1: f32, x2: f32, y2: f32, width: f32, color: u32):
+    can Abort.Panic, Unsafe.PointerCast:
+        return if width <= 0.0.f32()
+        dx: f32 = x2 - x1
+        dy: f32 = y2 - y1
+        length: f32 = SDL_sqrtf(dx * dx + dy * dy)
+        return if length <= 0.0.f32()
+        half_width: f32 = width / (2.0.f32() * length)
+        nx: f32 = -dy * half_width
+        ny: f32 = dx * half_width
+        sdl_stroke_quad(renderer, view, x1, y1, x2, y2, nx, ny, nx, ny, color)
+
 def sdl_fill_circle(renderer: mutable void&?, view: f32&?, cx: f32, cy: f32, radius: f32, color: u32):
     can Abort.Panic, Unsafe.PointerCast:
-        return if renderer == null or view == null
-        vertices: mutable f32[392] = zeroed
+        return if renderer == null or view == null or radius <= 0.0.f32()
+        target: mutable void& = renderer
+        viewport: f32& = view
+        segments: i64 = sdl_round_segments(radius * viewport[0])
+        vertices: mutable f32[400] = zeroed
         indices: mutable i32[144] = zeroed
-        sdl_vertex(&vertices[0], 0, SDLGeometry::x(view, cx), SDLGeometry::y(view, cy), color)
-        index: mutable i64 = 0
-        while index < 48 |index, vertices, indices, view, cx, cy, radius, color|:
-            angle: f32 = index.f32() / 48.0.f32() * 2.0.f32() * 3.14159265358979323846.f32()
-            sdl_vertex(&vertices[0], index + 1, SDLGeometry::x(view, cx + SDL_cosf(angle) * radius), SDLGeometry::y(view, cy + SDL_sinf(angle) * radius), color)
+        sdl_vertex(&vertices[0], 0, SDLGeometry::x(viewport, cx), SDLGeometry::y(viewport, cy), color)
+        for index in 0..<48 |index, indices|:
             indices[(index * 3).usize()] <- 0
             indices[(index * 3 + 1).usize()] <- (index + 1).i32()
-            indices[(index * 3 + 2).usize()] <- ((index + 1) % 48 + 1).i32()
-            index <- index + 1
-        target: mutable void& = renderer
-        trusted Unsafe.PointerCast:
-            _ = SDL_RenderGeometry(target, null, (&vertices[0]).cast[void&], 49.i32(), &indices[0], 144.i32())
+            indices[(index * 3 + 2).usize()] <- (index + 2).i32()
+        first: mutable i64 = 0
+        while first < segments |first, segments, vertices, indices, viewport, target, cx, cy, radius, color|:
+            remaining: i64 = segments - first
+            batch: i64 = 48 if remaining > 48 else remaining
+            for index in 0..<(batch + 1) |index, first, segments, vertices, viewport, cx, cy, radius, color|:
+                angle: f32 = ((first + index) % segments).f32() / segments.f32() * 6.283185307179586.f32()
+                sdl_vertex(&vertices[0], index + 1, SDLGeometry::x(viewport, cx + SDL_cosf(angle) * radius), SDLGeometry::y(viewport, cy + SDL_sinf(angle) * radius), color)
+            trusted Unsafe.PointerCast:
+                _ = SDL_RenderGeometry(target, null, (&vertices[0]).cast[void&], (batch + 2).i32(), (&indices[0]).uintptr().cast[i32&], (batch * 3).i32())
+            first <- first + batch
 
 export fn nw_sdl_fill_triangle(renderer: mutable void&?, view: f32&?, x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32, color: u32) = sdl_fill_triangle
 export fn nw_sdl_fill_circle(renderer: mutable void&?, view: f32&?, cx: f32, cy: f32, radius: f32, color: u32) = sdl_fill_circle
 
 extern SDL_strlen(text: cstr) -> usize
+extern SDL_utf8strlen(text: cstr) -> usize
 extern SDL_SetRenderScale(renderer: mutable void&, x: f32, y: f32) -> bool
 extern SDL_RenderDebugText(renderer: mutable void&, x: f32, y: f32, text: cstr) -> bool
 
-def sdl_draw_text(renderer: mutable void&?, view: f32&?, text: u8&?, x: f32, y: f32, size: f32, color: u32, anchor: u8):
+extern SDL_StepUTF8(text: mutable usize&, remaining: mutable usize&?) -> u32
+
+# SDL's debug font leaves these navigation glyphs blank. Draw the arrows
+# in the same eight-pixel cells so the rest of the label stays aligned.
+def sdl_draw_navigation_glyphs(renderer: mutable void&, text: cstr, x: f32, y: f32):
     can Abort.Panic, Unsafe.PointerCast:
+        cursor: mutable usize = text.uintptr()
+        column: mutable f32 = x
+        trusted Unsafe.PointerCast:
+            point: mutable usize& = (&cursor).uintptr().cast[mutable usize&]
+            glyph: mutable u32 = SDL_StepUTF8(point, null)
+            while glyph != 0.u32() |glyph, point, column, y, renderer|:
+                if glyph >= 8592.u32() and glyph <= 8595.u32():
+                    horizontal: bool = glyph == 8592.u32() or glyph == 8594.u32()
+                    direction: f32 = -1.0.f32() if glyph == 8592.u32() or glyph == 8593.u32() else 1.0.f32()
+                    dx: f32 = direction if horizontal else 0.0.f32()
+                    dy: f32 = 0.0.f32() if horizontal else direction
+                    cx: f32 = column + 3.5.f32()
+                    cy: f32 = y + 3.5.f32()
+                    tip_x: f32 = cx + dx * 3.0.f32()
+                    tip_y: f32 = cy + dy * 3.0.f32()
+                    _ = SDL_RenderLine(renderer, cx - dx * 3.0.f32(), cy - dy * 3.0.f32(), tip_x, tip_y)
+                    _ = SDL_RenderLine(renderer, tip_x, tip_y, tip_x - dx * 2.0.f32() + dy * 2.0.f32(), tip_y - dy * 2.0.f32() + dx * 2.0.f32())
+                    _ = SDL_RenderLine(renderer, tip_x, tip_y, tip_x - dx * 2.0.f32() - dy * 2.0.f32(), tip_y - dy * 2.0.f32() - dx * 2.0.f32())
+                column <- column + 8.0.f32()
+                glyph <- SDL_StepUTF8(point, null)
+
+extern SDL_DestroyRenderer(renderer: mutable void&)
+extern SDL_CreateSurface(width: i32, height: i32, format: u32) -> mutable void&? can[Memory.Allocate]
+extern SDL_CreateSoftwareRenderer(surface: mutable void&) -> mutable void&? can[Memory.Allocate]
+extern SDL_DestroySurface(surface: mutable void&) can[Memory.Release]
+extern SDL_CreateTextureFromSurface(renderer: mutable void&, surface: mutable void&) -> mutable void&? can[Memory.Allocate]
+extern SDL_DestroyTexture(texture: mutable void&) can[Memory.Release]
+extern SDL_RenderTexture(renderer: mutable void&, texture: mutable void&, source: f32&?, destination: f32&) -> bool
+extern SDL_SetTextureBlendMode(texture: mutable void&, mode: u32) -> bool
+
+# SDL_ttf returns a rasterized surface and baseline metric through the host.
+def sdl_draw_font_text(renderer: mutable void&, text: cstr, x: f32, y: f32, pixels: f32, color: u32, anchor: u8, bold: bool, angle: f64 = 0.0, face: i32 = 0.i32()) -> bool:
+    can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        callback: mutable void&? = SDL_GetPointerProperty(SDL_GetRendererProperties(renderer), "nw.font.rasterize", null)
+        return false if callback == null
+        return true if SDL_strlen(text) == 0.usize()
+        trusted Unsafe.PointerCast:
+            address: mutable void& = callback
+            rasterize: fn(mutable void&, usize, f32, u32, i32, usize) -> mutable void&? = address.uintptr().cast[fn(mutable void&, usize, f32, u32, i32, usize) -> mutable void&?]
+            ascent: mutable f32 = 0.0.f32()
+            surface: mutable void&? = rasterize(renderer, text.uintptr(), pixels, color, (face << 1.i32()) | (1.i32() if bold else 0.i32()), (&ascent).uintptr())
+            return false if surface == null
+            image: mutable void& = surface
+            texture: mutable void&? = SDL_CreateTextureFromSurface(renderer, image)
+            SDL_DestroySurface(image)
+            return false if texture == null
+            glyphs: mutable void& = texture
+            width: mutable f32 = 0.0.f32()
+            height: mutable f32 = 0.0.f32()
+            drawn: mutable bool = false
+            if SDL_GetTextureSize(glyphs, &width, &height):
+                left: f32 = x - width * (anchor % 3.u8()).f32() * 0.5.f32()
+                top: f32 = y - (ascent if anchor / 3.u8() == 0.u8() else (height * 0.5.f32() if anchor / 3.u8() == 1.u8() else 0.0.f32()))
+                box: f32[4] = [left, top, width, height]
+                bounds: f32& = (&box[0]).uintptr().cast[f32&]
+                drawn <- SDL_RenderTexture(renderer, glyphs, null, bounds) if angle == 0.0 else (
+                    SDL_RenderTextureRotated(renderer, glyphs, null, bounds, angle, null, 0.i32()))
+            SDL_DestroyTexture(glyphs)
+            return drawn
+
+# A single faced character rotates about its centre even in the
+# SDL-only build. Rasterize the built-in fallback into a transparent tile.
+def sdl_draw_debug_glyph(renderer: mutable void&, text: cstr, x: f32, y: f32, pixels: f32, color: u32, angle: f64):
+    can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        if SDL_CreateSurface(8.i32(), 8.i32(), 0x16762004.u32()) is surface:
+            if SDL_CreateSoftwareRenderer(surface) is software:
+                _ = SDL_SetRenderDrawColor(software, 0.u8(), 0.u8(), 0.u8(), 0.u8())
+                _ = SDL_RenderClear(software)
+                _ = SDL_SetRenderDrawColor(software, 255.u8(), 255.u8(), 255.u8(), 255.u8())
+                if SDL_RenderDebugText(software, 0.0.f32(), 0.0.f32(), text) and SDL_RenderPresent(software):
+                    if SDL_CreateTextureFromSurface(renderer, surface) is texture:
+                        trusted Unsafe.PointerCast:
+                            box: f32[4] = [x - pixels / 2.0.f32(), y - pixels / 2.0.f32(), pixels, pixels]
+                            _ = SDL_SetTextureBlendMode(texture, 1.u32())
+                            _ = SDL_SetTextureColorMod(texture, (color >> 24).u8(), (color >> 16).u8(), (color >> 8).u8())
+                            _ = SDL_SetTextureAlphaMod(texture, color.u8())
+                            _ = SDL_RenderTextureRotated(renderer, texture, null, (&box[0]).uintptr().cast[f32&], angle, null, 0.i32())
+                        SDL_DestroyTexture(texture)
+                SDL_DestroyRenderer(software)
+            SDL_DestroySurface(surface)
+
+def sdl_draw_faced_text(renderer: mutable void&, view: f32&, frame: NativeDisplayDecode::Frame&, cmd: heap Command&):
+    can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        pointer: mutable usize = 0.usize()
+        trusted Unsafe.PointerCast:
+            return if native_display_text(frame, cmd.cast[u8&], &pointer) != 1.u32() or pointer == 0.usize()
+            source: heap u8& = pointer.cast[heap u8&]
+            text: u8[2] = [source[0], 0.u8()]
+            string: cstr = (&text[0]).cast[cstr]
+            x: f32 = SDLGeometry::x(view, cmd.a)
+            y: f32 = SDLGeometry::y(view, cmd.b)
+            pixels: f32 = cmd.c * view[0]
+            capped: f32 = 200.0.f32() if pixels > 200.0.f32() else pixels
+            return if capped <= 0.0.f32()
+            return if sdl_draw_font_text(renderer, string, x, y, capped, cmd.color, 4.u8(), false, cmd.e.f64(), cmd.f.i32())
+            sdl_draw_debug_glyph(renderer, string, x, y, capped, cmd.color, cmd.e.f64())
+
+def sdl_draw_text_weighted(renderer: mutable void&?, view: f32&?, text: u8&?, x: f32, y: f32, size: f32, color: u32, anchor: u8, bold: bool):
+    can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
         return if renderer == null or view == null or text == null
         trusted Unsafe.PointerCast:
             target: mutable void& = renderer
@@ -127,9 +280,12 @@ def sdl_draw_text(renderer: mutable void&?, view: f32&?, text: u8&?, x: f32, y: 
             values: heap f32& = view_ptr.cast[heap f32&]
             chars: u8& = text
             string: cstr = chars.cast[cstr]
-            scale: f32 = size * values[0] / 8.0.f32()
-            return if scale == 0.0.f32()
-            width: f32 = SDL_strlen(string).f32() * 8.0.f32() * scale
+            pixels: f32 = size * values[0]
+            capped: f32 = 200.0.f32() if pixels > 200.0.f32() else pixels
+            return if capped <= 0.0.f32()
+            return if sdl_draw_font_text(target, string, SDLGeometry::x(view, x), SDLGeometry::y(view, y), capped, color, anchor, bold)
+            scale: f32 = capped / 8.0.f32()
+            width: f32 = SDL_utf8strlen(string).f32() * 8.0.f32() * scale
             height: f32 = 8.0.f32() * scale
             sx: mutable f32 = SDLGeometry::x(view, x)
             sy: mutable f32 = SDLGeometry::y(view, y)
@@ -144,13 +300,20 @@ def sdl_draw_text(renderer: mutable void&?, view: f32&?, text: u8&?, x: f32, y: 
             sdl_set_color(target, color)
             _ = SDL_SetRenderScale(target, scale, scale)
             _ = SDL_RenderDebugText(target, sx / scale, sy / scale, string)
+            sdl_draw_navigation_glyphs(target, string, sx / scale, sy / scale)
+            if bold:
+                _ = SDL_RenderDebugText(target, (sx + scale) / scale, sy / scale, string)
             _ = SDL_SetRenderScale(target, 1.0.f32(), 1.0.f32())
+
+def sdl_draw_text(renderer: mutable void&?, view: f32&?, text: u8&?, x: f32, y: f32, size: f32, color: u32, anchor: u8):
+    can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        sdl_draw_text_weighted(renderer, view, text, x, y, size, color, anchor, false)
 
 export fn nw_sdl_draw_text(renderer: mutable void&?, view: f32&?, text: u8&?, x: f32, y: f32, size: f32, color: u32, anchor: u8) = sdl_draw_text
 
 extern SDL_malloc(size: usize) -> mutable heap void&? can[Memory.Allocate]
 
-def sdl_draw_multiline(renderer: mutable void&?, view: f32&?, frame: NativeDisplayDecode::Frame&?, command: u8&?, x: f32, y: f32, size: f32, color: u32, anchor: u8):
+def sdl_draw_multiline_weighted(renderer: mutable void&?, view: f32&?, frame: NativeDisplayDecode::Frame&?, command: u8&?, x: f32, y: f32, size: f32, color: u32, anchor: u8, bold: bool):
     can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
         return if renderer == null or view == null or frame == null or command == null
         pointer: mutable usize = 0.usize()
@@ -161,6 +324,14 @@ def sdl_draw_multiline(renderer: mutable void&?, view: f32&?, frame: NativeDispl
             SDL_Log("Could not allocate text rendering buffer")
             return
         trusted Unsafe.PointerCast:
+            view_ptr: f32& = view
+            scales: heap f32& = view_ptr.cast[heap f32&]
+            viewport_scale: f32 = scales[0]
+            if viewport_scale <= 0.0.f32():
+                allocation: mutable heap void& = memory
+                SDL_free(allocation.cast[heap void&])
+                return
+            line_size: f32 = 200.0.f32() / viewport_scale if size * viewport_scale > 200.0.f32() else size
             allocation: mutable heap void& = memory
             buffer: mutable heap u8& = allocation.cast[mutable heap u8&]
             source: heap u8& = pointer.cast[heap u8&]
@@ -174,16 +345,20 @@ def sdl_draw_multiline(renderer: mutable void&?, view: f32&?, frame: NativeDispl
             index <- 0.usize()
             row: mutable i64 = 0
             line_start: mutable usize = 0.usize()
-            while index <= length |index, length, buffer, rows, row, line_start, renderer, view, x, y, size, color, anchor|:
+            while index <= length |index, length, buffer, rows, row, line_start, renderer, view, x, y, line_size, color, anchor, bold|:
                 if buffer[index] == 10.u8() or buffer[index] == 0.u8():
                     buffer[index] <- 0.u8()
-                    line_y: f32 = y + ((rows - 1).f32() * 0.5.f32() - row.f32()) * size * 1.25.f32()
+                    line_y: f32 = y + ((rows - 1).f32() * 0.5.f32() - row.f32()) * line_size * 1.25.f32()
                     line: u8& = (&buffer[line_start]).cast[u8&]
-                    sdl_draw_text(renderer, view, line, x, line_y, size, color, anchor)
+                    sdl_draw_text_weighted(renderer, view, line, x, line_y, line_size, color, anchor, bold)
                     line_start <- index + 1.usize()
                     row <- row + 1
                 index <- index + 1.usize()
             SDL_free(allocation.cast[heap void&])
+
+def sdl_draw_multiline(renderer: mutable void&?, view: f32&?, frame: NativeDisplayDecode::Frame&?, command: u8&?, x: f32, y: f32, size: f32, color: u32, anchor: u8):
+    can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        sdl_draw_multiline_weighted(renderer, view, frame, command, x, y, size, color, anchor, false)
 
 export fn nw_sdl_draw_multiline(renderer: mutable void&?, view: f32&?, frame: NativeDisplayDecode::Frame&?, command: u8&?, x: f32, y: f32, size: f32, color: u32, anchor: u8) = sdl_draw_multiline
 

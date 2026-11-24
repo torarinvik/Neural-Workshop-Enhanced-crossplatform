@@ -1,0 +1,114 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/tasks/crazy_cog_controls.elisa"
+
+extern dprintf(fd: i32, format: cstr, ...) -> i32 can[Console.Write]
+
+def cog_line(c: CrazyCog::Cog):
+    can Console.Write:
+        _ = dprintf(1.i32(), "cog %.17g %.17g %.17g %lld\n", c.x, c.y, c.r, c.z)
+
+def emit(m: CrazyCog::Machine&, draw: mutable MT19937&):
+    can Console.Write, Abort.Panic:
+        _ = dprintf(1.i32(), "deal %lld %.17g\n", m.plan.count.i64(), py_random(draw))
+        return if m.plan.count == 0.usize()
+        _ = dprintf(1.i32(), "machine %lld %.17g %.17g %lld %.17g %.17g %lld %lld\n",
+            m.fan_way, m.fan_low, m.fan_high, m.chains, m.lift, m.seconds, m.walls.count.i64(), m.tray.count.i64())
+        cog_line(m.motor)
+        cog_line(m.winch)
+        cog_line(m.fan)
+        for wall in m.walls:
+            _ = dprintf(1.i32(), "wall %.17g %.17g %.17g %.17g %lld\n", wall.x, wall.y, wall.w, wall.h, wall.z)
+        for r in m.tray:
+            _ = dprintf(1.i32(), "radius %lld\n", r)
+        for c in m.plan:
+            cog_line(c)
+        for link in m.plan_chains:
+            cog_line(link.first)
+            cog_line(link.second)
+
+def physics(machine: CrazyCog::Machine, policy: i64):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        m: mutable CrazyCog::Machine = machine
+        m.fan_way <- -m.fan_way if policy == 1
+        m.seconds <- 2.0 if policy == 2
+        run: mutable CrazyCog::Run = CrazyCog::begin(m)
+        if policy != 2 and policy != 3:
+            for c in m.plan:
+                run.wheels.push(CrazyCog::Wheel{cog: c, angle: 0.0, ratio: 0.0, driven: false})
+            for link in m.plan_chains:
+                run.belts.push(link)
+        CrazyCog::rewire(&run)
+        tick: mutable i64 = 0
+        _ = dprintf(1.i32(), "rewire %lld %lld\n", 1 if run.powered else 0, 1 if run.jammed else 0)
+        while run.result == CrazyCog::LIVE |run, tick, policy|:
+            if policy == 3:
+                port: i64 = CrazyCog::pilot(&run)
+                CrazyCog::act(&run, port)
+                _ = dprintf(1.i32(), "control %lld %.17g %.17g %lld %lld %lld %lld %lld %lld\n",
+                    port, run.hand.x, run.hand.y, 1 if run.hand.down else 0, run.layer, run.carry, run.stock,
+                    run.wheels.count.i64(), run.belts.count.i64())
+            CrazyCog::tick_train(&run, 1.0 / 60.0)
+            if tick % 8 == 0 or run.result != CrazyCog::LIVE:
+                _ = dprintf(1.i32(), "tick %lld %lld %.17g %.17g %.17g %.17g %.17g\n", tick, run.result, run.time,
+                    run.height, run.out, CrazyCog::motor_speed(&run), CrazyCog::fan_speed(&run))
+                for wheel in run.wheels:
+                    _ = dprintf(1.i32(), "turn %.17g %.17g\n", wheel.ratio, wheel.angle)
+            tick <- tick + 1
+        for cue in run.cues:
+            _ = dprintf(1.i32(), "cue %.17g %.17g %.17g %lld %.17g %.17g\n", cue.time, cue.duration, cue.frequency,
+                cue.voice, cue.gain, cue.pan)
+        _ = dprintf(1.i32(), "end\n")
+
+def blocked_train(jammed: bool):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        machine: mutable CrazyCog::Machine = zeroed
+        machine.level <- CrazyCog::grade(20)
+        radius: f64 = 30.0 if jammed else 52.0
+        winch_radius: f64 = 30.0 if jammed else 22.0
+        motor: CrazyCog::Cog = CrazyCog::Cog{x: 130.0, y: 400.0, r: radius, z: 0}
+        winch: CrazyCog::Cog = CrazyCog::Cog{x: 130.0 + radius + winch_radius, y: 400.0, r: winch_radius, z: 0}
+        machine.motor <- motor
+        machine.winch <- winch
+        machine.plan.push(motor)
+        machine.plan.push(winch)
+        if jammed:
+            machine.plan.push(CrazyCog::Cog{x: 160.0, y: 451.9615242270663, r: 30.0, z: 0})
+        machine.lift <- 190.0
+        machine.seconds <- 1.0
+        physics(machine, 0)
+
+def main() -> i32:
+    can Console.Write, Memory.Allocate, Memory.Release, Abort.Panic:
+        for rung in [0, 1, 4, 7, 10, 13, 16, 19, 20, 24, 28, 32, 40, 80]:
+            g: CrazyCog::Grade = CrazyCog::grade(rung)
+            _ = dprintf(1.i32(), "grade %lld %lld %lld %lld %.17g %lld %lld %lld %lld %.17g %.17g\n",
+                g.rung, g.links, 1 if g.chains else 0, g.layers, g.load, g.walls, g.walls_back, g.fan, g.spare, g.slack, g.place)
+            sampled: mutable bool = false
+            for seed in 0..<1000 |g, sampled|:
+                region trial(32768):
+                    in trial:
+                        draw: mutable MT19937 = zeroed
+                        mt_seed_int(&draw, seed.u64())
+                        candidate: CrazyCog::Machine = CrazyCog::build(g, &draw)
+                        emit(&candidate, &draw)
+                        if not sampled and candidate.plan.count > 0.usize():
+                            physics(candidate, 0)
+                            if g.rung == 1:
+                                physics(candidate, 2)
+                            if g.rung == 20:
+                                physics(candidate, 1)
+                            sampled <- true
+            if g.rung == 1 or g.rung == 10 or g.rung == 20 or g.rung == 32:
+                region replay(1048576):
+                    in replay:
+                        draw: mutable MT19937 = zeroed
+                        mt_seed_int(&draw, 17.u64())
+                        screened: CrazyCog::Machine = CrazyCog::deal(g, &draw)
+                        emit(&screened, &draw)
+                        if screened.plan.count > 0.usize():
+                            physics(screened, 3)
+        blocked_train(true)
+        blocked_train(false)
+        return 0.i32()

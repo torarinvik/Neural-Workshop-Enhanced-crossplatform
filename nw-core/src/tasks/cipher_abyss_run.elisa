@@ -1,0 +1,256 @@
+include "./cipher_abyss_board.elisa"
+include "./drshape_deal.elisa"
+
+extend CipherAbyss:
+    const LIVE: i64 = 0
+    const CRACKED: i64 = 1
+    const WRONG: i64 = 2
+    const DIFFERENT: i64 = 3
+    const SAME_THERE: i64 = 4
+    const SAME_MACHINE: i64 = 5
+    const DIFFERENT_MACHINE: i64 = 6
+    const RULE_CRACKED: i64 = 7
+    const WRONG_RULE: i64 = 8
+    const TIMEOUT: i64 = 9
+
+    const CHIME: i64 = 0
+    const TONE: i64 = 1
+    const BUZZ: i64 = 2
+    const DONE: i64 = 3
+    const MISS: i64 = 4
+    const TICK: i64 = 5
+    const HUM: i64 = 6
+
+    struct Answer:
+        sample: CipherLang::Sample
+        correct: bool
+
+    struct Run:
+        machine: CipherLang::Machine
+        hand: mutable HandView::Pointer
+        entry: mutable darray[i64]
+        log: mutable darray[CipherLang::Sample]
+        state: mutable CipherLang::State
+        testing: mutable bool
+        test_no: mutable i64
+        answers: mutable darray[Answer]
+        flash: mutable cstr
+        flash_at: mutable f64
+        submitted: mutable i64
+        said_same: mutable i64
+        twins_q: mutable bool
+        available: darray[CipherLang::Block]
+        board: mutable darray[CipherLang::Block]
+        cursor: mutable i64
+        checked: mutable darray[i64]
+        check_good: mutable i64
+        check_total: mutable i64
+        predicting: mutable bool
+        pending: mutable darray[i64]
+        predictions: mutable darray[CipherLang::Probe]
+        scroll: mutable i64
+        marks: mutable darray[i64]
+        numbers: mutable bool
+        input_order: mutable bool
+        shown_at: mutable f64
+        last: mutable CipherLang::Sample
+        time: mutable f64
+        result: mutable i64
+        notes: mutable darray[DrShapeDeal::Note]
+        note_seed: mutable i64
+        inverse: CipherLang::Inverse
+
+    def begin(program: darray[CipherLang::Node]&, rules: CipherLang::Rules&, machine: CipherLang::Machine) -> Run:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            available: darray[CipherLang::Block] = CipherLang::blocks(program, &rules.truths, machine.level.symbols)
+            inverse: CipherLang::Inverse = CipherLang::preimages(program, machine.rule, machine.level) if machine.kind == CipherLang::INVERT else zeroed
+            return Run{machine: machine, hand: HandView::initialize(), entry: [], log: [], state: zeroed, testing: false,
+                test_no: 0, answers: [], flash: "", flash_at: -10.0, submitted: -1, said_same: -1, twins_q: false,
+                available: available, board: [], cursor: 0, checked: [], check_good: 0, check_total: 0, predicting: false,
+                pending: [], predictions: [], scroll: 0, marks: [], numbers: true, input_order: false, shown_at: -10.0,
+                last: zeroed, time: 0.0, result: LIVE, notes: [], note_seed: 0, inverse: inverse}
+
+    def pitch(value: i64) -> f64:
+        pitches: f64[8] = [262.0, 294.0, 330.0, 392.0, 440.0, 523.0, 587.0, 659.0]
+        return pitches[value.usize()]
+
+    def note(run: mutable Run&, duration: f64, frequency: f64, voice: i64, gain: f64, pan: f64 = 0.0,
+             bright: f64 = 0.8, at: f64 = -1.0):
+        can Abort.Panic, Memory.Allocate:
+            run.note_seed <- run.note_seed + 1
+            time: f64 = run.time if at < 0.0 else at
+            balance: f64 = HandView::clamp(pan, -1.0, 1.0)
+            cue: DrShapeDeal::Note = DrShapeDeal::Note{t: time, dur: duration, freq: frequency, voice: voice,
+                gain: gain, gain2: gain, pan: balance, pan2: balance, bright: bright, seed: run.note_seed, who: -1, room: 0.0}
+            i: mutable i64 = run.notes.count.i64()
+            run.notes.push(cue)
+            while i > 0 and run.notes[(i - 1).usize()].t > time |run, i, time|:
+                run.notes[i.usize()] <- run.notes[(i - 1).usize()]
+                i <- i - 1
+            run.notes[i.usize()] <- cue
+
+    def sound(run: mutable Run&, row: darray[i64]&):
+        can Abort.Panic, Memory.Allocate:
+            length: i64 = row.count.i64()
+            for i in 0..<length |run, row, length|:
+                note(run, 0.14, pitch(row[i.usize()]), TONE, 0.4, -0.6 + 1.2 * i.f64() / max(1, length - 1).f64(),
+                    0.8, run.time + 0.16 * i.f64())
+
+    def say(run: mutable Run&, text: cstr):
+        run.flash <- text
+        run.flash_at <- run.time
+
+    def left(run: Run&) -> i64:
+        return run.machine.level.budget - run.log.count.i64()
+
+    def question_index(run: Run&) -> i64:
+        return run.test_no if run.testing and not run.twins_q and run.test_no < run.machine.tests.count.i64() else -1
+
+    def output_size(program: darray[CipherLang::Node]&, run: Run&, row: darray[i64]&) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            count: mutable i64 = 0
+            region scratch(4096):
+                in scratch:
+                    out: darray[i64] = CipherLang::run(program, run.machine.rule, row, run.machine.level.symbols, &run.state)
+                    count <- out.count.i64()
+            return count
+
+    def want(program: darray[CipherLang::Node]&, run: Run&) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return output_size(program, run, &run.pending) if run.pending.count > 0.usize()
+            index: i64 = question_index(run)
+            return run.machine.level.length if index < 0 or run.machine.kind == CipherLang::INVERT
+            given: CipherLang::Probe = run.machine.tests[index.usize()]
+            return output_size(program, run, &given.values)
+
+    def run_row(program: darray[CipherLang::Node]&, run: mutable Run&, given: darray[i64]) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            k: i64 = run.machine.level.symbols
+            rule: i64 = run.machine.rule
+            prior: CipherLang::State = run.state
+            result: darray[i64] = CipherLang::run(program, rule, &given, k, &prior)
+            turns: i64 = run.state.runs + 1
+            meta: i64 = run.state.meta + CipherLang::meta_bump(program, rule, &given, &prior)
+            run.state <- CipherLang::State{runs: turns, last_in: given, last_out: result, meta: meta}
+            run.last <- CipherLang::Sample{given: given, result: result}
+            run.shown_at <- run.time
+            note(run, 0.16 * max(1, result.count.i64()).f64() + 0.15, 98.0, HUM, 0.12, 0.0, 0.3)
+            return result
+
+    def type_symbol(program: darray[CipherLang::Node]&, run: mutable Run&, value: i64):
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return if run.result != LIVE or value < 0 or value >= run.machine.level.symbols or run.entry.count.i64() >= want(program, run)
+            run.entry.push(value)
+            note(run, 0.06, pitch(value), TICK, 0.3)
+
+    def remove_symbol(run: mutable Run&, at: i64 = -1):
+        can Abort.Panic:
+            size: i64 = run.entry.count.i64()
+            if size > 0:
+                index: i64 = size - 1 if at < 0 else min(at, size - 1)
+                _ = run.entry.remove_at(index.usize())
+            elif run.pending.count > 0.usize():
+                run.entry <- run.pending
+                run.pending <- []
+
+    def begin_test(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            return if run.testing or run.result != LIVE
+            run.testing <- true
+            run.pending <- []
+            run.state <- zeroed
+            run.entry.clear()
+            run.checked.clear()
+            note(run, 0.3, 520.0, CHIME, 0.4)
+
+    def won(result: i64) -> bool:
+        return result == CRACKED or result == DIFFERENT or result == SAME_MACHINE or result == RULE_CRACKED
+
+    def finish(run: mutable Run&, result: i64):
+        can Abort.Panic, Memory.Allocate:
+            note(run, 0.6, 1046.0, DONE, 0.5) if won(result) else note(run, 0.5, 80.0, MISS, 0.5)
+            run.result <- result
+
+    def experiment_row(program: darray[CipherLang::Node]&, run: mutable Run&, entered: darray[i64]):
+        can Abort.Panic, Memory.Allocate:
+            return if left(run) <= 0
+            predicts: bool = run.pending.count > 0.usize()
+            if run.predicting and not predicts:
+                run.pending <- entered
+                say(run, "What will it give? Put in your guess")
+                return
+            given: darray[i64] = run.pending if predicts else entered
+            run.pending <- []
+            result: darray[i64] = run_row(program, run, given)
+            run.log.push(CipherLang::Sample{given: given, result: result})
+            guess: darray[i64] = entered if predicts else []
+            run.predictions.push(CipherLang::Probe{values: guess})
+            if predicts:
+                say(run, "As you said" if CipherLang::same_row(&entered, &result) else "Not what you said")
+            run.checked.clear()
+            note(run, 0.1, 700.0, CHIME, 0.3)
+            sound(run, &result)
+            run.scroll <- 0
+            begin_test(run) if left(run) <= 0
+
+    def test_row(program: darray[CipherLang::Node]&, run: mutable Run&, entered: darray[i64]):
+        can Abort.Panic, Memory.Allocate:
+            k: i64 = run.machine.level.symbols
+            initial: CipherLang::State = zeroed
+            rule: i64 = run.machine.rule
+            if run.twins_q:
+                other: i64 = run.machine.other
+                a: darray[i64] = CipherLang::run(program, rule, &entered, k, &initial)
+                b: darray[i64] = CipherLang::run(program, other, &entered, k, &initial)
+                different: bool = not CipherLang::same_row(&a, &b)
+                run.answers.push(Answer{sample: CipherLang::Sample{given: entered, result: a}, correct: different})
+                sound(run, &a)
+                finish(run, DIFFERENT if different else SAME_THERE)
+                return
+            given: CipherLang::Probe = run.machine.tests[run.test_no.usize()]
+            ok: mutable bool = false
+            if run.machine.kind == CipherLang::INVERT:
+                index: i64 = CipherLang::inverse_lookup(&run.inverse, CipherLang::row_number(&given.values, k))
+                expected: darray[i64] = CipherLang::numbered_row(index, run.machine.level.length, k)
+                answer: darray[i64] = CipherLang::run(program, rule, &entered, k, &initial)
+                ok <- CipherLang::same_row(&answer, &given.values)
+                run.answers.push(Answer{sample: CipherLang::Sample{given: expected, result: given.values}, correct: ok})
+                sound(run, &given.values)
+            else:
+                truth: darray[i64] = run_row(program, run, given.values)
+                ok <- CipherLang::same_row(&entered, &truth)
+                run.answers.push(Answer{sample: CipherLang::Sample{given: given.values, result: truth}, correct: ok})
+                sound(run, &truth)
+            run.scroll <- 0
+            if not ok:
+                finish(run, WRONG)
+                return
+            run.test_no <- run.test_no + 1
+            note(run, 0.15, 880.0, CHIME, 0.4)
+            if run.test_no >= run.machine.tests.count.i64():
+                if run.machine.kind == CipherLang::TWINS:
+                    run.twins_q <- true
+                    run.entry.clear()
+                    say(run, "Is the second machine the same?")
+                else:
+                    finish(run, CRACKED)
+
+    def go(program: darray[CipherLang::Node]&, run: mutable Run&):
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return if run.result != LIVE
+            count: i64 = run.entry.count.i64()
+            if count != want(program, run):
+                say(run, "Fill every slot first")
+                note(run, 0.1, 90.0, BUZZ, 0.3)
+                return
+            row: darray[i64] = CipherLang::sliced(&run.entry, 0, count)
+            run.entry.clear()
+            if run.testing:
+                test_row(program, run, row)
+            else:
+                experiment_row(program, run, row)
+
+    def step(run: mutable Run&, dt: f64):
+        return if run.result != LIVE
+        run.time <- run.time + dt
+        run.result <- TIMEOUT if run.time >= run.machine.level.seconds

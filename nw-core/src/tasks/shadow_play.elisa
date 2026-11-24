@@ -1,0 +1,395 @@
+include "./drshape_deal.elisa"
+include "../pymath.elisa"
+
+module ShadowPlay:
+    const PI: f64 = 3.141592653589793
+    const SPIN: f64 = 1.0471975511965976
+    const WALL: f64 = 3.0
+    const FLOOR: f64 = 2.2
+    const CHECK: f64 = 0.05
+    const YAW_L: i64 = 0
+    const YAW_R: i64 = 1
+    const PITCH_D: i64 = 2
+    const PITCH_U: i64 = 3
+    const ROLL_L: i64 = 4
+    const ROLL_R: i64 = 5
+    const PORTS: i64 = 6
+    const MAX_JOINTS: i64 = 10
+    const MAX_STEPS: i64 = 19
+    const MAX_SAMPLES: i64 = 55
+    const SAMPLES_PER_SEGMENT: i64 = 6
+    const PENDING: i64 = 0
+    const WON: i64 = 1
+    const TIMED_OUT: i64 = -1
+
+    struct Grade:
+        rung: i64
+        bends: i64
+        axes: i64
+        tol: f64
+        hum: bool
+        floor: bool
+        turning: f64
+        swing: f64
+        hold: f64
+        seconds: f64
+
+    struct Rod:
+        joints: mutable RoomsView::Vec[MAX_JOINTS]
+        count: i64
+
+    struct SamplePoints:
+        points: mutable RoomsView::Vec[MAX_SAMPLES]
+        count: i64
+
+    struct Setup:
+        level: Grade
+        rod: Rod
+        target: DrShape::Matrix
+        start: DrShape::Matrix
+
+    struct Run:
+        setup: Setup
+        t: mutable f64
+        turn: mutable DrShape::Matrix
+        samples: SamplePoints
+        fit: mutable f64
+        checked: mutable f64
+        fit_since: mutable f64
+        result: mutable i64
+        notes: mutable darray[DrShapeDeal::Note]
+        next_hum: mutable f64
+        seed: mutable i64
+        dirty: mutable bool
+        capture: bool
+
+    def abs(value: f64) -> f64:
+        return -value if value < 0.0 else value
+
+    def radians(degrees: f64) -> f64:
+        return degrees * (PI / 180.0)
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung >= 1 else 1
+        top: i64 = r - 20 if r >= 20 else 0
+        bends: i64 = 3 if r < 4 else (4 if r < 7 else (5 if r < 20 else (8 if top >= 6 else 6 + top / 3)))
+        tolerance: f64 = 0.10 if r < 4 else (0.08 if r < 10 else (0.07 if r < 20 else (0.045 if top >= 10 else 0.065 - 0.002 * top.f64())))
+        turning: f64 = radians(10.0) if r >= 13 and r < 16 else (
+            radians(18.0 if top >= 8 else 10.0 + top.f64()) if r >= 20 else 0.0)
+        return Grade{rung: r, bends: bends, axes: 1 if r < 4 else (2 if r < 7 else 3), tol: tolerance,
+            hum: r < 10, floor: (r >= 10 and r < 13) or r >= 20, turning: turning,
+            swing: radians(22.0) if r >= 16 else 0.0, hold: 0.6 if r < 13 else 1.0,
+            seconds: 30.0 if r < 4 else (40.0 if r < 7 else (55.0 if r < 20 else 50.0))}
+
+    def mat(axis: i64, a: f64) -> DrShape::Matrix:
+        c: f64 = cos(a)
+        s: f64 = sin(a)
+        if axis == 0:
+            return DrShape::Matrix{x: RoomsView::vec(1.0, 0.0, 0.0), y: RoomsView::vec(0.0, c, -s), z: RoomsView::vec(0.0, s, c)}
+        if axis == 1:
+            return DrShape::Matrix{x: RoomsView::vec(c, 0.0, s), y: RoomsView::vec(0.0, 1.0, 0.0), z: RoomsView::vec(-s, 0.0, c)}
+        return DrShape::Matrix{x: RoomsView::vec(c, -s, 0.0), y: RoomsView::vec(s, c, 0.0), z: RoomsView::vec(0.0, 0.0, 1.0)}
+
+    def transpose(m: DrShape::Matrix) -> DrShape::Matrix:
+        return DrShape::Matrix{x: RoomsView::vec(m.x.x, m.y.x, m.z.x),
+            y: RoomsView::vec(m.x.y, m.y.y, m.z.y), z: RoomsView::vec(m.x.z, m.y.z, m.z.z)}
+
+    def angle_between(a: DrShape::Matrix, b: DrShape::Matrix) -> f64:
+        q: DrShape::Matrix = DrShape::matmul(a, transpose(b))
+        return acos(DrShapeDeal::clamp((q.x.x + q.y.y + q.z.z - 1.0) * 0.5, -1.0, 1.0))
+
+    def random_turn(rng: mutable MT19937&) -> DrShape::Matrix:
+        can Abort.Panic:
+            yaw: f64 = py_uniform(rng, -PI, PI)
+            pitch: f64 = py_uniform(rng, -PI, PI)
+            roll: f64 = py_uniform(rng, -PI, PI)
+            return DrShape::matmul(mat(2, roll), DrShape::matmul(mat(0, pitch), mat(1, yaw)))
+
+    def direction(choice: i64) -> RoomsView::Vec:
+        sign: f64 = 1.0 if choice % 2 == 0 else -1.0
+        return RoomsView::vec(sign, 0.0, 0.0) if choice < 2
+        return RoomsView::vec(0.0, sign, 0.0) if choice < 4
+        return RoomsView::vec(0.0, 0.0, sign)
+
+    def seen(points: RoomsView::Vec[MAX_STEPS]&, count: i64, probe: RoomsView::Vec) -> bool:
+        can Abort.Panic:
+            for i in 0..<count |points, probe|:
+                point: RoomsView::Vec = points[i.usize()]
+                return true if point.x == probe.x and point.y == probe.y and point.z == probe.z
+            return false
+
+    def centered(rod: Rod&) -> Rod:
+        can Abort.Panic:
+            sum: mutable RoomsView::Vec = zeroed
+            count: i64 = rod.count
+            for i in 0..<count |rod, sum|:
+                sum <- RoomsView::add(sum, rod.joints[i.usize()])
+            center: RoomsView::Vec = RoomsView::vec(sum.x / count.f64(), sum.y / count.f64(), sum.z / count.f64())
+            span: mutable f64 = 1.0
+            result: mutable Rod = Rod{joints: zeroed, count: count}
+            for i in 0..<count |rod, result, center, span|:
+                q: RoomsView::Vec = RoomsView::sub(rod.joints[i.usize()], center)
+                result.joints[i.usize()] <- q
+                span <- abs(q.x) if abs(q.x) > span
+                span <- abs(q.y) if abs(q.y) > span
+                span <- abs(q.z) if abs(q.z) > span
+            scale: f64 = 1.0 / span
+            for i in 0..<count |result, scale|:
+                result.joints[i.usize()] <- RoomsView::mul(result.joints[i.usize()], scale)
+            return result
+
+    def make_rod(bends: i64, rng: mutable MT19937&) -> Rod:
+        can Abort.Panic:
+            count: i64 = bends + 2
+            while true |count, rng|:
+                rod: mutable Rod = Rod{joints: zeroed, count: count}
+                used: mutable RoomsView::Vec[MAX_STEPS] = zeroed
+                used_count: mutable i64 = 1
+                last_axis: mutable i64 = -1
+                axes: mutable i64 = 0
+                valid: mutable bool = true
+                for joint in 1..<count |rod, used, used_count, last_axis, axes, valid, rng|:
+                    choices: mutable i64[6] = zeroed
+                    candidates: mutable i64 = 0
+                    for step in 0..<6 |choices, candidates, last_axis|:
+                        if step / 2 != last_axis:
+                            choices[candidates.usize()] <- step
+                            candidates <- candidates + 1
+                    i: mutable i64 = candidates - 1
+                    while i > 0 |i, choices, rng|:
+                        j: usize = py_choice_index(rng, i + 1).usize()
+                        temp: i64 = choices[i.usize()]
+                        choices[i.usize()] <- choices[j]
+                        choices[j] <- temp
+                        i <- i - 1
+                    p: RoomsView::Vec = rod.joints[(joint - 1).usize()]
+                    moved: mutable bool = false
+                    for j in 0..<candidates |choices, rng, p, used, used_count, rod, joint, last_axis, axes, moved|:
+                        step: i64 = choices[j.usize()]
+                        n: i64 = 2 if py_choice_index(rng, 3) == 2 else 1
+                        delta: RoomsView::Vec = direction(step)
+                        a: RoomsView::Vec = RoomsView::add(p, delta)
+                        b: RoomsView::Vec = RoomsView::add(p, RoomsView::mul(delta, n.f64()))
+                        continue if seen(&used, used_count, a) or (n == 2 and seen(&used, used_count, b))
+                        used[used_count.usize()] <- a
+                        used_count <- used_count + 1
+                        if n == 2:
+                            used[used_count.usize()] <- b
+                            used_count <- used_count + 1
+                        rod.joints[joint.usize()] <- b
+                        last_axis <- step / 2
+                        axes <- axes | (1 << last_axis)
+                        moved <- true
+                        break
+                    if not moved:
+                        valid <- false
+                        break
+                return centered(&rod) if valid and axes == 7
+            return zeroed
+
+    def sample_rod(rod: Rod&) -> SamplePoints:
+        can Abort.Panic:
+            segments: i64 = rod.count - 1
+            out: mutable SamplePoints = SamplePoints{points: zeroed, count: segments * SAMPLES_PER_SEGMENT + 1}
+            for i in 0..<segments |out, rod|:
+                a: RoomsView::Vec = rod.joints[i.usize()]
+                d: RoomsView::Vec = RoomsView::sub(rod.joints[(i + 1).usize()], a)
+                for j in 0..<SAMPLES_PER_SEGMENT |out, a, d, i|:
+                    p: RoomsView::Vec = RoomsView::add(a, RoomsView::mul(d, j.f64() / SAMPLES_PER_SEGMENT.f64()))
+                    out.points[(i * SAMPLES_PER_SEGMENT + j).usize()] <- p
+            out.points[(out.count - 1).usize()] <- rod.joints[segments.usize()]
+            return out
+
+    def wall_light(swing: f64, t: f64) -> RoomsView::Vec:
+        can Abort.Panic:
+            back: RoomsView::Vec = RoomsView::unit(RoomsView::vec(0.30, -0.18, -1.0))
+            return back if swing == 0.0
+            return RoomsView::unit(DrShape::apply(mat(1, swing * sin(0.35 * t)), back))
+
+    def floor_light() -> RoomsView::Vec:
+        can Abort.Panic:
+            return RoomsView::unit(RoomsView::vec(0.12, -1.0, -0.25))
+
+    def on_wall(p: RoomsView::Vec, light: RoomsView::Vec) -> RoomsView::Vec:
+        travel: f64 = (-WALL - p.z) / light.z
+        return RoomsView::vec(p.x + light.x * travel, p.y + light.y * travel, -WALL)
+
+    def on_floor(p: RoomsView::Vec, light: RoomsView::Vec) -> RoomsView::Vec:
+        travel: f64 = (-FLOOR - p.y) / light.y
+        return RoomsView::vec(p.x + light.x * travel, -FLOOR, p.z + light.z * travel)
+
+    def target_at(setup: Setup&, t: f64) -> DrShape::Matrix:
+        rate: f64 = setup.level.turning
+        return setup.target if rate == 0.0
+        return DrShape::matmul(mat(1, rate * t), setup.target)
+
+    def distance(points: SamplePoints&, other: SamplePoints&, floor_shadow: bool) -> f64:
+        can Abort.Panic:
+            total: mutable f64 = 0.0
+            for i in 0..<points.count |total, points, other, floor_shadow|:
+                a: RoomsView::Vec = points.points[i.usize()]
+                nearest: mutable f64 = 1e18
+                for j in 0..<other.count |other, a, nearest, floor_shadow|:
+                    b: RoomsView::Vec = other.points[j.usize()]
+                    dx: f64 = a.x - b.x
+                    dy: f64 = a.z - b.z if floor_shadow else a.y - b.y
+                    squared: f64 = dx * dx + dy * dy
+                    nearest <- squared if squared < nearest
+                total <- total + sqrt(nearest)
+            return total / points.count.f64()
+
+    def misfit(setup: Setup&, turn: DrShape::Matrix, t: f64, sample: SamplePoints&) -> f64:
+        can Abort.Panic:
+            goal: DrShape::Matrix = target_at(setup, t)
+            lamp: RoomsView::Vec = wall_light(setup.level.swing, t)
+            floor_lamp: RoomsView::Vec = floor_light()
+            count: i64 = sample.count
+            wall_mine: mutable SamplePoints = SamplePoints{points: zeroed, count: count}
+            wall_goal: mutable SamplePoints = SamplePoints{points: zeroed, count: count}
+            floor_mine: mutable SamplePoints = SamplePoints{points: zeroed, count: count}
+            floor_goal: mutable SamplePoints = SamplePoints{points: zeroed, count: count}
+            for i in 0..<count |sample, setup, turn, goal, lamp, floor_lamp, wall_mine, wall_goal, floor_mine, floor_goal|:
+                q: RoomsView::Vec = sample.points[i.usize()]
+                mine: RoomsView::Vec = DrShape::apply(turn, q)
+                want: RoomsView::Vec = DrShape::apply(goal, q)
+                wall_mine.points[i.usize()] <- on_wall(mine, lamp)
+                wall_goal.points[i.usize()] <- on_wall(want, lamp)
+                if setup.level.floor:
+                    floor_mine.points[i.usize()] <- on_floor(mine, floor_lamp)
+                    floor_goal.points[i.usize()] <- on_floor(want, floor_lamp)
+            a: f64 = distance(&wall_mine, &wall_goal, false)
+            b: f64 = distance(&wall_goal, &wall_mine, false)
+            wall: f64 = a if a >= b else b
+            return wall if not setup.level.floor
+            c: f64 = distance(&floor_mine, &floor_goal, true)
+            d: f64 = distance(&floor_goal, &floor_mine, true)
+            floor_distance: f64 = c if c >= d else d
+            return wall if wall >= floor_distance else floor_distance
+
+    def initialize(setup: Setup&, capture: bool) -> Run:
+        can Abort.Panic:
+            pts: SamplePoints = sample_rod(&setup.rod)
+            notes: darray[DrShapeDeal::Note] = []
+            return Run{setup: setup[0], t: 0.0, turn: setup.start, samples: pts,
+                fit: misfit(setup, setup.start, 0.0, &pts), checked: 0.0, fit_since: -1.0,
+                result: PENDING, notes: notes, next_hum: 0.3, seed: 0, dirty: false, capture: capture}
+
+    def rotate(run: mutable Run&, axis: i64, angle: f64):
+        rank: i64 = 1 if axis == 1 else (2 if axis == 0 else 3)
+        return if run.result != PENDING or rank > run.setup.level.axes or angle == 0.0
+        run.turn <- DrShape::matmul(mat(axis, angle), run.turn)
+        run.dirty <- true
+
+    def closeness(run: Run&) -> f64:
+        tol: f64 = run.setup.level.tol
+        return DrShapeDeal::clamp(1.0 - (run.fit - tol) / (5.0 * tol), 0.0, 1.0)
+
+    def cue(run: mutable Run&, time: f64, duration: f64, frequency: f64, gain: f64, bright: f64, voice: i64, seed: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.capture:
+                run.notes.push(DrShapeDeal::Note{t: time, dur: duration, freq: frequency,
+                    pan: 0.0, pan2: 0.0, gain: gain, gain2: gain, bright: bright, voice: voice,
+                    seed: seed, who: -1, room: 0.0})
+
+    def step(run: mutable Run&, dt: f64, controls: i64):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != PENDING
+            run.t <- run.t + dt
+            axes: i64[6] = [1, 1, 0, 0, 2, 2]
+            signs: f64[6] = [-1.0, 1.0, 1.0, -1.0, 1.0, -1.0]
+            for port in 0..<PORTS |run, controls, dt, axes, signs|:
+                if (controls & (1 << port)) != 0:
+                    rotate(run, axes[port.usize()], signs[port.usize()] * SPIN * dt)
+            if run.t - run.checked >= CHECK - 1e-9:
+                run.checked <- run.t
+                run.dirty <- false
+                run.fit <- misfit(&run.setup, run.turn, run.t, &run.samples)
+            if run.fit <= run.setup.level.tol:
+                if run.fit_since < 0.0:
+                    run.fit_since <- run.t
+                    run.seed <- run.seed + 1
+                    cue(run, run.t, 0.25, 660.0, 0.3, 0.9, 1, run.seed)
+                    cue(run, run.t + 0.06, 0.25, 990.0, 0.3, 0.9, 1, run.seed + 1)
+                elif run.t - run.fit_since >= run.setup.level.hold:
+                    run.result <- WON
+                    return
+            else:
+                run.fit_since <- -1.0
+            if run.setup.level.hum and run.t >= run.next_hum:
+                freq: f64 = 196.0 * pow(2.0, 1.5 * closeness(run))
+                run.seed <- run.seed + 1
+                cue(run, run.next_hum, 0.18, freq, 0.22, 0.6, 0, run.seed)
+                run.next_hum <- run.next_hum + 0.2
+            run.result <- TIMED_OUT if run.t >= run.setup.level.seconds
+
+    def wrap(value: f64) -> f64:
+        shifted: f64 = value + PI
+        period: f64 = PI * 2.0
+        return shifted - floor(shifted / period) * period - PI
+
+    def plan(q: DrShape::Matrix) -> RoomsView::Vec:
+        b: f64 = acos(DrShapeDeal::clamp(q.y.y, -1.0, 1.0))
+        return RoomsView::vec(atan2(q.x.z, q.x.x), 0.0, 0.0) if abs(sin(b)) < 1e-6
+        a: f64 = atan2(q.x.y, q.z.y)
+        c: f64 = atan2(q.y.x, -q.y.z)
+        alt_a: f64 = wrap(a + PI)
+        alt_c: f64 = wrap(c + PI)
+        return RoomsView::vec(alt_a, -b, alt_c) if abs(alt_a) + abs(b) + abs(alt_c) < abs(a) + abs(b) + abs(c)
+        return RoomsView::vec(a, b, c)
+
+    def autopilot(run: Run&) -> i64:
+        q: DrShape::Matrix = DrShape::matmul(target_at(&run.setup, run.t), transpose(run.turn))
+        eps: f64 = radians(0.6)
+        if run.setup.level.axes == 1:
+            yaw: f64 = atan2(q.x.z, q.x.x)
+            return 0 if abs(yaw) < eps
+            return 1 << (YAW_R if yaw > 0.0 else YAW_L)
+        angles: RoomsView::Vec = plan(q)
+        if abs(angles.y) <= eps:
+            yaw: f64 = atan2(q.x.z, q.x.x)
+            return 0 if abs(yaw) <= eps
+            return 1 << (YAW_R if yaw > 0.0 else YAW_L)
+        if abs(angles.z) > eps:
+            return 1 << (YAW_R if angles.z > 0.0 else YAW_L)
+        return 1 << (PITCH_D if angles.y > 0.0 else PITCH_U)
+
+    def solvable(setup: Setup&) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = initialize(setup, false)
+            while run.result == PENDING |run|:
+                step(&run, 1.0 / 60.0, autopilot(&run))
+            return run.result == WON
+
+    def build(level: Grade, rng: mutable MT19937&) -> Setup:
+        can Abort.Panic:
+            rod: Rod = make_rod(level.bends, rng)
+            base: DrShape::Matrix = random_turn(rng)
+            target: mutable DrShape::Matrix = base
+            start: mutable DrShape::Matrix = zeroed
+            if level.axes == 1:
+                yaw: f64 = py_uniform(rng, -PI, PI)
+                target <- DrShape::matmul(mat(1, yaw), base)
+                displacement: f64 = py_uniform(rng, radians(70.0), radians(150.0))
+                sign: f64 = 1.0 if py_choice_index(rng, 2) == 1 else -1.0
+                start <- DrShape::matmul(mat(1, displacement * sign), target)
+            else:
+                start <- random_turn(rng)
+                return zeroed if angle_between(start, target) < radians(80.0)
+            setup: Setup = Setup{level: level, rod: rod, target: target, start: start}
+            sample: SamplePoints = sample_rod(&rod)
+            return zeroed if misfit(&setup, start, 0.0, &sample) < 4.0 * level.tol
+            return setup
+
+    def deal(rung: i64, seed: i64) -> Setup:
+        can Abort.Panic, Memory.Allocate:
+            rng: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&rng, magnitude)
+            level: Grade = grade(rung)
+            first: mutable Setup = zeroed
+            for attempt in 0..<40 |rng, level, first|:
+                setup: Setup = build(level, &rng)
+                continue if setup.rod.count == 0
+                first <- setup if first.rod.count == 0
+                return setup if solvable(&setup)
+            return first

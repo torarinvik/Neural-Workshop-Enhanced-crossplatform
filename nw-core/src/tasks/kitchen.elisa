@@ -1,0 +1,393 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+
+module Kitchen:
+    const PORTS: i64 = 13
+    const CRATE: i64 = 0
+    const BOARD: i64 = 4
+    const STOVE: i64 = 6
+    const PLATE: i64 = 9
+    const PASS: i64 = 11
+    const BIN: i64 = 12
+    const WIDTH: f64 = 12.0
+    const HEIGHT: f64 = 7.0
+
+    # Food IDs preserve sampling order. Packed parts sort in Python's
+    # (food name, stage name) order, which differs from the sampling order.
+    const RAW: i64 = 0
+    const CHOPPED: i64 = 1
+    const COOKED: i64 = 2
+    const BURNT: i64 = 3
+
+    struct Grade:
+        rung: i64
+        parts: i64
+        foods: i64
+        boards: i64
+        stoves: i64
+        plates: i64
+        tickets: i64
+        gap: f64
+        patience: f64
+        hold: f64
+        lapse: i64
+        chopped_only: f64
+
+    struct Station:
+        present: bool
+        x: f64
+        y: f64
+        food: i64
+
+    struct Dish:
+        parts: mutable i64[3]
+        count: mutable i64
+
+    struct Ticket:
+        dish: Dish
+        due: f64
+        patience: f64
+
+    struct Shift:
+        level: Grade
+        stations: mutable Station[13]
+        tickets: mutable darray[Ticket]
+
+    def grade(rung: i64) -> Grade:
+        can Abort.Panic:
+            level: i64 = 1 if rung < 1 else rung
+            top: i64 = level - 16 if level > 16 else 0
+            tickets: i64 = 3 if level < 4 else 4 if level < 10 else 5 if level < 16 else 6 + top / 5
+            gap: f64 = 20.0 if level < 7 else 24.0 if level < 13 else 22.0
+            patience: f64 = 44.0 if level < 16 else 36.0
+            hold: f64 = 5.0 if level < 10 else 3.5 if level < 16 else fmax(2.2, 3.0 - 0.05 * top.f64())
+            return Grade{rung: level, parts: 1 if level < 7 else 2 if level < 13 else 3,
+                foods: 2 if level < 4 else 3 if level < 10 else 4,
+                boards: 1 if level < 13 else 2,
+                stoves: 1 if level < 4 else 2 if level < 16 else 3,
+                plates: 1 if level < 7 else 2, tickets: tickets,
+                gap: fmax(11.0, gap - 0.8 * top.f64()), patience: fmax(20.0, patience - 1.3 * top.f64()),
+                hold: hold, lapse: 1 if level < 10 else 0, chopped_only: 0.0 if level < 4 else 0.3}
+
+    def make_part(food: i64, stage: i64) -> i64:
+        return (3 - food) * 4 + stage + 1
+
+    def part_food(part: i64) -> i64:
+        return 3 - (part - 1) / 4
+
+    def part_stage(part: i64) -> i64:
+        return (part - 1) % 4
+
+    def add_sorted(dish: mutable Dish&, part: i64):
+        can Abort.Panic:
+            index: mutable i64 = dish.count
+            while index > 0 |dish, index, part|:
+                previous: i64 = dish.parts[(index - 1).usize()]
+                break if previous <= part
+                dish.parts[index.usize()] <- previous
+                index <- index - 1
+            dish.parts[index.usize()] <- part
+            dish.count <- dish.count + 1
+
+    def place(shift: mutable Shift&, port: i64, x: f64, y: f64, food: i64):
+        can Abort.Panic:
+            shift.stations[port.usize()] <- Station{present: true, x: x, y: y, food: food}
+
+    def layout(shift: mutable Shift&, foods: darray[i64]&):
+        can Abort.Panic:
+            port: mutable i64 = CRATE
+            for food in 0..<4 |shift, foods, port|:
+                for chosen in foods |shift, food, port|:
+                    if chosen == food:
+                        place(shift, port, 0.8, HEIGHT - 1.0 - port.f64() * 1.55, food)
+                        port <- port + 1
+            level: Grade = shift.level
+            spacing: f64 = 7.0 / (level.boards + level.stoves - 1).f64()
+            for i in 0..<level.boards |shift, spacing|:
+                place(shift, BOARD + i, 2.8 + i.f64() * spacing, HEIGHT - 0.75, -1)
+            for i in 0..<level.stoves |shift, spacing, level|:
+                place(shift, STOVE + i, 2.8 + (level.boards + i).f64() * spacing, HEIGHT - 0.75, -1)
+            for i in 0..<level.plates |shift|:
+                place(shift, PLATE + i, WIDTH - 0.8, HEIGHT - 2.0 - i.f64() * 1.6, -1)
+            place(shift, PASS, WIDTH - 0.8, 1.0, -1)
+            place(shift, BIN, 5.5, 0.75, -1)
+
+    def build(level: Grade, rng: mutable MT19937&) -> Shift:
+        can Memory.Allocate, Abort.Panic:
+            shift: mutable Shift = Shift{level: level, stations: zeroed, tickets: []}
+            foods: darray[i64] = py_sample_range(rng, 0, 3, level.foods)
+            layout(&shift, &foods)
+            due: mutable f64 = 2.0
+            for _ in 0..<level.tickets |shift, due, level, rng, foods|:
+                count: i64 = py_randint(rng, 1 if level.parts == 1 else level.parts - 1, level.parts)
+                dish: mutable Dish = zeroed
+                for _ in 0..<count |dish, foods, level, rng|:
+                    pick: usize = py_randbelow(rng, level.foods.u64()).usize()
+                    food: i64 = get foods[pick] else 0
+                    stage: i64 = CHOPPED if py_random(rng) < level.chopped_only else COOKED
+                    add_sorted(&dish, make_part(food, stage))
+                shift.tickets.push(Ticket{dish: dish, due: py_round_decimal(due, 10.0),
+                    patience: py_round_decimal(level.patience + 12.0 * count.f64(), 10.0)})
+                due <- due + py_uniform(rng, 0.8, 1.2) * level.gap
+            return shift
+
+    const WALK: f64 = 6.0
+    const CHOP: f64 = 1.6
+    const COOK: f64 = 4.0
+    const WAITING: i64 = 0
+    const OPEN: i64 = 1
+    const SERVED: i64 = 2
+    const LAPSED: i64 = 3
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const EXPIRED: i64 = 2
+    const NOTE_SERVED: i64 = 1
+    const NOTE_NO_TICKET: i64 = 2
+    const NOTE_BINNED: i64 = 3
+    const NO_PORT: i64 = -1
+
+    struct WorkItem:
+        part: i64
+        time: f64
+
+    struct Flash:
+        words: i64
+        port: i64
+        time: f64
+
+    struct Run:
+        shift: mutable Shift
+        t: mutable f64
+        x: mutable f64
+        y: mutable f64
+        target: mutable i64
+        held_part: mutable i64
+        held_dish: mutable Dish
+        boards: mutable WorkItem[2]
+        stoves: mutable WorkItem[3]
+        plates: mutable Dish[2]
+        status: mutable darray[i64]
+        arrived: mutable i64
+        served: mutable i64
+        lapsed: mutable i64
+        result: mutable i64
+        chopping: mutable i64
+        flashes: mutable Flash[6]
+        flash_count: mutable i64
+        burnt: mutable i64
+
+    def empty_shift() -> Shift:
+        return Shift{level: zeroed, stations: zeroed, tickets: []}
+
+    def start(shift: Shift) -> Run:
+        can Memory.Allocate, Abort.Panic:
+            run: mutable Run = zeroed
+            run.status <- []
+            reset(&run, shift)
+            return run
+
+    def reset(run: mutable Run&, shift: Shift):
+        can Memory.Allocate, Abort.Panic:
+            run.shift <- shift
+            run.t <- 0.0
+            run.x <- WIDTH / 2.0
+            run.y <- HEIGHT / 2.0
+            run.target <- NO_PORT
+            run.held_part <- 0
+            run.held_dish <- zeroed
+            run.boards <- zeroed
+            run.stoves <- zeroed
+            run.plates <- zeroed
+            run.arrived <- 0
+            run.served <- 0
+            run.lapsed <- 0
+            run.result <- LIVE
+            run.chopping <- NO_PORT
+            run.flash_count <- 0
+            run.burnt <- 0
+            for i in 0..<shift.level.tickets |run|:
+                if i < run.status.count.i64():
+                    run.status[i.usize()] <- WAITING
+                else:
+                    run.status.push(WAITING)
+
+    def reserve_shift(run: mutable Run&, owner: mutable Arena&, count: i64):
+        can Memory.Allocate, Abort.Panic, Global.Read, Global.Write:
+            _ = arena_da_reserve(owner, &run.shift.tickets, count.usize())
+            _ = arena_da_reserve(owner, &run.status, count.usize())
+            run.shift.tickets.count <- count.usize()
+            run.status.count <- count.usize()
+
+    def refill(run: mutable Run&, dealt: Shift&):
+        can Memory.Allocate, Abort.Panic:
+            shift: mutable Shift = Shift{level: dealt.level, stations: dealt.stations, tickets: run.shift.tickets}
+            for i in 0..<dealt.level.tickets |shift, dealt|:
+                shift.tickets[i.usize()] <- get dealt.tickets[i.usize()] else zeroed
+            reset(run, shift)
+
+    def send(run: mutable Run&, port: i64) -> bool:
+        can Abort.Panic:
+            return false if run.result != LIVE or port < 0 or port >= PORTS
+            return false if not run.shift.stations[port.usize()].present
+            run.target <- port
+            run.chopping <- NO_PORT
+            return true
+
+    def pan_stage(run: Run&, pan: WorkItem, time: f64) -> i64:
+        age: f64 = time - pan.time
+        return CHOPPED if age < COOK else COOKED if age < COOK + run.shift.level.hold else BURNT
+
+    def ticket_left(run: Run&, index: i64) -> f64:
+        can Abort.Panic:
+            ticket: Ticket = get run.shift.tickets[index.usize()] else zeroed
+            return ticket.due + ticket.patience - run.t
+
+    def empty_hands(run: Run&) -> bool:
+        return run.held_part == 0 and run.held_dish.count == 0
+
+    def same_dish(one: Dish&, two: Dish&) -> bool:
+        can Abort.Panic:
+            return false if one.count != two.count
+            for i in 0..<one.count |one, two|:
+                return false if one.parts[i.usize()] != two.parts[i.usize()]
+            return true
+
+    def matching_ticket(run: Run&, dish: Dish&) -> i64:
+        can Abort.Panic:
+            best: mutable i64 = -1
+            for i in 0..<run.arrived |run, dish, best|:
+                status: i64 = get run.status[i.usize()] else WAITING
+                if status == OPEN:
+                    ticket: Ticket = get run.shift.tickets[i.usize()] else zeroed
+                    if same_dish(&ticket.dish, dish) and (best < 0 or ticket_left(run, i) < ticket_left(run, best)):
+                        best <- i
+            return best
+
+    def note(run: mutable Run&, port: i64, words: i64):
+        can Abort.Panic:
+            index: usize = (run.flash_count % 6).usize()
+            run.flashes[index] <- Flash{words: words, port: port, time: run.t}
+            run.flash_count <- run.flash_count + 1
+
+    def use_board(run: mutable Run&, index: i64):
+        can Abort.Panic:
+            k: usize = index.usize()
+            board: WorkItem = run.boards[k]
+            if board.part == 0 and run.held_part > 0 and part_stage(run.held_part) == RAW:
+                run.boards[k] <- WorkItem{part: make_part(part_food(run.held_part), CHOPPED), time: 0.0}
+                run.held_part <- 0
+                run.chopping <- index
+            elif board.part != 0 and empty_hands(run):
+                if board.time >= CHOP:
+                    run.held_part <- board.part
+                    run.boards[k] <- zeroed
+                else:
+                    run.chopping <- index
+
+    def use_stove(run: mutable Run&, index: usize):
+        can Abort.Panic:
+            pan: WorkItem = run.stoves[index]
+            if pan.part == 0 and run.held_part > 0 and part_stage(run.held_part) == CHOPPED:
+                run.stoves[index] <- WorkItem{part: run.held_part, time: run.t}
+                run.held_part <- 0
+            elif pan.part != 0 and empty_hands(run):
+                run.held_part <- make_part(part_food(pan.part), pan_stage(run, pan, run.t))
+                run.stoves[index] <- zeroed
+
+    def use_plate(run: mutable Run&, index: usize):
+        can Abort.Panic:
+            plate: mutable Dish = run.plates[index]
+            if empty_hands(run):
+                if plate.count > 0:
+                    run.held_dish <- plate
+                    run.plates[index] <- zeroed
+            elif run.held_dish.count > 0:
+                if plate.count == 0:
+                    run.plates[index] <- run.held_dish
+                    run.held_dish <- zeroed
+            elif plate.count < 3:
+                stage: i64 = part_stage(run.held_part)
+                if stage == CHOPPED or stage == COOKED:
+                    # Player plates keep insertion order for the scene.
+                    plate.parts[plate.count.usize()] <- run.held_part
+                    plate.count <- plate.count + 1
+                    run.plates[index] <- plate
+                    run.held_part <- 0
+
+    def sorted_dish(dish: Dish&) -> Dish:
+        can Abort.Panic:
+            ordered: mutable Dish = zeroed
+            for i in 0..<dish.count |dish, ordered|:
+                add_sorted(&ordered, dish.parts[i.usize()])
+            return ordered
+
+    def use_station(run: mutable Run&, port: i64):
+        can Abort.Panic:
+            if port < BOARD:
+                if empty_hands(run):
+                    run.held_part <- make_part(run.shift.stations[port.usize()].food, RAW)
+            elif port < STOVE:
+                use_board(run, port - BOARD)
+            elif port < PLATE:
+                use_stove(run, (port - STOVE).usize())
+            elif port < PASS:
+                use_plate(run, (port - PLATE).usize())
+            elif port == PASS and run.held_dish.count > 0:
+                dish: Dish = sorted_dish(&run.held_dish)
+                ticket: i64 = matching_ticket(run, &dish)
+                if ticket >= 0:
+                    run.status[ticket.usize()] <- SERVED
+                    run.served <- run.served + 1
+                    run.held_dish <- zeroed
+                    note(run, port, NOTE_SERVED)
+                else:
+                    note(run, port, NOTE_NO_TICKET)
+            elif port == BIN and not empty_hands(run):
+                run.held_part <- 0
+                run.held_dish <- zeroed
+                note(run, port, NOTE_BINNED)
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic:
+            return if run.result != LIVE
+            run.t <- run.t + dt
+            while run.arrived < run.shift.level.tickets |run|:
+                ticket: Ticket = get run.shift.tickets[run.arrived.usize()] else zeroed
+                break if ticket.due > run.t
+                run.status[run.arrived.usize()] <- OPEN
+                run.arrived <- run.arrived + 1
+            for i in 0..<run.arrived |run|:
+                status: i64 = get run.status[i.usize()] else WAITING
+                if status == OPEN and ticket_left(run, i) <= 0.0:
+                    run.status[i.usize()] <- LAPSED
+                    run.lapsed <- run.lapsed + 1
+            for i in 0..<run.shift.level.stoves |run, dt|:
+                pan: WorkItem = run.stoves[i.usize()]
+                if pan.part != 0 and pan_stage(run, pan, run.t) == BURNT and run.t - dt - pan.time < COOK + run.shift.level.hold:
+                    run.burnt <- run.burnt + 1
+            port: i64 = run.target
+            if port != NO_PORT:
+                target: Station = run.shift.stations[port.usize()]
+                dx: f64 = target.x - run.x
+                dy: f64 = target.y - run.y
+                distance: f64 = py_hypot(dx, dy)
+                stride: f64 = WALK * dt
+                if distance <= stride:
+                    run.x <- target.x
+                    run.y <- target.y
+                    run.target <- NO_PORT
+                    use_station(run, port)
+                else:
+                    run.x <- run.x + dx / distance * stride
+                    run.y <- run.y + dy / distance * stride
+            if run.chopping != NO_PORT:
+                k: usize = run.chopping.usize()
+                board: WorkItem = run.boards[k]
+                if board.part != 0 and board.time < CHOP:
+                    progress: f64 = board.time + dt
+                    run.boards[k] <- WorkItem{part: board.part, time: progress}
+                    run.chopping <- NO_PORT if progress >= CHOP
+            if run.lapsed > run.shift.level.lapse:
+                run.result <- EXPIRED
+            elif run.served + run.lapsed == run.shift.level.tickets:
+                run.result <- CLEAR

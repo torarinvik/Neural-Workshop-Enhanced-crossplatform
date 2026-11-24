@@ -1,0 +1,388 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module Crossroads:
+    const PORTS: i64 = 4
+    const ROADS: i64 = 8
+    const CARS: i64 = 128
+    const WAIT_SLOTS: i64 = 32
+    const WORLD_W: f64 = 72.0
+    const WORLD_H: f64 = 48.0
+    const SPEED: f64 = 9.0
+    const GAP: f64 = 5.5
+    const STOP_BACK: f64 = 4.5
+    const AMBER_TIME: f64 = 1.6
+    const ALL_RED: f64 = 1.2
+    const EW: i64 = 0
+    const NS: i64 = 1
+    const GREEN: i64 = 0
+    const AMBER: i64 = 1
+    const RED: i64 = 2
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const GRIDLOCK: i64 = 2
+    const AMBULANCE: i64 = 3
+
+    struct Grade:
+        rung: i64
+        layout: i64
+        rate: f64
+        lopsided: f64
+        ambulances: i64
+        rush: bool
+        seconds: f64
+
+    struct Junction:
+        x: f64
+        y: f64
+
+    struct Crossing:
+        at: f64
+        junction: i64
+
+    struct Path:
+        x: f64
+        y: f64
+        dx: i64
+        dy: i64
+        length: f64
+        count: i64
+        crosses: mutable Crossing[2]
+        axis: i64
+
+    struct Arrival:
+        time: f64
+        path: i64
+        ambulance: bool
+
+    struct Town:
+        level: Grade
+        junctions: mutable Junction[PORTS]
+        paths: mutable Path[ROADS]
+        path_count: mutable i64
+        arrivals: mutable darray[Arrival]
+        start_green: mutable i64[PORTS]
+
+    struct Car:
+        path: i64
+        s: mutable f64
+        v: mutable f64
+        ambulance: bool
+        waited: mutable f64
+        colour: i64
+        born: f64
+
+    struct Light:
+        green: mutable i64
+        changing: mutable bool
+        start: mutable f64
+        since: mutable f64
+
+    struct Wait:
+        ambulance: bool
+        born: f64
+
+    struct Run:
+        town: Town
+        elapsed: mutable f64
+        cars: mutable Car[CARS]
+        car_count: mutable i64
+        lights: mutable Light[PORTS]
+        waiting: mutable Wait[WAIT_SLOTS]
+        backlog: mutable i64[ROADS]
+        next_arrival: mutable i64
+        served: mutable i64
+        result: mutable i64
+        palette: mutable i64
+        total_wait: mutable f64
+
+    struct Pressure:
+        total: mutable f64
+        urgent: mutable bool
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: i64 = r - 20 if r > 20 else 0
+        return Grade{rung: r, layout: 1 if r < 7 else (2 if r < 13 else 4),
+            rate: 0.16 if r < 4 else (0.22 if r < 7 else (0.2 if r < 13 else (0.17 if r < 20 else fmin(0.24, 0.18 + 0.004 * top.f64())))),
+            lopsided: 0.8 if r < 4 else 0.45, ambulances: 0 if r < 10 else (2 if r < 20 else 3 + top / 4),
+            rush: r >= 16, seconds: 70.0 if r < 20 else 80.0 + top.f64()}
+
+    def layout(level: Grade) -> Town:
+        can Abort.Panic, Memory.Allocate:
+            nx: i64 = 1 if level.layout == 1 else 2
+            ny: i64 = 2 if level.layout == 4 else 1
+            xs: f64[2] = [WORLD_W / 2.0 if nx == 1 else WORLD_W * 0.33, WORLD_W * 0.67]
+            ys: f64[2] = [WORLD_H / 2.0 if ny == 1 else WORLD_H * 0.32, WORLD_H * 0.68]
+            town: mutable Town = Town{level: level, junctions: zeroed, paths: zeroed, path_count: 2 * (nx + ny),
+                arrivals: [], start_green: zeroed}
+            for y in 0..<ny |town, xs, ys, nx|:
+                for x in 0..<nx |town, xs, ys, nx, y|:
+                    town.junctions[(y * nx + x).usize()] <- Junction{x: xs[x.usize()], y: ys[y.usize()]}
+            for k in 0..<town.path_count |town, xs, ys, nx, ny|:
+                lane: i64 = k / 2
+                horizontal: bool = lane < ny
+                index: i64 = lane if horizontal else lane - ny
+                forward: bool = k % 2 == 0
+                direction: i64 = 1 if forward else -1
+                count: i64 = nx if horizontal else ny
+                length: f64 = WORLD_W if horizontal else WORLD_H
+                origin: f64 = 0.0 if forward else length
+                x: f64 = origin if horizontal else xs[index.usize()] + direction.f64() * 1.6
+                y: f64 = ys[index.usize()] - direction.f64() * 1.6 if horizontal else origin
+                path: mutable Path = Path{x: x, y: y, dx: direction if horizontal else 0, dy: 0 if horizontal else direction,
+                    count: count, crosses: zeroed, length: length, axis: EW if horizontal else NS}
+                for at in 0..<count |count, path, index, forward, horizontal, origin, nx, xs, ys|:
+                    position: i64 = at if forward else count - at - 1
+                    coordinate: f64 = xs[position.usize()] if horizontal else ys[position.usize()]
+                    junction: i64 = index * nx + position if horizontal else position * nx + index
+                    path.crosses[at.usize()] <- Crossing{at: fabs(coordinate - origin), junction: junction}
+                town.paths[k.usize()] <- path
+            return town
+
+    def before(a: Arrival, b: Arrival) -> bool:
+        return a.time < b.time or (a.time == b.time and (a.path < b.path or
+            (a.path == b.path and not a.ambulance and b.ambulance)))
+
+    def hundredth(value: f64) -> f64:
+        can Abort.Panic:
+            # Compare the original value with the midpoint, using the product
+            # error to distinguish binary inputs that multiply to a tie.
+            scaled: f64 = value * 100.0
+            lower: i64 = floor(scaled).i64()
+            fraction: f64 = scaled - lower.f64()
+            if fraction == 0.5:
+                split: f64 = value * 134217729.0
+                high: f64 = split - (split - value)
+                rounding_error: f64 = (high * 100.0 - scaled) + (value - high) * 100.0
+                return (lower + (1 if rounding_error > 0.0 or (rounding_error == 0.0 and lower % 2 != 0) else 0)).f64() / 100.0
+            return (lower + (1 if fraction > 0.5 else 0)).f64() / 100.0
+
+    def build(level: Grade, draw: mutable MT19937&) -> Town:
+        can Abort.Panic, Memory.Allocate:
+            town: mutable Town = layout(level)
+            busy: i64 = py_randbelow(draw, 2.u64()).i64()
+            switch_at: f64 = py_uniform(draw, 0.35, 0.6) * level.seconds if level.rush else level.seconds
+            arrivals: mutable darray[Arrival] = []
+            for k in 0..<town.path_count |draw, level, town, busy, switch_at, arrivals|:
+                t: mutable f64 = py_uniform(draw, 0.0, 3.0)
+                path: Path = town.paths[k.usize()]
+                while t < level.seconds |draw, level, path, busy, switch_at, arrivals, t, k|:
+                    axis: i64 = busy if t < switch_at else 1 - busy
+                    rate: f64 = level.rate * (1.0 if path.axis == axis else level.lopsided)
+                    arrivals.push(Arrival{time: hundredth(t), path: k, ambulance: false})
+                    t <- t + (-log(1.0 - py_random(draw)) / rate + 0.9)
+            for _ in 0..<level.ambulances |level, draw, town, arrivals|:
+                t: f64 = hundredth(py_uniform(draw, 8.0, level.seconds - 12.0))
+                k: i64 = py_randbelow(draw, town.path_count.u64()).i64()
+                arrivals.push(Arrival{time: t, path: k, ambulance: true})
+            for i in 1..<arrivals.count.i64() |arrivals|:
+                next: Arrival = arrivals[i.usize()]
+                j: mutable i64 = i
+                while j > 0 and before(next, arrivals[(j - 1).usize()]) |arrivals, j, next|:
+                    arrivals[j.usize()] <- arrivals[(j - 1).usize()]
+                    j <- j - 1
+                arrivals[j.usize()] <- next
+            town.arrivals <- arrivals
+            for j in 0..<level.layout |town, draw|:
+                town.start_green[j.usize()] <- py_randbelow(draw, 2.u64()).i64()
+            return town
+
+    def initialize(town: Town&) -> Run:
+        can Abort.Panic:
+            run: mutable Run = Run{town: town[0], elapsed: 0.0, cars: zeroed, car_count: 0,
+                lights: zeroed, waiting: zeroed, backlog: zeroed, next_arrival: 0, served: 0,
+                result: LIVE, palette: 0, total_wait: 0.0}
+            for j in 0..<town.level.layout |town, run|:
+                run.lights[j.usize()].green <- town.start_green[j.usize()]
+            return run
+
+    def signal(light: Light, axis: i64, now: f64) -> i64:
+        return RED if light.green != axis
+        return GREEN if not light.changing
+        return AMBER if now - light.start < AMBER_TIME
+        return RED
+
+    def toggle(run: mutable Run&, junction: i64) -> bool:
+        can Abort.Panic:
+            return false if run.result != LIVE or junction < 0 or junction >= run.town.level.layout
+            index: usize = junction.usize()
+            return false if run.lights[index].changing
+            run.lights[index].start <- run.elapsed
+            run.lights[index].changing <- true
+            return true
+
+    def arrivals(run: mutable Run&) -> bool:
+        can Abort.Panic:
+            while run.next_arrival.usize() < run.town.arrivals.count |run|:
+                event: Arrival = run.town.arrivals[run.next_arrival.usize()]
+                break if event.time > run.elapsed
+                path: usize = event.path.usize()
+                count: i64 = run.backlog[path]
+                # At most one entry can leave before a queue over three ends the shift.
+                if count < 4:
+                    run.waiting[(event.path * 4 + count).usize()] <- Wait{ambulance: event.ambulance, born: run.elapsed}
+                run.backlog[path] <- count + 1
+                run.next_arrival <- run.next_arrival + 1
+            for k in 0..<run.town.path_count |run|:
+                index: usize = k.usize()
+                count: i64 = run.backlog[index]
+                continue if count == 0
+                last: mutable f64 = 99.0
+                for i in 0..<run.car_count |run, k, last|:
+                    car: Car = run.cars[i.usize()]
+                    last <- fmin(last, car.s) if car.path == k
+                if last >= GAP:
+                    first: Wait = run.waiting[(k * 4).usize()]
+                    run.palette <- run.palette + 1
+                    run.cars[run.car_count.usize()] <- Car{path: k, s: 0.0, v: SPEED * 0.8,
+                        ambulance: first.ambulance, waited: 0.0, colour: run.palette, born: first.born}
+                    run.car_count <- run.car_count + 1
+                    for i in 0..<3 |run, k|:
+                        run.waiting[(k * 4 + i).usize()] <- run.waiting[(k * 4 + i + 1).usize()]
+                    run.backlog[index] <- count - 1
+                if run.backlog[index] > 3:
+                    run.result <- GRIDLOCK
+                    return false
+            return true
+
+    def drive(run: mutable Run&, index: usize, path: Path, limit: f64, dt: f64) -> bool:
+        can Abort.Panic:
+            car: mutable Car = run.cars[index]
+            end: mutable f64 = limit
+            for cross in 0..<path.count |path, run, car, end|:
+                entry: Crossing = path.crosses[cross.usize()]
+                stop: f64 = entry.at - STOP_BACK
+                if car.s <= stop + 0.05:
+                    light: i64 = signal(run.lights[entry.junction.usize()], path.axis, run.elapsed)
+                    reach: f64 = car.v * car.v / 18.0
+                    end <- fmin(end, stop) if light == RED or (light == AMBER and stop - car.s > reach)
+                    break
+            room: f64 = fmax(0.0, end - car.s)
+            top: f64 = fmin(SPEED, sqrt(18.0 * room))
+            car.v <- fmin(top, car.v + 5.0 * dt) if car.v < top else top
+            car.s <- fmin(fmax(end, car.s), car.s + car.v * dt)
+            if car.v < 0.5:
+                car.waited <- car.waited + dt
+                run.total_wait <- run.total_wait + dt
+            elif not car.ambulance:
+                car.waited <- fmax(0.0, car.waited - dt * 0.5)
+            run.cars[index] <- car
+            if car.v < 0.5 and car.ambulance and car.waited > 4.0:
+                run.result <- AMBULANCE
+                return false
+            return true
+
+    def step(run: mutable Run&, dt: f64) -> bool:
+        can Abort.Panic:
+            return false if run.result != LIVE or not (dt >= 0.0 and dt <= 9007199254740.0)
+            run.elapsed <- run.elapsed + dt
+            for j in 0..<run.town.level.layout |run|:
+                at: usize = j.usize()
+                if run.lights[at].changing and run.elapsed - run.lights[at].start >= AMBER_TIME + ALL_RED:
+                    run.lights[at].green <- 1 - run.lights[at].green
+                    run.lights[at].changing <- false
+                    run.lights[at].since <- run.elapsed
+            return true if not arrivals(run)
+            driven: mutable bool[ROADS] = zeroed
+            gone: mutable bool[CARS] = zeroed
+            for i in 0..<run.car_count |run, driven, gone, dt|:
+                k: i64 = run.cars[i.usize()].path
+                continue if driven[k.usize()]
+                driven[k.usize()] <- true
+                path: Path = run.town.paths[k.usize()]
+                indices: mutable i64[CARS] = zeroed
+                count: mutable i64 = 0
+                for j in i..<run.car_count |run, k, indices, count|:
+                    continue if run.cars[j.usize()].path != k
+                    s: f64 = run.cars[j.usize()].s
+                    at: mutable i64 = count
+                    while at > 0 and run.cars[indices[(at - 1).usize()].usize()].s < s |run, indices, at, s|:
+                        indices[at.usize()] <- indices[(at - 1).usize()]
+                        at <- at - 1
+                    indices[at.usize()] <- j
+                    count <- count + 1
+                limit: mutable f64 = path.length + 20.0
+                for j in 0..<count |run, path, limit, gone, indices, dt|:
+                    index: usize = indices[j.usize()].usize()
+                    return true if not drive(run, index, path, limit, dt)
+                    s: f64 = run.cars[index].s
+                    gone[index] <- s > path.length + 4.0
+                    limit <- s - GAP
+            active: mutable i64 = 0
+            for i in 0..<run.car_count |run, gone, active|:
+                if gone[i.usize()]:
+                    run.served <- run.served + 1
+                else:
+                    run.cars[active.usize()] <- run.cars[i.usize()]
+                    active <- active + 1
+            run.car_count <- active
+            run.result <- CLEAR if run.elapsed >= run.town.level.seconds
+            return true
+
+    def pressure(run: Run&, junction: i64, axis: i64) -> Pressure:
+        can Abort.Panic:
+            weight: mutable Pressure = zeroed
+            for i in 0..<run.car_count |run, junction, axis, weight|:
+                car: Car = run.cars[i.usize()]
+                path: Path = run.town.paths[car.path.usize()]
+                continue if path.axis != axis
+                for k in 0..<path.count |path, car, junction, weight|:
+                    cross: Crossing = path.crosses[k.usize()]
+                    continue if cross.junction != junction
+                    gap: f64 = cross.at - STOP_BACK - car.s
+                    if gap > -0.5 and gap < 40.0:
+                        weight.total <- weight.total + (1.0 + car.waited * 0.4)
+                        weight.urgent <- true if car.ambulance
+                    break
+            for k in 0..<run.town.path_count |run, junction, axis, weight|:
+                path: Path = run.town.paths[k.usize()]
+                continue if path.axis != axis or path.crosses[0].junction != junction
+                count: i64 = run.backlog[k.usize()]
+                weight.total <- weight.total + 2.5 * count.f64()
+                for i in 0..<count |run, k, weight|:
+                    weight.urgent <- true if run.waiting[(k * 4 + i).usize()].ambulance
+            return weight
+
+    def autopilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return 0 if run.result != LIVE
+            mask: mutable i64 = 0
+            for j in 0..<run.town.level.layout |run, mask|:
+                light: Light = run.lights[j.usize()]
+                continue if light.changing
+                held: f64 = run.elapsed - light.since
+                green: Pressure = pressure(run, j, light.green)
+                red: Pressure = pressure(run, j, 1 - light.green)
+                if not green.urgent and ((red.urgent and held > 1.0) or (held > 5.0 and red.total > green.total * 1.4 + 1.5)):
+                    mask <- mask | (1 << j)
+            return mask
+
+    def play(town: Town&, pilot: bool) -> bool:
+        can Abort.Panic:
+            run: mutable Run = initialize(town)
+            while run.result == LIVE |run, pilot|:
+                if pilot:
+                    mask: i64 = autopilot(&run)
+                    for j in 0..<run.town.level.layout |run, mask|:
+                        if (mask & (1 << j)) != 0:
+                            _ = toggle(&run, j)
+                _ = step(&run, 1.0 / 30.0)
+            return run.result == CLEAR
+
+    def deal_seed(rung: i64, seed: i64) -> Town:
+        can Abort.Panic, Memory.Allocate:
+            draw: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&draw, magnitude)
+            level: Grade = grade(rung)
+            first: mutable Town = zeroed
+            for attempt in 0..<20 |draw, level, first|:
+                town: Town = build(level, &draw)
+                first <- town if attempt == 0
+                return town if play(&town, true) and not play(&town, false)
+            return first
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Town:
+        can Abort.Panic, Memory.Allocate:
+            return deal_seed(rung, py_randbelow(rng, 1073741824.u64()).i64())

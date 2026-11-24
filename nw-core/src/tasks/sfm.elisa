@@ -1,0 +1,288 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module ShapeFromMotion:
+    const SOLIDS: i64 = 8
+    const MAX_CHOICES: i64 = 6
+    const MAX_DOTS: i64 = 300
+    const VIEW: f64 = 1.35
+    const TAU: f64 = 6.283185307179586
+    const TILT: f64 = 0.24434609527920614
+
+    struct Grade:
+        rung: i64
+        choices: i64
+        dots: i64
+        noise: i64
+        life: f64
+        spin_share: f64
+        eye: f64
+        period: f64
+        alike: bool
+
+    struct Puzzle:
+        level: Grade
+        seed: i64
+        solid: i64
+        spin: bool
+        way: i64
+        count: i64
+        options: mutable i64[MAX_CHOICES]
+        answer: i64
+
+    struct Point:
+        x: f64
+        y: f64
+        z: f64
+
+    struct Dot:
+        x: f64
+        y: f64
+        size: f64
+
+    struct Sample:
+        cycle: i64
+        point: Point
+        vy: f64
+
+    struct Cloud:
+        valid: mutable bool
+        seed: mutable i64
+        rung: mutable i64
+        solid: mutable i64
+        samples: mutable Sample[MAX_DOTS]
+        dots: mutable Dot[MAX_DOTS]
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        eye: f64 = 3.0 + 0.6 * (r - 10).f64() if r >= 10 else 3.0
+        return Grade{rung: r, choices: 3 if r < 4 else (4 if r < 7 else (5 if r < 20 else 6)),
+            dots: 300 if r < 16 else (150 if r < 20 else (90 if r < 25 else 50)),
+            noise: 0 if r < 12 else (90 if r < 16 else (75 if r < 20 else (45 if r < 25 else 30))),
+            life: 0.0 if r < 7 else (0.5 if r < 16 else 0.25), spin_share: 0.0 if r < 10 else 1.0 / 3.0,
+            eye: eye if eye < 14.0 else 14.0, period: 4.0 if r < 20 else 7.0, alike: r >= 12}
+
+    def seed_magnitude(seed: i64) -> u64:
+        return (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+
+    def alternatives(rng: mutable MT19937&, solid: i64, alike: bool, wrong: mutable i64[7]&):
+        can Abort.Panic:
+            groups: i64[SOLIDS] = [0, 0, 0, 1, 2, 1, 3, 2]
+            neighbours: i64[24] = [2, 1, 4, 2, 5, 0, 1, 0, 3, 5, 2, 6,
+                7, 0, 2, 3, 1, 6, 3, 5, 4, 4, 2, 6]
+            first: mutable i64 = 0
+            last: mutable i64 = 7
+            if alike:
+                for i in 0..<3 |wrong, neighbours, solid|:
+                    wrong[i.usize()] <- neighbours[(solid * 3 + i).usize()]
+                first <- 3
+            for other in 0..<SOLIDS |solid, alike, groups, wrong, first, last|:
+                continue if other == solid
+                if alike:
+                    continue if other == wrong[0] or other == wrong[1] or other == wrong[2]
+                elif groups[other.usize()] == groups[solid.usize()]:
+                    last <- last - 1
+                    wrong[last.usize()] <- other
+                    continue
+                wrong[first.usize()] <- other
+                first <- first + 1
+            if alike:
+                shuffle(rng, wrong, 3, 7)
+            else:
+                # The near solid indices were collected in reverse order.
+                if last == 5:
+                    swap(wrong, 5, 6)
+                shuffle(rng, wrong, 0, first)
+                shuffle(rng, wrong, last, 7)
+
+    def swap(values: mutable i64[7]&, a: i64, b: i64):
+        can Abort.Panic:
+            value: i64 = values[a.usize()]
+            values[a.usize()] <- values[b.usize()]
+            values[b.usize()] <- value
+
+    def shuffle(rng: mutable MT19937&, values: mutable i64[7]&, begin: i64, end: i64):
+        can Abort.Panic:
+            index: mutable i64 = end - 1
+            while index > begin |index, begin, rng, values|:
+                selected: i64 = begin + py_randbelow(rng, (index - begin + 1).u64()).i64()
+                swap(values, index, selected)
+                index <- index - 1
+
+    def deal(rung: i64, seed: i64) -> Puzzle:
+        can Abort.Panic:
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, seed_magnitude(seed))
+            level: Grade = grade(rung)
+            solid: i64 = py_randbelow(&rng, SOLIDS.u64()).i64()
+            way: i64 = 1 if py_randbelow(&rng, 2.u64()) == 0 else -1
+            spin: bool = py_random(&rng) < level.spin_share
+            puzzle: mutable Puzzle = Puzzle{level: level, seed: seed, solid: solid, spin: spin, way: way,
+                count: 2 if spin else level.choices, options: zeroed, answer: 0 if way < 0 else 1}
+            return puzzle if spin
+            wrong: mutable i64[7] = zeroed
+            alternatives(&rng, solid, level.alike, &wrong)
+            answer: i64 = py_randbelow(&rng, level.choices.u64()).i64()
+            for i in 0..<level.choices |puzzle, wrong, solid, answer|:
+                puzzle.options[i.usize()] <- solid if i == answer else wrong[(i if i < answer else i - 1).usize()]
+            return Puzzle{level: level, seed: seed, solid: solid, spin: false, way: way,
+                count: level.choices, options: puzzle.options, answer: answer}
+
+    def point(x: f64, y: f64, z: f64) -> Point:
+        return Point{x: x, y: y, z: z}
+
+    def polar(radius: f64, y: f64, angle: f64) -> Point:
+        return point(radius * cos(angle), y, radius * sin(angle))
+
+    def surface(solid: i64, rng: mutable MT19937&) -> Point:
+        can Abort.Panic:
+            u: mutable f64 = py_random(rng)
+            v: mutable f64 = py_random(rng)
+            angle: f64 = TAU * v
+            a: f64 = 2.0 * u - 1.0
+            b: f64 = 2.0 * v - 1.0
+            if solid == 0:
+                return polar(sqrt(1.0 - a * a), a, angle)
+            if solid == 1:
+                face: i64 = py_randbelow(rng, 6.u64()).i64()
+                x: f64 = a * 0.8
+                y: f64 = b * 0.8
+                if face < 2:
+                    return point(0.8 if face == 0 else -0.8, x, y)
+                if face < 4:
+                    return point(x, 0.8 if face == 2 else -0.8, y)
+                return point(x, y, 0.8 if face == 4 else -0.8)
+            if solid == 2:
+                side: f64 = TAU * 0.8 * 2.0 * 0.9
+                caps: f64 = TAU * 0.8 * 0.8
+                if u * (side + caps) < side:
+                    return polar(0.8, py_uniform(rng, -0.9, 0.9), angle)
+                radius: f64 = 0.8 * sqrt(py_random(rng))
+                return polar(radius, 0.9 if py_random(rng) < 0.5 else -0.9, angle)
+            if solid == 3:
+                pi: f64 = TAU / 2.0
+                slant: f64 = pi * 0.95 * py_hypot(0.95, 1.8)
+                base: f64 = pi * 0.95 * 0.95
+                t: f64 = sqrt(py_random(rng))
+                return polar(t * 0.95, 0.9 - t * 1.8 if u * (slant + base) < slant else -0.9, angle)
+            if solid == 4:
+                while true |rng, u, v|:
+                    around: f64 = TAU * u
+                    tube: f64 = TAU * v
+                    radius: f64 = 0.72 + 0.3 * cos(tube)
+                    return polar(radius, 0.3 * sin(tube), around) if py_random(rng) * (0.72 + 0.3) <= radius
+                    u <- py_random(rng)
+                    v <- py_random(rng)
+            if solid == 5:
+                side: i64 = py_randbelow(rng, 5.u64()).i64()
+                return point(0.9 * a, -0.9, 0.9 * b) if side == 4
+                t: f64 = sqrt(py_random(rng))
+                base: f64 = 0.9 * t
+                offset: f64 = a * t * 0.9
+                y: f64 = 0.9 - t * 1.8
+                if side % 2 == 0:
+                    return point(-offset if side == 0 else offset, y, base if side == 0 else -base)
+                return point(-base if side == 1 else base, y, -offset if side == 1 else offset)
+            if solid == 6:
+                return point(a * 0.9, 0.75 * (a * a - b * b), b * 0.9)
+            radius: f64 = 0.7 + 0.16 * cos(angle)
+            return polar(radius, -0.9 + 1.8 * u + 0.16 * sin(angle), TAU * 2.5 * u)
+
+    def scaled_key(key: mutable u32[3]&, multiplier: u64, offset: i64):
+        # Multipliers fit in 32 bits. A signed offset is carried or borrowed
+        # through the low word before processing the higher words.
+        carry: mutable i64 = offset
+        for i in 0..<3 |key, multiplier, carry|:
+            product: u64 = key[i.usize()].u64() * multiplier
+            low: i64 = (product & 0xFFFFFFFF.u64()).i64() + carry
+            key[i.usize()] <- low.u32()
+            carry <- (product >> 32).i64() + (low >> 32)
+
+    def seed_sample(rng: mutable MT19937&, seed: i64, index: i64, cycle: i64, noise: bool):
+        can Abort.Panic:
+            magnitude: u64 = seed_magnitude(seed)
+            base: u64 = 1000033 if noise else 1000003
+            stride: u64 = 6151 if noise else 7919
+            if magnitude < 1000000000.u64() and cycle < 1000000000:
+                value: i64 = (seed * base.i64() + index) * stride.i64() + cycle
+                mt_seed_int(rng, seed_magnitude(value))
+                return
+            # CPython takes the absolute value after multiplying the seed.
+            sign: i64 = -1 if seed < 0 else 1
+            key: mutable u32[3] = [magnitude.u32(), (magnitude >> 32).u32(), 0]
+            scaled_key(&key, base, sign * index)
+            scaled_key(&key, stride, sign * cycle)
+            if key[2] == 0:
+                mt_seed_int(rng, key[0].u64() | (key[1].u64() << 32))
+                return
+            # The standard runtime accepts one or two seed words. This is the
+            # same MT19937 init_by_array recurrence for the three-word case.
+            mt_init_genrand(rng, 19650218)
+            at: mutable usize = 1
+            for i in 0..<624 |rng, at, key|:
+                last: u32 = rng.mt[at - 1]
+                word: usize = (i % 3).usize()
+                rng.mt[at] <- (rng.mt[at] ^ ((last ^ (last >> 30)) * 1664525.u32())) + key[word] + word.u32()
+                at <- at + 1
+                if at == MT_N:
+                    rng.mt[0] <- rng.mt[MT_N - 1]
+                    at <- 1
+            for i in 0..<623 |rng, at|:
+                last: u32 = rng.mt[at - 1]
+                rng.mt[at] <- (rng.mt[at] ^ ((last ^ (last >> 30)) * 1566083941.u32())) - at.u32()
+                at <- at + 1
+                if at == MT_N:
+                    rng.mt[0] <- rng.mt[MT_N - 1]
+                    at <- 1
+            rng.mt[0] <- 0x80000000
+
+    def sample(puzzle: Puzzle&, index: i64, cycle: i64, noise: bool) -> Sample:
+        can Abort.Panic:
+            rng: mutable MT19937 = zeroed
+            seed_sample(&rng, puzzle.seed, index, cycle, noise)
+            if noise:
+                x: f64 = py_uniform(&rng, -1.0, 1.0)
+                y: f64 = py_uniform(&rng, -1.0, 1.0)
+                vx: f64 = py_uniform(&rng, -0.3, 0.3)
+                vy: f64 = py_uniform(&rng, -0.3, 0.3)
+                return Sample{cycle: cycle, point: point(x, y, vx), vy: vy}
+            return Sample{cycle: cycle, point: surface(puzzle.solid, &rng), vy: 0.0}
+
+    def project(p: Point, ca: f64, sa: f64, eye: f64) -> Dot:
+        ct: f64 = cos(TILT)
+        st: f64 = sin(TILT)
+        x: f64 = p.x * ca - p.z * sa
+        z: f64 = p.x * sa + p.z * ca
+        y: f64 = p.y * ct - z * st
+        scale: f64 = eye / (eye + p.y * st + z * ct) if eye > 0.0 else 1.0
+        return Dot{x: x * scale, y: y * scale, size: scale}
+
+    def fraction(value: f64) -> f64:
+        return value - floor(value)
+
+    def update(puzzle: Puzzle&, t: f64, cloud: mutable Cloud&):
+        can Abort.Panic:
+            g: Grade = puzzle.level
+            reuse: bool = cloud.valid and cloud.seed == puzzle.seed and cloud.rung == g.rung and cloud.solid == puzzle.solid
+            angle: f64 = puzzle.way.f64() * TAU * t / g.period
+            ca: f64 = cos(angle)
+            sa: f64 = sin(angle)
+            eye: f64 = g.eye if puzzle.spin else 0.0
+            life: f64 = t / g.life if g.life > 0.0 else 0.0
+            solid_count: i64 = g.dots - g.noise
+            for index in 0..<g.dots |puzzle, cloud, reuse, life, solid_count, ca, sa, eye|:
+                noise: bool = index >= solid_count
+                k: i64 = index - solid_count if noise else index
+                age: f64 = life + fraction(k.f64() * (0.381966 if noise else 0.6180339887)) if g.life > 0.0 else 0.0
+                cycle: i64 = age.i64()
+                slot: usize = index.usize()
+                if not reuse or cloud.samples[slot].cycle != cycle:
+                    cloud.samples[slot] <- sample(puzzle, k, cycle, noise)
+                current: Sample = cloud.samples[slot]
+                remaining: f64 = age - cycle.f64()
+                p: Point = current.point
+                cloud.dots[slot] <- Dot{x: p.x + p.z * remaining, y: p.y + current.vy * remaining, size: 1.0} if noise else project(p, ca, sa, eye)
+            cloud.valid <- true
+            cloud.seed <- puzzle.seed
+            cloud.rung <- g.rung
+            cloud.solid <- puzzle.solid

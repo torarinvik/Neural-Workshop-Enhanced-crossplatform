@@ -1,0 +1,130 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_fileio.elisa"
+include "../tasks/tuner_recordings.elisa"
+include "../stats.elisa"
+
+module TunerRecordingFiles:
+    const CLASS_COUNT: i64 = 50
+    const MINIMUM_BANK: i64 = 300
+
+    struct Entry:
+        row: i64
+        label: i64
+        start: f64
+        end: f64
+        sounding: f64
+        db: f64
+
+    def parse(text: sview) -> darray[Entry]:
+        can Memory.Allocate, Abort.Panic:
+            entries: mutable darray[Entry] = []
+            length: i64 = sview_len(text).i64()
+            cursor: mutable i64 = 0
+            while cursor < length |cursor, text, length, entries|:
+                start: i64 = cursor
+                while cursor < length and sview_at(text, cursor.usize()) != 10.u8() |cursor, length, text|:
+                    cursor <- cursor + 1
+                stop: i64 = cursor
+                cursor <- cursor + 1
+                line: sview = string_view_slice(text, start, stop)
+                continue if sview_starts_with(line, "#")
+                first_byte: mutable i64 = start
+                while first_byte < stop and is_ascii_space(sview_at(text, first_byte.usize())) |first_byte, stop, text|:
+                    first_byte <- first_byte + 1
+                continue if first_byte == stop
+                edges: mutable i64[7] = zeroed
+                edges[0] <- start - 1
+                column: mutable i64 = 0
+                for i in start..<stop |text, edges, column|:
+                    if sview_at(text, i.usize()) == 9.u8() and column < 5:
+                        column <- column + 1
+                        edges[column.usize()] <- i
+                return [] if column != 5
+                edges[6] <- stop
+                row: ParsedInt = py_parse_int(string_view_slice(text, edges[0] + 1, edges[1]))
+                label: ParsedInt = py_parse_int(string_view_slice(text, edges[1] + 1, edges[2]))
+                first: ParsedInt = py_parse_int(string_view_slice(text, edges[2] + 1, edges[3]))
+                last: ParsedInt = py_parse_int(string_view_slice(text, edges[3] + 1, edges[4]))
+                sounding: ParsedFloat = py_parse_float(string_view_slice(text, edges[4] + 1, edges[5]))
+                db: ParsedFloat = py_parse_float(string_view_slice(text, edges[5] + 1, edges[6]))
+                return [] if not (row.ok and label.ok and first.ok and last.ok and sounding.ok and db.ok)
+                entries.push(Entry{row: row.value, label: label.value, start: first.value.f64() / 1000.0,
+                    end: last.value.f64() / 1000.0, sounding: sounding.value, db: db.value})
+            return entries
+
+    def clip_path(directory: cstr, row: i64, path: mutable u8&) -> bool:
+        can Abort.Panic:
+            length: i64 = string_len(directory)
+            return false if length <= 0 or length > 4083 or row < 0 or row > 9999999
+            text: sview = sview(directory, 0, length)
+            for i in 0..<length |path, text|:
+                path[i.usize()] <- sview_at(text, i.usize())
+            path[length.usize()] <- 47.u8()
+            remaining: mutable i64 = row
+            for i in 0..<7 |remaining, path, length|:
+                path[(length + 7 - i).usize()] <- (48 + remaining % 10).u8()
+                remaining <- remaining / 10
+            path[(length + 8).usize()] <- 46.u8()
+            path[(length + 9).usize()] <- 119.u8()
+            path[(length + 10).usize()] <- 97.u8()
+            path[(length + 11).usize()] <- 118.u8()
+            path[(length + 12).usize()] <- 0.u8()
+            return true
+
+    def bank(arena: mutable Arena&, index: cstr, directory: cstr) -> darray[Entry]:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic:
+            in arena:
+                body: cstr = try read_entire_file_cstr(arena, index) else ""
+                entries: darray[Entry] = parse(sview(body, 0, string_len(body)))
+                available: mutable darray[Entry] = []
+                path: mutable u8[4096] = zeroed
+                for i in 0..<entries.count |entries, available, directory, path|:
+                    e: Entry = entries[i]
+                    continue if e.label < 0 or e.label >= CLASS_COUNT or e.start < 0.0
+                    continue if not (e.end - e.start >= 1.0 and e.sounding >= 0.45 and e.db >= -42.0)
+                    if clip_path(directory, e.row, &path[0]):
+                        trusted Unsafe.PointerCast:
+                            if file_exists((&path[0]).cast[cstr]):
+                                available.push(e)
+                return [] if available.count.i64() < MINIMUM_BANK
+                return available
+
+    def clips(entries: darray[Entry]&) -> darray[Tuner::Clip]:
+        can Memory.Allocate, Abort.Panic:
+            result: mutable darray[Tuner::Clip] = []
+            for i in 0..<entries.count |entries, result|:
+                e: Entry = entries[i]
+                result.push(Tuner::Clip{row: e.row, label: e.label, duration: e.end - e.start})
+            return result
+
+    def read_clip_wave(arena: mutable Arena&, path: cstr, start: f64, end: f64) -> TunerAudio::Wave:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic:
+            in arena:
+                missing: darray[u8] = []
+                bytes: darray[u8] = try read_entire_file(arena, path) else missing
+                return TunerRecordings::decode(&bytes, start, end)
+
+    def playback(arena: mutable Arena&, directory: cstr, entries: darray[Entry]&, sound: Tuner::Sound&) -> TunerAudio::Wave:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic:
+            in arena:
+                if sound.bank == Tuner::TUNES:
+                    wave: TunerAudio::Wave = TunerAudio::tune_wave(sound)
+                    return TunerAudio::playback(&wave, sound.speed, sound.backward)
+                path: mutable u8[4096] = zeroed
+                if clip_path(directory, sound.row, &path[0]):
+                    for i in 0..<entries.count |entries, arena, path, sound|:
+                        entry: Entry = entries[i]
+                        if entry.row == sound.row:
+                            trusted Unsafe.PointerCast:
+                                wave: TunerAudio::Wave = read_clip_wave(arena, (&path[0]).cast[cstr], entry.start, entry.end)
+                                return TunerAudio::playback(&wave, sound.speed, sound.backward)
+                wave: TunerAudio::Wave = TunerRecordings::silence()
+                return TunerAudio::playback(&wave, sound.speed, sound.backward)
+
+    def prepare(arena: mutable Arena&, directory: cstr, entries: darray[Entry]&, radio: Tuner::Radio&) -> TunerAudio::Audio:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic:
+            in arena:
+                stations: mutable darray[TunerAudio::Wave] = []
+                for i in 0..<radio.count |arena, directory, entries, radio, stations|:
+                    stations.push(playback(arena, directory, entries, &radio.stations[i.usize()].sound))
+                return TunerAudio::Audio{heard: playback(arena, directory, entries, &radio.heard),
+                    stations: stations, hiss: TunerAudio::hiss(radio.seed)}

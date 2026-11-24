@@ -12,6 +12,10 @@
 // multi-threaded build needs SharedArrayBuffer and real atomics — that is a
 // later phase, and the core game does not need it.
 
+import { createDispatchEnvironment, createFirebreakEnvironment, createCrossroadsEnvironment, createRailYardEnvironment, createAirTrafficEnvironment, createEscortEnvironment, createSokobanLiveEnvironment, createKitchenEnvironment, createCraneEnvironment, createFerryEnvironment, createDockingEnvironment, createUnicycleEnvironment, createMorningRoundEnvironment, createHeavierEnvironment, createCrazyCogEnvironment, createPotterEnvironment, createConductorEnvironment, createTightropeEnvironment, createSignPainterEnvironment, createBartenderEnvironment, createLockPickEnvironment, createAirHockeyEnvironment, createSemaphoreEnvironment, createShadowPuppetsEnvironment, createNightWatchEnvironment, createKerbsideEnvironment, createSteadicamEnvironment, createFreeKickEnvironment, createByEarEnvironment, createPianoTunerEnvironment, createCricketHuntEnvironment, createClawMachineEnvironment, createGloveEnvironment, createCipherAbyssEnvironment, createFullStopEnvironment, createMissingWordEnvironment, createProofreaderEnvironment, createFiguresOfSpeechEnvironment, createBetweenTheLinesEnvironment, createSecondThoughtsEnvironment, createBadArgumentEnvironment, createSocialSenseEnvironment, createWhichFeelingEnvironment, createHowStronglyEnvironment, createReadingPeopleEnvironment, createWhyTheyFeelEnvironment, createToneOfVoiceEnvironment, createEmotionEnvironment, createRoverEnvironment, createGambleEnvironment, createBluffEnvironment, createExploreOrExploitEnvironment, createSonarEnvironment, createDamKeeperEnvironment, createDelayEnvironment, createHoldItEnvironment, createTimeItEnvironment, createBeatEnvironment, createCatchEnvironment, createEchoCaveEnvironment, createDroneHoopsEnvironment, createFieldManualEnvironment, createSafecrackerEnvironment, createStagehandEnvironment, createLoadingDockEnvironment, createGunslingerEnvironment, createDrShapeEnvironment, createShadowPlayEnvironment, createTunerEnvironment, createBalanceEnvironment, createJugglerEnvironment, createLanderEnvironment, createGliderEnvironment, createNotebookEnvironment, createStopAndSwitchEnvironment, createTriageEnvironment, createWhereWasItEnvironment, createWhichIsNearerEnvironment, createShapeFromMotionEnvironment, createSameOrMirrorEnvironment, createPointOfViewEnvironment, createInsideOrOutEnvironment, createWillItFallEnvironment, createCaptchaEnvironment, createSignalsEnvironment, createFoldItEnvironment, createWhoKnowsWhatEnvironment, createTouchingEnvironment, createCrossingsEnvironment } from "./rung-env.js";
+import { createCookieThiefEnvironment } from "./cookie-thief-env.js";
+import { createPublicFrameArchive, createPublicOutcomeVerifier } from "./public-outcome.js";
+
 const PAGE = 65536;
 
 export function createElisaRuntime() {
@@ -60,7 +64,7 @@ export function createElisaRuntime() {
 
     function alloc(bytes, align = 16) {
         const size = Number(bytes);
-        heapNext = (heapNext + align - 1) & ~(align - 1);
+        heapNext = Math.ceil(heapNext / align) * align;
         grow(size);
         const at = heapNext;
         heapNext += size;
@@ -178,6 +182,8 @@ export function createElisaRuntime() {
             flushLine(text);
             return text.length;
         },
+        // Elisa's JSON parser passes a validated, NUL-terminated decimal token.
+        strtod: (pointer) => Number(readCString(pointer)),
         snprintf: (dest, size, fmt) => writeFormatted(dest, size, readCString(fmt)),
         vsnprintf: (dest, size, fmt) => writeFormatted(dest, size, readCString(fmt)),
         va_copy: () => 0,
@@ -246,10 +252,20 @@ export function createElisaRuntime() {
         cos: (x) => Math.cos(x),
         sin: (x) => Math.sin(x),
         sqrt: (x) => Math.sqrt(x),
+        hypot: (x, y) => Math.hypot(x, y),
+        fmod: (x, y) => x % y,
+        fmin: (x, y) => Number.isNaN(x) ? y : (Number.isNaN(y) ? x : Math.min(x, y)),
+        fmax: (x, y) => Number.isNaN(x) ? y : (Number.isNaN(y) ? x : Math.max(x, y)),
         exp: (x) => Math.exp(x),
+        exp2: (x) => 2 ** x,
+        tan: (x) => Math.tan(x),
+        tanh: (x) => Math.tanh(x),
         log: (x) => Math.log(x),
+        log2: (x) => Math.log2(x),
         log10: (x) => Math.log10(x),
         asin: (x) => Math.asin(x),
+        acos: (x) => Math.acos(x),
+        atan: (x) => Math.atan(x),
         atan2: (y, x) => Math.atan2(y, x),
         pow: (base, exponent) => Math.pow(base, exponent),
         fabs: (x) => Math.abs(x),
@@ -418,5 +434,283 @@ export async function instantiateElisa(source, { warn = true } = {}) {
     }
     const instance = await WebAssembly.instantiate(module, runtime.imports);
     runtime.attach(instance);
-    return { instance, runtime, exports: instance.exports, stubbed: missing };
+    const exports = instance.exports;
+    const verifyPublicOutcome = createPublicOutcomeVerifier(exports, exports.memory);
+    const verifyTaskOutcome = createPublicOutcomeVerifier(exports, exports.memory, { allowConcessions: true });
+    const frameArchive = (context) =>
+        createPublicFrameArchive(context, exports, exports.memory, verifyPublicOutcome);
+    return {
+        instance, runtime, exports, stubbed: missing, verifyPublicOutcome, verifyTaskOutcome,
+        createPublicFrameArchive: frameArchive,
+        createDelayEnvironment: (context, options) =>
+            createDelayEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createHoldItEnvironment: (context, options) =>
+            createHoldItEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createTimeItEnvironment: (context, options) =>
+            createTimeItEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createBeatEnvironment: (context, options) =>
+            createBeatEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createCatchEnvironment: (context, options) =>
+            createCatchEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createEchoCaveEnvironment: (context, options) =>
+            createEchoCaveEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createDroneHoopsEnvironment: (context, options) =>
+            createDroneHoopsEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createFieldManualEnvironment: (context, options) =>
+            createFieldManualEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createSafecrackerEnvironment: (context, options) =>
+            createSafecrackerEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createStagehandEnvironment: (context, options) =>
+            createStagehandEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createLoadingDockEnvironment: (context, options) =>
+            createLoadingDockEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createGunslingerEnvironment: (context, options) =>
+            createGunslingerEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createDrShapeEnvironment: (context, options) =>
+            createDrShapeEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createShadowPlayEnvironment: (context, options) =>
+            createShadowPlayEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createTunerEnvironment: (context, options) =>
+            createTunerEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createBalanceEnvironment: (context, options) =>
+            createBalanceEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createJugglerEnvironment: (context, options) =>
+            createJugglerEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createLanderEnvironment: (context, options) =>
+            createLanderEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createGliderEnvironment: (context, options) =>
+            createGliderEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createStopAndSwitchEnvironment: (context, options) =>
+            createStopAndSwitchEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createNotebookEnvironment: (context, options) =>
+            createNotebookEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createTriageEnvironment: (context, options) =>
+            createTriageEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createWhereWasItEnvironment: (context, options) =>
+            createWhereWasItEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createSameOrMirrorEnvironment: (context, options) =>
+            createSameOrMirrorEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createPointOfViewEnvironment: (context, options) =>
+            createPointOfViewEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createWillItFallEnvironment: (context, options) =>
+            createWillItFallEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createCaptchaEnvironment: (context, options) =>
+            createCaptchaEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createSignalsEnvironment: (context, options) =>
+            createSignalsEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createFoldItEnvironment: (context, options) =>
+            createFoldItEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createWhoKnowsWhatEnvironment: (context, options) =>
+            createWhoKnowsWhatEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createSonarEnvironment: (context, options) =>
+            createSonarEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createGambleEnvironment: (context, options) =>
+            createGambleEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createBluffEnvironment: (context, options) =>
+            createBluffEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createExploreOrExploitEnvironment: (context, options) =>
+            createExploreOrExploitEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createInsideOrOutEnvironment: (context, options) =>
+            createInsideOrOutEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createTouchingEnvironment: (context, options) =>
+            createTouchingEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createCrossingsEnvironment: (context, options) =>
+            createCrossingsEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createWhichIsNearerEnvironment: (context, options) =>
+            createWhichIsNearerEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createShapeFromMotionEnvironment: (context, options) =>
+            createShapeFromMotionEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createDamKeeperEnvironment: (context, options) =>
+            createDamKeeperEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createDispatchEnvironment: (context, options) =>
+            createDispatchEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createFirebreakEnvironment: (context, options) =>
+            createFirebreakEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createCrossroadsEnvironment: (context, options) =>
+            createCrossroadsEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createRailYardEnvironment: (context, options) =>
+            createRailYardEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createAirTrafficEnvironment: (context, options) =>
+            createAirTrafficEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createEscortEnvironment: (context, options) =>
+            createEscortEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createSokobanLiveEnvironment: (context, options) =>
+            createSokobanLiveEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createKitchenEnvironment: (context, options) =>
+            createKitchenEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createCraneEnvironment: (context, options) =>
+            createCraneEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createFerryEnvironment: (context, options) =>
+            createFerryEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createDockingEnvironment: (context, options) =>
+            createDockingEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createUnicycleEnvironment: (context, options) =>
+            createUnicycleEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createRoverEnvironment: (context, options) =>
+            createRoverEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createMorningRoundEnvironment: (context, options) =>
+            createMorningRoundEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createHeavierEnvironment: (context, options) =>
+            createHeavierEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createCrazyCogEnvironment: (context, options) =>
+            createCrazyCogEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createPotterEnvironment: (context, options) =>
+            createPotterEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createConductorEnvironment: (context, options) =>
+            createConductorEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createTightropeEnvironment: (context, options) =>
+            createTightropeEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createSignPainterEnvironment: (context, options) =>
+            createSignPainterEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createBartenderEnvironment: (context, options) =>
+            createBartenderEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createLockPickEnvironment: (context, options) =>
+            createLockPickEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createAirHockeyEnvironment: (context, options) =>
+            createAirHockeyEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createSemaphoreEnvironment: (context, options) =>
+            createSemaphoreEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createShadowPuppetsEnvironment: (context, options) =>
+            createShadowPuppetsEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createNightWatchEnvironment: (context, options) =>
+            createNightWatchEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createKerbsideEnvironment: (context, options) =>
+            createKerbsideEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createSteadicamEnvironment: (context, options) =>
+            createSteadicamEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createFreeKickEnvironment: (context, options) =>
+            createFreeKickEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createByEarEnvironment: (context, options) =>
+            createByEarEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createPianoTunerEnvironment: (context, options) =>
+            createPianoTunerEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createCricketHuntEnvironment: (context, options) =>
+            createCricketHuntEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createClawMachineEnvironment: (context, options) =>
+            createClawMachineEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createGloveEnvironment: (context, options) =>
+            createGloveEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createCipherAbyssEnvironment: (context, options) =>
+            createCipherAbyssEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createFullStopEnvironment: (context, options) =>
+            createFullStopEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createMissingWordEnvironment: (context, options) =>
+            createMissingWordEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createProofreaderEnvironment: (context, options) =>
+            createProofreaderEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createFiguresOfSpeechEnvironment: (context, options) =>
+            createFiguresOfSpeechEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createBetweenTheLinesEnvironment: (context, options) =>
+            createBetweenTheLinesEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createSecondThoughtsEnvironment: (context, options) =>
+            createSecondThoughtsEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createBadArgumentEnvironment: (context, options) =>
+            createBadArgumentEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createSocialSenseEnvironment: (context, options) =>
+            createSocialSenseEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createWhichFeelingEnvironment: (context, options) =>
+            createWhichFeelingEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createHowStronglyEnvironment: (context, options) =>
+            createHowStronglyEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createReadingPeopleEnvironment: (context, options) =>
+            createReadingPeopleEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createWhyTheyFeelEnvironment: (context, options) =>
+            createWhyTheyFeelEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createToneOfVoiceEnvironment: (context, options) =>
+            createToneOfVoiceEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createEmotionEnvironment: (context, options) =>
+            createEmotionEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+        createCookieThiefEnvironment: (context, options) =>
+            createCookieThiefEnvironment(exports, context, () =>
+                createPublicFrameArchive(context, exports, exports.memory, verifyTaskOutcome), options),
+    };
 }

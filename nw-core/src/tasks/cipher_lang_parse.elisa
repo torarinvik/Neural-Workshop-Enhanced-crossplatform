@@ -1,0 +1,148 @@
+include "./cipher_lang_code.elisa"
+
+extend CipherLang:
+    struct Reader:
+        text: sview
+        length: i64
+        at: mutable i64
+
+    def digit(ch: i64) -> bool:
+        return ch >= 48 and ch <= 57
+
+    def letter(ch: i64) -> bool:
+        return (ch >= 65 and ch <= 90) or (ch >= 97 and ch <= 122) or ch == 95
+
+    def peek(reader: mutable Reader&) -> i64:
+        can Abort.Panic:
+            while reader.at < reader.length |reader|:
+                ch: i64 = sview_at(reader.text, reader.at.usize()).i64()
+                return ch if digit(ch) or letter(ch) or ch == 40 or ch == 41 or ch == 44 or ch == 58 or ch == 91 or ch == 93
+                reader.at <- reader.at + 1
+            return 0
+
+    def take(reader: mutable Reader&, want: i64) -> bool:
+        can Abort.Panic:
+            return false if peek(reader) != want
+            reader.at <- reader.at + 1
+            return true
+
+    def integer(reader: mutable Reader&) -> i64:
+        can Abort.Panic:
+            return -1 if not digit(peek(reader))
+            value: mutable i64 = 0
+            while reader.at < reader.length |reader, value|:
+                ch: i64 = sview_at(reader.text, reader.at.usize()).i64()
+                break if not digit(ch)
+                d: i64 = ch - 48
+                return -1 if value > (9223372036854775807 - d) / 10
+                value <- value * 10 + d
+                reader.at <- reader.at + 1
+            return value
+
+    def operator(reader: mutable Reader&) -> i64:
+        can Abort.Panic:
+            return -1 if not letter(peek(reader))
+            start: i64 = reader.at
+            while reader.at < reader.length |reader|:
+                break if not letter(sview_at(reader.text, reader.at.usize()).i64())
+                reader.at <- reader.at + 1
+            length: i64 = reader.at - start
+            for op in 0..<(META + 1) |reader, start, length|:
+                word: sview = sview(name(op), 0, -1)
+                continue if sview_len(word).i64() != length
+                equal_name: mutable bool = true
+                for i in 0..<length |word, reader, start, equal_name|:
+                    equal_name <- false if sview_at(reader.text, (start + i).usize()) != sview_at(word, i.usize())
+                return op if equal_name
+            return -1
+
+    def arity(op: i64) -> i64:
+        return 3 if op == CONV
+        return 2 if op == AFFINE
+        if op == ROT or op == SHIFT or op == MUL or op == TSHIFT or op == ODDSHIFT or op == XOR or op == GF or op == STRIDE or (op >= FIRST and op <= EVENS) or op == ECHO:
+            return 1
+        return 0
+
+    def whole(program: mutable darray[Node]&, entry: i64) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            return entry if program[entry.usize()].op >= FIRST
+            children: darray[i64] = [entry]
+            return add_node(program, SEQ, [], children)
+
+    def parse_primitive(reader: mutable Reader&, program: mutable darray[Node]&, op: i64, parens: bool) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            if op == FEISTEL:
+                return -1 if not parens
+                child: i64 = read_node(reader, program)
+                return -1 if child < 0
+                _ = take(reader, 44)
+                return -1 if not take(reader, 41)
+                branch: i64 = whole(program, child)
+                children: darray[i64] = [branch]
+                return add_node(program, FEISTEL, [], children)
+            args: mutable darray[i64] = []
+            table: bool = op == PERM or op == SUB
+            if table:
+                return -1 if not parens or not take(reader, 91)
+                while not take(reader, 93) |reader, args|:
+                    value: i64 = integer(reader)
+                    return -1 if value < 0
+                    args.push(value)
+                    _ = take(reader, 44)
+                return -1 if args.count == 0.usize()
+                _ = take(reader, 44)
+            else:
+                count: i64 = arity(op)
+                return -1 if count > 0 and not parens
+                for _ in 0..<count |reader, args|:
+                    value: i64 = integer(reader)
+                    return -1 if value < 0
+                    args.push(value)
+                    _ = take(reader, 44)
+            return -1 if parens and not take(reader, 41)
+            return add_node(program, op, args, [])
+
+    def read_node(reader: mutable Reader&, program: mutable darray[Node]&) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            op: i64 = operator(reader)
+            return -1 if op < 0
+            parens: bool = take(reader, 40)
+            return parse_primitive(reader, program, op, parens) if op < SEQ
+            return -1 if not parens and op != SEQ
+            children: mutable darray[i64] = []
+            args: mutable darray[i64] = []
+            if parens:
+                while not take(reader, 41) |reader, program, op, args, children|:
+                    if op == PROG:
+                        symbol: i64 = integer(reader)
+                        return -1 if symbol < 0 or symbol >= 8 or not take(reader, 58)
+                        args.push(symbol)
+                    entry: i64 = read_node(reader, program)
+                    return -1 if entry < 0
+                    child: Node = program[entry.usize()]
+                    index: i64 = children.count.i64()
+                    if op == SEQ:
+                        children.push(child.children[0] if child.op == SEQ and child.children.count == 1.usize() else entry)
+                    elif op == PROG:
+                        return -1 if child.op >= FIRST
+                        children.push(entry)
+                    elif index == 0 and (op == IF or op == META):
+                        return -1 if child.op < FIRST or child.op >= SEQ
+                        children.push(entry)
+                    else:
+                        children.push(whole(program, entry))
+                    _ = take(reader, 44)
+            n: i64 = children.count.i64()
+            return -1 if (op == IF and n != 3) or ((op == ALT or op == EXCEPT) and n != 2) or (op == META and n < 2)
+            return add_node(program, op, args, children)
+
+    def parse(program: mutable darray[Node]&, text: sview) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            reader: mutable Reader = Reader{text: text, length: sview_len(text).i64(), at: 0}
+            before: usize = program.count
+            result: i64 = read_node(&reader, program)
+            if result >= 0 and peek(&reader) == 0:
+                return whole(program, result)
+            while program.count > before |program, before|:
+                _ = program.pop()
+            return -1

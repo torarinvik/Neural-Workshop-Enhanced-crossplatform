@@ -1,0 +1,202 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+
+module Docking:
+    const LEFT: i64 = 0
+    const RIGHT: i64 = 1
+    const DOWN: i64 = 2
+    const UP: i64 = 3
+    const FORE: i64 = 4
+    const AFT: i64 = 5
+    const YAW_L: i64 = 6
+    const YAW_R: i64 = 7
+    const PITCH_D: i64 = 8
+    const PITCH_U: i64 = 9
+    const ROLL_L: i64 = 10
+    const ROLL_R: i64 = 11
+    const PORTS: i64 = 12
+    const NEUTRAL: i64 = -1
+
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const CONTACT: i64 = 2
+    const LOST: i64 = 3
+    const OFF_CENTRE: i64 = 1
+    const TOO_FAST: i64 = 2
+    const NOSE_OFF: i64 = 4
+    const ROLL_OFF: i64 = 8
+    const PUSH: f64 = 0.12
+    const TURN: f64 = 0.12
+    const PI: f64 = 3.141592653589793
+    const UNLIMITED_FUEL: f64 = 1000000000.0
+
+    struct Vec:
+        x: f64
+        y: f64
+        z: f64
+
+    struct Grade:
+        rung: i64
+        lateral_x: f64
+        lateral_y: f64
+        drift: f64
+        far: f64
+        nose: f64
+        spin: f64
+        station: f64
+        readouts: bool
+        tol: f64
+        vmax: f64
+        angle: f64
+        slack: f64
+
+    struct Approach:
+        level: Grade
+        pos: Vec
+        vel: Vec
+        att: Vec
+        spin: Vec
+        roll0: f64
+        fuel: mutable f64
+
+    struct Run:
+        approach: Approach
+        t: mutable f64
+        pos: mutable Vec
+        vel: mutable Vec
+        att: mutable Vec
+        spin: mutable Vec
+        fuel: mutable f64
+        result: mutable i64
+        problems: mutable i64
+
+    def radians(degrees: f64) -> f64:
+        return degrees * 0.017453292519943295
+
+    def grade(requested: i64) -> Grade:
+        rung: i64 = requested if requested > 1 else 1
+        if rung == 1:
+            return Grade{rung: rung, lateral_x: 1.2, lateral_y: 0.0, drift: 0.25, far: 12.0, nose: 0.0,
+                spin: 0.0, station: 0.0, readouts: true, tol: 0.35, vmax: 0.5, angle: 0.2, slack: 3.0}
+        if rung < 4:
+            return Grade{rung: rung, lateral_x: 1.2, lateral_y: 1.0, drift: 0.25, far: 14.0, nose: 0.0,
+                spin: 0.0, station: 0.0, readouts: true, tol: 0.3, vmax: 0.45, angle: 0.15, slack: 2.8}
+        if rung < 7:
+            return Grade{rung: rung, lateral_x: 1.5, lateral_y: 1.2, drift: 0.0, far: 18.0 + 2.0 * (rung - 4).f64(),
+                nose: 0.0, spin: 0.0, station: 0.0, readouts: true, tol: 0.25, vmax: 0.35, angle: 0.12, slack: 2.5}
+        if rung < 10:
+            return Grade{rung: rung, lateral_x: 1.5, lateral_y: 1.2, drift: 0.0, far: 20.0,
+                nose: radians(6.0), spin: radians(1.0), station: 0.0, readouts: false, tol: 0.22, vmax: 0.3,
+                angle: 0.08, slack: 2.2}
+        if rung < 13:
+            return Grade{rung: rung, lateral_x: 1.5, lateral_y: 1.5, drift: 0.0, far: 22.0,
+                nose: radians(8.0), spin: radians(1.5), station: radians(1.5 + 0.5 * (rung - 10).f64()),
+                readouts: false, tol: 0.2, vmax: 0.3, angle: 0.07, slack: 2.0}
+        top: f64 = (rung - 13).f64()
+        k: f64 = pow(0.95, top)
+        return Grade{rung: rung, lateral_x: 2.0, lateral_y: 2.0, drift: 0.0, far: 24.0 + top,
+            nose: radians(10.0), spin: radians(fmin(3.0, 2.0 + 0.1 * top)),
+            station: radians(fmin(4.0, 2.5 + 0.2 * top)), readouts: false, tol: fmax(0.12, 0.2 * k),
+            vmax: fmax(0.18, 0.3 * k), angle: fmax(0.045, 0.07 * k), slack: 1.1 + 0.8 * k}
+
+    def rotate_roll(v: Vec, angle: f64) -> Vec:
+        c: f64 = cos(angle)
+        s: f64 = sin(angle)
+        return Vec{x: v.x * c - v.y * s, y: v.x * s + v.y * c, z: v.z}
+
+    def rotate_pitch(v: Vec, angle: f64) -> Vec:
+        c: f64 = cos(angle)
+        s: f64 = sin(angle)
+        return Vec{x: v.x, y: v.y * c + v.z * s, z: -v.y * s + v.z * c}
+
+    def rotate_yaw(v: Vec, angle: f64) -> Vec:
+        c: f64 = cos(angle)
+        s: f64 = sin(angle)
+        return Vec{x: v.x * c + v.z * s, y: v.y, z: -v.x * s + v.z * c}
+
+    def body_to_world(v: Vec, att: Vec) -> Vec:
+        return rotate_yaw(rotate_pitch(rotate_roll(v, att.z), att.y), att.x)
+
+    def world_to_body(v: Vec, att: Vec) -> Vec:
+        return rotate_roll(rotate_pitch(rotate_yaw(v, -att.x), -att.y), -att.z)
+
+    def signed_range(rng: mutable MT19937&, magnitude: f64, low: f64) -> f64:
+        can Abort.Panic:
+            sign: f64 = -1.0 if py_randbelow(rng, 2.u64()) == 0.u64() else 1.0
+            return sign * magnitude * py_uniform(rng, low, 1.0)
+
+    def build(level: Grade, rng: mutable MT19937&) -> Approach:
+        can Abort.Panic:
+            x: f64 = signed_range(rng, level.lateral_x, 0.7)
+            y: f64 = signed_range(rng, level.lateral_y, 0.7)
+            yaw: f64 = signed_range(rng, level.nose, 0.6)
+            pitch: f64 = signed_range(rng, level.nose, 0.6)
+            roll: f64 = py_uniform(rng, -0.3, 0.3) if level.station != 0.0 else 0.0
+            sx: f64 = py_uniform(rng, -1.0, 1.0) * level.spin
+            sy: f64 = py_uniform(rng, -1.0, 1.0) * level.spin
+            sz: f64 = py_uniform(rng, -1.0, 1.0) * level.spin
+            station_angle: f64 = py_uniform(rng, 0.0, 2.0 * PI) if level.station != 0.0 else 0.0
+            return Approach{level: level, pos: Vec{x: x, y: y, z: -level.far},
+                vel: Vec{x: 0.0, y: 0.0, z: level.drift}, att: Vec{x: yaw, y: pitch, z: roll},
+                spin: Vec{x: sx, y: sy, z: sz}, roll0: station_angle, fuel: UNLIMITED_FUEL}
+
+    def start(approach: Approach) -> Run:
+        return Run{approach: approach, t: 0.0, pos: approach.pos, vel: approach.vel, att: approach.att,
+            spin: approach.spin, fuel: approach.fuel, result: LIVE, problems: 0}
+
+    def station_roll(run: Run&) -> f64:
+        return run.approach.roll0 + run.approach.level.station * run.t
+
+    def roll_error(run: Run&) -> f64:
+        q: f64 = PI / 2.0
+        delta: f64 = run.att.z - station_roll(run) + q / 2.0
+        rem: f64 = fmod(delta, q)
+        return (rem + q if rem < 0.0 else rem) - q / 2.0
+
+    def scaled_add(v: Vec, delta: Vec, dt: f64) -> Vec:
+        return Vec{x: v.x + delta.x * dt, y: v.y + delta.y * dt, z: v.z + delta.z * dt}
+
+    def active(mask: i64, port: i64) -> i64:
+        return (mask >> port) & 1
+
+    def thrust(run: mutable Run&, mask: i64, dt: f64):
+        can Abort.Panic:
+            count: mutable i64 = 0
+            for i in 0..<PORTS |mask, count|:
+                count <- count + active(mask, i)
+            run.fuel <- run.fuel - dt * count.f64()
+            body: Vec = Vec{x: (active(mask, RIGHT) - active(mask, LEFT)).f64() * PUSH,
+                y: (active(mask, UP) - active(mask, DOWN)).f64() * PUSH,
+                z: (active(mask, FORE) - active(mask, AFT)).f64() * PUSH}
+            run.vel <- scaled_add(run.vel, body_to_world(body, run.att), dt)
+            impulse: f64 = TURN * dt
+            spin: Vec = run.spin
+            # Apply each firing in Python's port order, including opposing pairs.
+            x: f64 = spin.x - active(mask, YAW_L).f64() * impulse + active(mask, YAW_R).f64() * impulse
+            y: f64 = spin.y - active(mask, PITCH_D).f64() * impulse + active(mask, PITCH_U).f64() * impulse
+            z: f64 = spin.z + active(mask, ROLL_L).f64() * impulse - active(mask, ROLL_R).f64() * impulse
+            run.spin <- Vec{x: x, y: y, z: z}
+
+    def contact(run: mutable Run&):
+        can Abort.Panic:
+            level: Grade = run.approach.level
+            off: f64 = py_hypot(run.pos.x, run.pos.y)
+            square: f64 = fmax(fabs(run.att.x), fabs(run.att.y))
+            run.problems <- ((OFF_CENTRE if off > level.tol else 0) |
+                (TOO_FAST if run.vel.z > level.vmax else 0) |
+                (NOSE_OFF if square > level.angle else 0) |
+                (ROLL_OFF if level.station != 0.0 and fabs(roll_error(run)) > level.angle else 0))
+            run.result <- CLEAR if run.problems == 0 else CONTACT
+
+    def step(run: mutable Run&, dt: f64, mask: i64):
+        can Abort.Panic:
+            return if run.result != LIVE
+            run.t <- run.t + dt
+            if mask != 0 and run.fuel > 0.0:
+                thrust(run, mask, dt)
+            run.pos <- scaled_add(run.pos, run.vel, dt)
+            run.att <- scaled_add(run.att, run.spin, dt)
+            if run.pos.z >= 0.0:
+                contact(run)
+            elif run.pos.z < -run.approach.level.far - 15.0 or run.t > 240.0:
+                run.result <- LOST

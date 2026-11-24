@@ -1,0 +1,243 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/scene_toneofvoice.elisa"
+include "../src/tasks/toneofvoice_host.elisa"
+
+extern getchar() -> i32 can[Blocking.IO]
+extern dprintf(fd: i32, format: cstr, ...) -> i32 can[Console.Write]
+extern exit(code: i32) can[Console.Write]
+
+# Built -O2, `assert` is dropped together with everything inside it; this
+# check stays, and a failure ends the sweep with a nonzero exit.
+def require(ok: bool, what: cstr):
+    can Console.Write:
+        if not ok:
+            _ = dprintf(2.i32(), "FAILED: %s\n", what)
+            exit(3.i32())
+
+def text_bytes(text: sview):
+    can Console.Write, Abort.Panic:
+        for i in 0..<sview_len(text).i64() |text|:
+            _ = dprintf(1.i32(), "%02x", sview_at(text, i.usize()).i32())
+        _ = dprintf(1.i32(), "\n")
+
+def flag(value: bool) -> i64:
+    return 1 if value else 0
+
+def emit(quiz: ReadingQuiz::Round&, draw: mutable MT19937&):
+    can Abort.Panic, Console.Write:
+        _ = dprintf(1.i32(), "deal %lld %.17g\n", quiz.need, py_random(draw))
+        for item in quiz.items:
+            text_bytes(bytes_view(item.prompt))
+            text_bytes(sview(item.title, 0, -1))
+            _ = dprintf(1.i32(), "item %.17g\n", item.seconds)
+            for step in item.steps:
+                text_bytes(bytes_view(step.ask))
+                _ = dprintf(1.i32(), "step %lld %lld %lld\n", step.options.count.i64(), step.answer, flag(step.wide))
+                for option in step.options:
+                    text_bytes(bytes_view(option))
+
+def emit_run(quiz: ReadingQuiz::Round, policy: i64):
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        return if quiz.need == 0
+        run: mutable ReadingQuiz::Run = ReadingQuiz::begin(quiz)
+        while run.result == ReadingQuiz::LIVE |run, policy|:
+            answer: i64 = ReadingQuiz::pilot(&run)
+            accepted: mutable bool = false
+            if answer >= 0 and policy != 2:
+                st: ReadingQuiz::Step = ReadingQuiz::active_step(&run)
+                # Policy 3 misses only an item's first step.
+                right: bool = policy == 0 or (policy == 3 and run.progress > 0)
+                port: i64 = answer if right else (answer + 1) % st.options.count.i64()
+                box: ReadingQuiz::Box = ReadingQuiz::option_box(port, st.options.count.i64(), st.wide)
+                y: f64 = box.y + box.height / 2.0
+                if y >= 0.0:
+                    accepted <- ReadingQuiz::click(&run, box.x + box.width / 2.0, y)
+                else:
+                    accepted <- ReadingQuiz::choose(&run, port)
+            ReadingQuiz::advance_quiz(&run, 1.0 / 30.0)
+            _ = dprintf(1.i32(), "tick %lld %lld %lld %lld %lld %lld %.17g %.17g %lld\n",
+                flag(accepted), run.index, run.progress, run.right, run.wrong, flag(run.showing), run.time, run.since, run.result)
+        for cue in run.cues:
+            _ = dprintf(1.i32(), "cue %.17g %.17g %.17g %lld %.17g\n", cue.time, cue.duration, cue.frequency, cue.voice, cue.gain)
+
+# The reference player's run, keeping when each item began (Run.starts),
+# then stereo windows around the first voices and the end.
+def emit_audio(round: ToneOfVoice::Round&):
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        run: mutable ReadingQuiz::Run = ReadingQuiz::begin(round.quiz)
+        starts: mutable darray[f64] = [0.0]
+        while run.result == ReadingQuiz::LIVE |run, starts|:
+            answer: i64 = ReadingQuiz::pilot(&run)
+            if answer >= 0:
+                _ = ReadingQuiz::choose(&run, answer)
+            before: i64 = run.index
+            ReadingQuiz::advance_quiz(&run, 1.0 / 30.0)
+            if run.index != before and run.index < run.round.items.count.i64():
+                starts.push(run.since)
+        voices: mutable darray[darray[f64]] = []
+        for hum_index in round.hums |voices, round|:
+            voices.push(ToneOfVoice::samples(hum_index, round.level.cut))
+        _ = dprintf(1.i32(), "starts %lld\n", starts.count.i64())
+        bytes: mutable u8[17640] = zeroed
+        for w in 0..<4 |run, starts, voices, round, bytes|:
+            begin: f64 = (starts[w.usize()] + ToneOfVoice::LEAD - 0.05) if w < 3 else run.time - 0.3
+            written: i64 = ToneOfVoiceAudio::render(&run, round.level, &voices, &starts, begin, begin + 0.2, &bytes[0], 17640)
+            _ = dprintf(1.i32(), "window %.17g %lld\n", begin, written)
+            for j in 0..<written |bytes|:
+                _ = dprintf(1.i32(), "%02x", bytes[j.usize()].i32())
+            _ = dprintf(1.i32(), "\n")
+
+# The page as the reference draws it: as dealt, with a wrong answer
+# shown, timed out, and while the first voice plays (the rings).
+def emit_pages(round: ToneOfVoice::Round&):
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        voices: mutable darray[darray[f64]] = []
+        for hum_index in round.hums |voices, round|:
+            voices.push(ToneOfVoice::samples(hum_index, round.level.cut))
+        for policy in 0..<4 |round, voices|:
+            run: mutable ReadingQuiz::Run = ReadingQuiz::begin(round.quiz)
+            step: ReadingQuiz::Step = ReadingQuiz::active_step(&run)
+            if policy == 1:
+                _ = ReadingQuiz::choose(&run, (step.answer + 1) % step.options.count.i64())
+            elif policy == 2:
+                ReadingQuiz::advance_quiz(&run, round.quiz.items[0].seconds)
+            elif policy == 3:
+                ReadingQuiz::advance_quiz(&run, ToneOfVoice::LEAD + 0.25)
+            page: mutable Display::DisplayList = Display::DisplayList()
+            SceneToneOfVoice::page(&page, &run, &voices)
+            for command in page.commands |page|:
+                if command.kind == Display::CMD_TEXT:
+                    _ = dprintf(1.i32(), "label %u %.9g %.9g %.9g %d ", command.color, command.a.f64(), command.b.f64(),
+                        command.c.f64(), command.d.i32())
+                    offset: i64 = command.ref.i64()
+                    length: i64 = (command.len & 0xffffff.u32()).i64()
+                    text_bytes(bytes_view_range(page.pool, offset.usize(), length.usize()))
+                else:
+                    _ = dprintf(1.i32(), "shape %d %u %.9g %.9g %.9g %.9g\n", command.kind.i32(), command.color,
+                        command.a.f64(), command.b.f64(), command.c.f64(), command.d.f64())
+            _ = dprintf(1.i32(), "end\n")
+
+def check_session(corpus: ToneOfVoice::Corpus&):
+    can Abort.Panic, Memory.Release, Memory.Allocate:
+        session: mutable ToneOfVoiceGame::Session = ToneOfVoiceGame::initialize(11, 2, true, -17)
+        require((ToneOfVoiceGame::start(&session, corpus, 0.0) can Global{Read,Write}), "toneofvoice_sweep line 116")
+        first: ReadingQuiz::Step = ReadingQuiz::active_step(&session.run)
+        box: ReadingQuiz::Box = ReadingQuiz::option_box(first.answer, first.options.count.i64(), first.wide)
+        require(ToneOfVoiceGame::pointer(&session, HandView::VIEW_LEFT + (box.x + box.width / 2.0) * HandView::VIEW_SCALE,
+            HandView::VIEW_BOTTOM + (box.y + box.height / 2.0) * HandView::VIEW_SCALE, 1), "toneofvoice_sweep line 119")
+        require(session.run.right == 1 and session.run.showing, "toneofvoice_sweep line 121")
+        require(session.voices.count == session.run.round.items.count and session.starts.count == 1.usize(), "toneofvoice_sweep line 122")
+        require(session.voices[0].count.i64() == ToneOfVoice::kept(corpus.shapes[session.hums[0].usize()], ToneOfVoice::grade(11).cut), "toneofvoice_sweep line 123")
+        clock: mutable f64 = 0.0
+        while session.phase == ToneOfVoiceGame::PLAYING |session, corpus, clock|:
+            port: i64 = ReadingQuiz::pilot(&session.run)
+            if port >= 0:
+                require(ToneOfVoiceGame::choose(&session, port), "toneofvoice_sweep line 128")
+                require(not ToneOfVoiceGame::choose(&session, port), "toneofvoice_sweep line 129")
+            clock <- clock + 0.05
+            require((ToneOfVoiceGame::advance(&session, corpus, clock) can Global{Read,Write}), "toneofvoice_sweep line 131")
+        require(session.phase == ToneOfVoiceGame::JUDGED and session.rung == 12, "toneofvoice_sweep line 132")
+        require(session.best_rung == 11 and session.wins == 1 and session.trial == 1, "toneofvoice_sweep line 133")
+        require(not (ToneOfVoiceGame::advance(&session, corpus, session.deadline - 0.001) can Global{Read,Write}), "toneofvoice_sweep line 134")
+        clock <- session.deadline
+        require((ToneOfVoiceGame::advance(&session, corpus, clock) can Global{Read,Write}), "toneofvoice_sweep line 136")
+        while session.phase == ToneOfVoiceGame::PLAYING |session, corpus, clock|:
+            step: ReadingQuiz::Step = ReadingQuiz::active_step(&session.run)
+            if step.answer >= 0 and step.options.count > 0.usize():
+                bad: i64 = (step.answer + 1) % step.options.count.i64()
+                require(ToneOfVoiceGame::choose(&session, bad), "toneofvoice_sweep line 141")
+            clock <- clock + 0.05
+            require((ToneOfVoiceGame::advance(&session, corpus, clock) can Global{Read,Write}), "toneofvoice_sweep line 143")
+        require(session.phase == ToneOfVoiceGame::JUDGED and session.rung == 11 and session.trial == 2, "toneofvoice_sweep line 144")
+        require((ToneOfVoiceGame::advance(&session, corpus, session.deadline) can Global{Read,Write}), "toneofvoice_sweep line 145")
+        require(session.phase == ToneOfVoiceGame::DONE and session.wins == 1, "toneofvoice_sweep line 146")
+        require((ToneOfVoiceGame::start(&session, corpus, session.time) can Global{Read,Write}), "toneofvoice_sweep line 147")
+        require(session.phase == ToneOfVoiceGame::PLAYING and session.rung == 11 and session.trial == 1 and session.wins == 0, "toneofvoice_sweep line 148")
+        ToneOfVoiceGame::close(&session) can Global{Read,Write}
+        require(session.phase == ToneOfVoiceGame::READY, "toneofvoice_sweep line 150")
+
+# The host the shells use: hum shapes kept in its own arena, a round
+# started at rung 1, its page, and a fixed player's run to the end. Built
+# -O2, an assert is dropped with everything in it, so nothing here is
+# called inside one.
+def check_host():
+    can Abort.Panic, Memory.Release, Memory.Allocate, Console.Write:
+        host: mutable ToneOfVoiceHost::Run = ToneOfVoiceHost::initialize(1, 1, false, 17)
+        began: bool = ToneOfVoiceHost::start(&host, 0.0) can Global{Read,Write}
+        item: ReadingQuiz::Item = ReadingQuiz::question(&host.session.run)
+        page: mutable Display::DisplayList = Display::DisplayList()
+        SceneToneOfVoice::render(&page, &host.session, false)
+        texts: mutable i64 = 0
+        for command in page.commands |texts|:
+            texts <- texts + 1 if command.kind == Display::CMD_TEXT
+        _ = dprintf(2.i32(), "host: started %lld shapes %lld items %lld steps %lld question steps %lld voices %lld texts %lld\n",
+            flag(began), host.corpus.shapes.count.i64(), host.session.run.round.items.count.i64(),
+            host.session.run.round.items[0].steps.count.i64(), item.steps.count.i64(), host.session.voices.count.i64(), texts)
+        require(began and host.corpus.shapes.count.i64() == ToneOfVoice::HUMS and host.session.run.round.items.count == 20.usize(), "host round")
+        require(item.steps.count == 1.usize() and host.session.voices.count == 20.usize() and texts > 10, "host page")
+        moves: mutable i64 = 0
+        for k in 0..<400 |host, moves|:
+            moves <- moves + 1 if (ToneOfVoiceHost::tone_input(&host, 0.1 * (k + 1).f64(), 0) can Global{Read,Write})
+            _ = ToneOfVoiceHost::tone_input(&host, 0.1 * (k + 1).f64(), -1) can Global{Read,Write}
+        _ = dprintf(2.i32(), "host: answers %lld phase %lld right %lld wrong %lld\n", moves, host.session.phase, host.session.run.right,
+            host.session.run.wrong)
+        # Pressing 1 throughout never passes (fixed_pass screens it out).
+        require(host.session.phase == ToneOfVoiceGame::DONE and host.session.run.result == ReadingQuiz::FAILED and moves > 0, "host fixed player")
+        ToneOfVoiceHost::close(&host) can Global{Read,Write}
+
+def test_level(corpus: ToneOfVoice::Corpus&, rung: i64):
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        g: ToneOfVoice::Grade = ToneOfVoice::grade(rung)
+        _ = dprintf(1.i32(), "level %lld %lld %lld %.17g %.17g %.17g %.17g %lld\n", g.rung, g.choices, flag(g.plain), g.agree,
+            g.hiss, g.cut, g.answer, g.items)
+        for seed in 0..<16 |g, corpus|:
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, seed.u64())
+            built: ToneOfVoice::Round = ToneOfVoice::build(g, &draw, corpus)
+            # _build returns None when pressing one number throughout passes.
+            screened: bool = ToneOfVoice::fixed_pass(&built.quiz.items, built.quiz.need)
+            # deal screens with round.fixed, worked out while building.
+            require(built.fixed == screened, "round.fixed disagrees with fixed_pass")
+            candidate: ToneOfVoice::Round = zeroed if screened else built
+            emit(&candidate.quiz, &draw)
+        rng: mutable MT19937 = zeroed
+        mt_seed_int(&rng, 17.u64())
+        dealt: ToneOfVoice::Round = ToneOfVoice::deal(g, &rng, corpus)
+        emit(&dealt.quiz, &rng)
+        # No round at this rung from these questions (Python raises).
+        return if dealt.quiz.items.count == 0.usize()
+        emit_pages(&dealt)
+        emit_run(dealt.quiz, 0)
+        if rung == 10:
+            emit_run(dealt.quiz, 1)
+            emit_run(dealt.quiz, 2)
+        emit_run(dealt.quiz, 3)
+        emit_audio(&dealt) if rung == 1 or rung == 10 or rung == 13 or rung == 16
+
+def main() -> i32:
+    can Abort.Panic, Blocking.IO, Console.Write, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+        for rung in [1, 4, 7, 10, 13, 16, 20, 25, 30]:
+            note: mutable dstr = []
+            SceneToneOfVoice::option_note(rung, &note)
+            text_bytes(bytes_view(note))
+        corpus: ToneOfVoice::Corpus = ToneOfVoice::hum_corpus()
+        for shape in corpus.shapes |corpus|:
+            _ = dprintf(1.i32(), "shape %lld %lld\n", shape.frames, shape.start)
+        for pick in 0..<18:
+            hum_index: i64 = [0, 41, 95, 133, 170, 239][(pick / 3).usize()]
+            cut: f64 = 0.0 if pick % 3 == 0 else (1.2 if pick % 3 == 1 else 0.9)
+            if true:
+                kept: darray[f64] = ToneOfVoice::samples(hum_index, cut)
+                _ = dprintf(1.i32(), "samples %lld\n", kept.count.i64())
+                for i in 0..<kept.count.i64() |kept|:
+                    if i % 97 == 0:
+                        _ = dprintf(1.i32(), "s %.17g\n", kept[i.usize()])
+        for rung in [0, 1, 2, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 20, 30, 99] |corpus|:
+            region trial(4194304):
+                in trial:
+                    test_level(&corpus, rung)
+        check_session(&corpus) can Global{Read,Write}
+        check_host() can Global{Read,Write}
+        return 0.i32()

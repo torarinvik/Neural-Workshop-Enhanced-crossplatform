@@ -1,0 +1,120 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_json.elisa"
+include "./readingpeople.elisa"
+
+extend ReadingPeople:
+    def copy_text(text: sview) -> dstr:
+        can Abort.Panic, Memory.Allocate:
+            result: mutable dstr = []
+            dstr_append_sview(&result, text)
+            return result
+
+    struct Decoded:
+        story: Story
+        valid: bool
+
+    struct Texts:
+        items: darray[dstr]
+        valid: bool
+
+    def texts_of[@r](root: JsonValueHandle[r], node: JsonValueHandle[r]) -> Texts:
+        can Memory.Allocate, Abort.Panic:
+            items: mutable darray[dstr] = []
+            return zeroed if not json_handle_is_array(node)
+            for i in 0..<json_handle_array_len(node) |root, node, items|:
+                entry: JsonValueHandle[r] = try json_handle_at(node, i) else json_handle_null(root)
+                return zeroed if not json_handle_is_string(entry)
+                text: sview @r = try json_handle_as_string(entry) else ""
+                items.push(copy_text(text))
+            return Texts{items: items, valid: true}
+
+    def index_of(items: darray[dstr]&, text: dstr&) -> i64:
+        can Abort.Panic:
+            for i in 0..<items.count.i64() |items, text|:
+                same: mutable bool = items[i.usize()].count == text.count
+                if same:
+                    for k in 0..<text.count.i64() |same, items, text, i|:
+                        same <- same and items[i.usize()][k.usize()] == text[k.usize()]
+                return i if same
+            return -1
+
+    # One line of emobench.jsonl as emotiondata writes it: kind, scenario,
+    # subject, choices and answer, and for "understand" the causes and the
+    # cause. Lines the reference could not read are skipped. A story whose
+    # answer is not among its choices, or that offers more than the eight
+    # answer ports, stays in the deck (its place shapes the shuffle) but
+    # is never asked; the reference stops on the first, and the fetcher
+    # never writes the second.
+    def decode_story[@r](arena: mutable Arena& @r, line: sview) -> Decoded:
+        can Memory.Allocate, Abort.Panic:
+            parsed: JsonParseResult[r] = json_parse_checked(arena, line) can Global{Read,Write}
+            return zeroed if parsed.code != JsonErrorCode.OK
+            root: JsonValueHandle[r] = json_handle_from_result(parsed)
+            kind_node: JsonValueHandle[r] = try json_handle_get(root, "kind") else json_handle_null(root)
+            scenario_node: JsonValueHandle[r] = try json_handle_get(root, "scenario") else json_handle_null(root)
+            subject_node: JsonValueHandle[r] = try json_handle_get(root, "subject") else json_handle_null(root)
+            answer_node: JsonValueHandle[r] = try json_handle_get(root, "answer") else json_handle_null(root)
+            cause_node: JsonValueHandle[r] = try json_handle_get(root, "cause") else json_handle_null(root)
+            return zeroed if not json_handle_is_string(kind_node) or not json_handle_is_string(scenario_node)
+            return zeroed if not json_handle_is_string(subject_node) or not json_handle_is_string(answer_node)
+            choices: Texts = texts_of(root, try json_handle_get(root, "choices") else json_handle_null(root))
+            return zeroed if not choices.valid
+            # causes and cause are optional: () and "".
+            causes_node: JsonValueHandle[r] = try json_handle_get(root, "causes") else json_handle_null(root)
+            causes: Texts = texts_of(root, causes_node) if json_handle_is_array(causes_node) else Texts{items: [], valid: true}
+            return zeroed if not causes.valid or (not json_handle_is_null(cause_node) and not json_handle_is_string(cause_node))
+            kind_text: sview @r = try json_handle_as_string(kind_node) else ""
+            kind: i64 = UNDERSTAND if sview_eq(kind_text, "understand") else (APPLY if sview_eq(kind_text, "act") else OTHER)
+            answer: dstr = copy_text(try json_handle_as_string(answer_node) else "")
+            cause: dstr = copy_text(try json_handle_as_string(cause_node) else "")
+            scenario: sview @r = try json_handle_as_string(scenario_node) else ""
+            subject: sview @r = try json_handle_as_string(subject_node) else ""
+            story: mutable Story = Story{kind: kind, scenario: copy_text(scenario), subject: copy_text(subject),
+                choices: choices.items, answer: index_of(&choices.items, &answer), causes: causes.items,
+                cause: index_of(&causes.items, &cause)}
+            return Decoded{story: story, valid: true}
+
+    def words_of(words: cstr) -> dstr:
+        can Abort.Panic, Memory.Allocate:
+            result: mutable dstr = []
+            dstr_append_cstr(&result, words)
+            return result
+
+    # emotiondata.SEED_STORIES.
+    def seed_stories() -> Corpus:
+        can Abort.Panic, Memory.Allocate:
+            corpus: mutable Corpus = zeroed
+            corpus.stories.push(Story{kind: UNDERSTAND,
+                scenario: words_of("Ana trained for months for the city race. On the day, she finished last, but her little brother ran to hug her at the line, holding a sign with her name."),
+                subject: words_of("Ana"),
+                choices: [words_of("Shame"), words_of("Touched"), words_of("Anger"), words_of("Boredom")], answer: 1,
+                causes: [words_of("She finished last"), words_of("Her brother came to cheer for her"),
+                    words_of("The race was too long"), words_of("She had trained for months")], cause: 1})
+            corpus.stories.push(Story{kind: APPLY,
+                scenario: words_of("A new colleague of Omar's eats lunch alone every day and seems nervous in meetings."),
+                subject: words_of("Omar"),
+                choices: [words_of("Ignore it, it is not his business"), words_of("Invite the colleague to join his group for lunch"),
+                    words_of("Tell the manager the colleague is unsociable"), words_of("Joke about it in the next meeting")], answer: 1,
+                causes: [], cause: -1})
+            return corpus
+
+    # emotiondata.stories(): emobench.jsonl, one story a line, or the seed
+    # stories when it holds none. Lines end at "\n", "\r\n" or "\r".
+    def from_story_cache(owner: mutable Arena&, text: sview) -> Corpus:
+        can Memory.Allocate, Abort.Panic:
+            corpus: mutable Corpus = zeroed
+            size: i64 = sview_len(text).i64()
+            start: mutable i64 = 0
+            i: mutable i64 = 0
+            in owner:
+                while i <= size |corpus, size, start, i, text, owner|:
+                    code: u8 = 10.u8() if i == size else sview_at(text, i.usize())
+                    if code == 10.u8() or code == 13.u8():
+                        if i > start:
+                            decoded: Decoded = decode_story(owner, string_view_slice(text, start, i)) can Global{Read,Write}
+                            corpus.stories.push(decoded.story) if decoded.valid
+                        if code == 13.u8() and i + 1 < size and sview_at(text, (i + 1).usize()) == 10.u8():
+                            i <- i + 1
+                        start <- i + 1
+                    i <- i + 1
+                return corpus if corpus.stories.count > 0.usize()
+                return seed_stories()

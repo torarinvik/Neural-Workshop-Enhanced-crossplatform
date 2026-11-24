@@ -1,0 +1,213 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+
+module Ferry:
+    const AHEAD: i64 = 0
+    const ASTERN: i64 = 1
+    const LEFT: i64 = 2
+    const RIGHT: i64 = 3
+    const AHEAD_LEFT: i64 = 4
+    const AHEAD_RIGHT: i64 = 5
+    const PORTS: i64 = 6
+    const NEUTRAL: i64 = -1
+
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const AGROUND: i64 = 2
+    const SWEPT: i64 = 3
+    const COLLISION: i64 = 4
+    const TIMEOUT: i64 = 5
+    const WIDTH: f64 = 64.0
+    const HEIGHT: f64 = 40.0
+    const SOUTH: f64 = 3.0
+    const NORTH: f64 = 37.0
+    const THRUST: f64 = 2.2
+    const DRAG: f64 = 0.45
+    const TURN: f64 = 55.0
+    const TOP: f64 = 4.5
+    const HULL: f64 = 2.0
+    const BARGE_LENGTH: f64 = 5.0
+    const BARGE_BEAM: f64 = 1.4
+    const BARGE_SPAN: f64 = WIDTH + 2.0 * BARGE_LENGTH + 8.0
+    const FOG: f64 = 16.0
+    const PI: f64 = 3.141592653589793
+    const WAKE_LENGTH: i64 = 40
+
+    struct Grade:
+        rung: i64
+        current: f64
+        crossings: i64
+        lanes: i64
+        barge_speed: f64
+        gusts: f64
+        fog: bool
+        seconds: f64
+
+    struct Point:
+        x: f64
+        y: f64
+
+    struct Barge:
+        lane_y: f64
+        speed: f64
+        start: f64
+        gap: f64
+
+    struct River:
+        level: Grade
+        piers: mutable Point[6]
+        barges: mutable Barge[3]
+        gust_seed: i64
+
+    struct Wake:
+        at: Point
+        time: f64
+
+    struct Run:
+        river: River
+        t: mutable f64
+        x: mutable f64
+        y: mutable f64
+        heading: mutable f64
+        speed: mutable f64
+        leg: mutable i64
+        docked_since: mutable f64
+        result: mutable i64
+        wake: mutable Wake[40]
+        wake_count: mutable i64
+        wake_next: mutable i64
+        thrusting: mutable i64
+
+    def grade(requested: i64) -> Grade:
+        rung: i64 = requested if requested > 1 else 1
+        top: i64 = rung - 20 if rung > 20 else 0
+        crossings: i64 = 2 if rung < 10 else 3 if rung < 20 else (3 + top / 4 if top < 8 else 5)
+        return Grade{rung: rung,
+            current: 1.0 if rung < 4 else 1.4 if rung < 7 else 2.0 if rung < 20 else fmin(3.0, 2.2 + 0.08 * top.f64()),
+            crossings: crossings, lanes: 0 if rung < 4 else 1 if rung < 7 else 2 if rung < 10 else 3,
+            barge_speed: 3.0 if rung < 20 else fmin(5.0, 3.4 + 0.15 * top.f64()),
+            gusts: 0.0 if rung < 13 else 0.5 + 0.03 * top.f64(), fog: rung >= 16,
+            seconds: 40.0 + 45.0 * crossings.f64()}
+
+    def build(level: Grade, rng: mutable MT19937&) -> River:
+        can Abort.Panic:
+            piers: mutable Point[6] = zeroed
+            barges: mutable Barge[3] = zeroed
+            for k in 0..<(level.crossings + 1) |rng, piers|:
+                y: f64 = SOUTH + 2.2 if k % 2 == 0 else NORTH - 2.2
+                piers[k.usize()] <- Point{x: py_uniform(rng, 12.0, WIDTH - 16.0), y: y}
+            for k in 0..<level.lanes |level, rng, barges|:
+                y: f64 = 20.0 if level.lanes == 1 else 14.0 + k.f64() * 12.0 if level.lanes == 2 else 9.5 + k.f64() * 10.5
+                sign: f64 = 1.0 if k % 2 == 0 else -0.7
+                speed: f64 = sign * level.barge_speed * py_uniform(rng, 0.85, 1.15)
+                x: f64 = py_uniform(rng, 0.0, WIDTH)
+                gap: f64 = py_uniform(rng, 44.0, 62.0)
+                barges[k.usize()] <- Barge{lane_y: y, speed: speed, start: x, gap: gap}
+            return River{level: level, piers: piers, barges: barges,
+                gust_seed: py_randbelow(rng, 1048576.u64()).i64()}
+
+    def start(river: River) -> Run:
+        return Run{river: river, t: 0.0, x: river.piers[0].x, y: river.piers[0].y, heading: 90.0,
+            speed: 0.0, leg: 1, docked_since: -1.0, result: LIVE, wake: zeroed, wake_count: 0, wake_next: 0,
+            thrusting: 0}
+
+    def wrap(value: f64, span: f64) -> f64:
+        # Match Python's positive modulo, including negative barge motion.
+        rem: f64 = fmod(value, span)
+        return rem + span if rem < 0.0 else rem
+
+    def current_at(level: Grade&, y: f64) -> f64:
+        return 0.0 if y <= SOUTH or y >= NORTH
+        return level.current * sin(PI * (y - SOUTH) / (NORTH - SOUTH))
+
+    def gust(run: Run&, time: f64) -> f64:
+        return 0.0 if run.river.level.gusts == 0.0
+        k: f64 = (run.river.gust_seed % 11).f64()
+        return run.river.level.gusts * sin(time * 0.45 + k) * sin(time * 0.17 + 2.0 * k)
+
+    def barge_x(barge: Barge, index: i64, time: f64) -> f64:
+        return wrap(barge.start + index.f64() * barge.gap + barge.speed * time, BARGE_SPAN) - BARGE_LENGTH - 4.0
+
+    def radians(degrees: f64) -> f64:
+        return degrees * 0.017453292519943295
+
+    def velocity(run: Run&) -> Point:
+        h: f64 = radians(run.heading)
+        return Point{x: run.speed * cos(h) + current_at(&run.river.level, run.y) + gust(run, run.t),
+            y: run.speed * sin(h)}
+
+    def target(run: Run&) -> Point:
+        can Abort.Panic:
+            return run.river.piers[run.leg.usize()]
+
+    def meets_barge(run: Run&) -> bool:
+        can Abort.Panic:
+            for i in 0..<run.river.level.lanes |run|:
+                barge: Barge = run.river.barges[i.usize()]
+                dy: f64 = fmax(0.0, fabs(run.y - barge.lane_y) - BARGE_BEAM)
+                if dy < HULL * 0.8:
+                    # Generated gaps are 44–62 m in an 82 m loop, so each
+                    # lane contains two barges.
+                    for k in 0..<2 |run, barge, dy|:
+                        dx: f64 = fmax(0.0, fabs(run.x - barge_x(barge, k, run.t)) - BARGE_LENGTH)
+                        return true if py_hypot(dx, dy) < HULL * 0.8
+            return false
+
+    def at_pier(run: Run&) -> bool:
+        can Abort.Panic:
+            pier: Point = target(run)
+            v: Point = velocity(run)
+            return fabs(run.x - pier.x) < 2.2 and fabs(run.y - pier.y) < 1.6 and py_hypot(v.x, v.y) < 0.9
+
+    def dock(run: mutable Run&):
+        can Abort.Panic:
+            if not at_pier(run):
+                run.docked_since <- -1.0
+            elif run.docked_since < 0.0:
+                run.docked_since <- run.t
+            elif run.t - run.docked_since >= 2.0:
+                run.docked_since <- -1.0
+                if run.leg == run.river.level.crossings:
+                    run.result <- CLEAR
+                else:
+                    run.leg <- run.leg + 1
+
+    def wake_sample(run: mutable Run&):
+        can Abort.Panic:
+            if run.wake_count > 0:
+                last: Wake = run.wake[((run.wake_next + WAKE_LENGTH - 1) % WAKE_LENGTH).usize()]
+                return if py_hypot(run.x - last.at.x, run.y - last.at.y) <= 0.8
+            run.wake[run.wake_next.usize()] <- Wake{at: Point{x: run.x, y: run.y}, time: run.t}
+            run.wake_next <- (run.wake_next + 1) % WAKE_LENGTH
+            run.wake_count <- run.wake_count + 1 if run.wake_count < WAKE_LENGTH
+
+    def step(run: mutable Run&, dt: f64, port: i64):
+        can Abort.Panic:
+            return if run.result != LIVE
+            run.t <- run.t + dt
+            ahead: bool = port == AHEAD or port == AHEAD_LEFT or port == AHEAD_RIGHT
+            run.thrusting <- 1 if ahead else -1 if port == ASTERN else 0
+            thrust: f64 = THRUST if ahead else -THRUST * 0.7 if port == ASTERN else 0.0
+            run.speed <- fmax(-2.0, fmin(TOP, run.speed + (thrust - DRAG * run.speed) * dt))
+            if port == LEFT or port == AHEAD_LEFT:
+                run.heading <- run.heading + TURN * dt
+            elif port == RIGHT or port == AHEAD_RIGHT:
+                run.heading <- run.heading - TURN * dt
+            run.heading <- wrap(run.heading, 360.0)
+            v: Point = velocity(run)
+            run.x <- run.x + v.x * dt
+            run.y <- run.y + v.y * dt
+            wake_sample(run)
+            if run.y < SOUTH + 1.2 or run.y > NORTH - 1.2:
+                if fabs(v.y) > 1.6:
+                    run.result <- AGROUND
+                    return
+                run.y <- fmax(SOUTH + 1.2, fmin(NORTH - 1.2, run.y))
+                run.speed <- run.speed * fmax(0.0, 1.0 - 4.0 * dt)
+            if run.x < 1.0 or run.x > WIDTH - 1.0:
+                run.result <- SWEPT
+            elif meets_barge(run):
+                run.result <- COLLISION
+            else:
+                dock(run)
+                run.result <- TIMEOUT if run.result == LIVE and run.t >= run.river.level.seconds

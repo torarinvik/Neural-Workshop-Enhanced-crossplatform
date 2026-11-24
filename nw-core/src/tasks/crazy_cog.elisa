@@ -1,0 +1,393 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "../hand_view.elisa"
+
+module CrazyCog:
+    const MESH: i64 = 0
+    const AXLE: i64 = 1
+    const CHAIN: i64 = 2
+    const TOL: f64 = 3.0
+    const SNAP: f64 = 28.0
+    const DRUM: f64 = 18.0
+    const FREE: f64 = 6.0
+    const SETTLE: f64 = 0.25
+    const FLOOR: f64 = 140.0
+
+    struct Grade:
+        rung: i64
+        links: i64
+        chains: bool
+        layers: i64
+        load: f64
+        walls: i64
+        walls_back: i64
+        fan: i64
+        spare: i64
+        slack: f64
+        place: f64
+
+    struct Cog:
+        x: f64
+        y: f64
+        r: f64
+        z: i64
+
+    struct Wall:
+        x: f64
+        y: f64
+        w: f64
+        h: f64
+        z: i64
+
+    struct Link:
+        first: Cog
+        second: Cog
+
+    struct Machine:
+        level: mutable Grade
+        motor: mutable Cog
+        winch: mutable Cog
+        fan: mutable Cog
+        fan_way: mutable i64
+        fan_low: mutable f64
+        fan_high: mutable f64
+        walls: mutable darray[Wall]
+        tray: mutable darray[i64]
+        chains: mutable i64
+        plan: mutable darray[Cog]
+        plan_chains: mutable darray[Link]
+        lift: mutable f64
+        seconds: mutable f64
+
+    def min_i(a: i64, b: i64) -> i64:
+        return a if a < b else b
+
+    def max_i(a: i64, b: i64) -> i64:
+        return a if a > b else b
+
+    def grade(requested: i64) -> Grade:
+        r: i64 = max_i(1, requested)
+        top: i64 = max_i(0, r - 20)
+        layers: i64 = 1 if r < 10 else (2 if r < 16 else (3 if r < 24 else (4 if r < 32 else 5)))
+        links: i64 = 1 if r < 4 else (3 if r < 13 else (4 if r < 20 else min_i(7, 5 + top / 6)))
+        return Grade{rung: r, links: max_i(links, 2 * layers - 1), chains: r >= 4, layers: layers,
+            load: 0.3 if r < 7 else (1.0 if r < 13 else (1.2 if r < 20 else fmin(3.6, 3.1 + 0.03 * top.f64()))),
+            walls: 0 if r < 10 else (2 if r < 20 else min_i(4, 2 + top / 6)),
+            walls_back: 0 if r < 20 else min_i(2, 1 + top / 10), fan: 0 if r < 16 else (1 if r < 20 else 2),
+            spare: 4 if r < 7 else (3 if r < 16 else (2 if r < 20 else max_i(1, 2 - top / 8))),
+            slack: 3.0 if r < 16 else (1.6 if r < 20 else fmax(1.2, 1.5 - 0.01 * top.f64())),
+            place: 12.0 if r < 4 else (9.0 if r < 16 else (6.0 if r < 20 else fmax(3.5, 5.5 - 0.1 * top.f64())))}
+
+    def cog_equals(a: Cog, b: Cog) -> bool:
+        return a.x == b.x and a.y == b.y and a.r == b.r and a.z == b.z
+
+    def distance(a: Cog, b: Cog) -> f64:
+        can Abort.Panic:
+            return py_hypot(a.x - b.x, a.y - b.y)
+
+    def cog_on_board(c: Cog) -> bool:
+        return c.x >= 30.0 + c.r and c.x <= 970.0 - c.r and c.y >= 130.0 + c.r and c.y <= 590.0 - c.r
+
+    def in_wall(x: f64, y: f64, r: f64, wall: Wall) -> bool:
+        can Abort.Panic:
+            nx: f64 = HandView::clamp(x, wall.x, wall.x + wall.w)
+            ny: f64 = HandView::clamp(y, wall.y, wall.y + wall.h)
+            return py_hypot(x - nx, y - ny) < r + 2.0
+
+    def meshed(a: Cog, b: Cog) -> bool:
+        can Abort.Panic:
+            return a.z == b.z and HandView::absolute(distance(a, b) - (a.r + b.r)) <= TOL
+
+    def shared_axle(a: Cog, b: Cog) -> bool:
+        return a.z != b.z and HandView::absolute(a.x - b.x) < 1.0 and HandView::absolute(a.y - b.y) < 1.0
+
+    def chain_hits_wall(a: Cog, b: Cog, wall: Wall) -> bool:
+        can Abort.Panic:
+            return false if a.z != wall.z
+            for k in 1..<20 |a, b, wall|:
+                x: f64 = a.x + (b.x - a.x) * k.f64() / 20.0
+                y: f64 = a.y + (b.y - a.y) * k.f64() / 20.0
+                return true if in_wall(x, y, 4.0, wall)
+            return false
+
+    def chain_ok(a: Cog, b: Cog, walls: darray[Wall]&) -> bool:
+        can Abort.Panic:
+            return false if a.z != b.z or cog_equals(a, b) or distance(a, b) < a.r + b.r + 12.0
+            for wall in walls:
+                return false if chain_hits_wall(a, b, wall)
+            return true
+
+    def lift_speed(ratio: f64, load: f64) -> f64:
+        return fmax(0.0, FREE / ratio * (1.0 - load / ratio))
+
+    def radius(draw: mutable MT19937&) -> i64:
+        can Abort.Panic:
+            sizes: i64[5] = [22, 30, 40, 52, 66]
+            return sizes[py_choice_index(draw, 5).usize()]
+
+    def draw_links(level: Grade, draw: mutable MT19937&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            n: i64 = level.links
+            return [MESH] if n == 1
+            kinds: mutable darray[i64] = []
+            spots: mutable darray[i64] = []
+            axles: i64 = level.layers - 1
+            for _ in 0..<200 |n, kinds, spots, draw, level, axles|:
+                kinds.clear()
+                spots.clear()
+                for _ in 0..<n |kinds, draw, level|:
+                    pick: i64 = py_choice_index(draw, 3 if level.chains else 2)
+                    kinds.push(CHAIN if pick == 2 else MESH)
+                for k in 1..<(n - 1) |spots|:
+                    spots.push(k)
+                py_shuffle_i64(draw, &spots)
+                for k in 0..<axles |spots, kinds|:
+                    kinds[spots[k.usize()].usize()] <- AXLE
+                continue if kinds[(n - 1).usize()] == MESH and kinds[(n - 2).usize()] == AXLE
+                meshes: mutable i64 = 0
+                adjacent: mutable bool = false
+                for k in 0..<n |kinds, meshes, adjacent|:
+                    kind: i64 = kinds[k.usize()]
+                    meshes <- meshes + 1 if kind == MESH
+                    adjacent <- true if k > 0 and kind == AXLE and kinds[(k - 1).usize()] == AXLE
+                return kinds if not adjacent and meshes % 2 == 1
+            return []
+
+    def draw_train_radii(level: Grade, kinds: darray[i64]&, draw: mutable MT19937&) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            radii: mutable darray[i64] = []
+            for _ in 0..<300 |level, kinds, draw, radii|:
+                radii.clear()
+                for _ in 0..<(level.links + 1) |radii, draw|:
+                    radii.push(radius(draw))
+                ratio: f64 = gearing(&radii, kinds, level.links)
+                if level.load <= 0.5 or (level.load * 1.15 < ratio and ratio < level.load * 3.2):
+                    return radii if lift_speed(ratio, level.load) > 0.0 else []
+            return []
+
+    def gearing(radii: darray[i64]&, kinds: darray[i64]&, count: i64, reverse: bool = false) -> f64:
+        can Abort.Panic:
+            ratio: mutable f64 = 1.0
+            for k in 0..<count |radii, kinds, ratio, reverse|:
+                if kinds[k.usize()] != AXLE:
+                    a: f64 = radii[k.usize()].f64()
+                    b: f64 = radii[(k + 1).usize()].f64()
+                    ratio <- ratio * (a / b if reverse else b / a)
+            return ratio
+
+    def place_cog(prev: Cog, kind: i64, r: f64, angle: f64, draw: mutable MT19937&) -> Cog:
+        can Abort.Panic:
+            return Cog{x: prev.x, y: prev.y, r: r, z: prev.z + 1} if kind == AXLE
+            gap: f64 = py_uniform(draw, 60.0, 170.0) if kind == CHAIN else 0.0
+            distance: f64 = prev.r + r + gap
+            return Cog{x: prev.x + distance * cos(angle), y: prev.y + distance * sin(angle), r: r, z: prev.z}
+
+    def clear_cog(c: Cog, prev: Cog, placed: darray[Cog]&, pegs: darray[Cog]&) -> bool:
+        can Abort.Panic:
+            return false if not cog_on_board(c)
+            for p in pegs:
+                d: f64 = distance(c, p)
+                return false if 1.0 < d and d < c.r + 8.0
+            for other in placed:
+                if not cog_equals(other, prev) and c.z == other.z and distance(c, other) < c.r + other.r + SNAP + 6.0:
+                    return false
+            return true
+
+    def draw_train(kinds: darray[i64]&, radii: darray[i64]&, draw: mutable MT19937&) -> darray[Cog]:
+        can Memory.Allocate, Abort.Panic:
+            motor: Cog = Cog{x: py_uniform(draw, 90.0, 170.0), y: py_uniform(draw, 200.0, 480.0), r: radii[0].f64(), z: 0}
+            plan: mutable darray[Cog] = [motor]
+            motor_peg: darray[Cog] = [motor]
+            empty: darray[Cog] = []
+            head: f64 = py_uniform(draw, -0.3, 0.4)
+            n: i64 = kinds.count.i64()
+            for k in 0..<n |kinds, radii, draw, plan, motor_peg, empty, n, motor, head|:
+                kind: i64 = kinds[k.usize()]
+                prev: Cog = plan[k.usize()]
+                found: mutable bool = false
+                for _ in 0..<30 |draw, radii, plan, motor_peg, empty, n, motor, head, kind, prev, found, k|:
+                    angle: f64 = head + py_uniform(draw, -0.9, 0.9)
+                    c: Cog = place_cog(prev, kind, radii[(k + 1).usize()].f64(), angle, draw)
+                    if kind == AXLE:
+                        return [] if not clear_cog(c, prev, &plan, &empty)
+                    else:
+                        continue if not clear_cog(c, prev, &plan, &motor_peg)
+                        continue if k + 1 == n and (c.y < 360.0 or c.x > 880.0 or (n != 1 and c.x - motor.x < 200.0))
+                    plan.push(c)
+                    found <- true
+                    break
+                return [] if not found
+            return plan
+
+    struct Fan:
+        parts: darray[Cog]
+        chain: Link
+        way: i64
+        low: f64
+        high: f64
+
+    def draw_fan(level: Grade, train: darray[Cog]&, pegs: darray[Cog]&, kinds: darray[i64]&,
+            radii: darray[i64]&, ratio: f64, draw: mutable MT19937&) -> Fan:
+        can Memory.Allocate, Abort.Panic:
+            n: i64 = level.links
+            idx: i64 = py_randrange(draw, 1, n)
+            base: Cog = train[idx.usize()]
+            motor: Cog = train[0]
+            winch: Cog = train[n.usize()]
+            way: mutable i64 = -1
+            for k in 0..<idx |way, kinds|:
+                way <- -way if kinds[k.usize()] == MESH
+            speed_base: f64 = gearing(radii, kinds, idx, true)
+            fan: mutable Cog = zeroed
+            middle: mutable Cog = zeroed
+            belt: bool = level.chains and py_random(draw) < 0.5
+            if belt:
+                for _ in 0..<30 |base, draw, train, pegs, fan|:
+                    r: f64 = radius(draw).f64()
+                    angle: f64 = py_uniform(draw, 0.5, 2.6)
+                    c: Cog = place_cog(base, CHAIN, r, angle, draw)
+                    if clear_cog(c, base, train, pegs):
+                        fan <- c
+                        break
+            else:
+                for _ in 0..<40 |base, draw, train, pegs, fan, middle|:
+                    first_r: f64 = radius(draw).f64()
+                    first_angle: f64 = py_uniform(draw, 0.5, 2.6)
+                    c: Cog = place_cog(base, MESH, first_r, first_angle, draw)
+                    continue if not clear_cog(c, base, train, pegs)
+                    last_r: f64 = radius(draw).f64()
+                    last_angle: f64 = py_uniform(draw, 0.3, 2.8)
+                    e: Cog = place_cog(c, MESH, last_r, last_angle, draw)
+                    if clear_cog(e, c, train, pegs):
+                        middle <- c
+                        fan <- e
+                        break
+            return zeroed if fan.r == 0.0
+            return zeroed if distance(fan, motor) < 130.0 or distance(fan, winch) < 110.0 or fan.y > 540.0
+            return zeroed if fan.x <= 90.0 or fan.x >= 910.0
+            return zeroed if fan.x + fan.r > winch.x + DRUM - 10.0 and fan.y < winch.y and fan.z == winch.z
+            speed: f64 = speed_base * base.r / fan.r
+            motor_speed: f64 = lift_speed(ratio, level.load) * ratio
+            parts: darray[Cog] = [fan] if belt else [fan, middle]
+            chain: Link = Link{first: base, second: fan} if belt else zeroed
+            return Fan{parts: parts, chain: chain, way: way, low: motor_speed * speed * 0.85, high: motor_speed * speed * 1.15}
+
+    def obstructs_path(wall: Wall, motor: Cog, winch: Cog) -> bool:
+        can Abort.Panic:
+            for k in 0..<31 |wall, motor, winch|:
+                x: f64 = motor.x + (winch.x - motor.x) * k.f64() / 30.0
+                y: f64 = motor.y + (winch.y - motor.y) * k.f64() / 30.0
+                return true if in_wall(x, y, 1.0, wall)
+            return false
+
+    def valid_wall(wall: Wall, attempt: i64, machine: Machine&, train: darray[Cog]&, fan: Fan&,
+            pegs: darray[Cog]&) -> bool:
+        can Abort.Panic:
+            return false if wall.x < 30.0 or wall.y < 130.0 or wall.x + wall.w > 970.0 or wall.y + wall.h > 590.0
+            for c in train:
+                return false if c.z == wall.z and in_wall(c.x, c.y, c.r + 10.0, wall)
+            for c in fan.parts:
+                return false if c.z == wall.z and in_wall(c.x, c.y, c.r + 10.0, wall)
+            if wall.z == 0 and machine.level.layers > 1 and attempt < 250:
+                return false if not obstructs_path(wall, machine.motor, machine.winch)
+            for p in pegs:
+                return false if in_wall(p.x, p.y, 75.0, wall)
+            winch: Cog = machine.winch
+            return false if in_wall(winch.x, winch.y + 84.0, 20.0, wall)
+            rope_x: f64 = winch.x + DRUM
+            return false if wall.z == winch.z and wall.x < rope_x + 40.0 and wall.x + wall.w > rope_x - 30.0 and wall.y < winch.y
+            for other in machine.walls:
+                if other.z == wall.z and wall.x < other.x + other.w + 20.0 and other.x < wall.x + wall.w + 20.0:
+                    return false if wall.y < other.y + other.h + 20.0 and other.y < wall.y + wall.h + 20.0
+            for link in machine.plan_chains:
+                return false if chain_hits_wall(link.first, link.second, wall)
+            return true
+
+    def draw_walls(machine: mutable Machine&, train: darray[Cog]&, fan: Fan&, pegs: darray[Cog]&,
+            draw: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            motor: Cog = machine.motor
+            winch: Cog = machine.winch
+            for z in 0..<machine.level.layers |machine, train, fan, pegs, draw, motor, winch|:
+                count: i64 = machine.level.walls if z == 0 else machine.level.walls_back
+                got: mutable i64 = 0
+                for attempt in 0..<300 |machine, train, fan, pegs, draw, motor, winch, z, count, got|:
+                    break if got >= count
+                    w: f64 = py_uniform(draw, 20.0, 70.0)
+                    h: f64 = py_uniform(draw, 80.0, 220.0)
+                    t: f64 = py_uniform(draw, 0.25, 0.75)
+                    x: f64 = motor.x + (winch.x - motor.x) * t + py_uniform(draw, -120.0, 120.0)
+                    y: f64 = motor.y + (winch.y - motor.y) * t + py_uniform(draw, -140.0, 140.0)
+                    wall: Wall = Wall{x: x - w / 2.0, y: y - h / 2.0, w: w, h: h, z: z}
+                    if valid_wall(wall, attempt, machine, train, fan, pegs):
+                        machine.walls.push(wall)
+                        got <- got + 1
+                return false if got < count
+            return true
+
+    def build(level: Grade, draw: mutable MT19937&) -> Machine:
+        can Memory.Allocate, Abort.Panic:
+            kinds: darray[i64] = draw_links(level, draw)
+            return zeroed if kinds.count == 0.usize()
+            radii: darray[i64] = draw_train_radii(level, &kinds, draw)
+            return zeroed if radii.count == 0.usize()
+            train: darray[Cog] = draw_train(&kinds, &radii, draw)
+            return zeroed if train.count == 0.usize()
+            n: i64 = level.links
+            ratio: f64 = gearing(&radii, &kinds, n)
+            motor: Cog = train[0]
+            winch: Cog = train[n.usize()]
+            rope_x: f64 = winch.x + DRUM
+            return zeroed if rope_x + 40.0 > 970.0
+            for i in 0..<n |train, winch, rope_x|:
+                c: Cog = train[i.usize()]
+                if c.x - c.r < rope_x + 26.0 and rope_x - 26.0 < c.x + c.r and c.y < winch.y and c.z == winch.z:
+                    return zeroed
+            pegs: mutable darray[Cog] = [motor, winch]
+            fan: Fan = draw_fan(level, &train, &pegs, &kinds, &radii, ratio, draw) if level.fan > 0 else zeroed
+            return zeroed if level.fan > 0 and fan.parts.count == 0.usize()
+            machine: mutable Machine = zeroed
+            machine.level <- level
+            machine.motor <- motor
+            machine.winch <- winch
+            machine.fan_way <- fan.way
+            machine.fan_low <- fan.low
+            machine.fan_high <- fan.high
+            if fan.parts.count != 0.usize():
+                machine.fan <- fan.parts[0]
+                pegs.push(machine.fan)
+            for k in 0..<n |machine, train, kinds|:
+                if kinds[k.usize()] == CHAIN:
+                    machine.plan_chains.push(Link{first: train[k.usize()], second: train[(k + 1).usize()]})
+            # The main train's belts constrain wall placement. The fan belt is
+            # checked only after walls have been dealt.
+            return zeroed if not draw_walls(&machine, &train, &fan, &pegs, draw)
+            if fan.chain.first.r > 0.0:
+                machine.plan_chains.push(fan.chain)
+            for link in machine.plan_chains:
+                return zeroed if not chain_ok(link.first, link.second, &machine.walls)
+            early_winch: bool = n > 1 and kinds[(n - 1).usize()] == MESH
+            machine.plan.push(motor)
+            limit: i64 = n - 1 if early_winch else n
+            for i in 1..<limit |machine, train|:
+                machine.plan.push(train[i.usize()])
+            for c in fan.parts:
+                machine.plan.push(c)
+            machine.plan.push(winch)
+            if early_winch:
+                machine.plan.push(train[(n - 1).usize()])
+            for i in 0..<machine.plan.count.i64() |machine|:
+                c: Cog = machine.plan[i.usize()]
+                for j in 0..<i |machine, c|:
+                    return zeroed if cog_equals(c, machine.plan[j.usize()])
+                machine.tray.push(c.r.i64())
+            for _ in 0..<level.spare |machine, draw|:
+                machine.tray.push(radius(draw))
+            extra: i64 = 1 if level.chains else 0
+            return zeroed if machine.tray.count.i64() + extra > 14
+            machine.chains <- machine.plan_chains.count.i64() + extra
+            py_shuffle_i64(draw, &machine.tray)
+            machine.lift <- winch.y - 70.0 - FLOOR
+            travel: f64 = machine.lift / (lift_speed(ratio, level.load) * DRUM) + SETTLE * 4.0
+            machine.seconds <- level.place * (machine.plan.count.i64() + machine.plan_chains.count.i64()).f64() + travel * level.slack + 3.0
+            return machine

@@ -18,6 +18,35 @@ def quoted(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def hub_categories(manifest: dict) -> list[dict]:
+    return manifest["categories"] + manifest.get("hub_categories", [])
+
+
+def hub_groups(manifest: dict) -> list[list[dict]]:
+    categories = hub_categories(manifest)
+    tasks = manifest["tasks"]
+    groups = [
+        sorted((row for row in tasks if row["category"] == category["id"]),
+               key=lambda row: row["position"])
+        for category in categories
+    ]
+    for row in manifest.get("hub_additions", []):
+        if any(task["id"] == row["id"] for group in groups for task in group):
+            raise ValueError(f"duplicate hub task ID: {row['id']}")
+        indices = [i for i, category in enumerate(categories) if category["id"] == row["category"]]
+        if len(indices) != 1:
+            raise ValueError(f"unknown hub category: {row['category']}")
+        group = groups[indices[0]]
+        if "after" not in row and not group:
+            group.append(row)
+            continue
+        anchors = [i for i, task in enumerate(group) if task["id"] == row["after"]]
+        if len(anchors) != 1:
+            raise ValueError(f"unknown hub task anchor: {row['after']}")
+        group.insert(anchors[0] + 1, row)
+    return groups
+
+
 def render(manifest: dict) -> str:
     if manifest.get("schema_version") != 5:
         raise ValueError("task catalog schema_version must be 5")
@@ -42,19 +71,17 @@ def render(manifest: dict) -> str:
     if unknown_overrides:
         raise ValueError(f"port overrides reference unknown tasks: {sorted(unknown_overrides)}")
 
-    grouped: list[list[dict]] = []
     for category_id in category_ids:
         rows = [row for row in tasks if row.get("category") == category_id]
         rows.sort(key=lambda row: row.get("position", -1))
         if [row.get("position") for row in rows] != list(range(len(rows))):
             raise ValueError(f"task positions in {category_id} must be contiguous from zero")
-        grouped.append(rows)
     if any(row.get("category") not in category_ids for row in tasks):
         raise ValueError("a task references an unknown category")
 
     labels: list[list[str]] = []
     ids: list[list[str]] = []
-    for rows in grouped:
+    for rows in hub_groups(manifest):
         category_labels: list[str] = []
         category_ids_for_menu: list[str] = []
         for row in rows:
@@ -74,7 +101,7 @@ def render(manifest: dict) -> str:
         raise ValueError("port task IDs must be unique after applying overrides")
 
     category_lines = []
-    for category, category_labels in zip(categories, labels):
+    for category, category_labels in zip(hub_categories(manifest), labels):
         task_values = ", ".join(quoted(label) for label in category_labels)
         category_lines.append(
             f"  Object.freeze({{ name: {quoted(category['label'])}, "

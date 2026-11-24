@@ -1,0 +1,293 @@
+include "./crazy_cog_run.elisa"
+
+extend CrazyCog:
+    const CLEAR: i64 = HandView::KEYS
+    const LAYER: i64 = CLEAR + 1
+    const NEARER: i64 = CLEAR + 2
+    const PORTS: i64 = CLEAR + 3
+    const CARRY_BELT: i64 = -1
+    const TRAY_Y: f64 = 62.0
+
+    def slots(run: Run&) -> i64:
+        return run.tray.count.i64() + (1 if run.machine.chains > 0 else 0)
+
+    def tray_gap(count: i64) -> f64:
+        can Abort.Panic:
+            return fmin(100.0, 940.0 / max_i(1, count).f64())
+
+    def tray_x(index: i64, count: i64) -> f64:
+        can Abort.Panic:
+            return 500.0 + (index.f64() - (count - 1).f64() / 2.0) * tray_gap(count)
+
+    def tray_at(run: Run&, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            return -1 if HandView::absolute(y - TRAY_Y) > 40.0
+            count: i64 = slots(run)
+            for k in 0..<count |run, x, count|:
+                if HandView::absolute(x - tray_x(k, count)) <= fmin(40.0, tray_gap(count) / 2.0):
+                    if k == run.tray.count.i64():
+                        return k if run.stock > 0 else -1
+                    return k if run.tray[k.usize()] != 0 else -1
+            return -1
+
+    def wheel_at(run: Run&, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            count: i64 = run.wheels.count.i64()
+            for offset in 0..<count |run, x, y, count|:
+                k: i64 = count - 1 - offset
+                c: Cog = run.wheels[k.usize()].cog
+                if c.z == run.layer and py_hypot(x - c.x, y - c.y) <= c.r:
+                    return k
+            return -1
+
+    def snap_cog(run: Run&, x: f64, y: f64, r: f64) -> Cog:
+        can Abort.Panic:
+            z: i64 = run.layer
+            candidate: Cog = Cog{x: x, y: y, r: r, z: z}
+            for peg in [run.machine.motor, run.machine.winch, run.machine.fan] |run, candidate, r, z|:
+                if peg.r > 0.0 and peg.z == z and distance(candidate, peg) <= SNAP and at_peg(run, peg) < 0:
+                    return Cog{x: peg.x, y: peg.y, r: r, z: z}
+            for wheel in run.wheels:
+                c: Cog = wheel.cog
+                if c.z != z and distance(candidate, c) <= SNAP * 0.6:
+                    axle: Cog = Cog{x: c.x, y: c.y, r: r, z: z}
+                    return axle if at_peg(run, axle) < 0
+            best: mutable Cog = candidate
+            gap: mutable f64 = SNAP
+            n: i64 = run.wheels.count.i64()
+            for i in 0..<n |run, n, candidate, r, z, best, gap|:
+                a: Cog = run.wheels[i.usize()].cog
+                continue if a.z != z
+                for j in (i + 1)..<n |run, a, candidate, r, z, best, gap|:
+                    b: Cog = run.wheels[j.usize()].cog
+                    continue if b.z != z
+                    ra: f64 = a.r + r
+                    rb: f64 = b.r + r
+                    dx: f64 = b.x - a.x
+                    dy: f64 = b.y - a.y
+                    d: f64 = py_hypot(dx, dy)
+                    continue if d < 0.000001 or d > ra + rb or d < HandView::absolute(ra - rb)
+                    k: f64 = (ra * ra - rb * rb + d * d) / (2.0 * d)
+                    h: f64 = sqrt(fmax(0.0, ra * ra - k * k))
+                    mx: f64 = a.x + dx * k / d
+                    my: f64 = a.y + dy * k / d
+                    for side in 0..<2 |best, gap, candidate, mx, my, dx, dy, h, d, r, z|:
+                        sign: f64 = 1.0 if side == 0 else -1.0
+                        c: Cog = Cog{x: mx - sign * dy * h / d, y: my + sign * dx * h / d, r: r, z: z}
+                        distance_to: f64 = distance(candidate, c)
+                        if distance_to < gap * 1.5:
+                            best <- c
+                            gap <- distance_to / 1.5
+            return best if gap < SNAP
+            for wheel in run.wheels:
+                a: Cog = wheel.cog
+                continue if a.z != z
+                length: f64 = distance(candidate, a)
+                d: f64 = length if length > 0.0 else 1.0
+                c: Cog = Cog{x: a.x + (x - a.x) * (a.r + r) / d, y: a.y + (y - a.y) * (a.r + r) / d, r: r, z: z}
+                distance_to: f64 = distance(candidate, c)
+                if distance_to < gap:
+                    best <- c
+                    gap <- distance_to
+            return best
+
+    def placeable(run: Run&, c: Cog) -> bool:
+        can Abort.Panic:
+            return false if not cog_on_board(c)
+            for wall in run.machine.walls:
+                return false if wall.z == c.z and in_wall(c.x, c.y, c.r, wall)
+            for p in [run.machine.motor, run.machine.winch, run.machine.fan] |c|:
+                d: f64 = distance(c, p)
+                return false if p.r > 0.0 and d > 1.0 and d < c.r + 8.0
+            for wheel in run.wheels:
+                other: Cog = wheel.cog
+                return false if other.z == c.z and distance(other, c) < other.r + c.r - TOL
+            return true
+
+    def return_radius(run: mutable Run&, radius: i64):
+        can Memory.Allocate, Abort.Panic:
+            for k in 0..<run.tray.count.i64() |run, radius|:
+                if run.tray[k.usize()] == 0:
+                    run.tray[k.usize()] <- radius
+                    return
+            run.tray.push(radius)
+
+    def saved_angle(run: Run&, cog: Cog) -> f64:
+        can Abort.Panic:
+            for delta in 0..<run.previous.count.i64() |run, cog|:
+                wheel: Wheel = run.previous[(run.previous.count.i64() - 1 - delta).usize()]
+                return wheel.angle if cog_equals(wheel.cog, cog)
+            return 0.0
+
+    def remember_wheel(run: mutable Run&, wheel: Wheel):
+        can Memory.Allocate, Abort.Panic:
+            for i in 0..<run.previous.count.i64() |run, wheel|:
+                if cog_equals(run.previous[i.usize()].cog, wheel.cog):
+                    run.previous[i.usize()] <- wheel
+                    return
+            run.previous.push(wheel)
+
+    def press_cog(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != LIVE or run.hand.down
+            run.hand.down <- true
+            x: f64 = run.hand.x
+            y: f64 = run.hand.y
+            picked: i64 = wheel_at(run, x, y)
+            if run.chain_from.r > 0.0:
+                a: Cog = run.chain_from
+                run.chain_from <- zeroed
+                if picked >= 0:
+                    b: Cog = run.wheels[picked.usize()].cog
+                    if chain_ok(a, b, &run.machine.walls) and not belt_between(a, b, &run.belts):
+                        run.belts.push(Link{first: a, second: b})
+                        note(run, 0.12, 640.0, TICK, 0.45, (b.x - 500.0) / 500.0)
+                        rewire(run)
+                        return
+                run.stock <- run.stock + 1
+                note(run, 0.15, 90.0, CLUNK, 0.4)
+                return
+            slot: i64 = tray_at(run, x, y)
+            if slot >= 0:
+                if slot == run.tray.count.i64():
+                    run.stock <- run.stock - 1
+                    run.carry <- CARRY_BELT
+                else:
+                    run.carry <- run.tray[slot.usize()]
+                    run.tray[slot.usize()] <- 0
+                note(run, 0.05, 900.0, TICK, 0.3)
+                return
+            if picked >= 0:
+                wheel: Wheel = run.wheels[picked.usize()]
+                remember_wheel(run, wheel)
+                _ = run.wheels.remove_at(picked.usize())
+                index: mutable i64 = run.belts.count.i64() - 1
+                while index >= 0 |run, index, wheel|:
+                    link: Link = run.belts[index.usize()]
+                    if cog_equals(wheel.cog, link.first) or cog_equals(wheel.cog, link.second):
+                        _ = run.belts.remove_at(index.usize())
+                        run.stock <- run.stock + 1
+                    index <- index - 1
+                run.carry <- wheel.cog.r.i64()
+                note(run, 0.05, 700.0, TICK, 0.3)
+                rewire(run)
+
+    def release_cog(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            return if not run.hand.down
+            run.hand.down <- false
+            held: i64 = run.carry
+            run.carry <- 0
+            return if held == 0 or run.result != LIVE
+            x: f64 = run.hand.x
+            y: f64 = run.hand.y
+            if held == CARRY_BELT:
+                index: i64 = wheel_at(run, x, y) if y >= 130.0 else -1
+                if index < 0:
+                    run.stock <- run.stock + 1
+                else:
+                    run.chain_from <- run.wheels[index.usize()].cog
+                    note(run, 0.05, 560.0, TICK, 0.3)
+                return
+            if y < 130.0:
+                return_radius(run, held)
+                return
+            c: Cog = snap_cog(run, x, y, held.f64())
+            if not placeable(run, c):
+                return_radius(run, held)
+                note(run, 0.15, 90.0, CLUNK, 0.4)
+                return
+            connected: mutable bool = false
+            for wheel in run.wheels:
+                connected <- connected or meshed(c, wheel.cog) or shared_axle(c, wheel.cog)
+            angle: f64 = saved_angle(run, c)
+            run.wheels.push(Wheel{cog: c, angle: angle, ratio: 0.0, driven: false})
+            note(run, 0.07, 520.0 if connected else 300.0, TICK, 0.45, (c.x - 500.0) / 500.0)
+            rewire(run)
+
+    def act(run: mutable Run&, port: i64):
+        can Memory.Allocate, Abort.Panic:
+            if port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                press_cog(run)
+            elif port == HandView::RELEASE:
+                release_cog(run)
+            elif run.result == LIVE:
+                if port == LAYER or port == NEARER:
+                    n: i64 = run.machine.level.layers
+                    if n > 1:
+                        direction: i64 = 1 if port == LAYER else -1
+                        run.layer <- (run.layer + direction + n) % n
+                        note(run, 0.05, 600.0 - 80.0 * run.layer.f64(), TICK, 0.25)
+                elif port == CLEAR:
+                    for i in 0..<run.wheels.count.i64() |run|:
+                        wheel: Wheel = run.wheels[i.usize()]
+                        return_radius(run, wheel.cog.r.i64())
+                        remember_wheel(run, wheel)
+                    run.stock <- run.stock + run.belts.count.i64() + (1 if run.chain_from.r > 0.0 else 0)
+                    run.wheels.clear()
+                    run.belts.clear()
+                    run.chain_from <- zeroed
+                    rewire(run)
+
+    def near(a: Cog, b: Cog) -> bool:
+        return a.r == b.r and a.z == b.z and HandView::absolute(a.x - b.x) < 6.0 and HandView::absolute(a.y - b.y) < 6.0
+
+    def placed_cog(run: Run&, target: Cog) -> Cog:
+        for wheel in run.wheels:
+            return wheel.cog if near(wheel.cog, target)
+        return zeroed
+
+    def steer_to(run: Run&, x: f64, y: f64, tolerance: f64, then_port: i64) -> i64:
+        port: i64 = HandView::toward(&run.hand, x, y, tolerance)
+        return port if port >= 0 else then_port
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            if not run.hand.down and run.carry == 0:
+                for wheel in run.wheels:
+                    planned: mutable bool = false
+                    for c in run.machine.plan:
+                        planned <- planned or near(wheel.cog, c)
+                    return CLEAR if not planned
+            for c in run.machine.plan:
+                continue if placed_cog(run, c).r > 0.0
+                if run.carry == 0:
+                    return HandView::RELEASE if run.hand.down
+                    return LAYER if run.layer != c.z
+                    for index in 0..<run.tray.count.i64() |run, c|:
+                        if run.tray[index.usize()].f64() == c.r:
+                            return steer_to(run, tray_x(index, slots(run)), TRAY_Y, 4.0, HandView::PRESS)
+                    return CLEAR
+                if run.carry.f64() != c.r:
+                    return steer_to(run, 500.0, TRAY_Y, 10.0, HandView::RELEASE)
+                return steer_to(run, c.x, c.y, 3.0, HandView::RELEASE)
+            for link in run.machine.plan_chains:
+                a: Cog = placed_cog(run, link.first)
+                b: Cog = placed_cog(run, link.second)
+                continue if belt_between(a, b, &run.belts)
+                if run.carry == CARRY_BELT:
+                    return steer_to(run, a.x, a.y, 3.0, HandView::RELEASE)
+                return HandView::RELEASE if run.hand.down
+                return LAYER if run.layer != a.z
+                if run.chain_from.r > 0.0:
+                    return steer_to(run, b.x, b.y, 3.0, HandView::PRESS)
+                return steer_to(run, tray_x(run.tray.count.i64(), slots(run)), TRAY_Y, 4.0, HandView::PRESS)
+            return HandView::RELEASE if run.hand.down else -1
+
+    def deal(level: Grade, draw: mutable MT19937&) -> Machine:
+        can Memory.Allocate, Abort.Panic:
+            for _ in 0..<4000 |level, draw|:
+                next: mutable MT19937 = zeroed
+                mt_seed_int(&next, py_getrandbits(draw, 32))
+                machine: Machine = build(level, &next)
+                continue if machine.plan.count == 0.usize()
+                run: mutable Run = begin(machine, false)
+                while run.result == LIVE |run|:
+                    port: i64 = pilot(&run)
+                    act(&run, port)
+                    tick_train(&run, 1.0 / 60.0)
+                return machine if run.result == BUCKET_UP
+            return zeroed

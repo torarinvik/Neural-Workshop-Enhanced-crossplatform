@@ -1,0 +1,183 @@
+include "./nearer.elisa"
+include "../rooms_view.elisa"
+
+module PointOfView:
+    const TABLE: f64 = 2.0
+    const RING: f64 = 6.2
+    const PI: f64 = 3.141592653589793
+    const RADIANS: f64 = 0.017453292519943295
+
+    struct Grade:
+        rung: i64
+        few: i64
+        most: i64
+        choices: i64
+        turn_min: f64
+        turn_max: f64
+        eye_min: f64
+        eye_max: f64
+        sides_only: bool
+        mirror: bool
+        heights: bool
+        colours: bool
+
+    struct View:
+        angle: f64
+        eye: f64
+        mirrored: bool
+
+    struct Arrangement:
+        solids: mutable Nearer::Solid[6]
+        count: mutable i64
+
+    struct Puzzle:
+        seed: i64
+        level: Grade
+        table: Arrangement
+        target: View
+        views: View[5]
+        answer: i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        few: i64 = 2 if r < 4 else (3 if r < 13 else (4 if r < 20 else 5))
+        return Grade{rung: r, few: few, most: few + 1, choices: 3 if r < 4 else (4 if r < 16 else 5),
+            turn_min: 90.0 if r < 13 else (45.0 if r < 20 else 25.0),
+            turn_max: 270.0 if r < 13 else (90.0 if r < 20 else 50.0),
+            eye_min: 2.6 if r < 20 else 0.9, eye_max: 2.6 if r < 20 else 5.0,
+            sides_only: r < 13, mirror: r >= 7, heights: r >= 10, colours: r < 16}
+
+    def camera(view: View) -> RoomsView::Camera:
+        can Abort.Panic:
+            eye: RoomsView::Vec = RoomsView::vec(RING * cos(view.angle), view.eye, RING * sin(view.angle))
+            forward: RoomsView::Vec = RoomsView::unit(RoomsView::sub(RoomsView::vec(0.0, 0.35, 0.0), eye))
+            right: RoomsView::Vec = RoomsView::unit(RoomsView::cross(forward, RoomsView::vec(0.0, 1.0, 0.0)))
+            return RoomsView::Camera{eye: eye, forward: forward, right: right, up: RoomsView::cross(right, forward)}
+
+    def signature(table: Arrangement&, view: View) -> i64:
+        can Abort.Panic:
+            cam: RoomsView::Camera = camera(view)
+            xs: mutable f64[6] = zeroed
+            ordered: mutable i64[6] = zeroed
+            sign: f64 = -1.0 if view.mirrored else 1.0
+            for i in 0..<table.count |table, cam, sign, xs, ordered|:
+                solid: Nearer::Solid = table.solids[i.usize()]
+                p: RoomsView::Point = RoomsView::project(&cam, RoomsView::vec(solid.x, solid.y, solid.z))
+                x: f64 = sign * p.x
+                at: mutable i64 = i
+                while at > 0 |xs, ordered, at, x|:
+                    prior: usize = (at - 1).usize()
+                    break if xs[prior] <= x
+                    xs[at.usize()] <- xs[prior]
+                    ordered[at.usize()] <- ordered[prior]
+                    at <- at - 1
+                xs[at.usize()] <- x
+                ordered[at.usize()] <- i
+            # Monochrome solids have unique (kind, rounded size), so their
+            # index order identifies the same view as the Python signature.
+            key: mutable i64 = 0
+            for i in 0..<table.count |key, ordered|:
+                key <- key * 6 + ordered[i.usize()]
+            return key
+
+    def size_tenths(size: f64) -> i64:
+        # Python rounds the input binary float, before multiplying by ten.
+        return 6 if size < 0.65
+        return 7 if size < 0.75
+        return 8 if size <= 0.85
+        return 9 if size <= 0.95
+        return 10
+
+    def repeated(table: Arrangement&, kind: i64, size: f64) -> bool:
+        can Abort.Panic:
+            tenths: i64 = size_tenths(size)
+            for i in 0..<table.count |table, kind, tenths|:
+                s: Nearer::Solid = table.solids[i.usize()]
+                return true if s.kind == kind and size_tenths(s.size) == tenths
+            return false
+
+    def overlaps(table: Arrangement&, x: f64, z: f64) -> bool:
+        can Abort.Panic:
+            for i in 0..<table.count |table, x, z|:
+                s: Nearer::Solid = table.solids[i.usize()]
+                return true if py_hypot(x - s.x, z - s.z) < 1.15
+            return false
+
+    def arrange(rng: mutable MT19937&, level: Grade, count: i64) -> Arrangement:
+        can Memory.Allocate, Abort.Panic:
+            colours: mutable darray[i64] = [0, 1, 2, 3, 4, 5]
+            py_shuffle_i64(rng, &colours)
+            table: mutable Arrangement = zeroed
+            heights: f64[4] = [0.7, 1.0, 1.6, 2.2]
+            for _try in 0..<300 |rng, level, count, table, colours, heights|:
+                break if table.count == count
+                size: f64 = Nearer::uniform(rng, 0.6, 1.0)
+                kind: i64 = py_randbelow(rng, 4.u64()).i64()
+                continue if not level.colours and repeated(&table, kind, size)
+                tall: f64 = heights[py_randbelow(rng, 4.u64()).usize()] if level.heights else 1.0
+                x: f64 = Nearer::uniform(rng, -TABLE + 0.6, TABLE - 0.6)
+                z: f64 = Nearer::uniform(rng, -TABLE + 0.6, TABLE - 0.6)
+                continue if overlaps(&table, x, z)
+                i: usize = table.count.usize()
+                table.solids[i] <- Nearer::Solid{x: x, y: size * tall / 2.0, z: z, size: size,
+                    yaw: Nearer::uniform(rng, 0.0, PI), kind: kind, colour: colours[i] if level.colours else -1}
+                table.count <- table.count + 1
+            return table
+
+    def distractor(rng: mutable MT19937&, level: Grade, target: View, first: bool) -> View:
+        can Abort.Panic:
+            if first and level.mirror:
+                return View{angle: target.angle, eye: target.eye, mirrored: true}
+            if level.sides_only:
+                shift: f64 = (1 + py_randbelow(rng, 3.u64()).i64()).f64() * PI / 2.0
+                return View{angle: target.angle + shift, eye: target.eye, mirrored: false}
+            delta: f64 = Nearer::uniform(rng, level.turn_min, level.turn_max) * RADIANS
+            sign: f64 = 1.0 if py_randbelow(rng, 2.u64()) == 0.u64() else -1.0
+            return View{angle: target.angle + sign * delta,
+                eye: Nearer::uniform(rng, level.eye_min, level.eye_max), mirrored: false}
+
+    def seen_before(seen: i64[5]&, count: i64, key: i64) -> bool:
+        can Abort.Panic:
+            for i in 0..<count |seen, key|:
+                return true if seen[i.usize()] == key
+            return false
+
+    def round_views(rng: mutable MT19937&, level: Grade, table: Arrangement&, seed: i64) -> Puzzle:
+        can Abort.Panic:
+            angle: f64 = py_randbelow(rng, 4.u64()).f64() * PI / 2.0 if level.sides_only else Nearer::uniform(rng, 0.0, 2.0 * PI)
+            target: View = View{angle: angle, eye: Nearer::uniform(rng, level.eye_min, level.eye_max), mirrored: false}
+            seen: mutable i64[5] = zeroed
+            seen[0] <- signature(table, target)
+            wrong: mutable View[5] = zeroed
+            count: mutable i64 = 0
+            for k in 0..<(level.choices - 1) |rng, level, table, target, seen, wrong, count|:
+                for _try in 0..<200 |rng, level, table, target, seen, wrong, count, k|:
+                    view: View = distractor(rng, level, target, k == 0)
+                    key: i64 = signature(table, view)
+                    if not seen_before(&seen, count + 1, key):
+                        count <- count + 1
+                        seen[count.usize()] <- key
+                        wrong[k.usize()] <- view
+                        break
+                    # This distractor is fixed, so retrying cannot consume RNG
+                    # or produce a different signature.
+                    break if k == 0 and level.mirror
+                return zeroed if count <= k
+            answer: i64 = py_randbelow(rng, level.choices.u64()).i64()
+            views: mutable View[5] = zeroed
+            for i in 0..<level.choices |views, wrong, answer, target|:
+                views[i.usize()] <- target if i == answer else wrong[(i if i < answer else i - 1).usize()]
+            return Puzzle{seed: seed, level: level, table: table[0], target: target, views: views, answer: answer}
+
+    def deal(rung: i64, seed: i64) -> Puzzle:
+        can Memory.Allocate, Abort.Panic:
+            level: Grade = grade(rung)
+            rng: mutable MT19937 = mt19937_new()
+            for attempt in 0..<500 |rng, level, seed|:
+                Nearer::seed_attempt(&rng, seed, attempt, 397.u64())
+                count: i64 = level.few + py_randbelow(&rng, (level.most - level.few + 1).u64()).i64()
+                table: Arrangement = arrange(&rng, level, count)
+                if table.count == count:
+                    result: Puzzle = round_views(&rng, level, &table, seed)
+                    return result if result.table.count > 0
+            return Puzzle{seed: seed, level: level, table: zeroed, target: zeroed, views: zeroed, answer: -1}

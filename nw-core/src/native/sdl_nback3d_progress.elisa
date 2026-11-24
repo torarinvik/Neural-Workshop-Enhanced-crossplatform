@@ -1,0 +1,201 @@
+# Native progress is local to the selected Python profile.
+extern SDL_TimeToDateTime(ticks: i64, date: mutable i32&, local_time: bool) -> bool
+
+def sdl_nback3d_date(date: i32&) -> i64:
+    can Abort.Panic:
+        return date[0].i64() * 10000 + date[1].i64() * 100 + date[2].i64()
+
+def sdl_nback3d_in_training_day(stamp: i64, stamp_hour: i64, today: i64, hour: i64, rollover: i64) -> bool:
+    can Abort.Panic:
+        if hour < rollover:
+            return stamp == today or (stamp == sdl_nback3d_yesterday(today) and stamp_hour >= rollover)
+        return stamp == today and stamp_hour >= rollover
+
+def sdl_nback3d_restore(progress: mutable NBack3DGame::Progression&, reset_daily: bool, rollover: i64) -> bool:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        path: mutable u8[4096] = zeroed
+        bytes: mutable u8[128] = zeroed
+        trusted Unsafe.PointerCast:
+            target: mutable u8& = (&path[0]).uintptr().cast[mutable u8&]
+            return false if not sdl_task_profile_sidecar(target, ".nback3d-progress")
+            if SDL_IOFromFile(target.cast[cstr], "rb") is stream:
+                size: usize = SDL_ReadIO(stream, (&bytes[0]).cast[mutable void&], 128.usize())
+                status: i32 = SDL_GetIOStatus(stream)
+                closed: bool = SDL_CloseIO(stream)
+                return false if not closed or status != 2.i32() or size == 0.usize() or size >= 128.usize()
+                raw: heap u8& = (&bytes[0]).uintptr().cast[heap u8&]
+                at: mutable i64 = 0
+                version: i64 = SyllogismOptions::saved_integer(raw, size.i64(), &at)
+                level: i64 = SyllogismOptions::saved_integer(raw, size.i64(), &at)
+                fallback: i64 = SyllogismOptions::saved_integer(raw, size.i64(), &at)
+                day: i64 = SyllogismOptions::saved_integer(raw, size.i64(), &at)
+                return false if (version != 1 and version != 2) or level < 1 or level > 8 or fallback < 0 or day < 0
+                stamp_hour: i64 = SyllogismOptions::saved_integer(raw, size.i64(), &at) if version == 2 else -1
+                return false if version == 2 and (stamp_hour < 0 or stamp_hour > 23)
+                while at < size.i64() and SyllogismOptions::whitespace(raw[at.usize()].i64()) |at, size, raw|:
+                    at <- at + 1
+                return false if at != size.i64()
+                if reset_daily:
+                    now: mutable i64 = 0
+                    local: mutable i32[9] = zeroed
+                    return false if not SDL_GetCurrentTime(&now) or not SDL_TimeToDateTime(now, &local[0], true)
+                    today: i64 = sdl_nback3d_date(&local[0])
+                    current: bool = today == day if version == 1 else sdl_nback3d_in_training_day(day, stamp_hour, today, local[3].i64(), rollover)
+                    return false if not current
+                progress.next_nback <- level
+                progress.fallback_progress <- fallback if fallback < progress.fallback_sessions else 0
+                return true
+        return false
+
+def sdl_nback3d_save_progress(handle: i64):
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: mutable heap NBack3DGame::NBack3DRun& = handle.uintptr().cast[mutable heap NBack3DGame::NBack3DRun&]
+            return if not run.save_progress or not run.progress_dirty
+            run.progress_dirty <- false
+            data: mutable u8[128] = zeroed
+            now: mutable i64 = 0
+            local: mutable i32[9] = zeroed
+            if not SDL_GetCurrentTime(&now) or not SDL_TimeToDateTime(now, &local[0], true):
+                SDL_Log("Could not date 3D N-Back progression")
+                return
+            day: i64 = sdl_nback3d_date(&local[0])
+            size: i32 = SDL_snprintf(&data[0], 128.usize(), "2 %lld %lld %lld %d\n",
+                run.progression.next_nback, run.progression.fallback_progress, day, local[3])
+            if size <= 0.i32() or size >= 128.i32() or not sdl_save_profile_sidecar(".nback3d-progress", &data[0], size.usize()):
+                SDL_Log("Could not save 3D N-Back progression")
+
+def sdl_nback3d_history_path(path: mutable u8&, configured: u8&) -> bool:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        trusted Unsafe.PointerCast:
+            name: mutable cstr = configured.cast[cstr]
+            if SDL_getenv("NW_NBACK_STATSFILE") is requested:
+                name <- requested.cast[cstr] if requested[0] != 0.u8()
+            address: i64 = path.uintptr().i64()
+            if SDL_strlen(name) > 0.usize():
+                bytes: u8& = name.cast[u8&]
+                windows: bool = syllogism_argument_is(SDL_GetPlatform().uintptr().i64(), "Windows")
+                if bytes[0] == 47.u8() or (windows and (bytes[0] == 92.u8() or bytes[1] == 58.u8())):
+                    return SyllogismOptionsHost::append(address, 4096, 0, name) >= 0
+                return false if sdl_data_path(path, 4096.usize(), "/", 0, true) == 0.i32()
+                return SyllogismOptionsHost::append(address, 4096, SDL_strlen(path.cast[cstr]).i64(), name) >= 0
+            suffix: mutable u8[270] = zeroed
+            output: mutable u8& = (&suffix[0]).uintptr().cast[mutable u8&]
+            length: i64 = sdl_profile_suffix(path, output)
+            return sdl_data_path(path, 4096.usize(), "/stats.txt", 0, true) != 0.i32() if length <= 0
+            return false if SyllogismOptionsHost::append(output.uintptr().i64(), 270, length - 11, "-stats.txt") < 0
+            return sdl_data_path(path, 4096.usize(), output.cast[cstr], 0, true) != 0.i32()
+
+def sdl_nback3d_yesterday(today: i64) -> i64:
+    can Abort.Panic:
+        return today - 1 if today % 100 > 1
+        year: i64 = today / 10000
+        month: i64 = today / 100 % 100
+        return (year - 1) * 10000 + 1231 if month == 1
+        leap: bool = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+        month_days: i64 = (29 if leap else 28) if month == 3 else (30 if month == 5 or month == 7 or month == 10 or month == 12 else 31)
+        return year * 10000 + (month - 1) * 100 + month_days
+
+def sdl_nback3d_history_row(record: StatsRecord&, today: i64, hour: i64, rollover: i64) -> bool:
+    can Abort.Panic:
+        return false if record.mode != NBack3DGame::MODE_POSITION or record.nback < 1 or record.percent < 0 or record.percent > 100
+        return true if rollover < 0
+        stamp: i64 = record.year * 10000 + record.month * 100 + record.day
+        return sdl_nback3d_in_training_day(stamp, record.hour, today, hour, rollover)
+
+def sdl_nback3d_import_history(progress: mutable NBack3DGame::Progression&, configured: u8&, rollover: i64):
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        path: mutable u8[4096] = zeroed
+        size: mutable i64 = 0
+        now: mutable i64 = 0
+        date: mutable i32[9] = zeroed
+        if rollover >= 0:
+            return if not SDL_GetCurrentTime(&now) or not SDL_TimeToDateTime(now, &date[0], true)
+        today: i64 = sdl_nback3d_date(&date[0])
+        hour: i64 = date[3].i64()
+        trusted Unsafe.PointerCast:
+            target: mutable u8& = (&path[0]).uintptr().cast[mutable u8&]
+            return if not sdl_nback3d_history_path(target, configured)
+            if sdl_read_corpus(target, &size) is raw:
+                records: darray[StatsRecord] = parse_stats_text(sview(raw.cast[cstr], 0, size))
+                SDL_free(raw)
+                next_level: mutable i64 = 0
+                for at in 0..<records.count.i64() |at, records, next_level, progress, today, hour, rollover|:
+                    row: StatsRecord = records[at.usize()]
+                    if sdl_nback3d_history_row(&row, today, hour, rollover):
+                        next_level <- NBack3DGame::clamp_nback(row.nback + (1 if row.percent >= progress.advance_threshold and row.nback < 8 else 0))
+                return if next_level == 0
+                count: mutable i64 = 0
+                for at in 0..<records.count.i64() |at, records, count, next_level, progress, today, hour, rollover|:
+                    row: StatsRecord = records[at.usize()]
+                    if sdl_nback3d_history_row(&row, today, hour, rollover):
+                        if row.nback != next_level:
+                            count <- 0
+                        elif row.percent < progress.fallback_threshold:
+                            count <- count + 1
+                if count >= progress.fallback_sessions:
+                    next_level <- NBack3DGame::clamp_nback(next_level - 1)
+                    count <- 0
+                progress.next_nback <- next_level
+                progress.fallback_progress <- count
+
+def sdl_nback3d_stats_path(configured: u8&) -> usize:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        path: mutable u8[4096] = zeroed
+        trusted Unsafe.PointerCast:
+            target: mutable u8& = (&path[0]).uintptr().cast[mutable u8&]
+            return 0.usize() if not sdl_nback3d_history_path(target, configured)
+            length: usize = SDL_strlen(target.cast[cstr]) + 1.usize()
+            if SDL_malloc(length) is copy:
+                memcpy(copy.cast[mutable void&], target.cast[void&], length)
+                return copy.uintptr()
+        return 0.usize()
+
+def sdl_nback3d_append_stats(run: NBack3DGame::NBack3DRun&) -> bool:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        path: mutable u8[4096] = zeroed
+        row: mutable u8[512] = zeroed
+        date: mutable i32[9] = zeroed
+        now: mutable i64 = 0
+        return false if not SDL_GetCurrentTime(&now) or not SDL_TimeToDateTime(now, &date[0], true)
+        trusted Unsafe.PointerCast:
+            destination: i64 = (&path[0]).uintptr().i64()
+            return false if SyllogismOptionsHost::settings_override(destination, 4096, run.stats_path.cast[cstr], true) < 0
+            filename: cstr = destination.uintptr().cast[cstr]
+            session: mutable i64 = 1
+            separator: mutable cstr = ""
+            size: mutable i64 = 0
+            if sdl_read_corpus(destination.uintptr().cast[u8&], &size) is raw:
+                data: heap u8& = raw.cast[heap u8&]
+                separator <- "\n" if data[(size - 1).usize()] != 10.u8()
+                records: darray[StatsRecord] = parse_stats_text(sview(raw.cast[cstr], 0, size))
+                SDL_free(raw)
+                for at in 0..<records.count.i64() |at, records, session|:
+                    record: StatsRecord = records[at.usize()]
+                    if record.mode == NBack3DGame::MODE_POSITION and record.manual == 0 and record.session >= session and record.session < 9223372036854775807:
+                        session <- record.session + 1
+            percent: i64 = NBack3DGame::score_percent(run, run.progression.jaeggi)
+            duration: f64 = run.interval_ms.f64() * run.total_trials.f64() / 1000.0
+            length: i32 = SDL_snprintf(&row[0], 512.usize(),
+                "%s%04d-%02d-%02d %02d:%02d:%02d,Po%lldB,%lld,10,%lld,%lld,%lld,%lld,%lld,%lld,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,%.3f,0\n",
+                separator, date[0], date[1], date[2], date[3], date[4], date[5],
+                run.nback, percent, run.nback, run.interval_ms / NBack3DGame::TICK_MS,
+                run.total_trials, 0 if run.progression.enabled else 1, session, percent, duration)
+            return false if length <= 0.i32() or length >= 512.i32()
+            if not sdl_append_file(filename, &row[0], length.usize()):
+                return false
+            start: i64 = 1 if row[0] == 10.u8() else 0
+            summary: sview = sview((&row[0]).uintptr().cast[cstr], start, length.i64() - 1)
+            return sdl_nback3d_append_session(run, summary)
+
+
+def sdl_nback3d_save_result(handle: i64):
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: mutable heap NBack3DGame::NBack3DRun& = handle.uintptr().cast[mutable heap NBack3DGame::NBack3DRun&]
+            return if run.stats_path == 0.usize() or not run.stats_pending
+            run.stats_pending <- false
+            if not sdl_nback3d_append_stats(run):
+                SDL_Log("Could not save all 3D N-Back session records")

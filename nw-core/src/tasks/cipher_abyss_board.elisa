@@ -1,0 +1,165 @@
+include "./cipher_abyss_machine.elisa"
+
+extend CipherLang:
+    const FORM: i64 = 0
+    const RULE: i64 = 1
+    const PREDICATE: i64 = 2
+    const SYMBOL_BLOCK: i64 = 3
+
+    const THEN2: i64 = 0
+    const THEN3: i64 = 1
+    const IF_FORM: i64 = 2
+    const ALT_FORM: i64 = 3
+    const EXCEPT_FORM: i64 = 4
+    const META2: i64 = 5
+    const META3: i64 = 6
+    const PROG2: i64 = 7
+    const PROG3: i64 = 8
+
+    struct Block:
+        kind: i64
+        value: i64
+
+    def form_size(form: i64) -> i64:
+        return 2 if form == THEN2 or form == ALT_FORM or form == EXCEPT_FORM
+        return 4 if form == META3 or form == PROG2
+        return 6 if form == PROG3
+        return 3
+
+    def form_slot(form: i64, at: i64) -> i64:
+        return SYMBOL_BLOCK if form >= PROG2 and at % 2 == 0
+        return PREDICATE if at == 0 and (form == IF_FORM or form == META2 or form == META3)
+        return RULE
+
+    def form_op(form: i64) -> i64:
+        return SEQ if form == THEN2 or form == THEN3
+        return IF if form == IF_FORM
+        return ALT if form == ALT_FORM
+        return EXCEPT if form == EXCEPT_FORM
+        return META if form == META2 or form == META3
+        return PROG
+
+    def gather_forms(program: darray[Node]&, entry: i64, forms: mutable i64&, visited: mutable darray[i64]&):
+        can Abort.Panic:
+            return if visited[entry.usize()] != 0
+            visited[entry.usize()] <- 1
+            node: Node& = &program[entry.usize()]
+            n: i64 = node.children.count.i64()
+            op: i64 = node.op
+            if op == SEQ:
+                forms[0] <- forms[0] | (1 << (THEN2 if n == 2 else THEN3)) if n >= 2
+                for child in node.children:
+                    part: Node& = &program[child.usize()]
+                    if part.op == FEISTEL:
+                        gather_forms(program, part.children[0], forms, visited)
+            elif op == IF or op == ALT or op == EXCEPT or op == META or op == PROG:
+                form: i64 = IF_FORM if op == IF else (ALT_FORM if op == ALT else (EXCEPT_FORM if op == EXCEPT else
+                    ((META2 if n == 3 else META3) if op == META else (PROG2 if n == 2 else PROG3))))
+                forms[0] <- forms[0] | (1 << form)
+                return if op == PROG
+                for i in (1 if op == IF or op == META else 0)..<n |program, node, forms, visited|:
+                    gather_forms(program, node.children[i.usize()], forms, visited)
+
+    def gather_pieces(program: darray[Node]&, entry: i64, visited: mutable darray[i64]&, steps: mutable darray[Rank]&, tests: mutable darray[Rank]&):
+        can Abort.Panic, Memory.Allocate:
+            return if visited[entry.usize()] != 0
+            visited[entry.usize()] <- 1
+            node: Node& = &program[entry.usize()]
+            op: i64 = node.op
+            if op < FIRST:
+                if op != PERM and op != SUB:
+                    steps.push(rank(program, entry, true))
+            elif op < SEQ:
+                tests.push(rank(program, entry, false))
+            else:
+                for child in node.children:
+                    gather_pieces(program, child, visited, steps, tests)
+
+    def unique_blocks(out: mutable darray[Block]&, ranked: mutable darray[Rank]&, kind: i64):
+        can Abort.Panic, Memory.Allocate:
+            sort_ranks(ranked)
+            for i in 0..<ranked.count.i64() |out, ranked, kind|:
+                item: Rank = ranked[i.usize()]
+                if i == 0 or code_less(&ranked[(i - 1).usize()].code, &item.code):
+                    out.push(Block{kind: kind, value: item.entry})
+                elif code_less(&item.code, &ranked[(i - 1).usize()].code):
+                    out.push(Block{kind: kind, value: item.entry})
+
+    def blocks(program: darray[Node]&, truths: darray[i64]&, k: i64) -> darray[Block]:
+        can Abort.Panic, Memory.Allocate:
+            forms: mutable i64 = (1 << THEN2) | (1 << THEN3)
+            visited_forms: mutable darray[i64] = Ints::zeros(program.count.i64())
+            visited_pieces: mutable darray[i64] = Ints::zeros(program.count.i64())
+            steps: mutable darray[Rank] = []
+            tests: mutable darray[Rank] = []
+            for entry in truths:
+                gather_forms(program, entry, &forms, &visited_forms)
+                gather_pieces(program, entry, &visited_pieces, &steps, &tests)
+            out: mutable darray[Block] = []
+            for form in 0..<(PROG3 + 1) |forms, out|:
+                if (forms & (1 << form)) != 0:
+                    out.push(Block{kind: FORM, value: form})
+            unique_blocks(&out, &steps, RULE)
+            unique_blocks(&out, &tests, PREDICATE)
+            if (forms & ((1 << PROG2) | (1 << PROG3))) != 0:
+                for v in 0..<k |out|:
+                    out.push(Block{kind: SYMBOL_BLOCK, value: v})
+            return out
+
+    def expecting(board: darray[Block]&) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            need: mutable darray[i64] = [RULE]
+            for block in board:
+                break if need.count == 0.usize()
+                _ = need.pop()
+                if block.kind == FORM:
+                    count: i64 = form_size(block.value)
+                    for i in 0..<count |need, count, block|:
+                        need.push(form_slot(block.value, count - 1 - i))
+            return need
+
+    def menu(board: darray[Block]&, available: darray[Block]&) -> darray[Block]:
+        can Abort.Panic, Memory.Allocate:
+            need: darray[i64] = expecting(board)
+            out: mutable darray[Block] = []
+            return out if need.count == 0.usize()
+            kind: i64 = need[need.count - 1.usize()]
+            for item in available:
+                if item.kind == kind or (kind == RULE and item.kind == FORM):
+                    out.push(item)
+            return out
+
+    def assemble_part(program: mutable darray[Node]&, board: darray[Block]&, at: mutable i64&) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            item: Block = board[at[0].usize()]
+            at[0] <- at[0] + 1
+            return seq1(program, item.value) if item.kind == RULE
+            return item.value if item.kind != FORM
+            op: i64 = form_op(item.value)
+            parts: mutable darray[i64] = []
+            args: mutable darray[i64] = []
+            count: i64 = form_size(item.value)
+            for i in 0..<count |program, board, at, op, parts, args|:
+                piece: i64 = assemble_part(program, board, at)
+                if op == PROG and i % 2 == 0:
+                    args.push(piece)
+                    continue
+                node: Node = program[piece.usize()]
+                if op == PROG:
+                    prim: mutable i64 = -1
+                    if node.op == SEQ and node.children.count > 0.usize():
+                        first: i64 = node.children[0]
+                        prim <- first if program[first.usize()].op < FIRST
+                    parts.push(prim if prim >= 0 else atomic(program, REV))
+                elif op == SEQ and node.op == SEQ:
+                    append_list(&parts, &node.children)
+                else:
+                    parts.push(piece)
+            return add_node(program, op, args, parts)
+
+    def assemble(program: mutable darray[Node]&, board: darray[Block]&) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            missing: darray[i64] = expecting(board)
+            return -1 if missing.count > 0.usize()
+            at: mutable i64 = 0
+            return assemble_part(program, board, &at)

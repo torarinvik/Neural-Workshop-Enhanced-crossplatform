@@ -1,0 +1,296 @@
+include "../pyrandom.elisa"
+include "../strings.elisa"
+
+module Captcha:
+    const ALPHABET: cstr = "ACDEFGHJKMNPQRTUVWXY347"
+    const BACKSPACE: i64 = 23
+    const SUBMIT: i64 = 24
+    const PORTS: i64 = 25
+    const LONGEST: i64 = 12
+    const W: f64 = 100.0
+    const H: f64 = 36.0
+    const COLOUR: i64 = 1
+    const SMALL: i64 = 2
+    const UPSIDE: i64 = 4
+    const BLOB: i64 = 0
+    const STRAY: i64 = 1
+    const LINE: i64 = 2
+    const ARC: i64 = 3
+    const STRIKE: i64 = 4
+
+    struct Grade:
+        rung: i64
+        length: i64
+        faces: i64
+        tilt: f64
+        colours: bool
+        wave: f64
+        crowd: f64
+        strikes: i64
+        noise: i64
+        clutter: i64
+        blobs: i64
+        decoys: i64
+
+    struct Glyph:
+        char: u8
+        x: f64
+        y: f64
+        size: f64
+        angle: f64
+        face: i64
+        colour: i64
+        real: bool
+
+    struct Mark:
+        kind: mutable i64
+        points: mutable f64[18]
+        width: mutable f64
+        colour: mutable u32
+        char: mutable u8
+        face: mutable i64
+
+    struct Puzzle:
+        level: Grade
+        glyphs: darray[Glyph]
+        marks: darray[Mark]
+        answer: darray[u8]
+        rules: i64
+        keep: i64
+        light: u32
+        other: u32
+        stripes: i64
+
+    def least(a: f64, b: f64) -> f64:
+        return a if a < b else b
+
+    def greatest(a: f64, b: f64) -> f64:
+        return a if a > b else b
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: i64 = r - 20 if r >= 20 else 0
+        return Grade{rung: r,
+            length: 4 if r < 4 else (5 if r < 10 else (6 if r < 16 else (7 if r < 20 else 8))),
+            faces: 1 if r < 4 else (3 if r < 7 else 16),
+            tilt: 6.0 if r < 4 else (20.0 if r < 7 else (30.0 if r < 16 else least(55.0, 40.0 + 2.0 * top.f64()))),
+            colours: r >= 4, wave: 0.0 if r < 7 else (3.0 if r < 16 else 4.5),
+            crowd: 1.0 if r < 7 else (0.82 if r < 13 else (0.75 if r < 20 else greatest(0.6, 0.72 - 0.01 * top.f64()))),
+            strikes: 0 if r < 7 else (1 if r < 13 else (2 if top < 3 else (5 if top >= 9 else 2 + top / 3))),
+            noise: 0 if r < 4 else (3 if r < 7 else (8 if r < 13 else (14 if r < 20 else (40 if top >= 11 else 18 + 2 * top)))),
+            clutter: 0 if r < 13 else (30 if r < 16 else (60 if r < 20 else (160 if top >= 10 else 80 + 8 * top))),
+            blobs: 0 if r < 7 else (3 if r < 13 else (6 if r < 20 else 9)),
+            decoys: 0 if r < 10 else (2 if r < 16 else (6 if top >= 9 else 3 + top / 3))}
+
+    def char_at(pool: cstr, index: i64) -> u8:
+        can Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                return pool.cast[u8&][index.usize()]
+
+    def alphabet_at(port: i64) -> u8:
+        can Unsafe.PointerCast:
+            return char_at(ALPHABET, port)
+
+    def ink(index: i64) -> u32:
+        return 0xd62c2cff if index == 0 else (0x2456d6ff if index == 1 else (
+            0x188c3cff if index == 2 else (0xe88010ff if index == 3 else (0x8438baff if index == 4 else 0x1c1c22ff))))
+
+    def colour_name(index: i64) -> cstr:
+        return "red" if index == 0 else ("blue" if index == 1 else (
+            "green" if index == 2 else ("orange" if index == 3 else ("purple" if index == 4 else "black"))))
+
+    def rule_text(puzzle: Puzzle&, text: mutable dstr&):
+        can Abort.Panic, Memory.Allocate:
+            if (puzzle.rules & COLOUR) != 0:
+                dstr_append_cstr(text, "Type only the ")
+                dstr_append_cstr(text, colour_name(puzzle.keep))
+                dstr_append_cstr(text, " characters")
+            else:
+                dstr_append_cstr(text, "Type the characters")
+            small: bool = (puzzle.rules & SMALL) != 0
+            upside: bool = (puzzle.rules & UPSIDE) != 0
+            return if not small and not upside
+            dstr_append_cstr(text, ", but not the ")
+            if small:
+                dstr_append_cstr(text, "small")
+            if upside:
+                dstr_append_cstr(text, " or " if small else "")
+                dstr_append_cstr(text, "upside-down")
+            dstr_append_cstr(text, " ones")
+
+    def option_note(rung: i64, text: mutable dstr&):
+        can Abort.Panic, Memory.Allocate:
+            level: Grade = grade(rung)
+            dstr_append_cstr(text, "Rung ")
+            dstr_append_i64(text, level.rung)
+            dstr_append_cstr(text, ": ")
+            dstr_append_i64(text, level.length)
+            dstr_append_cstr(text, " characters.")
+            if level.decoys > 0:
+                dstr_append_cstr(text, "  ")
+                dstr_append_i64(text, level.decoys)
+                dstr_append_cstr(text, " decoys.")
+            if level.clutter > 0:
+                dstr_append_cstr(text, "  Clutter.")
+
+    def random_rgb(rng: mutable MT19937&, low: i64, high: i64) -> u32:
+        can Abort.Panic:
+            range_size: i64 = high - low
+            red: u32 = (low + py_choice_index(rng, range_size)).u32()
+            green: u32 = (low + py_choice_index(rng, range_size)).u32()
+            blue: u32 = (low + py_choice_index(rng, range_size)).u32()
+            return (red << 24.u32()) | (green << 16.u32()) | (blue << 8.u32())
+
+    def choose_rules(rung: i64, rng: mutable MT19937&) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            rules: mutable darray[i64] = []
+            return rules if rung < 10
+            if rung < 20:
+                rules.push(COLOUR if rung < 13 else (SMALL if rung < 16 else UPSIDE))
+                _ = py_choice_index(rng, 1)
+            else:
+                rules <- [COLOUR, SMALL, UPSIDE]
+                if rung >= 24:
+                    py_shuffle_i64(rng, &rules)
+                    return [rules[0], rules[1]]
+                return [rules[py_choice_index(rng, 3).usize()]]
+            return rules
+
+    def glyphs(level: Grade&, answer: darray[u8]&, rules: darray[i64]&, flags: i64, keep: i64,
+               rng: mutable MT19937&) -> darray[Glyph]:
+        can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+            faces: darray[i64] = py_sample_range(rng, 0, 15, level.faces)
+            slots: mutable darray[i64] = []
+            total: i64 = level.length + level.decoys
+            for index in 0..<total |slots, level, index|:
+                slots.push(1 if index < level.length else 0)
+            py_shuffle_i64(rng, &slots)
+            while slots[0] == 0 |slots, rng|:
+                py_shuffle_i64(rng, &slots)
+            pitch: f64 = (W - 14.0) / total.f64()
+            size: f64 = least(H * 0.5, pitch * 1.4 / level.crowd)
+            x: mutable f64 = 7.0 + pitch / 2.0
+            phase: f64 = py_uniform(rng, 0.0, 6.283185307179586)
+            upside: bool = (flags & UPSIDE) != 0
+            tilt: f64 = least(level.tilt, 40.0) if upside else level.tilt
+            next: mutable i64 = 0
+            result: mutable darray[Glyph] = []
+            for slot in slots |result, rng, level, answer, rules, flags, keep, faces, pitch, size, x, phase, upside, tilt, next|:
+                real: bool = slot != 0
+                char: mutable u8 = 0.u8()
+                if real:
+                    char <- answer[next.usize()]
+                    next <- next + 1
+                else:
+                    char <- char_at("ACDEFGJKPQRTUVY347", py_choice_index(rng, 18)) if upside else alphabet_at(py_choice_index(rng, BACKSPACE))
+                scale: mutable f64 = size * py_uniform(rng, 0.85, 1.12) if level.colours else size
+                angle: mutable f64 = py_uniform(rng, -tilt, tilt)
+                colour: mutable i64 = py_choice_index(rng, 6) if level.colours else 5
+                if (flags & COLOUR) != 0:
+                    if real:
+                        colour <- keep
+                    else:
+                        choice: i64 = py_choice_index(rng, 5)
+                        colour <- choice if choice < keep else choice + 1
+                if not real:
+                    broken: i64 = rules[py_choice_index(rng, rules.count.i64()).usize()]
+                    colour <- keep if (flags & COLOUR) != 0 and broken != COLOUR
+                    scale <- size * py_uniform(rng, 0.38, 0.47) if broken == SMALL
+                    angle <- 180.0 + py_uniform(rng, -15.0, 15.0) if broken == UPSIDE
+                elif (flags & SMALL) != 0:
+                    scale <- greatest(scale, size * 0.85)
+                y: f64 = H / 2.0 + level.wave * sin(phase + x / 9.0) + py_uniform(rng, -1.0, 1.0) * (level.wave * 0.4)
+                cx: f64 = x + py_uniform(rng, -0.15, 0.15) * pitch
+                face: i64 = faces[py_choice_index(rng, level.faces).usize()]
+                result.push(Glyph{char: char, x: cx, y: y, size: scale, angle: angle, face: face, colour: colour, real: real})
+                x <- x + pitch
+            return result
+
+    def blob(rng: mutable MT19937&) -> Mark:
+        can Abort.Panic:
+            mark: mutable Mark = zeroed
+            radius: f64 = py_uniform(rng, 4.0, 10.0)
+            mark.kind <- BLOB
+            mark.points[0] <- py_uniform(rng, radius, W - radius)
+            mark.points[1] <- py_uniform(rng, radius * 0.6, H - radius * 0.6)
+            mark.points[2] <- radius
+            tint: u32 = random_rgb(rng, 90, 230)
+            mark.colour <- tint | (40 + py_choice_index(rng, 50)).u32()
+            return mark
+
+    def stray(rng: mutable MT19937&) -> Mark:
+        can Abort.Panic, Unsafe.PointerCast:
+            mark: mutable Mark = zeroed
+            mark.kind <- STRAY
+            mark.points[0] <- py_uniform(rng, 3.0, W - 3.0)
+            mark.points[1] <- py_uniform(rng, 3.0, H - 3.0)
+            mark.points[2] <- py_uniform(rng, 2.0, 5.0)
+            mark.points[3] <- py_uniform(rng, 0.0, 360.0)
+            tint: u32 = random_rgb(rng, 90, 230)
+            mark.colour <- tint | (50 + py_choice_index(rng, 60)).u32()
+            mark.char <- char_at("abcdefghijkmnpqrstuvwxyz#@&%*?+=~", py_choice_index(rng, 33))
+            mark.face <- py_choice_index(rng, 16)
+            return mark
+
+    def noise(rng: mutable MT19937&) -> Mark:
+        can Abort.Panic:
+            mark: mutable Mark = zeroed
+            if py_random(rng) < 0.5:
+                mark.kind <- LINE
+                mark.points[0] <- py_uniform(rng, 0.0, W)
+                mark.points[1] <- py_uniform(rng, 0.0, H)
+                mark.points[2] <- py_uniform(rng, 0.0, W)
+                mark.points[3] <- py_uniform(rng, 0.0, H)
+            else:
+                mark.kind <- ARC
+                radius: f64 = py_uniform(rng, 4.0, 15.0)
+                mark.points[0] <- py_uniform(rng, radius, W - radius)
+                mark.points[1] <- py_uniform(rng, least(radius, H / 2.0), greatest(H - radius, H / 2.0))
+                mark.points[2] <- least(radius, H / 2.0 - 0.5)
+                mark.points[3] <- py_uniform(rng, 0.0, 360.0)
+                mark.points[4] <- py_uniform(rng, 60.0, 220.0)
+            mark.width <- py_uniform(rng, 0.2, 0.6)
+            tint: u32 = random_rgb(rng, 90, 230)
+            mark.colour <- tint | (90 + py_choice_index(rng, 80)).u32()
+            return mark
+
+    def strike(rng: mutable MT19937&) -> Mark:
+        can Abort.Panic:
+            mark: mutable Mark = zeroed
+            mark.kind <- STRIKE
+            y: f64 = H / 2.0 + py_uniform(rng, -6.0, 6.0)
+            for j in 0..<9 |mark, rng, y, j|:
+                mark.points[(j * 2).usize()] <- W * j.f64() / 8.0
+                mark.points[(j * 2 + 1).usize()] <- y + py_uniform(rng, -3.0, 3.0)
+            mark.colour <- (ink(py_choice_index(rng, 6)) & 0xffffff00.u32()) | 220.u32()
+            mark.width <- py_uniform(rng, 0.5, 0.9)
+            return mark
+
+    def deal(rung: i64, seed: i64) -> Puzzle:
+        can Abort.Panic, Memory.Allocate, Unsafe.PointerCast:
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            level: Grade = grade(rung)
+            rules: darray[i64] = choose_rules(level.rung, &rng)
+            keep: i64 = py_choice_index(&rng, 6) if rules.count > 0.usize() else 0
+            flags: mutable i64 = 0
+            for rule in rules |flags|:
+                flags <- flags | rule
+            answer: mutable darray[u8] = []
+            for _ in 0..<level.length |answer, rng|:
+                answer.push(alphabet_at(py_choice_index(&rng, BACKSPACE)))
+            letters: darray[Glyph] = glyphs(&level, &answer, &rules, flags, keep, &rng)
+            marks: mutable darray[Mark] = []
+            for _ in 0..<level.blobs |marks, rng|:
+                marks.push(blob(&rng))
+            for _ in 0..<level.clutter |marks, rng|:
+                marks.push(stray(&rng))
+            for _ in 0..<level.noise |marks, rng|:
+                marks.push(noise(&rng))
+            for _ in 0..<level.strikes |marks, rng|:
+                marks.push(strike(&rng))
+            light: u32 = random_rgb(&rng, 222, 252) | 255.u32()
+            other: u32 = (random_rgb(&rng, 180, 240) | 255.u32()) if level.blobs > 0 else light
+            stripes: i64 = 6 + py_choice_index(&rng, 10) if level.rung >= 13 else 0
+            return Puzzle{level: level, glyphs: letters, marks: marks, answer: answer, rules: flags, keep: keep,
+                light: light, other: other, stripes: stripes}

@@ -1,0 +1,121 @@
+include "../tasks/tuner_game.elisa"
+include "../tasks/tuner_recordings.elisa"
+
+module TunerWeb:
+    const MIN_BANK: i64 = 300
+    const MAX_BANK: i64 = 2000
+    const MAX_FILE: i64 = 4194304
+
+    struct Session:
+        game: mutable TunerGame::Session
+        bank_owner: mutable Arena
+        clips: mutable darray[Tuner::Clip]
+        empty: darray[Tuner::Clip]
+        guide_pending: mutable bool
+
+    def initialize(rung: i64, trials: i64, adaptive: bool, seed: i64) -> Session:
+        can Abort.Panic:
+            clips: darray[Tuner::Clip] = []
+            return Session{game: TunerGame::initialize(rung, trials, adaptive, seed), bank_owner: zeroed,
+                clips: clips, empty: clips, guide_pending: false}
+
+    def append_clip(owner: mutable Arena&, clips: mutable darray[Tuner::Clip]&, clip: Tuner::Clip):
+        can Memory.Allocate, Abort.Panic:
+            in owner:
+                clips.push(clip)
+
+    def add_clip(s: mutable Session&, row: i64, label: i64, duration: f64) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            return false if s.game.phase != TunerGame::READY or s.clips.count.i64() >= MAX_BANK
+            return false if row < 0 or row >= MAX_BANK or label < 0 or label >= 50 or not (duration >= 1.0 and duration <= 60.0)
+            if s.clips.count > 0.usize():
+                last: Tuner::Clip = s.clips[s.clips.count - 1.usize()]
+                return false if last.row >= row
+            append_clip(&s.bank_owner, &s.clips, Tuner::Clip{row: row, label: label, duration: duration})
+            return true
+
+    def waiting(s: Session&) -> bool:
+        return s.game.phase == TunerGame::PLAYING and s.game.run.radio.heard.bank == Tuner::ESC50 and
+            (s.guide_pending or s.game.audio.stations.count.i64() != s.game.run.radio.count)
+
+    def start(s: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            clips: darray[Tuner::Clip]& = &s.clips if s.clips.count.i64() >= MIN_BANK else &s.empty
+            changed: bool = TunerGame::start(&s.game, now, clips) can Global{Read,Write}
+            s.guide_pending <- true if changed and s.game.run.radio.heard.bank == Tuner::ESC50
+            return changed
+
+    def advance(s: mutable Session&, now: f64, held: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if waiting(s)
+            clips: darray[Tuner::Clip]& = &s.clips if s.clips.count.i64() >= MIN_BANK else &s.empty
+            trial: i64 = s.game.trial
+            changed: bool = TunerGame::advance(&s.game, now, held, clips) can Global{Read,Write}
+            s.guide_pending <- true if s.game.trial != trial and s.game.run.radio.heard.bank == Tuner::ESC50
+            return changed
+
+    def agent_event(s: mutable Session&, now: f64, port: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return (start(s, now) can Global{Read,Write}) if port == TunerGame::START
+            return false if waiting(s)
+            clips: darray[Tuner::Clip]& = &s.clips if s.clips.count.i64() >= MIN_BANK else &s.empty
+            trial: i64 = s.game.trial
+            changed: bool = TunerGame::agent_event(&s.game, now, port, clips) can Global{Read,Write}
+            s.guide_pending <- true if s.game.trial != trial and s.game.run.radio.heard.bank == Tuner::ESC50
+            return changed
+
+    def row(s: Session&, position: i64) -> i64:
+        can Abort.Panic:
+            return -1 if not waiting(s)
+            return s.game.run.radio.heard.row if position == -1
+            return -1 if position < 0 or position >= s.game.run.radio.count
+            return s.game.run.radio.stations[position.usize()].sound.row
+
+    def read_wave(owner: mutable Arena&, source: u8&?, length: i64, start: f64, end: f64,
+            sound: Tuner::Sound&) -> TunerAudio::Wave:
+        can Abort.Panic, Memory.Allocate:
+            in owner:
+                bytes: mutable darray[u8] = []
+                if source != null:
+                    input: u8& = source
+                    _ = bytes.reserve(length.usize())
+                    for i in 0..<length |bytes, input|:
+                        bytes.push(input[i.usize()])
+                raw: TunerAudio::Wave = TunerRecordings::decode(&bytes, start, end)
+                return TunerAudio::playback(&raw, sound.speed, sound.backward)
+
+    def add_station(owner: mutable Arena&, stations: mutable darray[TunerAudio::Wave]&, wave: TunerAudio::Wave):
+        can Abort.Panic, Memory.Allocate:
+            in owner:
+                stations.push(wave)
+
+    def noise(owner: mutable Arena&, seed: i64) -> TunerAudio::Wave:
+        can Abort.Panic, Memory.Allocate:
+            in owner:
+                return TunerAudio::hiss(seed)
+
+    def load_wave(s: mutable Session&, position: i64, source: u8&?, length: i64,
+            from_ms: i64, to_ms: i64, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            return false if not waiting(s) or not TunerGame::valid_time(&s.game, now)
+            return false if length < 0 or length > MAX_FILE or from_ms < 0 or to_ms <= from_ms or to_ms > 60000
+            start: f64 = from_ms.f64() / 1000.0
+            end: f64 = to_ms.f64() / 1000.0
+            if position == -1:
+                return false if not s.guide_pending
+                s.game.audio.heard <- read_wave(&s.game.owner, source, length, start, end, &s.game.run.radio.heard)
+                s.guide_pending <- false
+            else:
+                return false if position < 0 or position >= s.game.run.radio.count or position != s.game.audio.stations.count.i64()
+                sound: Tuner::Sound& = &s.game.run.radio.stations[position.usize()].sound
+                wave: TunerAudio::Wave = read_wave(&s.game.owner, source, length, start, end, sound)
+                add_station(&s.game.owner, &s.game.audio.stations, wave)
+            if not waiting(s):
+                s.game.audio.hiss <- noise(&s.game.owner, s.game.run.radio.seed)
+                s.game.last_tick <- now
+            return true
+
+    def close(s: mutable Session&):
+        can Abort.Panic, Memory.Release:
+            TunerGame::close(&s.game) can Global{Read,Write}
+            TunerGame::release_owner(&s.bank_owner) can Global{Read,Write}

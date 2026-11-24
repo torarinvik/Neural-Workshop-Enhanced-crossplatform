@@ -1,0 +1,295 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/scene_cipher_abyss.elisa"
+include "../src/tasks/cipher_lang_parse.elisa"
+include "../src/tasks/cipher_abyss_audio.elisa"
+
+extern printf(format: cstr, ...) -> i32 can[Console.Write]
+
+def print_row(row: darray[i64]&):
+    can Console.Write:
+        _ = printf(" %lld", row.count.i64())
+        for symbol in row:
+            _ = printf(" %lld", symbol)
+
+def state(run: CipherAbyss::Run&, program: darray[CipherLang::Node]&):
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        _ = printf("state %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %.6f %.6f %lld\n",
+            CipherAbyss::want(program, run), run.log.count.i64(), 1 if run.testing else 0, run.test_no,
+            run.answers.count.i64(), run.result, run.said_same, 1 if run.twins_q else 0,
+            run.board.count.i64(), run.cursor, run.check_good, run.check_total,
+            1 if run.predicting else 0, run.scroll, 1 if run.numbers else 0, 1 if run.input_order else 0,
+            run.state.runs, run.hand.x, run.hand.y, 1 if run.hand.down else 0)
+        _ = printf("flash %s\n", run.flash)
+        _ = printf("rows")
+        print_row(&run.entry)
+        print_row(&run.pending)
+        print_row(&run.marks)
+        print_row(&run.checked)
+        _ = printf("\n")
+        log: i64 = run.log.count.i64()
+        if log > 0:
+            row: CipherLang::Sample = run.log[(log - 1).usize()]
+            prediction: CipherLang::Probe = run.predictions[(log - 1).usize()]
+            _ = printf("experiment")
+            print_row(&row.given)
+            print_row(&row.result)
+            print_row(&prediction.values)
+            _ = printf("\n")
+        index: i64 = run.answers.count.i64()
+        if index > 0:
+            answer: CipherAbyss::Answer = run.answers[(index - 1).usize()]
+            row: CipherLang::Sample = answer.sample
+            _ = printf("answer %lld", 1 if answer.correct else 0)
+            print_row(&row.given)
+            print_row(&row.result)
+            _ = printf("\n")
+
+def send(program: mutable darray[CipherLang::Node]&, run: mutable CipherAbyss::Run&, port: i64):
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        _ = printf("event %lld\n", port)
+        CipherAbyss::act(program, run, port)
+        CipherAbyss::step(run, 0.075)
+        state(run, program)
+
+def input_row(program: mutable darray[CipherLang::Node]&, run: mutable CipherAbyss::Run&, row: darray[i64]):
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        for symbol in row:
+            send(program, run, CipherAbyss::SYMBOL + symbol)
+        send(program, run, CipherAbyss::RUN)
+
+def show_blocks(program: darray[CipherLang::Node]&, entries: darray[CipherLang::Block]&):
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        _ = printf("blocks %lld\n", entries.count.i64())
+        for item in entries:
+            if item.kind == CipherLang::FORM or item.kind == CipherLang::SYMBOL_BLOCK:
+                _ = printf("%lld %lld\n", item.kind, item.value)
+            else:
+                region scratch(4096):
+                    in scratch:
+                        code: mutable dstr = []
+                        CipherLang::write_code(&code, program, item.value)
+                        _ = printf("%lld ", item.kind)
+                        for byte in code:
+                            _ = printf("%c", byte.i32())
+                        _ = printf("\n")
+
+def pcm(run: CipherAbyss::Run&, begin: f64):
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        _ = printf("pcm %.17g\n", begin)
+        region scratch(1048576):
+            in scratch:
+                bytes: mutable u8[8824] = zeroed
+                length: i64 = CipherAbyssAudio::render(run, begin, begin + 0.1, &bytes[0], 8824)
+                for i in 0..<length |bytes|:
+                    _ = printf("%02x", bytes[i.usize()].i32())
+                _ = printf("\n")
+
+def simulate(mode: i64):
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release, Global.Read:
+        region scratch(1048576):
+            in scratch:
+                rung: i64 = 19 if mode == 2 else (1 if mode == 6 else (13 if mode == 8 else 10))
+                level: CipherAbyss::Grade = CipherAbyss::grade(rung)
+                book: mutable CipherLang::Workshop = CipherLang::workshop(level)
+                code: cstr = "alt(rev,shift(1))" if mode == 8 else ("shift(1)" if mode != 6 else "rev")
+                rule: i64 = CipherLang::parse(&book.program, sview(code, 0, -1))
+                alternate: i64 = CipherLang::parse(&book.program, "shift(2)" if mode == 3 else "seq(shift(2),shift(3))")
+                given: darray[i64] = [0, 1, 1] if mode == 6 else [0, 1, 2, 3, 1, 0]
+                questions: darray[CipherLang::Probe] = [CipherLang::Probe{values: given}, CipherLang::Probe{values: given}]
+                kind: i64 = CipherLang::INVERT if mode == 2 else (CipherLang::TWINS if mode == 3 or mode == 4 else CipherLang::CRACK)
+                machine: CipherLang::Machine = CipherLang::Machine{level: level, rule: rule, tests: questions,
+                    seed: 37, plan: [], kind: kind, other: alternate, rejected: 0}
+                run: mutable CipherAbyss::Run = CipherAbyss::begin(&book.program, &book.rules, machine)
+                _ = printf("mode %lld %lld\n", mode, rung)
+                show_blocks(&book.program, &run.available)
+                if mode == 0:
+                    send(&book.program, &run, CipherAbyss::PREDICT)
+                    send(&book.program, &run, CipherAbyss::RUN)
+                    input_row(&book.program, &run, given)
+                    send(&book.program, &run, CipherAbyss::DELETE)
+                    send(&book.program, &run, CipherAbyss::RUN)
+                    prediction: darray[i64] = [1, 2, 3, 0, 2, 1]
+                    input_row(&book.program, &run, prediction)
+                    send(&book.program, &run, CipherAbyss::MARK)
+                    send(&book.program, &run, CipherAbyss::SORT)
+                    send(&book.program, &run, CipherAbyss::NUMBERS)
+                    send(&book.program, &run, CipherAbyss::PREDICT)
+                    second: darray[i64] = [0, 0, 0, 0, 0, 0]
+                    input_row(&book.program, &run, second)
+                elif mode == 5 or mode == 7:
+                    input_row(&book.program, &run, given)
+                    send(&book.program, &run, CipherAbyss::CHECK)
+                    choices: darray[CipherLang::Block] = CipherLang::menu(&run.board, &run.available)
+                    _ = printf("choose %lld\n", mode)
+                    for i in 0..<choices.count.i64() |choices, mode, book, run|:
+                        item: CipherLang::Block = choices[i.usize()]
+                        op: i64 = CipherLang::SHIFT if mode == 5 else CipherLang::REV
+                        if item.kind == CipherLang::RULE and book.program[item.value.usize()].op == op:
+                            _ = printf("board %lld\n", i)
+                            CipherAbyss::add_block(&run, i)
+                            state(&run, &book.program)
+                            break
+                    send(&book.program, &run, CipherAbyss::CHECK)
+                    send(&book.program, &run, CipherAbyss::SUBMIT)
+                elif mode == 6:
+                    send(&book.program, &run, CipherAbyss::SUBMIT)
+                    send(&book.program, &run, 6)
+                    send(&book.program, &run, 3)
+                    send(&book.program, &run, HandView::PRESS)
+                    send(&book.program, &run, HandView::RELEASE)
+                    _ = printf("advance %.1f\n", level.seconds)
+                    CipherAbyss::step(&run, level.seconds)
+                    state(&run, &book.program)
+                if mode <= 4 or mode == 8:
+                    send(&book.program, &run, CipherAbyss::TEST)
+                    inverse: darray[i64] = [3, 0, 1, 2, 0, 3]
+                    forward: darray[i64] = [1, 2, 3, 0, 2, 1]
+                    reversed: darray[i64] = [0, 1, 3, 2, 1, 0]
+                    input_row(&book.program, &run, inverse if mode == 2 else (given if mode == 1 else (reversed if mode == 8 else forward)))
+                    if mode != 1:
+                        input_row(&book.program, &run, inverse if mode == 2 else forward)
+                        if mode == 3:
+                            input_row(&book.program, &run, given)
+                        elif mode == 4:
+                            send(&book.program, &run, CipherAbyss::SUBMIT)
+                summary: CipherAbyss::Summary = CipherAbyss::summarize(&book.program, &book.rules, &run)
+                CipherAbyss::end_tones(&run, &summary)
+                _ = printf("notes %lld\n", run.notes.count.i64())
+                for note in run.notes:
+                    _ = printf("%lld %lld %.17g %.17g %.17g %.17g %.17g %.17g\n",
+                        note.seed, note.voice, note.t, note.dur, note.freq, note.gain, note.pan, note.bright)
+                pcm(&run, 0.0)
+                pcm(&run, 0.55)
+                pcm(&run, 1.05)
+                pcm(&run, 1.85)
+                metrics: mutable dstr = []
+                CipherAbyss::metrics(&metrics, &book.program, &run, &summary)
+                for byte in metrics:
+                    _ = printf("%c", byte.i32())
+                _ = printf("summary %lld %lld\n", summary.best, summary.standing)
+                for byte in summary.words:
+                    _ = printf("%c", byte.i32())
+                _ = printf("\n")
+                notebook: mutable dstr = []
+                CipherAbyss::notebook_text(&notebook, &book.program, &run)
+                for byte in notebook:
+                    _ = printf("%c", byte.i32())
+                _ = printf("end notebook\n")
+
+def session_input(session: mutable CipherAbyssGame::Session&, port: i64):
+    can Abort.Panic, Memory.Allocate, Memory.Release:
+        region event(4096):
+            in event:
+                _ = CipherAbyssGame::input(session, port) can Global{Read,Write}
+
+def session_row(session: mutable CipherAbyssGame::Session&, row: darray[i64]&):
+    can Abort.Panic, Memory.Allocate, Memory.Release:
+        for symbol in row:
+            session_input(session, CipherAbyss::SYMBOL + symbol) can Global{Read,Write}
+        session_input(session, CipherAbyss::RUN) can Global{Read,Write}
+
+def session_state(session: CipherAbyssGame::Session&, label: cstr):
+    can Console.Write:
+        _ = printf("session %s %lld %lld %lld %lld %lld %lld %lld %lld\n", label, session.phase, session.rung,
+            session.trial, session.wins, session.run.result, session.run.log.count.i64(),
+            session.run.answers.count.i64(), session.run.test_no)
+
+def scene_state(session: CipherAbyssGame::Session&, name: cstr):
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        region frame(65536):
+            in frame:
+                list: mutable Display::DisplayList = Display::DisplayList()
+                SceneCipherAbyss::render(&list, session, true, true)
+                _ = printf("scene %s\n", name)
+                for cmd in list.commands |list|:
+                    if cmd.kind == Display::CMD_TEXT:
+                        for i in 0..<(cmd.len & 0xffffff.u32()).i64() |list, cmd|:
+                            _ = printf("%c", list.pool[(cmd.ref.i64() + i).usize()].i32())
+                        _ = printf("\n")
+                    elif cmd.kind == Display::CMD_RECT and cmd.color == 0xfaec96ff:
+                        _ = printf("marked %.6f\n", cmd.b.f64())
+                _ = printf("scene end\n")
+
+def library_replay():
+    can Console.Write, Abort.Panic, Memory.Allocate:
+        program: mutable darray[CipherLang::Node] = []
+        rule: i64 = CipherLang::parse(&program, "meta(has(1),prog(0:shift(1),1:feistel(rev)),seq(xor(1),perm([1,0])))")
+        _ = printf("library_rule %lld\n", rule)
+        mask: i64 = CipherAbyss::operators(&program, rule)
+        library: mutable CipherAbyss::Library = zeroed
+        CipherAbyss::learn(&library, mask, 9)
+        CipherAbyss::learn(&library, 1 << CipherLang::XOR, 3)
+        CipherAbyss::learn(&library, 1 << CipherLang::REV, 14)
+        recalled: CipherAbyss::Library = CipherAbyss::remembered(&library, mask, 10)
+        words: mutable dstr = []
+        CipherAbyss::recall_text(&words, &recalled)
+        for byte in words:
+            _ = printf("%c", byte.i32())
+        _ = printf("\n")
+        record: mutable dstr = []
+        CipherAbyss::library_text(&record, &library)
+        for byte in record:
+            _ = printf("%c", byte.i32())
+
+def session_replay():
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        session: mutable CipherAbyssGame::Session = CipherAbyssGame::initialize(1, 2, true, 17)
+        for rung in [1.i64(), 4.i64(), 7.i64(), 10.i64(), 13.i64(), 16.i64(), 20.i64(), 25.i64(), 30.i64()]:
+            options: mutable dstr = []
+            SceneCipherAbyss::option_note(rung, &options)
+            for byte in options:
+                _ = printf("%c", byte.i32())
+            _ = printf("\n")
+        scene_state(&session, "ready")
+        _ = CipherAbyssGame::start(&session, 1.0) can Global{Read,Write}
+        session_state(&session, "start")
+        scene_state(&session, "start")
+        session_input(&session, CipherAbyss::PREDICT) can Global{Read,Write}
+        given: darray[i64] = [0, 0, 1]
+        session_row(&session, &given) can Global{Read,Write}
+        built: CipherLang::State = zeroed
+        prediction: darray[i64] = CipherLang::run(&session.book.program, session.run.machine.rule, &given, 2, &built)
+        session_row(&session, &prediction) can Global{Read,Write}
+        _ = printf("prediction %s\n", session.run.flash)
+        session_input(&session, CipherAbyss::PREDICT) can Global{Read,Write}
+        session_row(&session, &given) can Global{Read,Write}
+        x: f64 = SceneHand::x(650.0)
+        y: f64 = SceneHand::y(CipherAbyss::note_y(0))
+        _ = CipherAbyssGame::pointer(&session, x, y, 1, 1.0) can Global{Read,Write}
+        _ = CipherAbyssGame::pointer(&session, x, y, 2, 1.0) can Global{Read,Write}
+        _ = printf("mark %lld\n", session.run.marks[0])
+        scene_state(&session, "marked")
+        session_input(&session, CipherAbyss::TEST) can Global{Read,Write}
+        scene_state(&session, "test")
+        for i in 0..<session.run.machine.tests.count.i64() |session|:
+            question: CipherLang::Probe = session.run.machine.tests[i.usize()]
+            answer: darray[i64] = CipherLang::run(&session.book.program, session.run.machine.rule, &question.values, 2, &session.run.state)
+            session_row(&session, &answer) can Global{Read,Write}
+        _ = CipherAbyssGame::advance(&session, 2.0) can Global{Read,Write}
+        session_state(&session, "judged")
+        scene_state(&session, "judged")
+        _ = CipherAbyssGame::advance(&session, 10.999) can Global{Read,Write}
+        session_state(&session, "feedback")
+        _ = CipherAbyssGame::advance(&session, 11.0) can Global{Read,Write}
+        session_state(&session, "next")
+        session_input(&session, CipherAbyss::TEST) can Global{Read,Write}
+        question: CipherLang::Probe = session.run.machine.tests[0]
+        wrong: mutable darray[i64] = CipherLang::run(&session.book.program, session.run.machine.rule, &question.values, 2, &session.run.state)
+        wrong[0] <- 1 - wrong[0]
+        session_row(&session, &wrong) can Global{Read,Write}
+        _ = CipherAbyssGame::advance(&session, 12.0) can Global{Read,Write}
+        session_state(&session, "wrong")
+        _ = CipherAbyssGame::advance(&session, 21.0) can Global{Read,Write}
+        session_state(&session, "done")
+        scene_state(&session, "done")
+        CipherAbyssGame::close(&session) can Global{Read,Write}
+
+def main() -> i32:
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        for mode in 0..<9:
+            simulate(mode) can Global.Read
+        library_replay()
+        session_replay() can Global{Read,Write}
+        return 0.i32()

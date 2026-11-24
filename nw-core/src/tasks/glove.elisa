@@ -1,0 +1,437 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+# glove.py: catch the pitches while the camera keeps cutting away. A pitcher
+# throws ball after ball toward the plate; move the glove into each ball's
+# path where it reaches the plate. The camera cuts without warning between
+# angles, and every cut turns the way the glove moves on the screen with it.
+# Ports 0-3 move the glove up, down, left and right on the screen as the
+# camera now shows it, for the step they are sent in.
+module Glove:
+    const UP: i64 = 0
+    const DOWN: i64 = 1
+    const LEFT: i64 = 2
+    const RIGHT: i64 = 3
+    const PORTS: i64 = 4
+    const MOUND: f64 = 18.0
+    const RELEASE_X: f64 = 0.0
+    const RELEASE_Y: f64 = 1.8
+    const GLOVE_SPEED: f64 = 2.6
+    const BOX_X0: f64 = -1.0
+    const BOX_X1: f64 = 1.0
+    const BOX_Y0: f64 = 0.25
+    const BOX_Y1: f64 = 2.1
+    const REST_X: f64 = 0.0
+    const REST_Y: f64 = 1.15
+    const BALL: f64 = 0.037
+    const PI: f64 = 3.141592653589793
+    const MOST_PITCHES: i64 = 6
+    const POINTS: i64 = 400
+    const MOST_CUTS: i64 = 1024
+    const WOOD: i64 = 0
+    const BELL: i64 = 1
+    const GROWL: i64 = 2
+    # Results; LIVE while the inning goes on.
+    const LIVE: i64 = 0
+    const CAUGHT: i64 = 1
+    const MISSED: i64 = 2
+
+    struct Grade:
+        rung: i64
+        pitches: i64
+        misses: i64
+        speed: f64
+        curve: f64
+        cut: f64
+        per_pitch: bool
+        views: i64
+        glove: f64
+        spread: f64
+
+    # A pitch: when it is released, its flight at 1/240 s a point, and where
+    # and when it crosses the plate's plane.
+    struct Pitch:
+        at: mutable f64
+        ts: mutable f64[400]
+        xs: mutable f64[400]
+        ys: mutable f64[400]
+        zs: mutable f64[400]
+        count: mutable i64
+        cross_x: mutable f64
+        cross_y: mutable f64
+        cross_t: mutable f64
+
+    struct Game:
+        level: mutable Grade
+        pitches: mutable Pitch[6]
+        cut_at: mutable f64[1024]
+        cut_view: mutable i64[1024]
+        cuts: mutable i64
+        seconds: mutable f64
+        valid: mutable bool
+
+    struct Two:
+        x: f64
+        y: f64
+
+    struct Axes:
+        right: Two
+        up: Two
+
+    struct Run:
+        game: Game
+        t: mutable f64
+        glove_x: mutable f64
+        glove_y: mutable f64
+        next: mutable i64
+        caught: mutable i64
+        missed: mutable i64
+        flashed: mutable bool
+        flash_t: mutable f64
+        flash_got: mutable bool
+        result: mutable i64
+        notes: mutable darray[DrShapeDeal::Note]
+
+    @inline(never)
+    def sine(angle: f64) -> f64:
+        return sin(angle)
+
+    @inline(never)
+    def cosine(angle: f64) -> f64:
+        return cos(angle)
+
+    # Python's min and max of two: the first unless the second is strictly
+    # less (more).
+    def py_min(a: f64, b: f64) -> f64:
+        return b if b < a else a
+
+    def py_max(a: f64, b: f64) -> f64:
+        return b if b > a else a
+
+    # CPython 3.12's sum() of floats: 0, then a Neumaier-compensated sum,
+    # the compensation added only if it is non-zero and finite.
+    def psum3(a: f64, b: f64, c: f64) -> f64:
+        terms: f64[3] = [a, b, c]
+        total: mutable f64 = 0.0
+        low: mutable f64 = 0.0
+        for k in 0..<3 |terms, total, low|:
+            x: f64 = terms[k.usize()]
+            t: f64 = total + x
+            if fabs(total) >= fabs(x):
+                low <- low + ((total - t) + x)
+            else:
+                low <- low + ((x - t) + total)
+            total <- t
+        return total + low if low != 0.0 and low - low == 0.0 else total
+
+    def expovariate(draw: mutable MT19937&, rate: f64) -> f64:
+        can Abort.Panic:
+            return -log(1.0 - py_random(draw)) / rate
+
+    def grade(rung: i64) -> Grade:
+        can Abort.Panic:
+            r: i64 = rung if rung > 1 else 1
+            if r == 1:
+                return Grade{rung: r, pitches: 4, misses: 1, speed: 13.5, curve: 0.0, cut: 0.0, per_pitch: false, views: 1,
+                    glove: 0.24, spread: 0.55}
+            if r < 4:
+                return Grade{rung: r, pitches: 5, misses: 1, speed: 15.5 + (2 * (r - 2)).f64(), curve: 0.0, cut: 0.0,
+                    per_pitch: true, views: 3, glove: 0.22, spread: 0.6}
+            if r < 7:
+                return Grade{rung: r, pitches: 5, misses: 0, speed: 19.0 + 1.5 * (r - 4).f64(), curve: 0.0,
+                    cut: 1.2 - 0.1 * (r - 4).f64(), per_pitch: true, views: 4, glove: 0.2, spread: 0.6}
+            if r < 10:
+                return Grade{rung: r, pitches: 5, misses: 0, speed: 23.0, curve: 0.6 + 0.2 * (r - 7).f64(),
+                    cut: 0.8 - 0.05 * (r - 7).f64(), per_pitch: true, views: 5, glove: 0.19, spread: 0.6}
+            if r < 13:
+                return Grade{rung: r, pitches: 6, misses: 0, speed: 25.0, curve: 1.0, cut: 0.6 - 0.05 * (r - 10).f64(),
+                    per_pitch: true, views: 7, glove: 0.18, spread: 0.55}
+            k: f64 = (r - 13).f64()
+            return Grade{rung: r, pitches: 6, misses: 0, speed: py_min(40.0, 26.0 + 0.7 * k), curve: 1.2,
+                cut: py_max(0.1, 0.45 * pow(0.9, k)), per_pitch: true, views: 7,
+                glove: py_max(0.12, 0.17 * pow(0.97, k)), spread: 0.5}
+
+    # VIEWS: the eye and the point looked at.
+    def eye(view: i64) -> f64[3]:
+        return [0.0, 1.6, -5.0] if view == 0
+        return [1.2, 2.6, 23.0] if view == 1
+        return [-7.0, 1.6, 4.0] if view == 2
+        return [6.0, 2.2, -1.5] if view == 3
+        return [-2.5, 0.25, -2.0] if view == 4
+        return [0.5, 8.5, -3.5] if view == 5
+        return [4.0, 5.0, 10.0]
+
+    def look(view: i64) -> f64[3]:
+        return [0.0, 1.6, 9.0] if view == 0
+        return [0.0, 1.1, 0.0] if view == 1
+        return [0.0, 1.1, 1.0] if view == 2
+        return [0.0, 1.1, 2.0] if view == 3
+        return [0.0, 1.3, 1.5] if view == 4
+        return [0.0, 0.6, 2.0] if view == 5
+        return [0.0, 1.0, 0.0]
+
+    # throw: a pitch from the mound to (aim_x, aim_y) on the plate, bent by
+    # the spin (sx, sy), released at *at*.
+    def throw(level: Grade, aim_x: f64, aim_y: f64, sx: f64, sy: f64, at: f64, p: mutable Pitch&):
+        can Abort.Panic:
+            v: f64 = level.speed
+            x: mutable f64 = RELEASE_X
+            y: mutable f64 = RELEASE_Y
+            z: mutable f64 = MOUND
+            t_fly: f64 = MOUND / v
+            # aim so that gravity and the spin's bend bring it onto the aim
+            vx: mutable f64 = (aim_x - x) / t_fly - 0.5 * sx * t_fly
+            vy: mutable f64 = (aim_y - y) / t_fly + 0.5 * (9.81 - sy) * t_fly
+            vz: f64 = -v
+            p.at <- at
+            p.ts[0] <- 0.0
+            p.xs[0] <- x
+            p.ys[0] <- y
+            p.zs[0] <- z
+            n: mutable i64 = 1
+            t: mutable f64 = 0.0
+            dt: f64 = 1.0 / 240.0
+            while z > 0.0 |p, sx, sy, vz, dt, x, y, z, vx, vy, t, n|:
+                vx <- vx + sx * dt
+                vy <- vy + (sy - 9.81) * dt
+                x <- x + vx * dt
+                y <- y + vy * dt
+                z <- z + vz * dt
+                t <- t + dt
+                p.ts[n.usize()] <- t
+                p.xs[n.usize()] <- x
+                p.ys[n.usize()] <- y
+                p.zs[n.usize()] <- z
+                n <- n + 1
+            p.count <- n
+            ax: f64 = p.xs[(n - 2).usize()]
+            ay: f64 = p.ys[(n - 2).usize()]
+            az: f64 = p.zs[(n - 2).usize()]
+            s: f64 = az / (az - z)
+            p.cross_x <- ax + (x - ax) * s
+            p.cross_y <- ay + (y - ay) * s
+            p.cross_t <- t - dt * (1.0 - s)
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Game:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            game: mutable Game = zeroed
+            game.level <- grade(rung)
+            level: Grade = game.level
+            times: mutable f64[1024] = zeroed
+            for _ in 0..<200 |draw, game, level, times|:
+                at: mutable f64 = 2.0
+                last_x: mutable f64 = REST_X
+                last_y: mutable f64 = REST_Y
+                for k in 0..<level.pitches |draw, game, level, at, last_x, last_y|:
+                    aim_x: mutable f64 = 0.0
+                    aim_y: mutable f64 = 0.0
+                    for _j in 0..<50 |draw, level, aim_x, aim_y, last_x, last_y|:
+                        aim_x <- REST_X + py_uniform(draw, -1.0, 1.0) * level.spread
+                        aim_y <- REST_Y + py_uniform(draw, -1.0, 1.0) * level.spread
+                        break if (py_hypot(aim_x - REST_X, aim_y - REST_Y) > level.glove * 1.6 and
+                            py_hypot(aim_x - last_x, aim_y - last_y) > level.glove * 1.6)
+                    a: f64 = py_uniform(draw, 0.0, 2.0 * PI)
+                    bend: f64 = level.curve * pow(level.speed, 2.0) / MOUND * 0.15
+                    throw(level, aim_x, aim_y, bend * cosine(a), bend * sine(a), at, &game.pitches[k.usize()])
+                    last_x <- aim_x
+                    last_y <- aim_y
+                    at <- at + (game.pitches[k.usize()].cross_t + py_uniform(draw, 1.6, 2.4))
+                game.seconds <- at
+                game.cut_at[0] <- 0.0
+                game.cut_view[0] <- 0
+                game.cuts <- 1
+                view: mutable i64 = 0
+                if level.views > 1:
+                    view <- py_randbelow(draw, level.views.u64()).i64()
+                    game.cut_view[0] <- view
+                    count: mutable i64 = 0
+                    if level.per_pitch:
+                        for k in 1..<level.pitches |game, times, count|:
+                            times[count.usize()] <- game.pitches[k.usize()].at - 0.8
+                            count <- count + 1
+                    if level.cut != 0.0:
+                        t: mutable f64 = 0.0
+                        while t < game.seconds and count < MOST_CUTS - 1 |draw, game, level, times, count, t|:
+                            t <- t + (expovariate(draw, 1.0 / level.cut) + 0.08)
+                            times[count.usize()] <- t
+                            count <- count + 1
+                    # sorted(): stable, ascending
+                    for i in 1..<count |times|:
+                        j: mutable i64 = i
+                        while j > 0 and times[(j - 1).usize()] > times[j.usize()] |times, j|:
+                            held: f64 = times[j.usize()]
+                            times[j.usize()] <- times[(j - 1).usize()]
+                            times[(j - 1).usize()] <- held
+                            j <- j - 1
+                    for i in 0..<count |draw, game, level, times, view|:
+                        nv: i64 = py_randbelow(draw, (level.views - 1).u64()).i64()
+                        view <- nv if nv < view else nv + 1
+                        game.cut_at[game.cuts.usize()] <- times[i.usize()]
+                        game.cut_view[game.cuts.usize()] <- view
+                        game.cuts <- game.cuts + 1
+                game.valid <- true
+                if play(game, true) == CAUGHT and play(game, false) != CAUGHT:
+                    return game
+            return zeroed
+
+    # _project: where a point lands on the screen, up to scale, through the
+    # same pinhole the screen draws with; x runs the other way.
+    def project(view: i64, px: f64, py: f64, pz: f64) -> Two:
+        can Abort.Panic:
+            e: f64[3] = eye(view)
+            l: f64[3] = look(view)
+            f0: f64 = l[0] - e[0]
+            f1: f64 = l[1] - e[1]
+            f2: f64 = l[2] - e[2]
+            n: f64 = sqrt(psum3(f0 * f0, f1 * f1, f2 * f2))
+            g0: f64 = f0 / n
+            g1: f64 = f1 / n
+            g2: f64 = f2 / n
+            flat: bool = fabs(g1) < 0.999
+            u0: f64 = 0.0
+            u1: f64 = 1.0 if flat else 0.0
+            u2: f64 = 0.0 if flat else 1.0
+            r0: f64 = u1 * g2 - u2 * g1
+            r1: f64 = u2 * g0 - u0 * g2
+            r2: f64 = u0 * g1 - u1 * g0
+            rn: f64 = sqrt(psum3(r0 * r0, r1 * r1, r2 * r2))
+            s0: f64 = r0 / rn
+            s1: f64 = r1 / rn
+            s2: f64 = r2 / rn
+            v0: f64 = g1 * s2 - g2 * s1
+            v1: f64 = g2 * s0 - g0 * s2
+            v2: f64 = g0 * s1 - g1 * s0
+            d0: f64 = px - e[0]
+            d1: f64 = py - e[1]
+            d2: f64 = pz - e[2]
+            depth: f64 = py_max(1e-3, psum3(d0 * g0, d1 * g1, d2 * g2))
+            return Two{x: -psum3(d0 * s0, d1 * s1, d2 * s2) / depth, y: psum3(d0 * v0, d1 * v1, d2 * v2) / depth}
+
+    # axes: the ways across the plate's plane that move the glove right and
+    # up on the screen as the camera shows it, as seen at (x, y).
+    def axes(view: i64, x: f64, y: f64) -> Axes:
+        can Abort.Panic:
+            e: f64 = 0.01
+            p0: Two = project(view, x, y, 0.0)
+            px: Two = project(view, x + e, y, 0.0)
+            py: Two = project(view, x, y + e, 0.0)
+            j0: f64 = (px.x - p0.x) / e
+            j1: f64 = (py.x - p0.x) / e
+            j2: f64 = (px.y - p0.y) / e
+            j3: f64 = (py.y - p0.y) / e
+            h: f64 = py_hypot(j0, j1)
+            rn: f64 = h if h != 0.0 else 1e-9
+            k: f64 = py_hypot(j2, j3)
+            un: f64 = k if k != 0.0 else 1e-9
+            return Axes{right: Two{x: j0 / rn, y: j1 / rn}, up: Two{x: j2 / un, y: j3 / un}}
+
+    def begin(g: Game) -> Run:
+        can Abort.Panic, Memory.Allocate:
+            return Run{game: g, t: 0.0, glove_x: REST_X, glove_y: REST_Y, next: 0, caught: 0, missed: 0, flashed: false,
+                flash_t: 0.0, flash_got: false, result: LIVE, notes: []}
+
+    def view(run: Run&) -> i64:
+        can Abort.Panic:
+            v: mutable i64 = 0
+            for c in 0..<run.game.cuts |run, v|:
+                break if run.game.cut_at[c.usize()] > run.t
+                v <- run.game.cut_view[c.usize()]
+            return v
+
+    # The ball in flight, if any: its index among the pitches and the point.
+    def ball(run: Run&) -> i64:
+        can Abort.Panic:
+            for k in 0..<run.game.level.pitches |run|:
+                p: Pitch& = &run.game.pitches[k.usize()]
+                dt: f64 = run.t - p.at
+                return k if 0.0 <= dt and dt <= p.cross_t
+            return -1
+
+    def ball_point(run: Run&, k: i64) -> f64[3]:
+        can Abort.Panic:
+            p: Pitch& = &run.game.pitches[k.usize()]
+            dt: f64 = run.t - p.at
+            i: mutable i64 = (dt * 240.0).i64()
+            i <- p.count - 1 if p.count - 1 < i
+            return [p.xs[i.usize()], p.ys[i.usize()], p.zs[i.usize()]]
+
+    def shift(run: mutable Run&, dx: f64, dy: f64):
+        run.glove_x <- py_max(BOX_X0, py_min(BOX_X1, run.glove_x + dx))
+        run.glove_y <- py_max(BOX_Y0, py_min(BOX_Y1, run.glove_y + dy))
+
+    def note(run: mutable Run&, dur: f64, freq: f64, voice: i64, gain: f64):
+        can Abort.Panic, Memory.Allocate:
+            run.notes.push(DrShapeDeal::Note{t: run.t, dur: dur, freq: freq, pan: 0.0, pan2: 0.0, gain: gain, gain2: gain,
+                bright: 0.8, voice: voice, seed: run.notes.count.i64() + 1, who: -1, room: 0.0})
+
+    def step(run: mutable Run&, dt: f64, control: i64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            run.t <- run.t + dt
+            if control >= 0 and control < PORTS:
+                way: Axes = axes(view(run), run.glove_x, run.glove_y)
+                dx: mutable f64 = way.up.x
+                dy: mutable f64 = way.up.y
+                if control == DOWN:
+                    dx <- -way.up.x
+                    dy <- -way.up.y
+                elif control == RIGHT:
+                    dx <- way.right.x
+                    dy <- way.right.y
+                elif control == LEFT:
+                    dx <- -way.right.x
+                    dy <- -way.right.y
+                shift(run, dx * GLOVE_SPEED * dt, dy * GLOVE_SPEED * dt)
+            while run.next < run.game.level.pitches |run|:
+                p: Pitch& = &run.game.pitches[run.next.usize()]
+                break if run.t < p.at + p.cross_t
+                run.next <- run.next + 1
+                got: bool = py_hypot(p.cross_x - run.glove_x, p.cross_y - run.glove_y) <= run.game.level.glove
+                run.flashed <- true
+                run.flash_t <- run.t
+                run.flash_got <- got
+                if got:
+                    run.caught <- run.caught + 1
+                    note(run, 0.12, 220.0, WOOD, 0.6)
+                else:
+                    run.missed <- run.missed + 1
+                    note(run, 0.3, 110.0, GROWL, 0.4)
+                    if run.missed > run.game.level.misses:
+                        run.result <- MISSED
+                        return
+            run.result <- CAUGHT if run.next >= run.game.level.pitches
+
+    # The reference autopilot: knows where each pitch will cross from the
+    # moment it leaves the hand, until then waits at the middle, and moves
+    # the glove the screen way that best closes the gap. -1 is no port.
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE or run.next >= run.game.level.pitches
+            p: Pitch& = &run.game.pitches[run.next.usize()]
+            seen: bool = run.t >= p.at
+            ex: f64 = (p.cross_x if seen else REST_X) - run.glove_x
+            ey: f64 = (p.cross_y if seen else REST_Y) - run.glove_y
+            gap: f64 = py_hypot(ex, ey)
+            return -1 if gap < GLOVE_SPEED / 30.0 * 0.6
+            way: Axes = axes(view(run), run.glove_x, run.glove_y)
+            best: mutable f64 = 0.0
+            port: mutable i64 = -1
+            ways: f64[8] = [way.up.x, way.up.y, -way.up.x, -way.up.y, way.right.x, way.right.y, -way.right.x, -way.right.y]
+            order: i64[4] = [UP, DOWN, RIGHT, LEFT]
+            for i in 0..<4 |ways, order, ex, ey, gap, best, port|:
+                gain: f64 = (ways[(2 * i).usize()] * ex + ways[(2 * i + 1).usize()] * ey) / gap
+                if gain > best:
+                    best <- gain
+                    port <- order[i.usize()]
+            return -1 if port < 0 or best < 0.2
+            return port
+
+    # play(): one inning at 1/30 s a step, the autopilot asked every step,
+    # or nobody at the glove.
+    def play(g: Game, piloted: bool) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            run: mutable Run = begin(g)
+            while run.result == LIVE |run, piloted|:
+                step(&run, 1.0 / 30.0, pilot(&run) if piloted else -1)
+            return run.result

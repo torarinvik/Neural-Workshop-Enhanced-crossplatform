@@ -1,0 +1,108 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/scene_airhockey.elisa"
+
+extern printf(format: cstr, ...) -> i32 can[Console.Write]
+
+# Air Hockey frames for airhockey_scene_diff.py, which draws the same states
+# with the reference's own AirHockey._scene and requires every one of its
+# shapes, polygons and labels to appear, in order, in these frames.
+#
+# The states are the ones the scene branches on: the ready and done screens,
+# a posed table with a score, the serve-wait blink that HIDES the puck, the
+# camera seen from the far end (where the keeper bar is drawn first and the
+# draw order of puck and mallets reverses), and a whole autopiloted game
+# through its verdict.
+
+def frame(game: AirHockeyGame::Session&, name: cstr):
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        region scratch(65536):
+            in scratch:
+                list: mutable Display::DisplayList = Display::DisplayList()
+                SceneAirHockey::render(&list, game, true)
+                _ = printf("frame %s %lld %lld %lld %lld %lld %lld\n", name, game.phase, game.rung,
+                    game.trial, game.wins, game.run.score[0], game.run.score[1])
+                for cmd in list.commands |list|:
+                    if cmd.kind == Display::CMD_TEXT:
+                        for i in 0..<(cmd.len & 0xffffff.u32()).i64() |list, cmd|:
+                            _ = printf("%c", list.pool[(cmd.ref.i64() + i).usize()].i32())
+                        _ = printf("\n")
+                    elif cmd.kind == Display::CMD_POLYGON or cmd.kind == Display::CMD_POLY_POINT:
+                        _ = printf("poly %u %u %u %.7g %.7g\n", cmd.kind, cmd.color, cmd.len, cmd.a.f64(), cmd.b.f64())
+                    elif cmd.kind == Display::CMD_LINE or cmd.kind == Display::CMD_CIRCLE or cmd.kind == Display::CMD_RECT:
+                        _ = printf("shape %u %u %.7g %.7g %.7g %.7g\n", cmd.kind, cmd.color,
+                            cmd.a.f64(), cmd.b.f64(), cmd.c.f64(), cmd.d.f64())
+                _ = printf("end\n")
+
+# The same mid-game table on both sides: puck, both mallets, the bar and a
+# score, with the serve wait over so nothing blinks.
+def pose(game: mutable AirHockeyGame::Session&, time: f64):
+    can Abort.Panic:
+        game.run.time <- time
+        game.run.wait <- 0.0
+        game.run.puck <- AirHockey::point(0.2, 0.8)
+        game.run.mine <- AirHockey::point(-0.3, 0.35)
+        game.run.theirs <- AirHockey::point(0.25, 1.6)
+        game.run.keeper <- 0.1
+        game.run.score[0] <- 1
+        game.run.score[1] <- 0
+
+def main() -> i32:
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        game: mutable AirHockeyGame::Session = AirHockeyGame::initialize(1, 1, true, 17)
+        frame(&game, "ready")
+        _ = AirHockeyGame::start(&game, 0.0) can Global{Read,Write}
+        frame(&game, "start")
+
+        pose(&game, 1.25)
+        frame(&game, "posed")
+
+        # int(t * 6) is odd at t = 0.2 and the serve is still pending, so the
+        # puck -- and only the puck -- is skipped this frame.
+        game.run.time <- 0.2
+        game.run.wait <- 0.5
+        frame(&game, "blink")
+        AirHockeyGame::close(&game) can Global{Read,Write}
+
+        # Rung 20 swings the camera 22 degrees and flips it to the far end
+        # inside each dealt window; half a second into the first one.
+        game <- AirHockeyGame::initialize(20, 1, true, 17)
+        _ = AirHockeyGame::start(&game, 0.0) can Global{Read,Write}
+        if game.run.game.flip_count < 1:
+            return 1
+        pose(&game, game.run.game.flips[0].x + 0.5)
+        if not AirHockey::far_end(&game.run):
+            return 2
+        frame(&game, "far")
+        AirHockeyGame::close(&game) can Global{Read,Write}
+
+        game <- AirHockeyGame::initialize(1, 1, true, 17)
+        _ = AirHockeyGame::start(&game, 0.0) can Global{Read,Write}
+        t: mutable f64 = 0.0
+        while game.phase == AirHockeyGame::PLAYING and t < 80.0 |game, t|:
+            port: i64 = AirHockey::pilot(&game.run)
+            _ = AirHockeyGame::input(&game, port) can Global{Read,Write}
+            t <- t + 1.0 / 60.0
+            _ = AirHockeyGame::advance(&game, t) can Global{Read,Write}
+        frame(&game, "judged")
+        _ = AirHockeyGame::advance(&game, t + 2.49) can Global{Read,Write}
+        frame(&game, "hold")
+        _ = AirHockeyGame::advance(&game, t + 2.5) can Global{Read,Write}
+        frame(&game, "done")
+        AirHockeyGame::close(&game) can Global{Read,Write}
+
+        # The options dialog's note for every rung it offers, plus the edges
+        # of grade(): below one, and past the top of the table.
+        rungs: i64[11] = [1, 4, 7, 10, 13, 16, 20, 25, 30, 0, 200]
+        for i in 0..<11 |rungs|:
+            region note(4096):
+                in note:
+                    text: mutable dstr = []
+                    SceneAirHockey::option_note(rungs[i.usize()], &text)
+                    _ = printf("note %lld ", rungs[i.usize()])
+                    view: sview = bytes_view(text)
+                    for j in 0..<sview_len(view).i64() |view|:
+                        _ = printf("%c", sview_at(view, j.usize()).i32())
+                    _ = printf("\n")
+        return 0

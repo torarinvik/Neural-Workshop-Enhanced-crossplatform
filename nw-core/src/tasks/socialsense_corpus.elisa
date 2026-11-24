@@ -1,0 +1,171 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_json.elisa"
+include "./socialsense.elisa"
+
+extend SocialSense:
+    # Every kind socialdata files under "social": "social" itself and
+    # "social:<what>".
+    def social_kind(name: sview) -> bool:
+        can Abort.Panic:
+            size: i64 = sview_len(name).i64()
+            prefix: cstr = "social:"
+            for i in 0..<6 |name, size, prefix|:
+                return false if i >= size or sview_at(name, i.usize()) != sview_at(sview(prefix, 0, -1), i.usize())
+            return size == 6 or sview_at(name, 6) == 58.u8()
+
+    # The pool a kind fills: "social:" and one of the ladder's names.
+    def pool_of(kind: dstr) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            for k in 0..<KINDS |kind|:
+                name: mutable dstr = []
+                dstr_append_cstr(&name, "social:")
+                dstr_append_cstr(&name, kind_name(k))
+                return k if same_prompt(name, kind)
+            return -1
+
+    def copy_question_text(text: sview) -> dstr:
+        can Abort.Panic, Memory.Allocate:
+            result: mutable dstr = []
+            dstr_append_sview(&result, text)
+            return result
+
+    struct Decoded:
+        question: Question
+        valid: bool
+
+    def decode_question[@r](arena: mutable Arena& @r, line: sview) -> Decoded:
+        can Memory.Allocate, Abort.Panic:
+            parsed: JsonParseResult[r] = json_parse_checked(arena, line) can Global{Read,Write}
+            return zeroed if parsed.code != JsonErrorCode.OK
+            root: JsonValueHandle[r] = json_handle_from_result(parsed)
+            kind_node: JsonValueHandle[r] = try json_handle_get(root, "kind") else json_handle_null(root)
+            name: sview @r = try json_handle_as_string(kind_node) else ""
+            return zeroed if not social_kind(name)
+            prompt_node: JsonValueHandle[r] = try json_handle_get(root, "prompt") else json_handle_null(root)
+            ask_node: JsonValueHandle[r] = try json_handle_get(root, "ask") else json_handle_null(root)
+            options_node: JsonValueHandle[r] = try json_handle_get(root, "options") else json_handle_null(root)
+            answer_node: JsonValueHandle[r] = try json_handle_get(root, "answer") else json_handle_null(root)
+            answer: f64 = try json_handle_as_number(answer_node) else -1.0
+            count: i64 = json_handle_array_len(options_node)
+            return zeroed if answer < 0.0 or answer >= count.f64() or answer != answer.i64().f64()
+            return zeroed if count < 2 or count > ReadingQuiz::PORTS
+            return zeroed if not json_handle_is_string(prompt_node) or not json_handle_is_string(ask_node)
+            prompt: sview @r = try json_handle_as_string(prompt_node) else ""
+            ask: sview @r = try json_handle_as_string(ask_node) else ""
+            options: mutable darray[dstr] = []
+            for i in 0..<count |root, options_node, options|:
+                node: JsonValueHandle[r] = try json_handle_at(options_node, i) else json_handle_null(root)
+                return zeroed if not json_handle_is_string(node)
+                text: sview @r = try json_handle_as_string(node) else ""
+                label: dstr = copy_question_text(text)
+                options.push(label)
+            return Decoded{question: Question{kind: copy_question_text(name), prompt: copy_question_text(prompt), ask: copy_question_text(ask), options: options, answer: answer.i64()}, valid: true}
+
+    def take_line(loaded: mutable darray[Question]&, owner: mutable Arena&, line: sview):
+        can Memory.Allocate, Abort.Panic:
+            in owner:
+                decoded: Decoded = decode_question(owner, line) can Global{Read,Write}
+                loaded.push(decoded.question) if decoded.valid
+
+    def words_of(words: cstr) -> dstr:
+        can Abort.Panic, Memory.Allocate:
+            result: mutable dstr = []
+            dstr_append_cstr(&result, words)
+            return result
+
+    def put(loaded: mutable darray[Question]&, kind: cstr, prompt: cstr, ask: cstr, first: cstr, second: cstr, third: cstr):
+        can Abort.Panic, Memory.Allocate:
+            options: mutable darray[dstr] = []
+            options.push(words_of(first))
+            options.push(words_of(second))
+            options.push(words_of(third))
+            loaded.push(Question{kind: words_of(kind), prompt: words_of(prompt), ask: words_of(ask), options: options, answer: 0})
+
+    # socialdata.SEED's social questions, standing in when none is fetched.
+    def seed_questions(loaded: mutable darray[Question]&):
+        can Memory.Allocate, Abort.Panic:
+            put(loaded, "social:feel", "Sam forgot his best friend’s birthday and only remembered the day after.",
+                "How would Sam feel afterwards?", "guilty", "proud", "bored")
+            put(loaded, "social:why", "Sam forgot his best friend’s birthday and only remembered the day after.",
+                "What will Sam want to do next?", "apologise to his friend", "throw a party for himself", "forget it again")
+            put(loaded, "social:need", "Ana held the door open for the man carrying two heavy boxes.",
+                "What does Ana need to do before this?", "see the man coming", "carry the boxes", "lock the door")
+            put(loaded, "social:why", "Ana held the door open for the man carrying two heavy boxes.",
+                "Why did Ana do this?", "to be helpful", "to keep him out", "to cool the room")
+            put(loaded, "social:want", "Lee finished cooking a large dinner for the family.",
+                "What will Lee want to do next?", "call everyone to the table", "start cooking dinner", "buy the groceries")
+            put(loaded, "social:need", "Kim drove to the beach for the weekend.",
+                "What does Kim need to do before this?", "pack a bag", "swim in the sea", "drive home")
+            put(loaded, "social:others_feel", "Jo told the whole class the answer before the teacher could ask anyone.",
+                "How would others feel as a result?", "annoyed", "grateful to Jo", "sleepy")
+            put(loaded, "social:describe", "Max gave his lunch to a classmate who had forgotten his.",
+                "How would you describe Max?", "generous", "greedy", "forgetful")
+
+    # socialdata.questions(): D.of("social") is the kind "social" itself,
+    # then each "social:<what>" in the order it first appears.
+    def social_order(loaded: darray[Question]&) -> darray[Question]:
+        can Memory.Allocate, Abort.Panic:
+            kinds: mutable darray[dstr] = []
+            plain: mutable dstr = []
+            dstr_append_cstr(&plain, "social")
+            for question in loaded:
+                known: mutable bool = same_prompt(question.kind, plain)
+                for kind in kinds |known, question|:
+                    known <- known or same_prompt(kind, question.kind)
+                kinds.push(question.kind) if not known
+            ordered: mutable darray[Question] = []
+            for question in loaded |ordered, plain|:
+                ordered.push(question) if same_prompt(question.kind, plain)
+            for kind in kinds |ordered, loaded|:
+                for question in loaded |ordered, kind|:
+                    ordered.push(question) if same_prompt(question.kind, kind)
+            return ordered
+
+    # _situations(): the questions grouped by prompt, kept when they ask at
+    # least two different things, then sorted.
+    def situations_of(social: darray[Question]&) -> darray[Situation]:
+        can Memory.Allocate, Abort.Panic:
+            groups: mutable darray[Situation] = []
+            for question in social |groups|:
+                found: mutable i64 = -1
+                for g in 0..<groups.count.i64() |groups, question, found|:
+                    found <- g if found < 0 and same_prompt(groups[g.usize()].questions[0].prompt, question.prompt)
+                if found < 0:
+                    groups.push(Situation{questions: [question]})
+                else:
+                    groups[found.usize()].questions.push(question)
+            kept: mutable darray[Situation] = []
+            for group in groups |kept|:
+                asks: mutable i64 = 0
+                for i in 0..<group.questions.count.i64() |group, asks|:
+                    first: mutable bool = true
+                    for j in 0..<i |group, first, i|:
+                        first <- false if same_prompt(group.questions[j.usize()].ask, group.questions[i.usize()].ask)
+                    asks <- asks + 1 if first
+                kept.push(group) if asks >= 2
+            order: darray[i64] = sort_situations(&kept)
+            sorted: mutable darray[Situation] = []
+            for index in order |sorted, kept|:
+                sorted.push(kept[index.usize()])
+            return sorted
+
+    # The original questions.jsonl replaces every social question once it
+    # has any.
+    def from_question_cache(owner: mutable Arena&, text: sview) -> Corpus:
+        can Memory.Allocate, Abort.Panic:
+            loaded: mutable darray[Question] = []
+            size: i64 = sview_len(text).i64()
+            start: mutable i64 = 0
+            for i in 0..<(size + 1) |start, size, text, loaded, owner|:
+                if i == size or sview_at(text, i.usize()) == 10.u8():
+                    if i > start:
+                        take_line(&loaded, owner, string_view_slice(text, start, i)) can Global{Read,Write}
+                    start <- i + 1
+            in owner:
+                seed_questions(&loaded) if loaded.count == 0.usize()
+                corpus: mutable Corpus = zeroed
+                for question in loaded |corpus|:
+                    pool: i64 = pool_of(question.kind)
+                    corpus.pools[pool.usize()].push(question) if pool >= 0
+                social: darray[Question] = social_order(&loaded)
+                corpus.situations <- situations_of(&social)
+                return corpus

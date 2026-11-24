@@ -1,0 +1,199 @@
+include "../pyrandom.elisa"
+
+module WhatNext:
+    const MAX_CLIPS: i64 = 7
+    const MAX_CANDIDATES: i64 = 16
+    const MOST_CHOICES: i64 = 6
+    const OTHER: i64 = 0
+    const REVERSED: i64 = 1
+    const LATER: i64 = 2
+    const REPLAY: i64 = 3
+    const EARLIER: i64 = 4
+    const SKIPPED: i64 = 5
+    const TRUTH: i64 = 6
+
+    struct Grade:
+        rung: i64
+        choices: i64
+        kinds: i64
+        context: f64
+
+    # Store every 97th RGB byte, beginning at byte zero, for each frame.
+    # Presentation retains full frames in the host. All frames of one video
+    # have a uniform sample count, which may differ between clips.
+    struct Clip:
+        frames: i64
+        stride: i64
+        offset: i64
+
+    struct Group:
+        clips: mutable Clip[MAX_CLIPS]
+        count: mutable i64
+
+    struct Candidates:
+        kinds: mutable i64[MAX_CANDIDATES]
+        count: mutable i64
+
+    struct Slice:
+        clip: i64  # 0 is the opening clip, 1.. are additional clips
+        start: i64
+        length: i64
+        step: i64
+
+    struct Choice:
+        kind: i64
+        slice: Slice
+
+    struct Puzzle:
+        opening: Slice
+        options: mutable Choice[MOST_CHOICES]
+        count: i64
+        answer: i64
+
+    def grade(rung: i64) -> Grade:
+        can Abort.Panic:
+            r: i64 = rung if rung > 0 else 1
+            choices: i64 = 6 if r >= 13 else 2 + (r - 1) / 3
+            kinds: i64 = 1 if r < 4 else (3 if r < 8 else (31 if r < 12 else (63 if r < 16 else 62)))
+            context: f64 = 1.0 if r <= 20 else (0.25 if r >= 30 else 1.0 - 0.075 * (r - 20).f64())
+            return Grade{rung: r, choices: choices, kinds: kinds, context: context}
+
+    def has_kind(level: Grade&, kind: i64) -> bool:
+        return (level.kinds & (1 << kind)) != 0
+
+    def cut(length: i64) -> i64:
+        can Abort.Panic:
+            return (length.f64() * 0.4).i64()
+
+    def piece(length: i64) -> i64:
+        can Abort.Panic:
+            fraction: i64 = (length.f64() * 0.15).i64()
+            return 4 if fraction < 4 else (20 if fraction > 20 else fraction)
+
+    def valid(clip: Clip&, bytes: i64) -> bool:
+        can Abort.Panic:
+            return clip.frames > 0 and clip.stride > 0 and clip.offset >= 0 and clip.offset <= bytes and clip.frames <= (bytes - clip.offset) / clip.stride
+
+    def sample_diff(samples: u8&, one: Clip&, a: i64, two: Clip&, b: i64) -> bool:
+        can Abort.Panic:
+            count: i64 = one.stride if one.stride <= two.stride else two.stride
+            left: i64 = one.offset + a * one.stride
+            right: i64 = two.offset + b * two.stride
+            total: mutable i64 = 0
+            for i in 0..<count |samples, left, right, total|:
+                delta: i64 = samples[(left + i).usize()].i64() - samples[(right + i).usize()].i64()
+                total <- total + (delta if delta >= 0 else -delta)
+            return total >= count * 4
+
+    def separated(samples: u8&, one: Clip&, a: Slice&, two: Clip&, b: Slice&) -> bool:
+        can Abort.Panic:
+            middle: i64 = (a.length if a.length <= b.length else b.length) / 2
+            return sample_diff(samples, one, a.start, two, b.start) or
+                sample_diff(samples, one, a.start + middle * a.step, two, b.start + middle * b.step) or
+                sample_diff(samples, one, a.start + (a.length - 1) * a.step, two, b.start + (b.length - 1) * b.step)
+
+    def unlike(samples: u8&, group: Group&, a: Slice&, b: Slice&) -> bool:
+        can Abort.Panic:
+            return separated(samples, &group.clips[a.clip.usize()], a, &group.clips[b.clip.usize()], b)
+
+    def decoy(kind: i64, group: Group&, bytes: i64, other: i64, end: i64, width: i64) -> Slice:
+        can Abort.Panic:
+            if kind == OTHER:
+                return zeroed if other >= group.count
+                clip: Clip& = &group.clips[other.usize()]
+                start: i64 = cut(clip.frames)
+                return zeroed if not valid(clip, bytes) or start + width > clip.frames
+                return Slice{clip: other, start: start, length: width, step: 1}
+            if kind == REVERSED:
+                return Slice{clip: 0, start: end + width - 1, length: width, step: -1}
+            start: i64 = end - width if kind == REPLAY else (end / 2 - width / 2 if kind == EARLIER else (end + 2 * width if kind == LATER else end + width / 2))
+            return zeroed if start < 0 or start + width > group.clips[0].frames
+            return Slice{clip: 0, start: start, length: width, step: 1}
+
+    def append(picks: mutable Candidates&, kind: i64):
+        can Abort.Panic:
+            picks.kinds[picks.count.usize()] <- kind
+            picks.count <- picks.count + 1
+
+    def order(level: Grade&, rng: mutable MT19937&) -> Candidates:
+        can Abort.Panic:
+            same: mutable Candidates = zeroed
+            for kind in REVERSED..<(SKIPPED + 1) |same, level|:
+                if has_kind(level, kind):
+                    append(&same, kind)
+            last: mutable i64 = same.count - 1
+            while last >= 1 |last, same, rng|:
+                pick: i64 = py_randbelow(rng, (last + 1).u64()).i64()
+                swapped: i64 = same.kinds[last.usize()]
+                same.kinds[last.usize()] <- same.kinds[pick.usize()]
+                same.kinds[pick.usize()] <- swapped
+                last <- last - 1
+            picks: mutable Candidates = zeroed
+            if has_kind(level, OTHER):
+                append(&picks, OTHER)
+                for at in 1..<(level.choices - 1) |picks, same|:
+                    append(&picks, same.kinds[(at - 1).usize()] if at <= same.count else OTHER)
+            else:
+                picks <- same
+            fallback: i64[5] = [REVERSED, REPLAY, LATER, EARLIER, SKIPPED]
+            for at in 0..<5 |fallback, picks, level|:
+                kind: i64 = fallback[at.usize()]
+                if has_kind(level, kind):
+                    append(&picks, kind)
+            if has_kind(level, OTHER):
+                for _at in 0..<6 |picks|:
+                    append(&picks, OTHER)
+            return picks
+
+    def build(group: Group&, samples: u8&, bytes: i64, level: Grade&, rng: mutable MT19937&) -> Puzzle:
+        can Abort.Panic:
+            return zeroed if group.count < 1 or group.count > MAX_CLIPS or not valid(&group.clips[0], bytes)
+            frames: i64 = group.clips[0].frames
+            end: i64 = cut(frames)
+            width: i64 = piece(frames)
+            return zeroed if end + width > frames or end < width
+            truth: Slice = Slice{clip: 0, start: end, length: width, step: 1}
+            candidates: Candidates = order(level, rng)
+            options: mutable Choice[MOST_CHOICES] = zeroed
+            picked: mutable i64 = 0
+            kinds: mutable i64 = 0
+            other: mutable i64 = 1
+            for candidate in 0..<candidates.count |candidates, group, samples, bytes, level, end, width, truth, options, picked, kinds, other|:
+                kind: i64 = candidates.kinds[candidate.usize()]
+                if picked == level.choices - 1:
+                    break
+                if kind != OTHER and (kinds & (1 << kind)) != 0:
+                    continue
+                stretch: Slice = decoy(kind, group, bytes, other, end, width)
+                if kind == OTHER and other < group.count:
+                    other <- other + 1
+                if stretch.length == 0 or not unlike(samples, group, &stretch, &truth):
+                    continue
+                distinct: mutable bool = true
+                for at in 0..<picked |options, group, samples, stretch, distinct|:
+                    distinct <- false if not unlike(samples, group, &stretch, &options[at.usize()].slice)
+                if distinct:
+                    options[picked.usize()] <- Choice{kind: kind, slice: stretch}
+                    kinds <- kinds | (1 << kind)
+                    picked <- picked + 1
+            return zeroed if picked < level.choices - 1
+            answer: i64 = py_randbelow(rng, level.choices.u64()).i64()
+            at: mutable i64 = picked
+            while at > answer |at, answer, options|:
+                options[at.usize()] <- options[(at - 1).usize()]
+                at <- at - 1
+            options[answer.usize()] <- Choice{kind: TRUTH, slice: truth}
+            context: i64 = (end.f64() * level.context).i64()
+            shown: i64 = context if context > width else width
+            opening: Slice = Slice{clip: 0, start: end - shown, length: shown, step: 1}
+            return Puzzle{opening: opening, options: options, count: level.choices, answer: answer}
+
+    def playback(puzzle: Puzzle&, stream: i64, tick: i64) -> i64:
+        can Abort.Panic:
+            return -1 if puzzle.count == 0 or stream < 0 or stream > puzzle.count or tick < 0
+            opened: i64 = puzzle.opening.length
+            at: i64 = tick % (opened + puzzle.options[0].slice.length)
+            if stream == 0:
+                return puzzle.opening.start + (at if at < opened else opened - 1)
+            choice: Slice = puzzle.options[(stream - 1).usize()].slice
+            return choice.start + (0 if at < opened else (at - opened) * choice.step)

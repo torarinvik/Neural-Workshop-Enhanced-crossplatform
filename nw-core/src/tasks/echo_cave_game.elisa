@@ -1,0 +1,227 @@
+include "./echo_cave_audio.elisa"
+
+module EchoCaveGame:
+    const READY: i64 = 0
+    const PLAYING: i64 = 1
+    const JUDGED: i64 = 2
+    const DONE: i64 = 3
+    const START: i64 = 9
+    const RELEASE_BASE: i64 = 10
+    const CLEAR: i64 = 14
+    const SUBSTEP: f64 = 1.0 / 120.0
+
+    struct Session:
+        rng: mutable MT19937
+        start_rung: i64
+        total: i64
+        adaptive: bool
+        rung: mutable i64
+        trial: mutable i64
+        phase: mutable i64
+        run: mutable EchoCave::Run
+        last_tick: mutable f64
+        deadline: mutable f64
+        passed_count: mutable i64
+        best_rung: mutable i64
+        verdict_published: mutable bool
+        held: mutable i64
+        pulse: mutable i64
+        heard_to: mutable f64
+        pointer_at: mutable f64
+        pointer: mutable EchoCave::Point
+
+    const BACK: f64 = 4.0
+    const FOCAL: f64 = 389.0 * 0.9
+    const CX: f64 = 456.0
+    const CY: f64 = 179.0 + 389.0 / 2.0
+
+    struct Camera:
+        x: f64
+        y: f64
+        z: f64
+
+    def camera(run: EchoCave::Run&) -> Camera:
+        z: f64 = run.z - BACK
+        center: EchoCave::Point = EchoCave::axis(&run.cave, z)
+        return Camera{x: 0.5 * (run.x + center.x), y: 0.5 * (run.y + center.y), z: z}
+
+    def initialize(rung: i64, total: i64, adaptive: bool, seed: i64) -> Session:
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            initial: i64 = rung if rung > 0 else 1
+            return Session{rng: rng, start_rung: initial, total: total, adaptive: adaptive,
+                rung: initial, trial: 0, phase: READY, run: zeroed, last_tick: 0.0,
+                deadline: 0.0, passed_count: 0, best_rung: 0, verdict_published: false,
+                held: 0, pulse: 0, heard_to: 0.0, pointer_at: -10.0, pointer: zeroed}
+
+    def allowed_rung(rung: i64) -> bool:
+        return rung == 1 or rung == 4 or rung == 7 or rung == 10 or rung == 13 or rung == 16 or rung == 20 or rung == 25 or rung == 30
+
+    def allowed_total(total: i64) -> bool:
+        return total == 1 or total == 3 or total == 5 or total == 10 or total == 20
+
+    def next_trial(session: mutable Session&, now: f64):
+        can Abort.Panic:
+            session.verdict_published <- false
+            session.last_tick <- now
+            session.pulse <- 0
+            if session.trial >= session.total:
+                session.phase <- DONE
+                return
+            seed: i64 = py_randbelow(&session.rng, 1073741824.u64()).i64()
+            session.run <- EchoCave::trial(EchoCave::deal(session.rung, seed))
+            session.heard_to <- 0.0
+            session.pointer_at <- -10.0
+            session.trial <- session.trial + 1
+            session.phase <- PLAYING
+
+    def start(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic:
+            return false if session.phase != READY and session.phase != DONE
+            session.rung <- session.start_rung
+            session.trial <- 0
+            session.passed_count <- 0
+            session.best_rung <- 0
+            next_trial(session, now)
+            return session.phase == PLAYING
+
+    def judge(session: mutable Session&, now: f64):
+        passed: bool = session.run.result == EchoCave::ESCAPED
+        if passed:
+            session.passed_count <- session.passed_count + 1
+            session.best_rung <- session.rung if session.rung > session.best_rung
+        if session.adaptive:
+            session.rung <- session.rung + 1 if passed and session.rung < 9223372036854775807
+            session.rung <- session.rung - 1 if not passed and session.rung > 1
+        session.phase <- JUDGED
+        session.deadline <- now + 2.5
+
+    def input(session: mutable Session&, action: i64, now: f64) -> bool:
+        can Abort.Panic:
+            return start(session, now) if action == START
+            return false if action < 0 or action > CLEAR
+            return EchoCave::click(&session.run) if action == EchoCave::CLICK and session.phase == PLAYING
+            return false if action >= 4 and action < RELEASE_BASE
+            prior: i64 = session.held
+            if action == CLEAR:
+                changed: bool = prior != 0 or session.pointer_at >= 0.0
+                session.held <- 0
+                session.pointer_at <- -10.0
+                return changed
+            elif action < START:
+                session.held <- prior | (1 << action.u64())
+            else:
+                bit: i64 = 1 << (action - RELEASE_BASE).u64()
+                session.held <- prior ^ (prior & bit)
+            return prior != session.held
+
+    def pointer_move(session: mutable Session&, x: f64, y: f64) -> bool:
+        return false if session.phase != PLAYING
+        return false if session.pointer_at >= 0.0 and x == session.pointer.x and y == session.pointer.y
+        session.pointer <- EchoCave::Point{x: x, y: y}
+        session.pointer_at <- session.run.time
+        return true
+
+    def key_mask(held: i64) -> i64:
+        x: i64 = EchoCave::active(held, 3) - EchoCave::active(held, 2)
+        y: i64 = EchoCave::active(held, 0) - EchoCave::active(held, 1)
+        if x == 0:
+            return 1 if y > 0 else (2 if y < 0 else 0)
+        if y == 0:
+            return 4 if x < 0 else 8
+        if y > 0:
+            return 16 if x < 0 else 32
+        return 64 if x < 0 else 128
+
+    def tick(session: mutable Session&, now: f64):
+        can Abort.Panic:
+            elapsed: f64 = now - session.last_tick
+            dt: f64 = 0.1 if elapsed > 0.1 else elapsed
+            session.last_tick <- now
+            mask: i64 = key_mask(session.held) | session.pulse
+            session.run.aimed <- mask == 0 and session.run.time - session.pointer_at < 1.5
+            if session.run.aimed:
+                eye: Camera = camera(&session.run)
+                session.run.aim <- EchoCave::Point{x: (session.pointer.x - CX) * BACK / FOCAL - (session.run.x - eye.x),
+                    y: (session.pointer.y - CY) * BACK / FOCAL - (session.run.y - eye.y)}
+            session.pulse <- 0
+            ratio: f64 = dt / SUBSTEP
+            whole: i64 = ratio.i64()
+            steps: i64 = whole + 1 if ratio > whole.f64() else (1 if whole == 0 else whole)
+            for _step in 0..<steps |session, dt, steps, mask|:
+                EchoCave::step(&session.run, dt / steps.f64(), mask)
+                break if session.run.result != EchoCave::PENDING
+            if session.run.result != EchoCave::PENDING:
+                judge(session, now)
+
+    def advance(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic:
+            return false if not (now >= session.last_tick and now <= 9007199254740.0)
+            if session.phase == JUDGED:
+                return false if now < session.deadline
+                next_trial(session, now)
+                return true
+            return false if session.phase != PLAYING
+            tick(session, now)
+            return true
+
+    def agent_mask(session: mutable Session&, mask: i64) -> bool:
+        can Abort.Panic:
+            return false if session.phase != PLAYING or mask <= 0 or mask > 511
+            if (mask & 256) != 0:
+                _ = EchoCave::click(&session.run)
+            session.pulse <- session.pulse | (mask & 255)
+            return true
+
+    def agent_event(session: mutable Session&, now: f64, port: i64) -> bool:
+        can Abort.Panic:
+            return false if not (now >= session.last_tick and now <= 9007199254740.0)
+            return start(session, now) if port == START
+            if port >= 0 and port < START:
+                return agent_mask(session, 1 << port.u64())
+            return false if port != -1
+            if session.phase == JUDGED and session.verdict_published:
+                next_trial(session, now)
+                return true
+            return false if session.phase != PLAYING
+            tick(session, now)
+            session.verdict_published <- session.phase == JUDGED
+            return true
+
+    def info(session: Session&, field: i64) -> i64:
+        can Abort.Panic:
+            active: bool = session.phase == PLAYING or session.phase == JUDGED
+            return session.phase if field == 0
+            return session.rung if field == 1
+            return session.trial if field == 2
+            return session.total if field == 3
+            return (py_round_half_even(session.run.time * 1000.0) if active else 0) if field == 4
+            return (session.run.caught if active else 0) if field == 5
+            return (session.run.cave.level.need if active else 0) if field == 6
+            return session.run.result if field == 7 and session.phase == JUDGED
+            return session.passed_count if field == 8
+            return session.best_rung if field == 9
+            return py_round_half_even(session.deadline * 1000.0) if field == 10 and session.phase == JUDGED
+            return py_round_half_even(session.run.x * 1000.0) if field == 11 and active
+            return py_round_half_even(session.run.y * 1000.0) if field == 12 and active
+            return py_round_half_even(session.run.z * 1000.0) if field == 13 and active
+            return py_round_half_even(EchoCave::lit(&session.run) * 1000.0) if field == 14 and active
+            return session.run.cue_count if field == 15 and active
+            return -1
+
+    # Speakers can trail the live model so new notes arrive before their
+    # samples are queued. The stepped agent reads without the speaker delay.
+    def audio_window(session: mutable Session&, dest: mutable u8&, capacity: i64, speaker: bool = false) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 0 if session.phase != PLAYING and session.phase != JUDGED
+            elapsed: f64 = session.run.time - session.heard_to
+            available: i64 = capacity / TonePcm::FRAME_BYTES
+            return 0 if elapsed <= 0.0 or available < 1
+            frames: i64 = py_round_half_even(elapsed * TonePcm::RATE.f64())
+            return 0 if frames < 1
+            end: f64 = session.run.time if frames <= available else session.heard_to + available.f64() / TonePcm::RATE.f64()
+            lag: f64 = 0.15 if speaker else 0.0
+            length: i64 = EchoCaveAudio::render(&session.run, session.heard_to - lag, end - lag, dest, capacity)
+            session.heard_to <- end if length > 0
+            return length

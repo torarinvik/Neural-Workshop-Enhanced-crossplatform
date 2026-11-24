@@ -1,0 +1,260 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module Heavier:
+    const FIRST_PICK: i64 = 4
+    const PORTS: i64 = 8
+    const LANE: f64 = 6.0
+    const GRAVITY: f64 = 9.8
+    const STEP: f64 = 1.0 / 30.0
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const WRONG: i64 = 2
+    const TIMEOUT: i64 = 3
+
+    struct Grade:
+        rung: i64
+        crates: i64
+        ratio: f64
+        boards: i64
+        seconds: f64
+        weak: f64
+        floors: bool
+        slippery: bool
+        sizes: bool
+
+    struct Board:
+        mass: f64[4]
+        grip: f64[4]
+        size: f64[4]
+        force: f64
+        answer: i64
+        slippery: bool
+
+    struct Round:
+        level: Grade
+        boards: Board[5]
+
+    struct Deal:
+        valid: bool
+        round: Round
+
+    struct Cue:
+        t: f64
+        duration: f64
+        pitch: f64
+        voice: i64
+        gain: f64
+
+    struct Run:
+        round: Round
+        t: mutable f64
+        board: mutable i64
+        started: mutable f64
+        right: mutable i64
+        result: mutable i64
+        x: mutable f64[4]
+        v: mutable f64[4]
+        pushed: mutable f64[4]
+        # Up to four wall contacts and one answer per board, for five boards.
+        cues: mutable Cue[25]
+        cue_count: mutable i64
+
+    struct Pilot:
+        board: mutable i64
+        crate: mutable i64
+        phase: mutable i64
+        mark: mutable f64
+        speed: mutable f64
+        push_time: mutable f64
+        mass: mutable f64[4]
+        grip: mutable f64[4]
+
+    def grade(requested: i64) -> Grade:
+        rung: i64 = requested if requested > 0 else 1
+        if rung < 4:
+            return Grade{rung: rung, crates: 3, ratio: 3.0 if rung == 1 else (2.0 if rung == 2 else 1.5),
+                boards: 5, seconds: 30.0, weak: 1.0, floors: false, slippery: false, sizes: false}
+        if rung < 7:
+            return Grade{rung: rung, crates: 3, ratio: 1.5 - 0.05 * (rung - 4).f64(),
+                boards: 5, seconds: 30.0, weak: 1.0, floors: true, slippery: false, sizes: false}
+        if rung < 13:
+            return Grade{rung: rung, crates: 4, ratio: 1.35 if rung < 10 else 1.3 - 0.03 * (rung - 10).f64(),
+                boards: 4, seconds: 32.0, weak: 1.0, floors: true, slippery: true, sizes: rung >= 10}
+        return Grade{rung: rung, crates: 4, ratio: 1.0 + 0.2 * pow(0.85, (rung - 13).f64()),
+            boards: 4, seconds: 32.0, weak: fmax(0.5, pow(0.95, (rung - 13).f64())), floors: true,
+            slippery: true, sizes: true}
+
+    def board(level: Grade, rng: mutable MT19937&, slippery: bool) -> Board:
+        can Abort.Panic:
+            last: mutable Board = zeroed
+            for _ in 0..<200 |level, rng, slippery, last|:
+                n: i64 = level.crates
+                top: f64 = py_uniform(rng, 2.0, 4.0)
+                mass: mutable f64[4] = zeroed
+                grip: mutable f64[4] = zeroed
+                mass[0] <- top
+                for k in 1..<n |mass, top, level, rng|:
+                    mass[k.usize()] <- top / level.ratio / py_uniform(rng, 1.0, 1.0 + 0.6 * (level.ratio - 1.0))
+                mass[1] <- top / level.ratio
+                common: f64 = 0.0 if level.floors else py_uniform(rng, 0.2, 0.4)
+                for k in 0..<n |grip, level, rng, common|:
+                    grip[k.usize()] <- py_uniform(rng, 0.15, 0.45) if level.floors else common
+                if slippery:
+                    low: f64 = py_uniform(rng, 0.12, 0.3)
+                    grip[0] <- low
+                    for k in 1..<n |grip, low, level, rng|:
+                        grip[k.usize()] <- low * level.ratio * py_uniform(rng, 1.0, 1.3)
+                    for k in 0..<n |mass, rng|:
+                        mass[k.usize()] <- py_uniform(rng, 1.0, 4.0)
+                order: mutable i64[4] = [0, 1, 2, 3]
+                k: mutable i64 = n - 1
+                while k > 0 |k, rng, order|:
+                    other: usize = py_randbelow(rng, (k + 1).u64()).usize()
+                    saved: i64 = order[k.usize()]
+                    order[k.usize()] <- order[other]
+                    order[other] <- saved
+                    k <- k - 1
+                answer: mutable i64 = 0
+                force: mutable f64 = 0.0
+                masses: mutable f64[4] = zeroed
+                grips: mutable f64[4] = zeroed
+                sizes: mutable f64[4] = zeroed
+                for i in 0..<n |order, mass, grip, answer, force, masses, grips, sizes, level, rng|:
+                    k0: usize = order[i.usize()].usize()
+                    masses[i.usize()] <- mass[k0]
+                    grips[i.usize()] <- grip[k0]
+                    sizes[i.usize()] <- py_uniform(rng, 0.45, 0.9) if level.sizes else 0.7
+                    answer <- i if k0 == 0.usize()
+                    force <- fmax(force, mass[k0] * (grip[k0] * GRAVITY + 0.25 + 0.75 * level.weak))
+                last <- Board{mass: masses, grip: grips, size: sizes, force: force, answer: answer, slippery: slippery}
+                if not slippery and level.floors:
+                    slowest: mutable i64 = 0
+                    least: mutable f64 = force / masses[0] - grips[0] * GRAVITY
+                    for i in 1..<n |slowest, least, force, masses, grips|:
+                        accel: f64 = force / masses[i.usize()] - grips[i.usize()] * GRAVITY
+                        if accel < least:
+                            slowest <- i
+                            least <- accel
+                    continue if slowest == answer and py_random(rng) < 0.6
+                return last
+            return last
+
+    def start(round: Round) -> Run:
+        empty_cues: Cue[25] = zeroed
+        return Run{round: round, t: 0.0, board: 0, started: 0.0, right: 0, result: LIVE,
+            x: [0.0, 0.0, 0.0, 0.0], v: [0.0, 0.0, 0.0, 0.0], pushed: [0.0, 0.0, 0.0, 0.0],
+            cues: empty_cues, cue_count: 0}
+
+    def current(run: Run&) -> Board:
+        can Abort.Panic:
+            last: i64 = run.round.level.boards - 1
+            return run.round.boards[(run.board if run.board < last else last).usize()]
+
+    def note(run: mutable Run&, duration: f64, pitch: f64, voice: i64, gain: f64):
+        can Abort.Panic:
+            run.cues[run.cue_count.usize()] <- Cue{t: run.t, duration: duration, pitch: pitch, voice: voice, gain: gain}
+            run.cue_count <- run.cue_count + 1
+
+    def step(run: mutable Run&, dt: f64, control: i64):
+        can Abort.Panic:
+            return if run.result != LIVE
+            run.t <- run.t + dt
+            b: Board = current(run)
+            for k in 0..<run.round.level.crates |run, b, dt, control|:
+                at: usize = k.usize()
+                wall: f64 = LANE - b.size[at]
+                force: f64 = b.force if k == control and run.x[at] < wall else 0.0
+                run.pushed[at] <- run.pushed[at] + dt if force != 0.0
+                accel: f64 = force / b.mass[at] - b.grip[at] * GRAVITY
+                v: f64 = run.v[at] + (accel if run.v[at] > 0.0 else fmax(0.0, accel)) * dt
+                run.v[at] <- fmax(0.0, v)
+                run.x[at] <- run.x[at] + run.v[at] * dt
+                if run.x[at] > wall:
+                    run.x[at] <- wall
+                    if run.v[at] > 0.5:
+                        note(run, 0.12, 140.0, 0, fmin(0.4, 0.1 * run.v[at]))
+                    run.v[at] <- 0.0
+            run.result <- TIMEOUT if run.t - run.started > run.round.level.seconds
+
+    def answer(run: mutable Run&, crate: i64) -> bool:
+        can Abort.Panic:
+            return false if run.result != LIVE or crate < 0 or crate >= run.round.level.crates
+            if crate != current(run).answer:
+                run.result <- WRONG
+                note(run, 0.4, 110.0, 2, 0.4)
+                return true
+            run.right <- run.right + 1
+            note(run, 0.2, 880.0, 1, 0.3)
+            run.board <- run.board + 1
+            if run.board == run.round.level.boards:
+                run.result <- CLEAR
+                return true
+            run.started <- run.t
+            run.x <- zeroed
+            run.v <- zeroed
+            run.pushed <- zeroed
+            return true
+
+    def choose(run: Run&, pilot: mutable Pilot&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            if pilot.board != run.board:
+                fresh: Pilot = zeroed
+                pilot[0] <- fresh
+                pilot.board <- run.board
+            k: i64 = pilot.crate
+            n: i64 = run.round.level.crates
+            if k >= n:
+                slippery: bool = current(run).slippery
+                best: mutable i64 = 0
+                for i in 1..<n |pilot, slippery, best|:
+                    if (pilot.grip[i.usize()] < pilot.grip[best.usize()] if slippery else pilot.mass[i.usize()] > pilot.mass[best.usize()]):
+                        best <- i
+                return FIRST_PICK + best
+            if pilot.phase == 0:
+                pilot.phase <- 1
+                pilot.mark <- run.t
+                return k
+            elapsed: f64 = run.t - pilot.mark
+            if pilot.phase == 1:
+                return k if elapsed < 0.6
+                pilot.phase <- 2
+                pilot.mark <- run.t
+                pilot.speed <- run.v[k.usize()]
+                pilot.push_time <- elapsed
+                return -1
+            if elapsed >= STEP - 1e-9:
+                decel: f64 = fmax(0.000001, (pilot.speed - run.v[k.usize()]) / elapsed)
+                pilot.grip[k.usize()] <- decel / GRAVITY
+                pilot.mass[k.usize()] <- current(run).force / (pilot.speed / pilot.push_time + decel)
+                pilot.crate <- k + 1
+                pilot.phase <- 0
+            return -1
+
+    def play(round: Round) -> bool:
+        can Abort.Panic:
+            run: mutable Run = start(round)
+            pilot: mutable Pilot = zeroed
+            while run.result == LIVE |run, pilot|:
+                port: i64 = choose(&run, &pilot)
+                if port >= FIRST_PICK:
+                    _ = answer(&run, port - FIRST_PICK)
+                step(&run, STEP, port)
+            return run.result == CLEAR
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Deal:
+        can Abort.Panic:
+            level: Grade = grade(rung)
+            for _ in 0..<200 |level, rng|:
+                boards: mutable Board[5] = zeroed
+                answers: mutable i64 = 0
+                for i in 0..<level.boards |boards, answers, level, rng|:
+                    slippery: bool = level.slippery and py_random(rng) < 0.4
+                    boards[i.usize()] <- board(level, rng, slippery)
+                    answers <- answers | (1 << boards[i.usize()].answer)
+                continue if (answers & (answers - 1)) == 0
+                round: Round = Round{level: level, boards: boards}
+                return Deal{valid: true, round: round} if play(round)
+            exhausted: Deal = zeroed
+            return exhausted

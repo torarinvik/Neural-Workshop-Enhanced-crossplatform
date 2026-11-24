@@ -1,0 +1,297 @@
+include "./tasks/dispatch_game.elisa"
+include "./scene_polish.elisa"
+include "./scene_verdict.elisa"
+include "./verdict.elisa"
+include "./geometry.elisa"
+
+module SceneDispatch:
+    const WIDTH: f64 = 912.0
+    const HEIGHT: f64 = 684.0
+    const CENTER: u32 = Display::ANCHOR_CENTER_CENTER
+    const RAD: f64 = 0.017453292519943295
+    const CIRCLE: f64 = 6.283185307179586
+    const STATION: u32 = 0x80848cff
+    const HEAVY: u32 = 0x8448d6ff
+
+    def map_box() -> SceneHiddenRule::Rect:
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(HEIGHT, 116.0).f64()
+            bottom: f64 = Verdict::above_the_band(HEIGHT, Geometry::from_bottom_edge(HEIGHT, 58.0).f64()).f64()
+            size: f64 = fmax(40.0, fmin(WIDTH * 0.9, top - bottom))
+            return SceneHiddenRule::Rect{x: (WIDTH - size) / 2.0, y: bottom + (top - bottom - size) / 2.0, w: size, h: size}
+
+    def at(map: SceneHiddenRule::Rect&, x: f64, y: f64) -> Dispatch::Point:
+        return Dispatch::Point{x: map.x + x * map.w, y: map.y + y * map.w}
+
+    def incident_at(map: SceneHiddenRule::Rect&, incident: DispatchWorld::Incident) -> Dispatch::Point:
+        return at(map, incident.report.x, incident.report.y)
+
+    def unit_at(map: SceneHiddenRule::Rect&, world: DispatchWorld::World&, index: i64) -> Dispatch::Point:
+        can Abort.Panic:
+            unit: DispatchWorld::Unit = world.units[index.usize()]
+            pos: Dispatch::Point = at(map, unit.x, unit.y)
+            radius: f64 = map.w * 0.045
+            for i in 0..<world.open_count |map, world, index, pos, radius|:
+                slot: usize = world.order[i.usize()].usize()
+                point: Dispatch::Point = incident_at(map, world.incidents[slot])
+                if hypot(pos.x - point.x, pos.y - point.y) < radius:
+                    turn: f64 = (50 + 70 * index).f64() * RAD
+                    return Dispatch::Point{x: point.x + cos(turn) * radius * 1.15, y: point.y + sin(turn) * radius * 1.15}
+            return pos
+
+    def hit(session: DispatchGame::Session&, x: f64, y: f64, shift: bool = false) -> i64:
+        can Abort.Panic:
+            return -1 if session.phase != DispatchGame::RUNNING
+            world: DispatchWorld::World& = &session.round.world
+            area: SceneHiddenRule::Rect = map_box()
+            reach: f64 = area.w * 0.05
+            port: mutable i64 = -1
+            nearest: mutable f64 = reach
+            if session.selected >= 0:
+                for slot in 0..<Dispatch::SLOTS |world, area, x, y, nearest, port|:
+                    incident: DispatchWorld::Incident = world.incidents[slot.usize()]
+                    continue if incident.id < 0
+                    point: Dispatch::Point = incident_at(&area, incident)
+                    gap: f64 = hypot(point.x - x, point.y - y)
+                    if gap <= nearest and (port < 0 or gap < nearest):
+                        port <- DispatchGame::FIRST_SLOT + slot
+                        nearest <- gap
+                depots: Dispatch::Point[3] = Dispatch::stations()
+                for index in 0..<3 |area, depots, x, y, shift, nearest, port|:
+                    depot: Dispatch::Point = depots[index.usize()]
+                    point: Dispatch::Point = at(&area, depot.x, depot.y)
+                    gap: f64 = hypot(point.x - x, point.y - y)
+                    if gap <= nearest and (port < 0 or gap < nearest):
+                        port <- (DispatchGame::FIRST_REFIT if shift else DispatchGame::FIRST_STATION) + index
+                        nearest <- gap
+                return port if port >= 0
+            for i in 0..<world.unit_count |world, area, x, y, nearest, port|:
+                point: Dispatch::Point = unit_at(&area, world, i)
+                gap: f64 = hypot(point.x - x, point.y - y)
+                if gap <= nearest and (port < 0 or gap < nearest):
+                    port <- i
+                    nearest <- gap
+            return port if port >= 0 else DispatchGame::CLEAR_SELECTION
+
+    def town(list: mutable Display::DisplayList&, area: SceneHiddenRule::Rect&, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            edge: f64 = area.w * 0.02
+            card: SceneHiddenRule::Rect = ScenePolish::spread_box(area, edge)
+            ScenePolish::card_face(list, &card, edge * 1.2, 0x262b38ff if dark else 0xffffffff,
+                0x424a5cff if dark else 0xd2d8e4ff, 0.u32(), dark)
+            Display::draw_rect(list, area.x, area.y, area.w, area.h, 0x2c313cff if dark else 0xe2e6ecff)
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, 11.u64())
+            cell: f64 = area.w / 8.0
+            gap: f64 = cell * 0.16
+            for gx in 0..<8 |list, area, dark, rng, cell, gap|:
+                for gy in 0..<8 |list, area, dark, rng, cell, gap, gx|:
+                    park: bool = py_random(&rng) < 0.12
+                    fill: u32 = (0x2c4038ff if dark else 0xdcece0ff) if park else (0x343a46ff if dark else 0xf0f2f6ff)
+                    box: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: area.x + gx.f64() * cell + gap / 2.0,
+                        y: area.y + gy.f64() * cell + gap / 2.0, w: cell - gap, h: cell - gap}
+                    ScenePolish::rounded(list, &box, cell * 0.12, fill)
+
+    def stations(list: mutable Display::DisplayList&, area: SceneHiddenRule::Rect&):
+        can Abort.Panic, Memory.Allocate:
+            depots: Dispatch::Point[3] = Dispatch::stations()
+            half: f64 = area.w * 0.026
+            roof: u32 = ScenePolish::mix_rgb(STATION, 0x000000ff, 0.3)
+            front: u32 = ScenePolish::mix_rgb(STATION, 0xffffffff, 0.25)
+            for i in 0..<3 |list, area, depots, half, roof, front|:
+                depot: Dispatch::Point = depots[i.usize()]
+                point: Dispatch::Point = at(area, depot.x, depot.y)
+                plate: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: point.x - half, y: point.y - half, w: 2.0 * half, h: 2.0 * half}
+                back: SceneHiddenRule::Rect = ScenePolish::spread_box(&plate, 1.5)
+                ScenePolish::rounded(list, &back, half * 0.45, roof)
+                face: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: plate.x, y: plate.y, w: plate.w, h: plate.h * 0.78}
+                ScenePolish::rounded(list, &face, half * 0.35, front)
+
+    def routes(list: mutable Display::DisplayList&, area: SceneHiddenRule::Rect&, world: DispatchWorld::World&):
+        can Abort.Panic, Memory.Allocate:
+            depots: Dispatch::Point[3] = Dispatch::stations()
+            for i in 0..<world.unit_count |list, area, world, depots|:
+                unit: DispatchWorld::Unit = world.units[i.usize()]
+                continue if unit.kind == DispatchWorld::IDLE or unit.working
+                dest: mutable Dispatch::Point = zeroed
+                if unit.kind == DispatchWorld::INCIDENT:
+                    slot: i64 = DispatchWorld::slot_for(world, unit.target)
+                    continue if slot < 0
+                    dest <- incident_at(area, world.incidents[slot.usize()])
+                else:
+                    depot: Dispatch::Point = depots[unit.target.usize()]
+                    dest <- at(area, depot.x, depot.y)
+                here: Dispatch::Point = unit_at(area, world, i)
+                Display::draw_line(list, here.x, here.y, dest.x, dest.y, fmax(1.0, area.w * 0.002), 0x969caaff)
+
+    def arc(list: mutable Display::DisplayList&, pos: Dispatch::Point, radius: f64,
+            start: f64, sweep: f64, thickness: f64, color: u32):
+        can Abort.Panic, Memory.Allocate:
+            segments: i64 = fmax(14.0, trunc(radius / 1.25)).i64()
+            ScenePolish::arc(list, pos.x, pos.y, radius, start, sweep, thickness, color, segments)
+
+    def incidents(list: mutable Display::DisplayList&, area: SceneHiddenRule::Rect&, world: DispatchWorld::World&):
+        can Abort.Panic, Memory.Allocate:
+            radius: f64 = area.w * 0.045
+            for slot in 0..<Dispatch::SLOTS |list, area, world, radius|:
+                incident: DispatchWorld::Incident = world.incidents[slot.usize()]
+                continue if incident.id < 0
+                point: Dispatch::Point = incident_at(area, incident)
+                shown: f64 = incident.need if incident.confirmed else incident.need * incident.report.factor
+                share: f64 = fmax(0.14, fmin(1.12, shown / Dispatch::BURN))
+                arc(list, point, radius, 0.0, CIRCLE, fmax(1.5, area.w * 0.003), 0x96969cff)
+                Display::draw_circle(list, point.x, point.y, radius * share, 0xd46234ff if incident.confirmed else 0xecae4078)
+
+    def unit_radius(unit: DispatchWorld::Unit, size: f64) -> f64:
+        return size * (0.014 if unit.scout else (0.023 if unit.heavy else 0.019))
+
+    def units(list: mutable Display::DisplayList&, area: SceneHiddenRule::Rect&, session: DispatchGame::Session&, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            world: DispatchWorld::World& = &session.round.world
+            for i in 0..<world.unit_count |list, area, world|:
+                unit: DispatchWorld::Unit = world.units[i.usize()]
+                point: Dispatch::Point = unit_at(area, world, i)
+                radius: f64 = unit_radius(unit, area.w)
+                Display::draw_circle(list, point.x, point.y, radius + fmax(1.5, area.w * 0.004), 0xffffffff)
+            for i in 0..<world.unit_count |list, area, world, session, dark|:
+                unit: DispatchWorld::Unit = world.units[i.usize()]
+                point: Dispatch::Point = unit_at(area, world, i)
+                radius: f64 = unit_radius(unit, area.w)
+                color: u32 = 0x149ea8ff if unit.scout else (HEAVY if unit.heavy else 0x2c70deff)
+                if unit.working and unit.kind == DispatchWorld::REFIT:
+                    sweep: f64 = -CIRCLE * fmin(1.0, unit.refit / world.dealt.level.refit)
+                    arc(list, point, area.w * 0.037, CIRCLE / 4.0, sweep, fmax(2.5, area.w * 0.007), HEAVY)
+                Display::draw_circle(list, point.x, point.y, radius, color)
+                if session.phase == DispatchGame::RUNNING and session.selected == i:
+                    arc(list, point, area.w * 0.03, 0.0, CIRCLE,
+                        fmax(2.0, area.w * 0.005), 0xfafafaff if dark else 0x141418ff)
+
+    def map_labels(list: mutable Display::DisplayList&, area: SceneHiddenRule::Rect&,
+                   world: DispatchWorld::World&, ink: u32):
+        can Abort.Panic, Memory.Allocate:
+            depots: Dispatch::Point[3] = Dispatch::stations()
+            for i in 0..<3 |list, area, world, ink, depots|:
+                depot: Dispatch::Point = depots[i.usize()]
+                point: Dispatch::Point = at(area, depot.x, depot.y)
+                label: sview = "J" if i == 0 else ("K" if i == 1 else "L")
+                Display::draw_text_weight(list, label, point.x, point.y - area.w * 0.052,
+                    fmax(6.0, area.w * 0.016), ink, CENTER, true)
+            for slot in 0..<Dispatch::SLOTS |list, area, world, ink|:
+                incident: DispatchWorld::Incident = world.incidents[slot.usize()]
+                continue if incident.id < 0
+                point: Dispatch::Point = incident_at(area, incident)
+                letter: mutable dstr = []
+                letter.push((65 + slot).u8())
+                if not incident.confirmed:
+                    letter.push(63.u8())
+                Display::draw_text_weight(list, bytes_view(letter), point.x, point.y, fmax(7.0, area.w * 0.02), ink, CENTER, true)
+            for i in 0..<world.unit_count |list, area, world|:
+                point: Dispatch::Point = unit_at(area, world, i)
+                number: mutable dstr = []
+                dstr_append_i64(&number, i + 1)
+                Display::draw_text_weight(list, bytes_view(number), point.x, point.y, fmax(6.0, area.w * 0.017),
+                    0xffffffff, CENTER, true)
+
+    def count_label(out: mutable dstr&, prefix: cstr, value: i64):
+        can Abort.Panic, Memory.Allocate:
+            dstr_append_cstr(out, prefix)
+            dstr_append_i64(out, value)
+
+    def facts(out: mutable dstr&, session: DispatchGame::Session&):
+        can Abort.Panic, Memory.Allocate:
+            world: DispatchWorld::World& = &session.round.world
+            level: Dispatch::Grade = world.dealt.level
+            count_label(out, "rung ", level.rung)
+            count_label(out, "  ", session.trial)
+            count_label(out, "/", session.total)
+            count_label(out, "  ", world.time.i64())
+            dstr_append_cstr(out, "s")
+            count_label(out, "  damage ", round_half_even(world.damage))
+            count_label(out, "  saved ", world.saved)
+            count_label(out, "  lost ", world.lost)
+            if level.false_rate > 0.0:
+                count_label(out, "  false alarms ", round_half_even(level.false_rate * 100.0))
+                dstr_append_cstr(out, "%")
+            if level.size_error > 0.0:
+                dstr_append_sview(out, "  sizes ±")
+                dstr_append_i64(out, round_half_even(level.size_error * 100.0))
+                dstr_append_cstr(out, "%")
+            if level.refit > 0.0:
+                heavy: mutable i64 = 0
+                for i in 0..<level.crews |world, heavy|:
+                    heavy <- heavy + 1 if world.units[i.usize()].heavy
+                count_label(out, "  refits ", heavy)
+                count_label(out, "/", level.crews)
+
+    def verdict(out: mutable dstr&, session: DispatchGame::Session&):
+        can Abort.Panic, Memory.Allocate:
+            count_label(out, "Damage ", round_half_even(session.verdict_damage))
+            count_label(out, " against a par of ", session.par.i64())
+            count_label(out, ": ", session.verdict_saved)
+            count_label(out, " saved, ", session.verdict_lost)
+            dstr_append_cstr(out, " lost")
+
+    def render(list: mutable Display::DisplayList&, session: DispatchGame::Session&, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            ink: u32 = 0xffffffff if dark else 0x000000ff
+            Display::draw_text_weight(list, "Dispatch", 456.0, 648.0, 22.0, ink, CENTER, true)
+            Display::draw_text(list, "click a unit, then a place   keys: 1-4, A-H, J K L   Shift with a station: refit   Esc: menu",
+                456.0, 26.0, 12.0, ink, CENTER)
+            status: mutable dstr = []
+            if session.phase == DispatchGame::READY:
+                dstr_append_cstr(&status, "Press Space to start")
+            elif session.phase == DispatchGame::DONE:
+                dstr_append_i64(&status, session.wins)
+                count_label(&status, " of ", session.trial)
+                count_label(&status, " rounds under par   highest rung passed ", session.best_rung)
+            elif session.phase == DispatchGame::JUDGED:
+                verdict(&status, session)
+            else:
+                count_label(&status, "Keep the damage to ", session.par.i64())
+                dstr_append_cstr(&status, " or less")
+            Display::draw_text(list, bytes_view(status), 456.0, 614.0, 14.0, ink, CENTER)
+            return if session.phase == DispatchGame::READY
+            if session.phase != DispatchGame::DONE:
+                area: SceneHiddenRule::Rect = map_box()
+                world: DispatchWorld::World& = &session.round.world
+                town(list, &area, dark)
+                stations(list, &area)
+                routes(list, &area, world)
+                incidents(list, &area, world)
+                units(list, &area, session, dark)
+                map_labels(list, &area, world, ink)
+                details: mutable dstr = []
+                facts(&details, session)
+                Display::draw_text(list, bytes_view(details), 456.0, 588.0, 12.0, ink, CENTER)
+                for i in session.round.first_note..<session.round.notes.count.i64() |list, session, area, ink|:
+                    event: DispatchWorld::Event = session.round.notes[i.usize()].event
+                    point: Dispatch::Point = at(&area, event.x, event.y)
+                    words: sview = "saved" if event.kind == DispatchWorld::SAVED else ("lost" if event.kind == DispatchWorld::LOST else
+                        ("false alarm" if event.kind == DispatchWorld::FALSE_ALARM else "refitted"))
+                    Display::draw_text(list, words, point.x, point.y + area.w * 0.05, fmax(6.0, area.w * 0.016), ink, CENTER)
+            if session.phase == DispatchGame::JUDGED or session.phase == DispatchGame::DONE:
+                status <- []
+                verdict(&status, session)
+                SceneVerdict::put(list, WIDTH, HEIGHT, 1.0, 1.0, session.passed, bytes_view(status), 60.0, 16.0)
+            elif session.round.coach_kind != 0:
+                saved: bool = session.round.coach_kind == DispatchWorld::SAVED
+                SceneVerdict::put(list, WIDTH, HEIGHT, 1.0, 1.0, saved, "Saved one" if saved else "Lost one", 60.0, 16.0)
+
+    def option_note(rung: i64, out: mutable dstr&):
+        can Abort.Panic, Memory.Allocate:
+            level: Dispatch::Grade = Dispatch::grade(rung)
+            count_label(out, "Rung ", level.rung)
+            count_label(out, ": ", level.crews)
+            count_label(out, " crews, bursts of up to ", level.burst)
+            dstr_append_cstr(out, ".")
+            if level.scout:
+                count_label(out, "  ", round_half_even(level.false_rate * 100.0))
+                dstr_append_cstr(out, "% of reports are false alarms; a scout can check.")
+            if level.size_error > 0.0:
+                count_label(out, "  Reported sizes are off by up to ", round_half_even(level.size_error * 100.0))
+                dstr_append_cstr(out, "%.")
+            if level.refit > 0.0:
+                count_label(out, "  A crew can stand ", round_half_even(level.refit))
+                dstr_append_cstr(out, " seconds at a station for a refit and work twice as fast after.")
+            if level.factor < 1.0:
+                dstr_append_cstr(out, "  You must do better than the reference dispatcher.")

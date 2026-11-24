@@ -1,0 +1,234 @@
+include "./cipher_abyss_run.elisa"
+
+extend CipherAbyss:
+    const PAL_Y: f64 = 62.0
+    const ROW_Y: f64 = 150.0
+    const MENU_ROWS: i64 = 9
+    const NOTE_ROWS: i64 = 12
+
+    def pal_x(index: i64) -> f64:
+        return 52.0 + 70.0 * index.f64()
+
+    def slot_x(index: i64, count: i64) -> f64:
+        return 40.0 + fmin(52.0, 380.0 / max(1, count).f64()) * (index.f64() + 0.5)
+
+    def menu_y(index: i64) -> f64:
+        return 404.0 - 22.0 * index.f64()
+
+    def note_y(index: i64) -> f64:
+        return 572.0 - 38.0 * index.f64()
+
+    def add_block(run: mutable Run&, index: i64 = -1):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            menu: darray[CipherLang::Block] = CipherLang::menu(&run.board, &run.available)
+            picked: i64 = run.cursor if index < 0 else index
+            return if picked >= menu.count.i64()
+            run.board.push(menu[picked.usize()])
+            run.cursor <- 0
+            run.checked.clear()
+            note(run, 0.05, 600.0, TICK, 0.25)
+
+    def undo_block(run: mutable Run&):
+        can Abort.Panic:
+            return if run.board.count == 0.usize()
+            _ = run.board.pop()
+            run.cursor <- 0
+            run.checked.clear()
+
+    def cursor(run: mutable Run&, direction: i64):
+        can Abort.Panic, Memory.Allocate:
+            menu: darray[CipherLang::Block] = CipherLang::menu(&run.board, &run.available)
+            n: i64 = menu.count.i64()
+            run.cursor <- CipherLang::modulo(run.cursor + direction, n) if n > 0 else 0
+
+    def check_sample(program: darray[CipherLang::Node]&, entry: i64, state: mutable CipherLang::State&,
+                     sample: CipherLang::Sample&, k: i64) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            guess: darray[i64] = CipherLang::run(program, entry, &sample.given, k, state)
+            prior: CipherLang::State = CipherLang::advance(program, entry, state, &sample.given, &guess)
+            state[0] <- prior
+            return CipherLang::same_row(&guess, &sample.result)
+
+    def check(program: mutable darray[CipherLang::Node]&, run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            rule: i64 = CipherLang::assemble(program, &run.board)
+            if rule < 0:
+                say(run, "Finish the hypothesis first")
+                note(run, 0.1, 90.0, BUZZ, 0.3)
+                return
+            run.checked.clear()
+            good: mutable i64 = 0
+            k: i64 = run.machine.level.symbols
+            state: mutable CipherLang::State = zeroed
+            for row in run.log:
+                ok: i64 = 1 if check_sample(program, rule, &state, &row, k) else 0
+                good <- good + ok
+                run.checked.push(ok)
+            state <- zeroed
+            for answer in run.answers:
+                row: CipherLang::Sample = answer.sample
+                ok: i64 = 1 if check_sample(program, rule, &state, &row, k) else 0
+                good <- good + ok
+                run.checked.push(ok)
+            run.check_good <- good
+            run.check_total <- run.checked.count.i64()
+            note(run, 0.2, 660.0 if good == run.check_total else 220.0, CHIME, 0.3)
+
+    def submit(program: mutable darray[CipherLang::Node]&, run: mutable Run&):
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return if run.result != LIVE
+            level: Grade = run.machine.level
+            if run.twins_q:
+                same: bool = CipherLang::same_machine(program, run.machine.rule, run.machine.other, level)
+                run.said_same <- 1 if same else 0
+                finish(run, SAME_MACHINE if same else DIFFERENT_MACHINE)
+                return
+            if level.stage < 4:
+                say(run, "From rung 10 you can give the rule itself")
+                return
+            entry: i64 = CipherLang::assemble(program, &run.board)
+            if entry < 0:
+                say(run, "Finish the hypothesis first")
+                return
+            run.submitted <- entry
+            same: bool = CipherLang::same_machine(program, entry, run.machine.rule, level)
+            finish(run, RULE_CRACKED if same else WRONG_RULE)
+
+    def row_less(a: darray[i64]&, b: darray[i64]&) -> bool:
+        can Abort.Panic:
+            for i in 0..<min(a.count.i64(), b.count.i64()) |a, b|:
+                return a[i.usize()] < b[i.usize()] if a[i.usize()] != b[i.usize()]
+            return a.count < b.count
+
+    def notebook_rows(run: Run&) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            rows: mutable darray[i64] = []
+            for i in 0..<run.log.count.i64() |run, rows|:
+                slot: mutable i64 = i
+                rows.push(i)
+                if run.input_order:
+                    current: CipherLang::Sample& = &run.log[i.usize()]
+                    while slot > 0 |run, rows, slot, current|:
+                        previous: i64 = rows[(slot - 1).usize()]
+                        other: CipherLang::Sample& = &run.log[previous.usize()]
+                        break if not row_less(&current.given, &other.given)
+                        rows[slot.usize()] <- previous
+                        slot <- slot - 1
+                    rows[slot.usize()] <- i
+            for i in 0..<run.answers.count.i64() |rows|:
+                rows.push(-1 - i)
+            return rows
+
+    def visible(run: Run&) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            rows: darray[i64] = notebook_rows(run)
+            stop: i64 = max(0, rows.count.i64() - run.scroll)
+            return CipherLang::sliced(&rows, max(0, stop - NOTE_ROWS), stop)
+
+    def scroll(run: mutable Run&, by: i64):
+        most: i64 = max(0, run.log.count.i64() + run.answers.count.i64() - NOTE_ROWS)
+        run.scroll <- max(0, min(most, run.scroll + by))
+
+    def mark(run: mutable Run&, row: i64):
+        can Abort.Panic, Memory.Allocate:
+            for i in 0..<run.marks.count.i64() |run, row|:
+                if run.marks[i.usize()] == row:
+                    _ = run.marks.remove_at(i.usize())
+                    return
+            run.marks.push(row)
+
+    def toggle_prediction(run: mutable Run&):
+        return if run.testing
+        run.predicting <- not run.predicting
+        if not run.predicting and run.pending.count > 0.usize():
+            run.entry <- run.pending
+            run.pending <- []
+
+    def key(program: mutable darray[CipherLang::Node]&, run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            if port >= SYMBOL and port < DELETE:
+                type_symbol(program, run, port - SYMBOL)
+            elif port == DELETE:
+                remove_symbol(run)
+            elif port == RUN:
+                go(program, run)
+            elif port == TEST:
+                begin_test(run)
+            elif port == NEXT_BLOCK or port == PREV_BLOCK:
+                cursor(run, 1 if port == NEXT_BLOCK else -1)
+            elif port == ADD_BLOCK:
+                add_block(run)
+            elif port == UNDO_BLOCK:
+                undo_block(run)
+            elif port == CHECK:
+                check(program, run)
+            elif port == SUBMIT:
+                submit(program, run)
+            elif port == PREDICT:
+                toggle_prediction(run)
+            elif port == SCROLL_UP or port == SCROLL_DOWN:
+                scroll(run, 1 if port == SCROLL_UP else -1)
+            elif port == MARK and run.log.count > 0.usize():
+                mark(run, run.log.count.i64() - 1)
+            elif port == NUMBERS:
+                run.numbers <- not run.numbers
+            elif port == SORT:
+                run.input_order <- not run.input_order
+
+    def hit(program: mutable darray[CipherLang::Node]&, run: mutable Run&):
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return if run.result != LIVE or run.hand.down
+            run.hand.down <- true
+            x: f64 = run.hand.x
+            y: f64 = run.hand.y
+            if fabs(y - PAL_Y) <= 30.0:
+                for i in 0..<run.machine.level.symbols |program, run, x|:
+                    if fabs(x - pal_x(i)) <= 30.0:
+                        type_symbol(program, run, i)
+                        return
+                port: i64 = DELETE if fabs(x - 680.0) <= 42.0 else (RUN if fabs(x - 780.0) <= 42.0 else (TEST if fabs(x - 880.0) <= 42.0 else -1))
+                if port >= 0:
+                    key(program, run, port)
+                    return
+            if fabs(y - ROW_Y) <= 24.0:
+                if fabs(x - 430.0) <= 60.0:
+                    toggle_prediction(run)
+                    return
+                count: i64 = want(program, run)
+                for i in 0..<run.entry.count.i64() |run, x, count|:
+                    if fabs(x - slot_x(i, count)) <= 22.0:
+                        remove_symbol(run, i)
+                        return
+            if fabs(y - 212.0) <= 12.0:
+                port: i64 = UNDO_BLOCK if fabs(x - 270.0) <= 37.0 else (CHECK if fabs(x - 350.0) <= 37.0 else (SUBMIT if fabs(x - 440.0) <= 37.0 else -1))
+                if port >= 0:
+                    key(program, run, port)
+                    return
+            if x >= 30.0 and x <= 220.0:
+                menu: darray[CipherLang::Block] = CipherLang::menu(&run.board, &run.available)
+                top: i64 = max(0, run.cursor - MENU_ROWS + 1)
+                for i in 0..<min(MENU_ROWS, menu.count.i64() - top) |run, top, y|:
+                    if fabs(y - menu_y(i)) <= 11.0:
+                        add_block(run, top + i)
+                        return
+            if x >= 515.0 and x <= 990.0:
+                if y >= 604.0:
+                    key(program, run, SORT if x < 760.0 else NUMBERS)
+                    return
+                rows: darray[i64] = visible(run)
+                for i in 0..<rows.count.i64() |run, y, rows|:
+                    if fabs(y - note_y(i)) <= 19.0:
+                        mark(run, rows[rows.count - 1.usize() - i.usize()])
+                        return
+
+    def act(program: mutable darray[CipherLang::Node]&, run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            if port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                hit(program, run)
+            elif port == HandView::RELEASE:
+                run.hand.down <- false
+            elif port < PORTS:
+                key(program, run, port)

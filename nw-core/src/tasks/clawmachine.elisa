@@ -1,0 +1,263 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+# clawmachine.py: get the claw over the gold prize, then drop it. A glass
+# cabinet seen from the front, prizes on its floor at different depths, and
+# a claw on a cable under a trolley. Move the trolley left and right, in and
+# out, then drop: the claw goes straight down and closes. Left and right
+# are easy to see from the front; how far in is the whole difficulty. Ports
+# 0-3 move the trolley left, right, in and out for the step they are sent
+# in; port 4 drops the claw, at once.
+module ClawMachine:
+    const LEFT: i64 = 0
+    const RIGHT: i64 = 1
+    const IN: i64 = 2
+    const OUT: i64 = 3
+    const DROP: i64 = 4
+    const PORTS: i64 = 5
+    const HALF: f64 = 1.0
+    const DEEP: f64 = 1.6
+    const TOP: f64 = 1.7
+    const SPEED: f64 = 0.55
+    const FALL: f64 = 1.1
+    const G_OVER_L: f64 = 16.0
+    const MOST: i64 = 8
+    # Note voices, make_patches(('wood', 'bell', 'growl')).
+    const WOOD: i64 = 0
+    const BELL: i64 = 1
+    const GROWL: i64 = 2
+    # Results; LIVE while the try goes on. The misses say which way.
+    const LIVE: i64 = 0
+    const GOT_IT: i64 = 1
+    const NOT_GOLD: i64 = 2
+    const TOO_FAR_IN: i64 = 3
+    const NOT_FAR_ENOUGH_IN: i64 = 4
+    const TO_THE_RIGHT: i64 = 5
+    const TO_THE_LEFT: i64 = 6
+    const OUT_OF_TIME: i64 = 7
+
+    struct Grade:
+        rung: mutable i64
+        side: mutable bool
+        shadow: mutable bool
+        swing: mutable f64
+        low: mutable bool
+        sizes: mutable bool
+        belt: mutable f64
+        tol: mutable f64
+        prizes: mutable i64
+
+    struct Prize:
+        x: mutable f64
+        z: mutable f64
+        r: mutable f64
+        colour: mutable u32
+
+    struct Cabinet:
+        level: mutable Grade
+        # the first is the gold one
+        prizes: mutable Prize[8]
+        start: mutable f64[2]
+        seconds: mutable f64
+
+    struct Run:
+        cab: mutable Cabinet
+        t: mutable f64
+        x: mutable f64
+        z: mutable f64
+        vx: mutable f64
+        vz: mutable f64
+        ox: mutable f64
+        oz: mutable f64
+        wx: mutable f64
+        wz: mutable f64
+        dropped: mutable bool
+        drop: mutable f64
+        depth: mutable f64
+        belt: mutable f64
+        result: mutable i64
+        notes: mutable darray[DrShapeDeal::Note]
+        end: mutable f64
+
+    def py_min(a: f64, b: f64) -> f64:
+        return b if b < a else a
+
+    def py_max(a: f64, b: f64) -> f64:
+        return b if b > a else a
+
+    # Python's float %: the remainder takes the divisor's sign.
+    def py_mod(x: f64, m: f64) -> f64:
+        r: f64 = fmod(x, m)
+        return 0.0 if r == 0.0 else (r + m if (r < 0.0) != (m < 0.0) else r)
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 1 else 1
+        return Grade{rung: r, side: true, shadow: true, swing: 0.0, low: false, sizes: false, belt: 0.0, tol: 0.16,
+            prizes: 5} if r == 1
+        return Grade{rung: r, side: false, shadow: true, swing: 0.0, low: false, sizes: false, belt: 0.0, tol: 0.13,
+            prizes: 6} if r < 4
+        return Grade{rung: r, side: false, shadow: false, swing: 0.0, low: false, sizes: false, belt: 0.0, tol: 0.11,
+            prizes: 7} if r < 7
+        return Grade{rung: r, side: false, shadow: false, swing: 0.9, low: false, sizes: false, belt: 0.0, tol: 0.1,
+            prizes: 7} if r < 10
+        return Grade{rung: r, side: false, shadow: false, swing: 0.7, low: true, sizes: true, belt: 0.0, tol: 0.09,
+            prizes: 8} if r < 13
+        return Grade{rung: r, side: false, shadow: false, swing: py_max(0.25, 0.6 - 0.03 * (r - 13).f64()), low: true,
+            sizes: true, belt: py_min(0.25, 0.06 + 0.01 * (r - 13).f64()),
+            tol: py_max(0.035, 0.085 * pow(0.94, (r - 13).f64())), prizes: 8}
+
+    def colour(k: i64) -> u32:
+        colours: u32[5] = [0xe65050ff, 0x508ce6ff, 0x78c878ff, 0xc878dcff, 0xf0963cff]
+        return 0xfacd3cff if k == 0 else colours[(k % 5).usize()]
+
+    def begin(cab: Cabinet) -> Run:
+        return Run{cab: cab, t: 0.0, x: cab.start[0], z: cab.start[1], vx: 0.0, vz: 0.0, ox: 0.0, oz: 0.0, wx: 0.0,
+            wz: 0.0, dropped: false, drop: 0.0, depth: 0.0, belt: 0.0, result: LIVE, notes: [], end: cab.seconds}
+
+    # Where a prize is, the floor carrying it round: by the belt so far, or
+    # by where it will have taken it at time t.
+    def prize_x(run: Run&, p: Prize&) -> f64:
+        return py_mod(p.x + run.belt + HALF, 2.0 * HALF) - HALF
+
+    def claw_x(run: Run&) -> f64:
+        return run.x + run.ox
+
+    def claw_z(run: Run&) -> f64:
+        return run.z + run.oz
+
+    def note(run: mutable Run&, dur: f64, f: f64, voice: i64, gain: f64):
+        can Abort.Panic, Memory.Allocate:
+            run.notes.push(DrShapeDeal::Note{t: run.t, dur: dur, freq: f, pan: 0.0, pan2: 0.0, gain: gain, gain2: gain,
+                bright: 0.8, voice: voice, seed: run.notes.count.i64() + 1, who: -1, room: 0.0})
+
+    def swing_axis(o: mutable f64&, w: mutable f64&, c: f64, acc: f64, dt: f64):
+        speed: f64 = w[0] + ((-G_OVER_L) * o[0] - c * w[0] - 0.06 * acc) * dt
+        at: f64 = o[0] + speed * dt
+        o[0] <- py_max(-0.3, py_min(0.3, at))
+        w[0] <- speed
+
+    def step(run: mutable Run&, dt: f64, control: i64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            run.t <- run.t + dt
+            run.belt <- run.belt + run.cab.level.belt * dt
+            vx: mutable f64 = 0.0
+            vz: mutable f64 = 0.0
+            if not run.dropped:
+                vx <- SPEED * ((1.0 if control == RIGHT else 0.0) - (1.0 if control == LEFT else 0.0))
+                vz <- SPEED * ((1.0 if control == IN else 0.0) - (1.0 if control == OUT else 0.0))
+            nx: f64 = py_max(-HALF, py_min(HALF, run.x + vx * dt))
+            nz: f64 = py_max(0.0, py_min(DEEP, run.z + vz * dt))
+            ax: f64 = ((nx - run.x) / dt - run.vx) / dt
+            az: f64 = ((nz - run.z) / dt - run.vz) / dt
+            run.vx <- (nx - run.x) / dt
+            run.vz <- (nz - run.z) / dt
+            run.x <- nx
+            run.z <- nz
+            c: f64 = run.cab.level.swing
+            if c != 0.0:
+                swing_axis(&run.ox, &run.wx, c, ax, dt)
+                swing_axis(&run.oz, &run.wz, c, az, dt)
+            if run.dropped:
+                run.depth <- run.depth + FALL * dt
+                close(run) if run.depth >= TOP - 0.25
+            elif run.t > run.cab.seconds:
+                run.result <- OUT_OF_TIME
+
+    def let_go(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            if run.result == LIVE and not run.dropped:
+                run.dropped <- true
+                run.drop <- run.t
+                note(run, 0.15, 300.0, WOOD, 0.3)
+
+    def close(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            cx: f64 = claw_x(run)
+            cz: f64 = claw_z(run)
+            best: mutable f64 = 0.0
+            which: mutable i64 = -1
+            for k in 0..<run.cab.level.prizes |run, cx, cz, best, which|:
+                p: Prize& = &run.cab.prizes[k.usize()]
+                d: f64 = py_hypot(prize_x(run, p) - cx, p.z - cz)
+                if d <= run.cab.level.tol + (p.r - 0.16) * 0.5 and (which < 0 or d < best):
+                    best <- d
+                    which <- k
+            gold: Prize& = &run.cab.prizes[0]
+            gx: f64 = prize_x(run, gold)
+            gz: f64 = gold.z
+            if which == 0:
+                run.result <- GOT_IT
+                note(run, 0.3, 1320.0, BELL, 0.3)
+            elif which >= 0:
+                run.result <- NOT_GOLD
+                note(run, 0.4, 110.0, GROWL, 0.4)
+            else:
+                dx: f64 = cx - gx
+                dz: f64 = cz - gz
+                run.result <- TOO_FAR_IN if dz > fabs(dx) else (NOT_FAR_ENOUGH_IN if -dz > fabs(dx) else
+                    (TO_THE_RIGHT if dx > 0.0 else TO_THE_LEFT))
+                note(run, 0.4, 110.0, GROWL, 0.4)
+
+    def act(run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate:
+            let_go(run) if port == DROP
+
+    # Knows where the gold prize is: goes over it -- where it will be when
+    # the claw comes down -- waits for the swing to settle, drops. -1 is no
+    # port.
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE or run.dropped
+            level: Grade& = &run.cab.level
+            fall: f64 = (TOP - 0.25) / FALL
+            gold: Prize& = &run.cab.prizes[0]
+            gx: f64 = py_mod(prize_x(run, gold) + level.belt * fall + HALF, 2.0 * HALF) - HALF
+            dx: f64 = gx - run.x
+            dz: f64 = gold.z - run.z
+            step: f64 = SPEED / 30.0
+            tol: f64 = level.tol * 0.35
+            return (RIGHT if dx > 0.0 else LEFT) if fabs(dx) > py_max(tol, step) and fabs(dx) >= fabs(dz)
+            return (IN if dz > 0.0 else OUT) if fabs(dz) > py_max(tol, step)
+            if level.swing != 0.0:
+                amp: f64 = py_hypot(run.ox, run.oz) + py_hypot(run.wx, run.wz) / sqrt(G_OVER_L)
+                return -1 if amp > tol
+            return -1 if level.belt != 0.0 and (fabs(dx) > tol or fabs(dz) > tol)
+            return DROP
+
+    # clawmachine.play at 1/30 s a step: whether the autopilot gets it.
+    def play(cab: Cabinet) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = begin(cab)
+            while run.result == LIVE |run|:
+                port: i64 = pilot(&run)
+                act(&run, port) if port == DROP
+                step(&run, 1.0 / 30.0, -1 if port == DROP else port)
+            return run.result == GOT_IT
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Cabinet:
+        can Abort.Panic, Memory.Allocate:
+            cab: mutable Cabinet = zeroed
+            cab.level <- grade(rung)
+            cab.seconds <- 40.0
+            for _ in 0..<200 |cab, draw|:
+                count: mutable i64 = 0
+                while count < cab.level.prizes |cab, draw, count|:
+                    r: f64 = py_uniform(draw, 0.1, 0.24) if cab.level.sizes else 0.16
+                    x: f64 = py_uniform(draw, -HALF + 0.25, HALF - 0.25)
+                    z: f64 = py_uniform(draw, 0.25, DEEP - 0.25)
+                    apart: mutable bool = true
+                    for k in 0..<count |cab, apart, x, z, r|:
+                        p: Prize& = &cab.prizes[k.usize()]
+                        apart <- false if not (py_hypot(x - p.x, z - p.z) > r + p.r + 0.05)
+                    if apart:
+                        cab.prizes[count.usize()] <- Prize{x: x, z: z, r: r, colour: colour(count)}
+                        count <- count + 1
+                side: f64 = (-1.0 if py_choice_index(draw, 2) == 0 else 1.0) * (HALF - 0.1)
+                depth: f64 = 0.1 if py_choice_index(draw, 2) == 0 else DEEP - 0.1
+                cab.start <- [side, depth]
+                gold: Prize = cab.prizes[0]
+                continue if py_hypot(side - gold.x, depth - gold.z) < 0.6
+                return cab if play(cab)
+            return cab

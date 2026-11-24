@@ -1,0 +1,115 @@
+include "./dispatch_world.elisa"
+
+module DispatchReference:
+    struct Order:
+        unit: i64
+        kind: i64
+        index: i64
+
+    struct Orders:
+        values: mutable Order[DispatchWorld::UNITS]
+        count: mutable i64
+
+    def nearest_station(x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            depots: Dispatch::Point[3] = Dispatch::stations()
+            best: mutable i64 = 0
+            distance: mutable f64 = hypot(depots[0].x - x, depots[0].y - y)
+            for index in 1..<3 |depots, x, y, best, distance|:
+                depot: Dispatch::Point = depots[index.usize()]
+                gap: f64 = hypot(depot.x - x, depot.y - y)
+                if gap < distance:
+                    best <- index
+                    distance <- gap
+            return best
+
+    def scout_pick(world: DispatchWorld::World&, unit: DispatchWorld::Unit) -> i64:
+        can Abort.Panic:
+            pick: mutable i64 = -1
+            nearest: mutable f64 = 0.0
+            for i in 0..<world.open_count |world, unit, pick, nearest|:
+                slot: i64 = world.order[i.usize()]
+                incident: DispatchWorld::Incident = world.incidents[slot.usize()]
+                continue if incident.confirmed
+                distance: f64 = hypot(incident.report.x - unit.x, incident.report.y - unit.y)
+                if pick < 0 or distance < nearest:
+                    nearest <- distance
+                    pick <- slot
+            return pick
+
+    def crew_pick(world: DispatchWorld::World&, unit: DispatchWorld::Unit, taken: u64, scouting: i64) -> i64:
+        can Abort.Panic:
+            pick: mutable i64 = -1
+            least_slack: mutable f64 = 0.0
+            false_rate: f64 = world.dealt.level.false_rate
+            for i in 0..<world.open_count |world, unit, taken, scouting, false_rate, pick, least_slack|:
+                slot: i64 = world.order[i.usize()]
+                continue if (taken & (1.u64() << slot.u64())) != 0.u64()
+                incident: DispatchWorld::Incident = world.incidents[slot.usize()]
+                continue if not incident.confirmed and false_rate >= 0.25 and slot == scouting
+                factor: f64 = 1.0 if incident.confirmed else incident.report.factor
+                eta: f64 = hypot(incident.report.x - unit.x, incident.report.y - unit.y) / DispatchWorld::speed(unit)
+                growth: f64 = fmax(1e-6, incident.report.growth * factor)
+                arriving: f64 = incident.need * factor + growth * eta
+                continue if arriving >= Dispatch::BURN
+                slack: f64 = ((Dispatch::BURN - arriving) / growth) / (1.0 if incident.confirmed else fmax(0.05, 1.0 - false_rate))
+                if pick < 0 or slack < least_slack:
+                    pick <- slot
+                    least_slack <- slack
+            return pick
+
+    def orders(world: DispatchWorld::World&) -> Orders:
+        can Abort.Panic:
+            taken: mutable u64 = 0.u64()
+            scouting: mutable i64 = -1
+            refitting: mutable bool = false
+            for i in 0..<world.unit_count |world, taken, scouting, refitting|:
+                unit: DispatchWorld::Unit = world.units[i.usize()]
+                if unit.kind == DispatchWorld::REFIT:
+                    refitting <- true
+                elif unit.kind == DispatchWorld::INCIDENT:
+                    slot: i64 = DispatchWorld::slot_for(world, unit.target)
+                    if slot >= 0:
+                        if unit.scout:
+                            scouting <- slot
+                        else:
+                            taken <- taken | (1.u64() << slot.u64())
+            result: mutable Orders = zeroed
+            for i in 0..<world.unit_count |world, taken, scouting, refitting, result|:
+                unit: DispatchWorld::Unit = world.units[i.usize()]
+                continue if unit.kind != DispatchWorld::IDLE
+                pick: i64 = scout_pick(world, unit) if unit.scout else crew_pick(world, unit, taken, scouting)
+                if pick >= 0:
+                    result.values[result.count.usize()] <- Order{unit: i, kind: DispatchWorld::INCIDENT, index: pick}
+                    result.count <- result.count + 1
+                    taken <- taken | (1.u64() << pick.u64()) if not unit.scout
+                elif not refitting and DispatchWorld::can_refit(world, unit):
+                    refitting <- true
+                    result.values[result.count.usize()] <- Order{unit: i, kind: DispatchWorld::REFIT,
+                        index: nearest_station(unit.x, unit.y)}
+                    result.count <- result.count + 1
+            return result
+
+    def reference_round(dealt: Dispatch::Deal) -> DispatchWorld::World:
+        can Abort.Panic, Memory.Allocate:
+            world: mutable DispatchWorld::World = DispatchWorld::initialize(dealt, false)
+            while not world.over |world|:
+                selected: Orders = orders(&world)
+                for i in 0..<selected.count |selected, world|:
+                    order: Order = selected.values[i.usize()]
+                    _ = DispatchWorld::send(&world, order.unit, order.kind, order.index)
+                for _ in 0..<5 |world|:
+                    DispatchWorld::step(&world, DispatchWorld::SIM_DT)
+            return world
+
+    def idle_round(dealt: Dispatch::Deal) -> DispatchWorld::World:
+        can Abort.Panic, Memory.Allocate:
+            world: mutable DispatchWorld::World = DispatchWorld::initialize(dealt, false)
+            while not world.over |world|:
+                DispatchWorld::step(&world, 1.0)
+            return world
+
+    def par(dealt: Dispatch::Deal) -> f64:
+        can Abort.Panic, Memory.Allocate:
+            reference: DispatchWorld::World = reference_round(dealt)
+            return reference.damage * dealt.level.factor + dealt.level.grace

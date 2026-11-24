@@ -9,7 +9,7 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / 'shells/python'))
 import app
-binary = root / 'build/nw-sdl3'
+binary = Path(os.environ.get('NW_SDL_BINARY', root / 'build/nw-sdl3'))
 with tempfile.TemporaryDirectory() as directory:
     path = Path(directory) / 'settings'
     os.environ['NW_CROSSWORD_SETTINGS_PATH'] = str(path)

@@ -1,0 +1,239 @@
+include "../hand_view.elisa"
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+module Potter:
+    const FASTER: i64 = HandView::KEYS
+    const SLOWER: i64 = FASTER + 1
+    const WET: i64 = FASTER + 2
+    const PORTS: i64 = FASTER + 3
+
+    const AXIS: f64 = 500.0
+    const FOOT: f64 = 110.0
+    const TALL: f64 = 330.0
+    const UNIT: f64 = 170.0
+    const START_RADIUS: f64 = 0.6
+    const THIN: f64 = 0.16
+    const FAT: f64 = 1.2
+
+    const OVER: i64 = 0
+    const BESIDE: i64 = 1
+    const BRIEF: i64 = 2
+
+    const HUM: i64 = 0
+    const SCRAPE: i64 = 1
+    const DONE: i64 = 2
+    const SQUEAK: i64 = 3
+    const SPLASH: i64 = 4
+    const BUZZ: i64 = 5
+
+    const LIVE: i64 = 0
+    const FINISHED: i64 = 1
+    const COLLAPSED: i64 = 2
+    const HARD: i64 = 3
+
+    struct Grade:
+        rung: i64
+        bands: i64
+        near: f64
+        drag: f64
+        dry: f64
+        ghost: i64
+        wobble: f64
+        seconds: f64
+
+    struct Pot:
+        level: Grade
+        shape: mutable f64[16]
+        seed: i64
+        valid: bool
+
+    struct Run:
+        pot: Pot
+        hand: mutable HandView::Pointer
+        radius: mutable f64[16]
+        was_near: mutable bool[16]
+        speed: mutable i64
+        wet: mutable f64
+        time: mutable f64
+        turn: mutable f64
+        good_for: mutable f64
+        touching: mutable i64
+        hum_at: mutable f64
+        scrape_at: mutable f64
+        squeak_at: mutable f64
+        result: mutable i64
+        audible: bool
+        notes: mutable darray[DrShapeDeal::Note]
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung >= 1 else 1
+        top: i64 = r - 20 if r > 20 else 0
+        bands: i64 = 4 if r < 4 else (6 if r < 7 else (8 if r < 13 else (10 if r < 20 else (11 + top / 4 if top < 20 else 16))))
+        near: f64 = 0.09 if r < 4 else (0.075 if r < 10 else (0.06 if r < 20 else fmax(0.035, 0.055 - 0.001 * top.f64())))
+        drag: f64 = 0.0 if r < 4 else (0.15 if r < 13 else 0.22)
+        dry: f64 = 0.0 if r < 4 else (9.0 if r < 13 else (6.0 if r < 20 else fmax(3.0, 5.5 - 0.1 * top.f64())))
+        ghost: i64 = OVER if r < 7 else (BESIDE if r < 13 else BRIEF)
+        wobble: f64 = 0.0 if r < 10 else (0.02 if r < 20 else fmin(0.05, 0.025 + 0.001 * top.f64()))
+        span: f64 = 9.0 if r < 7 else (7.5 if r < 13 else (6.5 if r < 20 else fmax(4.0, 6.0 - 0.06 * top.f64())))
+        return Grade{rung: r, bands: bands, near: near, drag: drag, dry: dry, ghost: ghost,
+            wobble: wobble, seconds: bands.f64() * span + 6.0}
+
+    def uniform(draw: mutable MT19937&, low: f64, high: f64) -> f64:
+        return low + (high - low) * py_random(draw)
+
+    def build(level: Grade, draw: mutable MT19937&) -> Pot:
+        can Abort.Panic:
+            a: f64 = uniform(draw, 0.12, 0.26)
+            b: f64 = uniform(draw, -0.25, 0.25)
+            phase: f64 = uniform(draw, 0.0, 6.28)
+            wave: f64 = uniform(draw, 2.5, 5.5)
+            shape: mutable f64[16] = zeroed
+            gap: mutable f64 = 0.0
+            n: f64 = level.bands.f64()
+            for k in 0..<level.bands |a, b, phase, wave, n, gap, shape|:
+                radius: mutable f64 = HandView::clamp(0.6 + a * sin(phase + wave * k.f64() / n) + b * (k.f64() / (n - 1.0) - 0.5), 0.3, 1.0)
+                radius <- py_round_decimal(radius, 1000.0)
+                shape[k.usize()] <- radius
+                gap <- fmax(gap, fabs(radius - START_RADIUS))
+            valid: bool = gap >= 0.15
+            return Pot{level: level, shape: shape, seed: py_randbelow(draw, 1073741824.u64()).i64() if valid else 0, valid: valid}
+
+    def begin(pot: Pot, audible: bool = true) -> Run:
+        can Abort.Panic:
+            radii: mutable f64[16] = zeroed
+            for i in 0..<pot.level.bands |radii|:
+                radii[i.usize()] <- START_RADIUS
+            return Run{pot: pot, hand: HandView::initialize(), radius: radii, was_near: zeroed, speed: 1,
+                wet: 1.0, time: 0.0, turn: 0.0, good_for: 0.0, touching: -1, hum_at: 0.0, scrape_at: 0.0,
+                squeak_at: 0.0, result: LIVE, audible: audible, notes: []}
+
+    def note(run: mutable Run&, duration: f64, pitch: f64, voice: i64, gain: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if not run.audible
+            run.notes.push(DrShapeDeal::Note{t: run.time, dur: duration, freq: pitch, voice: voice, gain: gain,
+                gain2: gain, pan: 0.0, pan2: 0.0, bright: 0.8, seed: 1 + run.notes.count.i64(), who: -1, room: 0.0})
+
+    def act(run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate:
+            if port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::RELEASE:
+                run.hand.down <- false
+            elif run.result == LIVE:
+                if port == HandView::PRESS:
+                    run.hand.down <- true
+                elif port == FASTER:
+                    run.speed <- run.speed + 1 if run.speed < 3
+                elif port == SLOWER:
+                    run.speed <- run.speed - 1 if run.speed > 1
+                elif port == WET:
+                    run.wet <- 1.0
+                    note(run, 0.2, 700.0, SPLASH, 0.4)
+
+    def band_y(n: i64, k: f64) -> f64:
+        return FOOT + TALL * (k + 0.5) / n.f64()
+
+    def shown(run: Run&) -> bool:
+        return run.pot.level.ghost != BRIEF or run.time < 5.0
+
+    def band(run: Run&) -> i64:
+        n: i64 = run.pot.level.bands
+        k: i64 = ((run.hand.y - FOOT) / (TALL / n.f64())).i64()
+        return -1 if k < 0 or k >= n or fabs(run.hand.x - AXIS) > 1.5 * UNIT
+        return k
+
+    def miss(run: Run&) -> f64:
+        can Abort.Panic:
+            farthest: mutable f64 = 0.0
+            for i in 0..<run.pot.level.bands |run, farthest|:
+                farthest <- fmax(farthest, fabs(run.radius[i.usize()] - run.pot.shape[i.usize()]))
+            return farthest
+
+    def shape_band(run: mutable Run&, k: i64, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            if run.wet <= 0.0:
+                if run.time >= run.squeak_at:
+                    run.squeak_at <- run.time + 0.35
+                    note(run, 0.15, 1500.0, SQUEAK, 0.35)
+                return
+            level: Grade = run.pot.level
+            wanted: f64 = fabs(run.hand.x - AXIS) / UNIT + level.wobble * (run.speed - 1).f64() * sin(run.turn * 2.0)
+            rate: f64 = 0.22 * run.speed.f64() * dt
+            movement: f64 = HandView::clamp(wanted - run.radius[k.usize()], -rate, rate)
+            run.radius[k.usize()] <- run.radius[k.usize()] + movement
+            run.radius[(k - 1).usize()] <- run.radius[(k - 1).usize()] + level.drag * movement if k > 0
+            run.radius[(k + 1).usize()] <- run.radius[(k + 1).usize()] + level.drag * movement if k + 1 < level.bands
+            if fabs(movement) > 0.00001 and run.time >= run.scrape_at:
+                run.scrape_at <- run.time + 0.12
+                note(run, 0.1, 180.0 + 240.0 * run.radius[k.usize()], SCRAPE, 0.25)
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            level: Grade = run.pot.level
+            run.time <- run.time + dt
+            run.turn <- run.turn + dt * 3.0 * run.speed.f64()
+            run.wet <- fmax(0.0, run.wet - dt / level.dry) if level.dry > 0.0
+            if run.time >= run.hum_at:
+                run.hum_at <- run.time + 0.3
+                note(run, 0.32, 55.0 * run.speed.f64(), HUM, 0.12)
+            k: i64 = band(run) if run.hand.down else -1
+            run.touching <- k
+            shape_band(run, k, dt) if k >= 0
+            all_near: mutable bool = true
+            for j in 0..<level.bands |run, level, all_near|:
+                radius: f64 = run.radius[j.usize()]
+                if radius < THIN or radius > FAT:
+                    note(run, 0.5, 80.0, BUZZ, 0.6)
+                    run.result <- COLLAPSED
+                    return
+                near: bool = fabs(radius - run.pot.shape[j.usize()]) <= level.near
+                if near and not run.was_near[j.usize()]:
+                    note(run, 0.15, 660.0 * pow(2.0, j.f64() / 12.0), DONE, 0.3)
+                run.was_near[j.usize()] <- near
+                all_near <- all_near and near
+            run.good_for <- (run.good_for + dt) if all_near and not run.hand.down else 0.0
+            run.result <- FINISHED if run.good_for >= 0.8
+            run.result <- HARD if run.result == LIVE and run.time >= level.seconds
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            level: Grade = run.pot.level
+            return WET if level.dry > 0.0 and run.wet < 0.3
+            return FASTER if run.speed < 2
+            worst: mutable i64 = -1
+            gap: mutable f64 = 0.55 * level.near
+            for i in 0..<level.bands |run, worst, gap|:
+                diff: f64 = fabs(run.radius[i.usize()] - run.pot.shape[i.usize()])
+                if diff > gap:
+                    worst <- i
+                    gap <- diff
+            if run.hand.down:
+                return HandView::RELEASE if worst < 0 or run.touching != worst or gap <= 0.3 * level.near
+                return -1
+            return -1 if worst < 0
+            x: f64 = AXIS + UNIT * run.pot.shape[worst.usize()]
+            direction: i64 = HandView::toward(&run.hand, x, band_y(level.bands, worst.f64()))
+            return HandView::PRESS if direction < 0 else direction
+
+    def reference_wins(pot: Pot) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = begin(pot, false)
+            while run.result == LIVE |run|:
+                port: i64 = pilot(&run)
+                act(&run, port)
+                step(&run, 1.0 / 60.0)
+            return run.result == FINISHED
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Pot:
+        can Abort.Panic, Memory.Allocate:
+            level: Grade = grade(rung)
+            for i in 0..<80 |draw, level|:
+                candidate: mutable MT19937 = zeroed
+                mt_seed_int(&candidate, py_getrandbits(draw, 32))
+                pot: Pot = build(level, &candidate)
+                return pot if pot.valid and reference_wins(pot)
+            return Pot{level: level, shape: zeroed, seed: 0, valid: false}

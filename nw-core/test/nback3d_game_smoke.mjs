@@ -151,7 +151,9 @@ assert.equal(values[FIELD.answered], 1n);
 assert.equal(values[FIELD.verdict], 0n,
   "the first N=2 trial is necessarily a false alarm when answered");
 assert.equal(values[FIELD.falseAlarms], 1n);
-assert.equal(action(run, ACTION.match, 1602n, 7n), STATUS.ignored,
+assert.equal(action(run, ACTION.match, 1602n, 7n), STATUS.accepted,
+  "a second response can update reaction time");
+assert.equal(state(run)[FIELD.falseAlarms], 1n,
   "a second response in one trial cannot double-score it");
 
 assert.equal(advance(run, 3900n, 2300n, 8n), STATUS.accepted,
@@ -197,6 +199,9 @@ assert.deepEqual(state(restored), beforeSnapshot,
   "restored 3D N-Back state preserves the live stimulus");
 assert.deepEqual(frame(restored), frame(run),
   "restored 3D N-Back frame preserves the visible cube");
+assert.equal(action(restored, ACTION.restart, 12000n, 15n), STATUS.accepted);
+assert.deepEqual(state(restored).slice(0, 5), [PHASE.startup, 2n, 0n, 24n, 1n],
+  "restart retains the restored session settings");
 assert.equal(exports.nw_api_v1_destroy(restored), 0n);
 assert.equal(exports.nw_api_v1_destroy(run), 0n);
 

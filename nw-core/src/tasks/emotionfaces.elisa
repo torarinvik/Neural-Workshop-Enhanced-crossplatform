@@ -1,0 +1,286 @@
+include "./reading_quiz.elisa"
+include "./feeling_odds.elisa"
+include "../pymath.elisa"
+
+module EmotionFaces:
+    # emotion.py: which emotion is this face showing? FER-2013's
+    # photographs are not read yet: like the reference without them, the
+    # faces are drawn from a few lines (emotiondata._drawn_faces).
+    const FACES: i64 = 12
+    # FERPlus's order of emotions (emotiondata.EMOTIONS).
+    const NEUTRAL: i64 = 0
+    const HAPPINESS: i64 = 1
+    const SURPRISE: i64 = 2
+    const SADNESS: i64 = 3
+    const ANGER: i64 = 4
+    const DISGUST: i64 = 5
+    const FEAR: i64 = 6
+    const CONTEMPT: i64 = 7
+    const EMOTIONS: i64 = 8
+    # Drawn faces made of each emotion.
+    const EACH: i64 = 30
+    # Item crops.
+    # math.pi
+    const PI: f64 = 3.141592653589793
+    const WHOLE: i64 = 0
+    const EYES: i64 = 1
+    const MOUTH: i64 = 2
+
+    struct Grade:
+        rung: i64
+        # ORDER[:options]
+        options: i64
+        low: f64
+        high: f64
+        flash: f64
+        crop: f64
+        two: bool
+        seconds: f64
+        skill: f64
+
+    # A face: FERPlus's ten readers' votes, and the drawn face's brow
+    # tilt, brow height, eye open, mouth curve, mouth open and smirk.
+    struct Face:
+        votes: i64[8]
+        params: f64[6]
+
+    struct Corpus:
+        faces: mutable darray[Face]
+
+    struct Round:
+        level: Grade
+        quiz: ReadingQuiz::Round
+        # Each item's face (an index into the corpus) and crop.
+        faces: darray[i64]
+        crops: darray[i64]
+
+    # ORDER: the options, easiest first.
+    def order(k: i64) -> i64:
+        return HAPPINESS if k == 0
+        return SADNESS if k == 1
+        return SURPRISE if k == 2
+        return ANGER if k == 3
+        return NEUTRAL if k == 4
+        return FEAR if k == 5
+        return DISGUST if k == 6
+        return CONTEMPT
+
+    def order_index(emotion: i64) -> i64:
+        for k in 0..<EMOTIONS |emotion|:
+            return k if order(k) == emotion
+        return -1
+
+    # sorted(pool): the emotions' FERPlus names in alphabetical order.
+    def alphabetical(k: i64) -> i64:
+        return ANGER if k == 0
+        return CONTEMPT if k == 1
+        return DISGUST if k == 2
+        return FEAR if k == 3
+        return HAPPINESS if k == 4
+        return NEUTRAL if k == 5
+        return SADNESS if k == 6
+        return SURPRISE
+
+    # NAMES
+    def name(emotion: i64) -> cstr:
+        return "neutral" if emotion == NEUTRAL
+        return "happy" if emotion == HAPPINESS
+        return "surprised" if emotion == SURPRISE
+        return "sad" if emotion == SADNESS
+        return "angry" if emotion == ANGER
+        return "disgusted" if emotion == DISGUST
+        return "afraid" if emotion == FEAR
+        return "contemptuous"
+
+    def grade(requested: i64) -> Grade:
+        can Abort.Panic:
+            r: i64 = requested if requested > 0 else 1
+            n: i64 = 2 if r < 2 else (3 if r < 3 else (5 if r < 4 else (7 if r < 6 else 8)))
+            low: f64 = 0.9 if r < 4 else (0.8 if r < 6 else (0.7 if r < 9 else (0.6 if r < 12 else fmax(0.4, 0.6 - 0.02 * (r - 11).f64()))))
+            high: f64 = 1.0 if r < 9 else low + 0.25
+            flash: f64 = 0.0 if r < 8 else fmax(0.15, 1.6 - 0.12 * (r - 8).f64())
+            crop: f64 = 0.0 if r < 10 else fmin(0.6, 0.3 + 0.03 * (r - 10).f64())
+            seconds: f64 = fmax(2.5, 10.0 - 0.35 * (r - 1).f64())
+            skill: f64 = 0.8 if r < 4 else (0.75 if r < 9 else (0.65 if r < 14 else 0.5))
+            return Grade{rung: r, options: n, low: low, high: high, flash: py_round_decimal(flash, 100.0),
+                crop: py_round_decimal(crop, 100.0), two: r >= 14, seconds: py_round_decimal(seconds, 100.0), skill: skill}
+
+    # _drawn_faces' shapes: brow tilt, brow height, eye open, mouth curve,
+    # mouth open, smirk, by FERPlus's order.
+    def shape(emotion: i64, field: i64) -> f64:
+        table: f64[48] = [0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
+            0.0, 0.1, 0.45, 0.9, 0.3, 0.0,
+            0.0, 0.9, 1.0, 0.0, 0.9, 0.0,
+            -0.7, 0.3, 0.35, -0.8, 0.0, 0.0,
+            0.9, -0.6, 0.4, -0.2, 0.1, 0.0,
+            0.5, -0.4, 0.3, -0.5, 0.2, 0.3,
+            -0.5, 0.8, 0.95, -0.3, 0.6, 0.0,
+            0.2, 0.0, 0.45, 0.2, 0.0, 0.9]
+        return table[(6 * emotion + field).usize()]
+
+    # emotiondata._drawn_faces: 30 faces of each emotion, jittered, with
+    # votes as plain as the face is strong.
+    def drawn_faces() -> Corpus:
+        can Abort.Panic, Memory.Allocate:
+            corpus: mutable Corpus = zeroed
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, 7.u64())
+            cache: mutable GaussCache = zeroed
+            for k in 0..<EMOTIONS |corpus, draw, cache|:
+                for j in 0..<EACH |corpus, draw, cache, k|:
+                    strength: f64 = 0.55 + 0.45 * py_random(&draw)
+                    face: mutable Face = zeroed
+                    for f in 0..<6 |face, draw, cache, k, strength|:
+                        face.params[f.usize()] <- shape(k, f) * strength + py_gauss(&draw, &cache, 0.0, 0.08)
+                    agree: f64 = 0.95 - 0.5 * (1.0 - strength)
+                    rounded: i64 = py_round_half_even(10.0 * agree)
+                    main: i64 = rounded if rounded > 4 else 4
+                    face.votes[k.usize()] <- main
+                    for _ in 0..<(10 - main) |face, draw, k|:
+                        pick: i64 = py_choice_index(&draw, EMOTIONS - 1)
+                        other: i64 = pick if pick < k else pick + 1
+                        face.votes[other.usize()] <- face.votes[other.usize()] + 1
+                    corpus.faces.push(face)
+            return corpus
+
+    def total(face: Face&) -> i64:
+        sum: mutable i64 = 0
+        for k in 0..<EMOTIONS |sum, face|:
+            sum <- sum + face.votes[k.usize()]
+        return sum
+
+    # ranked()[place]: by votes, most first, ties in FERPlus's order.
+    def ranked(face: Face&, place: i64) -> i64:
+        can Abort.Panic:
+            for k in 0..<EMOTIONS |face, place|:
+                above: mutable i64 = 0
+                for j in 0..<EMOTIONS |above, face, k|:
+                    v: i64 = face.votes[j.usize()]
+                    w: i64 = face.votes[k.usize()]
+                    above <- above + 1 if v > w or (v == w and j < k)
+                return k if above == place
+            return -1
+
+    # top(): -1 when the first two tie.
+    def top(face: Face&) -> i64:
+        can Abort.Panic:
+            first: i64 = ranked(face, 0)
+            return -1 if face.votes[first.usize()] == face.votes[ranked(face, 1).usize()]
+            return first
+
+    def agreement(face: Face&) -> f64:
+        can Abort.Panic:
+            most: mutable i64 = 0
+            for k in 0..<EMOTIONS |most, face|:
+                most <- face.votes[k.usize()] if face.votes[k.usize()] > most
+            n: i64 = total(face)
+            return most.f64() / (n if n > 1 else 1).f64()
+
+    # _pool: each offered emotion's faces, in the corpus's order.
+    def pool(level: Grade, low: f64, high: f64, corpus: Corpus&) -> darray[darray[i64]]:
+        can Abort.Panic, Memory.Allocate:
+            keep: mutable darray[darray[i64]] = []
+            for e in 0..<EMOTIONS |keep|:
+                keep.push([])
+            for index in 0..<corpus.faces.count.i64() |keep, level, low, high, corpus|:
+                face: Face = corpus.faces[index.usize()]
+                first: i64 = top(&face)
+                continue if first < 0 or order_index(first) >= level.options
+                if level.two:
+                    second: i64 = ranked(&face, 1)
+                    continue if order_index(second) >= level.options
+                    continue if face.votes[second.usize()].f64() < 0.25 * total(&face).f64()
+                    continue if face.votes[second.usize()] == face.votes[ranked(&face, 2).usize()]
+                else:
+                    a: f64 = agreement(&face)
+                    continue if not (low <= a and a <= high)
+                keep[first.usize()].push(index)
+            return keep
+
+    def emotions_in(keep: darray[darray[i64]]&) -> i64:
+        count: mutable i64 = 0
+        for faces in keep |count|:
+            count <- count + 1 if faces.count > 0.usize()
+        return count
+
+    def step_of(ask: cstr, level: Grade, answer: i64) -> ReadingQuiz::Step:
+        can Abort.Panic, Memory.Allocate:
+            text: mutable dstr = []
+            dstr_append_cstr(&text, ask)
+            options: mutable darray[dstr] = []
+            for k in 0..<level.options |options|:
+                label: mutable dstr = []
+                dstr_append_cstr(&label, name(order(k)))
+                options.push(label)
+            return ReadingQuiz::Step{ask: text, options: options, answer: answer, wide: false, values: []}
+
+    def build(level: Grade, draw: mutable MT19937&, corpus: Corpus&) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            keep: mutable darray[darray[i64]] = pool(level, level.low, level.high, corpus)
+            if emotions_in(&keep) < 2:
+                keep <- pool(level, 0.5, 1.0, corpus)
+            present: i64 = emotions_in(&keep)
+            return zeroed if present < 2
+            sorted: mutable darray[i64] = []
+            for k in 0..<EMOTIONS |sorted, keep|:
+                e: i64 = alphabetical(k)
+                sorted.push(e) if keep[e.usize()].count > 0.usize()
+            items: mutable darray[ReadingQuiz::Item] = []
+            faces: mutable darray[i64] = []
+            crops: mutable darray[i64] = []
+            used: mutable darray[i64] = []
+            for _ in 0..<FACES |items, faces, crops, used, sorted, keep, level, draw, corpus|:
+                emotion: i64 = sorted[py_choice_index(draw, sorted.count.i64()).usize()]
+                choices: darray[i64] = keep[emotion.usize()]
+                face: mutable i64 = choices[py_choice_index(draw, choices.count.i64()).usize()]
+                seen: mutable bool = false
+                for u in used |seen, face|:
+                    seen <- true if u == face
+                if seen and choices.count.i64() > 1:
+                    face <- choices[py_choice_index(draw, choices.count.i64()).usize()]
+                used.push(face)
+                crop: mutable i64 = WHOLE
+                if level.crop != 0.0 and py_random(draw) < level.crop:
+                    crop <- EYES if py_choice_index(draw, 2) == 0 else MOUTH
+                steps: mutable darray[ReadingQuiz::Step] = []
+                truth: mutable dstr = []
+                dstr_append_cstr(&truth, name(emotion))
+                if level.two:
+                    steps.push(step_of("Which emotion is strongest?", level, order_index(emotion)))
+                    shown: Face = corpus.faces[face.usize()]
+                    second: i64 = ranked(&shown, 1)
+                    steps.push(step_of("And the next strongest?", level, order_index(second)))
+                    dstr_append_cstr(&truth, ", then ")
+                    dstr_append_cstr(&truth, name(second))
+                else:
+                    steps.push(step_of("Which emotion is this?", level, order_index(emotion)))
+                items.push(ReadingQuiz::Item{prompt: [], steps: steps, seconds: level.seconds * steps.count.i64().f64(), title: "",
+                    truth: truth, tolerance: 0.0, scored: false})
+                faces.push(face)
+                crops.push(crop)
+            labels: f64 = level.options.f64()
+            chance: f64 = 1.0 / (labels * labels if level.two else labels)
+            need: mutable i64 = FeelingOdds::need_for(FACES, chance)
+            if not level.two:
+                one: i64 = FeelingOdds::need_for(FACES, 1.0 / present.f64())
+                need <- one if one > need
+            skill: i64 = ceil(level.skill * FACES.f64()).i64()
+            need <- skill if skill > need
+            return Round{level: level, quiz: ReadingQuiz::Round{items: items, need: need}, faces: faces, crops: crops}
+
+    def deal(level: Grade, draw: mutable MT19937&, corpus: Corpus&) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            for _ in 0..<40 |level, draw, corpus|:
+                next: mutable MT19937 = zeroed
+                mt_seed_int(&next, py_getrandbits(draw, 32))
+                round: Round = build(level, &next, corpus)
+                # The reference player names every face at once, so every
+                # built round clears the score and time checks.
+                return round if round.quiz.items.count > 0.usize()
+            return zeroed
+
+    # Nothing is imported yet: the faces are the drawn ones.
+    def from_question_cache(owner: mutable Arena&, text: sview) -> Corpus:
+        can Memory.Allocate, Abort.Panic:
+            in owner:
+                return drawn_faces()

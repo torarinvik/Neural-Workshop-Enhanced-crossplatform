@@ -1,0 +1,158 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/scene_drshape.elisa"
+
+extern printf(format: cstr, ...) -> i32 can[Console.Write]
+
+def emit_state(s: DrShapeGame::Session&):
+    can Abort.Panic, Console.Write:
+        _ = printf("%lld %lld %lld %lld %lld %lld %.17g %.17g %lld %lld\n",
+            s.phase, s.puzzle.seed, s.rung, s.trial, s.choice, s.result, s.elapsed, DrShapeGame::strokes(s),
+            s.passed, s.best)
+
+def emit_audio(s: mutable DrShapeGame::Session&, bytes: mutable u8&, capacity: i64):
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        length: i64 = DrShapeGame::audio_window(s, bytes, capacity)
+        _ = printf("%.17g ", s.heard_to)
+        for i in 0..<length |bytes|:
+            _ = printf("%02x", bytes[i.usize()].i32())
+        _ = printf("\n")
+
+def replay() -> bool:
+    can Abort.Panic, Console.Write, Memory.Allocate, Memory.Release:
+        s: mutable DrShapeGame::Session = DrShapeGame::initialize(1, 3, true, -17)
+        return false if not (DrShapeGame::start(&s, 10.0) can Global{Read,Write})
+        return false if DrShapeGame::choosing(&s) or DrShapeGame::choose(&s, 0)
+        emit_state(&s)
+        now: mutable f64 = 10.0
+        # A stalled frame advances at most 100 ms; subsequent frames use 30 Hz substeps.
+        now <- now + 0.4
+        _ = DrShapeGame::advance(&s, now) can Global{Read,Write}
+        emit_state(&s)
+        for i in 0..<9 |now, s|:
+            now <- now + 0.05
+            _ = DrShapeGame::advance(&s, now) can Global{Read,Write}
+        emit_state(&s)
+        pcm: mutable u8[65536] = zeroed
+        emit_audio(&s, &pcm[0], 10000)
+        emit_audio(&s, &pcm[0], 65536)
+        emit_audio(&s, &pcm[0], 65536)
+        for trial in 0..<3 |s, now|:
+            if trial < 2:
+                while not DrShapeGame::choosing(&s) |s, now|:
+                    now <- now + 0.05
+                    _ = DrShapeGame::agent_event(&s, now, -1) can Global{Read,Write}
+                answer: i64 = s.puzzle.answer
+                port: i64 = answer if trial == 0 else (answer + 1) % s.puzzle.count
+                return false if (DrShapeGame::agent_event(&s, now, s.puzzle.count) can Global{Read,Write}) and s.puzzle.count < DrShape::MOST
+                return false if not (DrShapeGame::agent_event(&s, now, port) can Global{Read,Write})
+                return false if DrShapeGame::info(&s, 12) != -1 or DrShapeGame::choose(&s, port)
+                emit_state(&s)
+                now <- now + 0.05
+                _ = DrShapeGame::agent_event(&s, now, -1) can Global{Read,Write}
+            else:
+                while s.phase == DrShapeGame::PLAYING |s, now|:
+                    now <- now + 0.05
+                    _ = DrShapeGame::agent_event(&s, now, -1) can Global{Read,Write}
+            emit_state(&s)
+            return false if s.phase != DrShapeGame::JUDGED or DrShapeGame::info(&s, 12) != s.puzzle.answer
+            return false if DrShapeGame::advance(&s, s.deadline - 0.001) can Global{Read,Write}
+            now <- s.deadline if trial == 0 else now + 0.05
+            if trial == 0:
+                return false if not (DrShapeGame::advance(&s, now) can Global{Read,Write})
+            else:
+                return false if not (DrShapeGame::agent_event(&s, now, -1) can Global{Read,Write})
+            emit_state(&s)
+        return false if s.phase != DrShapeGame::DONE or s.puzzle.count != 0 or s.passed != 1
+        return false if not (DrShapeGame::start(&s, now + 1.0) can Global{Read,Write})
+        emit_state(&s)
+        DrShapeGame::close(&s) can Global{Read,Write}
+        return s.phase == DrShapeGame::READY and s.puzzle.count == 0
+
+def emit_point(p: DrShapeView::Point):
+    can Console.Write:
+        _ = printf("%.17g %.17g %.17g %.17g %.17g %.17g %.17g\n", p.x, p.y, p.depth, p.near, p.camera.x, p.camera.y, p.camera.z)
+
+def view_replay() -> bool:
+    can Abort.Panic, Console.Write:
+        area: DrShapeView::Rect = DrShapeView::Rect{x: 27.36, y: 179.0, w: 857.28, h: 389.0}
+        for count in 3..<7 |area|:
+            for i in 0..<count |area, count|:
+                cell: DrShapeView::Rect = DrShapeView::cell(area, count, i, count == 3)
+                _ = printf("%.17g %.17g %.17g %.17g\n", cell.x, cell.y, cell.w, cell.h)
+        v: DrShape::Matrix = DrShapeView::sway(DrShape::axis_turn(RoomsView::vec(1.0, 0.0, 0.0), 0.3), 1.2, 2)
+        orbit: DrShapeView::Camera = DrShapeView::orbit_camera(v, 400.0, 220.0, 100.0)
+        floor_cam: DrShapeView::Camera = DrShapeView::floor_camera(area, v, 0.85, 0.3, 3.4, 0.6)
+        place: DrShapeDeal::Place = DrShapeDeal::Place{thing: 1, x: -0.7, z: 0.85}
+        platform: DrShapeView::Camera = DrShapeView::platform_camera(v, DrShapeDeal::eye(0.8), 300.0, 260.0, 120.0, place, 0.5)
+        probe: RoomsView::Vec = RoomsView::vec(0.45, 0.15, -0.34)
+        emit_point(DrShapeView::project(&orbit, probe))
+        emit_point(DrShapeView::project(&floor_cam, probe))
+        emit_point(DrShapeView::project(&platform, probe))
+        rng: mutable MT19937 = zeroed
+        mt_seed_int(&rng, 17)
+        params: DrShape::Params = DrShape::draw_params(DrShape::PRISM, &rng)
+        form: DrShape::Form = DrShape::build(DrShape::PRISM, &params)
+        part: DrShapeView::Figure = DrShapeView::figure(&form, &orbit, 2.4, 0.12, 29)
+        return false if part.count != 3 or not part.has_pen
+        emit_point(part.pen)
+        complete: DrShapeView::Figure = DrShapeView::figure(&form, &orbit, form.path.count.f64(), 0.0, 29)
+        return false if complete.count != form.path.count + form.face_count
+        for i in 0..<complete.count |complete|:
+            item: DrShapeView::Item& = &complete.items[i.usize()]
+            _ = printf("%lld %.17g\n", 1.i64() if item.stroke else 0.i64(), item.depth)
+        return true
+
+def paint(list: mutable Display::DisplayList&, s: DrShapeGame::Session&, dark: bool, stage: i64) -> bool:
+    can Abort.Panic, Memory.Allocate, Console.Write:
+        Display::display_reset(list)
+        SceneDrShape::render(list, s, dark)
+        count: mutable i64 = 0
+        last_ring: mutable i64 = 0
+        tubes: mutable i64 = 0
+        green: mutable i64 = 0
+        red: mutable i64 = 0
+        for i in 0..<list.commands.count |list, last_ring, tubes, count, green, red|:
+            cmd: Display::DrawCmd = get list.commands[i] else zeroed
+            count <- count + 1 if cmd.kind == Display::CMD_POLYGON and cmd.len == 28.u32()
+            last_ring <- last_ring + 1 if cmd.kind == Display::CMD_POLYGON and cmd.len == 10.u32() and cmd.color == 0xffffe6ff
+            tubes <- tubes + 1 if cmd.kind == Display::CMD_LINE and (cmd.color & 255.u32()) == 230.u32()
+            green <- green + 1 if cmd.kind == Display::CMD_TEXT and cmd.color == SceneVerdict::correct_color()
+            red <- red + 1 if cmd.kind == Display::CMD_TEXT and cmd.color == SceneVerdict::incorrect_color()
+        return false if green != (1 if stage == 2 else 0) or red != (1 if stage == 3 else 0)
+        encoded: darray[u8] = Display::encode_binary(list)
+        return false if encoded.count > 1048576.usize()
+        _ = printf("%lld %lld %lld %lld %lld\n", s.puzzle.mode, stage, count, last_ring, tubes)
+        return list.commands.count > 0.usize()
+
+def frame_replay() -> bool:
+    can Abort.Panic, Console.Write, Memory.Allocate, Global.Read:
+        for mode in 0..<6:
+            s: mutable DrShapeGame::Session = DrShapeGame::initialize(30, 1, true, 17)
+            s.puzzle <- DrShapePuzzle::deal(30, 17, mode)
+            s.phase <- DrShapeGame::PLAYING
+            s.trial <- 1
+            s.elapsed <- 0.54
+            list: mutable Display::DisplayList = Display::DisplayList()
+            return false if not paint(&list, &s, false, 0)
+            return false if SceneDrShape::hit(&s, 456.0, 340.0) != -1
+            s.elapsed <- s.puzzle.show_end + 0.6
+            return false if not paint(&list, &s, true, 1)
+            target: i64 = s.puzzle.answer
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, DrShapeView::shake_seed(s.elapsed, target))
+            cell: DrShapeView::Rect = DrShapeView::shaken(DrShapeView::cell(SceneDrShape::area(), s.puzzle.count, target,
+                DrShapeView::panel(&s.puzzle)), s.puzzle.level.overload, &rng)
+            return false if SceneDrShape::hit(&s, cell.x + cell.w / 2.0, cell.y + cell.h / 2.0) != target
+            return false if not DrShapeGame::choose(&s, target)
+            s.phase <- DrShapeGame::JUDGED
+            return false if not paint(&list, &s, false, 2)
+            s.choice <- -1
+            s.result <- DrShapeGame::TIMEOUT
+            return false if not paint(&list, &s, false, 3)
+        return true
+
+def main() -> i32:
+    can Abort.Panic, Console.Write, Memory.Allocate, Memory.Release:
+        return 0.i32() if (replay() can Global{Read,Write}) and view_replay() and (frame_replay() can Global.Read) else 1.i32()

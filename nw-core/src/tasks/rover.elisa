@@ -1,0 +1,311 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+
+module Rover:
+    const DRIVE: i64 = 0
+    const BRAKE: i64 = 1
+    const LEFT: i64 = 2
+    const RIGHT: i64 = 3
+    const PORTS: i64 = 4
+    const NEUTRAL: i64 = -1
+    const PUSH: f64 = 1.6
+    const TOP: f64 = 3.0
+    const STEER: f64 = 0.55
+    const FLAG: f64 = 2.2
+    const BODY: f64 = 0.9
+    const MAX_ROCKS: i64 = 40
+    const WAVES: i64 = 3
+
+    struct Grade:
+        rung: i64
+        delay: f64
+        wander: f64
+        flags: i64
+        rocks: i64
+        hills: f64
+        tip: f64
+        drag: f64
+
+    struct Point:
+        x: f64
+        z: f64
+
+    struct Wave:
+        amp: f64
+        kx: f64
+        kz: f64
+        phase: f64
+
+    struct Rock:
+        at: Point
+        radius: f64
+
+    struct Ground:
+        level: Grade
+        waves: Wave[3]
+        rocks: Rock[40]
+        flags: Point[4]
+        delays: mutable darray[f64]
+        seconds: f64
+
+    struct State:
+        x: f64
+        z: f64
+        heading: f64
+        v: f64
+
+    def grade(requested: i64) -> Grade:
+        rung: i64 = requested if requested > 1 else 1
+        if rung == 1:
+            return Grade{rung: rung, delay: 0.2, wander: 0.0, flags: 1, rocks: 0, hills: 0.0, tip: 0.0, drag: 0.8}
+        if rung < 4:
+            return Grade{rung: rung, delay: 0.5, wander: 0.0, flags: 2, rocks: 0, hills: 0.0, tip: 0.0, drag: 0.8}
+        if rung < 7:
+            return Grade{rung: rung, delay: 1.0, wander: 0.0, flags: 3, rocks: 8 + 2 * (rung - 4), hills: 0.0, tip: 0.0, drag: 0.7}
+        if rung < 10:
+            return Grade{rung: rung, delay: 1.5 + 0.25 * (rung - 7).f64(), wander: 0.0, flags: 3, rocks: 12,
+                hills: 2.5, tip: 0.35, drag: 0.6}
+        if rung < 13:
+            return Grade{rung: rung, delay: 2.5 + 0.25 * (rung - 10).f64(), wander: 0.3, flags: 4, rocks: 14,
+                hills: 3.0, tip: 0.32, drag: 0.5}
+        extra: i64 = rung - 13
+        return Grade{rung: rung, delay: 3.0 + 0.3 * extra.f64(), wander: 0.3, flags: 4,
+            rocks: 16 + extra if extra < 24 else MAX_ROCKS, hills: 3.0, tip: 0.3, drag: fmax(0.2, 0.5 - 0.02 * extra.f64())}
+
+    def height(g: Ground&, x: f64, z: f64) -> f64:
+        can Abort.Panic:
+            return 0.0 if g.level.hills == 0.0
+            swell: mutable f64 = 0.0
+            for i in 0..<WAVES |g, x, z, swell|:
+                w: Wave = g.waves[i.usize()]
+                swell <- swell + w.amp * sin(w.kx * x + w.kz * z + w.phase)
+            return swell
+
+    def slope(g: Ground&, x: f64, z: f64, heading: f64) -> f64:
+        can Abort.Panic:
+            sx: f64 = height(g, x + 0.5, z) - height(g, x - 0.5, z)
+            sz: f64 = height(g, x, z + 0.5) - height(g, x, z - 0.5)
+            return fabs(sx * cos(heading) + sz * -sin(heading))
+
+    def delay_at(g: Ground&, t: f64) -> f64:
+        can Abort.Panic:
+            last: i64 = g.delays.count.i64() - 1
+            index: i64 = 0 if t < 0.0 else (last if t >= last.f64() else t.i64())
+            return g.delays[index]
+
+    def flag_distance(a: Point, b: Point) -> f64:
+        can Abort.Panic:
+            return py_hypot(a.x - b.x, a.z - b.z)
+
+    def next_rock(rng: mutable MT19937&, points: Point[5]&, flags: i64) -> Rock:
+        can Abort.Panic:
+            while true |rng, points, flags|:
+                leg: i64 = py_randbelow(rng, flags.u64()).i64()
+                fraction: f64 = py_random(rng)
+                a: Point = points[leg.usize()]
+                b: Point = points[(leg + 1).usize()]
+                x: f64 = a.x + (b.x - a.x) * fraction + py_uniform(rng, -4.0, 4.0)
+                z: f64 = a.z + (b.z - a.z) * fraction + py_uniform(rng, -4.0, 4.0)
+                at: Point = Point{x: x, z: z}
+                clear: mutable bool = true
+                for i in 0..<(flags + 1) |points, at, clear|:
+                    if flag_distance(at, points[i.usize()]) <= FLAG + 2.0:
+                        clear <- false
+                        break
+                if clear:
+                    return Rock{at: at, radius: py_uniform(rng, 0.6, 1.3)}
+            return Rock{at: Point{x: 0.0, z: 0.0}, radius: 0.0}
+
+    def build(level: Grade, rng: mutable MT19937&) -> Ground:
+        can Memory.Allocate, Abort.Panic:
+            waves: mutable Wave[3] = zeroed
+            if level.hills != 0.0:
+                for i in 0..<WAVES |waves, level, rng|:
+                    amp: f64 = level.hills * py_uniform(rng, 0.3, 0.6)
+                    kx: f64 = py_uniform(rng, -0.15, 0.15)
+                    kz: f64 = py_uniform(rng, -0.15, 0.15)
+                    phase: f64 = py_uniform(rng, 0.0, 6.3)
+                    waves[i.usize()] <- Wave{amp: amp, kx: kx, kz: kz, phase: phase}
+            points: mutable Point[5] = zeroed
+            flags: mutable Point[4] = zeroed
+            distance: mutable f64 = 0.0
+            heading: mutable f64 = 0.0
+            for i in 0..<level.flags |points, flags, distance, heading, rng|:
+                swing: f64 = 0.3 if i == 0 else 1.0
+                heading <- heading + py_uniform(rng, -swing, swing)
+                leg: f64 = py_uniform(rng, 18.0, 28.0)
+                prior: Point = points[i.usize()]
+                goal: Point = Point{x: prior.x + sin(heading) * leg, z: prior.z + cos(heading) * leg}
+                flags[i.usize()] <- goal
+                points[(i + 1).usize()] <- goal
+                distance <- distance + flag_distance(prior, goal)
+            rocks: mutable Rock[40] = zeroed
+            for i in 0..<level.rocks |rocks, level, rng, points|:
+                rocks[i.usize()] <- next_rock(rng, &points, level.flags)
+            seconds: f64 = 30.0 + distance * (1.0 + 0.5 * level.delay)
+            count: i64 = seconds.i64() + 2
+            delays: mutable darray[f64] = []
+            _ = delays.reserve(count.usize())
+            for _ in 0..<count |delays, level, rng|:
+                delays.push(level.delay * (1.0 + level.wander * py_uniform(rng, -1.0, 1.0)))
+            return Ground{level: level, waves: waves, rocks: rocks, flags: flags, delays: delays, seconds: seconds}
+
+    struct Controls:
+        drive: mutable f64
+        brake: mutable f64
+        left: mutable f64
+        right: mutable f64
+
+    def advance(level: Grade, state: State, on: Controls, dt: f64) -> State:
+        raw: f64 = state.v + PUSH * dt * on.drive - 2.0 * PUSH * dt * on.brake
+        coast: f64 = fmax(0.0, 1.0 - on.drive - on.brake)
+        moved: f64 = raw - copysign(fmin(fabs(raw), level.drag * dt * coast), raw)
+        v: f64 = fmax(-1.0, fmin(TOP, moved))
+        turn: f64 = STEER * fmax(-1.5, fmin(1.5, v)) * dt * (on.right - on.left)
+        h: f64 = state.heading + turn
+        return State{x: state.x + sin(h) * v * dt, z: state.z + cos(h) * v * dt, heading: h, v: v}
+
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const HIT_ROCK: i64 = 2
+    const TIPPED: i64 = 3
+    const TIMEOUT: i64 = 4
+    const HISTORY_CAPACITY: i64 = 4001
+    const HISTORY_RETAINED: i64 = 3000
+
+    struct Command:
+        at: f64
+        port: i64
+        duration: f64
+
+    struct Observation:
+        at: f64
+        state: State
+
+    struct Cue:
+        at: f64
+        passed: bool
+
+    struct Run:
+        ground: mutable Ground
+        t: mutable f64
+        state: mutable State
+        queue: mutable darray[Command]
+        queued: mutable i64
+        history: mutable darray[Observation]
+        history_next: mutable i64
+        history_count: mutable i64
+        reached: mutable i64
+        result: mutable i64
+        cues: mutable Cue[5]
+        cue_count: mutable i64
+
+    def start(ground: Ground) -> Run:
+        can Memory.Allocate, Abort.Panic:
+            state: State = zeroed
+            queue: darray[Command] = []
+            history: darray[Observation] = [Observation{at: 0.0, state: state}]
+            return Run{ground: ground, t: 0.0, state: state, queue: queue, queued: 0,
+                history: history, history_next: 1, history_count: 1,
+                reached: 0, result: LIVE, cues: zeroed, cue_count: 0}
+
+    def send(run: mutable Run&, port: i64, duration: f64):
+        can Memory.Allocate, Abort.Panic:
+            return if port < 0 or port >= PORTS
+            at: f64 = run.t + delay_at(&run.ground, run.t) / 2.0
+            cue: Command = Command{at: at, port: port, duration: duration}
+            if run.queued < run.queue.count.i64():
+                run.queue[run.queued] <- cue
+            else:
+                run.queue.push(cue)
+            run.queued <- run.queued + 1
+
+    def active(run: Run&, begin: f64, end: f64) -> Controls:
+        can Abort.Panic:
+            on: mutable Controls = zeroed
+            for i in 0..<run.queued |run, begin, end, on|:
+                cmd: Command = run.queue[i]
+                overlap: f64 = fmin(end, cmd.at + cmd.duration) - fmax(begin, cmd.at)
+                continue if overlap <= 0.0
+                portion: f64 = overlap / (end - begin)
+                if cmd.port == DRIVE:
+                    on.drive <- fmin(1.0, on.drive + portion)
+                elif cmd.port == BRAKE:
+                    on.brake <- fmin(1.0, on.brake + portion)
+                elif cmd.port == LEFT:
+                    on.left <- fmin(1.0, on.left + portion)
+                else:
+                    on.right <- fmin(1.0, on.right + portion)
+            return on
+
+    def expire(run: mutable Run&):
+        can Abort.Panic:
+            kept: mutable i64 = 0
+            for i in 0..<run.queued |run, kept|:
+                cmd: Command = run.queue[i]
+                if cmd.at + cmd.duration > run.t:
+                    run.queue[kept] <- cmd if kept != i
+                    kept <- kept + 1
+            run.queued <- kept
+
+    def remember(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            entry: Observation = Observation{at: run.t, state: run.state}
+            if run.history_next < run.history.count.i64():
+                run.history[run.history_next] <- entry
+            else:
+                run.history.push(entry)
+            run.history_next <- (run.history_next + 1) % HISTORY_CAPACITY
+            run.history_count <- run.history_count + 1
+            run.history_count <- HISTORY_RETAINED if run.history_count == HISTORY_CAPACITY
+
+    def seen(run: Run&) -> State:
+        can Abort.Panic:
+            back: f64 = run.t - delay_at(&run.ground, run.t) / 2.0
+            first: i64 = (run.history_next - run.history_count + HISTORY_CAPACITY) % HISTORY_CAPACITY
+            low: mutable i64 = 0
+            high: mutable i64 = run.history_count
+            while low + 1 < high |low, high, first, back, run|:
+                mid: i64 = (low + high) / 2
+                entry: Observation = run.history[(first + mid) % HISTORY_CAPACITY]
+                if entry.at > back:
+                    high <- mid
+                else:
+                    low <- mid
+            return run.history[(first + low) % HISTORY_CAPACITY].state
+
+    def note(run: mutable Run&, passed: bool):
+        can Abort.Panic:
+            run.cues[run.cue_count.usize()] <- Cue{at: run.t, passed: passed}
+            run.cue_count <- run.cue_count + 1
+
+    def step(run: mutable Run&, dt: f64, port: i64):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != LIVE
+            send(run, port, dt)
+            before: f64 = run.t
+            run.t <- run.t + dt
+            on: Controls = active(run, before, run.t)
+            expire(run)
+            lv: Grade = run.ground.level
+            s: State = advance(lv, run.state, on, dt)
+            run.state <- s
+            remember(run)
+            at: Point = Point{x: s.x, z: s.z}
+            for i in 0..<lv.rocks |run, at|:
+                r: Rock = run.ground.rocks[i.usize()]
+                if flag_distance(at, r.at) < r.radius + BODY:
+                    run.result <- HIT_ROCK
+                    note(run, false)
+                    return
+            if lv.tip != 0.0 and fabs(s.v) > 0.05 and slope(&run.ground, s.x, s.z, s.heading) > lv.tip:
+                run.result <- TIPPED
+                note(run, false)
+                return
+            if flag_distance(at, run.ground.flags[run.reached.usize()]) < FLAG:
+                run.reached <- run.reached + 1
+                note(run, true)
+                if run.reached == lv.flags:
+                    run.result <- CLEAR
+                    return
+            run.result <- TIMEOUT if run.t > run.ground.seconds

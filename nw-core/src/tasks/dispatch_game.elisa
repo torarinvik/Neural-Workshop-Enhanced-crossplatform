@@ -1,0 +1,213 @@
+include "./dispatch_reference.elisa"
+include "../strings.elisa"
+
+module DispatchGame:
+    const READY: i64 = 0
+    const RUNNING: i64 = 1
+    const JUDGED: i64 = 2
+    const DONE: i64 = 3
+    const FIRST_SLOT: i64 = DispatchWorld::UNITS
+    const FIRST_STATION: i64 = FIRST_SLOT + Dispatch::SLOTS
+    const FIRST_REFIT: i64 = FIRST_STATION + 3
+    const START: i64 = FIRST_REFIT + 3
+    const CLEAR_SELECTION: i64 = START + 1
+    const FEEDBACK_MS: i64 = 2200
+    const NOTE_MS: i64 = 1200
+
+    struct Note:
+        event: DispatchWorld::Event
+        until_ms: i64
+
+    struct Round:
+        world: mutable DispatchWorld::World
+        notes: mutable darray[Note]
+        first_note: mutable i64
+        coach_queue: mutable darray[i64]
+        coach_next: mutable i64
+        coach_kind: mutable i64
+
+    struct Session:
+        rng: mutable MT19937
+        owner: mutable Arena
+        start_rung: i64
+        total: i64
+        adaptive: bool
+        coach: bool
+        rung: mutable i64
+        trial: mutable i64
+        phase: mutable i64
+        round: mutable Round
+        selected: mutable i64
+        par: mutable f64
+        passed: mutable bool
+        wins: mutable i64
+        best_rung: mutable i64
+        verdict_damage: mutable f64
+        verdict_saved: mutable i64
+        verdict_lost: mutable i64
+        damage_sum: mutable f64
+        damage_correction: mutable f64
+        agent_seconds: mutable f64
+        last_ms: mutable i64
+        deadline_ms: mutable i64
+
+    def allowed_rung(rung: i64) -> bool:
+        return (rung >= 1 and rung <= 6) or rung == 8 or rung == 10 or rung == 12 or rung == 15 or rung == 20 or rung == 25 or rung == 30
+
+    def allowed_total(total: i64) -> bool:
+        return total == 1 or total == 2 or total == 3 or total == 5 or total == 8
+
+    def initialize(rung: i64, total: i64, adaptive: bool, seed: i64, coach: bool = false) -> Session:
+        can Abort.Panic:
+            rng: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&rng, magnitude)
+            initial: i64 = rung if rung > 0 else 1
+            return Session{rng: rng, owner: zeroed, start_rung: initial, total: total, adaptive: adaptive,
+                coach: coach, rung: initial, trial: 0, phase: READY, round: zeroed, selected: -1,
+                par: 0.0, passed: false, wins: 0, best_rung: 0, verdict_damage: 0.0,
+                verdict_saved: 0, verdict_lost: 0, damage_sum: 0.0, damage_correction: 0.0,
+                agent_seconds: 0.0, last_ms: 0, deadline_ms: 0}
+
+    def close(session: mutable Session&):
+        can Abort.Panic, Memory.Release:
+            arena_free(&session.owner) can Atomics{Exchange,Load,Store}, Unsafe{Alias,PointerCast,RawExtern,UncheckedIndex}, Global{Read,Write}
+            session.round <- zeroed
+            session.phase <- READY
+
+    def deal_owned(owner: mutable Arena&, rung: i64, rng: mutable MT19937&) -> Round:
+        can Abort.Panic, Memory.Allocate:
+            in owner:
+                dealt: Dispatch::Deal = Dispatch::deal(rung, rng)
+                return Round{world: DispatchWorld::initialize(dealt), notes: [], first_note: 0,
+                    coach_queue: [], coach_next: 0, coach_kind: 0}
+
+    def next_trial(session: mutable Session&, now_ms: i64):
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            close(session) can Global{Read,Write}
+            session.selected <- -1
+            session.last_ms <- now_ms
+            if session.trial >= session.total:
+                session.phase <- DONE
+                return
+            session.round <- deal_owned(&session.owner, session.rung, &session.rng)
+            session.par <- DispatchReference::par(session.round.world.dealt)
+            session.trial <- session.trial + 1
+            session.phase <- RUNNING
+
+    def input(session: mutable Session&, port: i64, now_ms: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if now_ms < session.last_ms or now_ms > 9007199254740991
+            if port == START:
+                return false if session.total <= 0 or (session.phase != READY and session.phase != DONE)
+                session.rung <- session.start_rung
+                session.trial <- 0
+                session.wins <- 0
+                session.best_rung <- 0
+                session.damage_sum <- 0.0
+                session.damage_correction <- 0.0
+                next_trial(session, now_ms) can Global{Read,Write}
+                return true
+            return false if session.phase != RUNNING or port < 0 or port > CLEAR_SELECTION
+            if port == CLEAR_SELECTION:
+                session.selected <- -1
+                return true
+            if port < FIRST_SLOT:
+                return false if port >= session.round.world.unit_count
+                session.selected <- -1 if session.selected == port else port
+                return true
+            return false if session.selected < 0
+            kind: i64 = DispatchWorld::INCIDENT if port < FIRST_STATION else (DispatchWorld::STATION if port < FIRST_REFIT else DispatchWorld::REFIT)
+            offset: i64 = FIRST_SLOT if port < FIRST_STATION else (FIRST_STATION if port < FIRST_REFIT else FIRST_REFIT)
+            return false if not DispatchWorld::send(&session.round.world, session.selected, kind, port - offset)
+            session.selected <- -1
+            return true
+
+    def tick_owned(owner: mutable Arena&, round: mutable Round&, now_ms: i64, dt: f64, coach: bool):
+        can Abort.Panic, Memory.Allocate:
+            in owner:
+                DispatchWorld::step(&round.world, dt)
+                events: darray[DispatchWorld::Event] = DispatchWorld::take_events(&round.world)
+                for event in events |round, now_ms, coach|:
+                    if event.kind != DispatchWorld::REPORT:
+                        round.notes.push(Note{event: event, until_ms: now_ms + NOTE_MS})
+                    if coach and (event.kind == DispatchWorld::SAVED or event.kind == DispatchWorld::LOST):
+                        round.coach_queue.push(event.kind)
+                round.coach_kind <- get round.coach_queue[round.coach_next.usize()] else 0
+                round.coach_next <- round.coach_next + 1 if round.coach_kind != 0
+                while round.first_note < round.notes.count.i64() and round.notes[round.first_note.usize()].until_ms <= now_ms |round, now_ms|:
+                    round.first_note <- round.first_note + 1
+
+    def judge(session: mutable Session&, now_ms: i64):
+        damage: f64 = session.round.world.damage
+        passed: bool = damage <= session.par + 1e-9
+        session.passed <- passed
+        session.verdict_damage <- damage
+        session.verdict_saved <- session.round.world.saved
+        session.verdict_lost <- session.round.world.lost
+        previous: f64 = session.damage_sum
+        next: f64 = previous + damage
+        session.damage_correction <- session.damage_correction + (((previous - next) + damage) if fabs(previous) >= fabs(damage) else ((damage - next) + previous))
+        session.damage_sum <- next
+        if passed:
+            session.wins <- session.wins + 1
+            session.best_rung <- session.rung if session.rung > session.best_rung
+        if session.adaptive:
+            session.rung <- session.rung + 1 if passed and session.rung < 9223372036854775807
+            session.rung <- session.rung - 1 if not passed and session.rung > 1
+        session.phase <- JUDGED
+        session.selected <- -1
+        session.deadline_ms <- now_ms + FEEDBACK_MS
+
+    def advance(session: mutable Session&, now_ms: i64, dt: f64, stepped: bool = false) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if now_ms < session.last_ms or now_ms > 9007199254740991
+            return false if not (dt >= 0.0 and dt <= 9007199254740.0)
+            if session.phase == JUDGED:
+                return false if not stepped and now_ms < session.deadline_ms
+                next_trial(session, now_ms) can Global{Read,Write}
+                return true
+            return false if session.phase != RUNNING
+            session.last_ms <- now_ms
+            tick_owned(&session.owner, &session.round, now_ms, fmin(dt, 0.25), session.coach)
+            if session.round.world.over and session.round.coach_kind == 0:
+                judge(session, now_ms)
+            return true
+
+    def agent_event(session: mutable Session&, now: f64, port: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not (now >= session.agent_seconds and now <= 9007199254740.0)
+            now_ms: i64 = (now * 1000.0).i64()
+            if port >= 0:
+                if port == START and (input(session, port, now_ms) can Global{Read,Write}):
+                    session.agent_seconds <- now
+                    return true
+                return input(session, port, now_ms) can Global{Read,Write} if port < START else false
+            return false if port != -1
+            elapsed: f64 = now - session.agent_seconds
+            changed: bool = advance(session, now_ms, elapsed, true) can Global{Read,Write}
+            session.agent_seconds <- now if changed
+            return changed
+
+    def mean_damage(session: Session&) -> f64:
+        scored: i64 = session.trial - (1 if session.phase == RUNNING else 0)
+        return (session.damage_sum + session.damage_correction) / scored.f64() if scored > 0 else 0.0
+
+
+    def info(session: Session&, field: i64) -> i64:
+        can Abort.Panic:
+            return session.phase if field == 0
+            return session.rung if field == 1
+            return session.trial if field == 2
+            return session.total if field == 3
+            return session.selected if field == 4
+            return session.round.world.open_count if field == 5
+            return session.round.world.next_report if field == 6
+            return round_half_even(session.round.world.damage) if field == 7
+            return session.wins if field == 8
+            return session.best_rung if field == 9
+            return session.start_rung if field == 10
+            return 1 if field == 11 and session.adaptive
+            return 0 if field == 11
+            return session.round.coach_kind if field == 12
+            return -1

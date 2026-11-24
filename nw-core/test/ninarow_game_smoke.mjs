@@ -61,6 +61,12 @@ function frame(handle) {
     Number(length)).slice();
 }
 
+function verdicts(handle) {
+  return decode(frame(handle)).filter(({ kind, color }) =>
+    kind === Kind.TEXT && (color === 0x40ff40ff || color === 0xff4040ff))
+    .map(({ text, color, b }) => ({ text, color, y: b }));
+}
+
 assert.equal(TASK, 3456348074n, "N-in-a-row keeps its stable task ID");
 assert.equal(Number(exports.nw_api_v1_supports(TASK)), 1);
 assert.equal(create([0n, 5n, 0n, 0n, 0n, 3n]), STATUS.badOptions);
@@ -100,12 +106,14 @@ values = state(run);
 assert.equal(values[INFO.phase], PHASE.judged);
 assert.equal(values[INFO.verdict], 1n);
 assert.equal(values[INFO.showAnswer], 1n);
+assert.deepEqual(verdicts(run), [{ text: "Right", color: 0x40ff40ff, y: 60 }]);
 assert.ok(decode(frame(run)).some(({ kind, text }) => kind === Kind.TEXT && text === "Right"));
 
 assert.equal(event(run, EVENT.keyDown, 1004, 4, KEY.space, 32n), STATUS.accepted,
   "Space advances from judged feedback to the next position");
 assert.equal(state(run)[INFO.phase], PHASE.asking);
 assert.equal(state(run)[INFO.trial], 2n);
+assert.deepEqual(verdicts(run), []);
 
 // Exercise cursor movement without needing the private answer field: the
 // controller accepts a move and preserves the selected empty cell.
@@ -126,5 +134,19 @@ assert.ok(values[INFO.size] >= values[INFO.length]);
 assert.ok(values[INFO.size] >= 5n);
 assert.ok(frame(custom).length > 0);
 assert.equal(exports.nw_api_v1_destroy(custom), 0n);
+
+const missed = create([1n, 1n, 0n, 0n, 0n, 3n], 42n);
+assert.equal(action(missed, ACTION.start, 1, 0), STATUS.accepted);
+values = state(missed);
+assert.notEqual(values[INFO.choice], values[INFO.answer], "the fixture starts on a wrong cell");
+assert.equal(event(missed, EVENT.keyDown, 2, 1, KEY.enter, 13n), STATUS.accepted);
+const missedVerdict = { text: "No", color: 0xff4040ff, y: 60 };
+assert.deepEqual(verdicts(missed), [missedVerdict]);
+assert.equal(action(missed, ACTION.start, 3, 2), STATUS.accepted);
+assert.deepEqual(verdicts(missed), [missedVerdict], "the summary retains the last verdict");
+assert.ok(decode(frame(missed)).some(({ text }) => text === "0 of 1 right, highest level 0"));
+assert.equal(action(missed, ACTION.start, 4, 3), STATUS.accepted);
+assert.deepEqual(verdicts(missed), []);
+assert.equal(exports.nw_api_v1_destroy(missed), 0n);
 
 console.log("PASS: N-in-a-row source-backed lifecycle, exact generator state, input, grading, render, options, and cleanup");

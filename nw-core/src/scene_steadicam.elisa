@@ -1,0 +1,222 @@
+include "./tasks/steadicam_game.elisa"
+include "./scene_live_view.elisa"
+include "./scene_polish.elisa"
+include "./scene_verdict.elisa"
+include "./scene_lens.elisa"
+
+# ui/steadicam.py: the viewfinder -- what the camera sees, with the framing
+# box drawn on it, and on the rungs that ask for a size, two marks for the
+# least and most of the frame's height the walker may fill. The box turns
+# green while the walker is framed.
+module SceneSteadicam:
+    const LEFT: f64 = (LiveView::WIDTH - LiveView::VIEW_WIDTH) / 2.0
+    # math.degrees multiplies by 180 / pi.
+    const TO_DEGREES: f64 = 57.29577951308232
+
+    def bottom() -> f64:
+        can Abort.Panic:
+            return Verdict::above_the_band(LiveView::HEIGHT, Geometry::from_bottom_edge(LiveView::HEIGHT, 58.0).f64()).f64()
+
+    def height() -> f64:
+        can Abort.Panic:
+            return fmax(40.0, Geometry::from_top_edge(LiveView::HEIGHT, 116.0).f64() - bottom())
+
+    def label(list: mutable Display::DisplayList&, text: sview, y: f64, size: f64, ink: u32, bold: bool = false):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, text, LiveView::CX, y, size, ink, Display::ANCHOR_CENTER_CENTER, bold)
+
+    def shirt(k: i64) -> u32:
+        return 0xdc463cff if k == 0 else (0x4678e6ff if k == 1 else (0xf0c83cff if k == 2 else 0x50be6eff))
+
+    # Where the viewfinder sits in the playing area.
+    def window() -> SceneLens::Clip:
+        can Abort.Panic:
+            width: f64 = LiveView::VIEW_WIDTH
+            tall: f64 = height()
+            across: f64 = tall / Steadicam::ASPECT
+            w: f64 = across if across < width else width
+            h: f64 = w * Steadicam::ASPECT
+            x0: f64 = LEFT + (width - w) / 2.0
+            y0: f64 = bottom() + (tall - h) / 2.0
+            return SceneLens::Clip{x0: x0, y0: y0, x1: x0 + w, y1: y0 + h}
+
+    # Steadicam._draw, without the frame's card.
+    def view(list: mutable Display::DisplayList&, run: Steadicam::Run&):
+        can Memory.Allocate, Abort.Panic:
+            width: f64 = LiveView::VIEW_WIDTH
+            tall: f64 = height()
+            across: f64 = tall / Steadicam::ASPECT
+            w: f64 = across if across < width else width
+            h: f64 = w * Steadicam::ASPECT
+            x0: f64 = LEFT + (width - w) / 2.0
+            y0: f64 = bottom() + (tall - h) / 2.0
+            clip: SceneLens::Clip = SceneLens::Clip{x0: x0, y0: y0, x1: x0 + w, y1: y0 + h}
+            cp: f64 = Steadicam::cosine(run.pitch)
+            look: SceneLens::Vec = SceneLens::vec(Steadicam::sine(run.yaw) * cp, Steadicam::sine(run.pitch),
+                Steadicam::cosine(run.yaw) * cp)
+            lens: SceneLens::Lens = SceneLens::camera(SceneLens::vec(0.0, Steadicam::EYE, 0.0), look, x0, y0, w, h,
+                run.fov * TO_DEGREES, true)
+            SceneLens::rect(list, clip, x0, y0, w, h, 0x96bee6ff)
+            for k in 0..<8 |list, clip, lens|:
+                z0: f64 = (2 + 6 * k).f64()
+                z1: f64 = (8 + 6 * k).f64()
+                ink: u32 = ((((88 - 3 * k).u32()) << 24.u32()) | (((140 - 4 * k).u32()) << 16.u32()) |
+                    (((80 - 2 * k).u32()) << 8.u32()) | 255.u32())
+                ground: SceneLens::Solid = SceneLens::quad(SceneLens::vec(-40.0, 0.0, z0), SceneLens::vec(40.0, 0.0, z0),
+                    SceneLens::vec(40.0, 0.0, z1), SceneLens::vec(-40.0, 0.0, z1))
+                SceneLens::face(list, clip, &lens, &ground, ink)
+            # Things far to near: the trees in the park's order, then the
+            # walkers, each by distance, a stable sort.
+            count: i64 = Steadicam::TREES + run.park.level.people
+            far: mutable f64[34] = zeroed
+            order: mutable i64[34] = zeroed
+            walk_x: mutable f64[4] = zeroed
+            walk_z: mutable f64[4] = zeroed
+            for k in 0..<Steadicam::TREES |run, far, order|:
+                far[k.usize()] <- py_hypot(run.park.tree_x[k.usize()], run.park.tree_z[k.usize()])
+                order[k.usize()] <- k
+            for k in 0..<run.park.level.people |run, far, order, walk_x, walk_z|:
+                at: Steadicam::Spot = Steadicam::where(&run.park.walkers[k.usize()], run.t)
+                walk_x[k.usize()] <- at.x
+                walk_z[k.usize()] <- at.z
+                far[(Steadicam::TREES + k).usize()] <- py_hypot(at.x, at.z)
+                order[(Steadicam::TREES + k).usize()] <- Steadicam::TREES + k
+            for i in 1..<count |far, order|:
+                j: mutable i64 = i
+                while j > 0 and far[order[(j - 1).usize()].usize()] < far[order[j.usize()].usize()] |far, order, j|:
+                    held: i64 = order[j.usize()]
+                    order[j.usize()] <- order[(j - 1).usize()]
+                    order[(j - 1).usize()] <- held
+                    j <- j - 1
+            for i in 0..<count |list, clip, lens, run, order, walk_x, walk_z|:
+                thing: i64 = order[i.usize()]
+                if thing < Steadicam::TREES:
+                    a: f64 = run.park.tree_x[thing.usize()]
+                    b: f64 = run.park.tree_z[thing.usize()]
+                    c: f64 = run.park.tree_r[thing.usize()]
+                    trunk: SceneLens::Solid = SceneLens::quad(SceneLens::vec(a - c * 0.4, 0.0, b), SceneLens::vec(a + c * 0.4, 0.0, b),
+                        SceneLens::vec(a + c * 0.4, 3.0, b), SceneLens::vec(a - c * 0.4, 3.0, b))
+                    SceneLens::face(list, clip, &lens, &trunk, 0x5a402cff)
+                    SceneLens::ball(list, clip, &lens, SceneLens::vec(a, 4.2, b), 1.8 + c, 0x346e3aff, 0.3)
+                else:
+                    k: i64 = thing - Steadicam::TREES
+                    a: f64 = walk_x[k.usize()]
+                    b: f64 = walk_z[k.usize()]
+                    top: u32 = shirt(k % 4) if run.park.level.people > 1 else shirt(0)
+                    legs: SceneLens::Solid = SceneLens::quad(SceneLens::vec(a - 0.18, 0.0, b), SceneLens::vec(a + 0.18, 0.0, b),
+                        SceneLens::vec(a + 0.18, 0.85, b), SceneLens::vec(a - 0.18, 0.85, b))
+                    SceneLens::face(list, clip, &lens, &legs, 0x323246ff)
+                    body: SceneLens::Solid = SceneLens::quad(SceneLens::vec(a - 0.24, 0.85, b), SceneLens::vec(a + 0.24, 0.85, b),
+                        SceneLens::vec(a + 0.24, 1.5, b), SceneLens::vec(a - 0.24, 1.5, b))
+                    SceneLens::face(list, clip, &lens, &body, top)
+                    SceneLens::ball(list, clip, &lens, SceneLens::vec(a, 1.63, b), 0.13, 0xe6bea0ff)
+            # The viewfinder.
+            ax: f64 = Steadicam::aim_x(run)
+            box: f64 = run.park.level.box
+            bw: f64 = box * w / 2.0
+            bh: f64 = box / Steadicam::ASPECT * 0.7 * h / 2.0
+            cx: f64 = x0 + w / 2.0 + ax * w / 2.0
+            cy: f64 = y0 + h / 2.0 + 0.0 * h / 2.0
+            ink: u32 = 0x6ef08ce6 if Steadicam::in_frame(run) else 0xffffffc8
+            SceneLens::line(list, clip, cx - bw, cy - bh, cx + bw, cy - bh, 2.0, ink)
+            SceneLens::line(list, clip, cx + bw, cy - bh, cx + bw, cy + bh, 2.0, ink)
+            SceneLens::line(list, clip, cx + bw, cy + bh, cx - bw, cy + bh, 2.0, ink)
+            SceneLens::line(list, clip, cx - bw, cy + bh, cx - bw, cy - bh, 2.0, ink)
+            lo: f64 = run.park.level.low
+            hi: f64 = run.park.level.high
+            if hi != 0.0:
+                least: f64 = lo * h / 2.0
+                SceneLens::line(list, clip, x0 + 14.0, y0 + h / 2.0 - least, x0 + 14.0, y0 + h / 2.0 + least, 4.0, 0xffdc78c8)
+                most: f64 = hi * h / 2.0
+                SceneLens::line(list, clip, x0 + 14.0, y0 + h / 2.0 - most, x0 + 14.0, y0 + h / 2.0 + most,
+                    4.0 if hi == lo else 2.0, 0xffa05ac8)
+            SceneLens::line(list, clip, x0 + w / 2.0 - 8.0, y0 + h / 2.0, x0 + w / 2.0 + 8.0, y0 + h / 2.0, 1.0, 0xffffff78)
+            SceneLens::line(list, clip, x0 + w / 2.0, y0 + h / 2.0 - 8.0, x0 + w / 2.0, y0 + h / 2.0 + 8.0, 1.0, 0xffffff78)
+
+    def card(list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            frame: SceneLens::Clip = window()
+            box: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: frame.x0 - 4.0, y: frame.y0 - 4.0,
+                w: frame.x1 - frame.x0 + 8.0, h: frame.y1 - frame.y0 + 8.0}
+            shades: u32[3] = [30.u32(), 18.u32(), 12.u32()]
+            for i in 0..<3 |list, box, shades|:
+                blur: f64 = i.f64() * 2.0
+                shadow: SceneHiddenRule::Rect = ScenePolish::spread_box(&box, blur, 4.0)
+                ScenePolish::rounded(list, &shadow, 14.0 + blur, shades[i.usize()])
+            ScenePolish::rounded(list, &box, 14.0, 0x1e2228ff)
+
+    def colour(k: i64) -> cstr:
+        return "red" if k == 0 else ("blue" if k == 1 else ("yellow" if k == 2 else "green"))
+
+    def verdict_text(run: Steadicam::Run&, words: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if run.result == Steadicam::LOST_THEM:
+                dstr_append_cstr(words, "Lost them for 3 seconds")
+            elif run.result != Steadicam::LIVE:
+                dstr_append_cstr(words, "Framed ")
+                dstr_append_i64(words, py_round_half_even(100.0 * Steadicam::share(run)))
+                dstr_append_cstr(words, "% of the time, ")
+                dstr_append_i64(words, py_round_half_even(100.0 * run.park.level.need))
+                dstr_append_cstr(words, "% needed")
+
+    def render(list: mutable Display::DisplayList&, session: SteadicamGame::Session&, dark: bool):
+        can Memory.Allocate, Abort.Panic:
+            ink: u32 = 0xffffffff if dark else 0x000000ff
+            run: Steadicam::Run& = &session.run
+            label(list, "Steadicam", 648.0, 22.0, ink, true)
+            label(list, "Arrows / WASD: pan and tilt   Q / E or wheel: zoom   Esc: menu", 26.0, 12.0, ink)
+            caption: mutable dstr = []
+            verdict_text(run, &caption)
+            status: mutable dstr = []
+            if session.phase == SteadicamGame::READY:
+                dstr_append_cstr(&status, "Press Space or click to start")
+            elif session.phase == SteadicamGame::DONE:
+                dstr_append_i64(&status, session.wins)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, session.trial)
+                dstr_append_cstr(&status, " passed   highest rung passed ")
+                dstr_append_i64(&status, session.best_rung)
+            elif session.phase == SteadicamGame::JUDGED:
+                status <- caption
+            elif run.park.level.people > 1:
+                dstr_append_cstr(&status, "Follow the ")
+                dstr_append_cstr(&status, colour(Steadicam::whom(run)))
+                dstr_append_cstr(&status, " one")
+            else:
+                dstr_append_cstr(&status, "Keep the walker in the box")
+            label(list, bytes_view(status), 614.0, 14.0, ink)
+            if session.phase == SteadicamGame::PLAYING or session.phase == SteadicamGame::JUDGED:
+                facts: mutable dstr = []
+                dstr_append_cstr(&facts, "rung ")
+                dstr_append_i64(&facts, session.rung)
+                dstr_append_cstr(&facts, "  ")
+                dstr_append_i64(&facts, session.trial)
+                dstr_append_cstr(&facts, "/")
+                dstr_append_i64(&facts, session.total)
+                dstr_append_cstr(&facts, "   framed ")
+                dstr_append_i64(&facts, py_round_half_even(100.0 * Steadicam::share(run)))
+                dstr_append_cstr(&facts, "% (need ")
+                dstr_append_i64(&facts, py_round_half_even(100.0 * run.park.level.need))
+                dstr_append_cstr(&facts, "%)   ")
+                dstr_append_i64(&facts, py_round_half_even(fmax(0.0, run.park.level.seconds - run.t)))
+                dstr_append_cstr(&facts, " s")
+                label(list, bytes_view(facts), 588.0, 12.0, ink)
+                card(list)
+                view(list, run)
+            if session.phase == SteadicamGame::JUDGED or session.phase == SteadicamGame::DONE:
+                SceneVerdict::put(list, LiveView::WIDTH, LiveView::HEIGHT, 1.0, 1.0, run.result == Steadicam::PASSED,
+                    bytes_view(caption), 60.0, 16.0)
+
+    # taskoptions.steadicam_note.
+    def option_note(rung: i64, words: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            level: Steadicam::Grade = Steadicam::grade(rung)
+            dstr_append_cstr(words, "Rung ")
+            dstr_append_i64(words, level.rung)
+            dstr_append_cstr(words, ": ")
+            dstr_append_i64(words, py_round_half_even(level.seconds))
+            dstr_append_cstr(words, " s, ")
+            dstr_append_i64(words, py_round_half_even(level.need * 100.0))
+            dstr_append_cstr(words, "% framed.")
+            dstr_append_cstr(words, "  A heavy head.") if level.heavy
+            dstr_append_cstr(words, "  Leave lead room.") if level.lead

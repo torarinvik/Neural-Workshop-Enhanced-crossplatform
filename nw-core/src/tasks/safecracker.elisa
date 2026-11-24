@@ -1,0 +1,498 @@
+include "../hand_view.elisa"
+include "../pymath.elisa"
+include "../strings.elisa"
+
+module Safecracker:
+    const LETTER: i64 = HandView::KEYS
+    const BACKSPACE: i64 = LETTER + 26
+    const PORTS: i64 = BACKSPACE + 1
+    const NUMBERS: i64 = 40
+    const PER: f64 = 9.0
+    const PI: f64 = 3.141592653589793
+    const DIAL_X: f64 = 2.0
+    const DIAL_Y: f64 = 2.5
+    const DIAL_RADIUS: f64 = 0.85
+    const HANDLE_X: f64 = 3.45
+    const HANDLE_Y: f64 = 2.5
+    const THROW: f64 = 0.8
+    const PENDING: i64 = 0
+    const PASSED: i64 = 1
+    const MISTAKES: i64 = 2
+    const TIMEOUT: i64 = 3
+    const GRAB_NONE: i64 = 0
+    const GRAB_DIAL: i64 = 1
+    const GRAB_LEVER: i64 = 2
+    const WORD: i64 = 0
+    const LAMP: i64 = 1
+    const OPPOSITE: i64 = 2
+    const BACKWARDS: i64 = 3
+    const COUNT: i64 = 4
+    const TWO: i64 = 5
+    const TICK: i64 = 0
+    const THUNK: i64 = 1
+    const CLACK: i64 = 2
+    const KEY: i64 = 3
+    const BUZZ: i64 = 4
+    const RATTLE: i64 = 5
+    const OPEN: i64 = 6
+
+    struct Grade:
+        rung: i64
+        tumblers: i64
+        mark: f64
+        glow: bool
+        first_clue: i64
+        clue_count: i64
+        drift: f64
+        swing: f64
+        decoys: i64
+        strict: bool
+        thunk: f64
+        seconds: f64
+
+    struct Safe:
+        level: Grade
+        valid: mutable bool
+        combo: mutable darray[i64]
+        decoys: mutable darray[i64]
+        clue: mutable dstr
+        answer: mutable dstr
+        lamps: mutable i64[2]
+        bolts: mutable i64
+        seed: mutable i64
+
+    struct Frame:
+        right: RoomsView::Vec
+        normal: RoomsView::Vec
+
+    struct Cue:
+        time: f64
+        duration: f64
+        pitch: f64
+        voice: i64
+        gain: f64
+        seed: i64
+
+    struct Run:
+        safe: Safe
+        hand: mutable HandView::Pointer
+        time: mutable f64
+        reading: mutable f64
+        tumblers_set: mutable i64
+        typed: mutable u8[5]
+        length: mutable i64
+        worded: mutable bool
+        lever: mutable f64
+        strikes: mutable i64
+        grab: mutable i64
+        angle: mutable f64
+        last_way: mutable i64
+        travel: mutable f64
+        pulled: mutable f64
+        rattled: mutable f64
+        phase: f64
+        record_audio: bool
+        notes: mutable darray[Cue]
+        result: mutable i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: i64 = r - 20 if r >= 20 else 0
+        t: f64 = top.f64()
+        tumblers: i64 = 1 if r < 4 else (2 if r < 7 else (3 if r < 16 else (4 if r < 20 else 5 + top / 4)))
+        first: i64 = WORD if r < 4 else (LAMP if r < 10 else (OPPOSITE if r < 13 else (BACKWARDS if r < 16 else TWO)))
+        return Grade{rung: r, tumblers: tumblers, glow: r < 4, first_clue: first, clue_count: 2 if r >= 7 and r < 16 else 1,
+            mark: 1.3 if r < 4 else (1.0 if r < 10 else (0.8 if r < 16 else HandView::clamp(0.6 - 0.01 * t, 0.4, 0.6))),
+            drift: 0.0 if r < 7 else (0.8 if r < 20 else HandView::clamp(1.0 + 0.05 * t, 1.0, 2.2)),
+            swing: 0.0 if r < 13 else (10.0 if r < 20 else HandView::clamp(12.0 + t, 12.0, 28.0)),
+            decoys: 0 if r < 10 else (2 if r < 20 else (10 if top >= 14 else 3 + top / 2)),
+            strict: r >= 10, thunk: 0.8 if r < 16 else (0.55 if r < 20 else HandView::clamp(0.5 - 0.01 * t, 0.3, 0.5)),
+            seconds: 14.0 + tumblers.f64() * (11.0 if r < 10 else (9.0 if r < 20 else HandView::clamp(8.5 - 0.1 * t, 5.5, 8.5)))}
+
+    def way(index: i64) -> i64:
+        return 1 if index % 2 == 0 else -1
+
+    def mod(value: i64) -> i64:
+        return (value % NUMBERS + NUMBERS) % NUMBERS
+
+    def wrap(value: f64, period: f64) -> f64:
+        return value - floor(value / period) * period
+
+    def between(a: f64, b: f64) -> f64:
+        return wrap(b - a + 20.0, 40.0) - 20.0
+
+    def answer_text(safe: mutable Safe&, text: sview, backwards: bool):
+        can Memory.Allocate, Abort.Panic:
+            length: i64 = sview_len(text).i64()
+            for i in 0..<length |safe, text, length, backwards|:
+                at: i64 = length - 1 - i if backwards else i
+                safe.answer.push(sview_at(text, at.usize()))
+
+    def count_word(index: i64) -> cstr:
+        return "ZERO" if index == 0
+        return "ONE" if index == 1
+        return "TWO" if index == 2
+        return "THREE" if index == 3
+        return "FOUR" if index == 4
+        return "FIVE" if index == 5
+        return "SIX" if index == 6
+        return "SEVEN" if index == 7
+        return "EIGHT" if index == 8
+        return "NINE"
+
+    def colour_word(index: i64) -> cstr:
+        return "RED" if index == 0
+        return "GREEN" if index == 1
+        return "BLUE" if index == 2
+        return "WHITE"
+
+    def opposite_word(index: i64) -> cstr:
+        return "HOT" if index == 0
+        return "COLD" if index == 1
+        return "UP" if index == 2
+        return "DOWN" if index == 3
+        return "IN" if index == 4
+        return "OUT" if index == 5
+        return "DAY" if index == 6
+        return "NIGHT" if index == 7
+        return "OPEN" if index == 8
+        return "SHUT" if index == 9
+        return "WET" if index == 10
+        return "DRY" if index == 11
+        return "FAST" if index == 12
+        return "SLOW" if index == 13
+        return "HIGH" if index == 14
+        return "LOW"
+
+    def clue_word(index: i64) -> cstr:
+        return "OPEN" if index == 0
+        return "GOLD" if index == 1
+        return "SAFE" if index == 2
+        return "LOCK" if index == 3
+        return "DOOR" if index == 4
+        return "KEYS" if index == 5
+        return "COIN" if index == 6
+        return "RING" if index == 7
+        return "VAULT" if index == 8
+        return "STEEL"
+
+    def clue(safe: mutable Safe&, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            selected: i64 = safe.level.first_clue + py_choice_index(rng, safe.level.clue_count)
+            backward: bool = selected == BACKWARDS or selected == TWO
+            kind: i64 = (OPPOSITE if py_random(rng) < 0.5 else LAMP) if selected == TWO else selected
+            if kind == COUNT:
+                answer_text(safe, sview(count_word(safe.bolts), 0, -1), false)
+                dstr_append_cstr(&safe.clue, "Type how many bolts the door has, as a word.")
+                return
+            if kind == LAMP:
+                side: i64 = py_choice_index(rng, 2)
+                dstr_append_cstr(&safe.clue, "Type the colour of the lamp on the ")
+                dstr_append_cstr(&safe.clue, "left" if side == 0 else "right")
+                answer_text(safe, sview(colour_word(safe.lamps[side.usize()]), 0, -1), backward)
+            elif kind == OPPOSITE:
+                base: i64 = py_choice_index(rng, 8) * 2
+                index: i64 = 1 if selected != TWO and py_random(rng) < 0.5 else 0
+                dstr_append_cstr(&safe.clue, "Type the opposite of ")
+                dstr_append_cstr(&safe.clue, opposite_word(base + index))
+                answer_text(safe, sview(opposite_word(base + 1 - index), 0, -1), backward)
+            else:
+                text: cstr = clue_word(py_choice_index(rng, 10))
+                dstr_append_cstr(&safe.clue, "Type " if backward else "Type the word ")
+                dstr_append_cstr(&safe.clue, text)
+                answer_text(safe, sview(text, 0, -1), backward)
+            dstr_append_cstr(&safe.clue, " backwards." if backward else ".")
+
+    def empty(level: Grade) -> Safe:
+        can Memory.Allocate, Abort.Panic:
+            return Safe{level: level, valid: false, combo: [], decoys: [], clue: [], answer: [], lamps: zeroed, bolts: 0, seed: 0}
+
+    def build(level: Grade, seed: i64) -> Safe:
+        can Abort.Panic, Memory.Allocate:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            safe: mutable Safe = empty(level)
+            at: mutable i64 = 0
+            blocked: mutable i64 = 0
+            for i in 0..<level.tumblers |safe, at, rng, blocked|:
+                at <- mod(at + way(i) * py_randint(&rng, 7, 30))
+                safe.combo.push(at)
+                for delta in -3..<4 |at, blocked|:
+                    blocked <- blocked | (1 << mod(at + delta).u64())
+            spare: mutable i64[40] = zeroed
+            count: mutable i64 = 0
+            for i in 0..<NUMBERS |blocked, spare, count|:
+                if (blocked & (1 << i.u64())) == 0:
+                    spare[count.usize()] <- i
+                    count <- count + 1
+            picks: darray[i64] = py_sample_range(&rng, 0, count - 1, level.decoys if count >= level.decoys else count)
+            for i in picks |safe, spare|:
+                safe.decoys.push(spare[i.usize()])
+            lamps: darray[i64] = py_sample_range(&rng, 0, 3, 2)
+            safe.lamps[0] <- get lamps[0] else 0
+            safe.lamps[1] <- get lamps[1] else 0
+            safe.bolts <- py_randint(&rng, 3, 9)
+            clue(&safe, &rng)
+            safe.seed <- py_choice_index(&rng, 1073741824)
+            safe.valid <- true
+            return safe
+
+    def initialize(safe: Safe, record_audio: bool = true) -> Run:
+        can Abort.Panic, Memory.Allocate:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, safe.seed.u64())
+            return Run{safe: safe, hand: HandView::initialize(), time: 0.0, reading: 0.0, tumblers_set: 0, typed: zeroed,
+                length: 0, worded: false, lever: 0.0, strikes: 0, grab: GRAB_NONE, angle: 0.0, last_way: 0, travel: 0.0,
+                pulled: 0.0, rattled: -1.0, phase: 6.28 * py_random(&rng), record_audio: record_audio, notes: [], result: PENDING}
+
+    def frame(run: Run&) -> Frame:
+        angle: f64 = run.safe.level.swing * (PI / 180.0) * (0.5 - 0.5 * cos(run.time * 1.1))
+        return Frame{right: RoomsView::vec(cos(angle), 0.0, -sin(angle)), normal: RoomsView::vec(sin(angle), 0.0, cos(angle))}
+
+    def view(run: Run&) -> HandView::Lens:
+        can Abort.Panic:
+            drift: f64 = run.safe.level.drift
+            eye: RoomsView::Vec = RoomsView::vec(2.0 + drift * sin(run.time * 0.6 + run.phase),
+                2.3 + 0.4 * drift * sin(run.time * 0.43), 9.0)
+            return HandView::lens(eye, RoomsView::vec(2.0, 2.3, 0.0), 880.0, 500.0, 285.0)
+
+    def see(camera: HandView::Lens&, door: Frame&, u: f64, v: f64, depth: f64 = 0.0) -> RoomsView::Vec:
+        return HandView::see(camera, RoomsView::vec(u * door.right.x + depth * door.normal.x, v,
+            u * door.right.z + depth * door.normal.z))
+
+    def under(camera: HandView::Lens&, door: Frame&, x: f64, y: f64) -> HandView::Intersection:
+        can Abort.Panic:
+            hit: HandView::Intersection = HandView::on_plane(camera, x, y, RoomsView::vec(0.0, 0.0, 0.0), door.normal)
+            return HandView::Intersection{valid: hit.valid, point: RoomsView::vec(RoomsView::dot(hit.point, door.right), hit.point.y, 0.0)}
+
+    def note(run: mutable Run&, time: f64, duration: f64, pitch: f64, voice: i64, gain: f64):
+        can Memory.Allocate, Abort.Panic:
+            if run.record_audio:
+                run.notes.push(Cue{time: time, duration: duration, pitch: pitch, voice: voice, gain: gain, seed: run.notes.count.i64() + 1})
+
+    def strike(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            run.strikes <- run.strikes + 1
+            note(run, run.time, 0.35, 95.0, BUZZ, 0.6)
+            run.result <- MISTAKES if run.strikes >= 3
+
+    def press(run: mutable Run&):
+        can Abort.Panic:
+            return if run.result != PENDING or run.hand.down
+            run.hand.down <- true
+            camera: HandView::Lens = view(run)
+            door: Frame = frame(run)
+            at: HandView::Intersection = under(&camera, &door, run.hand.x, run.hand.y)
+            return if not at.valid
+            if py_hypot(at.point.x - DIAL_X, at.point.y - DIAL_Y) <= DIAL_RADIUS:
+                run.grab <- GRAB_DIAL
+                run.angle <- atan2(at.point.y - DIAL_Y, at.point.x - DIAL_X)
+                run.last_way <- 0
+                run.travel <- 0.0
+            elif py_hypot(at.point.x - HANDLE_X, at.point.y - (HANDLE_Y - THROW * run.lever)) <= 0.4:
+                run.grab <- GRAB_LEVER
+                run.pulled <- at.point.y + THROW * run.lever
+
+    def on_mark(run: Run&) -> bool:
+        can Abort.Panic:
+            k: i64 = run.tumblers_set
+            return false if k >= run.safe.combo.count.i64()
+            target: i64 = get run.safe.combo[k.usize()] else -1
+            return HandView::absolute(between(run.reading, target.f64())) <= run.safe.level.mark
+
+    def release(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            return if not run.hand.down
+            run.hand.down <- false
+            grab: i64 = run.grab
+            run.grab <- GRAB_NONE
+            return if run.result != PENDING
+            run.lever <- 0.0 if grab == GRAB_LEVER
+            k: i64 = run.tumblers_set
+            return if grab != GRAB_DIAL or k >= run.safe.combo.count.i64() or run.travel < 0.5
+            if on_mark(run) and run.last_way == way(k) and run.travel >= 1.0:
+                run.tumblers_set <- k + 1
+                note(run, run.time, 0.3, 520.0 * pow(2.0, k.f64() / 6.0), CLACK, 0.6)
+            elif run.safe.level.strict:
+                strike(run)
+
+    def prefix_matches(run: Run&) -> bool:
+        can Abort.Panic:
+            for i in 0..<run.length |run|:
+                expected: u8 = get run.safe.answer[i.usize()] else 0.u8()
+                return false if run.typed[i.usize()] != expected
+            return true
+
+    def key(run: mutable Run&, port: i64):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != PENDING or run.worded
+            note(run, run.time, 0.05, 900.0, KEY, 0.3)
+            if port == BACKSPACE:
+                run.length <- run.length - 1 if run.length > 0
+                return
+            total: i64 = run.safe.answer.count.i64()
+            return if run.length >= total
+            run.typed[run.length.usize()] <- (65 + port - LETTER).u8()
+            run.length <- run.length + 1
+            if run.length == total:
+                if prefix_matches(run):
+                    run.worded <- true
+                    note(run, run.time, 0.4, 784.0, CLACK, 0.6)
+                elif run.safe.level.strict:
+                    run.length <- 0
+                    strike(run)
+
+    def unlocked(run: Run&) -> bool:
+        return run.worded and run.tumblers_set >= run.safe.combo.count.i64()
+
+    def turn(run: mutable Run&, amount: f64):
+        can Abort.Panic, Memory.Allocate:
+            sign: i64 = 1 if amount > 0.0 else -1
+            if sign != run.last_way:
+                run.last_way <- sign
+                run.travel <- 0.0
+            distance: f64 = HandView::absolute(amount)
+            run.travel <- run.travel + distance
+            old: f64 = run.reading
+            run.reading <- wrap(old + amount, 40.0)
+            if floor(old) != floor(run.reading):
+                note(run, run.time, 0.03, 1300.0, TICK, 0.22)
+            k: i64 = run.tumblers_set
+            if k < run.safe.combo.count.i64() and sign == way(k):
+                target: i64 = get run.safe.combo[k.usize()] else -1
+                gap: f64 = wrap((target.f64() - old) * sign.f64(), 40.0)
+                if gap > 0.0 and gap <= distance:
+                    note(run, run.time, 0.25, 98.0, THUNK, run.safe.level.thunk)
+            for i in 0..<run.safe.decoys.count.i64() |run, old, sign, distance|:
+                decoy: i64 = get run.safe.decoys[i.usize()] else -1
+                gap: f64 = wrap((decoy.f64() - old) * sign.f64(), 40.0)
+                if gap > 0.0 and gap <= distance:
+                    note(run, run.time, 0.2, 196.0, THUNK, run.safe.level.thunk)
+
+    def dial_angle(point: RoomsView::Vec) -> f64:
+        return atan2(point.y - DIAL_Y, point.x - DIAL_X)
+
+    def degrees_turned(before: f64, after: f64) -> f64:
+        return -(wrap(after - before + PI, 2.0 * PI) - PI) * (180.0 / PI)
+
+    def tick(run: mutable Run&, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != PENDING
+            run.time <- run.time + dt
+            if run.grab != GRAB_NONE:
+                camera: HandView::Lens = view(run)
+                door: Frame = frame(run)
+                at: HandView::Intersection = under(&camera, &door, run.hand.x, run.hand.y)
+                if at.valid and run.grab == GRAB_DIAL:
+                    angle: f64 = dial_angle(at.point)
+                    change: f64 = degrees_turned(run.angle, angle)
+                    run.angle <- angle
+                    if HandView::absolute(change) > 0.000001 and HandView::absolute(change) < 120.0:
+                        turn(run, change / PER)
+                elif at.valid:
+                    limit: f64 = 1.0 if unlocked(run) else 0.12
+                    want: f64 = (run.pulled - at.point.y) / THROW
+                    if want > limit + 0.05 and limit < 1.0 and run.time - run.rattled > 0.5:
+                        run.rattled <- run.time
+                        note(run, run.time, 0.15, 300.0, RATTLE, 0.45)
+                    run.lever <- HandView::clamp(want, 0.0, limit)
+                    if run.lever >= 1.0:
+                        semitones: f64[4] = [0.0, 4.0, 7.0, 12.0]
+                        for i in 0..<4 |run, semitones|:
+                            note(run, run.time + 0.09 * i.f64(), 0.4, 262.0 * pow(2.0, semitones[i.usize()] / 12.0), OPEN, 0.4)
+                        run.result <- PASSED
+            if run.result == PENDING and run.time >= run.safe.level.seconds:
+                note(run, run.time, 0.6, 95.0, BUZZ, 0.6)
+                run.result <- TIMEOUT
+
+    def act(run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate:
+            if port >= 0 and port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                press(run)
+            elif port == HandView::RELEASE:
+                release(run)
+            elif port >= LETTER and port < PORTS:
+                key(run, port)
+
+    def pilot_dial(run: Run&, camera: HandView::Lens&, door: Frame&) -> i64:
+        can Abort.Panic:
+            if not run.hand.down:
+                target: RoomsView::Vec = see(camera, door, DIAL_X, DIAL_Y + 0.7)
+                port: i64 = HandView::toward(&run.hand, target.x, target.y, 4.0)
+                return port if port >= 0 else HandView::PRESS
+            return HandView::RELEASE if run.grab != GRAB_DIAL
+            k: i64 = run.tumblers_set
+            target: i64 = get run.safe.combo[k.usize()] else -1
+            direction: i64 = way(k)
+            remaining: f64 = wrap((target.f64() - run.reading) * direction.f64(), 40.0)
+            near: f64 = remaining if remaining < 20.0 else 40.0 - remaining
+            mark: f64 = run.safe.level.mark
+            return HandView::RELEASE if near <= 0.6 * mark and run.last_way == direction and run.travel >= 1.0
+            backing: bool = run.last_way == -direction or run.last_way == 0
+            want: f64 = -direction.f64() * 1.5 if remaining > 36.0 or near <= 0.6 * mark or (backing and remaining < 2.0) else direction.f64() * HandView::clamp(remaining, 0.0, 2.5)
+            at: HandView::Intersection = under(camera, door, run.hand.x, run.hand.y)
+            return HandView::RELEASE if not at.valid
+            angle: f64 = dial_angle(at.point)
+            best: mutable i64 = -1
+            score: mutable f64 = 1000000000.0
+            for port in 0..<HandView::PRESS |run, camera, door, angle, want, mark, best, score|:
+                delta: RoomsView::Point = HandView::displacement(port)
+                hit: HandView::Intersection = under(camera, door, run.hand.x + delta.x, run.hand.y + delta.y)
+                continue if not hit.valid
+                radius: f64 = py_hypot(hit.point.x - DIAL_X, hit.point.y - DIAL_Y)
+                continue if radius < 0.9 or radius > 1.9
+                amount: f64 = degrees_turned(angle, dial_angle(hit.point)) / PER
+                direction_penalty: f64 = 5.0 if amount * want <= 0.0 else 0.0
+                overshoot_penalty: f64 = 5.0 if HandView::absolute(amount) > HandView::absolute(want) + 0.4 * mark else 0.0
+                miss: f64 = HandView::absolute(amount - want) + direction_penalty + 0.3 * HandView::absolute(radius - 1.4) + overshoot_penalty
+                if miss < score:
+                    best <- port
+                    score <- miss
+            if best < 0:
+                target: RoomsView::Vec = see(camera, door, DIAL_X + 1.4 * cos(angle), DIAL_Y + 1.4 * sin(angle))
+                best <- HandView::toward(&run.hand, target.x, target.y)
+            return best
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != PENDING
+            if not run.worded:
+                return HandView::RELEASE if run.hand.down
+                return BACKSPACE if not prefix_matches(run)
+                byte: u8 = get run.safe.answer[run.length.usize()] else 65.u8()
+                return LETTER + byte.i64() - 65
+            camera: HandView::Lens = view(run)
+            door: Frame = frame(run)
+            if run.tumblers_set < run.safe.combo.count.i64():
+                return pilot_dial(run, &camera, &door)
+            return HandView::RELEASE if run.hand.down and run.grab != GRAB_LEVER
+            y: f64 = HANDLE_Y - THROW * run.lever - (0.5 if run.hand.down else 0.0)
+            target: RoomsView::Vec = see(&camera, &door, HANDLE_X, y)
+            port: i64 = HandView::toward(&run.hand, target.x, target.y, 3.0 if run.hand.down else 4.0)
+            return HandView::PRESS if port < 0 and not run.hand.down
+            return port
+
+    def play(safe: Safe) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            run: mutable Run = initialize(safe, false)
+            while run.result == PENDING |run|:
+                act(&run, pilot(&run))
+                tick(&run, 1.0 / 60.0)
+            return run.result
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Safe:
+        can Memory.Allocate, Abort.Panic:
+            level: Grade = grade(rung)
+            for _attempt in 0..<60 |level, draw|:
+                safe: Safe = build(level, py_getrandbits(draw, 32).i64())
+                if play(safe) == PASSED:
+                    return safe
+            return empty(level)
+
+    def result_text(result: i64) -> sview:
+        return "The door is open" if result == PASSED
+        return "Three mistakes: the alarm went off" if result == MISTAKES
+        return "The alarm went off" if result == TIMEOUT
+        return ""

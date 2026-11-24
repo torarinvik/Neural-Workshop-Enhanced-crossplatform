@@ -48,7 +48,13 @@ DEFAULT_ELISA_CORE="$NW_ROOT/../../Go projects/Elisa-core"
 if [[ ! -d "$DEFAULT_ELISA_CORE/compiler" && -d "$NW_ROOT/stage0-elisa-compiler/compiler" ]]; then
     DEFAULT_ELISA_CORE="$NW_ROOT/stage0-elisa-compiler"
 fi
-DEFAULT_ELISA_STAGE1_ROOT="$NW_ROOT/../Elisa-compiler-port-current-23a0"
+# Pinned 2026-11-23 to the Stage1 product built 2026-11-21 from 67818158: its
+# sha256 matches its provenance, and this checkout reproduces the provenance's
+# source_tree_sha256 exactly. The previous pin (23a0) was built from an
+# uncommitted tree that no longer exists, and it predates runtime sources the
+# port now includes (elisacore_bigint.elisa). The old products are kept in
+# toolchain/ under -23a0 names.
+DEFAULT_ELISA_STAGE1_ROOT="$NW_ROOT/../Elisa-compiler-port-current-6781"
 if [[ ! -d "$DEFAULT_ELISA_STAGE1_ROOT" && -d "$NW_ROOT/stage1-elisa-compiler" ]]; then
     DEFAULT_ELISA_STAGE1_ROOT="$NW_ROOT/stage1-elisa-compiler"
 fi

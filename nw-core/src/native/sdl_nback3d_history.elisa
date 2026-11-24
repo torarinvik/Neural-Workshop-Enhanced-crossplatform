@@ -1,0 +1,232 @@
+# The display-list decoder bounds chart size. Plot the most recent 120 days.
+module NBackHistory:
+    const WINDOW: i64 = 120
+
+    struct Day:
+        date: mutable i64
+        total: mutable f64
+        maximum: mutable f64
+        count: mutable i64
+
+    struct Chart:
+        mode: mutable i64
+        title: mutable u8[256]
+        modalities: mutable i64[16]
+        modality_count: mutable i64
+        style: mutable i64
+        days: mutable i64
+        populated: mutable i64
+        recent_accuracy: mutable i64[16]
+        entries: mutable Day[120]
+
+    def ordinal(date: i64) -> i64:
+        y: i64 = date / 10000
+        m: i64 = date / 100 % 100
+        day: i64 = date % 100
+        year: i64 = y - 1 if m <= 2 else y
+        month: i64 = m + 9 if m <= 2 else m - 3
+        return year * 365 + year / 4 - year / 100 + year / 400 + (153 * month + 2) / 5 + day
+
+    def date_of(record: StatsRecord&, rollover: i64) -> i64:
+        can Abort.Panic:
+            return 0 if record.manual != 0 or record.nback < 1 or record.percent < 0 or record.percent > 100
+            return 0 if record.year < 1 or record.year > 9999 or record.month < 1 or record.month > 12 or record.day < 1 or record.day > 31
+            stamp: i64 = record.year * 10000 + record.month * 100 + record.day
+            return sdl_nback3d_yesterday(stamp) if record.hour < rollover else stamp
+
+    def next_mode(records: darray[StatsRecord]&, tables: ModeTables&, current: i64, rollover: i64) -> i64:
+        can Abort.Panic:
+            first: mutable i64 = 2048
+            next: mutable i64 = 2048
+            for at in 0..<records.count.i64() |at, records, tables, current, rollover, first, next|:
+                record: StatsRecord = records[at.usize()]
+                mode: i64 = record.mode
+                if (mode < first or (mode > current and mode < next)) and date_of(&record, rollover) > 0 and mode_index(tables, mode) >= 0:
+                    first <- mode if mode < first
+                    next <- mode if mode > current and mode < next
+            return next if next < 2048
+            return first if first < 2048 else current
+
+    def configure(chart: mutable Chart&, tables: ModeTables&, mode: i64):
+        can Abort.Panic, Unsafe.PointerCast:
+            chart.mode <- mode
+            index: i64 = mode_index(tables, mode)
+            return if index < 0
+            entry: ModeEntry = tables.entries[index.usize()]
+            chart.modality_count <- entry.modalities.count.i64()
+            for at in 0..<chart.modality_count |at, chart, entry|:
+                chart.modalities[at.usize()] <- modality_code(entry.modalities[at.usize()])
+            title_size: i64 = entry.long_name.count.i64()
+            for at in 0..<title_size |at, chart, entry|:
+                chart.title[at.usize()] <- entry.long_name[at.usize()]
+            trusted Unsafe.PointerCast:
+                title: mutable u8& = (&chart.title[0]).uintptr().cast[mutable u8&]
+                _ = SyllogismOptionsHost::append(title.uintptr().i64(), 256, title_size, " N-Back history")
+
+    def category_label(modality: i64) -> cstr:
+        return "Position " if modality == 0
+        return "Position 2 " if modality == 1
+        return "Position 3 " if modality == 2
+        return "Position 4 " if modality == 3
+        return "Color " if modality == 4
+        return "Image " if modality == 5
+        return "Color/Image 1 " if modality == 6
+        return "Color/Image 2 " if modality == 7
+        return "Color/Image 3 " if modality == 8
+        return "Color/Image 4 " if modality == 9
+        return "Vis & n-vis " if modality == 10
+        return "Vis & n-sound " if modality == 11
+        return "Sound & n-vis " if modality == 12
+        return "Sound " if modality == 13
+        return "Sound2 " if modality == 14
+        return "Arithmetic "
+
+    def aggregate(chart: mutable Chart&, records: darray[StatsRecord]&, advance: i64, fallback: i64, rollover: i64):
+        can Abort.Panic:
+            latest: mutable i64 = 0
+            for at in 0..<records.count.i64() |at, records, chart, latest, rollover|:
+                record: StatsRecord = records[at.usize()]
+                continue if record.mode != chart.mode
+                date: i64 = date_of(&record, rollover)
+                if date > 0:
+                    day: i64 = ordinal(date)
+                    latest <- day if day > latest
+            return if latest <= 0
+            start: i64 = latest - WINDOW + 1
+            first: mutable i64 = WINDOW
+            for at in 0..<records.count.i64() |at, records, chart, start, first, advance, fallback, rollover|:
+                record: StatsRecord = records[at.usize()]
+                continue if record.mode != chart.mode
+                date: i64 = date_of(&record, rollover)
+                continue if date <= 0
+                slot: i64 = ordinal(date) - start
+                continue if slot < 0 or slot >= WINDOW
+                index: usize = slot.usize()
+                first <- slot if slot < first
+                value: f64 = day_score(chart.style, record.nback.f64(), record.percent.f64(), advance.f64(), fallback.f64())
+                if chart.entries[index].count == 0:
+                    chart.populated <- chart.populated + 1
+                    chart.entries[index].date <- date
+                    chart.entries[index].maximum <- value
+                else:
+                    chart.entries[index].maximum <- value if value > chart.entries[index].maximum
+                chart.entries[index].total <- chart.entries[index].total + value
+                chart.entries[index].count <- chart.entries[index].count + 1
+            count: mutable i64 = 0
+            totals: mutable i64[16] = zeroed
+            for offset in 0..<records.count.i64() |offset, records, chart, count, totals, rollover|:
+                break if count >= 50
+                record: StatsRecord = records[(records.count.i64() - offset - 1).usize()]
+                if record.mode == chart.mode and date_of(&record, rollover) > 0:
+                    count <- count + 1
+                    for column in 0..<16 |column, totals, record|:
+                        percent: i64 = record.cats[column.usize()]
+                        totals[column.usize()] <- totals[column.usize()] + percent if percent >= 0 and percent <= 100
+            if count > 0:
+                for column in 0..<16 |column, chart, totals, count|:
+                    chart.recent_accuracy[column.usize()] <- totals[column.usize()] / count
+            chart.days <- WINDOW - first
+
+    def render(list: mutable Display::DisplayList&, chart: Chart&, black: bool, width: f64, height: f64):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            paint: mutable SceneGraph::Paint = SceneGraph::paint_of(black, width, height, width / 912.0, height / 684.0)
+            frame: mutable SceneGraph::Frame = zeroed
+            SceneGraph::frame_of(&frame, width, height)
+            trusted Unsafe.PointerCast:
+                title: cstr = (&chart.title[0]).uintptr().cast[cstr]
+                SceneGraph::put_frame(list, &paint, &frame, sview("G / Esc: return     M: change score     N: next game", 0, -1), sview(title, 0, -1))
+            if chart.populated < 2:
+                SceneGraph::put_insufficient(list, &paint, &frame)
+                return
+            labels: mutable darray[sview] = []
+            y_labels: mutable darray[sview] = []
+            dates: mutable u8[1920] = zeroed
+            scores: mutable u8[4096] = zeroed
+            xs: mutable darray[f64] = []
+            means: mutable darray[f64] = []
+            maxima: mutable darray[f64] = []
+            low: mutable f64 = 1.0e20
+            high: mutable f64 = -1.0e20
+            trusted Unsafe.PointerCast:
+                for at in 0..<chart.days |at, chart, labels, dates, low, high|:
+                    day: Day = chart.entries[(WINDOW - chart.days + at).usize()]
+                    slot: mutable u8& = (&dates[(at * 16).usize()]).uintptr().cast[mutable u8&]
+                    if day.count > 0:
+                        _ = SDL_snprintf(slot, 16.usize(), "%lld/%lld", day.date / 100 % 100, day.date % 100)
+                        mean: f64 = day.total / day.count.f64()
+                        low <- mean if mean < low
+                        high <- day.maximum if day.maximum > high
+                    labels.push(sview(slot.cast[cstr], 0, -1))
+                low <- SceneGraph::snapped_low(low)
+                high <- SceneGraph::snapped_high(high)
+                high <- low + (0.25 if low < 1.0e14 else low * 0.000001) if high <= low
+                raw_step: f64 = 0.25 if high - low <= 20.0 else ceil((high - low) / 80.0)
+                precision_step: f64 = high * 1.0e-15
+                step: f64 = raw_step if raw_step >= precision_step else precision_step
+                ticks: i64 = ((high - low) / step).i64() + 1
+                for at in 0..<ticks |at, y_labels, scores, low, step|:
+                    slot: mutable u8& = (&scores[(at * 32).usize()]).uintptr().cast[mutable u8&]
+                    _ = SDL_snprintf(slot, 32.usize(), "%.2f", low + at.f64() * step)
+                    y_labels.push(sview(slot.cast[cstr], 0, -1))
+                SceneGraph::put_x_axis(list, &paint, &frame, &labels, chart.days)
+                SceneGraph::put_y_axis(list, &paint, &frame, low, high, &y_labels, step)
+            for at in 0..<chart.days |at, chart, frame, xs, means, maxima, low, high|:
+                day: Day = chart.entries[(WINDOW - chart.days + at).usize()]
+                if day.count > 0:
+                    xs.push(SceneGraph::point_x(&frame, at, chart.days))
+                    means.push(SceneGraph::point_y(&frame, day.total / day.count.f64(), low, high))
+                    maxima.push(SceneGraph::point_y(&frame, day.maximum, low, high))
+            SceneGraph::put_series(list, &paint, &xs, &means, SceneGraph::color_average())
+            SceneGraph::put_series(list, &paint, &xs, &maxima, SceneGraph::color_maximum())
+            style: cstr = "Level" if chart.style == 0 else ("Accuracy" if chart.style == 1 else ("Level + accuracy" if chart.style == 2 else ("Level + scaled accuracy" if chart.style == 3 else "Threshold-adjusted score")))
+            legend: mutable dstr = []
+            dstr_append_cstr(&legend, style)
+            dstr_append_cstr(&legend, "     Last 50 rounds: ")
+            columns: i64[16] = [0, 9, 10, 11, 2, 6, 12, 13, 14, 15, 3, 7, 4, 1, 8, 5]
+            for at in 0..<chart.modality_count |at, chart, legend, columns|:
+                modality: i64 = chart.modalities[at.usize()]
+                column: usize = columns[modality.usize()].usize()
+                dstr_append_cstr(&legend, category_label(modality))
+                dstr_append_i64(&legend, chart.recent_accuracy[column])
+                dstr_append_cstr(&legend, "%   ")
+            SceneGraph::put_legend(list, &paint, bytes_view(legend))
+
+def sdl_nback_history_key(handle: i64, key: i64) -> bool:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        return false if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: mutable heap NBack3DGame::NBack3DRun& = handle.uintptr().cast[mutable heap NBack3DGame::NBack3DRun&]
+            if run.history_chart != 0.usize():
+                if key == 27 or key == 103 or key == 120 or key == 109 or key == 110:
+                    SDL_free(run.history_chart.cast[heap void&])
+                    run.history_chart <- 0.usize()
+                    return true if key != 109 and key != 110
+                    run.history_style <- (run.history_style + 1) % 5 if key == 109
+                else:
+                    return true
+            else:
+                return false if key != 103 or (run.phase != NBack3DGame::PHASE_READY and run.phase != NBack3DGame::PHASE_DONE)
+            if run.applause_voice != 0.usize():
+                SDLAudio::stop(run.applause_voice.cast[mutable void&])
+                run.applause_voice <- 0.usize()
+            if run.music_library != 0.usize():
+                sdl_reward_mixer_stop(run.music_library, run.music_mixer)
+                run.music_library <- 0.usize()
+                run.music_mixer <- 0.usize()
+                run.music_tier <- 0
+            if SDL_calloc(1.usize(), size_of(NBackHistory::Chart).usize()) is allocation:
+                chart: mutable heap NBackHistory::Chart& = allocation.cast[mutable heap NBackHistory::Chart&]
+                chart.style <- run.history_style
+                tables: ModeTables = ModeTables()
+                size: mutable i64 = 0
+                if run.stats_path != 0.usize():
+                    if sdl_read_corpus(run.stats_path.cast[u8&], &size) is raw:
+                        records: darray[StatsRecord] = parse_stats_text(sview(raw.cast[cstr], 0, size))
+                        SDL_free(raw)
+                        if key == 110:
+                            run.history_mode <- NBackHistory::next_mode(&records, &tables, run.history_mode, run.history_rollover)
+                        chart.mode <- run.history_mode
+                        NBackHistory::aggregate(chart, &records, run.progression.advance_threshold, run.progression.fallback_threshold, run.history_rollover)
+                NBackHistory::configure(chart, &tables, run.history_mode)
+                run.history_chart <- allocation.uintptr()
+            return true

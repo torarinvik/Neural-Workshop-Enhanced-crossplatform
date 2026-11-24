@@ -1,0 +1,137 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/geometry.elisa"
+include "../src/scene_drone_hoops.elisa"
+
+extern printf(format: cstr, ...) -> i32 can[Console.Write]
+
+def vec(p: RoomsView::Vec):
+    can Console.Write:
+        _ = printf(" %.17g %.17g %.17g", p.x, p.y, p.z)
+
+def state(run: DroneHoops::Run&):
+    can Console.Write:
+        _ = printf("%.17g %lld %lld %lld %lld", run.time, run.camera, run.next_hoop, run.bumps, run.result)
+        vec(run.p)
+        vec(run.v)
+        vec(run.thrust)
+        vec(run.eye)
+        vec(run.look)
+        _ = printf("\n")
+
+def emit(rung: i64, seed: i64):
+    can Abort.Panic, Console.Write:
+        course: DroneHoops::Course = DroneHoops::deal(rung, seed)
+        _ = printf("%lld %lld %lld\n", rung, seed, 1 if course.valid else 0)
+        return if not course.valid
+        level: DroneHoops::Grade = course.level
+        _ = printf("%lld %lld %lld %lld %lld %lld %lld %.17g %.17g\n", level.hoops, course.gust_count, level.birds * 4,
+            course.flash_count, course.cut_count, course.decoy, course.seed, course.circle_angle, course.circle_rate)
+        for i in 0..<level.hoops |course|:
+            h: DroneHoops::Hoop = course.hoops[i.usize()]
+            vec(h.centre)
+            _ = printf(" %.17g %.17g %.17g %.17g %.17g %lld %.17g\n", h.yaw, h.radius, h.amplitude,
+                h.rate, h.phase, 1 if h.sideways else 0, h.spin)
+        for i in 0..<course.gust_count |course|:
+            g: DroneHoops::Gust = course.gusts[i.usize()]
+            _ = printf("%.17g %.17g %.17g %.17g\n", g.time, g.duration, g.heading, g.strength)
+        for i in 0..<(level.birds * 4) |course|:
+            b: DroneHoops::Bird = course.birds[i.usize()]
+            _ = printf("%.17g %.17g", b.time, b.duration)
+            vec(b.a)
+            vec(b.b)
+            _ = printf("\n")
+        for i in 0..<course.flash_count |course|:
+            _ = printf("%.17g\n", course.flashes[i.usize()])
+        for i in 0..<course.cut_count |course|:
+            c: DroneHoops::Cut = course.cuts[i.usize()]
+            _ = printf("%.17g %lld\n", c.time, c.camera)
+        run: mutable DroneHoops::Run = DroneHoops::trial(course)
+        for i in 0..<720 |run|:
+            run.aimed <- i % 70 < 15
+            run.aimed_y <- i % 70 < 15
+            run.aim <- RoomsView::vec(4.0, 6.0, 2.0)
+            mask: i64 = (1 << (i / 23 % 10).u64()) | (1 << (i / 71 % 10).u64())
+            DroneHoops::step(&run, 1.0 / 60.0, 0 if i % 70 < 25 else mask)
+            if i % 60 == 59:
+                state(&run)
+        run <- DroneHoops::trial(course)
+        while run.result == DroneHoops::PENDING |run|:
+            port: i64 = DroneHoops::pilot(&run)
+            DroneHoops::step(&run, 1.0 / 30.0, 0 if port < 0 else 1 << port.u64())
+        state(&run)
+        run <- DroneHoops::trial(course)
+        while run.result == DroneHoops::PENDING |run|:
+            DroneHoops::step(&run, 1.0 / 30.0, 0)
+        state(&run)
+
+def crossings() -> bool:
+    can Abort.Panic:
+        course: DroneHoops::Course = DroneHoops::deal(10, 17)
+        run: mutable DroneHoops::Run = DroneHoops::trial(course)
+        h: DroneHoops::Hoop = course.hoops[1]
+        ring: DroneHoops::Hooped = DroneHoops::hoop_at(h, 0.0)
+        back: RoomsView::Vec = RoomsView::mul(ring.normal, -0.5)
+        front: RoomsView::Vec = RoomsView::mul(ring.normal, 0.5)
+        DroneHoops::cross_hoops(&run, RoomsView::add(ring.centre, back), RoomsView::add(ring.centre, front), front)
+        return false if run.result != DroneHoops::WRONG or run.next_hoop != 0
+        run <- DroneHoops::trial(course)
+        edge: RoomsView::Vec = RoomsView::add(ring.centre, RoomsView::vec(0.0, h.radius, 0.0))
+        DroneHoops::cross_hoops(&run, RoomsView::add(edge, back), RoomsView::add(edge, front), front)
+        return run.result == DroneHoops::PENDING and run.bumps == 1 and RoomsView::dot(run.v, ring.normal) < 0.0
+
+def session_check() -> bool:
+    can Abort.Panic, Memory.Allocate:
+        session: mutable DroneHoopsGame::Session = DroneHoopsGame::initialize(1, 1, true, 17)
+        display: mutable Display::DisplayList = Display::DisplayList()
+        SceneDroneHoops::render(&display, &session, true)
+        ready_count: i64 = display.commands.count.i64()
+        Display::display_reset(&display)
+        return false if not DroneHoopsGame::start(&session, 0.0)
+        SceneDroneHoops::render(&display, &session, true)
+        return false if display.commands.count.i64() <= ready_count + 50
+        cam: RoomsView::Camera = DroneHoopsGame::view(&session.run)
+        target: RoomsView::Point = RoomsView::project(&cam, RoomsView::vec(1.0, 2.5, -9.0))
+        focal: f64 = DroneHoopsGame::focal(&session.run)
+        return false if not DroneHoopsGame::pointer_event(&session, DroneHoopsGame::CX + target.x * focal,
+            DroneHoopsGame::CY + target.y * focal, 1, 0.0)
+        return false if py_hypot(session.run.aim.x - 1.0, session.run.aim.z + 9.0) > 0.000000001
+        return false if not DroneHoopsGame::pointer_event(&session, 0.0, 0.0, 2, 0.0)
+        return false if not DroneHoopsGame::wheel(&session, 4.0) or session.run.aim.y != 4.5
+        _ = DroneHoopsGame::advance(&session, 0.1)
+        return false if session.run.p.y <= 2.5
+        pcm: mutable u8[8820] = zeroed
+        return false if session.sound.cue_count == 0
+        return false if DroneHoopsGame::audio_window(&session, &pcm[0], 8820) != 8820
+        return false if DroneHoopsGame::audio_window(&session, &pcm[0], 8820) != 0
+        return false if not DroneHoopsGame::agent_mask(&session, 513)
+        _ = DroneHoopsGame::agent_event(&session, 0.2, -1)
+        return session.pulse == 0 and not session.run.aimed and not session.run.aimed_y and session.run.thrust.y < 0.0
+
+def views() -> bool:
+    can Abort.Panic, Memory.Allocate:
+        display: mutable Display::DisplayList = Display::DisplayList()
+        rungs: i64[4] = [1, 4, 10, 30]
+        modes: mutable i64 = 0
+        for i in 0..<4 |display, rungs, modes|:
+            course: DroneHoops::Course = DroneHoops::deal(rungs[i.usize()], 17)
+            return false if not course.valid
+            run: mutable DroneHoops::Run = DroneHoops::trial(course)
+            for j in 0..<8 |display, run, modes|:
+                run.time <- j.f64() * run.course.level.seconds * run.course.level.hoops.f64() / 8.0
+                DroneHoops::camera_now(&run, 1.0 / 30.0)
+                modes <- modes | (1 << (run.camera + 2).u64())
+                Display::display_reset(&display)
+                SceneDroneHoops::stage(&display, &run)
+                return false if display.commands.count < 50
+        return (modes & 3) == 3 and modes > 3
+
+def main() -> i32:
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        return 1.i32() if not crossings() or not session_check() or not views()
+        rungs: i64[16] = [-1, 1, 3, 4, 7, 10, 13, 16, 19, 20, 23, 24, 29, 35, 50, 100]
+        for i in 0..<16 |rungs|:
+            for seed in -1..<2 |rungs, i|:
+                emit(rungs[i.usize()], seed)
+        return 0.i32()

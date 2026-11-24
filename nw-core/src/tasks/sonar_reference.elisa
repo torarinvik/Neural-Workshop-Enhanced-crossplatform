@@ -1,0 +1,222 @@
+include "./sonar.elisa"
+
+module SonarReference:
+    const CANDIDATES: i64 = 36
+
+    struct Belief:
+        level: mutable Sonar::Grade
+        mass: mutable f64[Sonar::MAX_CELLS]
+        # Preserve dict insertion order for Python's stable ranking and
+        # for the order of floating-point additions in each probe's score.
+        order: mutable i64[Sonar::MAX_CELLS]
+        count: mutable i64
+
+    struct Sum:
+        total: mutable f64
+        correction: mutable f64
+
+    const DIG: i64 = Sonar::MAX_CELLS
+
+    struct Result:
+        cost: i64
+        found: bool
+
+    def add(sum: mutable Sum&, term: f64):
+        next: f64 = sum.total + term
+        larger: bool = fabs(sum.total) >= fabs(term)
+        lost: f64 = ((sum.total - next) + term) if larger else ((term - next) + sum.total)
+        sum.total <- next
+        sum.correction <- sum.correction + lost
+
+    def initialize(level: Sonar::Grade) -> Belief:
+        can Abort.Panic:
+            count: i64 = level.side * level.side
+            belief: mutable Belief = Belief{level: level, mass: zeroed, order: zeroed, count: count}
+            for cell in 0..<count |belief, count|:
+                belief.mass[cell.usize()] <- 1.0 / count.f64()
+                belief.order[cell.usize()] <- cell
+            return belief
+
+    def normalise(belief: mutable Belief&):
+        can Abort.Panic:
+            summed: mutable Sum = zeroed
+            for i in 0..<belief.count |belief, summed|:
+                add(&summed, belief.mass[belief.order[i.usize()].usize()])
+            total: f64 = summed.total + summed.correction
+            if total <= 0.0:
+                belief[0] <- initialize(belief.level)
+                return
+            count: mutable i64 = 0
+            for i in 0..<belief.count |belief, total, count|:
+                cell: i64 = belief.order[i.usize()]
+                mass: f64 = belief.mass[cell.usize()]
+                if mass > 0.0:
+                    belief.mass[cell.usize()] <- mass / total
+                    belief.order[count.usize()] <- cell
+                    count <- count + 1
+            belief.count <- count
+
+    def drift_add(moved: mutable Belief&, seen: mutable i64&, cell: i64, mass: f64):
+        can Abort.Panic:
+            if seen[cell.usize()] == 0:
+                seen[cell.usize()] <- 1
+                moved.order[moved.count.usize()] <- cell
+                moved.count <- moved.count + 1
+            moved.mass[cell.usize()] <- moved.mass[cell.usize()] + mass
+
+    def drift(belief: Belief&, moved: mutable Belief&):
+        can Abort.Panic:
+            q: f64 = belief.level.drift
+            moved.level <- belief.level
+            seen: mutable i64[Sonar::MAX_CELLS] = zeroed
+            for i in 0..<belief.count |belief, moved, seen, q|:
+                cell: i64 = belief.order[i.usize()]
+                mass: f64 = belief.mass[cell.usize()]
+                drift_add(moved, &seen[0], cell, mass * (1.0 - q))
+                options: mutable i64[4] = zeroed
+                count: i64 = Sonar::neighbours(cell, belief.level.side, &options[0])
+                for j in 0..<count |moved, seen, options, count, mass, q|:
+                    drift_add(moved, &seen[0], options[j.usize()], mass * q / count.f64())
+
+    def apply_drift(belief: mutable Belief&):
+        can Abort.Panic:
+            return if belief.level.drift <= 0.0
+            moved: mutable Belief = zeroed
+            drift(belief, &moved)
+            belief[0] <- moved
+
+    def heard(belief: mutable Belief&, cell: i64, reading: i64):
+        can Abort.Panic:
+            for i in 0..<belief.count |belief, cell, reading|:
+                where: i64 = belief.order[i.usize()]
+                weight: f64 = Sonar::likelihood(belief.level, reading, Sonar::band(belief.level, cell, where))
+                belief.mass[where.usize()] <- belief.mass[where.usize()] * weight
+            normalise(belief)
+            apply_drift(belief)
+
+    def missed(belief: mutable Belief&, cell: i64):
+        can Abort.Panic:
+            belief.mass[cell.usize()] <- 0.0
+            normalise(belief)
+            apply_drift(belief)
+
+    def entropy(belief: Belief&) -> f64:
+        can Abort.Panic:
+            sum: mutable Sum = zeroed
+            for i in 0..<belief.count |belief, sum|:
+                p: f64 = belief.mass[belief.order[i.usize()].usize()]
+                if p > 0.0:
+                    add(&sum, p * log(p))
+            return -(sum.total + sum.correction)
+
+    def expected_entropy(belief: Belief&, probe: i64) -> f64:
+        can Abort.Panic:
+            level: Sonar::Grade = belief.level
+            z: mutable f64[64] = zeroed
+            zlogz: mutable f64[64] = zeroed
+            for i in 0..<belief.count |belief, level, probe, z, zlogz|:
+                where: i64 = belief.order[i.usize()]
+                mass: f64 = belief.mass[where.usize()]
+                true_band: i64 = Sonar::band(level, probe, where)
+                for reading in (true_band - 1)..<(true_band + 2) |level, true_band, mass, z, zlogz|:
+                    weight: f64 = mass * Sonar::likelihood(level, reading, true_band)
+                    if weight > 0.0:
+                        at: usize = reading.usize()
+                        z[at] <- z[at] + weight
+                        zlogz[at] <- zlogz[at] + weight * log(weight)
+            total: mutable f64 = 0.0
+            for at in 0..<level.bands |z, zlogz, total|:
+                weight: f64 = z[at.usize()]
+                if weight > 0.0:
+                    total <- total + (weight * log(weight) - zlogz[at.usize()])
+            return total
+
+    # Python compares coordinate tuples as (x, y), independently of the
+    # row-major cell code used to index the grid.
+    def coordinate_order(cell: i64, side: i64) -> i64:
+        can Abort.Panic:
+            return (cell % side) * side + cell / side
+
+    def best(belief: Belief&) -> i64:
+        can Abort.Panic:
+            side: i64 = belief.level.side
+            best_cell: mutable i64 = belief.order[0]
+            for i in 1..<belief.count |belief, side, best_cell|:
+                cell: i64 = belief.order[i.usize()]
+                p: f64 = belief.mass[cell.usize()]
+                best_p: f64 = belief.mass[best_cell.usize()]
+                if p > best_p or (p == best_p and coordinate_order(cell, side) > coordinate_order(best_cell, side)):
+                    best_cell <- cell
+            return best_cell
+
+    def add_ranked(belief: Belief&, pool: mutable i64&) -> i64:
+        can Abort.Panic:
+            take: i64 = belief.count if belief.count < CANDIDATES / 2 else CANDIDATES / 2
+            for rank in 0..<take |belief, pool|:
+                cell: mutable i64 = -1
+                mass: mutable f64 = -1.0
+                for i in 0..<belief.count |belief, pool, cell, mass|:
+                    candidate: i64 = belief.order[i.usize()]
+                    p: f64 = belief.mass[candidate.usize()]
+                    if pool[candidate.usize()] == 0 and p > mass:
+                        cell <- candidate
+                        mass <- p
+                pool[cell.usize()] <- 1
+            return take
+
+    def reference_move(belief: Belief&, rng: mutable MT19937&) -> i64:
+        can Abort.Panic:
+            cell: i64 = best(belief)
+            sure: f64 = belief.mass[cell.usize()]
+            return DIG + cell if sure >= 0.999
+            side: i64 = belief.level.side
+            size: i64 = side * side
+            pool: mutable i64[Sonar::MAX_CELLS] = zeroed
+            count: mutable i64 = add_ranked(belief, &pool[0])
+            limit: i64 = size if size < CANDIDATES else CANDIDATES
+            while count < limit |rng, pool, count, limit, size|:
+                candidate: usize = py_randbelow(rng, size.u64()).usize()
+                if pool[candidate] == 0:
+                    pool[candidate] <- 1
+                    count <- count + 1
+
+            probe: mutable i64 = -1
+            lowest: mutable f64 = 0.0
+            for i in 0..<size |belief, pool, side, probe, lowest|:
+                candidate: i64 = coordinate_order(i, side)
+                if pool[candidate.usize()] != 0:
+                    score: f64 = expected_entropy(belief, candidate)
+                    if probe < 0 or score < lowest:
+                        probe <- candidate
+                        lowest <- score
+            return DIG + cell if (1.0 - sure) * belief.level.penalty.f64() <= 1.2
+            if belief.level.drift > 0.0:
+                before: f64 = entropy(belief)
+                moved: mutable Belief = zeroed
+                drift(belief, &moved)
+                spread: f64 = entropy(&moved) - before
+                if before - lowest <= (spread if spread > 0.0 else 0.0) + 0.02:
+                    return DIG + cell
+            return probe
+
+    def reference_cost(dealt: Sonar::Deal&) -> Result:
+        can Abort.Panic:
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, 0.u64())
+            play: mutable Sonar::Round = Sonar::initialize(dealt[0])
+            belief: mutable Belief = initialize(dealt.level)
+            while not play.over |play, belief, rng|:
+                action: i64 = reference_move(&belief, &rng)
+                if action >= DIG:
+                    if not Sonar::dig(&play, action - DIG):
+                        missed(&belief, action - DIG)
+                else:
+                    reading: i64 = Sonar::ping(&play, action)
+                    heard(&belief, action, reading)
+            return Result{cost: play.cost, found: play.found}
+
+    def par(dealt: Sonar::Deal&) -> f64:
+        can Abort.Panic:
+            result: Result = reference_cost(dealt)
+            cost: i64 = result.cost if result.found else dealt.budget * Sonar::PING
+            return cost.f64() + dealt.level.slack

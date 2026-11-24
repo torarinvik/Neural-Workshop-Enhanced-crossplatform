@@ -1,0 +1,172 @@
+include "./tasks/reading_quiz_run.elisa"
+include "./scene_hand.elisa"
+include "./scene_missing_word.elisa"
+
+module SceneReadingQuiz:
+    const PAPER: u32 = 0xf6f2e8ff
+    const INK: u32 = 0x22202cff
+    const PALE: u32 = 0xe8eaf4ff
+    const DIM: u32 = 0xa0a6baff
+    const GOOD: u32 = 0x3caa64ff
+    const BAD: u32 = 0xc8463cff
+    const BUTTON: u32 = 0x4a5474ff
+
+    struct TextLine:
+        start: i64
+        stop: i64
+
+    def lines(text: sview, size: f64, width: f64) -> darray[TextLine]:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable darray[TextLine] = []
+            length: i64 = sview_len(text).i64()
+            return out if length == 0
+            step: i64 = TextMetrics::advance(size)
+            start: mutable i64 = 0
+            at: mutable i64 = 0
+            split: mutable i64 = 0
+            space_start: mutable i64 = 0
+            used: mutable i64 = 0
+            while at < length |out, text, length, step, width, at, start, split, space_start, used|:
+                byte: u8 = sview_at(text, at.usize())
+                if TextMetrics::is_continuation(byte):
+                    at <- at + 1
+                    continue
+                if TextMetrics::is_break_line(text, at):
+                    out.push(TextLine{start: start, stop: at})
+                    at <- at + (1 if byte == 10.u8() else 3)
+                    start <- at
+                    split <- at
+                    space_start <- at
+                    used <- 0
+                    continue
+                if TextMetrics::is_break_space(text, at):
+                    space_start <- at if split != at
+                    at <- at + (3 if byte == 226.u8() else 1)
+                    split <- at
+                    used <- used + step
+                    continue
+                if (used + step).f64() >= width and split > start:
+                    out.push(TextLine{start: start, stop: space_start})
+                    at <- split
+                    start <- split
+                    used <- 0
+                    continue
+                used <- used + step
+                at <- at + 1
+            out.push(TextLine{start: start, stop: length})
+            return out
+
+    def paragraph(list: mutable Display::DisplayList&, text: sview, x: f64, y: f64, size: f64, width: f64,
+            ink: u32, left: bool, top: bool, bold: bool = false):
+        can Memory.Allocate, Abort.Panic:
+            pixel_size: f64 = size * SceneHand::SCALE
+            rows: darray[TextLine] = lines(text, pixel_size, (width * SceneHand::SCALE).i64().f64())
+            height: f64 = TextMetrics::line_height(pixel_size).f64()
+            first: mutable f64 = SceneHand::y(y)
+            if not top:
+                first <- first + fmax(0.0, (rows.count.i64() - 1).f64()) * height / 2.0
+            anchor: u32 = Display::ANCHOR_LEFT_TOP if top else (Display::ANCHOR_LEFT_CENTER if left else Display::ANCHOR_CENTER_CENTER)
+            for i in 0..<rows.count.i64() |rows, list, text, x, first, height, pixel_size, ink, anchor, bold|:
+                row: TextLine = rows[i.usize()]
+                if row.start != row.stop:
+                    Display::draw_text_weight(list, string_view_slice(text, row.start, row.stop), SceneHand::x(x),
+                        first - i.f64() * height, pixel_size, ink, anchor, bold)
+
+    def fit_prompt(text: sview, width: f64, height: f64) -> f64:
+        can Abort.Panic:
+            size: mutable f64 = 20.0
+            scale: f64 = SceneHand::SCALE
+            while size > 7.0 and TextMetrics::wrapped_height(size * scale, text, (width * scale).i64().f64()).f64() > height * scale |size, text, width, height, scale|:
+                size <- size - 0.5
+            return size
+
+    def fit_options(step: ReadingQuiz::Step&, width: f64) -> f64:
+        can Abort.Panic:
+            size: mutable f64 = 12.0
+            scale: f64 = SceneHand::SCALE
+            max_lines: f64 = 1.0 if step.wide else 2.0
+            while size > 7.0 |step, width, size, scale, max_lines|:
+                height: mutable i64 = 0
+                for option in step.options:
+                    measured: i64 = TextMetrics::wrapped_height(size * scale, bytes_view(option), (width * scale).i64().f64())
+                    height <- measured if measured > height
+                break if height.f64() <= max_lines * size * 1.75 * scale
+                size <- size - 0.5
+            return size
+
+    def buttons(list: mutable Display::DisplayList&, step: ReadingQuiz::Step&, showing: bool, selected: i64):
+        can Memory.Allocate, Abort.Panic:
+            count: i64 = step.options.count.i64()
+            first: ReadingQuiz::Box = ReadingQuiz::option_box(0, count, step.wide)
+            room: f64 = first.width - (44.0 if step.wide else 30.0)
+            size: f64 = fit_options(step, room)
+            for i in 0..<count |list, step, showing, selected, count, size, room|:
+                box: ReadingQuiz::Box = ReadingQuiz::option_box(i, count, step.wide)
+                middle: f64 = box.y + box.height / 2.0
+                color: u32 = GOOD if showing and i == step.answer else (BAD if showing and i == selected else BUTTON)
+                SceneMissingWord::rect(list, box.x, box.y, box.width, box.height, color)
+                number: mutable dstr = []
+                dstr_append_i64(&number, i + 1)
+                SceneHand::word(list, bytes_view(number), box.x + 12.0, middle, 9.0, DIM)
+                label: dstr = step.options[i.usize()]
+                x: f64 = box.x + (34.0 if step.wide else box.width / 2.0 + 6.0)
+                paragraph(list, bytes_view(label), x, middle, size, room, PALE, step.wide, false)
+
+    def dots(list: mutable Display::DisplayList&, run: ReadingQuiz::Run&):
+        can Memory.Allocate, Abort.Panic:
+            count: i64 = run.round.items.count.i64()
+            for i in 0..<count |list, run, count|:
+                marked: bool = i < run.right + run.wrong
+                right: bool = (run.marks & (1.u64() << i)) != 0.u64()
+                color: u32 = (GOOD if right else BAD) if marked else (0xf0d25aff if i == run.index else 0x5a6078ff)
+                x: f64 = 500.0 + (i.f64() - (count - 1).f64() / 2.0) * 22.0
+                Display::draw_circle(list, SceneHand::x(x), SceneHand::y(616.0), 7.0 * SceneHand::SCALE, color)
+            text: mutable dstr = []
+            dstr_append_cstr(&text, "need ")
+            dstr_append_i64(&text, run.round.need)
+            SceneHand::word(list, bytes_view(text), 940.0, 616.0, 9.0, DIM)
+
+    def page(list: mutable Display::DisplayList&, run: ReadingQuiz::Run&):
+        can Memory.Allocate, Abort.Panic:
+            dots(list, run)
+            item: ReadingQuiz::Item = ReadingQuiz::question(run)
+            count: i64 = item.steps.count.i64()
+            return if count == 0
+            SceneHand::word(list, sview(item.title, 0, -1), 500.0, 582.0, 11.0, DIM, true)
+            wide: mutable bool = false
+            for entry in item.steps:
+                wide <- wide or entry.wide
+            y: f64 = 300.0 if wide else 180.0
+            h: f64 = 262.0 if wide else 380.0
+            SceneMissingWord::rect(list, 60.0, y, 880.0, h, PAPER)
+            prompt: sview = bytes_view(item.prompt)
+            paragraph(list, prompt, 80.0, y + h - 16.0, fit_prompt(prompt, 840.0, h - 30.0),
+                840.0, INK, true, true)
+            step: ReadingQuiz::Step = item.steps[(count - 1).usize()] if run.showing else ReadingQuiz::active_step(run)
+            return if step.options.count == 0.usize()
+            ask_y: f64 = 278.0 if wide else 150.0
+            ask: mutable dstr = []
+            color: mutable u32 = PALE
+            if run.showing:
+                color <- 0x8ce6a0ff if run.correct else 0xff9682ff
+                dstr_append_cstr(&ask, "Right: " if run.correct else "No: ")
+                if item.truth.count > 0.usize():
+                    dstr_append_dstr(&ask, item.truth)
+                else:
+                    for i in 0..<count |ask, item|:
+                        entry: ReadingQuiz::Step = item.steps[i.usize()]
+                        dstr_append_cstr(&ask, ", ") if i > 0
+                        dstr_append_dstr(&ask, entry.options[entry.answer.usize()])
+            else:
+                dstr_append_dstr(&ask, step.ask)
+                if count > 1:
+                    dstr_append_cstr(&ask, "  (")
+                    dstr_append_i64(&ask, run.progress + 1)
+                    dstr_append_cstr(&ask, " of ")
+                    dstr_append_i64(&ask, count)
+                    dstr_append_cstr(&ask, ")")
+            paragraph(list, bytes_view(ask), 500.0, ask_y, 13.0, 900.0, color, false, false, true)
+            buttons(list, &step, run.showing, run.selected) if not (run.showing and item.scored)
+            if not run.showing:
+                share: f64 = fmax(0.0, item.seconds - (run.time - run.since)) / item.seconds
+                SceneMissingWord::rect(list, 20.0, 8.0, 960.0 * share, 6.0, 0x6ec88cff if share > 0.3 else 0xe66e50ff)

@@ -1,0 +1,89 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/tasks/gamble_game.elisa"
+
+extern printf(format: cstr, ...) -> i32 can[Console.Write]
+
+def emit(rung: i64, rng: mutable MT19937&, cache: mutable GaussCache&):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        dealt: Gamble::Deal = Gamble::deal(rung, rng, cache)
+        level: Gamble::Grade = dealt.level
+        _ = printf("level %lld %lld %lld %.17g %.17g %lld %lld %lld %lld %.17g %lld\n",
+            level.rung, level.arms, level.pulls, level.spread, level.drift, level.biters, level.jumps,
+            level.price, level.bankroll, level.allow, dealt.seed)
+        for machine in 0..<level.arms |dealt|:
+            m: Gamble::Machine = dealt.machines[machine.usize()]
+            _ = printf("machine %lld %.17g %lld\n", m.pays, m.bite_rate, m.bite)
+        for jump in dealt.jumps |dealt|:
+            _ = printf("jump %lld\n", jump)
+        for t in 0..<level.pulls |dealt, level|:
+            for arm in 0..<level.arms |dealt, level, t|:
+                at: usize = (t * level.arms + arm).usize()
+                odd: f64 = get dealt.odds[at] else -1.0
+                draw: f64 = get dealt.draws[at] else -1.0
+                _ = printf("turn %.17g %.17g %lld %.17g\n", odd, draw, Gamble::payout(&dealt, t, arm), Gamble::worth(&dealt, t, arm))
+        for policy in 0..<2 |dealt, level|:
+            round: mutable Gamble::Round = Gamble::initialize()
+            for t in 0..<level.pulls |dealt, round, level, policy|:
+                break if Gamble::over(&round, level)
+                if policy == 1 and t == 2:
+                    break if Gamble::stop(&round, level)
+                arm: i64 = (t * 3 + policy) % level.arms
+                _ = Gamble::pull(&round, &dealt, arm)
+                _ = printf("pull %lld %.17g\n", round.total, Gamble::value(&round))
+            _ = printf("end %lld %lld %lld\n", round.history.count.i64(), 1 if round.stopped else 0, 1 if Gamble::bust(&round, level) else 0)
+        reference: Gamble::Round = GambleReference::reference(&dealt)
+        _ = printf("reference %lld %lld %lld %.17g %.17g %.17g %.17g\n", reference.history.count.i64(),
+            1 if reference.stopped else 0, reference.total, Gamble::value(&reference),
+            GambleReference::guessing(&dealt), GambleReference::knowing(&dealt), GambleReference::par(&dealt))
+        for pull in reference.history |reference|:
+            _ = printf("move %lld %lld\n", pull.arm, pull.won)
+
+
+def replay():
+    can Console.Write, Abort.Panic, Memory.Allocate, Memory.Release:
+        session: mutable GambleGame::Session = GambleGame::initialize(1, 2, true, -17)
+        _ = GambleGame::input(&session, GambleGame::START, 100) can Global{Read,Write}
+        for trial in 0..<2 |session|:
+            _ = printf("live %lld %lld %.17g\n", session.rung, session.trial, session.par)
+            while session.phase == GambleGame::PULLING |session, trial|:
+                t: i64 = session.round.history.count.i64()
+                best: mutable i64 = 0
+                for arm in 1..<session.dealt.level.arms |session, t, best, trial|:
+                    candidate: f64 = Gamble::worth(&session.dealt, t, arm)
+                    previous: f64 = Gamble::worth(&session.dealt, t, best)
+                    if (candidate > previous and trial == 0) or (candidate < previous and trial == 1):
+                        best <- arm
+                _ = GambleGame::input(&session, best, 100 + trial * 4000 + t) can Global{Read,Write}
+            early: bool = GambleGame::advance(&session, session.deadline_ms - 1) can Global{Read,Write}
+            _ = printf("scored %lld %lld %lld %.17g %lld %lld\n", session.phase, session.rung, session.wins,
+                session.verdict_value, session.verdict_coins, 1 if early else 0)
+            _ = GambleGame::advance(&session, session.deadline_ms) can Global{Read,Write}
+        _ = printf("done %lld %lld %lld %lld\n", session.phase, session.wins, session.best_rung, session.dealt.odds.count.i64())
+        _ = GambleGame::input(&session, GambleGame::START, 10000) can Global{Read,Write}
+        _ = printf("restart %lld %lld %lld %lld\n", session.phase, session.trial, session.wins, session.dealt.seed)
+        GambleGame::close(&session) can Global{Read,Write}
+
+        paid: mutable GambleGame::Session = GambleGame::initialize(18, 1, false, 17)
+        _ = GambleGame::input(&paid, GambleGame::START, 0) can Global{Read,Write}
+        _ = GambleGame::input(&paid, GambleGame::STOP, 5) can Global{Read,Write}
+        _ = printf("stopped %lld %lld %lld %lld\n", paid.phase, 1 if paid.round.stopped else 0,
+            paid.verdict_coins, 1 if paid.passed else 0)
+        _ = GambleGame::advance(&paid, 6, true) can Global{Read,Write}
+        _ = printf("released %lld %lld\n", paid.phase, paid.dealt.draws.count.i64())
+        GambleGame::close(&paid) can Global{Read,Write}
+
+def main() -> i32:
+    can Console.Write, Memory.Allocate, Memory.Release, Abort.Panic:
+        levels: i64[13] = [1, 5, 6, 6, 7, 10, 14, 18, 19, 21, 25, 50, 512]
+        for seed in 0..<3 |levels|:
+            rng: mutable MT19937 = zeroed
+            cache: mutable GaussCache = zeroed
+            mt_seed_int(&rng, (seed * 421 + 17).u64())
+            for i in 0..<13 |levels, rng, cache|:
+                region scratch(1048576):
+                    in scratch:
+                        emit(levels[i.usize()], &rng, &cache)
+        replay() can Global{Read,Write}
+        return 0.i32()

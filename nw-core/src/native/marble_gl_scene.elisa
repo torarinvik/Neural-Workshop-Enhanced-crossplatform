@@ -1,0 +1,191 @@
+extern glUniform1f(location: i32, value: f32)
+extern glUniform3f(location: i32, x: f32, y: f32, z: f32)
+
+extern SDL_ConvertSurface(surface: mutable void&, format: u32) -> mutable void&? can[Memory.Allocate]
+extern SDL_FlipSurface(surface: mutable void&, mode: i32) -> bool
+extern SDL_SetError(format: cstr, ...) -> bool
+extern SDL_GetGlobalProperties() -> u32
+
+def marble_set_png_loader(loader: usize):
+    can Unsafe.PointerCast:
+        return if loader == 0.usize()
+        trusted Unsafe.PointerCast:
+            _ = SDL_SetPointerProperty(SDL_GetGlobalProperties(), "nw.marble.png-loader", loader.cast[mutable void&])
+
+export fn nw_marble_set_png_loader(loader: usize) = marble_set_png_loader
+
+def marble_load_png(path: cstr) -> mutable void&?:
+    can Blocking.IO, Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        loader: mutable void&? = SDL_GetPointerProperty(SDL_GetGlobalProperties(), "nw.marble.png-loader", null)
+        if loader == null:
+            _ = SDL_SetError("Marble textures require SDL 3.4 or newer")
+            return null
+        trusted Unsafe.PointerCast:
+            read_png: fn(cstr) -> mutable void&? = loader.uintptr().cast[fn(cstr) -> mutable void&?]
+            return read_png(path)
+
+# Public prefix of SDL_Surface through its pixel pointer.
+struct MarbleSDLSurface:
+    flags: u32
+    format: u32
+    width: i32
+    height: i32
+    pitch: i32
+    pixels: usize
+
+def marble_surface_pixels(surface: mutable void&, width: mutable i32&, height: mutable i32&, pixels: mutable usize&) -> bool:
+    can Abort.Panic, Unsafe.PointerCast:
+        trusted Unsafe.PointerCast:
+            rgba: MarbleSDLSurface& = surface.uintptr().cast[MarbleSDLSurface&]
+            if rgba.width <= 0.i32() or rgba.height <= 0.i32() or rgba.pixels == 0.usize():
+                return SDL_SetError("Marble surface has no pixels")
+            if rgba.pitch.i64() != rgba.width.i64() * 4:
+                return SDL_SetError("Marble texture rows are not tightly packed")
+            width[0] <- rgba.width
+            height[0] <- rgba.height
+            pixels[0] <- rgba.pixels
+            return true
+
+module MarbleGLScene:
+    struct Scene:
+        meshes: mutable MarbleGLMesh::Mesh[7]
+        shadow: mutable MarbleGLShadow::Target
+        colour: mutable MarbleGLColour::Target
+        program: mutable u32
+        shadow_program: mutable u32
+        composite: mutable u32
+        array: mutable u32
+        textures: mutable u32[3]
+
+    def close(scene: mutable Scene&):
+        can Memory.Release, Abort.Panic:
+            for part in 0..<7 |part, scene|:
+                MarbleGLMesh::close(&scene.meshes[part.usize()])
+            MarbleGLShadow::close(&scene.shadow)
+            MarbleGLColour::close(&scene.colour)
+            MarbleGLComposite::close(&scene.array)
+            MarbleGLProgram::destroy(scene.program)
+            MarbleGLProgram::destroy(scene.shadow_program)
+            MarbleGLProgram::destroy(scene.composite)
+            glDeleteTextures(3.i32(), &scene.textures[0])
+            scene[0] <- zeroed
+
+    def texture(id: u32, name: cstr) -> bool:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            base: u8&? = SDL_GetBasePath()
+            return false if base == null
+            trusted Unsafe.PointerCast:
+                prefix: u8& = base
+                path: mutable u8[4096] = zeroed
+                count: i32 = SDL_snprintf(&path[0], 4096.usize(), "%sres/marblemaze/%s", prefix.cast[cstr], name)
+                return false if count <= 0.i32() or count >= 4096.i32()
+                width: mutable i32 = 0.i32()
+                height: mutable i32 = 0.i32()
+                pixels: mutable usize = 0.usize()
+                loaded: mutable void&? = marble_load_png((&path[0]).uintptr().cast[cstr])
+                if loaded == null:
+                    SDL_Log("Could not load Marble texture %s: %s", name, SDL_GetError())
+                    return false
+                png: mutable void& = loaded
+                # SDL_PIXELFORMAT_RGBA32 is ABGR8888 on supported little-endian targets.
+                converted: mutable void&? = SDL_ConvertSurface(png, 0x16762004.u32())
+                SDL_DestroySurface(png)
+                if converted == null:
+                    SDL_Log("Could not convert Marble texture %s: %s", name, SDL_GetError())
+                    return false
+                surface: mutable void& = converted
+                if not SDL_FlipSurface(surface, 2.i32()) or not marble_surface_pixels(surface, &width, &height, &pixels):
+                    SDL_Log("Could not prepare Marble texture %s: %s", name, SDL_GetError())
+                    SDL_DestroySurface(surface)
+                    return false
+                if id == 0.u32():
+                    SDL_DestroySurface(surface)
+                    return true
+                glBindTexture(3553.u32(), id)
+                glTexImage2D(3553.u32(), 0.i32(), 32856.i32(), width, height, 0.i32(), 6408.u32(), 5121.u32(), pixels)
+                glTexParameteri(3553.u32(), 10241.u32(), 9729.i32())
+                glTexParameteri(3553.u32(), 10240.u32(), 9729.i32())
+                glTexParameteri(3553.u32(), 10242.u32(), 10497.i32())
+                glTexParameteri(3553.u32(), 10243.u32(), 33071.i32())
+                glBindTexture(3553.u32(), 0.u32())
+                SDL_DestroySurface(surface)
+                return glGetError() == 0.u32()
+
+    def open(scene: mutable Scene&, tray: MarbleMaze::MarbleTray&) -> bool:
+        can Blocking.IO, Console.Write, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            close(scene)
+            scene.program <- MarbleGLProgram::create(0)
+            scene.shadow_program <- MarbleGLProgram::create(1)
+            scene.composite <- MarbleGLProgram::create(2)
+            if scene.program == 0.u32() or scene.shadow_program == 0.u32() or scene.composite == 0.u32() or not MarbleGLShadow::open(&scene.shadow) or not MarbleGLComposite::open(&scene.array):
+                close(scene)
+                return false
+            glGenTextures(3.i32(), &scene.textures[0])
+            if not texture(scene.textures[0], "marble_colour.png") or not texture(scene.textures[1], "marble_rough.png") or not texture(scene.textures[2], "marble_normal.png"):
+                close(scene)
+                return false
+            for part in 0..<7 |part, scene, tray|:
+                mesh: MarbleGeometry::Mesh = MarbleGeometry::build(tray, part)
+                if not MarbleGLMesh::upload(&scene.meshes[part.usize()], &mesh):
+                    close(scene)
+                    return false
+            return true
+
+    def material(program: u32, part: i64):
+        can Abort.Panic:
+            kinds: i32[7] = [0.i32(), 0.i32(), 1.i32(), 3.i32(), 3.i32(), 4.i32(), 2.i32()]
+            red: f32[7] = [0.80.f32(), 0.80.f32(), 0.29.f32(), 0.58.f32(), 0.24.f32(), 0.16.f32(), 0.86.f32()]
+            green: f32[7] = [0.63.f32(), 0.63.f32(), 0.18.f32(), 0.44.f32(), 0.44.f32(), 0.55.f32(), 0.88.f32()]
+            blue: f32[7] = [0.41.f32(), 0.41.f32(), 0.11.f32(), 0.31.f32(), 0.29.f32(), 0.30.f32(), 0.93.f32()]
+            index: usize = part.usize()
+            glUniform1i(glGetUniformLocation(program, "material"), kinds[index])
+            glUniform3f(glGetUniformLocation(program, "tint"), red[index], green[index], blue[index])
+            glUniform1i(glGetUniformLocation(program, "cut_holes"), 1.i32() if part == 0 else 0.i32())
+
+    def draw(scene: mutable Scene&, packet: f64&, width: i32, height: i32, dark: bool) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic:
+            stage: i64[4] = [packet[4].i64(), packet[5].i64(), packet[6].i64(), packet[7].i64()]
+            return false if not MarbleGLColour::resize(&scene.colour, stage[2].i32(), stage[3].i32())
+            live: i64 = packet[3].i64()
+            shadow: u32 = scene.shadow_program
+            MarbleGLShadow::begin(&scene.shadow, shadow, packet)
+            for part in 0..<3 |part, scene, shadow, packet|:
+                MarbleGLShadow::draw(shadow, &scene.meshes[part.usize()], packet, 24, part == 0)
+            for ball in 0..<live |ball, scene, shadow, packet|:
+                MarbleGLShadow::draw(shadow, &scene.meshes[6], packet, 456 + 16 * ball, false)
+            MarbleGLColour::begin(&scene.colour, dark)
+            program: u32 = scene.program
+            glUseProgram(program)
+            MarbleGLShadow::matrix(program, "view_proj", packet, 8)
+            MarbleGLShadow::matrix(program, "light_matrix", packet, 56)
+            glUniform3f(glGetUniformLocation(program, "eye"), packet[584].f32(), packet[585].f32(), packet[586].f32())
+            glUniform3f(glGetUniformLocation(program, "light_direction"), -0.38.f32(), 0.86.f32(), 0.34.f32())
+            glUniform3f(glGetUniformLocation(program, "light_colour"), 1.0.f32(), 0.97.f32(), 0.90.f32())
+            glUniform3f(glGetUniformLocation(program, "sky_colour"), 0.76.f32(), 0.81.f32(), 0.90.f32())
+            glUniform3f(glGetUniformLocation(program, "ground_colour"), 0.42.f32(), 0.30.f32(), 0.19.f32())
+            glUniform1f(glGetUniformLocation(program, "grain_seed"), packet[1].f32())
+            glUniform1f(glGetUniformLocation(program, "shadow_texel"), 1.0.f32() / MarbleGLShadow::SIZE.f32())
+            glUniform1i(glGetUniformLocation(program, "shadows"), 1.i32())
+            MarbleGLShadow::holes(program, packet)
+            glActiveTexture(33984.u32())
+            glBindTexture(3553.u32(), scene.shadow.texture)
+            glUniform1i(glGetUniformLocation(program, "shadow_map"), 0.i32())
+            for unit in 0..<3 |unit, program, scene|:
+                name: cstr = "marble_colour" if unit == 0 else ("marble_rough" if unit == 1 else "marble_normal")
+                glActiveTexture((33985 + unit).u32())
+                glBindTexture(3553.u32(), scene.textures[unit.usize()])
+                glUniform1i(glGetUniformLocation(program, name), (unit + 1).i32())
+            MarbleGLShadow::matrix(program, "model", packet, 24)
+            for part in 0..<6 |part, scene, program|:
+                material(program, part)
+                MarbleGLMesh::draw(&scene.meshes[part.usize()], program)
+            material(program, 6)
+            for ball in 0..<live |ball, scene, program, packet|:
+                MarbleGLShadow::matrix(program, "model", packet, 456 + 16 * ball)
+                MarbleGLMesh::draw(&scene.meshes[6], program)
+            for unit in 1..<4 |unit|:
+                glActiveTexture((33984 + unit).u32())
+                glBindTexture(3553.u32(), 0.u32())
+            MarbleGLColour::resolve(&scene.colour)
+            MarbleGLComposite::draw(scene.composite, scene.array, &scene.colour, &stage, width, height)
+            return glGetError() == 0.u32()

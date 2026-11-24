@@ -1,0 +1,145 @@
+include "./tasks/camera_render.elisa"
+include "./scene_verdict.elisa"
+
+module SceneCamera:
+    # Camera uses two significant digits for small values and options notes.
+    def append_significant(out: mutable dstr&, value: f64):
+        can Memory.Allocate, Abort.Panic:
+            if value == 0.0:
+                dstr_append_cstr(out, "0")
+                return
+            scaled: mutable f64 = value
+            exponent: mutable i64 = 0
+            while scaled < 1.0 |scaled, exponent|:
+                scaled <- scaled * 10.0
+                exponent <- exponent - 1
+            while scaled >= 10.0 |scaled, exponent|:
+                scaled <- scaled / 10.0
+                exponent <- exponent + 1
+            units: mutable i64 = round_half_even(scaled * 10.0)
+            if units == 100:
+                units <- 10
+                exponent <- exponent + 1
+            if exponent < -4:
+                dstr_append_i64(out, units / 10)
+                if units % 10 != 0:
+                    dstr_append_cstr(out, ".")
+                    dstr_append_i64(out, units % 10)
+                dstr_append_cstr(out, "e-")
+                if exponent > -10:
+                    dstr_append_cstr(out, "0")
+                dstr_append_i64(out, -exponent)
+                return
+            places: i64 = Camera::max_value(0.0, -exponent.f64() + (1.0 if units % 10 != 0 else 0.0)).i64()
+            dstr_append_fixed(out, value, places)
+
+    def metres(out: mutable dstr&, value: f64):
+        can Memory.Allocate, Abort.Panic:
+            if value >= 1.0:
+                dstr_append_fixed(out, value, 2)
+                dstr_append_cstr(out, " m")
+            elif value >= 0.01:
+                dstr_append_fixed(out, value * 100.0, 1)
+                dstr_append_cstr(out, " cm")
+            else:
+                if value >= 0.00001:
+                    dstr_append_fixed(out, value * 1000.0, 2)
+                else:
+                    append_significant(out, value * 1000.0)
+                dstr_append_cstr(out, " mm")
+
+    def degrees(out: mutable dstr&, value: f64):
+        can Memory.Allocate, Abort.Panic:
+            if value >= 0.01:
+                dstr_append_fixed(out, value, 1 if value >= 1.0 else 2)
+            else:
+                append_significant(out, value)
+            dstr_append_cstr(out, "°")
+
+    def options_note(out: mutable dstr&, rung: i64, adaptive: bool):
+        can Memory.Allocate, Abort.Panic:
+            level: Camera::Grade = Camera::grade(rung)
+            dstr_append_cstr(out, "Rung ")
+            dstr_append_i64(out, level.rung)
+            dstr_append_cstr(out, ": within ")
+            append_significant(out, level.reach if level.reach >= 0.01 else level.reach * 1000.0)
+            dstr_append_cstr(out, " m and " if level.reach >= 0.01 else " mm and ")
+            append_significant(out, level.aim)
+            dstr_append_cstr(out, " degrees, ")
+            dstr_append_i64(out, level.objects)
+            dstr_append_cstr(out, " objects.")
+            if level.meter:
+                dstr_append_cstr(out, "  A meter shows how close you are.")
+            if adaptive:
+                dstr_append_cstr(out, "  A match climbs a rung, a miss drops one; the ladder has no top.")
+
+    def outcome(out: mutable dstr&, result: CameraGame::Result&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_cstr(out, "Matched: " if result.matched else "Missed: ")
+            metres(out, result.distance)
+            dstr_append_cstr(out, " and ")
+            degrees(out, result.angle)
+            dstr_append_cstr(out, " off")
+
+    def chrome(list: mutable Display::DisplayList&, run: CameraGame::Session&,
+               dark: bool, width: f64, height: f64):
+        can Memory.Allocate, Abort.Panic:
+            ink: u32 = 0xffffffff if dark else 0x000000ff
+            centre: f64 = Geometry::width_center(width).f64()
+            live: CameraView::Rect = CameraView::live_rect(width, height)
+            status_y: f64 = Geometry::from_top_edge(height, 70.0).f64()
+            Display::draw_text_weight(list, "Camera", centre, Geometry::from_top_edge(height, 36.0).f64(),
+                Geometry::calc_fontsize(height, 22.0), ink, Display::ANCHOR_CENTER_CENTER, true)
+            Display::draw_text(list, "WASD walk  drag/arrows look  Q/E up, down  Shift slow  T photo  Enter match  Esc menu",
+                centre, Geometry::from_bottom_edge(height, 26.0).f64(), Geometry::calc_fontsize(height, 11.0),
+                ink, Display::ANCHOR_CENTER_CENTER)
+
+            status: mutable dstr = []
+            feedback: mutable dstr = []
+            if run.scored > 0 and (run.phase == CameraGame::JUDGED or run.phase == CameraGame::DONE):
+                result: CameraGame::Result = run.results[(run.scored - 1).usize()]
+                outcome(&feedback, &result)
+                SceneVerdict::put(list, width, height, 1.0, 1.0, result.matched, bytes_view(feedback), 60.0, 16.0)
+            if run.phase == CameraGame::DONE:
+                dstr_append_i64(&status, run.matched)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, run.scored)
+                dstr_append_cstr(&status, " matched   highest rung matched ")
+                dstr_append_i64(&status, run.best)
+            elif run.phase == CameraGame::JUDGED:
+                dstr_append_sview(&status, bytes_view(feedback))
+            elif run.phase == CameraGame::SEARCHING:
+                dstr_append_cstr(&status, "Stand where the photo was taken")
+            else:
+                dstr_append_cstr(&status, "Could not build the field. Press Space to retry." if run.deal_failed else "Press Space to start")
+            Display::draw_text(list, bytes_view(status), live.left, status_y,
+                Geometry::calc_fontsize(height, 14.0), ink, Display::ANCHOR_LEFT_CENTER)
+            return if not run.scene.valid
+
+            level: Camera::Grade = run.scene.level
+            details: mutable dstr = []
+            dstr_append_cstr(&details, "rung ")
+            dstr_append_i64(&details, level.rung)
+            dstr_append_cstr(&details, "  photo ")
+            dstr_append_i64(&details, run.trial)
+            dstr_append_cstr(&details, "/")
+            dstr_append_i64(&details, run.total)
+            dstr_append_cstr(&details, "  within ")
+            metres(&details, level.reach)
+            dstr_append_cstr(&details, ", ")
+            degrees(&details, level.aim)
+            Display::draw_text(list, bytes_view(details), live.left + live.width, status_y,
+                Geometry::calc_fontsize(height, 12.0), ink, Display::ANCHOR_RIGHT_CENTER)
+
+            raster: CameraRender::Pass = CameraRender::raster_pass(&live, &run.pose, level.field)
+            return if not CameraRender::visible(&raster, width.i64(), height.i64())
+            if not run.peek:
+                photo: CameraView::Rect = CameraView::photo_rect(&live)
+                photo_pass: CameraRender::Pass = CameraRender::raster_pass(&photo, &run.scene.target, level.field)
+                if CameraRender::visible(&photo_pass, width.i64(), height.i64()):
+                    Display::draw_box(list, photo_pass.x.f64() - 3.0, photo_pass.y.f64() - 3.0, photo_pass.width.f64() + 6.0,
+                        photo_pass.height.f64() + 6.0, 0xfafafaff, 3.0)
+            if level.meter and run.phase == CameraGame::SEARCHING:
+                warmth: f64 = Camera::closeness(&run.pose, &run.scene.target, &level)
+                Display::draw_rect(list, live.left, live.bottom + 8.0, live.width * 0.4, 10.0, 0x282830c8)
+                Display::draw_rect(list, live.left, live.bottom + 8.0, live.width * 0.4 * warmth, 10.0, 0x5a8ce6ff)

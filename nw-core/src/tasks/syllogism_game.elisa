@@ -19,7 +19,8 @@ module SyllogismGame:
     const DOWN: i64 = 5
     const CHOOSE: i64 = 6
 
-    struct Run:
+    struct SyllogismRun:
+        initial_seed: mutable i64
         rng: mutable MT19937
         rung: mutable i64
         start_rung: mutable i64
@@ -30,6 +31,12 @@ module SyllogismGame:
         best_rung: mutable i64
         trial: mutable i64
         right: mutable i64
+        started_at_ms: mutable i64
+        elapsed_ms: mutable i64
+        result_count: mutable i64
+        result_rung: mutable i64[15]
+        result_correct: mutable i64[15]
+        result_elapsed_ms: mutable i64[15]
         phase: mutable i64
         generation_failed: mutable bool
         verdict: mutable i64
@@ -55,7 +62,7 @@ module SyllogismGame:
     def allowed_trials(value: i64) -> bool:
         return value == 1 or value == 2 or value == 3 or value == 5 or value == 6 or value == 8 or value == 10 or value == 15
 
-    def clear(run: mutable Run&):
+    def clear(run: mutable SyllogismRun&):
         can Abort.Panic:
             run.used <- 0
             run.line_count <- 0
@@ -67,13 +74,13 @@ module SyllogismGame:
             run.answer <- -1
             run.family <- 0
 
-    def deal(run: mutable Run&) -> bool:
+    def deal(run: mutable SyllogismRun&) -> bool:
         can Memory.Allocate, Abort.Panic:
             success: mutable bool = false
             seed: i64 = py_randbelow(&run.rng, 1073741824.u64()).i64()
             region question(67108864):
                 in question:
-                    work: mutable Syllogism::Work = Syllogism::Work()
+                    work: mutable Syllogism::SyllogismWork = Syllogism::SyllogismWork()
                     q: mutable Syllogism::Question = Syllogism::Question()
                     success <- Syllogism::generate(run.rung, seed, not run.real_words, &work, &q)
                     success <- false if q.used < 0 or q.used > MAX_TEXT or q.line_count < 0 or q.line_count > MAX_LINES or q.working_count < 0 or q.working_count > MAX_WORKING or q.option_count <= 0 or q.option_count > MAX_OPTIONS or q.answer < 0 or q.answer >= q.option_count
@@ -100,9 +107,10 @@ module SyllogismGame:
                 destroy question
             return success
 
-    def initialize(run: mutable Run&, rung: i64, trials: i64, show_working: bool,
+    def initialize(run: mutable SyllogismRun&, rung: i64, trials: i64, show_working: bool,
                    adaptive: bool, real_words: bool, seed: i64):
         can Abort.Panic:
+            run.initial_seed <- seed
             run.rng <- mt19937_new()
             mt_seed_int(&run.rng, seed.u64())
             run.rung <- rung
@@ -114,19 +122,23 @@ module SyllogismGame:
             run.best_rung <- 0
             run.trial <- 0
             run.right <- 0
+            run.started_at_ms <- 0
+            run.elapsed_ms <- 0
+            run.result_count <- 0
             run.phase <- READY
             run.generation_failed <- false
             run.verdict <- -1
             clear(run)
 
-    def apply(run: mutable Run&, action: i64, value: i64, now_ms: i64) -> i64:
+    def apply(run: mutable SyllogismRun&, action: i64, value: i64, now_ms: i64) -> i64:
         can Memory.Allocate, Abort.Panic:
-            _ = now_ms
             if action == START:
                 if run.phase == ASKING: return 2
                 if run.phase == DONE:
                     run.trial <- 0
                     run.right <- 0
+                    run.elapsed_ms <- 0
+                    run.result_count <- 0
                     run.best_rung <- 0
                     run.rung <- run.start_rung
                     run.generation_failed <- false
@@ -136,6 +148,7 @@ module SyllogismGame:
                 run.trial <- run.trial + 1
                 clear(run)
                 if deal(run):
+                    run.started_at_ms <- now_ms
                     run.phase <- ASKING
                 else:
                     clear(run)
@@ -155,6 +168,14 @@ module SyllogismGame:
                 run.choice <- value
             if action == ANSWER or action == CHOOSE:
                 run.verdict <- 1 if run.choice == run.answer else 0
+                took: i64 = now_ms - run.started_at_ms if now_ms >= run.started_at_ms and run.started_at_ms >= 0 else 0
+                if run.result_count < 15:
+                    slot: usize = run.result_count.usize()
+                    run.result_rung[slot] <- run.rung
+                    run.result_correct[slot] <- run.verdict
+                    run.result_elapsed_ms[slot] <- took
+                    run.result_count <- run.result_count + 1
+                run.elapsed_ms <- 9223372036854775807 if took > 9223372036854775807 - run.elapsed_ms else run.elapsed_ms + took
                 if run.verdict == 1:
                     run.right <- run.right + 1
                     run.best_rung <- run.rung if run.rung > run.best_rung else run.best_rung
@@ -167,7 +188,7 @@ module SyllogismGame:
                 return 1
             return 2
 
-    def info(run: Run&, field: i64) -> i64:
+    def info(run: SyllogismRun&, field: i64) -> i64:
         if field == 0: return run.phase
         if field == 1: return run.rung
         if field == 2: return run.trial
@@ -182,11 +203,17 @@ module SyllogismGame:
         if field == 11: return 1 if run.adaptive else 0
         if field == 12: return 1 if run.real_words else 0
         if field == 13: return 1 if run.generation_failed else 0
+        if field == 14: return run.elapsed_ms / 1000
+        if field == 15: return run.result_count
         return -1
 
-    def value(run: Run&, field: i64, at: i64) -> i64:
+    def value(run: SyllogismRun&, field: i64, at: i64) -> i64:
         if field == 0: return run.answer if at == 0 and run.phase == JUDGED else -1
         if field == 1: return run.options_start[at.usize()] if at >= 0 and at < run.option_count else -1
+        if at < 0 or at >= run.result_count: return -1
+        if field == 2: return run.result_rung[at.usize()]
+        if field == 3: return run.result_correct[at.usize()]
+        if field == 4: return run.result_elapsed_ms[at.usize()]
         return -1
 
     def family_hint(family: i64) -> sview:
@@ -212,7 +239,7 @@ module SyllogismGame:
         if rung == 11: return sview("two questions, one answer", 0, -1)
         return sview("three questions, one answer", 0, -1)
 
-    def render(run: Run&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
+    def render(run: SyllogismRun&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
         can Memory.Allocate, Abort.Panic:
             region frame(67108864):
                 in frame:
@@ -224,7 +251,7 @@ module SyllogismGame:
                         options.push(string_view_slice(bytes_view(text), run.options_start[option.usize()], run.options_start[option.usize()] + run.options_len[option.usize()]))
                     sx: f64 = width / Display::REFERENCE_WIDTH
                     sy: f64 = height / Display::REFERENCE_HEIGHT
-                    paint: SceneSyllogism::Paint = SceneSyllogism::paint_of(black, width, height, sx, sy)
+                    paint: SceneSyllogism::SyllogismPaint = SceneSyllogism::paint_of(black, width, height, sx, sy)
                     premises: mutable dstr = []
                     count: i64 = run.working_count if run.phase == JUDGED and run.show_working else run.line_count
                     for line in 0..<count |line, run, text, premises|:

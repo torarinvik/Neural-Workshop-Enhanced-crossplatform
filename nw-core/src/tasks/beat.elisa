@@ -1,0 +1,184 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+include "../strings.elisa"
+
+module Beat:
+    const TAP: i64 = 0
+    const LEAD: f64 = 0.8
+    const PENDING: i64 = 0
+    const PASSED: i64 = 1
+    const MISSED: i64 = 2
+    const STRAY: i64 = 3
+
+    struct Grade:
+        rung: i64
+        tempo_min: f64
+        tempo_max: f64
+        pattern: f64[3]
+        cycle: i64
+        window: f64
+        heard: i64
+        silent: i64
+        reprise: bool
+
+    struct Song:
+        level: Grade
+        times: mutable f64[39]
+        count: i64
+        intro: i64
+        reprise_at: i64
+        reprise_count: i64
+        judged: i64
+        end: mutable f64
+
+    struct Run:
+        song: Song
+        time: mutable f64
+        taps: mutable i64
+        tap_count: mutable i64
+        capacity: mutable i64
+        claimed: mutable bool[39]
+        hits: mutable i64
+        strays: mutable i64
+        result: mutable i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = 1 if rung < 1 else rung
+        pattern: i64 = 0 if r < 10 else (1 if r < 13 else (2 if r < 16 else r % 3))
+        top: i64 = 0 if r < 20 else r - 20
+        late_window: f64 = 0.07 if top >= 8 else 0.1 - 0.004 * top.f64()
+        window: f64 = 0.18 if r < 4 else (0.13 if r < 10 else (0.12 if r < 16 else late_window))
+        silent: i64 = 6 if r < 4 else (8 if r < 16 else (10 if r < 20 else (20 if top >= 8 else 12 + top)))
+        return Grade{rung: r, tempo_min: 0.8 if r < 7 else 0.45, tempo_max: 0.8 if r < 7 else 0.95,
+            pattern: [1.0, 0.0, 0.0] if pattern == 0 else ([1.35, 0.65, 0.0] if pattern == 1 else [1.5, 0.75, 0.75]),
+            cycle: pattern + 1, window: window, heard: 8 if r < 10 else 12, silent: silent, reprise: r >= 16}
+
+    def whole_cycles(beats: i64, cycle: i64) -> i64:
+        return ((beats + cycle - 1) / cycle) * cycle
+
+    def deal(rung: i64, seed: i64) -> Song:
+        can Abort.Panic:
+            level: Grade = grade(rung)
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            unit: f64 = level.tempo_min + (level.tempo_max - level.tempo_min) * py_random(&rng)
+            intro: i64 = whole_cycles(level.heard, level.cycle)
+            judged: i64 = whole_cycles(level.silent, level.cycle)
+            reprise_at: i64 = intro + whole_cycles(judged / 2, level.cycle)
+            reprise_count: i64 = 2 * level.cycle if level.reprise else 0
+            song: mutable Song = Song{level: level, times: zeroed, count: intro + judged + reprise_count,
+                intro: intro, reprise_at: reprise_at, reprise_count: reprise_count, judged: judged, end: 0.0}
+            time: mutable f64 = LEAD
+            for i in 0..<song.count |song, time, unit, level|:
+                song.times[i.usize()] <- py_round_half_even(time * 10000.0).f64() / 10000.0
+                time <- time + unit * level.pattern[(i % level.cycle).usize()]
+            song.end <- song.times[(song.count - 1).usize()] + level.window + 0.8
+            return song
+
+    def heard(song: Song&, index: i64) -> bool:
+        return index < song.intro or (index >= song.reprise_at and index < song.reprise_at + song.reprise_count)
+
+    def last_beat(song: Song&, time: f64) -> i64:
+        can Abort.Panic:
+            for i in 0..<song.count |song, time|:
+                return i - 1 if song.times[i.usize()] > time
+            return song.count - 1
+
+    def curtain(song: Song&, time: f64) -> bool:
+        can Abort.Panic:
+            next: i64 = last_beat(song, time) + 1
+            return next >= song.count or not heard(song, next)
+
+    def trial(song: Song) -> Run:
+        return Run{song: song, time: 0.0, taps: 0, tap_count: 0, capacity: 0,
+            claimed: zeroed, hits: 0, strays: 0, result: PENDING}
+
+    def dispose(run: mutable Run&):
+        can Memory.Release, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                free(run.taps.uintptr().cast[heap void&]) if run.taps != 0
+            run.taps <- 0
+            run.capacity <- 0
+            run.tap_count <- 0
+
+    def grow_taps(run: mutable Run&) -> bool:
+        can Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+            capacity: i64 = 32 if run.capacity == 0 else run.capacity * 2
+            return false if capacity > 268435456
+            if malloc((capacity * size_of(f64).i64()).usize()) is memory:
+                trusted Unsafe.PointerCast:
+                    if run.taps != 0:
+                        previous: heap void& = run.taps.uintptr().cast[heap void&]
+                        memcpy(memory, previous, (run.tap_count * size_of(f64).i64()).usize())
+                        free(previous)
+                run.taps <- memory.uintptr().i64()
+                run.capacity <- capacity
+                return true
+            return false
+
+    def tap_time(run: Run&, index: i64) -> f64:
+        can Abort.Panic, Unsafe.PointerCast:
+            return -1.0 if index < 0 or index >= run.tap_count
+            trusted Unsafe.PointerCast:
+                taps: heap f64& = run.taps.uintptr().cast[heap f64&]
+                return taps[index.usize()]
+
+    def tap(run: mutable Run&) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if run.result != PENDING
+            return false if run.tap_count == run.capacity and not grow_taps(run)
+            trusted Unsafe.PointerCast:
+                taps: mutable heap f64& = run.taps.uintptr().cast[mutable heap f64&]
+                taps[run.tap_count.usize()] <- run.time
+            run.tap_count <- run.tap_count + 1
+            song: Song& = &run.song
+            window: f64 = song.level.window
+            # The shortest beat interval at each rung exceeds two scoring windows.
+            # Each tap can therefore be in range of at most one silent beat.
+            stray: mutable bool = run.time > song.times[song.intro.usize()] - 3.0 * window
+            for i in song.intro..<song.count |run, song, window, stray|:
+                continue if heard(song, i)
+                delta: f64 = song.times[i.usize()] - run.time
+                distance: f64 = -delta if delta < 0.0 else delta
+                if distance < 3.0 * window:
+                    stray <- true
+                if not run.claimed[i.usize()] and distance <= window:
+                    run.claimed[i.usize()] <- true
+                    run.hits <- run.hits + 1
+                    return true
+            if stray:
+                run.strays <- run.strays + 1
+            return true
+
+    def required(song: Song&) -> i64:
+        return (song.judged * 3 + 3) / 4
+
+    def step(run: mutable Run&, dt: f64):
+        return if run.result != PENDING
+        run.time <- run.time + dt
+        if run.time >= run.song.end:
+            run.result <- MISSED if run.hits < required(&run.song) else (STRAY if run.strays > 2 else PASSED)
+
+    def pilot(run: Run&) -> bool:
+        can Abort.Panic:
+            song: Song& = &run.song
+            for i in song.intro..<song.count |song, run|:
+                time: f64 = song.times[i.usize()]
+                if not heard(song, i) and not run.claimed[i.usize()] and time <= run.time + 0.000000001 and run.time - time < song.level.window:
+                    return true
+            return false
+
+    def result_text(run: Run&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if run.result == STRAY:
+                dstr_append_i64(out, run.strays)
+                dstr_append_cstr(out, " taps off the beat")
+            else:
+                dstr_append_i64(out, run.hits)
+                dstr_append_cstr(out, " of ")
+                dstr_append_i64(out, run.song.judged)
+                dstr_append_cstr(out, " beats kept")
+                if run.result == MISSED:
+                    dstr_append_cstr(out, " -- ")
+                    dstr_append_i64(out, required(&run.song))
+                    dstr_append_cstr(out, " needed")

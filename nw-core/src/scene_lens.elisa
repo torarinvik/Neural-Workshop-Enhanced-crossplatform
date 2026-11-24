@@ -1,0 +1,298 @@
+include "./display.elisa"
+
+# ui/lens.py's pinhole camera and ui/livetask.py's flat shapes, as the
+# reference draws them: points cut where they pass behind the lens before
+# they are seen, then every shape cut to the scene's rectangle -- rectangles
+# by their corners, lines by Liang-Barsky, polygons by Sutherland-Hodgman,
+# discs dropped when their middle is outside and pulled in from the edges.
+module SceneLens:
+    const DEGREE: f64 = 0.017453292519943295
+    const MOST: i64 = 48
+
+    struct Vec:
+        x: f64
+        y: f64
+        z: f64
+
+    struct Clip:
+        x0: f64
+        y0: f64
+        x1: f64
+        y1: f64
+
+    struct Lens:
+        eye: Vec
+        f: Vec
+        r: Vec
+        u: Vec
+        focal: f64
+        cx: f64
+        cy: f64
+
+    struct Seen:
+        valid: bool
+        x: f64
+        y: f64
+        z: f64
+
+    # Up to MOST points on the screen, or in the world.
+    struct Flat:
+        xs: mutable f64[48]
+        ys: mutable f64[48]
+        count: mutable i64
+
+    struct Solid:
+        points: mutable Vec[48]
+        count: mutable i64
+
+    def vec(x: f64, y: f64, z: f64) -> Vec:
+        return Vec{x: x, y: y, z: z}
+
+    def sub(a: Vec, b: Vec) -> Vec:
+        return Vec{x: a.x - b.x, y: a.y - b.y, z: a.z - b.z}
+
+    def dot(a: Vec, b: Vec) -> f64:
+        return a.x * b.x + a.y * b.y + a.z * b.z
+
+    def cross(a: Vec, b: Vec) -> Vec:
+        return Vec{x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x}
+
+    def unit(v: Vec) -> Vec:
+        length: f64 = sqrt(dot(v, v))
+        d: f64 = length if length != 0.0 else 1.0
+        return Vec{x: v.x / d, y: v.y / d, z: v.z / d}
+
+    # CPython 3.12's sum() of floats: 0, then a Neumaier-compensated sum,
+    # the compensation added only if it is non-zero and finite.
+    def psum3(a: f64, b: f64, c: f64) -> f64:
+        terms: f64[3] = [a, b, c]
+        total: mutable f64 = 0.0
+        low: mutable f64 = 0.0
+        for k in 0..<3 |terms, total, low|:
+            x: f64 = terms[k.usize()]
+            t: f64 = total + x
+            if fabs(total) >= fabs(x):
+                low <- low + ((total - t) + x)
+            else:
+                low <- low + ((x - t) + total)
+            total <- t
+        return total + low if low != 0.0 and low - low == 0.0 else total
+
+    # Lens(eye, target, focal, cx, cy, up, x_right).
+    def lens(eye: Vec, target: Vec, focal: f64, cx: f64, cy: f64, up: Vec, x_right: bool) -> Lens:
+        f: Vec = unit(sub(target, eye))
+        r: Vec = unit(cross(f, up))
+        u: Vec = cross(r, f)
+        right: Vec = Vec{x: -r.x, y: -r.y, z: -r.z} if x_right else r
+        return Lens{eye: eye, f: f, r: right, u: u, focal: focal, cx: cx, cy: cy}
+
+    @inline(never)
+    def tangent(angle: f64) -> f64:
+        return tan(angle)
+
+    # LiveTask.camera: a lens at eye looking along look, filling the
+    # rectangle, fov degrees across.
+    def camera(eye: Vec, look: Vec, left: f64, bottom: f64, width: f64, height: f64, fov: f64, x_right: bool) -> Lens:
+        focal: f64 = width / (2.0 * tangent(fov * DEGREE / 2.0))
+        target: Vec = Vec{x: eye.x + look.x, y: eye.y + look.y, z: eye.z + look.z}
+        up: Vec = Vec{x: 0.0, y: 0.0, z: 1.0} if fabs(look.y) > 0.999 * sqrt(psum3(look.x * look.x, look.y * look.y, look.z * look.z)) else Vec{x: 0.0, y: 1.0, z: 0.0}
+        return lens(eye, target, focal, left + width / 2.0, bottom + height / 2.0, up, x_right)
+
+    def see(lens: Lens&, p: Vec, near: f64 = 0.05) -> Seen:
+        d: Vec = sub(p, lens.eye)
+        z: f64 = dot(d, lens.f)
+        return Seen{valid: false, x: 0.0, y: 0.0, z: 0.0} if z < near
+        k: f64 = lens.focal / z
+        return Seen{valid: true, x: lens.cx + dot(d, lens.r) * k, y: lens.cy + dot(d, lens.u) * k, z: z}
+
+    def size(lens: Lens&, world: f64, depth: f64) -> f64:
+        return world * lens.focal / (depth if depth > 1e-6 else 1e-6)
+
+    def rect(list: mutable Display::DisplayList&, clip: Clip, x: f64, y: f64, w: f64, h: f64, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            ax: f64 = clip.x0 if clip.x0 > x else x
+            ay: f64 = clip.y0 if clip.y0 > y else y
+            bx: f64 = clip.x1 if clip.x1 < x + w else x + w
+            by: f64 = clip.y1 if clip.y1 < y + h else y + h
+            return if bx <= ax or by <= ay
+            Display::draw_rect(list, ax, ay, bx - ax, by - ay, ink)
+
+    def line(list: mutable Display::DisplayList&, clip: Clip, ax: f64, ay: f64, bx: f64, by: f64, thick: f64, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            dx: f64 = bx - ax
+            dy: f64 = by - ay
+            lo: mutable f64 = 0.0
+            hi: mutable f64 = 1.0
+            ps: f64[4] = [-dx, dx, -dy, dy]
+            qs: f64[4] = [ax - clip.x0, clip.x1 - ax, ay - clip.y0, clip.y1 - ay]
+            for e in 0..<4 |ps, qs, lo, hi|:
+                p: f64 = ps[e.usize()]
+                q: f64 = qs[e.usize()]
+                if p == 0.0:
+                    return if q < 0.0
+                    continue
+                t: f64 = q / p
+                if p < 0.0:
+                    lo <- t if t > lo else lo
+                else:
+                    hi <- t if t < hi else hi
+                return if lo > hi
+            Display::draw_line(list, ax + dx * lo, ay + dy * lo, ax + dx * hi, ay + dy * hi, thick, ink)
+
+    def disc(list: mutable Display::DisplayList&, clip: Clip, x: f64, y: f64, radius: f64, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            return if not (clip.x0 <= x and x <= clip.x1 and clip.y0 <= y and y <= clip.y1)
+            r: mutable f64 = radius
+            if r > 4.0:
+                edges: f64[4] = [x - clip.x0, clip.x1 - x, y - clip.y0, clip.y1 - y]
+                for e in 0..<4 |edges, r|:
+                    r <- edges[e.usize()] if edges[e.usize()] < r
+            Display::draw_circle(list, x, y, r if r > 0.5 else 0.5, ink)
+
+    def inside(clip: Clip, edge: i64, x: f64, y: f64) -> bool:
+        return x >= clip.x0 if edge == 0
+        return x <= clip.x1 if edge == 1
+        return y >= clip.y0 if edge == 2
+        return y <= clip.y1
+
+    # _cut_poly's crossing of edge a-b with one side of the rectangle.
+    def crossing(clip: Clip, edge: i64, ax: f64, ay: f64, bx: f64, by: f64, out: mutable Flat&):
+        can Abort.Panic:
+            n: usize = out.count.usize()
+            if edge == 0 or edge == 1:
+                side: f64 = clip.x0 if edge == 0 else clip.x1
+                out.xs[n] <- side
+                out.ys[n] <- ay + (by - ay) * (side - ax) / (bx - ax)
+            else:
+                side: f64 = clip.y0 if edge == 2 else clip.y1
+                out.xs[n] <- ax + (bx - ax) * (side - ay) / (by - ay)
+                out.ys[n] <- side
+            out.count <- out.count + 1
+
+    # LiveTask.poly: the polygon cut to the rectangle, drawn if three
+    # points are left.
+    def poly(list: mutable Display::DisplayList&, clip: Clip, shape: Flat, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            pts: mutable Flat = shape
+            for edge in 0..<4 |clip, pts|:
+                out: mutable Flat = zeroed
+                n: i64 = pts.count
+                for i in 0..<n |clip, edge, pts, out, n|:
+                    j: i64 = i - 1 if i > 0 else n - 1
+                    ax: f64 = pts.xs[j.usize()]
+                    ay: f64 = pts.ys[j.usize()]
+                    bx: f64 = pts.xs[i.usize()]
+                    by: f64 = pts.ys[i.usize()]
+                    if inside(clip, edge, bx, by):
+                        crossing(clip, edge, ax, ay, bx, by, &out) if not inside(clip, edge, ax, ay)
+                        out.xs[out.count.usize()] <- bx
+                        out.ys[out.count.usize()] <- by
+                        out.count <- out.count + 1
+                    elif inside(clip, edge, ax, ay):
+                        crossing(clip, edge, ax, ay, bx, by, &out)
+                pts <- out
+                break if pts.count == 0
+            return if pts.count < 3
+            Display::begin_polygon(list, pts.count, pts.xs[0], pts.ys[0], ink)
+            for i in 0..<pts.count |list, pts|:
+                Display::polygon_point(list, pts.xs[i.usize()], pts.ys[i.usize()])
+
+    # LiveTask._clip: the polygon cut where it passes behind the lens, as
+    # screen points.
+    def cut(lens: Lens&, shape: Solid&, near: f64 = 0.08) -> Flat:
+        can Abort.Panic:
+            depth: mutable f64[48] = zeroed
+            n: i64 = shape.count
+            for i in 0..<n |lens, shape, depth|:
+                p: Vec = shape.points[i.usize()]
+                depth[i.usize()] <- (p.x - lens.eye.x) * lens.f.x + (p.y - lens.eye.y) * lens.f.y + (p.z - lens.eye.z) * lens.f.z
+            kept: mutable Solid = zeroed
+            for i in 0..<n |shape, depth, kept, near, n|:
+                j: i64 = (i + 1) % n
+                a: Vec = shape.points[i.usize()]
+                b: Vec = shape.points[j.usize()]
+                da: f64 = depth[i.usize()]
+                db: f64 = depth[j.usize()]
+                if da >= near:
+                    kept.points[kept.count.usize()] <- a
+                    kept.count <- kept.count + 1
+                if (da >= near) != (db >= near):
+                    s: f64 = (near - da) / (db - da)
+                    kept.points[kept.count.usize()] <- Vec{x: a.x + (b.x - a.x) * s, y: a.y + (b.y - a.y) * s,
+                        z: a.z + (b.z - a.z) * s}
+                    kept.count <- kept.count + 1
+            out: mutable Flat = zeroed
+            for i in 0..<kept.count |lens, kept, out, near|:
+                q: Seen = see(lens, kept.points[i.usize()], near * 0.5)
+                if q.valid:
+                    out.xs[out.count.usize()] <- q.x
+                    out.ys[out.count.usize()] <- q.y
+                    out.count <- out.count + 1
+            return out
+
+    def face(list: mutable Display::DisplayList&, clip: Clip, lens: Lens&, shape: Solid&, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            flat: Flat = cut(lens, shape)
+            poly(list, clip, flat, ink)
+
+    def quad(a: Vec, b: Vec, c: Vec, d: Vec) -> Solid:
+        shape: mutable Solid = zeroed
+        shape.points[0] <- a
+        shape.points[1] <- b
+        shape.points[2] <- c
+        shape.points[3] <- d
+        shape.count <- 4
+        return shape
+
+    def seg(list: mutable Display::DisplayList&, clip: Clip, lens: Lens&, a: Vec, b: Vec, thick: f64, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            shape: mutable Solid = zeroed
+            shape.points[0] <- a
+            shape.points[1] <- b
+            shape.points[2] <- b
+            shape.count <- 3
+            q: Flat = cut(lens, &shape)
+            return if q.count < 2
+            last: usize = (q.count - 1).usize()
+            line(list, clip, q.xs[0], q.ys[0], q.xs[last], q.ys[last], thick, ink)
+
+    # An RGBA ink scaled channel by channel as int(c * k), the alpha kept.
+    def shade(ink: u32, k: f64, keep_alpha: bool) -> u32:
+        red: u32 = (((ink >> 24.u32()) & 255.u32()).f64() * k).i64().u32()
+        green: u32 = (((ink >> 16.u32()) & 255.u32()).f64() * k).i64().u32()
+        blue: u32 = (((ink >> 8.u32()) & 255.u32()).f64() * k).i64().u32()
+        alpha: u32 = (ink & 255.u32()) if keep_alpha else 255.u32()
+        return (red << 24.u32()) | (green << 16.u32()) | (blue << 8.u32()) | alpha
+
+    # LiveTask.ball: a sphere, its shadowed rim and its lit face.
+    def ball(list: mutable Display::DisplayList&, clip: Clip, lens: Lens&, p: Vec, r: f64, ink: u32, darken: f64 = 0.25):
+        can Memory.Allocate, Abort.Panic:
+            q: Seen = see(lens, p)
+            return if not q.valid
+            rr: f64 = size(lens, r, q.z)
+            disc(list, clip, q.x, q.y, rr, shade(ink, 1.0 - darken, false))
+            disc(list, clip, q.x - rr * 0.15, q.y + rr * 0.15, rr * 0.8, ink)
+
+    # LiveTask.box: the faces turned toward the lens, shaded by side.
+    def box(list: mutable Display::DisplayList&, clip: Clip, lens: Lens&, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64,
+            z1: f64, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            e: Vec = lens.eye
+            if e.x < x0:
+                side: Solid = quad(vec(x0, y0, z0), vec(x0, y1, z0), vec(x0, y1, z1), vec(x0, y0, z1))
+                face(list, clip, lens, &side, shade(ink, 0.75, true))
+            if e.x > x1:
+                side: Solid = quad(vec(x1, y0, z0), vec(x1, y0, z1), vec(x1, y1, z1), vec(x1, y1, z0))
+                face(list, clip, lens, &side, shade(ink, 0.75, true))
+            if e.z < z0:
+                side: Solid = quad(vec(x0, y0, z0), vec(x1, y0, z0), vec(x1, y1, z0), vec(x0, y1, z0))
+                face(list, clip, lens, &side, shade(ink, 0.9, true))
+            if e.z > z1:
+                side: Solid = quad(vec(x0, y0, z1), vec(x0, y1, z1), vec(x1, y1, z1), vec(x1, y0, z1))
+                face(list, clip, lens, &side, shade(ink, 0.9, true))
+            if e.y > y1:
+                side: Solid = quad(vec(x0, y1, z0), vec(x1, y1, z0), vec(x1, y1, z1), vec(x0, y1, z1))
+                face(list, clip, lens, &side, shade(ink, 1.0, true))
+            if e.y < y0:
+                side: Solid = quad(vec(x0, y0, z0), vec(x0, y0, z1), vec(x1, y0, z1), vec(x1, y0, z0))
+                face(list, clip, lens, &side, shade(ink, 0.6, true))

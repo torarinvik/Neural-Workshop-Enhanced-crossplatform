@@ -1,0 +1,440 @@
+include "./drshape.elisa"
+include "../pymath.elisa"
+
+module DrShapeDeal:
+    const SHOW_DEPTH: f64 = 3.4
+    const SPEED_OF_SOUND: f64 = 343.0
+    const SIZE: i64 = 0
+    const MIRROR: i64 = 1
+    const COLOUR: i64 = 2
+    const NEAR: i64 = 3
+    const OTHER: i64 = 4
+
+    struct Note:
+        t: f64
+        dur: f64
+        freq: f64
+        pan: f64
+        pan2: f64
+        gain: f64
+        gain2: f64
+        bright: f64
+        voice: i64
+        seed: i64
+        who: i64
+        room: f64
+
+    struct Song:
+        notes: mutable Note[DrShape::MAX_STROKES]
+        drawn_by: mutable f64[DrShape::MAX_STROKES]
+        end: mutable f64
+        count: mutable i64
+
+    struct Voice:
+        offset: i64
+        spare: i64
+        pan_shift: f64
+        pan_width: f64
+        gain: f64
+        transpose: i64
+        who: i64
+        distance: f64
+
+    def clamp(value: f64, lo: f64, hi: f64) -> f64:
+        return lo if value < lo else (hi if value > hi else value)
+
+    def near(p: RoomsView::Vec) -> f64:
+        return clamp((p.z + 1.0) / 2.0, 0.0, 1.0)
+
+    def semitones(mid: RoomsView::Vec) -> i64:
+        can Abort.Panic:
+            step: i64 = clamp(py_round_half_even((mid.y + 1.0) * 4.5).f64(), 0.0, 9.0).i64()
+            scale: i64[5] = [0, 2, 4, 7, 9]
+            return 12 * (step / 5) + scale[(step % 5).usize()]
+
+    def duration(a: RoomsView::Vec, b: RoomsView::Vec) -> f64:
+        return clamp(DrShape::distance(a, b) * 0.5, 0.2, 0.7)
+
+    def sing(form: DrShape::Form&, view: DrShape::Matrix, start: f64, tempo: f64, voice: Voice, reference: f64 = SHOW_DEPTH) -> Song:
+        can Abort.Panic:
+            song: mutable Song = zeroed
+            song.count <- form.path.count
+            song.end <- start
+            far: f64 = clamp(reference / clamp(voice.distance, 0.3, 1.7976931348623157e308), 0.3, 1.5) if voice.distance > 0.0 else 1.0
+            room: f64 = clamp(0.25 * voice.distance / reference, 0.0, 0.85)
+            late: f64 = voice.distance / SPEED_OF_SOUND
+            for i in 0..<song.count |song, form, view, tempo, voice, far, room, late|:
+                k: usize = i.usize()
+                edge: DrShape::Segment = form.path.segments[k]
+                a: RoomsView::Vec = DrShape::apply(view, edge.a)
+                b: RoomsView::Vec = DrShape::apply(view, edge.b)
+                mid: RoomsView::Vec = RoomsView::mul(RoomsView::add(a, b), 0.5)
+                dur: f64 = duration(a, b) / tempo
+                freq: f64 = 196.0 * pow(2.0, (semitones(mid) + voice.transpose).f64() / 12.0)
+                tint: i64 = voice.spare if voice.spare >= 0 and i % 2 != 0 else form.tints[k] + voice.offset
+                song.notes[k] <- Note{t: song.end + late, dur: dur, freq: freq,
+                    pan: clamp(voice.pan_shift + a.x * voice.pan_width, -1.0, 1.0),
+                    pan2: clamp(voice.pan_shift + b.x * voice.pan_width, -1.0, 1.0),
+                    gain: far * voice.gain * (0.35 + 0.65 * near(a)),
+                    gain2: far * voice.gain * (0.35 + 0.65 * near(b)),
+                    bright: (far if far < 1.0 else 1.0) * (0.25 + 0.75 * near(mid)),
+                    voice: tint, seed: i + 1000 * (voice.who + 30), who: voice.who, room: room}
+                song.end <- song.end + dur
+                song.drawn_by[k] <- song.end
+            return song
+
+    struct Cue:
+        pitch: i64
+        duration: i64
+        pan: i64
+        voice: i64
+
+    struct Tune:
+        cues: mutable Cue[DrShape::MAX_STROKES]
+        count: mutable i64
+
+    def tune(form: DrShape::Form&, view: DrShape::Matrix) -> Tune:
+        can Abort.Panic:
+            out: mutable Tune = zeroed
+            out.count <- form.path.count
+            for i in 0..<out.count |out, form, view|:
+                k: usize = i.usize()
+                edge: DrShape::Segment = form.path.segments[k]
+                a: RoomsView::Vec = DrShape::apply(view, edge.a)
+                b: RoomsView::Vec = DrShape::apply(view, edge.b)
+                mid: RoomsView::Vec = RoomsView::mul(RoomsView::add(a, b), 0.5)
+                pan: f64 = clamp(a.x, -1.0, 1.0) + clamp(b.x, -1.0, 1.0)
+                out.cues[k] <- Cue{pitch: semitones(mid), duration: py_round_half_even(duration(a, b) * 10.0),
+                    pan: py_round_half_even(pan * 2.0), voice: form.tints[k]}
+            return out
+
+    def same_tune(a: Tune&, b: Tune&) -> bool:
+        can Abort.Panic:
+            return false if a.count != b.count
+            for i in 0..<a.count |a, b|:
+                p: Cue = a.cues[i.usize()]
+                q: Cue = b.cues[i.usize()]
+                return false if p.pitch != q.pitch or p.duration != q.duration or p.pan != q.pan or p.voice != q.voice
+            return true
+
+    struct Candidate:
+        form: DrShape::Form
+        view: DrShape::Matrix
+        spin: RoomsView::Vec
+        size: f64
+        depth: f64
+        side: f64
+
+    struct Match:
+        target: mutable DrShape::Form
+        view: mutable DrShape::Matrix
+        cards: mutable Candidate[DrShape::MOST]
+        answer: mutable i64
+        count: mutable i64
+
+    struct Decoy:
+        form: DrShape::Form
+        size: f64
+
+    def tilt(level: DrShape::Grade&, rng: mutable MT19937&) -> DrShape::Matrix:
+        can Abort.Panic:
+            shallow: f64 = -0.35 if level.turn == 0 else py_uniform(rng, -0.6, -0.2)
+            heading: f64 = py_uniform(rng, 0.0, DrShape::TAU)
+            up: RoomsView::Vec = RoomsView::vec(0.0, 0.0, 1.0) if level.turn == 0 else RoomsView::vec(0.0, 1.0, 0.0)
+            return DrShape::matmul(DrShape::axis_turn(RoomsView::vec(1.0, 0.0, 0.0), shallow), DrShape::axis_turn(up, heading))
+
+    def make_decoy(level: DrShape::Grade&, target: DrShape::Form&, params: DrShape::Params&, family: i64,
+            colours: i64, kind: i64, strict: bool, rng: mutable MT19937&) -> Decoy:
+        can Memory.Allocate, Abort.Panic:
+            if kind == SIZE:
+                sizes: f64[4] = [0.55, 0.6, 1.65, 1.8]
+                return Decoy{form: target[0], size: sizes[py_choice_index(rng, 4).usize()]}
+            shape: mutable DrShape::Form = target[0]
+            if kind == MIRROR:
+                DrShape::stretch(&shape, RoomsView::vec(-1.0, 1.0, 1.0))
+            elif kind == COLOUR:
+                DrShape::recolour(&shape, rng)
+            else:
+                if kind == NEAR:
+                    changed: mutable DrShape::Params = params[0]
+                    DrShape::nudge(family, &changed, rng)
+                    shape <- DrShape::build(family, &changed)
+                else:
+                    selected: i64 = family if strict and py_random(rng) < 0.5 else level.families[py_choice_index(rng, level.family_count).usize()]
+                    different: DrShape::Params = DrShape::draw_params(selected, rng)
+                    shape <- DrShape::build(selected, &different)
+                DrShape::colour(&shape, colours, rng)
+            return Decoy{form: shape, size: 1.0}
+
+    def same_decoy(decoys: Decoy[DrShape::MOST]&, count: i64, next: Decoy&) -> bool:
+        can Abort.Panic:
+            for i in 0..<count |decoys, next|:
+                other: Decoy& = &decoys[i.usize()]
+                return true if not DrShape::distinct(&other.form, &next.form, 0.1, other.size, next.size)
+            return false
+
+    def heard(known: Tune[DrShape::MOST]&, count: i64, next: Tune&) -> bool:
+        can Abort.Panic:
+            for i in 0..<count |known, next|:
+                return true if same_tune(&known[i.usize()], next)
+            return false
+
+    def candidate(source: Decoy&, level: DrShape::Grade&, view: DrShape::Matrix, strict: bool, floor: bool,
+            rng: mutable MT19937&) -> Candidate:
+        can Abort.Panic:
+            v: mutable DrShape::Matrix = view
+            if not strict and level.turn == 1:
+                angle: f64 = py_uniform(rng, 0.5, DrShape::TAU - 0.5)
+                v <- DrShape::matmul(view, DrShape::axis_turn(RoomsView::vec(0.0, 0.0, 1.0), angle))
+            elif not strict and level.turn == 2:
+                v <- DrShape::random_turn(rng)
+            spin: mutable RoomsView::Vec = zeroed
+            if level.tumble and not strict:
+                if floor:
+                    spin <- RoomsView::vec(0.0, 1.0, 0.0)
+                else:
+                    x: f64 = py_uniform(rng, -1.0, 1.0)
+                    y: f64 = py_uniform(rng, -1.0, 1.0)
+                    z: f64 = py_uniform(rng, -1.0, 1.0)
+                    spin <- RoomsView::vec(x, y, z)
+            depth: f64 = source.size * py_uniform(rng, 2.3, 4.4) if floor else 0.0
+            side: f64 = py_uniform(rng, -0.25, 0.25) * depth if floor else 0.0
+            return Candidate{form: source.form, view: v, spin: spin, size: source.size, depth: depth, side: side}
+
+    def build_match(level: DrShape::Grade&, mode: i64, rng: mutable MT19937&) -> Match:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable Match = zeroed
+            family: i64 = level.families[py_choice_index(rng, level.family_count).usize()]
+            params: DrShape::Params = DrShape::draw_params(family, rng)
+            out.target <- DrShape::build(family, &params)
+            return out if out.target.path.count < 3
+            strict: bool = mode != DrShape::SEE
+            floor: bool = level.floor and not strict
+            colours: i64 = 1 if level.colours == 1 else py_randint(rng, 2, level.colours)
+            DrShape::colour(&out.target, colours, rng)
+            chiral: bool = DrShape::magnitude(DrShape::handedness(&out.target.path)) > 0.08
+            out.view <- tilt(level, rng)
+            margin: f64 = 0.25 if strict else 0.12
+            known: mutable Tune[DrShape::MOST] = zeroed
+            known[0] <- tune(&out.target, out.view)
+            decoys: mutable Decoy[DrShape::MOST] = zeroed
+            counts: mutable i64[5] = zeroed
+            count: mutable i64 = 0
+            for attempt in 0..<120 |level, rng, out, params, family, colours, strict, floor, chiral, margin, known, decoys, counts, count|:
+                break if count == level.candidates - 1
+                roll: f64 = py_random(rng)
+                kind: mutable i64 = OTHER
+                if floor and roll < 0.3 and counts[SIZE.usize()] < 2:
+                    kind <- SIZE
+                elif level.mirror and chiral and roll < 0.45 and counts[MIRROR.usize()] < 1:
+                    kind <- MIRROR
+                elif colours > 1 and roll < 0.65 and counts[COLOUR.usize()] < 2:
+                    kind <- COLOUR
+                elif level.near and (not strict or level.rung >= 17) and roll < 0.85:
+                    kind <- NEAR
+                next: Decoy = make_decoy(level, &out.target, &params, family, colours, kind, strict, rng)
+                continue if next.form.path.count < 3 or not DrShape::distinct(&out.target, &next.form, margin, 1.0, next.size)
+                continue if same_decoy(&decoys, count, &next)
+                if strict:
+                    sound: Tune = tune(&next.form, out.view)
+                    continue if heard(&known, count + 1, &sound)
+                    known[(count + 1).usize()] <- sound
+                counts[kind.usize()] <- counts[kind.usize()] + 1
+                decoys[count.usize()] <- next
+                count <- count + 1
+            return out if count < level.candidates - 1
+            out.answer <- py_choice_index(rng, level.candidates)
+            base: Decoy = Decoy{form: out.target, size: 1.0}
+            for i in 0..<level.candidates |out, decoys, level, base, strict, floor, rng|:
+                source: Decoy& = &base if i == out.answer else &decoys[(i if i < out.answer else i - 1).usize()]
+                out.cards[i.usize()] <- candidate(source, level, out.view, strict, floor, rng)
+            out.count <- level.candidates
+            return out
+
+    const PLATFORM: f64 = 2.7
+    const ORBIT: f64 = 7.0
+    const ORBIT_RISE: f64 = 0.5
+    const OBJECT: f64 = 0.78
+
+    struct Place:
+        thing: i64
+        x: f64
+        z: f64
+
+    struct Layout:
+        places: mutable Place[3]
+
+    struct Thing:
+        form: DrShape::Form
+        turn: DrShape::Matrix
+
+    struct PlatformCard:
+        layout: Layout
+        look: f64
+
+    struct Platform:
+        things: mutable Thing[DrShape::MOST + 2]
+        thing_count: mutable i64
+        target: mutable Layout
+        look: mutable f64
+        cards: mutable PlatformCard[DrShape::MOST]
+        answer: mutable i64
+        count: mutable i64
+
+    def open_spot(occupied: Layout&, count: i64, x: f64, z: f64) -> bool:
+        can Abort.Panic:
+            return false if py_hypot(x - (PLATFORM - 0.1), z) <= 1.7
+            for i in 0..<count |occupied, x, z|:
+                p: Place = occupied.places[i.usize()]
+                return false if py_hypot(x - p.x, z - p.z) <= 1.7
+            return true
+
+    def add_spot(occupied: mutable Layout&, count: i64, thing: i64, rng: mutable MT19937&) -> bool:
+        can Abort.Panic:
+            for attempt in 0..<60 |occupied, count, thing, rng|:
+                r: f64 = PLATFORM * 0.82 * sqrt(py_random(rng))
+                angle: f64 = py_uniform(rng, 0.0, DrShape::TAU)
+                x: f64 = r * cos(angle)
+                z: f64 = r * sin(angle)
+                if open_spot(occupied, count, x, z):
+                    occupied.places[count.usize()] <- Place{thing: thing, x: x, z: z}
+                    return true
+            return false
+
+    def same_layout(a: Layout&, b: Layout&) -> bool:
+        can Abort.Panic:
+            # Each slot keeps its original identity index when a thing is
+            # moved, and a replacement has an identity unique to that card.
+            for i in 0..<3 |a, b|:
+                p: Place = a.places[i.usize()]
+                q: Place = b.places[i.usize()]
+                return false if p.thing != q.thing or py_hypot(p.x - q.x, p.z - q.z) >= 0.45
+            return true
+
+    def duplicate_layout(target: Layout&, decoys: Layout[DrShape::MOST]&, count: i64, other: Layout&) -> bool:
+        can Abort.Panic:
+            return true if same_layout(target, other)
+            for i in 0..<count |decoys, other|:
+                return true if same_layout(&decoys[i.usize()], other)
+            return false
+
+    def paint_thing(form: mutable DrShape::Form&, tint: i64):
+        can Abort.Panic:
+            for i in 0..<form.path.count |form, tint|:
+                form.tints[i.usize()] <- tint
+            for i in 0..<form.face_count |form, tint|:
+                form.faces[i.usize()].tint <- tint
+
+    def scene_form(family: i64, tint: i64, rng: mutable MT19937&) -> DrShape::Form:
+        can Abort.Panic:
+            params: DrShape::Params = DrShape::draw_params(family, rng)
+            form: mutable DrShape::Form = DrShape::build(family, &params)
+            paint_thing(&form, tint)
+            return form
+
+    def shift_look(look: f64, maximum: f64, rng: mutable MT19937&) -> f64:
+        can Abort.Panic:
+            direction: f64 = -1.0 if py_choice_index(rng, 2) == 0 else 1.0
+            return look + direction * py_uniform(rng, 0.9, maximum)
+
+    def move_spot(layout: mutable Layout&, index: i64, rng: mutable MT19937&) -> bool:
+        can Abort.Panic:
+            occupied: mutable Layout = zeroed
+            occupied.places[0] <- layout.places[((index + 1) % 3).usize()]
+            occupied.places[1] <- layout.places[((index + 2) % 3).usize()]
+            return false if not add_spot(&occupied, 2, index, rng)
+            layout.places[index.usize()] <- occupied.places[2]
+            return true
+
+    def build_platform(level: DrShape::Grade&, mode: i64, rng: mutable MT19937&) -> Platform:
+        can Memory.Allocate, Abort.Panic:
+            out: mutable Platform = zeroed
+            families: mutable i64[6] = zeroed
+            family_count: mutable i64 = 0
+            for i in 0..<level.family_count |level, families, family_count|:
+                f: i64 = level.families[i.usize()]
+                if f >= DrShape::SPACE and f != DrShape::BRANCH:
+                    families[family_count.usize()] <- f
+                    family_count <- family_count + 1
+            return out if family_count == 0
+            selected: darray[i64] = py_sample_range(rng, 0, family_count - 1, 3)
+            picked: mutable i64[3] = zeroed
+            for i in 0..<3 |selected, family_count, rng, picked|:
+                picked[i.usize()] <- (get selected[i.usize()] else 0) if family_count >= 3 else py_choice_index(rng, family_count)
+            for i in 0..<3 |out, picked, families, rng|:
+                form: DrShape::Form = scene_form(families[picked[i.usize()].usize()], i, rng)
+                return out if form.path.count < 3
+                out.things[i.usize()] <- Thing{form: form, turn: DrShape::random_turn(rng)}
+            out.thing_count <- 3
+            for i in 0..<3 |out, rng|:
+                return out if not add_spot(&out.target, i, i, rng)
+            out.look <- py_uniform(rng, 0.0, DrShape::TAU)
+            decoys: mutable Layout[DrShape::MOST] = zeroed
+            count: mutable i64 = 0
+            for attempt in 0..<100 |out, decoys, count, level, families, family_count, rng|:
+                break if count == level.candidates - 1
+                roll: f64 = py_random(rng)
+                other: mutable Layout = out.target
+                if roll < 0.3:
+                    pair: darray[i64] = py_sample_range(rng, 0, 2, 2)
+                    a: usize = (get pair[0] else 0).usize()
+                    b: usize = (get pair[1] else 0).usize()
+                    p: Place = other.places[a]
+                    q: Place = other.places[b]
+                    other.places[a] <- Place{thing: p.thing, x: q.x, z: q.z}
+                    other.places[b] <- Place{thing: q.thing, x: p.x, z: p.z}
+                elif roll < 0.55:
+                    index: i64 = py_choice_index(rng, 3)
+                    continue if not move_spot(&other, index, rng)
+                elif roll < 0.75:
+                    for i in 0..<3 |other|:
+                        p: Place = other.places[i.usize()]
+                        other.places[i.usize()] <- Place{thing: p.thing, x: p.x, z: -p.z}
+                else:
+                    index: usize = py_choice_index(rng, 3).usize()
+                    family: i64 = families[py_choice_index(rng, family_count).usize()]
+                    form: DrShape::Form = scene_form(family, index.i64(), rng)
+                    continue if form.path.count < 3 or not DrShape::distinct(&out.things[index].form, &form, 0.2)
+                    out.things[out.thing_count.usize()] <- Thing{form: form, turn: DrShape::random_turn(rng)}
+                    p: Place = other.places[index]
+                    other.places[index] <- Place{thing: out.thing_count, x: p.x, z: p.z}
+                    out.thing_count <- out.thing_count + 1
+                continue if duplicate_layout(&out.target, &decoys, count, &other)
+                decoys[count.usize()] <- other
+                count <- count + 1
+            return out if count < level.candidates - 1
+            out.answer <- py_choice_index(rng, level.candidates)
+            away: f64 = shift_look(out.look, 2.4, rng)
+            for i in 0..<level.candidates |out, away, mode, decoys, level, rng|:
+                look: f64 = out.look if mode == DrShape::HEAR_SCENE else (shift_look(out.look, 2.6, rng) if level.each_side else away)
+                layout: Layout = out.target if i == out.answer else decoys[(i if i < out.answer else i - 1).usize()]
+                out.cards[i.usize()] <- PlatformCard{layout: layout, look: look}
+            out.count <- level.candidates
+            return out
+
+    struct Eye:
+        origin: RoomsView::Vec
+        view: DrShape::Matrix
+
+    def eye(look: f64) -> Eye:
+        can Abort.Panic:
+            origin: RoomsView::Vec = RoomsView::vec(ORBIT * cos(ORBIT_RISE) * sin(look),
+                ORBIT * sin(ORBIT_RISE), -ORBIT * cos(ORBIT_RISE) * cos(look))
+            forward: RoomsView::Vec = RoomsView::mul(origin, -1.0 / ORBIT)
+            across: RoomsView::Vec = RoomsView::cross(RoomsView::vec(0.0, 1.0, 0.0), forward)
+            right: RoomsView::Vec = RoomsView::mul(across, 1.0 / sqrt(RoomsView::dot(across, across)))
+            return Eye{origin: origin, view: DrShape::Matrix{x: right, y: RoomsView::cross(forward, right), z: forward}}
+
+    def seen_from(camera: Eye, p: RoomsView::Vec) -> RoomsView::Vec:
+        return DrShape::apply(camera.view, RoomsView::sub(p, camera.origin))
+
+    def ground_lift(thing: Thing&) -> f64:
+        can Abort.Panic:
+            low: mutable f64 = 1.7976931348623157e308
+            for i in 0..<thing.form.path.count |thing, low|:
+                stroke: DrShape::Segment = thing.form.path.segments[i.usize()]
+                a: f64 = DrShape::apply(thing.turn, stroke.a).y * OBJECT
+                b: f64 = DrShape::apply(thing.turn, stroke.b).y * OBJECT
+                low <- a if a < low
+                low <- b if b < low
+            return -low

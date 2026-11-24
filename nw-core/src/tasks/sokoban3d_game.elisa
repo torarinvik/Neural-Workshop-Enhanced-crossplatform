@@ -41,17 +41,34 @@ module Sokoban3DGame:
     const INFO_SOLVED_COUNT: i64 = 15
     const INFO_LOST_COUNT: i64 = 16
     const INFO_HAS_LEVEL: i64 = 17
+    const INFO_SHOW_MARKS: i64 = 18
+    const INFO_SHOW_TRAPS: i64 = 19
+    const INFO_ADAPTIVE: i64 = 20
+    const INFO_TOTAL_STEPS: i64 = 21
+    const INFO_TOTAL_PAR: i64 = 22
+    const INFO_BEST_RUNG: i64 = 23
+    const INFO_TAKEN_SECONDS: i64 = 24
 
     const CELL_WALL: i64 = 0
     const CELL_GOAL: i64 = 1
     const CELL_TRAP: i64 = 2
     const CELL_BOX: i64 = 3
 
+    const MESSAGE_GRADE: i64 = 0
+    const MESSAGE_RESTART: i64 = 1
+    const MESSAGE_WALL: i64 = 2
+    const MESSAGE_BOX: i64 = 3
+
     const HISTORY_CAPACITY: i64 = 4096
     const COLUMNS: i64 = 180
 
     struct Run:
         flat: mutable SokobanGame::SokobanRun
+        show_marks: mutable bool
+        step_minimum: mutable i64
+        total_steps: mutable i64
+        message_kind: mutable i64
+        trial_lost: mutable bool
         facing: mutable i64
         start_facing: mutable i64
         history_count: mutable i64
@@ -66,10 +83,25 @@ module Sokoban3DGame:
             run.history_count <- 0
 
     def initialize(run: mutable Run&, start_rung: i64, total_trials: i64,
-                   adaptive: bool, show_traps: bool, seed: i64):
+                   adaptive: bool, show_traps: bool, seed: i64, show_marks: bool = true):
         can Memory.Allocate, Abort.Panic:
             SokobanGame::initialize(&run.flat, start_rung, total_trials,
                                     adaptive, show_traps, seed)
+            reset_options(run, show_marks)
+
+    def configure(run: mutable Run&, start_rung: i64, total_trials: i64,
+                  adaptive: bool, show_traps: bool, show_marks: bool):
+        can Abort.Panic:
+            SokobanGame::configure(&run.flat, start_rung, total_trials, adaptive, show_traps)
+            reset_options(run, show_marks)
+
+    def reset_options(run: mutable Run&, show_marks: bool):
+        can Abort.Panic:
+            run.show_marks <- show_marks
+            run.step_minimum <- -1
+            run.total_steps <- 0
+            run.message_kind <- MESSAGE_GRADE
+            run.trial_lost <- false
             run.facing <- 0
             run.start_facing <- 0
             clear_history(run)
@@ -104,27 +136,39 @@ module Sokoban3DGame:
 
     def next_trial(run: mutable Run&, now_ms: i64):
         can Memory.Allocate, Abort.Panic:
+            if run.flat.trial >= run.flat.total_trials:
+                run.flat.phase <- PHASE_DONE
+                return
             SokobanGame::next_trial(&run.flat, now_ms)
-            if run.flat.has_level:
-                orient(run)
+            prepare_trial(run)
             clear_history(run)
 
-    def orient(run: mutable Run&):
+    def prepare_trial(run: mutable Run&):
         can Memory.Allocate, Abort.Panic:
+            run.message_kind <- MESSAGE_GRADE
+            run.trial_lost <- false
+            run.step_minimum <- -1
             if run.flat.has_level:
-                region pose(1048576):
+                region pose(67108864):
                     in pose:
                         boxes: mutable darray[i64] = Ints::zeros(Sokoban::MOST_CELLS)
                         copy_boxes(run, &boxes)
                         level: mutable Sokoban::Level = level_for(run, &boxes)
                         run.facing <- Sokoban3D::facing_at(&level)
                         run.start_facing <- run.facing
+                        work: mutable Sokoban::SokobanWork = Sokoban::work_new()
+                        search: mutable Sokoban3D::Search = Sokoban3D::new_search()
+                        solution: Sokoban3D::Solution = Sokoban3D::solve_bounded(
+                            &search, &work, &level, Sokoban3D::STEP_BUDGET, &level.boxes_in, run.flat.player, run.facing)
+                        run.step_minimum <- solution.steps if solution.found else -1
+                        run.flat.par <- solution.steps if solution.found else solution.bound
                     destroy pose
 
     def start_run(run: mutable Run&, now_ms: i64):
         can Memory.Allocate, Abort.Panic:
             SokobanGame::start_run(&run.flat, now_ms)
-            orient(run)
+            run.total_steps <- 0
+            prepare_trial(run)
             clear_history(run)
 
     def restart(run: mutable Run&):
@@ -132,8 +176,7 @@ module Sokoban3DGame:
             SokobanGame::reset_level(&run.flat)
             run.facing <- run.start_facing
             clear_history(run)
-            run.flat.phase <- PHASE_PUSHING
-            run.flat.verdict <- -1
+            run.message_kind <- MESSAGE_RESTART
 
     def solved(run: Run&) -> bool:
         can Abort.Panic:
@@ -181,6 +224,7 @@ module Sokoban3DGame:
                     return 1
                 return 2
             if action == ACTION_RESTART:
+                return 2 if run.flat.phase != PHASE_PUSHING
                 restart(run)
                 return 1
             if action == ACTION_UNDO:
@@ -202,7 +246,11 @@ module Sokoban3DGame:
                     doing: i64 = action - ACTION_AHEAD
                     moved: Sokoban3D::Step = Sokoban3D::after(&level, &boxes,
                                                               old_player, old_facing, doing)
-                    return 2 if not moved.moved and not moved.pushed and moved.facing == old_facing
+                    if not moved.moved and moved.facing == old_facing:
+                        direction: i64 = old_facing if doing == YouAreHere::AHEAD else (old_facing + 2) % 4
+                        blocked: i64 = Sokoban3D::step_to(&level, old_player, direction)
+                        run.message_kind <- MESSAGE_BOX if blocked >= 0 else MESSAGE_WALL
+                        return 2
                     remember(run, old_player, old_facing, moved.pushed,
                              moved.from_cell, moved.to_cell)
                     run.flat.player <- moved.cell
@@ -213,11 +261,28 @@ module Sokoban3DGame:
                         run.flat.boxes[moved.to_cell.usize()] <- 1
                         run.flat.pushes <- run.flat.pushes + 1
                     if solved(run):
-                        SokobanGame::settle_solved(&run.flat, now_ms)
+                        settle_solved(run, now_ms)
                     elif moved.pushed and SokobanGame::is_deadlocked(&run.flat):
+                        run.trial_lost <- true
                         SokobanGame::settle_lost(&run.flat)
                 destroy motion
             return 1
+
+    def settle_solved(run: mutable Run&, now_ms: i64):
+        can Abort.Panic:
+            run.flat.solved_count <- run.flat.solved_count + 1
+            run.flat.total_par <- run.flat.total_par + run.flat.par
+            run.total_steps <- run.total_steps + run.flat.moves
+            run.flat.best_rung <- run.flat.rung if run.flat.rung > run.flat.best_rung
+            elapsed: i64 = now_ms - run.flat.started_at_ms
+            run.flat.took_seconds <- elapsed / 1000 if elapsed > 0 else 0
+            run.flat.phase <- PHASE_SOLVED
+            run.flat.verdict <- 1 if run.flat.moves <= run.flat.par else 0
+            if run.flat.adaptive:
+                if run.flat.moves.f64() <= run.flat.par.f64() * 1.4:
+                    run.flat.rung <- SokobanGame::clamp_rung(run.flat.rung + 1)
+                elif run.flat.moves > run.flat.par * 2:
+                    run.flat.rung <- SokobanGame::clamp_rung(run.flat.rung - 1)
 
     def info(run: Run&, field: i64) -> i64:
         can Abort.Panic:
@@ -233,11 +298,18 @@ module Sokoban3DGame:
             return run.flat.width if field == INFO_WIDTH
             return run.flat.height if field == INFO_HEIGHT
             return run.flat.par if field == INFO_PAR
-            return run.flat.minimum if field == INFO_MINIMUM
-            return run.flat.at_least if field == INFO_AT_LEAST
-            return run.flat.bound if field == INFO_BOUND
+            return run.step_minimum if field == INFO_MINIMUM
+            return run.flat.par if field == INFO_AT_LEAST
+            return run.flat.par if field == INFO_BOUND
             return run.flat.solved_count if field == INFO_SOLVED_COUNT
             return run.flat.lost_count if field == INFO_LOST_COUNT
+            return (1 if run.show_marks else 0) if field == INFO_SHOW_MARKS
+            return (1 if run.flat.show_traps else 0) if field == INFO_SHOW_TRAPS
+            return (1 if run.flat.adaptive else 0) if field == INFO_ADAPTIVE
+            return run.total_steps if field == INFO_TOTAL_STEPS
+            return run.flat.total_par if field == INFO_TOTAL_PAR
+            return run.flat.best_rung if field == INFO_BEST_RUNG
+            return run.flat.took_seconds if field == INFO_TAKEN_SECONDS
             return 1 if run.flat.has_level and field == INFO_HAS_LEVEL else 0
 
     def value(run: Run&, field: i64, at: i64) -> i64:
@@ -254,11 +326,62 @@ module Sokoban3DGame:
             SokobanGame::dispose(&run.flat)
             clear_history(run)
 
+    def append_verdict(run: Run&, text: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if run.flat.verdict < 0:
+                return
+            if run.trial_lost:
+                dstr_append_cstr(text, "Stuck — that box can never reach a goal now")
+                return
+            if run.step_minimum >= 0 and run.flat.moves <= run.flat.par:
+                dstr_append_cstr(text, "Done — the minimum ")
+                dstr_append_i64(text, run.flat.par)
+                dstr_append_cstr(text, " steps, ")
+                dstr_append_i64(text, run.flat.took_seconds)
+                dstr_append_cstr(text, "s")
+            else:
+                dstr_append_cstr(text, "Done in ")
+                dstr_append_i64(text, run.flat.moves)
+                dstr_append_cstr(text, " steps — ")
+                dstr_append_cstr(text, "the minimum was " if run.step_minimum >= 0 else "provably at least ")
+                dstr_append_i64(text, run.flat.par)
+
+    def append_status(run: Run&, text: mutable dstr&, verdict: sview):
+        can Memory.Allocate, Abort.Panic:
+            if run.flat.phase == PHASE_READY:
+                dstr_append_cstr(text, "Press Space to start")
+            elif run.flat.phase == PHASE_UNAVAILABLE:
+                dstr_append_cstr(text, "Warehouse unavailable")
+            elif run.flat.phase == PHASE_DONE:
+                efficiency: i64 = py_round_half_even(100.0 * run.flat.total_par.f64() / run.total_steps.f64()) if run.total_steps > 0 else 0
+                dstr_append_i64(text, run.flat.solved_count)
+                dstr_append_cstr(text, " warehouses, ")
+                dstr_append_i64(text, efficiency)
+                dstr_append_cstr(text, "% step efficiency, highest rung ")
+                dstr_append_i64(text, run.flat.best_rung)
+            elif run.flat.phase == PHASE_SOLVED or run.flat.phase == PHASE_LOST:
+                dstr_append_sview(text, verdict)
+            elif run.message_kind == MESSAGE_RESTART:
+                dstr_append_cstr(text, "Back at the door, facing the way you came in")
+            elif run.message_kind == MESSAGE_WALL:
+                dstr_append_cstr(text, "A wall")
+            elif run.message_kind == MESSAGE_BOX:
+                dstr_append_cstr(text, "That box will not go that way")
+            else:
+                dstr_append_sview(text, SokobanGame::grade_name(run.flat.rung))
+                dstr_append_cstr(text, " — minimum " if run.step_minimum >= 0 else " — provably at least ")
+                dstr_append_i64(text, run.flat.par)
+                dstr_append_cstr(text, " steps")
+
     def render(run: Run&, black_background: bool, width: f64, height: f64,
                list: mutable Display::DisplayList&):
         can Memory.Allocate, Abort.Panic:
             region frame(2097152):
                 in frame:
+                    verdict: mutable dstr = []
+                    append_verdict(run, &verdict)
+                    status: mutable dstr = []
+                    append_status(run, &status, bytes_view(verdict))
                     if not run.flat.has_level:
                         empty_bool: mutable darray[bool] = []
                         empty_i64: mutable darray[i64] = []
@@ -270,8 +393,8 @@ module Sokoban3DGame:
                                                &empty_bool, &empty_i64, 0, &empty_bool,
                                                false, false, &empty_sights, &empty_marks,
                                                0, 0, run.flat.trial, run.flat.total_trials,
-                                               sview("Push the boxes home", 0, -1),
-                                               run.flat.verdict, sview("", 0, -1))
+                                               bytes_view(status),
+                                               run.flat.verdict, bytes_view(verdict))
                         return
                     boxes: mutable darray[i64] = Ints::zeros(Sokoban::MOST_CELLS)
                     copy_boxes(run, &boxes)
@@ -311,10 +434,10 @@ module Sokoban3DGame:
                                            run.flat.has_level, run.flat.width,
                                            run.flat.height, &walls, &goals, &traps,
                                            &plan_boxes, run.flat.start_player,
-                                           &live, run.flat.show_traps, true,
+                                           &live, run.flat.show_traps, run.show_marks,
                                            &sights, &scene_marks, run.flat.moves,
                                            run.flat.pushes, run.flat.trial,
                                            run.flat.total_trials,
-                                           sview("Push the boxes home", 0, -1),
-                                           run.flat.verdict, sview("", 0, -1))
+                                           bytes_view(status),
+                                           run.flat.verdict, bytes_view(verdict))
                 destroy frame

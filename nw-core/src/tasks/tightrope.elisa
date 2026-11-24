@@ -1,0 +1,327 @@
+include "../hand_view.elisa"
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+module Tightrope:
+    const STEP: i64 = HandView::KEYS
+    const PORTS: i64 = STEP + 1
+    const REACH: f64 = 480.0
+    const REACH_F: f64 = 200.0
+    const LEVEL: f64 = 250.0
+    const FWD_PX: f64 = 60.0
+    const PERCH: f64 = 0.6
+    const PULL: f64 = 5.0
+    const PULL_F: f64 = 4.0
+    const LAG: f64 = 0.18
+
+    const TICK: i64 = 0
+    const WIND: i64 = 1
+    const BIRD: i64 = 2
+    const DONE: i64 = 3
+    const CREAK: i64 = 4
+    const FELL: i64 = 5
+
+    const LIVE: i64 = 0
+    const ACROSS: i64 = 1
+    const SIDEWAYS: i64 = 2
+    const FORWARD: i64 = 3
+    const BACKWARD: i64 = 4
+    const TIMEOUT: i64 = 5
+
+    struct Grade:
+        rung: i64
+        steps: i64
+        jolt: f64
+        tip: f64
+        sway: f64
+        gusts: i64
+        blow: f64
+        birds: i64
+        breeze: f64
+        spring: f64
+        bounce: f64
+        tip_p: f64
+        jolt_p: f64
+        seconds: f64
+
+    struct Gust:
+        t: f64
+        dur: f64
+        push: f64
+
+    struct Bird:
+        t: f64
+        side: i64
+
+    struct Walk:
+        level: Grade
+        gusts: Gust[9]
+        birds: Bird[8]
+        seed: i64
+        valid: bool
+
+    struct Run:
+        walk: Walk
+        hand: mutable HandView::Pointer
+        lean: mutable f64
+        rate: mutable f64
+        taken: mutable i64
+        foot: mutable i64
+        rest: mutable f64
+        perched: mutable i64[2]
+        perches: mutable i64
+        bird_no: mutable i64
+        warned: mutable bool[9]
+        creak_at: mutable f64
+        held: mutable f64
+        held_f: mutable f64
+        pitch: mutable f64
+        prate: mutable f64
+        swing: mutable f64
+        swing_v: mutable f64
+        boing: mutable f64
+        boing_v: mutable f64
+        breeze_phase: f64[2]
+        time: mutable f64
+        result: mutable i64
+        audible: bool
+        notes: mutable darray[DrShapeDeal::Note]
+
+    def grow(rung: i64, start: i64, first: f64, per: f64, cap: f64) -> f64:
+        return 0.0 if rung < start else fmin(cap, first + per * (rung - start).f64())
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        k: i64 = r - 1
+        steps: i64 = 40 if k >= 53 else 5 + 2 * k / 3
+        gusts: i64 = 0 if r < 7 else (9 if r >= 31 else 1 + (r - 7) / 3)
+        birds: i64 = 0 if r < 10 else (8 if r >= 38 else 1 + (r - 10) / 4)
+        return Grade{rung: r, steps: steps, jolt: fmin(0.7, 0.12 + 0.025 * k.f64()),
+            tip: fmin(4.6, 1.5 + 0.11 * k.f64()), sway: grow(r, 4, 0.12, 0.02, 0.5),
+            gusts: gusts, blow: grow(r, 7, 0.7, 0.05, 1.7), birds: birds, breeze: grow(r, 13, 0.3, 0.03, 1.0),
+            spring: grow(r, 16, 0.5, 0.04, 1.3), bounce: grow(r, 20, 0.5, 0.03, 1.1),
+            tip_p: fmin(3.2, 0.8 + 0.09 * k.f64()), jolt_p: fmin(0.45, 0.06 + 0.018 * k.f64()),
+            seconds: steps.f64() * fmax(1.2, 3.6 - 0.08 * k.f64()) + 8.0}
+
+    def uniform(draw: mutable MT19937&, low: f64, high: f64) -> f64:
+        return low + (high - low) * py_random(draw)
+
+    def build(level: Grade, draw: mutable MT19937&) -> Walk:
+        can Abort.Panic:
+            span: f64 = level.seconds - 6.0
+            gusts: mutable Gust[9] = zeroed
+            birds: mutable Bird[8] = zeroed
+            for i in 0..<level.gusts |level, span, draw, gusts|:
+                at: f64 = uniform(draw, 2.5, span)
+                duration: f64 = uniform(draw, 0.8, 1.6)
+                push: f64 = -level.blow if py_randbelow(draw, 2.u64()) == 0.u64() else level.blow
+                slot: mutable i64 = i
+                while slot > 0 |slot, at, duration, push, gusts|:
+                    prev: Gust = gusts[(slot - 1).usize()]
+                    break if prev.t < at or (prev.t == at and (prev.dur < duration or (prev.dur == duration and prev.push <= push)))
+                    gusts[slot.usize()] <- prev
+                    slot <- slot - 1
+                gusts[slot.usize()] <- Gust{t: at, dur: duration, push: push}
+            for i in 0..<level.birds |level, span, draw, birds|:
+                at: f64 = uniform(draw, 2.0, span)
+                side: i64 = -1 if py_randbelow(draw, 2.u64()) == 0.u64() else 1
+                slot: mutable i64 = i
+                while slot > 0 |slot, at, side, birds|:
+                    prev: Bird = birds[(slot - 1).usize()]
+                    break if prev.t < at or (prev.t == at and prev.side <= side)
+                    birds[slot.usize()] <- prev
+                    slot <- slot - 1
+                birds[slot.usize()] <- Bird{t: at, side: side}
+            return Walk{level: level, gusts: gusts, birds: birds, seed: py_randbelow(draw, 1073741824.u64()).i64(), valid: true}
+
+    def begin(walk: Walk, audible: bool = true) -> Run:
+        draw: mutable MT19937 = zeroed
+        mt_seed_int(&draw, walk.seed.u64())
+        a: f64 = uniform(&draw, 0.0, 6.3)
+        b: f64 = uniform(&draw, 0.0, 6.3)
+        return Run{walk: walk, hand: HandView::initialize(), lean: 0.0, rate: 0.0, taken: 0, foot: 1,
+            rest: 0.0, perched: zeroed, perches: 0, bird_no: 0, warned: zeroed, creak_at: 0.0,
+            held: 0.0, held_f: 0.0, pitch: 0.0, prate: 0.0, swing: 0.0, swing_v: 0.0, boing: 0.0,
+            boing_v: 0.0, breeze_phase: [a, b], time: 0.0, result: LIVE, audible: audible, notes: []}
+
+    def aim(run: Run&) -> f64:
+        return HandView::clamp((run.hand.x - 500.0) / REACH, -1.0, 1.0)
+
+    def aim_f(run: Run&) -> f64:
+        return HandView::clamp((run.hand.y - LEVEL) / REACH_F, -1.0, 1.0)
+
+    def gust(run: Run&) -> f64:
+        can Abort.Panic:
+            for i in 0..<run.walk.level.gusts |run|:
+                g: Gust = run.walk.gusts[i.usize()]
+                return g.push if g.t <= run.time and run.time < g.t + g.dur
+            return 0.0
+
+    def breeze(run: Run&) -> f64:
+        can Abort.Panic:
+            return run.walk.level.breeze * (0.7 * sin(0.45 * run.time + run.breeze_phase[0]) + 0.5 * sin(1.1 * run.time + run.breeze_phase[1]))
+
+    def wind(run: Run&) -> f64:
+        can Abort.Panic:
+            return gust(run) + breeze(run)
+
+    def outside_f(run: Run&) -> f64:
+        can Abort.Panic:
+            return 0.4 * breeze(run) + 0.5 * run.boing_v * run.walk.level.bounce
+
+    def swing_push(run: Run&) -> f64:
+        return -9.0 * run.swing - 0.8 * run.swing_v - 2.0 * run.walk.level.spring * sin(run.lean)
+
+    def tip(run: Run&) -> f64:
+        return run.walk.level.tip * (1.0 + 2.0 * fabs(run.boing))
+
+    def outside(run: Run&) -> f64:
+        can Abort.Panic:
+            load: mutable i64 = 0
+            for i in 0..<run.perches |run, load|:
+                load <- load + run.perched[i.usize()]
+            return wind(run) + run.walk.level.sway * sin(run.time * 1.7) + 1.2 * load.f64() - 0.25 * swing_push(run)
+
+    def bird_spot(run: Run&, side: i64) -> RoomsView::Vec:
+        x: f64 = 500.0 + REACH * (run.held * 0.35 + side.f64() * PERCH)
+        return RoomsView::vec(x, LEVEL + FWD_PX * run.held_f - (x - 500.0) * tan(run.lean) * 0.5, 1.0)
+
+    def note(run: mutable Run&, duration: f64, pitch: f64, voice: i64, gain: f64, pan: f64 = 0.0):
+        can Abort.Panic, Memory.Allocate:
+            return if not run.audible
+            run.notes.push(DrShapeDeal::Note{t: run.time, dur: duration, freq: pitch, voice: voice, gain: gain,
+                gain2: gain, pan: pan, pan2: pan, bright: 0.8, seed: 1 + run.notes.count.i64(), who: -1, room: 0.0})
+
+    def press(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE or run.hand.down
+            run.hand.down <- true
+            for i in 0..<run.perches |run|:
+                side: i64 = run.perched[i.usize()]
+                q: RoomsView::Vec = bird_spot(run, side)
+                if py_hypot(run.hand.x - q.x, run.hand.y - q.y) <= 34.0:
+                    run.perched[0] <- run.perched[1] if i == 0 and run.perches == 2
+                    run.perches <- run.perches - 1
+                    note(run, 0.2, 1400.0, BIRD, 0.4, side.f64() * 0.7)
+                    return
+
+    def footstep(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE or run.time < run.rest
+            level: Grade = run.walk.level
+            run.rest <- run.time + 0.35
+            run.taken <- run.taken + 1
+            run.foot <- -run.foot
+            slip: f64 = 3.0 if fabs(run.lean) > 0.3 else 1.0
+            run.rate <- run.rate + run.foot.f64() * level.jolt * slip
+            run.swing_v <- run.swing_v + run.foot.f64() * 0.3 * level.spring
+            run.boing_v <- run.boing_v - level.bounce
+            run.prate <- run.prate + level.jolt_p * (3.0 if fabs(run.pitch) > 0.25 else 1.0)
+            note(run, 0.06, 240.0, TICK, 0.4)
+            if run.taken >= level.steps:
+                note(run, 0.4, 880.0, DONE, 0.5)
+                run.result <- ACROSS
+
+    def act(run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate:
+            if port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::RELEASE:
+                run.hand.down <- false
+            elif port == HandView::PRESS:
+                press(run)
+            elif port == STEP:
+                footstep(run)
+
+    def weather(run: mutable Run&, level: Grade):
+        can Abort.Panic, Memory.Allocate:
+            for i in 0..<level.gusts |run|:
+                g: Gust = run.walk.gusts[i.usize()]
+                if not run.warned[i.usize()] and run.time >= g.t - 1.0:
+                    run.warned[i.usize()] <- true
+                    note(run, 1.0 + g.dur, 200.0, WIND, 0.35, -0.8 if g.push > 0.0 else 0.8)
+            while run.bird_no < level.birds and run.walk.birds[run.bird_no.usize()].t <= run.time |run, level|:
+                side: i64 = run.walk.birds[run.bird_no.usize()].side
+                run.bird_no <- run.bird_no + 1
+                continue if run.perches == 2 or (run.perches == 1 and run.perched[0] == side)
+                run.perched[run.perches.usize()] <- side
+                run.perches <- run.perches + 1
+                note(run, 0.25, 1800.0, BIRD, 0.4, side.f64() * 0.7)
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            level: Grade = run.walk.level
+            run.time <- run.time + dt
+            weather(run, level)
+            follow: f64 = fmin(1.0, dt / LAG)
+            run.held <- run.held + (aim(run) - run.held) * follow
+            acc: f64 = swing_push(run)
+            push: f64 = tip(run) * sin(run.lean) - PULL * run.held + outside(run)
+            run.swing_v <- run.swing_v + acc * dt
+            run.swing <- run.swing + run.swing_v * dt
+            run.boing_v <- run.boing_v + (-30.0 * run.boing - 1.2 * run.boing_v) * dt
+            run.boing <- run.boing + run.boing_v * dt
+            run.rate <- run.rate + (push - 0.6 * run.rate) * dt
+            run.lean <- run.lean + run.rate * dt
+            run.held_f <- run.held_f + (aim_f(run) - run.held_f) * follow
+            push_f: f64 = level.tip_p * sin(run.pitch) - PULL_F * run.held_f + outside_f(run)
+            run.prate <- run.prate + (push_f - 0.6 * run.prate) * dt
+            run.pitch <- run.pitch + run.prate * dt
+            if fabs(run.pitch) > 0.3 and run.time >= run.creak_at:
+                run.creak_at <- run.time + 0.4
+                note(run, 0.2, 420.0 if run.pitch > 0.0 else 220.0, CREAK, 0.3)
+            if fabs(run.lean) > 0.35 and run.time >= run.creak_at:
+                run.creak_at <- run.time + 0.4
+                note(run, 0.2, 300.0, CREAK, 0.3, 0.6 if run.lean > 0.0 else -0.6)
+            if fabs(run.lean) >= 0.7 or fabs(run.pitch) >= 0.6:
+                note(run, 0.6, 70.0, FELL, 0.6)
+                run.result <- SIDEWAYS if fabs(run.lean) >= 0.7 else (FORWARD if run.pitch > 0.0 else BACKWARD)
+            elif run.time >= level.seconds:
+                run.result <- TIMEOUT
+
+    def led(want: f64, held: f64) -> f64:
+        return HandView::clamp(held + 2.5 * (HandView::clamp(want, -1.0, 1.0) - held), -1.0, 1.0)
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            return HandView::RELEASE if run.hand.down
+            steady: bool = fabs(run.lean) < 0.08 and fabs(run.rate) < 0.25 and fabs(run.pitch) < 0.08 and fabs(run.prate) < 0.25
+            want: f64 = (tip(run) * sin(run.lean) + outside(run) + 9.0 * run.lean + 5.0 * run.rate) / PULL
+            want_f: f64 = (run.walk.level.tip_p * sin(run.pitch) + outside_f(run) + 7.0 * run.pitch + 4.0 * run.prate) / PULL_F
+            x: f64 = 500.0 + REACH * led(want, run.held)
+            y: f64 = LEVEL + REACH_F * led(want_f, run.held_f)
+            calm: bool = fabs(run.lean) < 0.2 and fabs(run.rate) < 0.5 and fabs(run.pitch) < 0.15 and fabs(run.prate) < 0.4
+            if run.perches > 0 and calm:
+                q: RoomsView::Vec = bird_spot(run, run.perched[0])
+                if fabs(run.hand.y - q.y) > 20.0:
+                    return HandView::toward(&run.hand, run.hand.x, q.y, 15.0)
+                return HandView::PRESS if fabs(run.hand.x - q.x) <= 28.0
+                return 9 if q.x > run.hand.x else 6
+            ex: f64 = fabs(run.hand.x - x) / REACH
+            ey: f64 = fabs(run.hand.y - y) / REACH_F
+            if fmax(ex, ey) > 0.03:
+                return HandView::toward(&run.hand, x, run.hand.y, 6.0) if ex >= ey
+                return HandView::toward(&run.hand, run.hand.x, y, 6.0)
+            return STEP if steady and run.time >= run.rest
+            return -1
+
+    def reference_wins(walk: Walk) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = begin(walk, false)
+            while run.result == LIVE |run|:
+                act(&run, pilot(&run))
+                step(&run, 1.0 / 60.0)
+            return run.result == ACROSS
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Walk:
+        can Abort.Panic, Memory.Allocate:
+            level: Grade = grade(rung)
+            for _ in 0..<80 |level, draw|:
+                rng: mutable MT19937 = zeroed
+                mt_seed_int(&rng, py_getrandbits(draw, 32))
+                walk: Walk = build(level, &rng)
+                return walk if reference_wins(walk)
+            return Walk{level: level, gusts: zeroed, birds: zeroed, seed: 0, valid: false}

@@ -1,0 +1,350 @@
+include "../hand_view.elisa"
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+module AirHockey:
+    const LEFT: i64 = HandView::KEYS
+    const RIGHT: i64 = LEFT + 1
+    const PORTS: i64 = RIGHT + 1
+    const PUCK: f64 = 0.06
+    const MALLET: f64 = 0.11
+    const BAR: f64 = 0.17
+    const THEIRS: f64 = 0.34
+    const REACH: f64 = 7.0
+    const KEEP: f64 = 2.2
+    const CLACK: i64 = 0
+    const WALL: i64 = 1
+    const GOAL: i64 = 2
+    const LOST: i64 = 3
+    const HUM: i64 = 4
+    const LIVE: i64 = 0
+    const WON: i64 = 1
+    const LOST_GAME: i64 = 2
+    const TIMEOUT: i64 = 3
+
+    struct Grade:
+        rung: i64
+        need: i64
+        allow: i64
+        pace: f64
+        rival: f64
+        mouth: f64
+        swing: f64
+        flips: bool
+        seconds: f64
+
+    struct Game:
+        level: Grade
+        serve: f64
+        flips: RoomsView::Point[15]
+        flip_count: i64
+        seed: i64
+        valid: bool
+
+    struct Run:
+        game: Game
+        hand: mutable HandView::Pointer
+        mine: mutable RoomsView::Point
+        mine_v: mutable RoomsView::Point
+        theirs: mutable RoomsView::Point
+        theirs_v: mutable RoomsView::Point
+        keeper: mutable f64
+        score: mutable i64[2]
+        draw: mutable MT19937
+        wait: mutable f64
+        puck: mutable RoomsView::Point
+        velocity: mutable RoomsView::Point
+        to_me: mutable bool
+        angle: mutable f64
+        clack_at: mutable f64
+        left_until: mutable f64
+        right_until: mutable f64
+        time: mutable f64
+        result: mutable i64
+        audible: bool
+        notes: mutable darray[DrShapeDeal::Note]
+
+    struct MalletMove:
+        position: RoomsView::Point
+        velocity: RoomsView::Point
+
+    def point(x: f64, y: f64) -> RoomsView::Point:
+        return RoomsView::Point{x: x, y: y}
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: f64 = (r - 20).f64() if r > 20 else 0.0
+        need: i64 = 1 if r < 4 else (2 if r < 10 else 3)
+        return Grade{rung: r, need: need, allow: 3 if r < 10 else (2 if r < 20 else 1),
+            pace: 2.2 if r < 4 else (2.8 if r < 10 else (3.3 if r < 20 else fmin(6.0, 3.5 + 0.06 * top))),
+            rival: 0.7 if r < 7 else (1.0 if r < 13 else (1.25 if r < 20 else fmin(2.4, 1.3 + 0.03 * top))),
+            mouth: 0.34 if r < 7 else (0.42 if r < 20 else fmin(0.6, 0.44 + 0.004 * top)),
+            swing: 0.0 if r < 13 else 22.0, flips: r >= 16, seconds: 45.0 + 25.0 * need.f64()}
+
+    def uniform(draw: mutable MT19937&, low: f64, high: f64) -> f64:
+        return low + (high - low) * mt_random_res53(draw)
+
+    def build(level: Grade, draw: mutable MT19937&) -> Game:
+        can Abort.Panic:
+            flips: mutable RoomsView::Point[15] = zeroed
+            count: mutable i64 = 0
+            time: mutable f64 = 0.0
+            while level.flips and time < level.seconds |level, draw, flips, count, time|:
+                time <- time + uniform(draw, 6.0, 10.0)
+                end: f64 = time + uniform(draw, 2.5, 4.0)
+                flips[count.usize()] <- point(time, end)
+                count <- count + 1
+                time <- end
+            serve: f64 = uniform(draw, -0.5, 0.5)
+            return Game{level: level, serve: serve, flips: flips, flip_count: count,
+                seed: py_randbelow(draw, 1073741824.u64()).i64(), valid: true}
+
+    def begin(game: Game, audible: bool = true) -> Run:
+        draw: mutable MT19937 = zeroed
+        mt_seed_int(&draw, game.seed.u64())
+        return Run{game: game, hand: HandView::initialize(), mine: point(0.0, 0.3), mine_v: zeroed,
+            theirs: point(0.0, 1.7), theirs_v: zeroed, keeper: 0.0, score: zeroed, draw: draw,
+            wait: 0.8, puck: point(0.0, 1.0), velocity: zeroed, to_me: true, angle: game.serve,
+            clack_at: 0.0, left_until: -1.0, right_until: -1.0, time: 0.0, result: LIVE, audible: audible, notes: []}
+
+    def far_end(run: Run&) -> bool:
+        can Abort.Panic:
+            for i in 0..<run.game.flip_count |run|:
+                span: RoomsView::Point = run.game.flips[i.usize()]
+                return true if span.x <= run.time and run.time < span.y
+            return false
+
+    # Keep libm sine separate from cosine. Darwin's combined sincos entry
+    # differs by an ulp for some angles, which changes later puck collisions.
+    @inline(never)
+    def sine(angle: f64) -> f64:
+        return sin(angle)
+
+    def view(run: Run&) -> HandView::Lens:
+        can Abort.Panic:
+            angle: mutable f64 = run.game.level.swing * (3.141592653589793 / 180.0) * sin(run.time * 0.5)
+            angle <- angle + 3.141592653589793 if far_end(run)
+            eye: RoomsView::Vec = RoomsView::vec(2.5 * sine(angle), 2.0, -1.0 + 2.5 * cos(angle))
+            return HandView::lens(eye, RoomsView::vec(0.0, 0.0, -1.0), 720.0, 500.0, 330.0)
+
+    def world(p: RoomsView::Point, up: f64 = 0.0) -> RoomsView::Vec:
+        return RoomsView::vec(p.x, up, -p.y)
+
+    def see(run: Run&, p: RoomsView::Point, up: f64 = 0.0) -> RoomsView::Vec:
+        can Abort.Panic:
+            camera: HandView::Lens = view(run)
+            return HandView::see(&camera, world(p, up))
+
+    def under(run: Run&) -> RoomsView::Point:
+        can Abort.Panic:
+            camera: HandView::Lens = view(run)
+            horizontal: f64 = (run.hand.x - camera.cx) / camera.focal
+            vertical: f64 = (run.hand.y - camera.cy) / camera.focal
+            ray: RoomsView::Vec = RoomsView::unit(RoomsView::vec(
+                camera.camera.forward.x + horizontal * camera.camera.right.x + vertical * camera.camera.up.x,
+                camera.camera.forward.y + horizontal * camera.camera.right.y + vertical * camera.camera.up.y,
+                camera.camera.forward.z + horizontal * camera.camera.right.z + vertical * camera.camera.up.z))
+            return run.mine if fabs(ray.y) < 0.000001
+            distance: f64 = -camera.camera.eye.y / ray.y
+            return run.mine if distance <= 0.0
+            return point(camera.camera.eye.x + ray.x * distance, -(camera.camera.eye.z + ray.z * distance))
+
+    def act(run: mutable Run&, port: i64):
+        if port < HandView::PRESS:
+            HandView::move(&run.hand, port)
+        elif port == HandView::PRESS:
+            run.hand.down <- true
+        elif port == HandView::RELEASE:
+            run.hand.down <- false
+        elif port == LEFT:
+            run.left_until <- run.time + HandView::LATCH
+        elif port == RIGHT:
+            run.right_until <- run.time + HandView::LATCH
+
+    def note(run: mutable Run&, duration: f64, frequency: f64, voice: i64, gain: f64, pan: f64 = 0.0):
+        can Abort.Panic, Memory.Allocate:
+            return if not run.audible
+            side: f64 = HandView::clamp(pan, -1.0, 1.0)
+            run.notes.push(DrShapeDeal::Note{t: run.time, dur: duration, freq: frequency, voice: voice,
+                gain: gain, gain2: gain, pan: side, pan2: side, bright: 0.8, seed: 1 + run.notes.count.i64(), who: -1, room: 0.0})
+
+    def serve(run: mutable Run&):
+        run.puck <- point(0.0, 1.0)
+        way: f64 = -1.0 if run.to_me else 1.0
+        run.velocity <- point(0.9 * sine(run.angle), 0.9 * way * cos(run.angle))
+        run.angle <- uniform(&run.draw, -0.6, 0.6)
+
+    def mallet(at: RoomsView::Point, want: RoomsView::Point, top: f64, dt: f64) -> MalletMove:
+        dx: mutable f64 = want.x - at.x
+        dy: mutable f64 = want.y - at.y
+        distance: f64 = py_hypot(dx, dy)
+        go: f64 = fmin(distance, top * dt)
+        if distance > 0.000000001:
+            dx <- dx / distance * go
+            dy <- dy / distance * go
+        return MalletMove{position: point(at.x + dx, at.y + dy), velocity: point(dx / dt, dy / dt)}
+
+    def hit(run: mutable Run&, at: RoomsView::Point, velocity: RoomsView::Point, forward: bool = false):
+        can Abort.Panic, Memory.Allocate:
+            px: f64 = run.puck.x
+            nx: mutable f64 = px - at.x
+            ny: mutable f64 = run.puck.y - at.y
+            distance: f64 = py_hypot(nx, ny)
+            return if distance >= PUCK + MALLET or distance < 0.000000001
+            nx <- nx / distance
+            ny <- ny / distance
+            rvx: f64 = run.velocity.x - velocity.x
+            rvy: f64 = run.velocity.y - velocity.y
+            along: f64 = rvx * nx + rvy * ny
+            if along < 0.0:
+                spring: f64 = 1.25 + 0.65 * fmin(1.0, py_hypot(velocity.x, velocity.y) / 1.5)
+                vx: f64 = rvx - spring * along * nx + velocity.x
+                vy: f64 = rvy - spring * along * ny + velocity.y
+                run.velocity <- point(vx, -0.6 * vy if forward and vy > 0.0 else vy)
+                if run.time >= run.clack_at:
+                    run.clack_at <- run.time + 0.08
+                    note(run, 0.05, 500.0, CLACK, 0.5, px)
+            run.puck <- point(at.x + nx * (PUCK + MALLET + 0.002), at.y + ny * (PUCK + MALLET + 0.002))
+
+    def goal(run: mutable Run&, who: i64):
+        can Abort.Panic, Memory.Allocate:
+            run.score[who.usize()] <- run.score[who.usize()] + 1
+            note(run, 0.4, 880.0 if who == 0 else 110.0, GOAL if who == 0 else LOST, 0.6)
+            run.to_me <- who == 0
+            run.wait <- 0.9
+            run.puck <- point(0.0, 1.0)
+            run.velocity <- zeroed
+            run.result <- WON if run.score[0] >= run.game.level.need
+            run.result <- LOST_GAME if run.result != WON and run.score[1] >= run.game.level.allow
+
+    def move_mallets(run: mutable Run&, dt: f64):
+        can Abort.Panic:
+            spot: RoomsView::Point = under(run)
+            want: RoomsView::Point = point(HandView::clamp(spot.x, -1.0 + MALLET, 1.0 - MALLET), HandView::clamp(spot.y, 0.14, 0.95))
+            moved: MalletMove = mallet(run.mine, want, REACH, dt)
+            run.mine <- moved.position
+            run.mine_v <- moved.velocity
+            px: f64 = run.puck.x
+            py: f64 = run.puck.y
+            target: mutable RoomsView::Point = zeroed
+            if py > run.theirs.y and py_hypot(run.velocity.x, run.velocity.y) < 0.4:
+                target <- point(px + (0.5 if run.theirs.x >= px else -0.5), 1.5)
+                run.velocity <- point(run.velocity.x, run.velocity.y - 1.2 * dt)
+            elif py > 1.05 and run.velocity.y > -0.3 and py < run.theirs.y + 0.05:
+                target <- point(px, py + 0.02)
+            else:
+                target <- point(HandView::clamp(px, -THEIRS, THEIRS), 1.72)
+            aim: RoomsView::Point = point(HandView::clamp(target.x, -1.0 + MALLET, 1.0 - MALLET), HandView::clamp(target.y, 1.08, 1.86))
+            opponent: MalletMove = mallet(run.theirs, aim, run.game.level.rival * (1.0 if target.y < 1.7 else 1.5), dt)
+            run.theirs <- opponent.position
+            run.theirs_v <- opponent.velocity
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            run.time <- run.time + dt
+            slide: f64 = ((1.0 if run.right_until >= run.time else 0.0) - (1.0 if run.left_until >= run.time else 0.0)) * KEEP * dt
+            run.keeper <- HandView::clamp(run.keeper + (-slide if far_end(run) else slide), -run.game.level.mouth, run.game.level.mouth)
+            move_mallets(run, dt)
+            if run.wait > 0.0:
+                run.wait <- run.wait - dt
+                serve(run) if run.wait <= 0.0
+                return
+            vx: mutable f64 = run.velocity.x
+            vy: mutable f64 = run.velocity.y
+            speed: f64 = py_hypot(vx, vy)
+            if speed > run.game.level.pace:
+                vx <- vx / speed * run.game.level.pace
+                vy <- vy / speed * run.game.level.pace
+            vx <- vx * (1.0 - 0.12 * dt)
+            vy <- vy * (1.0 - 0.12 * dt)
+            px: mutable f64 = run.puck.x + vx * dt
+            py: mutable f64 = run.puck.y + vy * dt
+            if fabs(px) > 1.0 - PUCK:
+                px <- -(1.0 - PUCK) if px < 0.0 else 1.0 - PUCK
+                vx <- -0.8 * vx
+                note(run, 0.04, 300.0, WALL, 0.3, px)
+            run.puck <- point(px, py)
+            run.velocity <- point(vx, vy)
+            hit(run, run.mine, run.mine_v)
+            hit(run, run.theirs, run.theirs_v, true)
+            px <- run.puck.x
+            py <- run.puck.y
+            vx <- run.velocity.x
+            vy <- run.velocity.y
+            if py < PUCK + 0.06 and vy < 0.0 and fabs(px - run.keeper) <= BAR:
+                run.velocity <- point(vx + 1.5 * (px - run.keeper), fabs(vy))
+                run.puck <- point(px, PUCK + 0.06)
+                note(run, 0.05, 420.0, CLACK, 0.45, px)
+            elif py < PUCK:
+                if fabs(px) < run.game.level.mouth:
+                    goal(run, 1)
+                    return
+                run.puck <- point(px, PUCK)
+                run.velocity <- point(vx, fabs(vy))
+            elif py > 2.0 - PUCK:
+                if fabs(px) < THEIRS:
+                    goal(run, 0)
+                    return
+                run.puck <- point(px, 2.0 - PUCK)
+                run.velocity <- point(vx, -fabs(vy))
+            if py_hypot(run.velocity.x, run.velocity.y) < 0.12 and py > 0.9 and py < 1.1:
+                run.velocity <- point(run.velocity.x, run.velocity.y - 0.3)
+            run.result <- TIMEOUT if run.time >= run.game.level.seconds
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            px: f64 = run.puck.x
+            py: f64 = run.puck.y
+            vx: f64 = run.velocity.x
+            vy: f64 = run.velocity.y
+            if vy < -0.2 and py < 1.2:
+                time: f64 = (py - PUCK - 0.06) / -vy
+                x: mutable f64 = px + vx * time
+                while fabs(x) > 1.0 - PUCK |x|:
+                    x <- (-(2.0 * (1.0 - PUCK)) if x < 0.0 else 2.0 * (1.0 - PUCK)) - x
+                if fabs(x) < run.game.level.mouth + BAR and fabs(x - run.keeper) > 0.06 and time < 0.6:
+                    right: bool = (x > run.keeper) != far_end(run)
+                    until: f64 = run.right_until if right else run.left_until
+                    return (RIGHT if right else LEFT) if until < run.time
+            want: mutable RoomsView::Point = zeroed
+            if run.wait > 0.0 or py > 1.0 + (0.25 if vy < 0.0 else 0.0):
+                want <- point(0.5 * px, 0.32)
+            else:
+                aim: f64 = -0.7 * THEIRS if run.theirs.x > 0.0 else 0.7 * THEIRS
+                dx: f64 = aim - px
+                dy: f64 = 2.0 - py
+                distance: f64 = py_hypot(dx, dy)
+                want <- point(px - dx / distance * 0.24, py - dy / distance * 0.24)
+                if run.mine.y < py - 0.08:
+                    lands: f64 = px + (px - run.mine.x) / (py - run.mine.y) * (2.0 - py)
+                    if fabs(lands) < 0.8 * THEIRS:
+                        ux: f64 = px - run.mine.x
+                        uy: f64 = py - run.mine.y
+                        u: f64 = py_hypot(ux, uy)
+                        want <- point(px + ux / u * 0.3, py + uy / u * 0.3)
+                elif run.mine.y > py - 0.02:
+                    want <- point(px + (0.3 if run.mine.x > px else -0.3), fmax(0.14, py - 0.3))
+            q: RoomsView::Vec = see(run, point(HandView::clamp(want.x, -0.9, 0.9), HandView::clamp(want.y, 0.14, 0.95)))
+            return -1 if q.z < 0.05
+            return HandView::toward(&run.hand, q.x, q.y, 4.0)
+
+    def reference_wins(game: Game) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = begin(game, false)
+            while run.result == LIVE |run|:
+                act(&run, pilot(&run))
+                step(&run, 1.0 / 60.0)
+            return run.result == WON
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Game:
+        can Abort.Panic, Memory.Allocate:
+            level: Grade = grade(rung)
+            for _ in 0..<80 |level, draw|:
+                rng: mutable MT19937 = zeroed
+                mt_seed_int(&rng, py_getrandbits(draw, 32))
+                game: Game = build(level, &rng)
+                return game if reference_wins(game)
+            return zeroed

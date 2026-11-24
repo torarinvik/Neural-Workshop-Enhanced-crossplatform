@@ -1,0 +1,270 @@
+# Separate native export unit for the SDL Camera run and OpenGL presentation.
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../scene_camera.elisa"
+include "../tasks/ints.elisa"
+include "../tasks/marblemaze.elisa"
+include "marble_geometry.elisa"
+include "marble_shader_assets.elisa"
+include "marble_gl_program.elisa"
+include "marble_gl_mesh.elisa"
+include "marble_gl_shadow.elisa"
+include "marble_gl_colour.elisa"
+include "marble_gl_composite.elisa"
+include "camera_gl.elisa"
+
+extern SDL_GetBasePath() -> u8&? can[Blocking.IO]
+extern SDL_snprintf(dest: mutable u8&, capacity: usize, format: cstr, ...) -> i32
+extern SDL_GetError() -> cstr
+extern SDL_Log(format: cstr, ...) can[Console.Write]
+extern SDL_LoadFile(path: cstr, length: mutable usize&) -> mutable heap void&? can[Blocking.IO, Memory.Allocate]
+extern SDL_free(data: heap void&) can[Memory.Release]
+extern SDL_CreateWindow(label: cstr, w: i32, h: i32, flags: u64) -> mutable void&? can[Memory.Allocate]
+extern SDL_DestroyWindow(window: mutable void&) can[Memory.Release]
+extern SDL_GL_SetAttribute(attribute: i32, value: i32) -> bool
+extern SDL_GL_GetAttribute(attribute: i32, value: mutable i32&) -> bool
+extern SDL_GL_CreateContext(window: mutable void&) -> mutable void&? can[Memory.Allocate]
+extern SDL_GL_DestroyContext(context: mutable void&) -> bool can[Memory.Release]
+extern SDL_GL_GetCurrentWindow() -> mutable void&?
+extern SDL_GL_GetCurrentContext() -> mutable void&?
+extern SDL_GL_MakeCurrent(window: mutable void&?, context: mutable void&?) -> bool
+extern SDL_CreateTexture(renderer: mutable void&, format: u32, access: i32, width: i32, height: i32) -> mutable void&? can[Memory.Allocate]
+extern SDL_DestroyTexture(texture: mutable void&) can[Memory.Release]
+extern SDL_SetTextureBlendMode(texture: mutable void&, mode: u32) -> bool
+extern SDL_UpdateTexture(texture: mutable void&, rect: i32&?, pixels: void&, pitch: i32) -> bool
+extern SDL_RenderTextureRotated(renderer: mutable void&, texture: mutable void&, source: f32&?, destination: f32&, angle: f64, center: f32&?, flip: i32) -> bool
+extern glReadPixels(x: i32, y: i32, w: i32, h: i32, format: u32, kind: u32, pixels: mutable u8&)
+extern glUniform1f(location: i32, value: f32)
+extern glUniform3f(location: i32, x: f32, y: f32, z: f32)
+extern malloc(size: usize) -> mutable heap void&? can[Memory.Allocate]
+extern free(data: heap void&) can[Memory.Release]
+extern SDL_SetError(format: cstr, ...) -> bool
+include "sdl_windows_gl_binding.elisa"
+
+module SDLCamera:
+    const RGBA32: u32 = 0x16762004
+
+    struct Session:
+        game: mutable CameraGame::Session
+        graphics: mutable CameraGL::Renderer
+        window: mutable void&?
+        context: mutable void&?
+        texture: mutable void&?
+        pixels: mutable heap void&?
+        texture_renderer: mutable usize
+        width: mutable i32
+        height: mutable i32
+
+    def create(rung: i64, trials: i64, adaptive: i64, seed: i64) -> usize:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0.usize() if not CameraGame::allowed_rung(rung) or not CameraGame::allowed_total(trials)
+            return 0.usize() if adaptive != 0 and adaptive != 1
+            if malloc(size_of(Session).usize()) is data:
+                trusted Unsafe.PointerCast:
+                    state: mutable heap Session& = data.cast[mutable heap Session&]
+                    state[0] <- zeroed
+                    state.game <- CameraGame::initialize(rung, trials, adaptive == 1, seed)
+                    return state.uintptr()
+            return 0.usize()
+
+    def release_transfer(state: mutable Session&):
+        can Memory.Release:
+            if state.texture is texture:
+                SDL_DestroyTexture(texture)
+            if state.pixels is pixels:
+                free(pixels)
+            state.texture <- null
+            state.pixels <- null
+            state.texture_renderer <- 0.usize()
+
+    def destroy(handle: usize):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return if handle == 0.usize()
+            trusted Unsafe.PointerCast:
+                state: mutable heap Session& = handle.cast[mutable heap Session&]
+                release_transfer(state)
+                if state.context is context:
+                    old_window: mutable void&? = SDL_GL_GetCurrentWindow()
+                    old_context: mutable void&? = SDL_GL_GetCurrentContext()
+                    if SDL_GL_MakeCurrent(state.window, context):
+                        CameraGL::close(&state.graphics)
+                    if old_context != context:
+                        _ = SDL_GL_MakeCurrent(old_window, old_context)
+                    _ = SDL_GL_DestroyContext(context)
+                if state.window is window:
+                    SDL_DestroyWindow(window)
+                CameraGame::close(&state.game) can Global{Read,Write}
+                free(state.cast[heap void&])
+
+    def action(handle: usize, code: i64, value: i64, aux: i64, now_ms: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle == 0.usize() or code < 0 or code > CameraGame::DRAG_ACTION or now_ms < 0
+            return false if not CameraGame::valid_input(code, value, aux)
+            trusted Unsafe.PointerCast:
+                state: mutable heap Session& = handle.cast[mutable heap Session&]
+                return CameraGame::input(&state.game, code, value, aux, now_ms.f64() / 1000.0) can Global{Read,Write}
+
+    def advance(handle: usize, now_ms: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle == 0.usize() or now_ms < 0
+            trusted Unsafe.PointerCast:
+                state: mutable heap Session& = handle.cast[mutable heap Session&]
+                return CameraGame::advance(&state.game, now_ms.f64() / 1000.0) can Global{Read,Write}
+
+    def phase(handle: usize) -> i64:
+        can Unsafe.PointerCast:
+            return -1 if handle == 0.usize()
+            trusted Unsafe.PointerCast:
+                state: heap Session& = handle.cast[heap Session&]
+                return state.game.phase
+
+    def write_chrome(owner: mutable Arena&, game: CameraGame::Session&, dest: mutable u8&, capacity: i64, dark: bool, width: i32, height: i32) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            in owner:
+                list: mutable Display::DisplayList = Display::DisplayList()
+                SceneCamera::chrome(&list, game, dark, width.f64(), height.f64())
+                packet: darray[u8] = Display::encode_binary(&list)
+                length: i64 = packet.count.i64()
+                return -1 if length > capacity
+                trusted Unsafe.PointerCast:
+                    memcpy(dest.cast[mutable void&], (&packet[0]).cast[void&], length.usize())
+                return length
+
+    def chrome(handle: usize, dest: mutable u8&, capacity: i64, black: i64, width: i32, height: i32) -> i64:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return -1 if handle == 0.usize() or capacity <= 0 or width <= 0.i32() or height <= 0.i32()
+            owner: mutable Arena = zeroed
+            trusted Unsafe.PointerCast:
+                state: heap Session& = handle.cast[heap Session&]
+                length: i64 = write_chrome(&owner, &state.game, dest, capacity, black != 0, width, height)
+                CameraGame::release_scene(&owner) can Global{Read,Write}
+                return length
+
+    def open_context(state: mutable Session&) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic:
+            return true if state.context != null
+            attrs: i32[4] = [17.i32(), 18.i32(), 20.i32(), 19.i32()]
+            requested: i32[4] = [3.i32(), 3.i32(), 1.i32(), 2.i32()]
+            saved: mutable i32[4] = zeroed
+            known: mutable bool[4] = zeroed
+            for at in 0..<4 |attrs, requested, saved, known|:
+                known[at.usize()] <- SDL_GL_GetAttribute(attrs[at.usize()], &saved[at.usize()])
+                _ = SDL_GL_SetAttribute(attrs[at.usize()], requested[at.usize()])
+            opened: mutable void&? = SDL_CreateWindow("Camera OpenGL", 64.i32(), 64.i32(), 10.u64())
+            context: mutable void&? = null
+            if opened is window:
+                context <- SDL_GL_CreateContext(window)
+            for at in 0..<4 |attrs, saved, known|:
+                if known[at.usize()]:
+                    _ = SDL_GL_SetAttribute(attrs[at.usize()], saved[at.usize()])
+            if context == null:
+                if opened is window:
+                    SDL_DestroyWindow(window)
+                return false
+            static if ELISA_TARGET_OS_WINDOWS:
+                if not sdl_prepare_windows_gl():
+                    _ = SDL_GL_DestroyContext(context)
+                    if opened is window:
+                        SDL_DestroyWindow(window)
+                    return false
+            state.window <- opened
+            state.context <- context
+            return true
+
+    def prepare_transfer(state: mutable Session&, renderer: mutable void&, width: i32, height: i32) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic:
+            if state.texture != null and state.texture_renderer == renderer.uintptr() and state.width == width and state.height == height:
+                return true
+            release_transfer(state)
+            if SDL_CreateTexture(renderer, RGBA32, 1.i32(), width, height) is texture:
+                state.texture <- texture
+                state.pixels <- malloc((width.i64() * height.i64() * 4).usize())
+                if state.pixels != null and SDL_SetTextureBlendMode(texture, 1.u32()):
+                    state.width <- width
+                    state.height <- height
+                    state.texture_renderer <- renderer.uintptr()
+                    return true
+            release_transfer(state)
+            return false
+
+    def draw(owner: mutable Arena&, state: mutable Session&, output: mutable void&, width: i32, height: i32) -> i32:
+        can Blocking.IO, Console.Write, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            in owner:
+                frame: CameraRender::Frame = CameraRender::frame(&state.game, width.i64(), height.i64())
+                return 0.i32() if frame.passes == 0
+                return -1.i32() if not prepare_transfer(state, output, width, height)
+                pixels: mutable heap void&? = state.pixels
+                texture: mutable void&? = state.texture
+                return -1.i32() if pixels == null or texture == null
+                old_window: mutable void&? = SDL_GL_GetCurrentWindow()
+                old_context: mutable void&? = SDL_GL_GetCurrentContext()
+                if not open_context(state):
+                    _ = SDL_GL_MakeCurrent(old_window, old_context)
+                    return -1.i32()
+                rendered: mutable bool = false
+                if SDL_GL_MakeCurrent(state.window, state.context) and (CameraGL::render(&state.graphics, &frame) can Global{Read,Write}):
+                    glBindFramebuffer(MarbleGLColour::FRAMEBUFFER, state.graphics.target.resolved)
+                    trusted Unsafe.PointerCast:
+                        glReadPixels(0.i32(), 0.i32(), width, height, 6408.u32(), 5121.u32(), pixels.cast[mutable u8&])
+                    glBindFramebuffer(MarbleGLColour::FRAMEBUFFER, 0.u32())
+                    rendered <- glGetError() == 0.u32()
+                restored: bool = SDL_GL_MakeCurrent(old_window, old_context)
+                return -1.i32() if not rendered or not restored
+                return -1.i32() if not SDL_UpdateTexture(texture, null, pixels, width * 4.i32())
+                bounds: f32[4] = [0.0.f32(), 0.0.f32(), width.f32(), height.f32()]
+                trusted Unsafe.PointerCast:
+                    return 1.i32() if SDL_RenderTextureRotated(output, texture, null,
+                        (&bounds[0]).uintptr().cast[f32&], 0.0, null, 2.i32()) else -1.i32()
+
+    def present(handle: usize, output: mutable void&, width: i32, height: i32) -> i32:
+        can Blocking.IO, Console.Write, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return -1.i32() if handle == 0.usize() or width <= 0.i32() or height <= 0.i32() or width > 32768.i32() or height > 32768.i32()
+            owner: mutable Arena = zeroed
+            trusted Unsafe.PointerCast:
+                state: mutable heap Session& = handle.cast[mutable heap Session&]
+                result: i32 = draw(&owner, state, output, width, height) can Global{Read,Write}
+                CameraGame::release_scene(&owner) can Global{Read,Write}
+                return result
+
+export fn nw_sdl_camera_create(rung: i64, trials: i64, adaptive: i64, seed: i64) -> usize = SDLCamera::create
+export fn nw_sdl_camera_destroy(handle: usize) = SDLCamera::destroy
+export fn nw_sdl_camera_action(handle: usize, code: i64, value: i64, aux: i64, now_ms: i64) -> bool = SDLCamera::action
+export fn nw_sdl_camera_advance(handle: usize, now_ms: i64) -> bool = SDLCamera::advance
+export fn nw_sdl_camera_phase(handle: usize) -> i64 = SDLCamera::phase
+export fn nw_sdl_camera_chrome(handle: usize, dest: mutable u8&, capacity: i64, black: i64, width: i32, height: i32) -> i64 = SDLCamera::chrome
+export fn nw_sdl_camera_present(handle: usize, output: mutable void&, width: i32, height: i32) -> i32 = SDLCamera::present
+
+def sdl_camera_option(row: i64, value: i64, direction: i64) -> i64:
+    if row == 2:
+        return value if direction == 0 else 1 - value
+    limit: i64 = 100 if row == 0 else 30
+    if direction == 0:
+        return value if (CameraGame::allowed_rung(value) if row == 0 else CameraGame::allowed_total(value)) else -1
+    at: mutable i64 = value
+    while true |at, limit, direction, row|:
+        at <- (at + direction + limit - 1) % limit + 1
+        return at if (CameraGame::allowed_rung(at) if row == 0 else CameraGame::allowed_total(at))
+    return value
+
+def sdl_camera_note(owner: mutable Arena&, dest: mutable u8&, capacity: i64, rung: i64, adaptive: i64) -> i64:
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        in owner:
+            text: mutable dstr = []
+            SceneCamera::options_note(&text, rung, adaptive != 0)
+            length: i64 = text.count.i64()
+            return -1 if length > capacity
+            trusted Unsafe.PointerCast:
+                memcpy(dest.cast[mutable void&], (&text[0]).cast[void&], length.usize())
+            return length
+
+def sdl_camera_write_note(dest: mutable u8&, capacity: i64, rung: i64, adaptive: i64) -> i64:
+    can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        return -1 if not CameraGame::allowed_rung(rung) or capacity <= 0
+        owner: mutable Arena = zeroed
+        length: i64 = sdl_camera_note(&owner, dest, capacity, rung, adaptive)
+        CameraGame::release_scene(&owner) can Global{Read,Write}
+        return length
+
+export fn nw_sdl_camera_option(row: i64, value: i64, direction: i64) -> i64 = sdl_camera_option
+export fn nw_sdl_camera_write_note(dest: mutable u8&, capacity: i64, rung: i64, adaptive: i64) -> i64 = sdl_camera_write_note

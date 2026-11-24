@@ -1,0 +1,88 @@
+extern SDL_RenderReadPixels(renderer: mutable void&, rectangle: void&?) -> mutable void&? can[Memory.Allocate]
+extern SDL_ConvertSurface(surface: mutable void&, format: u32) -> mutable void&? can[Memory.Allocate]
+extern SDL_LockSurface(surface: mutable void&) -> bool
+extern SDL_UnlockSurface(surface: mutable void&)
+extern SDL_SetPointerPropertyWithCleanup(properties: u32, name: cstr, value: mutable heap void&, callback: fn(usize, usize) -> void can[Memory.Release, Unsafe.PointerCast, Abort.Panic], userdata: void&?) -> bool
+
+module SDLFrameExport:
+    const RGBA32: u32 = 0x16762004.u32()
+
+    struct Surface:
+        flags: u32
+        format: u32
+        width: i32
+        height: i32
+        pitch: i32
+        pixels: uintptr
+
+    struct Publisher:
+        owner: mutable uintptr
+        capacity: mutable i64
+        sequence: mutable u64
+        failed: mutable bool
+
+    def cleanup(userdata: usize, address: usize):
+        can Memory.Release, Unsafe.PointerCast, Abort.Panic:
+            _ = userdata
+            trusted Unsafe.PointerCast:
+                state: mutable heap Publisher& = address.cast[mutable heap Publisher&]
+                FrameSharedMemory::release(&state.owner)
+                SDL_free(state.cast[heap void&])
+
+    def publisher(renderer: mutable void&) -> mutable void&?:
+        can Memory.Allocate, Memory.Release, Unsafe.PointerCast, Abort.Panic:
+            properties: u32 = SDL_GetRendererProperties(renderer)
+            if SDL_GetPointerProperty(properties, "nw.frame.export", null) is state:
+                return state
+            if SDL_calloc(1.usize(), size_of(Publisher)) is allocation:
+                if SDL_SetPointerPropertyWithCleanup(properties, "nw.frame.export", allocation, cleanup, null):
+                    trusted Unsafe.PointerCast:
+                        return allocation.cast[mutable void&]
+            return null
+
+    def publish_surface(state: mutable Publisher&, surface: mutable void&, name: cstr):
+        can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return if not SDL_LockSurface(surface)
+            trusted Unsafe.PointerCast:
+                rgba: Surface& = surface.cast[Surface&]
+                width: i64 = rgba.width.i64()
+                height: i64 = rgba.height.i64()
+                if width > 0 and height > 0 and height <= (9223372036854775807 - FrameExport::HEADER_BYTES) / (width * 4):
+                    capacity: i64 = FrameExport::HEADER_BYTES + width * height * 4
+                    if capacity > state.capacity:
+                        FrameSharedMemory::release(&state.owner)
+                        state.owner <- FrameSharedMemory::create(name, capacity)
+                        state.capacity <- capacity
+                        if state.owner == 0.uintptr():
+                            SDL_Log("Could not create NW_SHM frame mapping: %s", name)
+                            state.failed <- true
+                    if state.owner != 0.uintptr():
+                        sequence: u64 = state.sequence + 1.u64()
+                        if FrameSharedMemory::publish_rows(state.owner, sequence, SDL_GetTicksNS(),
+                                width.u32(), height.u32(), rgba.pixels.cast[u8&?], rgba.pitch.i64(), false) >= 0:
+                            state.sequence <- sequence
+            SDL_UnlockSurface(surface)
+
+    def capture(renderer: mutable void&, name: cstr):
+        can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            if publisher(renderer) is storage:
+                trusted Unsafe.PointerCast:
+                    state: mutable Publisher& = storage.cast[mutable Publisher&]
+                    return if state.failed
+                    if SDL_RenderReadPixels(renderer, null) is source:
+                        layout: Surface& = source.cast[Surface&]
+                        if layout.format == RGBA32:
+                            publish_surface(state, source, name)
+                        elif SDL_ConvertSurface(source, RGBA32) is converted:
+                            publish_surface(state, converted, name)
+                            SDL_DestroySurface(converted)
+                        SDL_DestroySurface(source)
+
+def sdl_publish_rendered_frame(renderer: mutable void&):
+    can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        if SDL_getenv("NW_SHM") is name:
+            if name[0] != 0.u8():
+                trusted Unsafe.PointerCast:
+                    SDLFrameExport::capture(renderer, name.uintptr().cast[cstr])
+
+export fn nw_sdl_publish_rendered_frame(renderer: mutable void&) = sdl_publish_rendered_frame

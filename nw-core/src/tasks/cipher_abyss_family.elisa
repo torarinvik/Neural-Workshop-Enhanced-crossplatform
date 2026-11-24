@@ -1,0 +1,191 @@
+include "./cipher_abyss_rules.elisa"
+
+extend CipherLang:
+    struct Rank:
+        entry: i64
+        size: i64
+        code: dstr
+
+    def rank(program: darray[Node]&, entry: i64, order_by_size: bool) -> Rank:
+        can Abort.Panic, Memory.Allocate:
+            code: mutable dstr = []
+            write_code(&code, program, entry)
+            return Rank{entry: entry, size: size(program, entry) if order_by_size else 0, code: code}
+
+    def rank_less(a: Rank, b: Rank) -> bool:
+        can Abort.Panic:
+            return a.size < b.size if a.size != b.size
+            return code_less(&a.code, &b.code)
+
+    def sort_ranks(ranks: mutable darray[Rank]&):
+        can Abort.Panic, Memory.Allocate:
+            n: i64 = ranks.count.i64()
+            buffer: mutable darray[Rank] = []
+            for value in ranks:
+                buffer.push(value)
+            span: mutable i64 = 1
+            while span < n |ranks, buffer, span, n|:
+                start: mutable i64 = 0
+                while start < n |ranks, buffer, span, n, start|:
+                    middle: i64 = CipherAbyss::min(n, start + span)
+                    stop: i64 = CipherAbyss::min(n, middle + span)
+                    left: mutable i64 = start
+                    right: mutable i64 = middle
+                    for at in start..<stop |ranks, buffer, left, right, middle, stop|:
+                        if right >= stop or (left < middle and not rank_less(ranks[right.usize()], ranks[left.usize()])):
+                            buffer[at.usize()] <- ranks[left.usize()]
+                            left <- left + 1
+                        else:
+                            buffer[at.usize()] <- ranks[right.usize()]
+                            right <- right + 1
+                    start <- stop
+                for i in 0..<n |ranks, buffer|:
+                    ranks[i.usize()] <- buffer[i.usize()]
+                span <- span * 2
+
+    def has_code(ordered: darray[Rank]&, wanted: dstr&) -> bool:
+        can Abort.Panic:
+            low: mutable i64 = 0
+            high: mutable i64 = ordered.count.i64()
+            while low < high |ordered, wanted, low, high|:
+                mid: i64 = low + (high - low) / 2
+                if code_less(&ordered[mid.usize()].code, wanted):
+                    low <- mid + 1
+                else:
+                    high <- mid
+            return low < ordered.count.i64() and not code_less(wanted, &ordered[low.usize()].code)
+
+    def background(program: mutable darray[Node]&, out: mutable darray[i64]&, level: CipherAbyss::Grade):
+        can Abort.Panic, Memory.Allocate:
+            return if level.stage < 3
+            pieces: mutable darray[i64] = positions(program, level.length)
+            changes: darray[i64] = values(program, level.symbols)
+            named: i64 = pieces.count.i64() + CipherAbyss::min(changes.count.i64(), level.symbols + 2)
+            append_list(&pieces, &changes)
+            for part in pieces:
+                out.push(seq1(program, part))
+            if level.stage >= 5:
+                pool: darray[i64] = sliced(&pieces, 0, named)
+                combinations(program, out, &pool, SEQ)
+
+    def quirks(stage: i64) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            return [SAME] if stage == 1
+            return [SAME, SORTED] if stage == 2
+            return [PAL, SORTED] if stage == 4
+            return [SORTED] if stage == 6
+            return [PAL, SORTED, SAME] if stage == 7
+            return []
+
+    def quirked(program: mutable darray[Node]&, truths: darray[i64]&, level: CipherAbyss::Grade, odd_tests: darray[i64]&) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            k: i64 = level.symbols
+            odd: mutable darray[i64] = []
+            limit: i64 = 3 if level.stage == 6 else k
+            for i in 1..<limit |program, odd|:
+                odd.push(atomic(program, SHIFT, i))
+            if level.stage != 6:
+                odd.push(atomic(program, REV))
+                odd.push(atomic(program, SORT))
+                if k > 2:
+                    odd.push(atomic(program, MUL, k - 1))
+            choices: darray[i64] = wrapped(program, &odd)
+            candidates: mutable darray[i64] = []
+            for op in odd_tests:
+                trigger: i64 = atomic(program, op)
+                for base in truths:
+                    for q in choices:
+                        candidates.push(triple(program, IF, trigger, q, base))
+            return candidates
+
+    def chain(program: mutable darray[Node]&, draw: mutable MT19937&, choices: darray[i64]&, depth: i64) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            count: i64 = 1 + py_randbelow(draw, depth.u64()).i64()
+            parts: mutable darray[i64] = []
+            for _ in 0..<count |parts, draw, choices|:
+                parts.push(choices[py_randbelow(draw, choices.count.u64()).usize()])
+            return add_node(program, SEQ, [], parts)
+
+    def grow(program: mutable darray[Node]&, draw: mutable MT19937&, choices: darray[i64]&, tests: darray[i64]&,
+             depth: i64, nest: i64, k: i64) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            kind: f64 = py_random(draw)
+            return chain(program, draw, choices, depth) if nest <= 0 or kind < 0.4
+            if kind < 0.7:
+                trigger: i64 = tests[py_randbelow(draw, tests.count.u64()).usize()]
+                left: i64 = grow(program, draw, choices, tests, depth, nest - 1, k)
+                right: i64 = grow(program, draw, choices, tests, depth, nest - 1, k)
+                return triple(program, IF, trigger, left, right)
+            left: i64 = grow(program, draw, choices, tests, depth, nest - 1, k)
+            right: i64 = chain(program, draw, choices, depth)
+            return pair(program, EXCEPT, left, right) if kind < 0.85
+            trigger: i64 = tests[py_randbelow(draw, k.u64()).usize()]
+            return triple(program, META, trigger, left, right)
+
+    def code_hash(code: dstr&) -> u64:
+        hash: mutable u64 = 14695981039346656037.u64()
+        for byte in code:
+            hash <- (hash ^ byte.u64()) * 1099511628211.u64()
+        return hash
+
+    def open_rules(program: mutable darray[Node]&, level: CipherAbyss::Grade) -> Rules:
+        can Abort.Panic, Memory.Allocate:
+            n: i64 = level.length
+            k: i64 = level.symbols
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, level.rung.u64() * 7.u64() + 1.u64())
+            choices: mutable darray[i64] = positions(program, n)
+            changes: darray[i64] = values(program, k)
+            append_list(&choices, &changes)
+            choices.push(atomic(program, DEDUPE))
+            choices.push(atomic(program, HALVE))
+            strides(program, n, &choices)
+            tests: darray[i64] = predicates(program, k, true)
+            depth: i64 = 2 + sqrt(level.step.f64() / 3.0).i64()
+            nest: i64 = 1 + log2(1.0 + level.step.f64() / 10.0).i64()
+            count: i64 = CipherAbyss::max(500, (4000.0 / (1.0 + level.step.f64() / 20.0)).i64())
+            # At most 4,000 rules fit below half the power-of-two hash table.
+            slots: mutable darray[i64] = Ints::zeros(8192)
+            ranked: mutable darray[Rank] = []
+            while ranked.count.i64() < count |program, draw, choices, tests, depth, nest, k, slots, ranked, count|:
+                entry: i64 = grow(program, &draw, &choices, &tests, depth, nest, k)
+                item: Rank = rank(program, entry, false)
+                slot: mutable usize = (code_hash(&item.code) & 8191.u64()).usize()
+                while slots[slot] != 0 |program, ranked, slots, slot, entry|:
+                    break if equal(program, ranked[(slots[slot] - 1).usize()].entry, entry)
+                    slot <- ((slot + 1.usize()) & 8191.usize())
+                if slots[slot] == 0:
+                    slots[slot] <- ranked.count.i64() + 1
+                    ranked.push(item)
+            sort_ranks(&ranked)
+            rules: mutable darray[i64] = []
+            for item in ranked:
+                rules.push(item.entry)
+            return Rules{hypotheses: rules, truths: rules}
+
+    def families(program: mutable darray[Node]&, level: CipherAbyss::Grade) -> Rules:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            base: Rules = open_rules(program, level) if level.stage == 11 else raw(program, level)
+            hypotheses: mutable darray[i64] = sliced(&base.hypotheses, 0, base.hypotheses.count.i64())
+            background(program, &hypotheses, level)
+            traits: darray[i64] = quirks(level.stage)
+            truths: mutable darray[i64] = base.truths
+            if traits.count > 0.usize():
+                truths <- quirked(program, &base.truths, level, &traits)
+                append_list(&hypotheses, &truths)
+            levels: darray[i64] = dedupe(program, &hypotheses, level.length, level.symbols)
+            ranked: mutable darray[Rank] = []
+            for rule in levels:
+                ranked.push(rank(program, rule, true))
+            names: mutable darray[Rank] = []
+            for truth in truths:
+                normalized: i64 = canonical(program, truth, level.length, level.symbols)
+                names.push(rank(program, normalized, false))
+            sort_ranks(&ranked)
+            sort_ranks(&names)
+            candidates: mutable darray[i64] = []
+            eligible: mutable darray[i64] = []
+            for item in ranked:
+                candidates.push(item.entry)
+                eligible.push(item.entry) if has_code(&names, &item.code)
+            return Rules{hypotheses: candidates, truths: eligible}

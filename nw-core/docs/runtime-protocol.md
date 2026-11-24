@@ -11,12 +11,12 @@ Python and SDL task hubs expose only their explicitly implemented controllers;
 unintegrated entries remain inert. No generic or
 non-3D N-Back mode is part of the port.
 
-The current application artifact was promoted on 2026-11-10 using the
+The application artifact promoted on 2026-11-10 used the
 source-fresh Elisa-compiler Stage1 product at commit
 `d3b2e657d57c159c77b9523542f21fd67a93b916`, source fingerprint
 `9de69658a554a61ac1679e3cd52398ea73800adf700fb0c51d7a636324dceef9`, product
 SHA-256 `eaa65de1651631e703365e46a39ede6f1bcee123c3653755c368c59f51725f0f`.
-The promoted `build/nwcore.wasm` is 1,629,226 bytes, SHA-256
+That promoted `build/nwcore.wasm` was 1,629,226 bytes, SHA-256
 `a99f7d098a76f495b94505873a283c7f6cdcdab25c279c5c04e996228069b30d`; the
 linked Stage1 object SHA-256 is
 `c7761d5729d0e66493a6587c1b66f1c497b9c7ef8cd3986b376ab6f9f4bc9837`. The
@@ -135,6 +135,7 @@ returned as positive `i64` values:
 | `tetris` | `679042920` | yes; source-backed controller, state ABI, display-list render, and browser route |
 | `tower_of_hanoi` | `1419634454` | yes |
 | `maze` | `3848665378` | yes |
+| `cookie_thief` | `2851280360` | yes |
 | `n_in_a_row` | `3456348074` | yes |
 | `numberology` | `1263422208` | yes |
 | `in_the_dark` | `1343235803` | yes |
@@ -155,7 +156,8 @@ returned as positive `i64` values:
 | `overrun` | `1156693128` | yes |
 
 `nw_api_v1_create(task, options_version, a, b, c, d, e, f, seed)` returns a
-positive handle or a negative error. `options_version` must be 1. The six
+positive handle or a negative error. The options version is 1 for the table
+below. The Jigsaw task ID also accepts version 2 for Video Jigsaw. The six
 task-specific scalar slots are deliberately documented here and reserved
 slots must be zero:
 
@@ -169,7 +171,15 @@ slots must be zero:
 | Graph Mapping | nodes: 4, 5, 6, 7, 8, 9, 10, 12, 14, 16 | density: sparse `0`, medium `1`, dense `2` | trials: 5, 10, 15, 20, 30, 50, 80, 100 | exposure ms: 0, 3000, 5000, 8000, 12000, 20000 | adaptive, 0/1 | subtle, 0/1 |
 | Find the Winning Move (Go) | starting level: 1–10 | positions per run: 1, 3, 5, 8, 10, 15, 20, 30, 50 | 0 | 0 | 0 | 0 |
 | Matrix Reasoning | level: 1–12 | trials: 5, 10, 15, 20, 30, 50, 80, 100 | exposure ms: 0, 10000, 20000, 30000, 45000, 60000 | adaptive, 0/1 | `e` bit 0 feedback and bit 1 explanation | color, 0/1 |
-| Jigsaw Puzzle | starting side: 2, 3, 4, 5, 6, 7, 8, 10 | puzzles: 1, 2, 3, 5, 8, 12, 20 | adaptive, 0/1 | preview, 0/1 | mark placed, 0/1 | 0 |
+| Jigsaw Puzzle | starting side, 2–10 | puzzles per run | adaptive, 0/1 | preview, 0/1 | mark placed, 0/1 | requested pieces, at least 2, or 0 for side mode |
+| Video Sequence | pieces per clip, 3–9 | clips per run, 1/3/5/8/12/20 | adaptive, 0/1 | mark placed, 0/1 | 0 | 0 |
+| Hidden Rule | starting rung, 1/2/3/4/6/8/10/12/13/16/19/25/30 | rounds, 1/3/5/8/12 | adaptive, 0/1 | 0 | 0 |
+| Hidden Wiring | starting rung, 1/3/5/7/10/12/16/20/25/30 | rounds, 1/3/5/8/12 | adaptive, 0/1 | 0 | 0 |
+| Triage | starting rung | rounds | adaptive, 0/1 | stepped dials, 0/1 | 0 |
+| Delay | starting rung | runs | adaptive, 0/1 | stepped dials, 0/1 | 0 |
+| Notebook | starting rung, 1/3/6/8/12/16/20/25/30 | rounds, 1/3/5/8 | adaptive, 0/1 | 0 | 0 | 0 |
+| Hold It | starting rung | holds | adaptive, 0/1 | stepped dials, 0/1 | 0 | 0 |
+| Stop & Switch | starting rung | blocks | adaptive, 0/1 | stepped dials, 0/1 | 0 |
 | Scramble | starting level: 1–12 | lines per run: 1–100 | show word count, 0/1 | adaptive, 0/1 | 0 | 0 |
 | Scrabble | starting level: 1–10 | boards per run: 1, 2, 3, 5, 8, 10, 15 | show premiums, 0/1 | adaptive, 0/1 | 0 | 0 |
 | Crossed Wires | rung: 1–12 | rounds: 1, 2, 3, 5, 8, 10, 15, 20 | adaptive, 0/1 | draw grid, 0/1 | 0 | 0 |
@@ -233,11 +243,363 @@ owned by the controller.
 Jigsaw defaults to `(3, 3, 1, 1, 0, 0)`, matching the original side, puzzle
 count, adaptive, preview, and mark-placed settings. Its browser options panel
 validates and persists all five values and recreates the controller when
-applied. The `e` slot carries `mark_placed`; `f` is reserved. The shell can
+applied. The `e` slot carries `mark_placed`. A nonzero `f` selects the
+Python piece-count grid and its adaptive progression. Photo Jigsaw caps the
+board at 277×277 tiles and fits smaller photographs to their pixel dimensions.
+Saved browser side settings are migrated
+to their square piece count. The shell can
 import the external DIV2K directory into IndexedDB, stores its unseen-photo
 rotation across sessions, and renders the source tile crops and centered-square
 preview. The coloured-tile fallback remains available when no photos are
 imported.
+
+Video Jigsaw uses the same slots with version 2 and requires a nonzero `f`.
+Slot `f` accepts custom counts of at least two. The requested count selects
+a 4:3 grid and its adaptive progression. Video grids fit the decoded
+320×240 dimensions, with a maximum of 76,800 tiles. The 2,500-piece preset
+fits a 58×44 grid of 2,552 tiles. Rendering emits a 4:3 board and preview
+with sprite IDs for the source tiles. The preview retains ID 5500, and
+tiles past index 2,499 use IDs 5501 through 79800. A host must supply
+and play the clip for those sprites. Action `6` with zero value and auxiliary
+fields returns an unloaded Video Jigsaw puzzle to the ready screen, restores
+its pre-deal random state, and rolls back the puzzle number. This action is
+accepted only before the clip-ready action has started the solve clock.
+
+Video Sequence uses version 1 and the task ID `3061430628`. Space or action
+`0` starts the run and enters loading phase `4`. After loading a clip at
+15 frames per second, the host sends action `2` with its frame count in
+the value field (3–120) or action `3` with zero value if loading fails.
+The clip-ready action starts the solve clock and truncates any remainder
+when it divides the clip into equal segments. Pointer input uses normalized
+coordinates, and action `1` picks a zero-based tile position directly.
+Advancing after the solve verdict enters loading for the next clip or ends
+the run.
+
+The scene emits sprite IDs `100000 + piece` for segments. The host can use
+`nw_api_v1_video_sequence_source_frame(handle, piece, time_ms)` to resolve
+the current frame index in the source clip. The fields accepted by
+`nw_api_v1_video_sequence_info` and returned in the state payload, in order,
+are phase, active pieces, clip number, clips per run, minimum swaps, actual
+swaps, picked position, frames per segment, solve start time, and hovered
+position.
+
+Hidden Rule uses version 1 and task ID `189731380`. Action `10` starts
+a run. Actions `0`–`5` cycle the corresponding builder properties, `6`
+tests the object, `7` starts the exam, and `8` and `9` answer lit and
+dark. Space and the keys 1–6 also work through the keyboard event path.
+Pointer events pass normalized coordinates to the same scene hit testing
+as the native task. The phase sequence is ready, testing, examining,
+judged, and done. The info fields and state payload give phase, rung,
+round number, rounds per run, tests, exam answers, revealed wrong answers,
+rounds passed, highest rung passed, and the verdict deadline in milliseconds.
+The wrong-answer count is revealed at judgment. The host advances at the
+deadline to start the next round or show the score.
+
+Hidden Wiring uses version 1 and task ID `462267443`. Actions `0`–`7`
+toggle switches, `8` records a lamp observation, `9` starts the exam, `10`
+submits the current switch settings, and `11` starts a run. Pointer input
+uses the shared scene hit tests. The state payload reports phase, rung,
+round number, rounds per run, observations, answers, revealed wrong
+answers, rounds passed, highest rung passed, and the verdict deadline in
+milliseconds. The host advances after the four-second verdict.
+
+Triage uses version 1 and task ID `166983937`. Actions `0`–`7` open
+cards, `8`–`15` swap neighboring digits, `16` ends the round, and `17`
+starts a run. Space, the keys 1–8, and Enter map to the same actions.
+Pointer events use the shared scene's card, swap, and Done hit tests.
+The 12-field state reports phase (ready, playing, judged, finished),
+current rung, round number, rounds per run, move budget, moves used,
+payout, active card index (`-1` if none), rounds passed, highest rung
+passed, verdict deadline in milliseconds, and the face-up card mask.
+The task-specific info export also exposes the solved card mask as
+field 12. The host advances after the 2.5-second verdict.
+For the stepped environment, action `18` flags a playing round as out of
+time. The controller shows a red verdict until the next advance, which
+deals the next round without changing the rung or scored-round tally.
+Phase `4` represents the flag, and task info field `13` reports the number
+of rounds judged by their gameplay results.
+With the stepped-dials option off, the starting rung must be one of
+1/3/5/8/12/16/20/21/25/30 and the round count one of 1/3/5/8/12. With
+it on, both accept signed 64-bit integers. Rungs below 1 start at rung
+1 and nonpositive round counts finish immediately. Negative signed
+seeds use their magnitude, as in Python.
+The `nw_triage_options_note(dest, capacity, rung)` export writes the
+UTF-8 starting-rung preview without a trailing NUL and returns its byte
+length. The preview uses the same formatter as the native options menu.
+
+Native Triage callers use `nw_triage_create(rung, trials, adaptive, seed)`
+and release the returned handle with `nw_triage_destroy`. Creation
+accepts stepped dials and returns zero on failure. `nw_triage_action`
+and `nw_triage_advance` take caller-provided milliseconds and return
+whether they changed the run. `nw_triage_info` uses the field order
+above. Callers can write a display list with `nw_triage_frame_write`
+or render tightly packed RGBA8 pixels with
+`nw_triage_rgba_write(output, capacity, handle, black, width, height)`.
+Both return a byte count or zero on failure. The RGBA writer uses an
+offscreen SDL renderer and caller-owned memory.
+
+Both native and WebAssembly stepped hosts configure the think bank with
+`nw_triage_think_configure(handle, capacity_seconds, refill_seconds)`
+before starting. `nw_triage_step(handle, elapsed_seconds)` charges the
+bank during play, presents a timeout on expiry, and holds a scored
+verdict for one stepped frame before dealing again. Each new deal
+refills the bank up to capacity. `nw_triage_think_left` returns seconds
+remaining and info field `14` counts forfeits. Hosts own the publication
+of frames and action receipts when using those controller exports directly.
+
+The native agent adapter handles that publication with
+`nw_triage_agent_create`, `nw_triage_agent_act`,
+`nw_triage_agent_publish`, and `nw_triage_agent_destroy`. Creation
+takes the rung, rounds, adaptive flag, seed, think capacity and refill
+in seconds, port count (at least 17), and neutral-outcomes flag.
+The first publication draws the opening frame. Each subsequent call
+advances one step and writes an NWFB header followed by tightly packed
+RGBA8 pixels. Callers supply the buffer, dimensions, elapsed seconds,
+and a monotonic timestamp in nanoseconds. An action returns its receipt
+ID, or zero if rejected. Only one action may be finalized per open
+receipt.
+
+The publication metadata is an 80-byte header followed by two 64-byte
+lowercase SHA-256 strings. In order, the header contains frame sequence,
+timestamp, finished flag, open receipt ID, outcome receipt ID, outcome
+scalar, action port, receipt frame sequence, receipt timestamp, and round
+number. The scalar is a double and the other fields are signed 64-bit
+integers. Receipt ID zero means absent and port `-1` means no action.
+The strings identify the current frame and, for an outcome, the opening
+stimulus. Callers retain historical frames for evidence verification.
+
+The SDL build emits `libnw-agent.dylib` on macOS, `libnw-agent.so` on
+Linux, or `nw-agent.dll` on Windows. Desktop packages stage the library
+when it is available. The packaged declarations are in
+`include/nw_triage_agent.h`. The library uses SDL and the Elisa runtime
+and can be loaded by an agent host without Python.
+
+Delay uses version 1 and task ID `1322381784`. Actions `0`, `1`, and
+`2` take or give up, wait, and start, respectively. Space and the left
+and right arrow keys use the same actions. Pointer events hit the
+shared cards. Hosts advance the logical clock throughout active play
+and the three-second verdict. The state reports phase, adaptive rung,
+current run number, number of runs, offer mode, coins, zero-based offer
+index, runs passed, highest rung passed, run start time, pause or
+verdict deadline, and run duration. The last three fields are in
+milliseconds. Rendering uses the most recent logical timestamp, and
+hidden offer durations are absent from the state payload.
+
+Interactive Delay accepts rungs 1/4/7/10/13/16/20/25/30 and run counts
+1/3/5/10. The stepped-dials flag accepts signed 64-bit integers for those
+two fields.
+
+The browser agent uses `nw_delay_agent_event(handle, seconds, port)`
+for its fractional-second clock. Ports `0` and `1` take or wait, port
+`2` starts, and port `-1` advances a frame. The first tick that settles
+a round displays the verdict. The next tick deals or finishes the run
+without consuming the interactive three-second verdict delay.
+Agent-managed and interactive-clock calls should use separate handles.
+
+The native agent library exposes the same clocked task through
+`nw_delay_agent_create(rung, trials, adaptive, seed, ports, neutral)`
+and the matching `nw_delay_agent_act`, `nw_delay_agent_publish`, and
+`nw_delay_agent_destroy` functions. Publish takes elapsed seconds and
+returns the same NWFB payload and `NWAgentPublication` metadata as
+Triage. Delay advances its own clock from elapsed seconds and has no
+separate think bank.
+
+Stop & Switch uses version 1 and task ID `1769824260`. Actions `0` and
+`1` answer left and right, and `2` starts a run. Space and the left and
+right arrow keys map to those actions. A primary pointer press starts an
+idle run. Advance drives the cue, response window, stop ring, and
+2.5-second verdict.
+
+The state payload reports phase, adaptive rung, current block, configured
+blocks, completed stimuli in the block, correct responses, correct-answer
+bit mask, stimulus visibility, stop-ring visibility, rule, shape, and
+colour. Rule, shape, and colour return `-1` until their visible cue.
+Task-specific fields 12–16 expose the shown side, block length, blocks
+passed, highest rung passed, and the verdict deadline in milliseconds.
+The side field is `-1` for left or a hidden stimulus, distinguished by
+the visibility field. Future stop signals are absent from public state.
+Interactive rungs are 1/4/7/10/13/16/20/25/30 and block counts are
+1/3/6/10/20. The stepped-dials flag accepts signed 64-bit integers.
+`nw_stop_switch_options_note` writes the rung preview as UTF-8. The browser
+maps F and J to the left and right actions and defaults to rung 1, six
+blocks, and adaptive difficulty.
+
+The browser exposes `createStopAndSwitchEnvironment(context, options)`.
+Its `nw_stop_switch_agent_event(handle, seconds, port)` clock takes port
+`2` to start, ports `0` and `1` for answers, and `-1` for a step without
+an action. The first step that sees a verdict publishes it and the next
+step deals or ends the run. Use separate handles for the interactive and
+stepped clocks.
+
+The native agent library exports `nw_stop_switch_agent_create`,
+`nw_stop_switch_agent_act`, `nw_stop_switch_agent_publish`, and
+`nw_stop_switch_agent_destroy` with the Delay agent signatures and
+NWFB publication format. Both agents use fractional elapsed seconds and
+two answer ports. The Stop & Switch default is six blocks.
+
+Hold It uses version 1 and task ID `3702462192`. Action `0` presses the
+key, `1` releases it, and `2` starts a run. Space starts and holds,
+a primary click starts, and focus loss, tab hiding, or cancel release the
+held input. Advance supplies the time for the model's clamped substeps.
+The state reports phase, rung, trial, total, instruction kind, factor in
+thousandths, lamp count, two lamp visibility flags, whether the turn to
+hold has begun, whether the key is holding a lamp, and the result code.
+Result codes are 0 pending, 1 pass, 2 too short, 3 too long, and 4 no hold.
+Fields 12–15 report pass count, best rung, target milliseconds, and held
+milliseconds. The durations return `-1` until a hold has been judged.
+Interactive rungs are 1/4/7/10/13/16/20/25/30 and trial counts are
+1/3/5/10/20. The browser defaults to rung 1, five holds, and adaptive
+difficulty. `nw_hold_it_options_note` writes the selected rung preview.
+`nw_hold_it_audio(handle, dest, capacity)` consumes elapsed audio in
+at most one-second chunks. It returns the number of bytes written as
+22,050 Hz stereo signed 16-bit little-endian PCM. A second read without
+any elapsed model time returns zero. Each new hold resets the audio
+cursor. The browser routes elapsed chunks to Web Audio and SDL queues
+the trial's synthesised audio through FFI.
+
+The browser's `createHoldItEnvironment` exposes one action port.
+Sending port `0` holds for the next frame. Omitting it releases the key
+on that frame. The clock advances through `nw_hold_it_agent_event`
+with absolute seconds and port `0` for held, `-1` for idle, or `2`
+to start. The first judged frame carries the verdict and the next
+frame deals or ends the run. When audio elapsed, the observation includes
+`audio_pcm`, `audio_rate`, `audio_channels`, and `audio_sample_width`.
+
+The native agent library exposes `nw_hold_it_agent_create`,
+`nw_hold_it_agent_act`, `nw_hold_it_agent_publish`, and
+`nw_hold_it_agent_destroy` with the clocked agent signatures.
+`nw_hold_it_agent_audio` copies and consumes elapsed PCM after a
+successful publication. Its format matches the browser's audio.
+
+Notebook uses version 1 and task ID `1307337504`. Actions 0–3
+answer, 4–11 write to a line, 12 advances a fact card, and 13 starts.
+Shift+1–8 writes, 1–4 answers, and Enter or N advances a fact card.
+Space starts the run. Pointer hits use the same bounds as the display
+list. The state reports phase, rung, round, total, zero-based card index,
+card count, line count, answered count, correct count, last answer,
+passes, and best rung. Fields 12–15 expose the displayed choices, field
+16 gives the verdict deadline in milliseconds, and field 17 gives the
+current card kind. Field 18 gives the think-clock forfeit count. Upcoming facts and correct answer indices stay
+private. `nw_notebook_options_note` writes the selected rung preview.
+
+The browser's `createNotebookEnvironment` exposes all 13 ports and an
+optional think clock. Its stepped handle uses option slot 4 set to 1
+and accepts signed trial counts and starting rungs up to 4096. The
+controller bounds adaptive growth at 4096 to bound the size of the
+noise-card sample. Configure the clock with
+`nw_notebook_think_configure` before starting, pass elapsed seconds to
+`nw_notebook_step`, and read the bank with `nw_notebook_think_left`.
+A score or forfeit is visible for one publication before the next deal.
+
+The native library exposes `nw_notebook_agent_create`,
+`nw_notebook_agent_act`, `nw_notebook_agent_publish`, and
+`nw_notebook_agent_destroy` with the Triage agent signatures and
+NWFB frame format. Both hosts derive verdicts from the rendered frame.
+
+Where Was It? uses version 1 and task ID `1679726570`. Actions 0–29
+choose a floor cell during the test, 30 advances the study room, and
+31 starts. Space starts or advances, Enter advances, and pointer hits
+use the projected floor and solids in paint order. The state exposes
+the phase, rung, trial, trial total, study stage, room count, floor
+dimensions, chosen cell, and outcome counters. Future rooms and the
+answer are private. Browser agents use `createWhereWasItEnvironment`
+with 31 ports and the optional think clock. The WASM step calls are
+`nw_where_was_it_think_configure`, `nw_where_was_it_step`, and
+`nw_where_was_it_think_left`. The stepped handle sets option slot 4 to
+1 to accept integer rungs and trial counts outside the interactive
+options menu. `nw_where_was_it_options_note` writes the starting-rung
+preview used by the Long-term memory menu. The native library exports
+`nw_where_was_it_agent_create`, `nw_where_was_it_agent_act`,
+`nw_where_was_it_agent_publish`, and `nw_where_was_it_agent_destroy`
+with the Notebook signatures and NWFB frame format.
+
+Same or Mirror? uses version 1 and task ID `2468745517`. Actions 0–4
+choose the numbered answer, with 0 and 1 meaning Same and Mirror on
+paired trials, and action 5 starts. The paired keyboard shortcuts
+use key codes 20 and 9 in the common event ABI. The state reports the
+figure count, cube count, lighting, chosen answer, and outcome counts
+without exposing the correct port. Browser agents use five ports and
+an optional think clock through `createSameOrMirrorEnvironment`.
+The low-level clock calls are `nw_same_or_mirror_think_configure`,
+`nw_same_or_mirror_step`, and `nw_same_or_mirror_think_left`. The native
+agent library exposes `nw_same_or_mirror_agent_create`,
+`nw_same_or_mirror_agent_act`, `nw_same_or_mirror_agent_publish`, and
+`nw_same_or_mirror_agent_destroy` with the Notebook ABI and NWFB frames.
+
+Which Is Nearer? uses version 1 and task ID `3493829017`. Actions 0–5
+choose a visible solid by its numbered port, and action 6 starts.
+A moving-eye trial uses the host's logical time for its sway. During
+ordered trials a repeated choice is ignored, and the first wrong
+choice settles the round. The answer order stays private until the
+verdict. The browser's `createWhichIsNearerEnvironment` takes six
+ports and a frame rate of at least 10 Hz. Its clock uses
+`nw_which_is_nearer_agent_event(handle, seconds, port)` with port
+−1 to advance. The interactive handle uses slot 4 set to 0 and the
+agent sets it to 1 to accept integer dials outside the menu. Native
+`libnw-agent` provides the same six-port clocked task through
+`nw_which_is_nearer_agent_create`, `nw_which_is_nearer_agent_act`,
+`nw_which_is_nearer_agent_publish`, and `nw_which_is_nearer_agent_destroy`
+with the Delay ABI and NWFB frame format.
+
+Point of View uses version 1 and task ID `2761162517`. Actions 0–4
+choose pictures in reading order and action 5 starts. The map is a
+visual cue. Public state includes the picture count, number of solids,
+colour mode, and scored outcomes. The answer port remains private.
+Browser agents use `createPointOfViewEnvironment` with five ports and
+an optional think clock. WASM calls for that clock are
+`nw_point_of_view_think_configure`, `nw_point_of_view_step`, and
+`nw_point_of_view_think_left`. Native `libnw-agent` exports
+`nw_point_of_view_agent_create`, `nw_point_of_view_agent_act`,
+`nw_point_of_view_agent_publish`, and `nw_point_of_view_agent_destroy`
+with the Notebook ABI and NWFB frames.
+
+Inside or Out? uses version 1 and task ID `3450025504`. Actions 0 and 1
+choose Inside/Yes and Outside/No. Action 2 starts the run. Public
+information fields 4–6 contain the paired-dot flag, closed-line vertex
+count, and number of decoys. The answer is private until feedback.
+`createInsideOrOutEnvironment` and the native
+`nw_inside_or_out_agent_*` exports provide two answer ports and an
+optional think clock.
+
+Touching? uses version 1 and task ID `4278212208`. Action 6 starts the
+run. Actions 0–2 choose Apart, Touching, or Overlapping in the two-shape
+mode. Actions 0–5 select a count in the touching-pairs mode. Information
+fields 4–6 give the available choice count, shape count, and thick-outline
+flag. The answer stays private until feedback.
+`createTouchingEnvironment` and the native `nw_touching_agent_*`
+exports provide a six-port stepped agent with an optional think clock.
+
+Crossings uses version 1 and task ID `3322789258`. Action 7 starts the
+run. Actions 0–6 submit crossing counts, with the maximum varying by
+rung. Information fields 4–6 give the number of choices, red-line
+point count, and decoy count. The crossing markers appear on the
+judged frame. `createCrossingsEnvironment` and native
+`nw_crossings_agent_*` exports provide seven stepped ports and an
+optional think clock.
+
+Time It uses version 1 and task ID `46880388`. Action 1 starts a run
+and action 0 presses at the most recent simulation time. Fields 4–6
+give the motion kind, elapsed milliseconds, and tolerance window.
+Fields 7, 10, and 11 expose the result, the feedback deadline, and the
+signed timing error during judgement. Browser and native agents use one
+clocked port. They can read elapsed 22,050 Hz stereo S16LE PCM through
+`nw_time_it_audio` and `nw_time_it_agent_audio`, respectively.
+
+Juggler uses version 1 and task ID `178836257`. Action 2 starts an act.
+Interactive actions 0 and 1 hold the left and right controls. Actions 3
+and 4 release them, and action 5 clears both. Fields 4–6 expose time in
+milliseconds, tray position in millimetres, and velocity in millimetres
+per second. Agent ports 0 and 1 push for one frame, and the tray brakes
+when an agent sends no action.
+
+Balance uses version 1 and task ID `2560266987`. Action 2 starts a
+course. Actions 0 and 1 hold the left or right push in interactive
+sessions. Actions 3 and 4 release them, and action 5 clears both.
+Fields 4–6 give elapsed milliseconds, cart position in millimetres,
+and pole angle in microradians. Fields 11–13 give collected flags,
+total flags, and the latest push direction. The browser and native
+clocked agents treat ports 0 and 1 as pushes for a single frame.
+
 N-Cup Monte uses `(3, 8, 1, 6, 340, 1150)` with seed 17 in the browser
 route. Its source-default cup numbers remain enabled because the shared six-
 slot options ABI has no seventh `show_numbers` field; the controller documents
@@ -659,8 +1021,11 @@ zero by default, matching the source defaults of showing working, adapting, and
 using real words. Actions 0–5 start, submit, or move the selection; action 6
 selects and submits the zero-based option in `value`. The answer accessor is
 hidden until judgment. Info fields 9–13 expose best correct level, the three
-configured flags, and generation failure. The source changes require a fresh
-artifact before these fields and actions are available.
+configured flags, and generation failure. Fields 14 and 15 expose total judged
+time in whole seconds and the number of judged questions. The task-specific
+value accessor fields 2, 3, and 4 expose each judged question’s level, correctness,
+and elapsed milliseconds; unfinished questions have no result row. The source
+changes require a fresh artifact before these fields and actions are available.
 
 Numberology's twelve common fields are phase (`READY=0`, `WORKING=1`,
 `JUDGED=2`, `DONE=3`), current level, trial, total trials, shown-term count,
@@ -837,9 +1202,31 @@ Maze's twelve common fields are phase (`READY=0`, `WALKING=1`, `SOLVED=2`,
 steps, verdict (-1/0/1), width, height, held-key mask, solved count, and
 highest rung. The additive `nw_api_v1_maze_info` accessor exposes the start,
 exit, door count, exact minimum, greedy comparison, adaptive/trail flags,
-aggregate par/steps, elapsed whole seconds, message kind, and other source
-fields. `nw_api_v1_maze_cell(handle, field, cell)` returns wall and walked
+aggregate par/steps, elapsed whole seconds, message kind, and the number of
+perfect solves at field `23`. `nw_api_v1_maze_cell(handle, field, cell)` returns wall and walked
 flags or one-based door/key colour identifiers; out-of-board cells return 0.
+
+Cookie Thief takes a level, round count, beat duration in milliseconds, setup
+duration in milliseconds, adaptive flag, and a coaching flag. Set the coaching
+flag to one for per-beat labels in an environment that pays dense outcomes.
+SDL and web gameplay use zero. Actions
+are start/next (`0`), grab (`1`), leave (`2`), lunge (`3`), and wait (`4`). Wait
+leaves the simulation unchanged until the host advances the clock. Space or
+Enter starts or advances, while Up, Down, and Right map to grab, leave, and
+lunge. Each `advance` processes at most one phase transition or beat. The common
+state includes phase (`READY=0`, `SETTING=1`, `RUNNING=2`, `SCORED=3`, `DONE=4`),
+rung, round, total rounds, beat duration, setup duration, adaptive flag, beat
+index, eaten cookies, caught count, verdict, and clean rounds. The additive
+`nw_api_v1_cookie_thief_info` accessor also exposes points and the guessing
+baseline at fields `12` and `13`. Field `14` is the coaching flag. Field `15`
+reports the visible verdict as absent (`-1`), negative (`0`), or positive
+(`1`). A round verdict overrides any coaching label on the final beat.
+
+The options screen reads each row’s choices from `nw_cookie_thief_option_value`
+and renders through `nw_cookie_thief_options_frame`. The frame includes the
+400-round guessing estimate for the selected level. Applying options through
+`nw_api_v1_cookie_thief_apply_options` is accepted on the ready and results
+screens and resets the run while preserving the random stream.
 
 Marble Maze's fields are phase (`READY=0`, `RUNNING=1`, `FEEDBACK=2`,
 `PREPARING=3`, `DONE=4`), current rung, trial, total trials, board generation,
@@ -1254,3 +1641,2017 @@ five current conformance tasks use them, and ownership/invalid-handle tests
 pass. The
 current task-specific ABI documentation is a migration aid, not a completion
 claim.
+
+### Public outcome pixel reader
+
+`nw_public_outcome_read(rgba, bytes, width, height, output)` derives the
+standard verdict scalar from a top-down RGBA framebuffer. It scans the bottom
+quarter of the image, classifies occupied columns by feedback colour, and
+joins same-colour runs across gaps shorter than `max(8, width / 40)`. Alpha
+does not affect classification. The 32-byte output contains signed 64-bit
+positive, negative, and oops label counts followed by a 64-bit floating-point
+scalar. The scalar subtracts both negative and oops labels from positive labels
+and divides by the total label count.
+
+The result is `1` when labels are present, `0` when the selected band is
+empty of labels, and `-1` for an invalid buffer or dimensions. Invalid calls
+leave the output untouched. In WebAssembly, `rgba` and `output` are linear
+memory addresses and the output requires eight-byte alignment. The native
+export takes pointers to readable input and writable output. This entry point
+reads pixels independently of receipt and frame archive verification.
+
+`nw_public_frame_digest(input, bytes, output)` writes the SHA-256 digest of
+the supplied bytes as 64 lowercase ASCII hex digits. The output has no
+terminator. It returns `1` for success or `-1` for invalid input.
+`nw_public_outcome_verify_frame(rgba, bytes, width, height, expected, scalar)`
+returns `1` when the last evidence frame has the expected digest and yields
+the supplied scalar, `0` for a mismatch or absent verdict, and `-1` for an
+invalid buffer or dimensions. The caller supplies the full evidence buffer,
+including alpha. The digest covers every supplied byte. These operations
+verify the final frame. Checking earlier evidence frames and binding receipts
+to an evidence sequence require the archive and ledger.
+
+`nw_public_outcome_verify_evidence(rgba, bytes, width, height, evidence, count,
+archive, receipt_id, receipt, scalar)` checks the ordered evidence and receipt
+before verifying the final frame. `evidence` points to `count` consecutive
+64-byte ASCII digests. `archive` points to `count` rows of two signed 64-bit
+words, the archived frame address and byte length, in digest order. Address
+zero denotes a missing frame. Pass a null archive for a single receipt-free
+frame.
+
+The host resolves the ledger lookup by receipt ID. Pass `-1` as the receipt
+ID for a receipt-free outcome. The receipt row contains seven signed 64-bit
+words in order:
+
+1. Ledger lookup key
+2. Stored receipt ID or `-1` if absent
+3. Trial sequence or `-1` if absent
+4. Stimulus digest address
+5. Feedback digest address or zero if absent
+6. Bound evidence list address or zero if absent
+7. Bound evidence digest count
+
+Each named receipt requires both an archive and a ledger record. The verifier
+checks the stimulus, optional feedback, complete bound sequence when present,
+and the original stored receipt ID and trial sequence rule. All archived frames
+are hashed against their declared digests. The result is `1` for a verified
+outcome, `0` for missing or mismatched evidence, and `-1` for invalid memory
+ranges or malformed ABI input. The host owns archive and ledger storage and
+validates external outcome object fields before marshalling the typed ABI.
+
+The web runtime returned by `instantiateElisa` exposes
+`verifyPublicOutcome(outcome, rgba, width, height, archive, ledger)`. It
+accepts top-down RGBA byte arrays and archives and ledgers keyed by digest and
+receipt ID as Maps or plain objects. It validates the public outcome fields,
+marshals the evidence into WebAssembly memory, and frees the temporary
+buffers after verification. It returns a boolean. The browser host supplies
+the frame and owns the archive and receipt ledger.
+
+The web runtime also exposes `createPublicFrameArchive(context)` for a 2D
+canvas context. The shell binds its main context at
+`window.__nw.createPublicFrameArchive()`. The host calls `capture()` after
+drawing a significant frame. The result includes the backing-buffer
+dimensions, top-down RGBA bytes, SHA-256 digest, sequence number, and
+monotonic timestamp in nanoseconds. `get(digest)` returns a copy of archived
+bytes. `verify(outcome, frame, ledger)` uses the private archive, and
+`clear()` releases its entries. Receipts are supplied by the caller.
+
+The archive's `createReceiptSession({ ports, drive, neutralOutcomes })` lets a
+host bind a response to the rendered stimulus. Call `open()` after drawing
+the stimulus, then call `act(port, logp)` to dispatch one zero-based action
+through the synchronous driver. After the driver returns, call `publish()`
+on rendered frames to capture evidence. By default the receipt settles on the
+first frame with a readable verdict. With `neutralOutcomes` enabled, the first
+published frame after the action can settle the receipt with a scalar of zero.
+The generic archive verifier requires a readable pixel verdict for that
+scalar. The task verifier described below can also verify a concession.
+`getReceipt(id)` returns a copy of the receipt, and `verify(outcome, frame)`
+checks it against the session ledger and archived pixels. `closeWindow()`
+ends the current response window. `clear()` also removes the ledger and
+archived frames.
+
+`createCookieThiefEnvironment(context, options)` is available from the
+instantiated runtime and from the web shell's `window.__nw` interface. Pass
+a dedicated 2D canvas context. The stepped run starts immediately, uses a
+virtual 60 Hz clock, and accepts zero-based grab, leave, lunge, and wait
+ports. The default setup and beat durations use 16 ms to fit one virtual
+tick at the controller's millisecond resolution. Call `observe()` to read
+the current frame and `advance()` to tick and draw the next frame. The
+`act(port, logp)`, `getReceipt(id)`, and `verify(outcome, frame)` methods
+use the same receipt protocol as the archive. The following advance deals
+from a scored frame. Call `close()` to release the controller and evidence.
+
+Cookie Thief observations expose `frame_seq`, `timestamp_ns`, `width`,
+`height`, `rgba`, and `done`, plus an `outcome` when one is published.
+`step(ports)` returns the observation, queued events, and completion flag
+as a three-element array. It drains the event queue, including the final
+`run_end` event. A sparse verdict binds to the full round's evidence even
+if the caller left its response window idle. `reset(seed)` clears that
+run's receipts, evidence, events, and counters. `accounting.snapshot()`
+reports trial, frame, outcome, and latency counters. The browser returns a
+copy of every observation synchronously, so the dropped and duplicate frame
+counters remain zero. Use `frameHz` to configure the virtual clock and
+`runtimePorts` to configure the advertised action count. Extra ports are
+accepted as inert actions in neutral-outcome mode.
+
+The native and WebAssembly `nw_public_outcome_verify_task_evidence` export
+takes the same arguments as `nw_public_outcome_verify_evidence`. It accepts a
+zero concession on any valid frame with matching digests and receipt
+evidence. Nonzero claims still require a matching pixel verdict. Browser
+hosts can call `verifyTaskOutcome` on the instantiated runtime. Cookie
+Thief uses this verifier, and its session requires the receipt to have
+settled before accepting a claim. The generic verifier retains its
+pixel-derived scalar rule for all claims.
+
+Cookie Thief accepts an optional `frameExport` SharedArrayBuffer. Allocate
+at least 36 bytes plus four bytes per canvas pixel and pass the same buffer
+to the reader. Each published frame writes the Python NWFB version 1
+header followed by top-down RGBA. The writer leaves the most recent frame
+in the caller-owned buffer on close. The buffer is a one-way observation
+channel. Readers must coordinate reads with completed publications when
+they need a consistent snapshot. Browsers require a cross-origin isolated
+page for SharedArrayBuffer use. Set `NW_WEB_SHARED_FRAMES=1` when running
+`serve_web.sh` to enable the isolation headers on the local server.
+
+The native and WebAssembly `nw_frame_export_header` export writes 36 bytes
+to a caller-supplied destination. Its arguments after the destination and
+capacity are unsigned 64-bit frame sequence and timestamp, unsigned 32-bit
+width and height, and the consumed flag. It returns 36 on success and -1
+for an invalid destination. Cookie Thief publishes frames with the consumed
+flag clear, matching the Python environment, and rejects positive
+`thinkSeconds` because the task already has its own clock.
+
+Native hosts can call `nw_frame_shared_create(name, capacity)` to create a
+named NWFB mapping and receive an opaque owner handle. The name uses UTF-8
+and the capacity includes the header and pixel bytes. Creation returns
+zero if the name is occupied or the OS cannot allocate the mapping.
+`nw_frame_shared_publish(handle, sequence, timestamp_ns, width, height,
+pixels, bytes, consumed)` copies a tightly packed top-down RGBA frame and
+returns the bytes written, or -1 for invalid dimensions or capacity.
+`nw_frame_shared_release(&handle)` releases ownership and clears the
+handle. POSIX release unlinks the name, and a Windows mapping persists
+until the last process releases its view and handle. Callers coordinate
+reads and choose a capacity large enough for the frames they will publish.
+
+Set `NW_SHM` to a free shared-memory name to publish desktop SDL frames.
+The desktop reads back the rendered pixels before presentation and
+publishes a sequence number and SDL monotonic timestamp with each frame.
+The mapping is released when its renderer closes. If the framebuffer grows
+beyond the allocation, a reader must reattach to the replacement mapping.
+On Windows, an attached reader must close its old view before a replacement
+can use the same name. A failed mapping creation is logged and leaves the
+desktop running.
+
+Marble Maze composites its WebGL stage into the main 2D canvas before
+archive capture. For a graphical archive check, open the web shell in a
+headless Playwright session with `marble-test-hooks=1` and
+`marble-test-freeze-clock=1`, then pass
+`test/marble_frame_archive_browser_replay.js` to Playwright CLI
+`run-code --filename`. The replay compares archived stage pixels to the
+WebGL canvas and recomputes the archived frame's SHA-256.
+
+For a Linux graphical desktop check, run
+`test/sdl_marble_shared_frame_x11_test.py` under `xvfb-run` with a
+MuJoCo-enabled desktop binary as its argument. The replay uses Python 3.13
+or later, X11, and XTest. It starts a tray, reads the composited stage
+through NWFB, and checks that normal quit releases the named mapping.
+
+
+### Lander
+
+Lander uses task ID `2771681963`. Create options 0–2 select the
+starting rung, landings per run, and adaptive difficulty. Up, Left, and
+Right take key-down and key-up events. Focus loss and cancellation
+clear held controls. Agent ports 0–4 fire, turn left, turn right, fire
+while turning left, and fire while turning right for one frame.
+
+`nw_api_v1_lander_info` exposes phase, rung, trial, total, flight time
+in milliseconds, position in millimetres, verdict, landings passed,
+highest rung passed, verdict deadline in milliseconds, velocity in
+millimetres per second, tilt in degrees, remaining fuel in milliseconds
+(`-1` for unlimited), and whether the engine is firing. Outside the
+relevant phase, verdict and deadline read as `-1`.
+
+
+### Keep the Beat
+
+Keep the Beat uses task ID `4282310537`. Create options 0–2 select
+the starting rung, songs per run, and adaptive difficulty. Agent
+port 0 taps at the last published model time. `nw_beat_audio`
+reads elapsed stereo signed 16-bit little-endian PCM at 22,050 Hz.
+
+`nw_api_v1_beat_info` exposes phase, rung, song number, total,
+silent beat count, elapsed milliseconds, scoring window in
+milliseconds, verdict, songs passed, highest rung passed, verdict
+deadline in milliseconds, tap count, curtain state, hits, stray
+taps, and song end in milliseconds, in field order 0–15.
+
+
+### Shadow Play
+
+Shadow Play uses task ID `2286122724`. Create options 0–2 select
+the starting rung, trials per run, and adaptive difficulty. Option 3
+enables agent dials, which accept any positive rung and trial count.
+
+`nw_shadow_play_advance(handle, seconds, held)` takes an absolute clock
+in seconds and a six-bit held-control mask. From bit 0 to bit 5 the
+controls turn left, turn right, pitch down, pitch up, roll left, and
+roll right. The same order applies to the six agent ports in
+`nw_shadow_play_agent_event`. Port 6 starts and port -1 advances one
+agent frame. Use separate handles for interactive and agent clocks.
+
+`nw_shadow_play_drag(handle, dx, dy, roll)` takes deltas in reference
+canvas coordinates with positive y upward. Set `roll` to 1 for roll
+and 0 for turn and pitch. `nw_shadow_play_audio` reads elapsed stereo
+signed 16-bit little-endian PCM at 22,050 Hz.
+
+`nw_api_v1_shadow_play_info` exposes phase, rung, trial, total trials,
+elapsed milliseconds, fit per thousand, available axes, verdict,
+trials passed, highest rung passed, verdict deadline in milliseconds,
+fit start in elapsed milliseconds, and floor shadow, in field order
+0–12.
+
+The native agent library provides `nw_shadow_play_agent_create`,
+`nw_shadow_play_agent_act`, `nw_shadow_play_agent_publish`,
+`nw_shadow_play_agent_audio`, and `nw_shadow_play_agent_destroy`.
+Its first publication opens the initial trial without advancing its
+clock. Subsequent publications take elapsed seconds and return a frame
+and receipt metadata using the native agent ABI.
+
+### Captcha
+
+Captcha uses task ID `1314221109`. Create options 0–2 select the starting
+rung, trials, and adaptive difficulty. Option 3 enables unrestricted
+positive rung and trial dials. Action ports 0–22 type
+`ACDEFGHJKMNPQRTUVWXY347` in order. Port 23 erases, port 24 submits,
+and port 25 starts. Common advance uses the interactive 2,500 ms feedback
+deadline.
+
+`nw_api_v1_captcha_info` exposes phase, rung, trial, total trials, typed
+length, verdict, passed count, highest rung passed, feedback deadline
+in milliseconds, and forfeits, in field order 0–9. The answer is present in the verdict
+frame when the trial settles. The scene carries clockwise glyph rotation
+in the text command's `e` field and the one-based typeface slot in `f`.
+
+The stepped browser environment uses the same action ports.
+`nw_captcha_think_configure` configures the bank before start.
+`nw_captcha_step` consumes elapsed seconds while the trial is open
+and publishes one frame of the verdict before dealing again. A forfeit
+uses phase 4, displays “Out of time”, and leaves the rung and graded
+answer count unchanged. The clock refills after the new deal is
+published. `nw_captcha_think_left` returns the remaining seconds.
+Use separate handles for stepped and interactive clocks.
+
+The native agent library exposes `nw_captcha_agent_create`,
+`nw_captcha_agent_act`, `nw_captcha_agent_publish`, and
+`nw_captcha_agent_destroy`. The first publication opens the receipt
+without charging elapsed time. Native agent frames use SDL's rotated
+bitmap glyphs.
+
+### Signals
+
+Signals uses task ID `3284569614`. Create options 0–2 select the starting
+rung, games per run, and adaptive difficulty. Ports 0–7 pick an object,
+ports 8–15 send a glyph, and port 16 starts or restarts a run. An exchange
+with a two-glyph message settles after the second glyph. Advance observes
+the 2,800 ms result deadline.
+
+`nw_api_v1_signals_info` exposes phase, rung, trial, configured games,
+completed exchanges, verdict, games passed, highest rung passed, feedback
+deadline in milliseconds, understood exchanges, total exchanges, and role
+in fields 0–11. Role 0 is listening and role 1 is speaking. The display list
+shows the partner's message or the player's target and partial message.
+SDL uses screen 83 for `--screen signals` and exposes the same fields
+in `--dump`.
+
+The stepped Signals environment uses 16 action ports and starts the run
+automatically. Configure the bank before starting with
+`nw_signals_think_configure`. `nw_signals_step` publishes one verdict
+frame and then deals the next game. A think-clock forfeit paints
+“Out of time,” consumes one game, and leaves the rung unchanged.
+Field 12 counts forfeits and `nw_signals_think_left` returns the
+remaining bank in seconds. The browser runtime exposes
+`createSignalsEnvironment`. The native agent library exposes
+`nw_signals_agent_create`, `nw_signals_agent_act`,
+`nw_signals_agent_publish`, and `nw_signals_agent_destroy`.
+
+### Fold It
+
+Fold It uses task ID `3561462226`. Create options 0–2 select the starting
+rung, nets per run, and adaptive difficulty. Option 3 enables positive
+integer dials beyond the interactive options menu. Ports 0–5 choose
+answers and port 6 starts or restarts the run. Interactive advance
+observes the 2,500 ms feedback deadline.
+
+`nw_api_v1_fold_it_info` exposes phase, rung, trial, total, choice count,
+net index, revealed answer, chosen answer, pass verdict, passed count,
+highest rung passed, scored count, forfeits, and deadline in fields
+0–13. The revealed answer is available after grading.
+
+The browser’s `createFoldItEnvironment` uses the same six answer ports.
+Configure its bank with `nw_fold_it_think_configure` before starting.
+`nw_fold_it_step` retains the verdict for one publication and then
+deals the next net. `nw_fold_it_think_left` reports the remaining bank
+in seconds. SDL uses screen 84 for `--screen fold-it` and exposes the
+same fields in `--dump`. The native library exposes
+`nw_fold_it_agent_create`, `nw_fold_it_agent_act`,
+`nw_fold_it_agent_publish`, and `nw_fold_it_agent_destroy`.
+
+### Who Knows What?
+
+Who Knows What? uses task ID `163698951`. Create options 0–2 select the
+starting rung, stories per run, and adaptive difficulty. Option 3 enables
+positive integer dials beyond the interactive options menu. Ports 0–3
+choose answers and port 4 starts or restarts the run. Interactive advance
+uses the 2,500 ms feedback deadline.
+
+`nw_api_v1_who_knows_what_info` exposes phase, rung, trial, total, choice
+count, panel count, revealed answer, chosen answer, pass verdict, passed
+count, highest rung passed, scored count, forfeits, and deadline in fields
+0–13. The answer is available after grading.
+
+The browser’s `createWhoKnowsWhatEnvironment` starts automatically.
+`nw_who_knows_what_think_configure` configures the bank before start,
+`nw_who_knows_what_step` advances the stepped controller, and
+`nw_who_knows_what_think_left` reports the remaining seconds.
+With a think clock, a timeout consumes the story without changing
+the rung or the graded answer count. SDL uses screen 85 for
+`--screen who-knows-what` and exposes the same fields in `--dump`.
+The native library exposes `nw_who_knows_what_agent_create`,
+`nw_who_knows_what_agent_act`, `nw_who_knows_what_agent_publish`,
+and `nw_who_knows_what_agent_destroy`.
+
+### Sonar
+
+Sonar uses task ID `3424761748`. Create options 0–2 select the
+starting rung, rounds per run, and adaptive difficulty. Option 3
+enables positive integer dials outside the interactive choices.
+Options 4 and 5 are zero.
+
+Action ports 0–3 move the cursor up, down, left, and right. Port 4 pings,
+port 5 digs, and port 6 starts or restarts. Arrow keys move the cursor.
+P and Space ping during a round, and D and Enter dig. P and D use logical
+key codes 32 and 33. A primary board press pings. A secondary press or
+Shift-primary press digs. The controller advances after 1,800 ms of
+feedback.
+
+`nw_api_v1_sonar_info` fields 0–14 return phase, current rung, round
+number, total rounds, board side, cursor cell, actions used, cost,
+twice par, passes, best rung passed, last pass flag, feedback deadline
+in milliseconds, elapsed trial milliseconds, and forfeits. Cells are numbered
+from the top-left in row-major order. The pass flag and elapsed time
+are available after judgment, and the deadline is available during
+feedback. `nw_sonar_options_note` writes the source option preview as
+UTF-8.
+
+SDL uses screen 87 for `--screen sonar` and exposes the same fields
+in `--dump`. It reads `SONAR_RUNG`, `SONAR_TRIALS`, and
+`SONAR_ADAPTIVE` from the profile and saves edits to the profile's
+`.sonar-options` sidecar.
+
+The browser's `createSonarEnvironment` starts automatically with six
+action ports. `nw_sonar_think_configure` sets the optional bank before
+start, `nw_sonar_step` advances one publication, and
+`nw_sonar_think_left` reports seconds remaining. A timeout publishes
+one red verdict frame and consumes a round. The rung and scored-round
+count stay as they were before the timeout. The next round refills the
+bank up to capacity.
+
+The native library exports `nw_sonar_agent_create`,
+`nw_sonar_agent_act`, `nw_sonar_agent_publish`, and
+`nw_sonar_agent_destroy`. The publish call returns the standard
+receipt and frame packet and supports the 24×24 board.
+
+### Dispatch
+
+Dispatch uses task ID `2857709163`. Create options 0–2 select starting
+rung, rounds per run, and adaptive difficulty. Option 3 permits positive
+integer rung and round counts outside the interactive choices. Option 4
+enables per-incident coaching for stepped callers using option 3. Option 5
+is zero.
+
+Action ports 0–3 select a unit, 4–11 target incidents, 12–14 target
+stations, 15–17 target refits, and 18 starts or restarts. Logical
+key codes 35–42 represent A–H, and 43–45 represent J/K/L. The Shift
+modifier changes a station order into a refit. Pointer targets use the
+same coordinates, and clicking away from every target clears selection.
+
+`nw_api_v1_advance` takes elapsed active milliseconds. Running rounds
+advance in 50 ms simulation steps with carry between calls and a
+250 ms cap per call. Judgment uses a 2,200 ms logical deadline.
+`nw_dispatch_options_note` writes the starting-rung description as
+UTF-8. The web shell saves options under `nw.dispatch.options.v1`
+and accepts a non-negative signed 64-bit `dispatch-seed` URL parameter.
+
+SDL assigns screen 89 to `--screen dispatch` and includes it after Sonar
+in Decisions. Space starts or restarts a run. Keys 1–4 select units,
+A–H target incident slots, J/K/L target stations, and Shift+J/K/L
+target refits. Mouse orders follow the map hit targets and use the
+same station modifier.
+
+SDL reads `DISPATCH_RUNG`, `DISPATCH_TRIALS`, and
+`DISPATCH_ADAPTIVE` from the profile and saves edits in its
+`.dispatch-options` sidecar. The WASM state packet,
+`nw_api_v1_dispatch_info`, and SDL `--dump` fields are phase,
+current rung, round number, total rounds, selected unit, open reports,
+reports seen, rounded damage, passes, best rung passed, starting rung,
+and adaptive flag. The selected unit is `-1` when the selection is clear.
+The task-specific WASM info export also reports the active coaching cue
+at field 12. It returns 0 without a cue, 1 for a save, and 2 for a loss.
+
+`createDispatchEnvironment` exposes the 18 agent ports. The town advances
+with every step, including an idle step. `nw_dispatch_agent_event` takes
+absolute virtual seconds, with port `-1` for a tick. A judgment paints one
+frame before the next step moves on to the following round or completion.
+The browser and native agent hosts enable coaching only with neutral
+outcomes and the coach option. They derive event and round rewards from
+the painted verdict and attach them to the action's receipt.
+
+The native library exports `nw_dispatch_agent_create`,
+`nw_dispatch_agent_act`, `nw_dispatch_agent_publish`, and
+`nw_dispatch_agent_destroy`. The constructor accepts the starting rung,
+round count, adaptive flag, seed, runtime port count, neutral-outcomes
+flag, and coach flag.
+
+### Gamble
+
+Gamble uses task ID `816838233`. Create options 0–2 select starting rung,
+rounds per run, and adaptive difficulty. Option 3 permits positive integer
+rungs and round counts beyond the interactive choices. Options 4 and 5
+are zero.
+
+Ports 0–7 pull the corresponding machine, port 8 stops a paid round, and
+port 9 starts or restarts. Keyboard controls use Space, digits 1–8, and
+S. The logical key code for S is 34. A primary press starts from the
+ready or finished screen, or activates a machine or Stop during play.
+Judgment advances after 3,000 ms.
+
+`nw_api_v1_gamble_info` fields 0–10 return phase, current rung, round number,
+total rounds, pulls used, net coins, passes, best rung passed, starting rung,
+the adaptive flag, and think-clock forfeits. The state packet carries the
+same values in its first eleven fields.
+`nw_gamble_options_note` writes the starting-rung description as UTF-8.
+
+The web shell stores options under `nw.gamble.options.v1` and accepts a
+non-negative signed 64-bit `gamble-seed` URL parameter for replay. SDL
+assigns screen 88 to `--screen gamble`, exposes fields 0–9 in `--dump`,
+and reads `GAMBLE_RUNG`, `GAMBLE_TRIALS`, and `GAMBLE_ADAPTIVE` from the
+profile. It saves edits in the profile's `.gamble-options` sidecar.
+
+The browser's `createGambleEnvironment` starts automatically with nine
+action ports. `nw_gamble_think_configure`, `nw_gamble_step`, and
+`nw_gamble_think_left` expose the stepped clock. Each forfeit paints one
+red verdict frame, consumes a round, and leaves the rung and scored-round
+count unchanged. The next round refills the clock up to capacity.
+
+The native library exports `nw_gamble_agent_create`,
+`nw_gamble_agent_act`, `nw_gamble_agent_publish`, and
+`nw_gamble_agent_destroy`. Publication returns the shared frame format
+and the receipt that identifies the action or expired response window.
+
+### Bluff
+
+Bluff uses task ID `3952940662`. Create options 0–2 select the starting
+rung, rounds per run, and adaptive progression. Option 3 permits the agent
+interface to use positive rungs and round counts outside the interactive
+choices. Options 4 and 5 are zero.
+
+Action ports 0 and 1 select the passive and aggressive moves. Port 2
+starts or restarts. The browser maps the original keyboard shortcuts
+to logical keys 12 and 13, accepts only primary pointer presses, and
+stores options under `nw.bluff.options.v1`. Use `bluff-seed` to replay a
+non-negative signed 64-bit seed.
+
+SDL assigns screen 90 to `--screen bluff` and lists it in Decisions.
+Press Space or click to start or restart. During play, 1, K, or F chooses
+the passive action, and 2, B, or C chooses the aggressive action. A primary
+click activates the visible action button. Round feedback lasts 3,000 ms.
+
+C opens options from the ready or finished screen. SDL reads `BLUFF_RUNG`,
+`BLUFF_TRIALS`, and `BLUFF_ADAPTIVE` from the profile and saves edits in its
+`.bluff-options` sidecar. The `--dump` fields 0–9 give the phase, current
+rung, round number, total rounds, completed hands, chips, passes, best rung
+passed, starting rung, and adaptive flag.
+
+The WASM state packet and `nw_api_v1_bluff_info` include a forfeit count
+in field 10. `createBluffEnvironment` starts automatically and exposes
+two ports. `nw_bluff_think_configure`, `nw_bluff_step`, and
+`nw_bluff_think_left` drive its think clock. An expired clock publishes
+one red verdict frame, consumes the round, and leaves the rung unchanged.
+Starting the next round refills the clock up to capacity.
+
+The native library exposes `nw_bluff_agent_create`, `nw_bluff_agent_act`,
+`nw_bluff_agent_publish`, and `nw_bluff_agent_destroy` through the shared
+frame and receipt protocol.
+
+### Explore or Exploit
+
+Explore or Exploit uses task ID `3798735432`. Create options 0–2 select
+the starting rung, runs, and adaptive progression. Option 3 allows agent
+sessions to use positive rungs and run counts outside the interactive
+choices. Options 4 and 5 are zero.
+
+Ports 0–7 pull the corresponding machine. Ports beyond the current
+machine count leave the deal unchanged. Port 8 starts or restarts.
+The desktop and browser accept Space, digits 1–8, and primary clicks.
+Batch rounds reveal pending coins and machine history every five pulls.
+The desktop and browser advance from the verdict after 3,000 ms.
+
+SDL assigns screen 91 to `--screen explore-exploit`. It reads
+`EXPLORE_EXPLOIT_RUNG`, `EXPLORE_EXPLOIT_TRIALS`, and
+`EXPLORE_EXPLOIT_ADAPTIVE` from profiles and stores edits in the
+`.explore-exploit-options` sidecar. The browser stores options under
+`nw.explore_exploit.options.v1` and accepts an `explore_exploit-seed`
+query parameter. Applying options preserves the current random stream.
+
+State fields 0–9 give the phase, current rung, run number, total runs,
+pull count, revealed coins, passes, highest rung passed, starting rung,
+and adaptive flag. The WASM info export and state packet also give the
+forfeit count in field 10.
+
+`createExploreOrExploitEnvironment` starts automatically with eight ports.
+Its think clock publishes one red verdict when it expires, consumes the
+run, and refills up to capacity on the next deal. The native library exports
+`nw_explore_exploit_agent_create`, `nw_explore_exploit_agent_act`,
+`nw_explore_exploit_agent_publish`, and `nw_explore_exploit_agent_destroy`
+through the shared frame and receipt protocol.
+
+### Firebreak
+
+Firebreak uses task ID `2288460636`. Create options 0–2 select the starting
+rung, fires per run, and adaptive progression. Option 3 permits positive
+rungs and run counts outside the interactive choices for agent sessions.
+Options 4 and 5 are zero.
+
+Ports 0–3 move the cursor up, down, left, and right. Port 4 digs. Ports
+5–8 move four cells in those same directions. Port 9 starts or restarts.
+Interactive ports 10–579 place the cursor on a row-major board cell and
+attempt a dig. Shift-arrow moves four cells. Space starts from the ready
+or finished screen. Space, Enter, and board clicks dig during play.
+
+SDL assigns screen 92 to `--screen firebreak`, reads the Python profile's
+`FIREBREAK_RUNG`, `FIREBREAK_TRIALS`, and `FIREBREAK_ADAPTIVE` values,
+and saves edits in its `.firebreak-options` sidecar. The browser stores
+options under `nw.firebreak.options.v1` and accepts a `firebreak-seed` query
+parameter. Applying options preserves the current random stream.
+
+State fields 0–11 give the phase, current rung, round number, total rounds,
+cursor column and row, shovels, verdict, passes, highest rung passed,
+starting rung, and adaptive flag. The verdict is zero during play, one
+for a burned town, two for a saved town, and three for timeout.
+
+`createFirebreakEnvironment` starts automatically with nine ports.
+`nw_firebreak_agent_event` advances the fire on port −1 and accepts the
+nine crew actions between ticks. The native library exposes
+`nw_firebreak_agent_create`, `nw_firebreak_agent_act`,
+`nw_firebreak_agent_publish`, and `nw_firebreak_agent_destroy`.
+
+### Crossroads
+
+Crossroads uses task ID `601803310`. Create options 0–2 select the
+starting rung, shifts per run, and adaptive progression. Option 3
+permits positive rungs and trial counts outside the interactive choices
+for agent sessions. Options 4 and 5 are zero.
+
+Ports 0–3 request a light switch at the corresponding junction. Port
+4 starts or restarts the run. Interactive players use Space to start
+and number keys 1–4 or a junction click to switch its lights. The
+interactive clock clamps elapsed time to 100 ms and subdivides it into
+steps no larger than 1/60 s. A verdict stays visible for three seconds.
+
+SDL assigns screen 93 to `--screen crossroads`, reads
+`CROSSROADS_RUNG`, `CROSSROADS_TRIALS`, and `CROSSROADS_ADAPTIVE`
+from the selected profile, and saves edits to `.crossroads-options`.
+The browser stores options under `nw.crossroads.options.v1` and
+accepts a `crossroads-seed` query parameter.
+
+State fields 0–11 give the phase, current rung, shift number, total
+shifts, active cars, processed arrivals, served cars, verdict, wins,
+highest rung passed, starting rung, and adaptive flag. The verdict is
+zero during play, one for a clear shift, two for gridlock, and three
+for an ambulance held up.
+
+`createCrossroadsEnvironment` starts automatically with four ports.
+`nw_crossroads_agent_event` advances on port −1 and accepts light
+switch requests between ticks. The native library exposes
+`nw_crossroads_agent_create`, `nw_crossroads_agent_act`,
+`nw_crossroads_agent_publish`, and `nw_crossroads_agent_destroy`.
+
+### Rail Yard
+
+Rail Yard uses task ID `3428277734`. Create options 0–2 select the
+starting rung, yards per run, and adaptive progression. Set option 3
+to one to use positive rungs and trial counts outside the interactive
+choices. Options 4 and 5 are zero.
+
+Ports 0–14 throw the points numbered 1–15. Ports 15–16 toggle the
+two tunnel signals. Available controls depend on the yard layout.
+Port 17 starts or restarts. Interactive players can press 1–9 for
+points, Q or W for signals, or click any point or signal. The
+interactive clock clamps frames to 100 ms, splits them into
+simulation steps no longer than 1/60 s, and advances after three
+seconds of verdict feedback.
+
+SDL assigns screen 94 to `--screen rail-yard`. It reads
+`RAILYARD_RUNG`, `RAILYARD_TRIALS`, and `RAILYARD_ADAPTIVE`
+from the selected profile and writes `.railyard-options`. The
+browser stores options under `nw.railyard.options.v1` and accepts
+a `rail-yard-seed` query parameter.
+
+State fields 0–11 report the phase, current rung, yard number,
+yards per run, scheduled trains, trains that reached a station,
+trains home, verdict, passing yards, highest rung passed, starting
+rung, and adaptive flag. Verdict values 0–6 represent play in
+progress, a pass, a routing loss, a failed timeout, derailment,
+collision, and a passing timeout. The finished screen keeps the
+last verdict visible.
+
+`createRailYardEnvironment` starts with 17 action ports.
+`nw_railyard_agent_event` accepts actions between clock ticks and
+advances time on port −1. The native library exposes
+`nw_railyard_agent_create`, `nw_railyard_agent_act`,
+`nw_railyard_agent_publish`, and `nw_railyard_agent_destroy`.
+
+### Air Traffic
+
+Air Traffic uses task ID `3001039441`. Create options 0–2 select the
+starting rung, skies per run, and adaptive progression. Option 3
+permits positive rungs and trial counts outside the interactive
+choices. Options 4 and 5 are zero.
+
+Ports 0–7 select aircraft slots. Ports 8–11 order hold, left, right,
+and land. Port 12 starts or restarts. Interactive players select
+with 1–8 or click an aircraft, hold with H, turn with A/D or the
+arrow keys, and land with L or by clicking the selected aircraft’s
+assigned runway. The interactive clock clamps frames to 100 ms and
+splits them into steps no longer than 1/60 s. Verdict feedback lasts
+three seconds.
+
+SDL assigns screen 95 to `--screen air-traffic`. It reads
+`AIRTRAFFIC_RUNG`, `AIRTRAFFIC_TRIALS`, and `AIRTRAFFIC_ADAPTIVE`
+from the profile and saves edits to `.airtraffic-options`. The
+browser stores options under `nw.airtraffic.options.v1` and accepts
+the `air-traffic-seed` query parameter.
+
+State fields 0–11 report phase, current rung, sky number, skies per
+run, scheduled aircraft, aircraft aloft, aircraft landed, verdict,
+passes, highest rung passed, starting rung, and adaptive flag.
+Verdict values 0–6 represent play in progress, a clear sky, timeout,
+fuel loss, airspace loss, storm loss, and collision.
+
+`createAirTrafficEnvironment` starts with 12 ports.
+`nw_airtraffic_agent_event` accepts orders between ticks and advances
+time on port −1. The native library exposes
+`nw_airtraffic_agent_create`, `nw_airtraffic_agent_act`,
+`nw_airtraffic_agent_publish`, and `nw_airtraffic_agent_destroy`.
+
+### Escort
+
+Escort uses task ID `3128828853`. Create options 0–2 select the
+starting rung, temples per run, and adaptive progression. Option 3
+permits positive rungs and trial counts outside the interactive
+choices. Options 4 and 5 are zero.
+
+Ports 0–5 pull the corresponding lever when present. Port 6 starts
+or restarts. Interactive players use keys 1–6 or click a lever or its
+linked device. A lever can switch two devices at higher rungs.
+The clock clamps interactive frames to 100 ms, subdivides them into
+steps no longer than 1/60 s, and shows verdict feedback for three seconds.
+
+SDL assigns screen 96 to `--screen escort`. It reads `ESCORT_RUNG`,
+`ESCORT_TRIALS`, and `ESCORT_ADAPTIVE` from the profile and saves
+edits to `.escort-options`. The browser stores options under
+`nw.escort.options.v1` and accepts the `escort-seed` query parameter.
+
+State fields 0–11 give phase, current rung, temple number, temples
+per run, walkers, levers, walkers through, verdict, wins, highest
+rung passed, starting rung, and adaptive flag. Verdict values 0–4
+represent play in progress, a successful crossing, a pit fall,
+a flame loss, and timeout.
+
+`createEscortEnvironment` starts with six ports.
+`nw_escort_agent_event` handles lever pulls and advances the clock
+on port −1. The native library exposes `nw_escort_agent_create`,
+`nw_escort_agent_act`, `nw_escort_agent_publish`, and
+`nw_escort_agent_destroy`.
+
+### Sokoban Live
+
+Task ID `95000669` uses create options 0–2 for the starting rung,
+warehouse count, and adaptive mode. The settings menu offers rungs
+1, 4, 7, 10, 13, 16, 20, 25, and 30 and counts 1, 3, 5, 10, and 20.
+Option 3 enables stepped agent mode. SDL opens screen 97 via
+`--screen sokoban-live`,
+reads the original `SOKOBANLIVE_RUNG`, `SOKOBANLIVE_TRIALS`, and
+`SOKOBANLIVE_ADAPTIVE` profile keys, and saves edits to
+`.sokobanlive-options`. The browser uses `sokoban-live-seed` and
+`nw.sokobanlive.options.v1`.
+
+Movement actions 0–3 map to up, down, left, and right, using the
+arrow keys or WASD. Action 4 starts or restarts a run, as does a
+left click on the ready or done scene. Moves recover for 0.18 s.
+
+State fields 0–11 contain phase, current rung, trial, total trials,
+pushes, steps, covered pads, verdict, wins, best rung, starting rung,
+and adaptive mode. Verdict values 0–4 mean live, success, caught by
+a guard, stuck crate, and timeout.
+
+`createSokobanLiveEnvironment` exposes four ports.
+`nw_sokobanlive_agent_event` accepts movement on ports 0–3 and
+advances the clock on port −1. The native library exports
+`nw_sokobanlive_agent_create`, `nw_sokobanlive_agent_act`,
+`nw_sokobanlive_agent_publish`, and `nw_sokobanlive_agent_destroy`.
+
+### Kitchen
+
+Task ID `870733615` uses create options 0–2 for the starting rung,
+shifts per run, and adaptive mode. Option 3 enables stepped agent
+mode. The SDL route is screen 98, also available as `--screen kitchen`.
+SDL reads `KITCHEN_RUNG`, `KITCHEN_TRIALS`, and `KITCHEN_ADAPTIVE` from
+the existing profile and saves edits to `.kitchen-options`. The browser
+uses `kitchen-seed` and `nw.kitchen.options.v1`.
+
+Action ports 0–12 select crates 1–4, boards Q and W, stoves E, R and T,
+plates A and S, the pass D, and the bin F. The keyboard dispatch codes are
+12–15 for the crates and 68–76 for the remaining stations. A pointer
+press selects the nearest station within one walking unit. Action 13,
+Space, or a left click starts from the ready or done screen.
+
+State fields 0–11 contain phase, current rung, trial, total trials,
+served tickets, lapsed tickets, total tickets in the current shift,
+verdict, wins, best rung, starting rung, and adaptive mode. Verdict
+values 0–2 mean live, cleared, and ticket expiration.
+
+`createKitchenEnvironment` exposes 13 ports. `nw_kitchen_agent_event`
+accepts station orders and advances the clock on port −1. The native
+library exports `nw_kitchen_agent_create`, `nw_kitchen_agent_act`,
+`nw_kitchen_agent_publish`, and `nw_kitchen_agent_destroy`.
+
+### Crane
+
+Task ID `462731910` uses create options 0–2 for the starting rung, yards
+per run, and adaptive mode. Option 3 enables stepped agent mode. SDL
+opens screen 99 with `--screen crane`, reads the existing `CRANE_RUNG`,
+`CRANE_TRIALS`, and `CRANE_ADAPTIVE` profile keys, and saves to
+`.crane-options`. The browser uses `crane-seed` and `nw.crane.options.v1`.
+
+Ports 0–3 drive left, drive right, hoist up, and hoist down. Port 4
+grabs or releases, and port 5 starts a run. Arrows and WASD can be held,
+with left, right, up, and down in priority order. Key release clears that
+physical key, and focus loss clears all held controls. A left click or
+Space starts from the ready or done screen. Space and Enter grab or
+release during play.
+
+Fields 0–14 report phase, current rung, trial, total trials, containers
+placed, container count, elapsed milliseconds, verdict, wins, best
+rung, starting rung, adaptive mode, trolley position in millimeters,
+cable length in millimeters, and held container index (−1 for empty).
+Verdict codes 0–6 represent live, clear, hard drop, wrong bay, outside
+bay, collision, and timeout.
+
+`createCraneEnvironment` exposes the five control ports.
+`nw_crane_agent_event` advances on port −1. The native library exports
+`nw_crane_agent_create`, `nw_crane_agent_act`, `nw_crane_agent_publish`,
+and `nw_crane_agent_destroy`.
+
+### Ferry
+
+Task ID `709946811` uses create options 0–2 for the starting rung, rivers
+per run, and adaptive mode. Option 3 enables stepped agent mode. SDL
+opens screen 100 with `--screen ferry`, reads `FERRY_RUNG`, `FERRY_TRIALS`,
+and `FERRY_ADAPTIVE`, and saves to `.ferry-options`. The browser uses
+`ferry-seed` and `nw.ferry.options.v1`.
+
+Ports 0–5 are ahead, astern, left, right, ahead-left, and ahead-right.
+A left click or port 6 (Space) starts from the ready or done screen.
+Arrows and WASD use independent held keys. Up combines with either turn,
+with left taking precedence when both turns are held. Focus loss clears
+held controls.
+
+Fields 0–14 report phase, rung, trial, total trials, current crossing,
+crossing count, elapsed milliseconds, verdict, wins, best rung, starting
+rung, adaptive mode, x and y in millimeters, and heading in millidegrees.
+Verdict codes 0–5 mean live, clear, aground, swept out, barge collision,
+and timeout.
+
+`createFerryEnvironment` exposes six control ports.
+`nw_ferry_agent_event` advances on port −1. The native exports are
+`nw_ferry_agent_create`, `nw_ferry_agent_act`, `nw_ferry_agent_publish`,
+and `nw_ferry_agent_destroy`.
+
+### Docking
+
+Task ID `935767654` uses create options 0–2 for the starting rung,
+dockings per run, and adaptive mode. Option 3 enables stepped agent
+mode. SDL opens screen 101 with `--screen docking`, reads the original
+`BERTH_RUNG`, `BERTH_TRIALS`, and `BERTH_ADAPTIVE` settings, and saves to
+`.docking-options`. The browser uses `docking-seed` and
+`nw.docking.options.v1`.
+
+Ports 0–5 translate left, right, down, up, forward, and back. Ports 6–11
+turn the nose left, right, down, and up, then roll left and right. Held
+controls use the first port in that order. Space, a primary click, or
+action 12 starts a run. Focus loss clears held controls.
+
+Fields 0–9 report phase, rung, trial, total trials, wins, best rung,
+starting rung, adaptive mode, verdict, and clearance flags. Verdict
+codes 0–3 mean live, clear, contact failure, and drift. Clearance flags
+1, 2, 4, and 8 mean off centre, too fast, nose off, and roll off. Fields
+10–17 report elapsed milliseconds, fuel milliseconds, position in
+millimeters along x, y, and z, and yaw, pitch, and roll in milliradians.
+
+`createDockingEnvironment` exposes 12 control ports.
+`nw_docking_agent_event` advances on port −1. The native exports are
+`nw_docking_agent_create`, `nw_docking_agent_act`,
+`nw_docking_agent_publish`, and `nw_docking_agent_destroy`.
+`nw_docking_contact_audio` writes the judged contact cue as 0.8 seconds
+of 22,050 Hz stereo little-endian PCM16, requiring 70,560 bytes.
+
+### Rover
+
+Task ID `3976448863` uses create options 0–2 for the starting rung,
+drives per run, and adaptive mode. Option 3 enables stepped agent mode.
+SDL launches with `--screen rover`, reads `ROVER_RUNG`, `ROVER_TRIALS`,
+and `ROVER_ADAPTIVE`, and saves to `.rover-options`. The browser uses
+`rover-seed` and `nw.rover.options.v1`.
+
+Ports 0–3 drive, brake or reverse, turn left, and turn right. Controls
+take priority in that order. The arrow and WASD aliases track each
+physical key independently. Focus loss clears held keys. Space, a
+primary click, or action 4 starts a run.
+
+Fields 0–8 report phase, current rung, trial, total trials, wins, best
+rung, starting rung, adaptive mode, and verdict. Verdicts 0–4 mean live,
+clear, rock collision, tipped, and timeout. Fields 9–13 report reached
+flags, total flags, commands in transit, elapsed milliseconds, and
+signal delay in milliseconds. Fields 14–19 report true x and z, observed
+x and z, observed heading, and observed speed. These values use
+millimeters, milliradians, and millimeters per second.
+
+`createRoverEnvironment` exposes four control ports. Port −1 advances
+`nw_rover_agent_event` at the supplied time. The native agent uses
+`nw_rover_agent_create`, `nw_rover_agent_act`, `nw_rover_agent_publish`,
+and `nw_rover_agent_destroy`. `nw_rover_audio_window` renders up to one
+second of stereo little-endian PCM16 at 22,050 Hz for a trial-time interval.
+
+### Unicycle
+
+Task ID `2516562765` uses create options 0–2 for the starting rung,
+rides per run, and adaptive mode. Option 3 enables stepped agent mode.
+SDL launches with `--screen unicycle`, reads `UNI_RUNG`, `UNI_TRIALS`,
+and `UNI_ADAPTIVE`, and saves to `.unicycle-options`. The browser uses
+`unicycle-seed` and `nw.unicycle.options.v1`.
+
+Ports 0–3 pedal, back-pedal, lean back, and lean forward. Ports 4–7
+combine pedal or back-pedal with either lean direction. Arrows and WASD
+are independent held keys. Opposing directions on the same axis cancel
+and focus loss clears held keys. Space, a primary click, or action 8
+starts a run.
+
+Fields 0–8 report phase, current rung, trial, total trials, wins, best
+rung, starting rung, adaptive mode, and verdict. Verdicts 0–4 mean live,
+clear, head over heels, fell off, and timeout. Fields 9–16 report last
+port, elapsed milliseconds, allotted milliseconds, wheel x and y in
+millimeters, horizontal speed in millimeters per second, tilt in
+milliradians, and finish position in millimeters.
+
+`createUnicycleEnvironment` exposes eight control ports. Port −1
+advances `nw_unicycle_agent_event` at the supplied time. Native agents
+use the `nw_unicycle_agent_create`, `nw_unicycle_agent_act`,
+`nw_unicycle_agent_publish`, and `nw_unicycle_agent_destroy` exports.
+`nw_unicycle_contact_audio` writes the finish or fall cue as 0.8 seconds
+of 22,050 Hz stereo little-endian PCM16, requiring 70,560 bytes.
+
+### Full Stop
+
+Full Stop uses task ID `3891758761`. The common-v1 create parameters are
+starting rung, runs per session, and adaptive difficulty. The renderer uses
+the standard 912 × 684 reference frame. A left click or Space starts a
+session. Pointer events move the cursor and place stops. Enter submits and
+R clears the stops.
+
+`nw_full_stop_load` accepts three pointer/byte-length pairs in the order
+`passages.txt`, `sentences.txt`, and `lexicon.tsv`. Pass a zero pair for
+each omitted file. The import copies the parsed corpus into the run's arena,
+so callers can release their buffers after the call. Import is available
+once, before play. Bundled seed data supplies the omitted files.
+
+`nw_full_stop_audio_window` writes interleaved stereo PCM at 22,050 Hz.
+The stepped agent has sixteen ports. Ports 0–13 use the shared hand
+controls, 14 submits, and 15 resets. The WebAssembly agent entry uses
+16 to start and −1 to advance a frame. The native agent ABI uses the
+standard create, act, publish, and destroy calls.
+
+### The Missing Word
+
+The Missing Word uses task ID `2323823752`. Its common-v1 parameters are
+starting rung, passages per session, and adaptive difficulty. Pointer input
+opens the choices under a gap or strikes out a word. Enter submits and R
+restores the original damage. Feedback lasts four seconds in interactive
+play. State field 10 reports that the corpus has no eligible passage.
+
+`nw_missing_word_load` uses the same three cache spans as `nw_full_stop_load`.
+Import is available before play. The browser agent accepts those files as
+`passageCaches` with optional `passages`, `sentences`, and `lexicon` byte
+buffers. Native agents read the existing files in the Workshop data directory.
+The agents use ports 0–13 for the pointer, 14 to submit, and 15 to reset.
+The WebAssembly agent entry uses 16 to start and −1 to advance a frame.
+
+### The Proofreader
+
+The Proofreader uses task ID `2105479234`. Its first three create options
+are starting rung, passages per run, and adaptive difficulty. Option 3
+allows positive integer dials beyond the options menu when set to 1.
+Options 4 and 5 are zero. Field 11 reports the number of dealt changes
+including sentence order. Field 12 counts edits made during the passage.
+
+Drag a row by its number or a word within its row. Click a word to show
+its forms, then click an offered form to replace it. Enter submits and R
+restores the original damage. Cancellation clears any held tile.
+Interactive feedback lasts four seconds. Cache spans, agent ports, and
+byte buffers use the same format as The Missing Word. The web agent
+factory is `createProofreaderEnvironment`.
+
+### Figures of Speech
+
+Figures of Speech uses task ID `2703097653`. Create options 0–2 are
+starting rung, rounds per run, and adaptive difficulty. Option 3 permits
+positive integer dials beyond the interactive menu when set to 1.
+Options 4 and 5 are zero. State fields 10–12 are the current question
+index, correct answers, and wrong answers.
+
+Space or a primary click starts the run. Number keys 1–8 and pointer
+presses choose answers. The right answer stays up for 1.4 seconds between
+questions, and a completed round has 2.5 seconds of interactive feedback.
+`nw_figures_of_speech_load` accepts an original `questions.jsonl` byte
+span before play. Imported questions replace bundled questions by kind.
+
+The web factory is `createFiguresOfSpeechEnvironment`, with optional
+`questionCache` bytes. Agent ports 0–7 correspond to answers in display
+order. The WebAssembly agent entry uses 8 to start and −1 to advance.
+
+### Between the Lines
+
+Between the Lines is the first card under Social, one of the four tabs
+after Decisions (Computer use, Emotion, Social and Rationality, as in
+the original hub; a tab with no card yet says so). It uses task ID
+`4294934071`. Create options 0–2 are starting rung, rounds per run, and
+adaptive difficulty; option 3 permits positive integer dials beyond the
+menu when set to 1. Options 4 and 5 are zero. State fields 10–12 are
+the current question index, correct answers, and wrong answers.
+
+A round is 20 questions: what a reply implies, from rung 4 which remark
+is sarcastic, and from rung 7 whether a sentence is ironic. The answers
+keep the order they were written in. Space or a primary click starts the
+run; number keys 1–8 and pointer presses choose answers. The right
+answer stays up for 1.4 seconds, and a finished round has 2.5 seconds of
+feedback. `nw_between_the_lines_load` accepts the original
+`questions.jsonl`, the file Figures of Speech reads too; the browser
+keeps one imported copy for both. Imported questions replace the bundled
+ones by kind.
+
+The web factory is `createBetweenTheLinesEnvironment`, with optional
+`questionCache` bytes. Agent ports 0–7 are the answers in display order;
+the agent entry uses 8 to start and −1 to advance. SDL uses screen 130
+for `--screen between-the-lines`, reads `LINES_RUNG`, `LINES_TRIALS`
+and `LINES_ADAPTIVE`, saves changes to the profile's
+`.between-the-lines-options` sidecar, and reads
+`datasets/social/questions.jsonl` from the data directory. The native
+library exports `nw_between_the_lines_agent_{create,act,publish,destroy}`.
+
+### Second Thoughts
+
+Second Thoughts is the second card under Rationality. It uses task ID
+`2360688716`. Create options 0–2 are starting rung, rounds per run, and
+adaptive difficulty; option 3 permits positive integer dials beyond the
+menu when set to 1. Options 4 and 5 are zero. State fields 10–12 are
+the current question index, correct answers, and wrong answers.
+
+A round is ten puzzles, made with fresh numbers and names; the first
+answer that comes to mind is always one of the choices. Space or a
+primary click starts the run; number keys 1–8 and pointer presses
+choose answers. The right answer stays up for 1.4 seconds, and a
+finished round has 2.5 seconds of feedback. Nothing is imported, so
+there is no load export.
+
+The web factory is `createSecondThoughtsEnvironment`. Agent ports 0–7
+are the answers in display order; the agent entry uses 8 to start and
+−1 to advance. SDL uses screen 131 for `--screen second-thoughts`,
+reads `SECOND_RUNG`, `SECOND_TRIALS` and `SECOND_ADAPTIVE`, and saves
+changes to the profile's `.second-thoughts-options` sidecar. The native
+library exports `nw_second_thoughts_agent_{create,act,publish,destroy}`.
+
+### Emotion
+
+Emotion is the first card under Emotion, before Which Feeling. It uses
+task ID `1337504642`. Its options and state fields are those of Why They
+Feel, with the current face at field 10. It draws its own faces and has
+no load export; FER-2013's photographs are not read yet.
+
+A round is 12 faces. Rung 1 asks happy or sad, rung 2 adds surprise,
+rung 3 anger and neutral, rungs 4–5 offer seven emotions and rung 6 on
+all eight. From rung 8 the face is covered after 1.6 s, 0.12 s less a
+rung down to 0.15 s; from rung 10 some faces show only the eyes or the
+mouth; from rung 14 each face asks the strongest emotion and then the
+next. The answer time is 10 s a step at rung 1, 0.35 s less a rung down
+to 2.5 s. `nw_emotion_audio_window` returns the quiz's notes.
+
+The web factory is `createEmotionEnvironment`. SDL uses screen 139 for
+`--screen emotion`, reads `EMO_RUNG`, `EMO_TRIALS` and `EMO_ADAPTIVE`,
+and saves changes to the profile's `.emotion-options` sidecar. The
+native library exports `nw_emotion_agent_{create,act,publish,destroy}`.
+
+### Which Feeling
+
+Which Feeling is the second card under Emotion, after Emotion. It uses task ID `2151530893`. Create
+options 0–2 are starting rung, rounds per run, and adaptive difficulty;
+option 3 permits positive integer dials beyond the menu when set to 1.
+Options 4 and 5 are zero. State fields 10–12 are the current comment
+index, correct answers, and wrong answers.
+
+A round is ten comments, with 2 to 8 shuffled answers depending on the
+rung and a fixed time each. Space or a primary click starts the run;
+number keys 1–8 and pointer presses choose answers. The right answer
+stays up for 1.4 seconds, and a finished round has 2.5 seconds of
+feedback. `nw_which_feeling_load` takes the text of `goemotions.tsv`: a
+label, a tab and the comment on each line. Labels the task does not ask
+about are ignored, and a file without a line holding a tab gives the
+bundled comments.
+
+The web factory is `createWhichFeelingEnvironment`, whose
+`commentCache` option takes the file's bytes. The browser keeps the
+imported file under its own storage key. Agent ports 0–7 are the answers
+in display order; the agent entry uses 8 to start and −1 to advance. SDL
+uses screen 134 for `--screen which-feeling`, reads
+`datasets/emotion/goemotions.tsv` from the workshop data directory, reads
+`FEEL_RUNG`, `FEEL_TRIALS` and `FEEL_ADAPTIVE`, and saves changes to the
+profile's `.which-feeling-options` sidecar. The native library exports
+`nw_which_feeling_agent_{create,act,publish,destroy}`.
+
+### How Strongly
+
+How Strongly is the third card under Emotion, after Which Feeling. It
+uses task ID `1500838626`. Create options 0–2 are starting rung, rounds
+per run, and adaptive difficulty; option 3 permits positive integer dials
+beyond the menu when set to 1. Options 4 and 5 are zero. State fields
+10–12 are the current dialogue index, correct answers, and wrong answers.
+
+Rungs 1–3 deal eight dialogues and ask which of the speaker's emotions is
+strongest. From rung 4 a round is six dialogues; each emotion is asked in
+turn on a scale of 0, 2, …, 10, and the dialogue counts right when the
+misses together stay within the rung's tolerance (8 at rung 4, narrowing
+by 2 every other rung to 0). Each dialogue has 60 seconds at rung 1, two
+fewer a rung down to 20. Space or a primary click starts the run; number
+keys 1–8 and pointer presses choose answers. Feedback names the strongest
+emotion, or every emotion with its reference level, and hides the scale.
+`nw_how_strongly_load` takes the text of `eqbench.jsonl`: one JSON object
+a line with `text`, `who`, `emotions` and `scores`. Lines that do not
+decode, or whose emotions and scores differ in number, are skipped, and a
+file with no usable line gives the bundled dialogues.
+
+The web factory is `createHowStronglyEnvironment`, whose `dialogueCache`
+option takes the file's bytes. The browser keeps the imported file under
+its own storage key. Agent ports 0–7 are the answers in display order;
+the agent entry uses 8 to start and −1 to advance. SDL uses screen 135
+for `--screen how-strongly`, reads `datasets/emotion/eqbench.jsonl` from
+the workshop data directory, reads `STRONG_RUNG`, `STRONG_TRIALS` and
+`STRONG_ADAPTIVE`, and saves changes to the profile's
+`.how-strongly-options` sidecar. The native library exports
+`nw_how_strongly_agent_{create,act,publish,destroy}`.
+
+### Reading People
+
+Reading People is the fourth card under Emotion. It uses task ID
+`249251215`. Create options 0–2 are starting rung, rounds per run, and
+adaptive difficulty; option 3 permits positive integer dials beyond the
+menu when set to 1. Options 4 and 5 are zero. State fields 10–12 are the
+current story index, correct answers, and wrong answers.
+
+A round is six stories. Rungs 1–3 ask how the subject feels, rungs 4–6
+ask that and then why (two steps, both needed), rungs 7–9 ask what would
+help most, and later rungs mix all three. Each step has 45 seconds at
+rung 1, two fewer a rung down to 15. `nw_reading_people_load` takes the
+text of `emobench.jsonl`: one JSON object a line with `kind`
+(`understand` or `act`), `scenario`, `subject`, `choices` and `answer`,
+and for `understand` also `causes` and `cause`. Unreadable lines are
+skipped, and a file with no usable line gives the bundled stories.
+
+The web factory is `createReadingPeopleEnvironment`, whose `storyCache`
+option takes the file's bytes. Agent ports 0–7 are the answers in
+display order; the agent entry uses 8 to start and −1 to advance. SDL
+uses screen 136 for `--screen reading-people`, reads
+`datasets/emotion/emobench.jsonl`, reads `READ_RUNG`, `READ_TRIALS` and
+`READ_ADAPTIVE`, and saves changes to the profile's
+`.reading-people-options` sidecar. The native library exports
+`nw_reading_people_agent_{create,act,publish,destroy}`.
+
+### Why They Feel
+
+Why They Feel is the fifth card under Emotion. It uses task ID
+`3835238973`. Its options and state fields are those of Reading People,
+with the current story at field 10. It makes its own stories and has no
+load export.
+
+A round is ten stories, each asking how someone feels, or from rung 15
+what one person thinks another thinks someone feels. Rungs offer 2 to 8
+answers and 30 seconds a story at rung 1, one fewer a rung down to 8.
+The web factory is `createWhyTheyFeelEnvironment`. SDL uses screen 137
+for `--screen why-they-feel`, reads `WHY_RUNG`, `WHY_TRIALS` and
+`WHY_ADAPTIVE`, and saves changes to the profile's `.why-they-feel-options`
+sidecar. The native library exports
+`nw_why_they_feel_agent_{create,act,publish,destroy}`.
+
+### Tone of Voice
+
+Tone of Voice is the sixth and last card under Emotion, after Why They Feel. It
+uses task ID `529523398`. Its options and state fields are those of Why
+They Feel, with the current voice at field 10. It makes its own voices
+(hums) and has no load export; CREMA-D clips are not read yet.
+
+A round is 20 voices at two choices and 10 otherwise. Rung 1 offers two
+emotions, rungs 2–3 three, 4–6 four, and from rung 7 all six with the
+plain voice. A hiss joins from rung 10, and from rung 13 only 1.2 s
+(0.9 s from rung 16) of each voice is kept. Each voice starts 0.4 s into
+its item and plays twice with 0.6 s between. The answer time adds 6 s
+at rung 1, 0.2 s less a rung down to 2.5 s. `nw_tone_of_voice_audio_window`
+returns the voices, hiss and notes as stereo 16-bit PCM, on the run's
+own clock (field 9).
+
+The web factory is `createToneOfVoiceEnvironment`. SDL uses screen 138
+for `--screen tone-of-voice`, reads `VOICE_RUNG`, `VOICE_TRIALS` and
+`VOICE_ADAPTIVE`, and saves changes to the profile's
+`.tone-of-voice-options` sidecar. The native library exports
+`nw_tone_of_voice_agent_{create,act,publish,destroy}`.
+
+### Social Sense
+
+Social Sense is the second card under Social, after Between the Lines.
+It uses task ID `2281393555`. Create options 0–2 are starting rung,
+rounds per run, and adaptive difficulty; option 3 permits positive
+integer dials beyond the menu when set to 1. Options 4 and 5 are zero.
+State fields 10–12 are the current question index, correct answers, and
+wrong answers.
+
+A round is 12 situations, and passing takes at least 9 right. From rung 13 an item asks two
+questions about one situation, and both must be right. Space or a
+primary click starts the run; number keys 1–8 and pointer presses choose
+answers, which are shuffled. The right answer stays up for 1.4 seconds,
+and a finished round has 2.5 seconds of feedback.
+`nw_social_sense_load` takes the text of `questions.jsonl`; any question
+of kind `social` or `social:<what>` replaces all the bundled ones, and
+other kinds are ignored. A rung whose kinds have no questions deals no
+round, and the run stays ready.
+
+The web factory is `createSocialSenseEnvironment`, with the same
+`questionCache` option as Between the Lines. Agent ports 0–7 are the
+answers in display order; the agent entry uses 8 to start and −1 to
+advance. SDL uses screen 133 for `--screen social-sense`, reads
+`SENSE_RUNG`, `SENSE_TRIALS` and `SENSE_ADAPTIVE`, and saves changes to
+the profile's `.social-sense-options` sidecar. The native library
+exports `nw_social_sense_agent_{create,act,publish,destroy}`.
+
+### Bad Argument
+
+Bad Argument is the first card under Rationality, before Second
+Thoughts. It uses task ID `2769191638`. Create options 0–2 are starting
+rung, rounds per run, and adaptive difficulty; option 3 permits positive
+integer dials beyond the menu when set to 1. Options 4 and 5 are zero.
+State fields 10–12 are the current question index, correct answers, and
+wrong answers.
+
+A round is 20 arguments, and passing takes at least 15 right. Space or a primary click starts
+the run; number keys 1–8 and pointer presses choose answers. The answers
+are "it follows" and "it does not follow" in that order, or, on the
+rungs that ask what is wrong, the five names of a flaw in shuffled
+order. The right answer stays up for 1.4 seconds, and a finished round
+has 2.5 seconds of feedback. `nw_bad_argument_load` takes the text of
+`questions.jsonl`; its `fallacy` and `formal` questions replace the
+bundled ones of the same kind, and other kinds are ignored.
+
+The web factory is `createBadArgumentEnvironment`, with the same
+`questionCache` option as Between the Lines. Agent ports 0–7 are the
+answers in display order; the agent entry uses 8 to start and −1 to
+advance. SDL uses screen 132 for `--screen bad-argument`, reads
+`ARGUE_RUNG`, `ARGUE_TRIALS` and `ARGUE_ADAPTIVE`, and saves changes to
+the profile's `.bad-argument-options` sidecar. The native library
+exports `nw_bad_argument_agent_{create,act,publish,destroy}`.
+
+### Crazy Cog
+
+Crazy Cog uses task ID `205861782`. Create options 0–2 are starting
+rung, machines per run, and adaptive difficulty. Set option 3 to 1 to
+use positive integer rung and trial counts beyond the menu. Options 4
+and 5 are zero.
+
+Space or a primary click starts the run. Drag cogs and chains from
+the tray. Tab and F go one plane deeper. Shift+Tab and G go one plane
+nearer. Keys 1–5 select a plane and R clears the board. Logical key
+codes 87 and 88 are the F and G aliases. Interactive feedback lasts
+2.5 seconds.
+
+`nw_api_v1_crazy_cog_info` fields 0–9 are phase, current rung, trial,
+trial count, wins, best passing rung, starting rung, adaptive flag,
+verdict, and simulation milliseconds. Fields 10–12 are the zero-based
+active plane, plane count, and carried item (zero for none, −1 for a
+chain, or the cog radius). Verdicts 0–3 mean active, bucket up, fan
+incorrect, and out of time.
+
+The web factory is `createCrazyCogEnvironment`. Ports 0–11 move the
+pointer, 12 presses, 13 releases, 14 clears the board, 15 moves deeper,
+and 16 moves nearer. The agent entry uses 17 to start and −1 to advance.
+`nw_crazy_cog_audio_window` writes interleaved signed 16-bit stereo PCM
+at 22,050 Hz for a run-relative time window.
+
+SDL uses screen 110 for `--screen crazy-cog`. Its profile loader reads
+`COG_RUNG`, `COG_TRIALS`, and `COG_ADAPTIVE` from the original
+configuration. Edits use the selected profile’s `.crazy-cog-options`
+sidecar. The native agent library exposes the
+`nw_crazy_cog_agent_{create,act,publish,destroy}` entry points.
+
+### Potter’s Wheel
+
+Potter’s Wheel uses task ID `4292812816`. Create options 0–2 are the
+starting rung, pots per run, and adaptive difficulty. Set option 3 to 1
+for positive integer rung and trial counts beyond the menu. Options 4
+and 5 are zero.
+
+Space, Enter, or a primary click starts a session. Hold the pointer
+against a band to shape it. Up and W spin the wheel faster, Down and
+S slow it, and Space wets the clay. Feedback lasts 2.5 seconds.
+
+`nw_api_v1_potters_wheel_info` fields 0–9 are phase, current rung, trial,
+trial count, wins, best passing rung, starting rung, adaptive flag,
+verdict, and simulation milliseconds. Fields 10–14 are wheel speed,
+band count, wetness in thousandths, touched band (−1 when none), and
+the pressed-pointer flag. Verdicts 0–3 are active, finished, collapsed,
+and hardened.
+
+The web factory is `createPotterEnvironment`. Agent ports 0–11 move
+the pointer, 12 presses, 13 releases, 14 speeds up, 15 slows down, and
+16 adds water. The agent entry uses 17 to start and −1 to advance.
+`nw_potters_wheel_audio_window` writes interleaved signed 16-bit stereo
+PCM at 22,050 Hz.
+
+SDL uses screen 112 for `--screen potters-wheel`. It loads
+`POTTER_RUNG`, `POTTER_TRIALS`, and `POTTER_ADAPTIVE` from the selected
+profile and saves edits in its `.potters-wheel-options` sidecar. The
+native agent exports `nw_potters_wheel_agent_{create,act,publish,destroy}`.
+
+### Conductor
+
+Conductor uses task ID `3161448022`. Create options 0–2 are the
+starting rung, pieces per run, and adaptive difficulty. Set option 3 to
+1 for positive integer rung and trial counts beyond the menu. Options 4
+and 5 are zero.
+
+Space, Enter, or primary click starts a run. Flick the pointer down on
+each beat and click the indicated section for an entrance or cutoff.
+Up or W gives the louder cue, and Down or S gives the softer cue.
+Feedback lasts 2.5 seconds.
+
+`nw_api_v1_conductor_info` fields 0–9 report phase, rung, trial, trial
+count, wins, best passing rung, starting rung, adaptive flag, verdict,
+and simulation milliseconds. Fields 10–14 report volume, sounded beats,
+slips, judged beats, and the pressed-pointer flag. Verdicts 0–2 are
+active, Bravo, and the orchestra fell apart.
+
+The web factory is `createConductorEnvironment`. Agent ports 0–11 move
+the pointer, 12 presses, 13 releases, and 14 and 15 request louder and
+softer. The agent entry uses 16 to start and −1 to advance.
+`nw_conductor_audio_window` writes signed 16-bit stereo PCM at 22,050 Hz.
+
+SDL uses screen 113 for `--screen conductor`. It reads `CONDUCT_RUNG`,
+`CONDUCT_TRIALS`, and `CONDUCT_ADAPTIVE`, and saves changes in the
+selected profile’s `.conductor-options` sidecar. The native library
+exports `nw_conductor_agent_{create,act,publish,destroy}`.
+
+### Tightrope
+
+The Tightrope card is in Attention. The three creation options are the
+starting rung, crossings per run, and adaptive difficulty. Option 3 can
+be set to 1 for positive rung and trial counts outside the menu.
+
+Space, Enter, or primary click starts a run. Move the pointer to balance
+left to right and front to back, press Space, Up, or W to take a step,
+and click a perched bird to shoo it. Feedback lasts 2.5 seconds.
+
+`nw_api_v1_tightrope_info` fields 0–9 report phase, rung, trial, trial
+count, wins, best passing rung, starting rung, adaptive flag, verdict,
+and simulation milliseconds. Fields 10–14 report steps taken, steps
+required, lean and pitch in milliradians, and the pressed-pointer flag.
+Verdicts 0–5 are active, across, fell sideways, fell forward, fell
+backward, and out of time.
+
+The web factory is `createTightropeEnvironment`. Ports 0–11 move the
+pointer, 12 presses, 13 releases, and 14 steps. The agent entry uses 15
+to start and −1 to advance. `nw_tightrope_audio_window` writes signed
+16-bit stereo PCM at 22,050 Hz.
+
+SDL uses screen 114 for `--screen tightrope`. It reads `ROPE_RUNG`,
+`ROPE_TRIALS`, and `ROPE_ADAPTIVE`, then saves changes in the profile's
+`.tightrope-options` sidecar. The native library exports
+`nw_tightrope_agent_{create,act,publish,destroy}`.
+
+### Sign Painter
+
+The Sign Painter card is in Attention. The three creation options are
+the starting rung, signs per run, and adaptive difficulty. Set option
+3 to 1 to accept positive rung and trial counts outside the menu.
+
+Space, Enter, or primary click starts a run. Hold the button and trace
+each stroke. Use 1–4 or R, G, B, and Y to choose a colour, then Space
+with the brush lifted to dip it. Feedback lasts 2.5 seconds.
+
+`nw_api_v1_sign_painter_info` fields 0–9 report phase, rung, trial,
+trial count, wins, best passing rung, starting rung, adaptive flag,
+verdict, and simulation milliseconds. Fields 10–16 report the current
+stroke and sample indices, selected colour, paint remaining, the
+pressed-pointer flag, smudge count, and stroke count. Verdicts 0–4
+are active, handsome sign, mess, wrong colour, and dried paint.
+
+The web factory is `createSignPainterEnvironment`. Ports 0–11 move
+the pointer, 12 presses, 13 releases, 14–17 select colour, and 18 dips.
+The agent entry uses 19 to start and −1 to advance.
+`nw_sign_painter_audio_window` writes signed 16-bit stereo PCM at
+22,050 Hz.
+
+SDL uses screen 115 for `--screen sign-painter`. It reads `SIGN_RUNG`,
+`SIGN_TRIALS`, and `SIGN_ADAPTIVE` and saves changes in the profile's
+`.sign-painter-options` sidecar. The native library exports
+`nw_sign_painter_agent_{create,act,publish,destroy}`.
+
+### Bartender
+
+The Bartender card is in Attention. Its three creation options are
+starting rung, nights per run, and adaptive difficulty. Option 3 allows
+positive rung and trial counts outside the menu when set to 1.
+
+Space, Enter, or primary click starts a run. Hold a bottle above the
+glass to pour. Use Space or I to toggle ice. Pull the glass back,
+push it forward, and release it to slide it to the customer.
+Feedback lasts 2.5 seconds.
+
+`nw_api_v1_bartender_info` fields 0–9 report phase, rung, trial,
+trial count, wins, best passing rung, starting rung, adaptive flag,
+verdict, and simulation milliseconds. Fields 10–18 report customers
+served, customers total, strikes, glass fill in thousandths, the
+pressed-pointer flag, held item, ice flag, glass position in
+millimetres, and whether the glass is sliding. A held item of −1
+means an empty hand, 0–4 are bottles, and 5 is the glass. Verdicts
+0–7 are active, good night, spill, broken glass, walkout, incomplete
+service, wrong drink, and empty seat.
+
+The web factory is `createBartenderEnvironment`. Ports 0–11 move the
+pointer, 12 presses, 13 releases, and 14 toggles ice. The agent entry
+uses 15 to start and −1 to advance. `nw_bartender_audio_window` writes
+signed 16-bit stereo PCM at 22,050 Hz.
+
+SDL uses screen 116 for `--screen bartender`. It reads `BAR_RUNG`,
+`BAR_TRIALS`, and `BAR_ADAPTIVE` and saves changes to the profile's
+`.bartender-options` sidecar. The native agent exports
+`nw_bartender_agent_{create,act,publish,destroy}`.
+
+### Lock Pick
+
+The Lock Pick card is in Attention. Its creation options are starting
+rung, locks per run, and adaptive difficulty. Set option 3 to 1 to use
+positive rung and trial counts outside the menu.
+
+Space, Enter, or primary click starts a run. Hold Space or T for
+tension, and hold the pointer under a pin to lift it. Space and T
+have independent key-down and key-up state. The API key code for T
+is 98. Feedback lasts 2.5 seconds.
+
+`nw_api_v1_lock_pick_info` fields 0–9 report phase, rung, trial, trial
+count, wins, best passing rung, starting rung, adaptive flag, verdict,
+and simulation milliseconds. Fields 10–16 report pins set, pins
+total, tension in thousandths, slips, the pressed-pointer flag,
+held-tension key bits, and the pin under the pick. The key bits are
+1 for Space and 2 for T. Verdicts 0–3 are active, turned lock,
+slipped wrench, and approaching someone.
+
+The web factory is `createLockPickEnvironment`. Ports 0–11 move the
+pointer, 12 presses, 13 releases, and 14 latches tension for 250 ms.
+The agent entry uses 15 to start and −1 to advance.
+`nw_lock_pick_audio_window` writes signed 16-bit stereo PCM at 22,050 Hz.
+
+SDL uses screen 117 for `--screen lock-pick`. It reads `PICK_RUNG`,
+`PICK_TRIALS`, and `PICK_ADAPTIVE` and saves changes to the profile's
+`.lock-pick-options` sidecar. The native library exports
+`nw_lock_pick_agent_{create,act,publish,destroy}`.
+
+### Air Hockey
+
+The Air Hockey card is in Attention, after Lock Pick. It uses task ID
+`1330898689`. Its creation options are starting rung, games per run,
+and adaptive difficulty. Set option 3 to 1 to use positive rung and
+trial counts outside the menu.
+
+Space, Enter, or primary click starts a run. The pointer moves your
+mallet. Left or A and Right or D slide the bar in your goal; the four
+keys have independent key-down and key-up state, so releasing one
+leaves the others held. Left takes precedence when both directions
+are held. The API key codes for A and D are 99 and 100. Key repeats
+are ignored. Feedback lasts 2.5 seconds.
+
+`nw_api_v1_air_hockey_info` fields 0–9 report phase, rung, trial, trial
+count, wins, best passing rung, starting rung, adaptive flag, verdict,
+and simulation milliseconds. Fields 10–17 report your score, their
+score, goals needed to win, goals against that lose, the
+pressed-pointer flag, held bar-key bits, the bar position in
+thousandths, and whether the camera is at the far end. The key bits
+are 1 for Left, 2 for A, 4 for Right, and 8 for D. Verdicts 0–3 are
+active, won, lost, and time.
+
+The web factory is `createAirHockeyEnvironment`. Ports 0–11 move the
+pointer, 12 presses, 13 releases, and 14 and 15 latch the bar left
+and right for 250 ms. The agent entry uses 16 to start and −1 to
+advance. `nw_air_hockey_audio_window` writes signed 16-bit stereo PCM
+at 22,050 Hz.
+
+SDL uses screen 118 for `--screen air-hockey`. It reads `HOCKEY_RUNG`,
+`HOCKEY_TRIALS`, and `HOCKEY_ADAPTIVE` and saves changes to the
+profile's `.air-hockey-options` sidecar. The native library exports
+`nw_air_hockey_agent_{create,act,publish,destroy}`.
+
+### Semaphore
+
+The Semaphore card is in Attention, after Air Hockey. It uses task ID
+`64710845`. Its creation options are starting rung, messages per run,
+and adaptive difficulty. Set option 3 to 1 to use positive rung and
+trial counts outside the menu.
+
+Space, Enter, or primary click starts a run. Drag your flags by their
+tips with the pointer, then type the letter the signal stands for.
+Letters arrive as text events: A–Z and a–z are the same letter, and
+anything else is ignored. A letter typed while your flags do not match
+the signal, or a wrong letter, is a strike, and a signal is struck at
+most once. Feedback lasts 2.5 seconds.
+
+`nw_api_v1_semaphore_info` fields 0–9 report phase, rung, trial, trial
+count, wins, best passing rung, starting rung, adaptive flag, verdict,
+and simulation milliseconds. Fields 10–17 report letters read, letters
+in the message, strikes, strikes allowed, the pressed-pointer flag, the
+signalled letter's index (−1 when none is up), the held flag (−1 when
+none), and the help shown now: 0 names the letter, 1 shows the chart,
+and 3 shows nothing. At peek rungs the chart shows only early in each
+signal. Verdicts 0–2 are active, passed, and failed.
+
+The web factory is `createSemaphoreEnvironment`. Ports 0–11 move the
+pointer, 12 presses, 13 releases, and 14–39 type A–Z. The agent entry
+uses 40 to start and −1 to advance. `nw_semaphore_audio_window` writes
+signed 16-bit stereo PCM at 22,050 Hz.
+
+SDL uses screen 119 for `--screen semaphore`. Letter keys type their
+letter during play, Q included. It reads `SEMA_RUNG`, `SEMA_TRIALS`,
+and `SEMA_ADAPTIVE` and saves changes to the profile's
+`.semaphore-options` sidecar. The native library exports
+`nw_semaphore_agent_{create,act,publish,destroy}`.
+
+### Shadow Puppets
+
+The Shadow Puppets card is in Attention, after Semaphore. It uses task
+ID `1903607369`. Its creation options are starting rung, figures per
+run, and adaptive difficulty. Set option 3 to 1 to use positive rung and
+trial counts outside the menu.
+
+Space, Enter, or primary click starts a run. Dragging with the pointer
+turns the figure. Q and E roll it while held. The two keys have
+independent key-down and key-up state, and Q takes precedence when both
+are held. The figure rolls 2 degrees for each advance while a key is
+held, as the reference rolls once a frame. The API key codes for Q and E
+are 101 and 102. Key repeats are ignored. Feedback lasts 2.5 seconds.
+
+`nw_api_v1_shadow_puppets_info` fields 0–9 report phase, rung, trial,
+trial count, wins, best passing rung, starting rung, adaptive flag,
+verdict, and simulation milliseconds. Fields 10–17 report shadows cast,
+shadows wanted, the hold in milliseconds, the pressed-pointer flag, the
+held roll-key bits (1 for Q, 2 for E), the distance from the nearest
+fit in thousandths of a degree, where the wanted shadow is shown (0 on
+the wall, 1 on a card, 2 only named), and whether the figure is hidden.
+Verdicts 0–2 are active, passed, and failed.
+
+The web factory is `createShadowPuppetsEnvironment`. Ports 0–11 move the
+pointer, 12 presses, 13 releases, and 14 and 15 roll the figure left
+and right once. The agent entry uses 16 to start and −1 to advance.
+`nw_shadow_puppets_audio_window` writes signed 16-bit stereo PCM at
+22,050 Hz.
+
+SDL uses screen 120 for `--screen shadow-puppets`. During play Q rolls
+the figure instead of quitting. It reads `PUPPET_RUNG`,
+`PUPPET_TRIALS`, and `PUPPET_ADAPTIVE` and saves changes to the
+profile's `.shadow-puppets-options` sidecar. The native library exports
+`nw_shadow_puppets_agent_{create,act,publish,destroy}`.
+
+### Night Watch
+
+The Night Watch card is in Attention, after Shadow Puppets. It uses task
+ID `981902657`. Its creation options are starting rung, nights per run,
+and adaptive difficulty. Set option 3 to 1 to use positive rung and
+trial counts outside the menu.
+
+Space, Enter, or primary click starts a run. The pointer moves the torch
+and a primary click blows the whistle at whoever is under it. Left and
+A turn the view one way along the floor, Right and D the other. The four
+keys have independent key-down and key-up state, and a left key takes
+precedence when both directions are held. The API key codes for A and D
+are 99 and 100, shared with Air Hockey. Key repeats are ignored. As in
+the reference, a released key keeps turning the view until its
+quarter-second latch runs out; cancel, focus loss, and hiding the page
+stop it at once. Feedback lasts 2.5 seconds.
+
+`nw_api_v1_night_watch_info` fields 0–9 report phase, rung, trial, trial
+count, wins, best passing rung, starting rung, adaptive flag, verdict,
+and simulation milliseconds. Fields 10–17 report thieves caught, thieves
+tonight, strikes, strikes allowed, the pressed-pointer flag, the held
+turning-key bits (1 for Left, 2 for A, 4 for Right, 8 for D), whistle
+blasts left, and the view's offset along the floor in thousandths.
+Verdicts 0–5 are active, every thief caught, no whistle left, the wrong
+one whistled at, the safe robbed, and dawn.
+
+The web factory is `createNightWatchEnvironment`. Ports 0–11 move the
+pointer, 12 presses, 13 releases, and 14 and 15 turn the view left and
+right for one latch. The agent entry uses 16 to start and −1 to advance.
+`nw_night_watch_audio_window` writes signed 16-bit stereo PCM at 22,050
+Hz.
+
+SDL uses screen 121 for `--screen night-watch`. It reads `WATCH_RUNG`,
+`WATCH_TRIALS`, and `WATCH_ADAPTIVE` and saves changes to the profile's
+`.night-watch-options` sidecar. The native library exports
+`nw_night_watch_agent_{create,act,publish,destroy}`.
+
+### Kerbside
+
+The Kerbside card is in Attention, after Night Watch. It uses task ID
+`1420277302`. Its creation options are starting rung, crossings per run,
+and adaptive difficulty. Set option 3 to 1 to use positive rung and
+trial counts outside the menu.
+
+Space or primary click starts a run; Enter does not, as in the
+reference. Up and W walk forward, Down and S step back. The four keys
+have independent key-down and key-up state, and walking takes precedence
+when both directions are held. The API key codes for W and S are 77 and
+78. Key repeats are ignored. A released key stops the walker at once.
+Cancel, focus loss, and hiding the page release all four. Feedback lasts
+2.5 seconds.
+
+`nw_api_v1_kerbside_info` fields 0–9 report phase, rung, trial, trial
+count, wins, best passing rung, starting rung, adaptive flag, verdict,
+and simulation milliseconds. Fields 10–17 report lanes, the walker's
+place across the street in millimetres from the near lane line, the far
+kerb in millimetres, the time limit in milliseconds, the held walking-key
+bits (1 for Up, 2 for W, 4 for Down, 8 for S), the lane that struck the
+walker (1-based, 0 if none), the number of cars, and the number of
+parked vans. Verdicts 0–3 are active, across, struck, and still on the
+street.
+
+The web factory is `createKerbsideEnvironment`. Port 0 walks and port 1
+steps back, for the frame they are sent in. The agent entry uses 2 to
+start and −1 to advance. `nw_kerbside_audio_window` writes signed 16-bit
+stereo PCM at 22,050 Hz. The window holds every car's engine, the wind,
+and the verdict note. The sound is worked out from the run's log on
+request. The session carries each track's phase forward between windows,
+so playing forward costs only the new steps. Asking for an earlier window
+recounts from the start.
+
+SDL uses screen 122 for `--screen kerbside`. It reads `KERB_RUNG`,
+`KERB_TRIALS`, and `KERB_ADAPTIVE` and saves changes to the profile's
+`.kerbside-options` sidecar. The native library exports
+`nw_kerbside_agent_{create,act,publish,destroy}`.
+
+### Steadicam
+
+The Steadicam card is in Attention, after Kerbside. It uses task ID
+`2305084378`. Its creation options are starting rung, takes per run,
+and adaptive difficulty. Set option 3 to 1 to use positive rung and
+trial counts outside the menu.
+
+Space or primary click starts a run; Enter does not, as in the
+reference. Left and A pan left, Right and D pan right, Up and W tilt
+up, Down and S tilt down, E zooms in and Q zooms out. The ten keys have
+independent key-down and key-up state. When several are held, the first
+in that order steers, as in the reference's key poll. The API key codes
+for W, S, A, D, Q, and E are 77, 78, 99, 100, 101, and 102. Key repeats
+are ignored. During a take, dragging with the primary button pans by
+the field of view over 900 for each reference pixel across and tilts by
+as much for each pixel up. The wheel zooms by a factor of exp(−0.08)
+per notch up. Cancel, focus loss, and hiding the page release every key
+and end a drag. Feedback lasts 2.5 seconds.
+
+`nw_api_v1_steadicam_info` fields 0–9 report phase, rung, trial, trial
+count, wins, best passing rung, starting rung, adaptive flag, verdict,
+and simulation milliseconds. Fields 10–17 report yaw, pitch, and field
+of view in thousandths of a radian, the share of the counted time framed
+in percent, the held camera-key bits (1 Left, 2 A, 4 Right, 8 D, 16 Up,
+32 W, 64 Down, 128 S, 256 E, 512 Q), whom to follow, whether that
+person is in the box now, and the number of people. Verdicts 0–3 are
+active, passed, framed too little, and lost for three seconds.
+
+The web factory is `createSteadicamEnvironment`. Ports 0–5 pan left and
+right, tilt up and down, and zoom in and out, for the frame they are
+sent in. The agent entry uses 6 to start and −1 to advance.
+`nw_steadicam_audio_window` writes signed 16-bit stereo PCM at 22,050
+Hz: the bell when the person to follow changes.
+
+SDL uses screen 123 for `--screen steadicam`. It reads `STEADY_RUNG`,
+`STEADY_TRIALS`, and `STEADY_ADAPTIVE` and saves changes to the
+profile's `.steadicam-options` sidecar. During a take, Q zooms out
+instead of acting as a shell shortcut. The native library exports
+`nw_steadicam_agent_{create,act,publish,destroy}`.
+
+### Free Kick
+
+The Free Kick card is in Attention, after Steadicam. It uses task ID
+`3503424810`. Its creation options are starting rung, kicks per run,
+and adaptive difficulty. Set option 3 to 1 to use positive rung and
+trial counts outside the menu.
+
+Space or primary click starts a run; Enter does not, as in the
+reference. During a round Space kicks, at once. Left and Right turn the
+aim, Up and Down raise and lower it, A and D curl the ball, and W and S
+kick harder and softer. The eight keys have independent key-down and
+key-up state. When several are held, the first in that order turns its
+dial, as in the reference's key poll. The API key codes for A, D, W, and
+S are 99, 100, 77, and 78. Key repeats are ignored. The dials stop at
+once when their key is released. Cancel, focus loss, and hiding the page
+release every key. The dials do nothing once the ball is kicked.
+Feedback lasts 2.5 seconds.
+
+`nw_api_v1_free_kick_info` fields 0–9 report phase, rung, trial, trial
+count, wins, best passing rung, starting rung, adaptive flag, verdict,
+and simulation milliseconds. Fields 10–17 report the aim, height, curl,
+and power dials in thousandths (degrees, degrees, curl, and metres a
+second), the held dial-key bits (1 Left, 2 Right, 4 Up, 8 Down, 16 A,
+32 D, 64 W, 128 S), whether the ball is kicked, how far a goal missed
+the ring in millimetres, and the ball's distance from the goal line in
+millimetres. Verdicts 0–8 are active, in the ring, into the wall, fell
+short, wide of the goal, over the bar, saved, in the goal but off the
+ring, and out of time.
+
+The web factory is `createFreeKickEnvironment`. Ports 0–7 turn the
+dials for the frame they are sent in: aim left and right, raise, lower,
+curl left and right, harder, and softer. Port 8 kicks at once. The agent
+entry uses 9 to start and −1 to advance. `nw_free_kick_audio_window`
+writes signed 16-bit stereo PCM at 22,050 Hz: the thud of the kick, then
+a bell for a ball in the ring or a growl for any other ending.
+
+SDL uses screen 124 for `--screen free-kick`. It reads `KICK_RUNG`,
+`KICK_TRIALS`, and `KICK_ADAPTIVE` and saves changes to the profile's
+`.free-kick-options` sidecar. The native library exports
+`nw_free_kick_agent_{create,act,publish,destroy}`.
+
+### Glove
+
+The Glove card is in Attention, after Free Kick. It uses task ID
+`4083731742`. Its creation options are starting rung, innings per run,
+and adaptive difficulty. Set option 3 to 1 to use positive rung and
+trial counts outside the menu.
+
+Space or primary click starts a run; Enter does not, and Space does
+nothing during an inning, as in the reference. Up or W, Down or S, Left
+or A, and Right or D move the glove the way the screen shows up, down,
+left and right. The eight keys have independent key-down and key-up
+state. When several are held, Up or W wins, then Down or S, then Left or
+A, as in the reference's key poll. The API key codes for W, S, A, and D
+are 77, 78, 99, and 100. Key repeats are ignored. Cancel, focus loss,
+and hiding the page release every key. Every pointer move during an
+inning, pressed or not, carries the glove's picture by as much as the
+pointer moved, at most 0.25 m a move. Feedback lasts 2.5 seconds.
+
+`nw_api_v1_glove_info` fields 0–9 report phase, rung, trial, trial
+count, wins, best passing rung, starting rung, adaptive flag, verdict,
+and simulation milliseconds. Fields 10–17 report the glove's x and y in
+millimetres, the view, the catches, the misses, the held key bits (1 Up,
+2 W, 4 Down, 8 S, 16 Left, 32 A, 64 Right, 128 D), the next pitch, and
+the pitch in flight (−1 for none). Verdicts 0–2 are active, caught and
+missed.
+
+The web factory is `createGloveEnvironment`. Ports 0–3 move the glove
+up, down, left and right for the frame they are sent in. The agent entry
+uses 4 to start and −1 to advance. `nw_glove_audio_window` writes signed
+16-bit stereo PCM at 22,050 Hz: the thud of a catch or the growl of a
+miss.
+
+SDL uses screen 125 for `--screen glove`. It reads `GLOVE_RUNG`,
+`GLOVE_TRIALS`, and `GLOVE_ADAPTIVE` and saves changes to the profile's
+`.glove-options` sidecar. The native library exports
+`nw_glove_agent_{create,act,publish,destroy}`.
+
+### By Ear
+
+The By Ear card is in Perception, after Captcha. It uses task ID
+`2841258479`. Its creation options are starting rung, melodies per run,
+and adaptive difficulty. Set option 3 to 1 to use positive rung and
+trial counts outside the menu.
+
+Space or primary click starts a run; Enter does not, and Space does
+nothing during a try. The tune plays first, and keys pressed while it
+plays do nothing. Then the keys A W S E D F T G Y H U J K, API key codes
+103–115, play the keys from C to the C above at once, as does a primary
+click on a key in play; the black keys are hit first where they cover
+the white. No key is held: key-up events are ignored. Feedback lasts
+2.5 seconds.
+
+`nw_api_v1_by_ear_info` fields 0–9 report phase, rung, trial, trial
+count, wins, best passing rung, starting rung, adaptive flag, verdict,
+and simulation milliseconds. Fields 10–17 report the steps played back,
+the steps in the tune, the bits of the keys of a pair pressed so far,
+the lit first key (−1 for none), whether the tune is still playing, the
+keys pressed, and when the tune ends and when the try runs out, in
+milliseconds. Verdicts 0–4 are active, all played back, a wrong note,
+a pair's keys too far apart, and too slow.
+
+The web factory is `createByEarEnvironment`. Ports 0–12 press the keys
+from C to C at once. The agent entry uses 13 to start and −1 to advance.
+`nw_by_ear_audio_window` writes signed 16-bit stereo PCM at 22,050 Hz:
+the tune, each key pressed, and the verdict's note.
+
+SDL uses screen 126 for `--screen by-ear`. It reads `EAR_RUNG`,
+`EAR_TRIALS`, and `EAR_ADAPTIVE` and saves changes to the profile's
+`.by-ear-options` sidecar. The native library exports
+`nw_by_ear_agent_{create,act,publish,destroy}`.
+
+### Piano Tuner
+
+The Piano Tuner card is in Perception, after By Ear. It uses task ID
+`994919917`. Its creation options are starting rung, strings per run,
+and adaptive difficulty. Set option 3 to 1 to use positive rung and
+trial counts outside the menu.
+
+Space or primary click starts a run. In play, Space or Enter says the
+string is in tune at once; Enter does not start a run. Up or W and Down
+or S, API key codes 4, 77, 6 and 78, are held keys that turn the pin up
+and down, 60 cents a second, or 5 while Shift (code 24) is held too. A
+key-up lets each go on its own. A pointer move with the primary button
+down (value bit 1) after a primary press turns the pin 0.4 cents a
+pixel up; a move without it, or a primary release, ends the drag.
+Feedback lasts 2.5 seconds.
+
+`nw_api_v1_piano_tuner_info` fields 0–9 report phase, rung, trial, trial
+count, wins, best passing rung, starting rung, adaptive flag, verdict,
+and simulation milliseconds. Fields 10–17 report the string being
+tuned, the strings in the try, the strings tuned, the error in
+thousandths of a cent (sharp positive), the pin's angle in thousandths
+of a degree, the held-key bits (Up 1, W 2, Down 4, S 8, Shift 16), the
+tolerance in thousandths of a cent, and the interval being tuned
+(unison, octave, fifth, fourth, major third). Verdicts 0–4 are active,
+in tune, sharp, flat, and out of time.
+
+The web factory is `createPianoTunerEnvironment`. Ports 0–3 turn the pin
+up and down quickly and slowly for the step they are sent in; port 4
+says it is in tune at once. The agent entry uses 5 to start and −1 to
+advance. `nw_piano_tuner_audio_window` writes signed 16-bit stereo PCM
+at 22,050 Hz: the reference and the string, six partials each, sliding
+between settings, and the bell or wood note of each judgment.
+
+SDL uses screen 127 for `--screen piano-tuner`. It reads `TUNE_RUNG`,
+`TUNE_TRIALS`, and `TUNE_ADAPTIVE` and saves changes to the profile's
+`.piano-tuner-options` sidecar. The native library exports
+`nw_piano_tuner_agent_{create,act,publish,destroy}`.
+
+### Cricket Hunt
+
+The Cricket Hunt card is in Perception, after Piano Tuner. It uses task
+ID `3655954588`. Its creation options are starting rung, hunts per run,
+and adaptive difficulty. Set option 3 to 1 to use positive rung and
+trial counts outside the menu.
+
+Space or primary click starts a run, and in play Space grabs at once.
+W or Up and S or Down walk, A or Left and D or Right turn, and Q and E
+look up and down; they are held keys, API key codes 77, 4, 78, 6, 99,
+3, 100, 5, 101 and 102, each let go on its own key-up. When several are
+down the first of that list moves. A pointer move with the primary
+button down (value bit 1) after a primary press turns the head 0.006
+radians a pixel right and up; a move without it, or a primary release,
+ends the drag. Feedback lasts 2.5 seconds.
+
+`nw_api_v1_cricket_hunt_info` fields 0–9 report phase, rung, trial,
+trial count, wins, best passing rung, starting rung, adaptive flag,
+verdict, and simulation milliseconds. Fields 10–17 report crickets
+caught, crickets in the room, grabs at nothing, the position x and z,
+the heading and the look's pitch (each in thousandths of a metre or
+radian), and the held-key bits (W 1, Up 2, S 4, Down 8, A 16, Left 32, D
+64, Right 128, Q 256, E 512). Verdicts 0–3 are active, all caught, out
+of time, and three grabs at nothing.
+
+The web factory is `createCricketHuntEnvironment`. Ports 0–5 walk forward
+and back, turn left and right, and look up and down for the step they
+are sent in; port 6 grabs at once. The agent entry uses 7 to start and
+−1 to advance. `nw_cricket_hunt_audio_window` writes signed 16-bit
+stereo PCM at 22,050 Hz: each cricket's gated chirp, panned and
+brightened as it is heard, the room's hum, and the notes of hops,
+catches and misses.
+
+SDL uses screen 128 for `--screen cricket-hunt`. Q looks up during play
+instead of quitting. It reads `CRICKET_RUNG`, `CRICKET_TRIALS`, and
+`CRICKET_ADAPTIVE` and saves changes to the profile's
+`.cricket-hunt-options` sidecar. The native library exports
+`nw_cricket_hunt_agent_{create,act,publish,destroy}`.
+
+### Claw Machine
+
+The Claw Machine card is in Perception, after Cricket Hunt. It uses task
+ID `2783635748`. Its creation options are starting rung, drops per run,
+and adaptive difficulty. Set option 3 to 1 to use positive rung and
+trial counts outside the menu.
+
+Space or a primary press starts a run; Enter does not. In play Space
+or Enter drops the claw, once a try. Left or A and Right or D move the trolley
+across, and Up or W and Down or S move it in and out; they are held
+keys, API key codes 3, 99, 5, 100, 4, 77, 6 and 78, each let go on its
+own key-up. A pointer does nothing else. Feedback lasts 2.5 seconds.
+
+`nw_api_v1_claw_machine_info` fields 0–9 report phase, rung, trial,
+trial count, wins, best passing rung, starting rung, adaptive flag,
+verdict, and simulation milliseconds. Fields 10–17 report whether the
+claw was dropped, its depth, the trolley's x and z, the swing's offsets
+x and z (each in thousandths of a metre), the prizes in the cabinet, and
+the held-key bits (Left 1, A 2, Right 4, D 8, Up 16, W 32, Down 64, S
+128). Verdicts 0–7 are active, got it, not the gold one, too far in, not
+far enough in, to the right, to the left, and out of time.
+
+The web factory is `createClawMachineEnvironment`. Ports 0–3 move the
+trolley left, right, in and out for the step they are sent in; port 4
+drops. The agent entry uses 5 to start and −1 to advance.
+`nw_claw_machine_audio_window` writes signed 16-bit stereo PCM at
+22,050 Hz: the run's notes (the knock of the drop, then a bell or a
+growl) through the shared note synth.
+
+SDL uses screen 129 for `--screen claw-machine`. It reads `CLAW_RUNG`,
+`CLAW_TRIALS`, and `CLAW_ADAPTIVE` and saves changes to the profile's
+`.claw-machine-options` sidecar. The native library exports
+`nw_claw_machine_agent_{create,act,publish,destroy}`.
+
+### The Cipher Abyss
+
+The Cipher Abyss uses task ID `1865539977`. Create options 0–2 are the
+starting rung, machines per run, and adaptive difficulty. Option 3
+allows positive integer rung and trial counts beyond the menu. Option
+4 enables the first-rung tutorial, and option 5 is zero.
+
+Space, Enter, or a primary click starts a run. Keys 1–8 enter symbols,
+Backspace deletes, and Enter runs an experiment or submits a test
+answer. Up, Down, Space, and Z control the hypothesis board. Logical
+codes 89–97 are T (test), C (check), S (submit), P (predict), PageUp,
+PageDown, M (mark), N (numbers), and O (sort). X downloads the notebook
+in the browser. Interactive feedback lasts nine seconds.
+
+`nw_api_v1_cipher_abyss_info` fields 0–9 are phase, current rung,
+trial, trial count, wins, best passing rung, starting rung, adaptive
+flag, verdict, and simulation milliseconds. Fields 10–12 are machine
+kind, experiment count, and the zero-based test index.
+
+`nw_cipher_abyss_record` writes UTF-8 bytes to a caller-provided
+buffer. Kind 0 exports the current notebook once the run starts,
+kind 1 returns one newline-terminated JSON record during feedback,
+and kind 2 returns the version-one operator library.
+`nw_cipher_abyss_load_library` accepts that JSON while ready or after
+a session ends. The browser stores the operator library, round records,
+and tutorial state locally.
+`nw_cipher_abyss_audio_window` writes interleaved signed 16-bit stereo
+PCM at 22,050 Hz for a run-relative window.
+
+The web factory is `createCipherAbyssEnvironment`. Agent ports 0–11
+move the pointer, 12 presses, 13 releases, and 14–21 enter symbols.
+Ports 22–36 perform delete, run, test, next block, previous block,
+add block, undo block, check, submit, predict, scroll up, scroll down,
+mark, numbers, and sort. The agent entry uses 37 to start and −1 to
+advance.
+
+SDL uses screen 111 for `--screen cipher-abyss`. The profile loader
+reads `CIPHER_RUNG`, `CIPHER_TRIALS`, and `CIPHER_ADAPTIVE`. Changes
+use the selected profile’s `.cipher-abyss-options` sidecar. Visible
+sessions use the original data directory for the tutorial marker,
+`cipher_abyss_library.json`, `cipher_abyss_rounds.jsonl`, and the X shortcut’s
+`cipher_abyss_notebook.txt`. The native library exports
+`nw_cipher_abyss_agent_{create,act,publish,destroy}`.
+
+### Dam Keeper
+
+Dam Keeper uses task ID `2780310580`. Create options 0–2 select the
+starting rung, valleys per run, and adaptive difficulty. Option 3 enables
+positive integer dials beyond the interactive options menu. Options 4
+and 5 are zero.
+
+Action ports 0–5 adjust the gates in open/shut pairs, one pair per dam.
+Logical key codes 26–31 map to Q, A, W, S, E, and D in the same order.
+Action port 6 and Space start or restart the run. A primary pointer press
+on the upper half of a gate opens it a notch. A press on the lower half shuts it a notch. Interactive advance
+clamps each simulation update to 100 ms and displays feedback for 3 seconds.
+
+`nw_api_v1_dam_keeper_info` fields 0–10 return phase, rung, valley number,
+valleys per run, simulation milliseconds, dam count, verdict, fault dam
+index, valleys passed, highest rung passed, and feedback deadline in
+milliseconds. The verdict, fault dam, and deadline are available during
+feedback. `nw_dam_keeper_options_note` writes the starting-rung preview
+as UTF-8.
+
+SDL uses screen 86 for `--screen dam-keeper` and exposes the same fields
+in `--dump`. It reads `DAMKEEPER_RUNG`, `DAMKEEPER_TRIALS`, and
+`DAMKEEPER_ADAPTIVE` from the profile and saves edits to the profile’s
+`.dam-keeper-options` sidecar.
+
+The browser's `createDamKeeperEnvironment` starts automatically. It
+uses `nw_dam_keeper_agent_event` with the virtual clock in seconds.
+Port -1 advances the clock even when no gate moves. The frame that
+settles a valley carries the verdict. The next stepped frame opens
+the next valley or reports completion. The six action ports remain
+available on two-dam valleys, with the third dam's ports acting as no-ops.
+The native library provides `nw_dam_keeper_agent_create`,
+`nw_dam_keeper_agent_act`, `nw_dam_keeper_agent_publish`, and
+`nw_dam_keeper_agent_destroy` through the same receipt and frame ABI
+used by the other clocked agents.
+
+### Glider
+
+Glider uses task ID `3159511168`. Create options 0–2 select the
+starting rung, flights per run, and adaptive difficulty. Space
+starts from ready or done and holds lift during flight. Up also
+holds lift. Focus loss and cancellation release lift. Agent port 0
+holds lift for one frame.
+
+`nw_api_v1_glider_info` exposes phase, rung, flight number, total,
+elapsed milliseconds, height in thousandths of a canyon unit, walls
+passed, verdict, flights passed, highest rung passed, verdict deadline
+in milliseconds, vertical velocity in thousandths of a canyon unit
+per second, wall count, lift state, and the collided wall number.
+
+
+### Catch
+
+Catch uses task ID `1116268876`. Create options 0–2 select the
+starting rung, rounds per run, and adaptive difficulty. Keys and
+pointer moves update held directions and floor aim. Focus loss and
+cancellation release held directions.
+
+Ports 0–3 move the first basket left, right, nearer, and farther.
+Ports 4–7 use the same order for the second basket. WASM
+`nw_catch_agent_mask` and native `nw_catch_agent_act_mask` accept
+one bit per port and apply the selected inputs together for one
+frame. Browser receipts include the selected port numbers. In a
+native verdict tied to a mask action, `action_port` is 256 plus
+the submitted mask. Single-port calls keep their usual port number.
+
+`nw_api_v1_catch_info` exposes phase, rung, round, rounds per run,
+elapsed milliseconds, catches, drops, verdict, rounds passed,
+highest rung passed, verdict deadline in milliseconds, ball count,
+basket count, then each basket's X and Z in thousandths of a court
+unit. `nw_catch_audio` reads elapsed 22,050 Hz stereo signed
+16-bit little-endian PCM.
+
+
+### Echo Cave
+
+Echo Cave uses task ID `2392810020`. Create options 0–2 select
+the starting rung, flights per run, and adaptive difficulty. Space
+starts from ready or done and clicks during flight. Arrow keys
+and pointer moves control steering. Focus loss and cancellation
+clear held directions and mouse aim.
+
+Ports 0–7 steer up, down, left, right, up-left, up-right, down-left,
+and down-right. Port 8 clicks. WASM `nw_echo_cave_agent_mask` and
+native `nw_echo_cave_agent_act_mask` accept one bit per port. A native
+verdict tied to a mask action reports `action_port` as 512 plus the
+mask. The native and WASM agent audio calls expose elapsed 22,050 Hz
+stereo signed 16-bit little-endian PCM. `nw_echo_cave_speaker_audio`
+applies the interactive speaker delay.
+
+`nw_api_v1_echo_cave_info` exposes phase, rung, flight number, total,
+elapsed milliseconds, moths caught, moths needed, verdict, flights
+passed, highest rung passed, verdict deadline in milliseconds, X, Y,
+depth, visible distance in thousandths of a cave unit, and cue count.
+
+### Camera
+
+The Camera render bridge uses task ID `2663290958`, returned by
+`nw_api_v1_task_camera`. Create options 0–2 select the starting rung, number
+of photos, and adaptive difficulty. Options 3–5 are zero. The run uses
+the common create, dispatch, advance, and destroy calls.
+
+Action codes 0–29 are the ten movement ports, with three step sizes per
+movement. Code 30 submits a match and 31 starts a run. Codes 32–41 hold
+a movement and 42–51 release it, in the same order as the stepped ports.
+Codes 52 and 53 toggle slow movement and photo peek using value 0 or 1.
+Code 54 clears controls, as do cancellation, blur, and hidden-page
+events. Code 55 accepts horizontal and upward-positive vertical drag
+deltas in thousandths of a logical pixel.
+
+`nw_camera_info` fields 0–9 return the phase, current scene rung, trial
+number, total trials, stepped inputs, scored trials, matches, best
+matched rung, peek flag, and deal failure flag.
+
+`nw_camera_frame` writes the shared `NWCF` frame packet for physical
+canvas dimensions. It returns the byte length, zero when there is no
+scene or drawable viewport, or a negative protocol error.
+`nw_camera_mesh` writes a shared `NWCM` indexed mesh for a requested kind
+and field size. Both write into caller-owned WASM memory. The browser
+renderer reads scene and mesh packets synchronously and copies decoded
+values before reusing the same buffer.
+
+`nw_camera_chrome` writes a display list in the same canvas pixel
+coordinates as the scene packet. Hosts composite the 3D scene first
+and draw this list over it. The display list also covers ready and
+completed runs, which have no 3D scene.
+
+`nw_camera_options_note` writes the source-compatible starting-rung
+description as UTF-8 given the rung and adaptive flag.

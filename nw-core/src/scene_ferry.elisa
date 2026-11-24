@@ -1,0 +1,308 @@
+include "./tasks/ferry_game.elisa"
+include "./scene_polish.elisa"
+include "./scene_verdict.elisa"
+include "./geometry.elisa"
+include "./verdict.elisa"
+
+module SceneFerry:
+    const WIDTH: f64 = 912.0
+    const HEIGHT: f64 = 684.0
+    const WATER_EDGE: u32 = 0x5caac4ff
+    const WATER_MID: u32 = 0x226096ff
+    const LAMP: u32 = 0xffd650ff
+    const DOCKING: u32 = 0x78f096ff
+
+    struct Frame:
+        x: f64
+        y: f64
+        s: f64
+
+    def frame() -> Frame:
+        can Abort.Panic:
+            y: f64 = Verdict::above_the_band(HEIGHT, Geometry::from_bottom_edge(HEIGHT, 58.0).f64()).f64()
+            top: f64 = Geometry::from_top_edge(HEIGHT, 116.0).f64()
+            s: f64 = fmin(WIDTH * 0.94 / Ferry::WIDTH, fmax(40.0, top - y) / (Ferry::HEIGHT + 2.5))
+            return Frame{x: (WIDTH - Ferry::WIDTH * s) / 2.0, y: y, s: s}
+
+    def colour(index: i64) -> u32:
+        can Abort.Panic:
+            cargo: u32[4] = [0xde5442ff, 0x3c82d6ff, 0xf0b032ff, 0x50aa64ff]
+            return cargo[(index % 4).usize()]
+
+    def river_rect(list: mutable Display::DisplayList&, f: Frame, x: f64, y: f64, w: f64, h: f64, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_rect(list, f.x + x * f.s, f.y + y * f.s, w * f.s, h * f.s, ink)
+
+    def river_gradient(list: mutable Display::DisplayList&, f: Frame, y: f64, low: u32, high: u32):
+        can Memory.Allocate, Abort.Panic:
+            step: f64 = (Ferry::NORTH - Ferry::SOUTH) * f.s / 28.0
+            for i in 0..<14 |list, f, y, low, high, step|:
+                ink: u32 = ScenePolish::mix_rgb(low, high, (i.f64() + 0.5) / 14.0)
+                Display::draw_rect(list, f.x, f.y + y * f.s + i.f64() * step, Ferry::WIDTH * f.s, step + 1.0, ink)
+
+    def bank(list: mutable Display::DisplayList&, f: Frame, low: f64, high: f64, sand: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            river_rect(list, f, 0.0, low, Ferry::WIDTH, high - low, 0x70ac56ff)
+            river_rect(list, f, 0.0, sand, Ferry::WIDTH, 0.8, 0xe2ce96ff)
+            s: f64 = f.s
+            for _ in 0..<16 |list, f, low, high, rng, s|:
+                x: f64 = f.x + py_uniform(rng, 1.0, Ferry::WIDTH - 1.0) * s
+                y: f64 = f.y + py_uniform(rng, low + 0.4, high - 1.0) * s
+                if py_random(rng) < 0.7:
+                    radius: f64 = s * py_uniform(rng, 0.5, 0.8)
+                    Display::draw_circle(list, x, y, radius, ScenePolish::mix_rgb(0x32783cff, 0x5aa050ff, py_random(rng)))
+                else:
+                    Display::draw_rect(list, x - 0.6 * s, y - 0.4 * s, 1.2 * s, 0.8 * s, 0xf4ecdcff)
+                    roof: u32 = 0xc8503cff if py_randbelow(rng, 2.u64()) == 0.u64() else 0x5a6eaaff
+                    Display::draw_triangle(list, x - 0.8 * s, y + 0.4 * s, x + 0.8 * s, y + 0.4 * s, x, y + s, roof)
+
+    def river_scenery(list: mutable Display::DisplayList&, f: Frame, river: Ferry::River&, dark: bool):
+        can Memory.Allocate, Abort.Panic:
+            s: f64 = f.s
+            box: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: f.x - 6.0, y: f.y - 6.0,
+                w: Ferry::WIDTH * s + 12.0, h: Ferry::HEIGHT * s + 12.0}
+            ScenePolish::shadow(list, &box, 14.0, 4.0, dark)
+            ScenePolish::rounded(list, &box, 14.0, 0x3c5a3cff)
+            river_gradient(list, f, Ferry::SOUTH, WATER_EDGE, WATER_MID)
+            river_gradient(list, f, 20.0, WATER_MID, WATER_EDGE)
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, river.gust_seed.u64())
+            bank(list, f, 0.0, Ferry::SOUTH, Ferry::SOUTH - 0.8, &rng)
+            bank(list, f, Ferry::NORTH, Ferry::HEIGHT, Ferry::NORTH, &rng)
+            for i in 0..<(river.level.crossings + 1) |list, f, river, s|:
+                pier: Ferry::Point = river.piers[i.usize()]
+                north: bool = pier.y > 20.0
+                base: f64 = Ferry::NORTH if north else Ferry::SOUTH
+                tip: f64 = pier.y + (-1.6 if north else 1.6)
+                lo: f64 = fmin(base, tip)
+                height: f64 = fabs(tip - base)
+                river_rect(list, f, pier.x + 2.6, lo, 1.2, height, 0x96683eff)
+                x: f64 = f.x + (pier.x + 2.6) * s
+                for j in 0..<(height.i64() + 1) |list, f, s, x, lo|:
+                    y: f64 = f.y + (lo + j.f64()) * s
+                    Display::draw_line(list, x, y, x + 1.2 * s, y, 1.0, 0x6e4c2cff)
+
+    def current_streaks(list: mutable Display::DisplayList&, f: Frame, run: Ferry::Run&):
+        can Memory.Allocate, Abort.Panic:
+            s: f64 = f.s
+            gust: f64 = Ferry::gust(run, run.t)
+            level: Ferry::Grade = run.river.level
+            for k in 0..<36 |list, f, run, level, s, gust|:
+                yy: f64 = Ferry::SOUTH + 1.0 + Ferry::wrap(k.f64() * 7.13, Ferry::NORTH - Ferry::SOUTH - 2.0)
+                c: f64 = Ferry::current_at(&level, yy) + gust
+                x: f64 = f.x + (Ferry::wrap(k.f64() * 11.7 + c * run.t, Ferry::WIDTH + 4.0) - 2.0) * s
+                y: f64 = f.y + yy * s
+                Display::draw_line(list, x, y, x - 0.6 * s * (0.5 + c), y, 2.0, 0xd2ecfa5a)
+
+    def docking_pier(list: mutable Display::DisplayList&, f: Frame, run: Ferry::Run&):
+        can Memory.Allocate, Abort.Panic:
+            s: f64 = f.s
+            target: Ferry::Point = Ferry::target(run)
+            x: f64 = f.x + target.x * s
+            y: f64 = f.y + target.y * s
+            lamp: f64 = x + 3.2 * s
+            docking: bool = run.docked_since >= 0.0
+            ScenePolish::glow(list, lamp, y, 2.2 * s, 0xffdc78ff, 110)
+            Display::draw_box(list, x - 2.2 * s, y - 1.6 * s, 4.4 * s, 3.2 * s, DOCKING if docking else LAMP, 3.0)
+            Display::draw_circle(list, lamp, y, 0.35 * s, 0xffeca0ff)
+            for i in 0..<4 |list, s, x, y, target|:
+                px: f64 = x + (2.9 + (i % 2).f64() * 0.6) * s
+                py: f64 = y + (1.0 if target.y > 20.0 else -1.0) * (0.8 + 0.5 * i.f64()) * s
+                Display::draw_circle(list, px, py, 0.28 * s, colour(i))
+            if docking:
+                share: f64 = fmin(1.0, (run.t - run.docked_since) / 2.0)
+                ScenePolish::arc(list, lamp, y, 0.9 * s, Ferry::PI / 2.0, 2.0 * Ferry::PI * share, 3.0, DOCKING)
+
+    def traffic(list: mutable Display::DisplayList&, f: Frame, run: Ferry::Run&):
+        can Memory.Allocate, Abort.Panic:
+            s: f64 = f.s
+            for i in 0..<run.river.level.lanes |list, f, run, s|:
+                barge: Ferry::Barge = run.river.barges[i.usize()]
+                way: f64 = 1.0 if barge.speed > 0.0 else -1.0
+                nose: f64 = way * Ferry::BARGE_LENGTH * s
+                half_beam: f64 = Ferry::BARGE_BEAM * s
+                y: f64 = f.y + barge.lane_y * s
+                for k in 0..<2 |list, f, run, s, i, barge, way, nose, half_beam, y|:
+                    bx: f64 = Ferry::barge_x(barge, k, run.t)
+                    if not run.river.level.fog or py_hypot(bx - run.x, barge.lane_y - run.y) <= Ferry::FOG:
+                        x: f64 = f.x + bx * s
+                        Display::begin_polygon(list, 5, x - nose, y - half_beam, 0x3c3840ff)
+                        Display::polygon_point(list, x - nose, y - half_beam)
+                        Display::polygon_point(list, x + nose * 0.75, y - half_beam)
+                        Display::polygon_point(list, x + nose, y)
+                        Display::polygon_point(list, x + nose * 0.75, y + half_beam)
+                        Display::polygon_point(list, x - nose, y + half_beam)
+                        for j in 0..<3 |list, s, i, k, x, y, way, nose|:
+                            cx: f64 = x - nose * 0.75 + way * j.f64() * 2.6 * s
+                            Display::draw_rect(list, cx - 1.1 * s, y - 0.9 * s, 2.2 * s, 1.8 * s, colour(2 * i + k + j))
+                        angle: f64 = -Ferry::PI / 3.0 if way > 0.0 else 2.0 * Ferry::PI / 3.0
+                        ScenePolish::arc(list, x + nose, y, 1.4 * s, angle, 2.0 * Ferry::PI / 3.0, 2.0, 0xf0faffaa)
+
+    def mist(list: mutable Display::DisplayList&, f: Frame, time: f64):
+        can Memory.Allocate, Abort.Panic:
+            rx: f64 = 10.5 * f.s
+            ry: f64 = 3.0 * f.s
+            for k in 0..<7 |list, f, time, rx, ry|:
+                x: f64 = f.x + (11.0 + Ferry::wrap(k.f64() * 13.0 + time * 0.8, Ferry::WIDTH - 22.0)) * f.s
+                y: f64 = f.y + (Ferry::SOUTH + 2.0 + Ferry::wrap(k.f64() * 5.3, Ferry::NORTH - Ferry::SOUTH - 4.0)) * f.s
+                Display::begin_polygon(list, 20, x + rx, y, 0xecf0f678)
+                for j in 0..<20 |list, x, y, rx, ry|:
+                    a: f64 = Ferry::PI * j.f64() / 10.0
+                    Display::polygon_point(list, x + cos(a) * rx, y + sin(a) * ry)
+
+    struct Pose:
+        x: f64
+        y: f64
+        ux: f64
+        uy: f64
+
+    def boat_point(pose: Pose, along: f64, across: f64) -> Ferry::Point:
+        return Ferry::Point{x: pose.x + pose.ux * along - pose.uy * across,
+            y: pose.y + pose.uy * along + pose.ux * across}
+
+    def boat_vertex(list: mutable Display::DisplayList&, pose: Pose, along: f64, across: f64):
+        can Memory.Allocate, Abort.Panic:
+            p: Ferry::Point = boat_point(pose, along, across)
+            Display::polygon_point(list, p.x, p.y)
+
+    def boat(list: mutable Display::DisplayList&, f: Frame, run: Ferry::Run&):
+        can Memory.Allocate, Abort.Panic:
+            s: f64 = f.s
+            h: f64 = Ferry::radians(run.heading)
+            pose: Pose = Pose{x: f.x + run.x * s, y: f.y + run.y * s, ux: cos(h), uy: sin(h)}
+            l: f64 = 2.6 * s
+            b: f64 = 1.1 * s
+            tip: Ferry::Point = boat_point(pose, l, 0.0)
+            Display::begin_polygon(list, 5, tip.x, tip.y, 0xfafafcff)
+            Display::polygon_point(list, tip.x, tip.y)
+            boat_vertex(list, pose, l * 0.45, b)
+            boat_vertex(list, pose, -l, b * 0.9)
+            boat_vertex(list, pose, -l, -b * 0.9)
+            boat_vertex(list, pose, l * 0.45, -b)
+            aft: Ferry::Point = boat_point(pose, -l, 0.0)
+            bow: Ferry::Point = boat_point(pose, l * 0.8, 0.0)
+            Display::draw_line(list, aft.x, aft.y, bow.x, bow.y, fmax(2.0, 0.25 * s), 0xdc403cff)
+            front: Ferry::Point = boat_point(pose, -0.2 * l, 0.55 * b)
+            Display::begin_polygon(list, 4, front.x, front.y, 0x4678b4ff)
+            Display::polygon_point(list, front.x, front.y)
+            boat_vertex(list, pose, 0.35 * l, 0.55 * b)
+            boat_vertex(list, pose, 0.35 * l, -0.55 * b)
+            boat_vertex(list, pose, -0.2 * l, -0.55 * b)
+            if run.thrusting != 0:
+                for k in 0..<3 |list, pose, s, l, run|:
+                    p: Ferry::Point = boat_point(pose, -l - (0.4 + 0.5 * k.f64()) * s * run.thrusting.f64(),
+                        sin(run.t * 20.0 + k.f64()) * 0.3 * s)
+                    Display::draw_circle(list, p.x, p.y, 0.25 * s, 0xffffffb4)
+
+    def wake(list: mutable Display::DisplayList&, f: Frame, run: Ferry::Run&):
+        can Memory.Allocate, Abort.Panic:
+            first: i64 = run.wake_next + Ferry::WAKE_LENGTH - run.wake_count
+            for i in first..<(first + run.wake_count) |list, f, run|:
+                mark: Ferry::Wake = run.wake[(i % Ferry::WAKE_LENGTH).usize()]
+                age: f64 = run.t - mark.time
+                if age <= 6.0:
+                    alpha: u32 = (120.0 * (1.0 - age / 6.0)).u32()
+                    Display::draw_circle(list, f.x + mark.at.x * f.s, f.y + mark.at.y * f.s,
+                        (0.3 + age * 0.12) * f.s, 0xf0faff00 | alpha)
+
+    def ferry_round(list: mutable Display::DisplayList&, x: f64, y: f64, w: f64, h: f64, radius: f64, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            box: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: x, y: y, w: fmax(1.0, w), h: fmax(1.0, h)}
+            ScenePolish::rounded(list, &box, radius, ink)
+
+    def crossing_progress(list: mutable Display::DisplayList&, f: Frame, run: Ferry::Run&):
+        can Memory.Allocate, Abort.Panic:
+            s: f64 = f.s
+            y: f64 = f.y + (Ferry::HEIGHT + 0.6) * s
+            for i in 1..<(run.river.level.crossings + 1) |list, f, run, s, y|:
+                ink: u32 = 0x50c882ff if i < run.leg else LAMP if i == run.leg else 0xbec4d0ff
+                Display::draw_circle(list, f.x + (1.2 + (i - 1).f64() * 1.6) * s, y + 0.6 * s, 0.55 * s, ink)
+            share: f64 = fmax(0.0, 1.0 - run.t / run.river.level.seconds)
+            x: f64 = f.x + (Ferry::WIDTH - 20.5) * s
+            ferry_round(list, x, y + 0.2 * s, 20.0 * s, 0.8 * s, 0.4 * s, 0xbec4d0ff)
+            if share > 0.02:
+                ferry_round(list, x, y + 0.2 * s, 20.0 * s * share, 0.8 * s, 0.4 * s,
+                    ScenePolish::mix_rgb(0xec5040ff, 0x3cbe78ff, fmin(1.0, share * 1.6)))
+
+    def verdict_text(run: Ferry::Run&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if run.result == Ferry::CLEAR:
+                dstr_append_i64(out, run.leg)
+                dstr_append_cstr(out, " crossings in ")
+                dstr_append_i64(out, py_round_half_even(run.t))
+                dstr_append_cstr(out, " s")
+            elif run.result == Ferry::AGROUND:
+                dstr_append_cstr(out, "The ferry ran hard aground")
+            elif run.result == Ferry::SWEPT:
+                dstr_append_cstr(out, "Swept out of the harbour")
+            elif run.result == Ferry::COLLISION:
+                dstr_append_cstr(out, "The ferry struck a barge")
+            elif run.result == Ferry::TIMEOUT:
+                dstr_append_cstr(out, "Out of time")
+
+    def ferry_text(list: mutable Display::DisplayList&, words: sview, y: f64, size: f64, ink: u32, bold: bool = false):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, words, WIDTH / 2.0, y, size, ink, Display::ANCHOR_CENTER_CENTER, bold)
+
+    def render(list: mutable Display::DisplayList&, session: FerryGame::Session&, dark: bool):
+        can Memory.Allocate, Abort.Panic:
+            ink: u32 = 0xffffffff if dark else 0x000000ff
+            ferry_text(list, "Ferry", 648.0, 22.0, ink, true)
+            ferry_text(list, "Up: ahead   Down: astern   Left / Right: turn   dock at the lit pier   Esc: menu", 26.0, 12.0, ink)
+            caption: mutable dstr = []
+            verdict_text(&session.run, &caption)
+            status: mutable dstr = []
+            if session.phase == FerryGame::READY:
+                dstr_append_cstr(&status, "Press Space or click to start")
+            elif session.phase == FerryGame::DONE:
+                dstr_append_i64(&status, session.wins)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, session.trial)
+                dstr_append_cstr(&status, " passed   highest rung passed ")
+                dstr_append_i64(&status, session.best_rung)
+            elif session.phase == FerryGame::JUDGED:
+                status <- caption
+            else:
+                dstr_append_cstr(&status, "Carry the passengers across: dock at the lit pier")
+            ferry_text(list, bytes_view(status), 614.0, 14.0, ink)
+            if session.phase == FerryGame::PLAYING or session.phase == FerryGame::JUDGED:
+                facts: mutable dstr = []
+                dstr_append_cstr(&facts, "rung ")
+                dstr_append_i64(&facts, session.rung)
+                dstr_append_cstr(&facts, "  ")
+                dstr_append_i64(&facts, session.trial)
+                dstr_append_cstr(&facts, "/")
+                dstr_append_i64(&facts, session.total)
+                dstr_append_cstr(&facts, "   crossing ")
+                dstr_append_i64(&facts, session.run.leg)
+                dstr_append_cstr(&facts, " of ")
+                dstr_append_i64(&facts, session.run.river.level.crossings)
+                ferry_text(list, bytes_view(facts), 588.0, 12.0, ink)
+                f: Frame = frame()
+                river_scenery(list, f, &session.run.river, dark)
+                current_streaks(list, f, &session.run)
+                wake(list, f, &session.run)
+                docking_pier(list, f, &session.run)
+                traffic(list, f, &session.run)
+                boat(list, f, &session.run)
+                if session.run.river.level.fog:
+                    mist(list, f, session.run.t)
+                crossing_progress(list, f, &session.run)
+            if (session.phase == FerryGame::JUDGED or session.phase == FerryGame::DONE) and caption.count > 0:
+                SceneVerdict::put(list, WIDTH, HEIGHT, 1.0, 1.0, session.run.result == Ferry::CLEAR,
+                    bytes_view(caption), 60.0, 16.0)
+
+    def option_note(rung: i64, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            level: Ferry::Grade = Ferry::grade(rung)
+            dstr_append_cstr(out, "Rung ")
+            dstr_append_i64(out, level.rung)
+            dstr_append_cstr(out, ": ")
+            dstr_append_i64(out, level.crossings)
+            dstr_append_cstr(out, " crossings, a ")
+            dstr_append_fixed(out, py_round_decimal(level.current, 10.0), 1)
+            dstr_append_cstr(out, " m/s river, ")
+            dstr_append_i64(out, level.lanes)
+            dstr_append_cstr(out, " lane(s).")
+            dstr_append_cstr(out, "  Gusts.") if level.gusts > 0.0
+            dstr_append_cstr(out, "  Fog hides the barges.") if level.fog

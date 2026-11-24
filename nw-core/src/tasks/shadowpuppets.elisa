@@ -1,0 +1,524 @@
+include "../hand_view.elisa"
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+# shadowpuppets.py: turn a figure of blocks until the shadow a lamp throws
+# of it on the wall is the shape asked for, and hold it there a moment.
+#
+# A way of standing is a 3x3 matrix, row-major in f64[9]. A shadow is the
+# set of wall cells the blocks fall on; cells (x, y) lie in -2..2, so a
+# shadow is a 25-bit mask with bit (x + 2) * 5 + (y + 2). That order is the
+# order Python sorts the cells in, so comparing masks bit by bit from the
+# bottom compares the reference's sorted cell lists.
+module ShadowPuppets:
+    const ROLL_LEFT: i64 = HandView::KEYS
+    const ROLL_RIGHT: i64 = HandView::KEYS + 1
+    const PORTS: i64 = HandView::KEYS + 2
+    const GAIN: f64 = 0.3
+    const ROLL: f64 = 2.0
+    const STAY: f64 = 0.7
+    const WARM: i64 = 0
+    const DONE: i64 = 1
+    const TICK: i64 = 2
+    const HUM: i64 = 3
+    const WALL: i64 = 0
+    const CARD: i64 = 1
+    const NAMED: i64 = 2
+    const LIVE: i64 = 0
+    const PASSED: i64 = 1
+    const FAILED: i64 = 2
+    const MOST: i64 = 8
+    const SQUARES: i64 = 24
+    const SHAPES: i64 = 9
+    const BAR: i64 = 3          # 'I', the side of a flat figure
+    const NO_NAME: i64 = -1
+
+    struct Grade:
+        rung: i64
+        flat: bool
+        shadows: i64
+        near: f64
+        shown: i64
+        tone: bool
+        hidden: bool
+        seconds: f64
+
+    struct Puppet:
+        level: Grade
+        front: i64
+        side: i64
+        start: f64[9]
+        wanted: i64[8]
+        names: i64[8]
+        count: i64
+        seed: i64
+        valid: bool
+
+    struct Run:
+        puppet: Puppet
+        cubes: i64[81]
+        blocks: i64
+        square: f64[216]
+        marks: i64[24]
+        m: mutable f64[9]
+        at: mutable i64
+        stay: mutable f64
+        last_x: mutable f64
+        last_y: mutable f64
+        tone_at: mutable f64
+        hand: mutable HandView::Pointer
+        time: mutable f64
+        result: mutable i64
+        audible: bool
+        notes: mutable darray[DrShapeDeal::Note]
+
+    # math.radians and math.degrees, as CPython multiplies.
+    def radians(degrees: f64) -> f64:
+        return degrees * (3.141592653589793 / 180.0)
+
+    def degrees(radians: f64) -> f64:
+        return radians * (180.0 / 3.141592653589793)
+
+    # Separate libm calls, as Python makes them; a fused sincos can differ.
+    @inline(never)
+    def sine(angle: f64) -> f64:
+        return sin(angle)
+
+    @inline(never)
+    def cosine(angle: f64) -> f64:
+        return cos(angle)
+
+    # Python's sum() of floats from its int 0 start: 0 + the first term, then
+    # Neumaier's compensated sum over the rest, the compensation added at the
+    # end only when it is a finite non-zero. A plain left-to-right add
+    # differs from it in the last bit often enough to change a run.
+    def psum(terms: f64&, count: i64) -> f64:
+        can Abort.Panic:
+            total: mutable f64 = 0.0 + terms[0]
+            compensation: mutable f64 = 0.0
+            for k in 1..<count |terms, total, compensation|:
+                x: f64 = terms[k.usize()]
+                after: f64 = total + x
+                if fabs(total) >= fabs(x):
+                    compensation <- compensation + ((total - after) + x)
+                else:
+                    compensation <- compensation + ((x - after) + total)
+                total <- after
+            if compensation != 0.0 and compensation - compensation == 0.0:
+                total <- total + compensation
+            return total
+
+    def mul(a: f64[9], b: f64[9]) -> f64[9]:
+        can Abort.Panic:
+            out: mutable f64[9] = zeroed
+            for i in 0..<3 |out, a, b|:
+                for j in 0..<3 |out, a, b, i|:
+                    terms: f64[3] = [a[(i * 3).usize()] * b[j.usize()], a[(i * 3 + 1).usize()] * b[(3 + j).usize()],
+                        a[(i * 3 + 2).usize()] * b[(6 + j).usize()]]
+                    out[(i * 3 + j).usize()] <- psum(&terms[0], 3)
+            return out
+
+    def eye() -> f64[9]:
+        return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+
+    def turn(axis: i64, angle: f64) -> f64[9]:
+        can Abort.Panic:
+            c: f64 = cosine(radians(angle))
+            s: f64 = sine(radians(angle))
+            i: i64 = 1 if axis == 0 else (2 if axis == 1 else 0)
+            j: i64 = 2 if axis == 0 else (0 if axis == 1 else 1)
+            out: mutable f64[9] = eye()
+            out[(i * 3 + i).usize()] <- c
+            out[(i * 3 + j).usize()] <- -s
+            out[(j * 3 + i).usize()] <- s
+            out[(j * 3 + j).usize()] <- c
+            return out
+
+    # put(m, v): one row of m against v.
+    def put(m: f64[9], row: i64, x: f64, y: f64, z: f64) -> f64:
+        can Abort.Panic:
+            terms: f64[3] = [m[(row * 3).usize()] * x, m[(row * 3 + 1).usize()] * y, m[(row * 3 + 2).usize()] * z]
+            return psum(&terms[0], 3)
+
+    # Degrees between two ways of standing.
+    def apart(a: f64[9], b: f64[9]) -> f64:
+        can Abort.Panic:
+            terms: mutable f64[9] = zeroed
+            for k in 0..<9 |terms, a, b|:
+                terms[k.usize()] <- a[k.usize()] * b[k.usize()]
+            trace: f64 = psum(&terms[0], 9)
+            return degrees(acos(fmax(-1.0, fmin(1.0, (trace - 1.0) / 2.0))))
+
+    def earlier(a: f64&, b: f64&) -> bool:
+        can Abort.Panic:
+            for k in 0..<9 |a, b|:
+                return a[k.usize()] < b[k.usize()] if a[k.usize()] != b[k.usize()]
+            return false
+
+    # SQUARE: the 24 ways a cube can sit, sorted. They are the signed
+    # permutation matrices of determinant 1, which is what the reference's
+    # walk of quarter turns snaps to.
+    def squares() -> f64[216]:
+        can Abort.Panic:
+            out: mutable f64[216] = zeroed
+            used: mutable i64 = 0
+            perms: i64[18] = [0, 1, 2, 0, 2, 1, 1, 0, 2, 1, 2, 0, 2, 0, 1, 2, 1, 0]
+            parity: i64[6] = [1, -1, -1, 1, 1, -1]
+            for p in 0..<6 |out, used, perms, parity|:
+                for signs in 0..<8 |out, used, perms, parity, p|:
+                    s0: i64 = -1 if (signs & 1) != 0 else 1
+                    s1: i64 = -1 if (signs & 2) != 0 else 1
+                    s2: i64 = -1 if (signs & 4) != 0 else 1
+                    continue if parity[p.usize()] * s0 * s1 * s2 != 1
+                    base: i64 = used * 9
+                    out[(base + perms[(p * 3).usize()]).usize()] <- s0.f64()
+                    out[(base + 3 + perms[(p * 3 + 1).usize()]).usize()] <- s1.f64()
+                    out[(base + 6 + perms[(p * 3 + 2).usize()]).usize()] <- s2.f64()
+                    used <- used + 1
+            # Insertion sort, by rows as Python compares tuples.
+            for i in 1..<SQUARES |out|:
+                k: mutable i64 = i
+                while k > 0 and earlier(&out[(k * 9).usize()], &out[((k - 1) * 9).usize()]) |out, k|:
+                    for e in 0..<9 |out, k|:
+                        held: f64 = out[(k * 9 + e).usize()]
+                        out[(k * 9 + e).usize()] <- out[((k - 1) * 9 + e).usize()]
+                        out[((k - 1) * 9 + e).usize()] <- held
+                    k <- k - 1
+            return out
+
+    def square(all: f64[216]&, index: i64) -> f64[9]:
+        can Abort.Panic:
+            out: mutable f64[9] = zeroed
+            for e in 0..<9 |out, all, index|:
+                out[e.usize()] <- all[(index * 9 + e).usize()]
+            return out
+
+    def bit(x: i64, y: i64) -> i64:
+        return 1 << ((x + 2) * 5 + (y + 2))
+
+    # SHAPES, by sorted name: + C H I L O S T U.
+    def rows(shape: i64) -> cstr:
+        return ".X.XXX.X." if shape == 0 else ("XXXX..XXX" if shape == 1 else ("X.XXXXX.X" if shape == 2 else
+            (".X..X..X." if shape == 3 else ("X..X..XXX" if shape == 4 else ("XXXX.XXXX" if shape == 5 else
+            (".XX.X.XX." if shape == 6 else ("XXX.X..X." if shape == 7 else "X.XX.XXXX")))))))
+
+    def name(shape: i64) -> sview:
+        can Abort.Panic:
+            return sview("+CHILOSTU", shape, shape + 1)
+
+    def cells(shape: i64) -> i64:
+        can Abort.Panic:
+            text: sview = sview(rows(shape), 0, -1)
+            out: mutable i64 = 0
+            for y in 0..<3 |text, out|:
+                for x in 0..<3 |text, out, y|:
+                    out <- out | bit(x - 1, 1 - y) if sview_at(text, (y * 3 + x).usize()) == 88.u8()
+            return out
+
+    def has(mask: i64, x: i64, y: i64) -> bool:
+        return (mask & bit(x, y)) != 0
+
+    def count_cells(mask: i64) -> i64:
+        rest: mutable i64 = mask
+        count: mutable i64 = 0
+        while rest != 0 |rest, count|:
+            rest <- rest & (rest - 1)
+            count <- count + 1
+        return count
+
+    def lowest(mask: i64) -> i64:
+        index: mutable i64 = 0
+        while (mask & (1 << index)) == 0 |index, mask|:
+            index <- index + 1
+        return index
+
+    # sorted(a) < sorted(b), the cells compared as Python compares lists.
+    def before(a: i64, b: i64) -> bool:
+        x: mutable i64 = a
+        y: mutable i64 = b
+        while true |x, y|:
+            return y != 0 if x == 0
+            return false if y == 0
+            lx: i64 = lowest(x)
+            ly: i64 = lowest(y)
+            return lx < ly if lx != ly
+            x <- x & (x - 1)
+            y <- y & (y - 1)
+        return false
+
+    # blocks(front, side), in sorted (x, y, z) order; the count is returned.
+    def blocks(front: i64, side: i64, out: mutable i64&) -> i64:
+        can Abort.Panic:
+            a: i64 = cells(front)
+            b: i64 = cells(side)
+            count: mutable i64 = 0
+            for x in -1..<2 |a, b, out, count|:
+                for y in -1..<2 |a, b, out, count, x|:
+                    for z in -1..<2 |a, b, out, count, x, y|:
+                        if has(a, x, y) and has(b, z, y):
+                            out[(count * 3).usize()] <- x
+                            out[(count * 3 + 1).usize()] <- y
+                            out[(count * 3 + 2).usize()] <- z
+                            count <- count + 1
+            return count
+
+    def shadow(cubes: i64&, count: i64, m: f64[9]) -> i64:
+        can Abort.Panic:
+            out: mutable i64 = 0
+            for c in 0..<count |cubes, m, out|:
+                cx: f64 = cubes[(c * 3).usize()].f64()
+                cy: f64 = cubes[(c * 3 + 1).usize()].f64()
+                cz: f64 = cubes[(c * 3 + 2).usize()].f64()
+                out <- out | bit(py_round_half_even(put(m, 0, cx, cy, cz)), py_round_half_even(put(m, 1, cx, cy, cz)))
+            return out
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 1 else 1
+        top: i64 = r - 20 if r > 20 else 0
+        shadows: i64 = 1 if r < 10 else (2 if r < 20 else (3 + top / 8 if 3 + top / 8 < 8 else 8))
+        return Grade{rung: r, flat: r < 4, shadows: shadows,
+            near: 16.0 if r < 7 else (13.0 if r < 13 else (11.0 if r < 20 else fmax(4.0, 10.0 - 0.15 * top.f64()))),
+            shown: WALL if r < 7 else (CARD if r < 13 else NAMED),
+            tone: r < 10, hidden: r >= 16, seconds: 20.0 + 30.0 * shadows.f64()}
+
+    def build(level: Grade, draw: mutable MT19937&) -> Puppet:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            bad: Puppet = zeroed
+            fronts: i64[8] = [0, 1, 2, 4, 5, 6, 7, 8]
+            front: i64 = fronts[py_choice_index(draw, 8).usize()]
+            side: mutable i64 = BAR
+            if not level.flat:
+                sides: mutable i64[8] = zeroed
+                many: mutable i64 = 0
+                for n in 0..<SHAPES |sides, many, front|:
+                    if n != front and n != BAR:
+                        sides[many.usize()] <- n
+                        many <- many + 1
+                side <- sides[py_choice_index(draw, many).usize()]
+            cubes: mutable i64[81] = zeroed
+            count: i64 = blocks(front, side, &cubes[0])
+            all: f64[216] = squares()
+            marks: mutable i64[24] = zeroed
+            seen: mutable i64[24] = zeroed
+            kinds: mutable i64 = 0
+            for q in 0..<SQUARES |all, cubes, count, marks, seen, kinds|:
+                mark: i64 = shadow(&cubes[0], count, square(&all, q))
+                marks[q.usize()] <- mark
+                fresh: mutable bool = true
+                for k in 0..<kinds |seen, mark, fresh|:
+                    fresh <- false if seen[k.usize()] == mark
+                if fresh:
+                    seen[kinds.usize()] <- mark
+                    kinds <- kinds + 1
+            wanted: mutable i64[8] = zeroed
+            names: mutable i64[8] = zeroed
+            if level.shown == NAMED:
+                named: mutable darray[i64] = []
+                pair: i64[2] = [front, side]
+                for i in 0..<2 |pair, named, seen, kinds|:
+                    n: i64 = pair[i.usize()]
+                    continue if n == BAR
+                    found: mutable bool = false
+                    for k in 0..<kinds |seen, n, found|:
+                        found <- true if seen[k.usize()] == cells(n)
+                    named.push(n) if found
+                py_shuffle_i64(draw, &named)
+                total: i64 = named.count.i64()
+                return bad if total < 2 and level.shadows > total
+                for i in 0..<level.shadows |wanted, names, named, total|:
+                    pick: i64 = named[(i % total).usize()]
+                    wanted[i.usize()] <- cells(pick)
+                    names[i.usize()] <- pick
+                for i in 1..<level.shadows |wanted|:
+                    return bad if wanted[i.usize()] == wanted[(i - 1).usize()]
+            else:
+                # sorted(seen, key=sorted)
+                for i in 1..<kinds |seen|:
+                    k: mutable i64 = i
+                    while k > 0 and before(seen[k.usize()], seen[(k - 1).usize()]) |seen, k|:
+                        held: i64 = seen[k.usize()]
+                        seen[k.usize()] <- seen[(k - 1).usize()]
+                        seen[(k - 1).usize()] <- held
+                        k <- k - 1
+                last: mutable i64 = -1
+                for i in 0..<level.shadows |wanted, names, seen, kinds, last, draw|:
+                    rest: mutable i64[24] = zeroed
+                    open: mutable i64 = 0
+                    for k in 0..<kinds |rest, open, seen, last|:
+                        mark: i64 = seen[k.usize()]
+                        if mark != last and count_cells(mark) >= 4:
+                            rest[open.usize()] <- mark
+                            open <- open + 1
+                    return bad if open == 0
+                    last <- rest[py_choice_index(draw, open).usize()]
+                    wanted[i.usize()] <- last
+                    names[i.usize()] <- NO_NAME
+            away: mutable i64[24] = zeroed
+            far: mutable i64 = 0
+            for q in 0..<SQUARES |away, far, marks, wanted|:
+                if marks[q.usize()] != wanted[0]:
+                    away[far.usize()] <- q
+                    far <- far + 1
+            return bad if far == 0
+            start: mutable f64[9] = square(&all, away[py_choice_index(draw, far).usize()])
+            for axis in 0..<3 |start, draw|:
+                start <- mul(turn(axis, -12.0 + 24.0 * py_random(draw)), start)
+            return Puppet{level: level, front: front, side: side, start: start, wanted: wanted, names: names,
+                count: level.shadows, seed: py_randbelow(draw, 1073741824.u64()).i64(), valid: true}
+
+    def begin(puppet: Puppet, audible: bool = true) -> Run:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            cubes: mutable i64[81] = zeroed
+            count: i64 = blocks(puppet.front, puppet.side, &cubes[0])
+            all: f64[216] = squares()
+            marks: mutable i64[24] = zeroed
+            for q in 0..<SQUARES |all, cubes, count, marks|:
+                marks[q.usize()] <- shadow(&cubes[0], count, square(&all, q))
+            hand: HandView::Pointer = HandView::initialize()
+            return Run{puppet: puppet, cubes: cubes, blocks: count, square: all, marks: marks, m: puppet.start,
+                at: 0, stay: 0.0, last_x: hand.x, last_y: hand.y, tone_at: 0.5, hand: hand, time: 0.0,
+                result: LIVE, audible: audible, notes: []}
+
+    def note(run: mutable Run&, duration: f64, frequency: f64, voice: i64, gain: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if not run.audible
+            run.notes.push(DrShapeDeal::Note{t: run.time, dur: duration, freq: frequency, voice: voice,
+                gain: gain, gain2: gain, pan: 0.0, pan2: 0.0, bright: 0.8, seed: 1 + run.notes.count.i64(), who: -1, room: 0.0})
+
+    # Which shadow is wanted now: the last once all are cast.
+    def current(run: Run&) -> i64:
+        return run.at if run.at < run.puppet.count else run.puppet.count - 1
+
+    def wanted(run: Run&) -> i64:
+        can Abort.Panic:
+            return run.puppet.wanted[current(run).usize()]
+
+    def named(run: Run&) -> i64:
+        can Abort.Panic:
+            return run.puppet.names[current(run).usize()]
+
+    # The nearest fit, the first of the closest in SQUARE order.
+    struct Fit:
+        off: f64
+        index: i64
+
+    def nearest(run: Run&) -> Fit:
+        can Abort.Panic:
+            want: i64 = wanted(run)
+            best: mutable Fit = Fit{off: 0.0, index: -1}
+            for q in 0..<SQUARES |run, want, best|:
+                continue if run.marks[q.usize()] != want
+                d: f64 = apart(run.m, square(&run.square, q))
+                best <- Fit{off: d, index: q} if best.index < 0 or d < best.off
+            return best
+
+    def off(run: Run&) -> f64:
+        can Abort.Panic:
+            return nearest(run).off
+
+    def press(run: mutable Run&):
+        run.hand.down <- true
+        run.last_x <- run.hand.x
+        run.last_y <- run.hand.y
+
+    def release(run: mutable Run&):
+        run.hand.down <- false
+
+    def key(run: mutable Run&, port: i64):
+        can Abort.Panic:
+            if port == ROLL_LEFT or port == ROLL_RIGHT:
+                run.m <- mul(turn(2, ROLL if port == ROLL_LEFT else -ROLL), run.m)
+
+    def act(run: mutable Run&, port: i64):
+        can Abort.Panic:
+            if port >= 0 and port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                press(run)
+            elif port == HandView::RELEASE:
+                release(run)
+            elif port >= HandView::KEYS and port < PORTS:
+                key(run, port)
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            run.time <- run.time + dt
+            if run.hand.down:
+                dx: f64 = run.hand.x - run.last_x
+                dy: f64 = run.hand.y - run.last_y
+                if dx != 0.0 or dy != 0.0:
+                    run.m <- mul(turn(0, -dy * GAIN), mul(turn(1, dx * GAIN), run.m))
+            run.last_x <- run.hand.x
+            run.last_y <- run.hand.y
+            gap: f64 = off(run)
+            level: Grade = run.puppet.level
+            if level.tone and run.time >= run.tone_at:
+                run.tone_at <- run.time + 0.35
+                note(run, 0.12, 220.0 * pow(2.0, 2.0 * (1.0 - fmin(gap, 180.0) / 180.0)), WARM, 0.3)
+            if gap <= level.near:
+                run.stay <- run.stay + dt
+                if run.stay >= STAY:
+                    run.at <- run.at + 1
+                    run.stay <- 0.0
+                    note(run, 0.5, 880.0, DONE, 0.55)
+                    if run.at >= run.puppet.count:
+                        run.result <- PASSED
+                        return
+            else:
+                run.stay <- 0.0
+            run.result <- FAILED if run.time >= level.seconds
+
+    # The reference player: whichever single move brings the figure nearest
+    # the fit.
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            fit: Fit = nearest(run)
+            return -1 if fit.off <= 0.5 * run.puppet.level.near
+            hand: HandView::Pointer = run.hand
+            if not hand.down:
+                if fabs(hand.x - 500.0) > 150.0 or fabs(hand.y - 320.0) > 120.0:
+                    going: i64 = HandView::toward(&hand, 500.0, 320.0, 40.0)
+                    return going if going >= 0
+                return HandView::PRESS
+            return HandView::RELEASE if not (100.0 < hand.x and hand.x < 900.0 and 80.0 < hand.y and hand.y < 560.0)
+            target: f64[9] = square(&run.square, fit.index)
+            best_gap: mutable f64 = fit.off
+            best: mutable i64 = -1
+            for port in 0..<12 |run, target, best_gap, best|:
+                direction: i64 = port / 3
+                dxi: i64 = -1 if direction == 2 else (1 if direction == 3 else 0)
+                dyi: i64 = 1 if direction == 0 else (-1 if direction == 1 else 0)
+                size: f64 = 80.0 if port % 3 == 0 else (20.0 if port % 3 == 1 else 5.0)
+                m: f64[9] = mul(turn(0, (-dyi).f64() * size * GAIN), mul(turn(1, dxi.f64() * size * GAIN), run.m))
+                gap: f64 = apart(m, target)
+                if gap < best_gap - 0.000001:
+                    best_gap <- gap
+                    best <- port
+            for port in ROLL_LEFT..<PORTS |run, target, best_gap, best|:
+                m: f64[9] = mul(turn(2, ROLL if port == ROLL_LEFT else -ROLL), run.m)
+                gap: f64 = apart(m, target)
+                if gap < best_gap - 0.000001:
+                    best_gap <- gap
+                    best <- port
+            return best
+
+    def reference_passes(puppet: Puppet) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            run: mutable Run = begin(puppet, false)
+            while run.result == LIVE |run|:
+                act(&run, pilot(&run))
+                step(&run, 1.0 / 60.0)
+            return run.result == PASSED
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Puppet:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            level: Grade = grade(rung)
+            for _ in 0..<80 |level, draw|:
+                rng: mutable MT19937 = zeroed
+                mt_seed_int(&rng, py_getrandbits(draw, 32))
+                puppet: Puppet = build(level, &rng)
+                return puppet if puppet.valid and reference_passes(puppet)
+            return zeroed

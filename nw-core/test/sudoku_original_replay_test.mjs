@@ -76,6 +76,7 @@ try {
   assert.equal(task, 4211466488n, "Sudoku keeps its stable task ID");
   assert.equal(action(ACTION.start), STATUS_ACCEPTED);
   assert.deepEqual(state(), oracle.initial, "the initial source deal diverged");
+  timestamp = 2100;
   const cells = oracle.givens.length;
   assert.deepEqual(values(VALUE.given, cells), oracle.givens,
     "source givens diverged");
@@ -132,6 +133,8 @@ try {
   assert.equal(info(17), oracle.score.solved, "solved count diverged");
   assert.equal(info(18), oracle.score.slips, "slip count diverged");
   assert.equal(info(19), oracle.score.best_rung, "best rung diverged");
+  assert.equal(info(21), oracle.score.clean, "clean solve count diverged");
+  assert.equal(info(22), oracle.score.seconds, "total solve time diverged");
   assert.equal(action(ACTION.start), STATUS_ACCEPTED,
     "Space should advance the solved puzzle to the run summary");
   assert.deepEqual(state(), oracle.done_state,

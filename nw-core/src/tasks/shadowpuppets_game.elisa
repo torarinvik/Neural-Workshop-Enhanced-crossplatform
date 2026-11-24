@@ -1,0 +1,194 @@
+include "./shadowpuppets.elisa"
+
+module ShadowPuppetsGame:
+    const READY: i64 = 0
+    const PLAYING: i64 = 1
+    const JUDGED: i64 = 2
+    const DONE: i64 = 3
+    const START: i64 = ShadowPuppets::PORTS
+    const FEEDBACK: f64 = 2.5
+
+    struct Session:
+        rng: mutable MT19937
+        start_rung: mutable i64
+        total: mutable i64
+        adaptive: mutable bool
+        rung: mutable i64
+        trial: mutable i64
+        wins: mutable i64
+        best_rung: mutable i64
+        phase: mutable i64
+        time: mutable f64
+        deadline: mutable f64
+        run: mutable ShadowPuppets::Run
+        owner: mutable Arena
+        roll_keys: mutable i64
+
+    def initialize(rung: i64, trials: i64, adaptive: bool, seed: i64) -> Session:
+        rng: mutable MT19937 = zeroed
+        magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+        mt_seed_int(&rng, magnitude)
+        initial: i64 = ShadowPuppets::grade(rung).rung
+        return Session{rng: rng, start_rung: initial, total: trials, adaptive: adaptive,
+            rung: initial, trial: 0, wins: 0, best_rung: 0, phase: READY, time: 0.0,
+            deadline: 0.0, run: zeroed, owner: zeroed, roll_keys: 0}
+
+    def close(session: mutable Session&):
+        can Abort.Panic, Memory.Release:
+            session.run <- zeroed
+            session.phase <- READY
+            session.roll_keys <- 0
+            arena_free(&session.owner) can Atomics{Exchange,Load,Store}, Unsafe{Alias,PointerCast,RawExtern,UncheckedIndex}, Global{Read,Write}
+
+    def allowed_rung(rung: i64) -> bool:
+        return rung == 1 or rung == 4 or rung == 7 or rung == 10 or rung == 13 or rung == 16 or rung == 20 or rung == 25 or rung == 30
+
+    def allowed_total(trials: i64) -> bool:
+        return trials == 1 or trials == 3 or trials == 5 or trials == 10 or trials == 20
+
+    def reconfigure(session: mutable Session&, rung: i64, trials: i64, adaptive: bool) -> bool:
+        can Abort.Panic, Memory.Release:
+            return false if session.phase != READY and session.phase != DONE
+            return false if not allowed_rung(rung) or not allowed_total(trials)
+            close(session) can Global{Read,Write}
+            session.start_rung <- rung
+            session.rung <- rung
+            session.total <- trials
+            session.adaptive <- adaptive
+            session.trial <- 0
+            session.wins <- 0
+            session.best_rung <- 0
+            return true
+
+    def next_trial(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            if session.trial >= session.total:
+                session.time <- now
+                session.phase <- DONE
+                return true
+            puppet: ShadowPuppets::Puppet = ShadowPuppets::deal(session.rung, &session.rng)
+            if not puppet.valid:
+                session.phase <- DONE
+                return false
+            keys: i64 = session.roll_keys
+            close(session) can Global{Read,Write}
+            session.roll_keys <- keys
+            session.time <- now
+            session.run <- ShadowPuppets::begin(puppet)
+            session.trial <- session.trial + 1
+            session.phase <- PLAYING
+            return true
+
+    def valid_time(session: Session&, now: f64) -> bool:
+        return now >= session.time and now <= 9007199254740.0
+
+    def start(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if (session.phase != READY and session.phase != DONE) or session.total < 1
+            return false if not valid_time(session, now)
+            session.rung <- session.start_rung
+            session.trial <- 0
+            session.wins <- 0
+            session.best_rung <- 0
+            return next_trial(session, now) can Global{Read,Write}
+
+    def reserve_cues(session: mutable Session&, more: i64):
+        can Abort.Panic, Memory.Allocate:
+            _ = arena_da_reserve[DrShapeDeal::Note](&session.owner, &session.run.notes,
+                session.run.notes.count + more.usize()) can Global{Read,Write}
+
+    def input(session: mutable Session&, port: i64) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            return false if session.phase != PLAYING or port < 0 or port >= ShadowPuppets::PORTS
+            ShadowPuppets::act(&session.run, port)
+            return true
+
+    # Reference framebuffer coordinates with a bottom-left origin.
+    def pointer(session: mutable Session&, x: f64, y: f64, kind: i64, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            if kind == 1 and (session.phase == READY or session.phase == DONE):
+                return (start(session, now) can Global{Read,Write})
+            return false if session.phase != PLAYING or kind < 0 or kind > 2
+            HandView::place(&session.run.hand, (x - HandView::VIEW_LEFT) / HandView::VIEW_SCALE,
+                (y - HandView::VIEW_BOTTOM) / HandView::VIEW_SCALE)
+            return true if kind == 0 else (input(session, HandView::PRESS if kind == 1 else HandView::RELEASE) can Global{Read,Write})
+
+    def judge(session: mutable Session&, now: f64):
+        passed: bool = session.run.result == ShadowPuppets::PASSED
+        if passed:
+            session.wins <- session.wins + 1
+            session.best_rung <- session.rung if session.rung > session.best_rung
+        if session.adaptive:
+            session.rung <- session.rung + 1 if passed and session.rung < 9223372036854775807
+            session.rung <- session.rung - 1 if not passed and session.rung > 1
+        session.deadline <- now + FEEDBACK
+        session.phase <- JUDGED
+
+    def advance(session: mutable Session&, now: f64, stepped: bool = false) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not valid_time(session, now)
+            if session.phase == JUDGED:
+                return false if not stepped and now < session.deadline
+                return next_trial(session, now) can Global{Read,Write}
+            return false if session.phase != PLAYING
+            dt: f64 = fmin(0.1, now - session.time)
+            session.time <- now
+            steps: i64 = fmax(1.0, ceil(dt / (1.0 / 120.0))).i64()
+            quantum: f64 = dt / steps.f64()
+            reserve_cues(session, 5 * steps) can Global{Read,Write}
+            # ShadowPuppets._held: a held Q rolls the figure left, else a held
+            # E right, once a frame, before the frame's steps.
+            if (session.roll_keys & 1) != 0:
+                ShadowPuppets::act(&session.run, ShadowPuppets::ROLL_LEFT)
+            elif (session.roll_keys & 2) != 0:
+                ShadowPuppets::act(&session.run, ShadowPuppets::ROLL_RIGHT)
+            for _ in 0..<steps |session, quantum|:
+                ShadowPuppets::step(&session.run, quantum)
+                break if session.run.result != ShadowPuppets::LIVE
+            if session.run.result != ShadowPuppets::LIVE:
+                judge(session, now)
+            return true
+
+    def agent_event(session: mutable Session&, now: f64, port: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not valid_time(session, now)
+            return (start(session, now) can Global{Read,Write}) if port == START
+            return (advance(session, now, true) can Global{Read,Write}) if port == -1
+            return (input(session, port) can Global{Read,Write})
+
+
+    # Q is bit 1 and E bit 2; each is held on its own.
+    def hold_key(session: mutable Session&, key_bit: i64, down: bool) -> bool:
+        return false if key_bit != 1 and key_bit != 2
+        return false if down and session.phase != PLAYING
+        before: i64 = session.roll_keys
+        session.roll_keys <- before | key_bit if down else before & (3 ^ key_bit)
+        return session.roll_keys != before
+
+    def clear_controls(session: mutable Session&) -> bool:
+        changed: bool = session.run.hand.down or session.roll_keys != 0
+        session.roll_keys <- 0
+        session.run.hand.down <- false
+        return changed
+
+    def info(session: Session&, field: i64) -> i64:
+        can Abort.Panic:
+            return session.phase if field == 0
+            return session.rung if field == 1
+            return session.trial if field == 2
+            return session.total if field == 3
+            return session.wins if field == 4
+            return session.best_rung if field == 5
+            return session.start_rung if field == 6
+            return (1 if session.adaptive else 0) if field == 7
+            return session.run.result if field == 8
+            return py_round_half_even(session.run.time * 1000.0) if field == 9
+            return session.run.at if field == 10
+            return session.run.puppet.count if field == 11
+            return py_round_half_even(session.run.stay * 1000.0) if field == 12
+            return (1 if session.run.hand.down else 0) if field == 13
+            return session.roll_keys if field == 14
+            return (py_round_half_even(ShadowPuppets::off(&session.run) * 1000.0) if session.run.puppet.valid else -1) if field == 15
+            return session.run.puppet.level.shown if field == 16
+            return (1 if session.run.puppet.level.hidden else 0) if field == 17
+            return -1

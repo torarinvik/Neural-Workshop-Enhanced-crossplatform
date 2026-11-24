@@ -1,0 +1,442 @@
+include "sdl_exports.elisa"
+include "marble_mujoco.elisa"
+include "marble_native_session.elisa"
+include "marble_geometry.elisa"
+include "marble_view.elisa"
+include "marble_shader_assets.elisa"
+include "marble_gl_program.elisa"
+include "marble_gl_mesh.elisa"
+include "marble_gl_shadow.elisa"
+include "marble_gl_colour.elisa"
+include "marble_gl_composite.elisa"
+include "marble_gl_scene.elisa"
+
+module SDLMarblePhysics:
+    struct Session:
+        handle: mutable i64
+        physics: mutable MarbleNativeSession::Physics
+        hole_count: mutable i64
+        hole_generation: mutable i64
+        holes: mutable f64[384]
+
+    struct Renderer:
+        generation: mutable i64
+        handle: mutable i64
+        scene: mutable MarbleGLScene::Scene
+
+    def render(renderer_slot: mutable usize&, physics_slot: usize, width: i32, height: i32, dark: i64) -> i32:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            packet: mutable f64[587] = zeroed
+            return 0.i32() if view(physics_slot, width.i64(), height.i64(), &packet[0], 587) == 0
+            trusted Unsafe.PointerCast:
+                if renderer_slot[0] == 0.usize():
+                    raw: mutable heap void&? = malloc(size_of(Renderer).usize())
+                    return -1.i32() if raw == null
+                    block: mutable heap void& = raw
+                    fresh: mutable heap Renderer& = block.cast[mutable heap Renderer&]
+                    fresh[0] <- zeroed
+                    renderer_slot[0] <- block.uintptr()
+                renderer: mutable heap Renderer& = renderer_slot[0].cast[mutable heap Renderer&]
+                session: heap Session& = physics_slot.cast[heap Session&]
+                if renderer.scene.program == 0.u32() or renderer.handle != session.handle or renderer.generation != session.physics.generation:
+                    run: heap MarbleMazeGame::MarbleRun& = session.handle.uintptr().cast[heap MarbleMazeGame::MarbleRun&]
+                    work: mutable MarbleMaze::MarbleWork = MarbleMaze::MarbleWork()
+                    tray: mutable MarbleMaze::MarbleTray = MarbleMaze::MarbleTray()
+                    MarbleMaze::deal(run.rung, run.board_seed, 24, &work, &tray)
+                    return -1.i32() if not MarbleGLScene::open(&renderer.scene, &tray)
+                    renderer.handle <- session.handle
+                    renderer.generation <- session.physics.generation
+                return 1.i32() if MarbleGLScene::draw(&renderer.scene, &packet[0], width, height, dark != 0) else -1.i32()
+
+    def render_close(slot: mutable usize&, context_current: i32):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return if slot[0] == 0.usize()
+            trusted Unsafe.PointerCast:
+                renderer: mutable heap Renderer& = slot[0].cast[mutable heap Renderer&]
+                if context_current != 0.i32():
+                    MarbleGLScene::close(&renderer.scene)
+                free(renderer.cast[heap void&])
+                slot[0] <- 0.usize()
+
+    def update(slot: mutable usize&, handle: i64, elapsed: i64, key: i64) -> i32:
+        can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                if slot[0] == 0.usize():
+                    return 1.i32() if handle <= 0
+                    raw: mutable heap void&? = malloc(size_of(Session).usize())
+                    return 0.i32() if raw == null
+                    block: mutable heap void& = raw
+                    fresh: mutable heap Session& = block.cast[mutable heap Session&]
+                    fresh[0] <- zeroed
+                    slot[0] <- block.uintptr()
+                session: mutable heap Session& = slot[0].cast[mutable heap Session&]
+                if session.handle != handle or handle <= 0:
+                    MarbleNativeSession::close(&session.physics)
+                    session.handle <- handle
+                    session.hole_generation <- 0
+                if handle <= 0:
+                    free(session.cast[heap void&])
+                    slot[0] <- 0.usize()
+                    return 1.i32()
+                run: mutable heap MarbleMazeGame::MarbleRun& = handle.uintptr().cast[mutable heap MarbleMazeGame::MarbleRun&]
+                if key == 114 and run.phase == MarbleMazeGame::PHASE_RUNNING:
+                    MarbleNativeSession::close(&session.physics)
+                elif key == 108:
+                    MarbleMuJoCo::level(&session.physics.engine)
+                return 0.i32() if not MarbleNativeSession::advance(run, &session.physics, elapsed)
+                generation: i64 = session.physics.generation
+                if generation != 0 and generation != session.hole_generation:
+                    # Write the packed uniforms from a locally generated tray.
+                    # The current Stage1 heap-field path loses nested array data.
+                    work: mutable MarbleMaze::MarbleWork = MarbleMaze::MarbleWork()
+                    tray: mutable MarbleMaze::MarbleTray = MarbleMaze::MarbleTray()
+                    MarbleMaze::deal(run.rung, run.board_seed, 24, &work, &tray)
+                    values: mutable f64[384] = zeroed
+                    session.hole_count <- MarbleGeometry::shader_holes(&tray, &values[0], 0)
+                    session.holes <- values
+                    session.hole_generation <- generation
+                return 1.i32()
+
+    # Renderer packet: generation, grain seed, hole count, live marble count,
+    # viewport, camera, tray, shadow clip, shadow texture, holes, marble models.
+    def view(slot: usize, width: i64, height: i64, out: mutable f64&, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if slot == 0.usize() or capacity < 587
+            trusted Unsafe.PointerCast:
+                session: heap Session& = slot.cast[heap Session&]
+                return 0 if session.physics.engine.data == 0.usize()
+                run: heap MarbleMazeGame::MarbleRun& = session.handle.uintptr().cast[heap MarbleMazeGame::MarbleRun&]
+                tray: MarbleMaze::MarbleTray& = &session.physics.tray
+                engine: MarbleMuJoCo::Engine& = &session.physics.engine
+                w: f64 = tray.width.f32().f64()
+                d: f64 = tray.depth.f32().f64()
+                stage: i64[4] = MarbleView::stage(width, height)
+                return 0 if stage[2] <= 0
+                camera: f64[16] = MarbleView::camera(w, d, stage[2].f64() / stage[3].f64())
+                frame: f64[16] = MarbleView::board_frame(engine.roll, engine.pitch)
+                light: MarbleView::Light = MarbleView::light(w, d)
+                out[0] <- session.physics.generation.f64()
+                out[1] <- run.grain_seed
+                hole_count: i64 = session.hole_count
+                for at in 0..<(4 * hole_count) |at, out, session|:
+                    out[(72 + at).usize()] <- session.holes[at.usize()]
+                out[2] <- hole_count.f64()
+                for at in 0..<4 |at, out, stage|:
+                    out[(4 + at).usize()] <- stage[at.usize()].f64()
+                for at in 0..<16 |at, out, camera, frame, light|:
+                    out[(8 + at).usize()] <- camera[at.usize()]
+                    out[(24 + at).usize()] <- frame[at.usize()]
+                    out[(40 + at).usize()] <- light.clip[at.usize()]
+                    out[(56 + at).usize()] <- light.texture[at.usize()]
+                live: mutable i64 = 0
+                for ball in 0..<engine.count |ball, engine, frame, w, d, live, out|:
+                    if engine.status[ball.usize()] < MarbleMuJoCo::HOME:
+                        at: usize = (1 + ball * 7).usize()
+                        model: f64[16] = MarbleView::marble(&frame, engine.motion[at] - w / 2.0,
+                            engine.motion[at + 2.usize()], d / 2.0 - engine.motion[at + 1.usize()],
+                            engine.motion[at + 3.usize()], engine.motion[at + 4.usize()],
+                            engine.motion[at + 5.usize()], engine.motion[at + 6.usize()])
+                        base: i64 = 456 + live * 16
+                        for field in 0..<16 |field, out, model, base|:
+                            out[(base + field).usize()] <- model[field.usize()]
+                        live <- live + 1
+                out[3] <- live.f64()
+                distance: f64 = MarbleView::camera_distance(w, d, stage[2].f64() / stage[3].f64())
+                elevation: f64 = 47.0 * MarbleGeometry::PI / 180.0
+                out[584] <- 0.0
+                out[585] <- sin(elevation) * distance
+                out[586] <- cos(elevation) * distance
+                return 456 + live * 16
+
+    # Return the mesh's required scalar count, writing only into sufficient buffers.
+    def mesh(slot: usize, part: i64, out: mutable f64&, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if slot == 0.usize() or part < 0 or part > 6
+            trusted Unsafe.PointerCast:
+                session: heap Session& = slot.cast[heap Session&]
+                return 0 if session.physics.engine.data == 0.usize()
+                data: MarbleGeometry::Mesh = MarbleGeometry::build(&session.physics.tray, part)
+                coordinates: i64 = data.positions.count.i64()
+                indices: i64 = data.indices.count.i64()
+                size: i64 = 2 + 2 * coordinates + indices
+                return size if capacity < size
+                out[0] <- coordinates.f64()
+                out[1] <- indices.f64()
+                for at in 0..<coordinates |at, coordinates, data, out|:
+                    out[(2 + at).usize()] <- data.positions[at.usize()]
+                    out[(2 + coordinates + at).usize()] <- data.normals[at.usize()]
+                for at in 0..<indices |at, coordinates, data, out|:
+                    out[(2 + 2 * coordinates + at).usize()] <- data.indices[at.usize()].f64()
+                return size
+
+export fn nw_sdl_marble_physics(slot: mutable usize&, handle: i64, elapsed: i64, key: i64) -> i32 = SDLMarblePhysics::update
+
+def sdl_marble_advance(slot: mutable usize&, handle: i64, screenshot: usize, last_tick: mutable u64&) -> i32:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        now: u64 = SDL_GetTicks()
+        if screenshot == 0.usize() and SDLMarblePhysics::update(slot, handle, (now - last_tick[0]).i64(), 0) == 0.i32():
+            return 0.i32()
+        last_tick[0] <- now
+        return 1.i32()
+
+export fn nw_sdl_marble_advance(slot: mutable usize&, handle: i64, screenshot: usize, last_tick: mutable u64&) -> i32 = sdl_marble_advance
+export fn nw_sdl_marble_view(slot: usize, width: i64, height: i64, out: mutable f64&, capacity: i64) -> i64 = SDLMarblePhysics::view
+export fn nw_sdl_marble_mesh(slot: usize, part: i64, out: mutable f64&, capacity: i64) -> i64 = SDLMarblePhysics::mesh
+export fn nw_sdl_marble_shader(shader: i64, length: mutable usize&) -> mutable heap void&? = MarbleShaderAssets::read_shader_asset
+export fn nw_sdl_marble_program_create(pair: i64) -> u32 = MarbleGLProgram::create
+export fn nw_sdl_marble_program_destroy(program: u32) = MarbleGLProgram::destroy
+export fn nw_sdl_marble_render(slot: mutable usize&, physics: usize, width: i32, height: i32, dark: i64) -> i32 = SDLMarblePhysics::render
+export fn nw_sdl_marble_render_close(slot: mutable usize&, context_current: i32) = SDLMarblePhysics::render_close
+
+extern glReadPixels(x: i32, y: i32, w: i32, h: i32, format: u32, kind: u32, pixels: mutable f32&)
+
+def sdl_marble_read_stage(slot: usize, pixels: mutable void&) -> i32:
+    can Unsafe.PointerCast:
+        return 0.i32() if slot == 0.usize()
+        trusted Unsafe.PointerCast:
+            renderer: heap SDLMarblePhysics::Renderer& = slot.cast[heap SDLMarblePhysics::Renderer&]
+            target: MarbleGLColour::Target& = &renderer.scene.colour
+            glBindFramebuffer(MarbleGLColour::FRAMEBUFFER, target.resolved)
+            glReadPixels(0.i32(), 0.i32(), target.width, target.height, 6408.u32(), 5121.u32(), pixels.cast[mutable f32&])
+            glBindFramebuffer(MarbleGLColour::FRAMEBUFFER, 0.u32())
+            return 1.i32() if glGetError() == 0.u32() else 0.i32()
+
+def sdl_marble_stage(width: i32, height: i32, out: mutable i32&) -> i32:
+    can Abort.Panic:
+        return 0.i32() if width <= 0.i32() or height <= 0.i32()
+        stage: i64[4] = MarbleView::stage(width.i64(), height.i64())
+        for at in 0..<4 |at, stage, out|:
+            out[at.usize()] <- stage[at.usize()].i32()
+        return 1.i32() if out[2] > 0.i32() else 0.i32()
+
+export fn nw_sdl_marble_read_stage(slot: usize, pixels: mutable void&) -> i32 = sdl_marble_read_stage
+export fn nw_sdl_marble_stage(width: i32, height: i32, out: mutable i32&) -> i32 = sdl_marble_stage
+
+def sdl_marble_mujoco_selftest() -> i32:
+    can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        handle: i64 = marble_create(3, 1, 0, 2600, 0, 42)
+        return 1.i32() if handle <= 0
+        slot: mutable usize = 0.usize()
+        packet: mutable f64[587] = zeroed
+        started: bool = marble_action(handle, MarbleMazeGame::ACTION_START, 0, 0) == 1
+        opened: bool = SDLMarblePhysics::update(&slot, handle, 0, 0) == 1.i32()
+        before: i64 = SDLMarblePhysics::view(slot, 912, 684, &packet[0], 587)
+        initial_y: f64 = packet[469]
+        held: bool = marble_action(handle, MarbleMazeGame::ACTION_HOLD_EAST, 0, 0) == 1
+        advanced: bool = SDLMarblePhysics::update(&slot, handle, 50, 0) == 1.i32()
+        after: i64 = SDLMarblePhysics::view(slot, 912, 684, &packet[0], 587)
+        moved: bool = before > 456 and before == after and packet[469] != initial_y and marble_info(handle, 6) > 0
+        closed: bool = SDLMarblePhysics::update(&slot, 0, 0, 0) == 1.i32() and slot == 0.usize()
+        _ = marble_destroy(handle)
+        return 0.i32() if started and opened and held and advanced and moved and closed else 1.i32()
+
+export fn nw_sdl_marble_mujoco_selftest() -> i32 = sdl_marble_mujoco_selftest
+
+def sdl_marble_assets_selftest() -> i32:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        for shader in 0..<6 |shader|:
+            size: mutable usize = 0.usize()
+            source: mutable heap void&? = MarbleShaderAssets::read_shader_asset(shader, &size)
+            if source == null:
+                SDL_Log("Could not load packaged Marble shader %lld: %s", shader, SDL_GetError())
+                return 1.i32()
+            trusted Unsafe.PointerCast:
+                bytes: mutable heap void& = source
+                SDL_free(bytes.cast[heap void&])
+            return 1.i32() if size == 0.usize()
+        return 1.i32() if not MarbleGLScene::texture(0.u32(), "marble_colour.png")
+        return 1.i32() if not MarbleGLScene::texture(0.u32(), "marble_rough.png")
+        return 1.i32() if not MarbleGLScene::texture(0.u32(), "marble_normal.png")
+        return 0.i32()
+
+export fn nw_sdl_marble_assets_selftest() -> i32 = sdl_marble_assets_selftest
+
+include "sdl_windows_gl_binding.elisa"
+
+export fn nw_marble_prepare_gl() -> bool = sdl_prepare_windows_gl
+extern SDL_GL_MakeCurrent(window: mutable void&, context: mutable void&) -> bool
+extern SDL_GL_DestroyContext(context: mutable void&) -> bool
+
+extern SDL_GL_SetAttribute(attribute: i32, value: i32) -> bool
+extern SDL_GL_CreateContext(window: mutable void&) -> mutable void&?
+
+def sdl_marble_open_context(state: mutable void&) -> i32:
+    can Abort.Panic, Unsafe.PointerCast:
+        # SDL_GL_CONTEXT_MAJOR_VERSION, MINOR_VERSION, PROFILE_MASK, FLAGS.
+        _ = SDL_GL_SetAttribute(17.i32(), 3.i32())
+        _ = SDL_GL_SetAttribute(18.i32(), 3.i32())
+        _ = SDL_GL_SetAttribute(20.i32(), 1.i32())
+        _ = SDL_GL_SetAttribute(19.i32(), 2.i32())
+        # SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN.
+        opened: mutable void&? = SDL_CreateWindow("Marble OpenGL", 64.i32(), 64.i32(), 10.u64())
+        return 0.i32() if opened == null
+        window: mutable void& = opened
+        created: mutable void&? = SDL_GL_CreateContext(window)
+        if created == null:
+            SDL_DestroyWindow(window)
+            return 0.i32()
+        trusted Unsafe.PointerCast:
+            slots: mutable usize& = state.cast[mutable usize&]
+            slots[0] <- window.uintptr()
+            slots[1] <- created.uintptr()
+        return 1.i32()
+
+export fn nw_sdl_marble_open_context(state: mutable void&) -> i32 = sdl_marble_open_context
+
+# The C bridge owns the SDL ABI and passes five pointer-sized slots in
+# MarblePresentation order: window, context, texture, pixels, and scene.
+def sdl_marble_present_close(state: mutable void&):
+    can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        trusted Unsafe.PointerCast:
+            slots: mutable usize& = state.cast[mutable usize&]
+            if slots[4] != 0.usize():
+                current: bool = slots[1] != 0.usize() and SDL_GL_MakeCurrent(slots[0].cast[mutable void&], slots[1].cast[mutable void&])
+                SDLMarblePhysics::render_close((&slots[4]).uintptr().cast[mutable usize&], 1.i32() if current else 0.i32())
+            if slots[1] != 0.usize():
+                _ = SDL_GL_DestroyContext(slots[1].cast[mutable void&])
+            if slots[0] != 0.usize():
+                SDL_DestroyWindow(slots[0].cast[mutable void&])
+            if slots[2] != 0.usize():
+                SDL_DestroyTexture(slots[2].cast[mutable void&])
+            if slots[3] != 0.usize():
+                SDL_DestroySurface(slots[3].cast[mutable void&])
+            for index in 0..<5 |index, slots|:
+                slots[index] <- 0.usize()
+
+export fn nw_marble_present_close(state: mutable void&) = sdl_marble_present_close
+
+def sdl_marble_key(state: mutable void&, slot: mutable usize&, rows: usize&, key: i64, last_tick: mutable u64&) -> i32:
+    can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        handle: i64 = sdl_active_handle(rows, 4.usize())
+        return 1.i32() if handle == 0 and slot[0] == 0.usize()
+        updated: i32 = SDLMarblePhysics::update(slot, handle, 0, key)
+        if slot[0] == 0.usize():
+            sdl_marble_present_close(state)
+        if key == 32 or key == 114:
+            last_tick[0] <- SDL_GetTicks()
+        return updated
+
+export fn nw_sdl_marble_key(state: mutable void&, slot: mutable usize&, rows: usize&, key: i64, last_tick: mutable u64&) -> i32 = sdl_marble_key
+
+def sdl_marble_close(state: mutable void&, slot: mutable usize&):
+    can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        sdl_marble_present_close(state)
+        _ = SDLMarblePhysics::update(slot, 0, 0, 0)
+
+export fn nw_sdl_marble_close(state: mutable void&, slot: mutable usize&) = sdl_marble_close
+
+# Return zero to use standard SDL presentation, one for a Marble frame, and
+# minus one when Marble presentation fails.
+def sdl_marble_finish_frame(state: mutable void&, renderer: mutable void&, physics: usize, screenshot: usize, data: u8&?, length: i64, width: i32, height: i32, trial: i64, black: i64) -> i32:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        if physics == 0.usize() or screenshot != 0.usize() or syllogism_argument_is(SDL_GetCurrentVideoDriver().uintptr().i64(), "dummy"):
+            sdl_marble_present_close(state)
+            return 0.i32()
+        return -1.i32() if sdl_draw_frame_theme(renderer, data, length, width, height, trial, black) == 0.i32()
+        if sdl_marble_present(state, renderer, physics, width, height, black) < 0.i32():
+            SDL_Log("Could not render Marble stage: %s", SDL_GetError())
+            return -1.i32()
+        sdl_draw_debug_hud(renderer, data, length, width, height)
+        sdl_publish_rendered_frame(renderer)
+        if not SDL_RenderPresent(renderer):
+            SDL_Log("Could not present Marble frame: %s", SDL_GetError())
+            return -1.i32()
+        SDL_Delay(16.u32())
+        return 1.i32()
+
+export fn nw_sdl_marble_finish_frame(state: mutable void&, renderer: mutable void&, physics: usize, screenshot: usize, data: u8&?, length: i64, width: i32, height: i32, trial: i64, black: i64) -> i32 = sdl_marble_finish_frame
+
+
+def sdl_marble_upload_stage(renderer: mutable void&, texture: mutable void&, pixels: void&, pitch: i32, stage: i32&, height: i32) -> i32:
+    can Abort.Panic, Unsafe.PointerCast:
+        return -1.i32() if not SDL_UpdateTexture(texture, null, pixels, pitch)
+        destination: mutable f32[4] = zeroed
+        destination[0] <- stage[0].f32()
+        destination[1] <- (height - stage[1] - stage[3]).f32()
+        destination[2] <- stage[2].f32()
+        destination[3] <- stage[3].f32()
+        trusted Unsafe.PointerCast:
+            return 1.i32() if SDL_RenderTexture(renderer, texture, null, (&destination[0]).uintptr().cast[f32&]) else -1.i32()
+
+
+def sdl_marble_stage_surface(slots: mutable usize&, renderer: mutable void&, width: i32, height: i32) -> bool:
+    can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        trusted Unsafe.PointerCast:
+            if slots[3] != 0.usize():
+                SDL_DestroySurface(slots[3].cast[mutable void&])
+            if slots[2] != 0.usize():
+                SDL_DestroyTexture(slots[2].cast[mutable void&])
+            slots[3] <- 0.usize()
+            slots[2] <- 0.usize()
+            # SDL_PIXELFORMAT_RGBA32 on the supported little-endian targets.
+            surface: mutable void&? = SDL_CreateSurface(width, height, 0x16762004.u32())
+            return false if surface == null
+            slots[3] <- surface.uintptr()
+            # SDL_TEXTUREACCESS_STREAMING and SDL_BLENDMODE_NONE.
+            created: mutable void&? = SDL_CreateTexture(renderer, 0x16762004.u32(), 1.i32(), width, height)
+            return false if created == null
+            texture: mutable void& = created
+            slots[2] <- texture.uintptr()
+            return SDL_SetTextureBlendMode(texture, 0.u32())
+
+def sdl_marble_transfer_stage(state: mutable void&, renderer: mutable void&, stage: i32&, height: i32) -> i32:
+    can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        trusted Unsafe.PointerCast:
+            slots: mutable usize& = state.cast[mutable usize&]
+            width: mutable i32 = 0.i32()
+            rows: mutable i32 = 0.i32()
+            pixels: mutable usize = 0.usize()
+            if slots[3] != 0.usize():
+                _ = marble_surface_pixels(slots[3].cast[mutable void&], &width, &rows, &pixels)
+            if width != stage[2] or rows != stage[3] or slots[2] == 0.usize():
+                return -1.i32() if not sdl_marble_stage_surface(slots, renderer, stage[2], stage[3])
+                return -1.i32() if not marble_surface_pixels(slots[3].cast[mutable void&], &width, &rows, &pixels)
+            return -1.i32() if pixels == 0.usize()
+            return -1.i32() if sdl_marble_read_stage(slots[4], pixels.cast[mutable void&]) == 0.i32()
+            return -1.i32() if not SDL_FlipSurface(slots[3].cast[mutable void&], 2.i32())
+            return sdl_marble_upload_stage(renderer, slots[2].cast[mutable void&], pixels.cast[void&], width * 4.i32(), stage, height)
+
+export fn nw_sdl_marble_transfer_stage(state: mutable void&, renderer: mutable void&, stage: i32&, height: i32) -> i32 = sdl_marble_transfer_stage
+
+
+def sdl_marble_present(state: mutable void&, renderer: mutable void&, physics: usize, width: i32, height: i32, black: i64) -> i32:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        trusted Unsafe.PointerCast:
+            slots: mutable usize& = state.cast[mutable usize&]
+            if physics == 0.usize():
+                if slots[0] != 0.usize():
+                    sdl_marble_present_close(state)
+                return 0.i32()
+            rect: mutable i32[4] = zeroed
+            stage: mutable i32& = (&rect[0]).uintptr().cast[mutable i32&]
+            return 0.i32() if sdl_marble_stage(width, height, stage) == 0.i32()
+            driver: u8&? = SDL_GetCurrentVideoDriver()
+            return 0.i32() if driver == null or syllogism_argument_is(driver.uintptr().i64(), "dummy")
+            fresh: bool = slots[1] == 0.usize()
+            return -1.i32() if fresh and sdl_marble_open_context(state) == 0.i32()
+            if not SDL_GL_MakeCurrent(slots[0].cast[mutable void&], slots[1].cast[mutable void&]) or (fresh and not sdl_prepare_windows_gl()):
+                if fresh:
+                    sdl_marble_present_close(state)
+                return -1.i32()
+            result: i32 = SDLMarblePhysics::render((&slots[4]).uintptr().cast[mutable usize&], physics, width, height, black)
+            return result if result <= 0.i32()
+            return sdl_marble_transfer_stage(state, renderer, stage, height)
+
+export fn nw_marble_present(state: mutable void&, renderer: mutable void&, physics: usize, width: i32, height: i32, black: i64) -> i32 = sdl_marble_present
+
+def sdl_marble_startup_status(argc: i64, argv: usize&?) -> i32:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return -1.i32() if argc != 2 or argv == null
+        args: usize& = argv
+        option: i64 = args[1].i64()
+        if syllogism_argument_is(option, "--selftest-marble-mujoco"):
+            result: i32 = sdl_marble_mujoco_selftest()
+            _ = printf("Marble MuJoCo selftest: PASS\n") if result == 0.i32() else printf("Marble MuJoCo selftest: FAIL\n")
+            return result
+        if syllogism_argument_is(option, "--selftest-marble-assets"):
+            result: i32 = sdl_marble_assets_selftest()
+            _ = printf("Marble assets selftest: PASS\n") if result == 0.i32() else printf("Marble assets selftest: FAIL\n")
+            return result
+        return -1.i32()
+
+export fn nw_sdl_marble_startup_status(argc: i64, argv: usize&?) -> i32 = sdl_marble_startup_status

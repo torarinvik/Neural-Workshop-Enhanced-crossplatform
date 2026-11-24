@@ -114,7 +114,7 @@ def reference():
                    + [KIND_INDEX[REF["kind_of"](text)]])
 
     questions = []
-    for row in range(160):
+    for row in range(800):
         asked = write_text(3 + row % 9, row * 5 + 1)
         answer = write_text(1 + row % 3, row * 7 + 2)
         aliases = [write_text(1 + one, row * 11 + one) for one in range(row % 4)]
@@ -134,6 +134,7 @@ def reference():
                + [len(pool.alike(kind)) for kind in
                   ("year", "number", "name", "phrase", "word")])
 
+    by_answer = {one.answer: at for at, one in enumerate(questions)}
     for rung in range(1, 8):
         for seed in range(1, 13):
             made = REF["generate"](rung, rung * 1000 + seed, pool)
@@ -143,16 +144,24 @@ def reference():
             else:
                 row.extend((questions.index(made.question), len(made.options),
                             made.answer, made.rung))
-                by_answer = {one.answer: at for at, one in enumerate(questions)}
                 row.extend(by_answer[one] for one in made.options)
             out.append(row)
-    return [",".join(str(one) for one in row) for row in out]
+    return [",".join(str(one) for one in row) for row in out], [
+        by_answer[one.answer] for one in questions
+    ]
 
 
 def main():
     got = subprocess.run([sys.argv[1]], capture_output=True, text=True, check=True)
     mine = [line for line in got.stdout.splitlines() if line.strip()]
-    want = reference()
+    want, answer_ids = reference()
+    # The Python round contains answer strings. Distinct corpus rows may
+    # supply the same string, so compare options by their displayed answer.
+    for index, line in enumerate(mine):
+        cells = line.split(",")
+        if cells[0] == "round" and cells[3] == "1":
+            cells[8:] = [str(answer_ids[int(cell)]) for cell in cells[8:]]
+            mine[index] = ",".join(cells)
     if len(mine) != len(want):
         print("MISMATCH line count: elisa %d, python %d" % (len(mine), len(want)))
         for index, (a, b) in enumerate(zip(mine, want)):

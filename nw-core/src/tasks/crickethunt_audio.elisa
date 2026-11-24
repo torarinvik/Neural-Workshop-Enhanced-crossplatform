@@ -1,0 +1,153 @@
+include "./drshape_audio.elisa"
+include "./crickethunt.elisa"
+
+# livesound.py for Cricket Hunt: a track a cricket -- three partials, gated
+# into chirps by a pattern fixed in advance -- and the room's hum, two
+# partials and some noise; each set once a step and sliding in a straight
+# line between settings, its phase the integral of its pitch, played by
+# table lookup; then the run's synth notes (wood, bell, growl), and the
+# whole cut to 16-bit stereo.
+module CricketHuntAudio:
+    const RATE: i64 = 22050
+    const TABLE: i64 = 4096
+    const MASK: i64 = 4095
+    const HOLD: f64 = 0.25
+    const PI: f64 = 3.141592653589793
+
+    struct Bank:
+        patches: DrShapeAudio::Bank
+        # livesound's _SIN and _NOISE, arrays of 'f': single precision, as
+        # the reference keeps them.
+        sine: darray[f64]
+        noise: darray[f64]
+
+    @inline(never)
+    def sine(angle: f64) -> f64:
+        return sin(angle)
+
+    def bank() -> Bank:
+        can Abort.Panic, Memory.Allocate:
+            patches: mutable DrShapeAudio::Bank = zeroed
+            patches.count <- 3
+            voices: i64[3] = [DrShapeAudio::WOOD, DrShapeAudio::BELL, DrShapeAudio::GROWL]
+            draw: mutable MT19937 = zeroed
+            for i in 0..<3 |patches, draw, voices|:
+                mt_seed_int(&draw, (i + 1).u64())
+                patches.patches[i.usize()] <- DrShapeAudio::make_patch(voices[i.usize()], &draw, 0.0)
+            table: mutable darray[f64] = []
+            for i in 0..<TABLE |table|:
+                table.push(sine(2.0 * PI * i.f64() / TABLE.f64()).f32().f64())
+            # [random.Random(7).uniform(-1, 1) for _i in range(RATE)] makes a
+            # new generator for every sample, so every sample is the same.
+            noise: mutable darray[f64] = []
+            for _ in 0..<RATE |noise, draw|:
+                mt_seed_int(&draw, 7.u64())
+                noise.push(py_uniform(&draw, -1.0, 1.0).f32().f64())
+            return Bank{patches: patches, sine: table, noise: noise}
+
+    # livesound.Gate.at: on for duty of every pulse (rate a second), pulses
+    # only during the first burst seconds of every every; offset by phase.
+    def gate(t: f64, every: f64, phase: f64) -> bool:
+        at: f64 = t + phase
+        return false if every > 0.0 and CricketHunt::py_mod(at, every) >= 0.22
+        return CricketHunt::py_mod(at * 32.0, 1.0) < 0.55
+
+    def segment_at(times: darray[f64]&, t: f64) -> i64:
+        can Abort.Panic:
+            low: mutable i64 = 0
+            high: mutable i64 = times.count.i64()
+            while low < high |times, t, low, high|:
+                middle: i64 = (low + high) / 2
+                if t < times[middle.usize()]:
+                    high <- middle
+                else:
+                    low <- middle + 1
+            return low - 1 if low > 0 else 0
+
+    # Track.render for one track: a cricket's, or the hum (CricketHunt::HUM).
+    def render_track(out: mutable darray[f64]&, run: CricketHunt::Run&, bank: Bank&, track: i64, t0: f64, n: i64):
+        can Abort.Panic:
+            times: darray[f64]& = &run.times
+            count: i64 = times.count.i64()
+            return if count == 0
+            hum: bool = track == CricketHunt::HUM
+            parts: i64 = 2 if hum else 3
+            mults: f64[3] = [1.0, 2.0, 3.0]
+            weights: f64[3] = [1.0, 0.5, 0.0] if hum else [1.0, 0.35, 0.15]
+            noise: f64 = 0.4 if hum else 0.0
+            f0: f64 = 60.0 if hum else run.room.crickets[track.usize()].pitch
+            every: f64 = run.room.level.every
+            offset: f64 = 0.0 if hum else run.room.crickets[track.usize()].phase * every
+            end: f64 = times[(count - 1).usize()] + HOLD
+            k: mutable i64 = segment_at(times, t0)
+            i: mutable i64 = ceil((times[0] - t0) * RATE.f64()).i64()
+            i <- 0 if i < 0
+            base: i64 = py_round_half_even(t0 * RATE.f64())
+            while i < n and k < count |out, run, bank, times, count, k, i, t0, n, end, mults, weights, parts, noise, f0, hum, every, offset, base, track|:
+                ta: f64 = times[k.usize()]
+                last: bool = k + 1 >= count
+                tb: f64 = end if last else times[(k + 1).usize()]
+                stop_at: i64 = ceil((tb - t0) * RATE.f64()).i64()
+                stop: i64 = n if n < stop_at else stop_at
+                if stop > i:
+                    width: f64 = tb - ta
+                    span: f64 = width if width > 1e-9 else 1e-9
+                    at: usize = (k * CricketHunt::TRACKS + track).usize()
+                    next: usize = ((k + 1) * CricketHunt::TRACKS + track).usize()
+                    l0: f64 = run.left[at]
+                    r0: f64 = run.right[at]
+                    l1: f64 = 0.0 if last else run.left[next]
+                    r1: f64 = 0.0 if last else run.right[next]
+                    if fmax(fmax(l0, l1), fmax(r0, r1)) >= 1e-4:
+                        bright: f64 = run.bright[at]
+                        amps: mutable f64[3] = zeroed
+                        for p in 0..<parts |amps, weights, bright|:
+                            amps[p.usize()] <- weights[p.usize()] * (1.0 if p == 0 else bright)
+                        ph0: f64 = run.phases[at]
+                        for j in i..<stop |out, bank, t0, ta, span, l0, l1, r0, r1, ph0, f0, mults, amps, parts, noise, hum, every, offset, base|:
+                            s: f64 = t0 + j.f64() / RATE.f64() - ta
+                            continue if s < 0.0
+                            w: f64 = s / span
+                            gl: f64 = l0 + (l1 - l0) * w
+                            gr: f64 = r0 + (r1 - r0) * w
+                            continue if gl <= 1e-5 and gr <= 1e-5
+                            continue if not hum and not gate(ta + s, every, offset)
+                            turn: f64 = ph0 + f0 * s + 0.5 * 0.0 * s * s
+                            v: mutable f64 = 0.0
+                            for p in 0..<parts |bank, turn, mults, amps, v|:
+                                index: i64 = (turn * mults[p.usize()] * TABLE.f64()).i64() & MASK
+                                v <- v + amps[p.usize()] * bank.sine[index.usize()]
+                            if noise != 0.0:
+                                cell: i64 = (base + j) % RATE
+                                v <- v + noise * bank.noise[(cell + RATE if cell < 0 else cell).usize()]
+                            out[(2 * j).usize()] <- out[(2 * j).usize()] + v * gl
+                            out[(2 * j + 1).usize()] <- out[(2 * j + 1).usize()] + v * gr
+                    i <- stop
+                k <- k + 1
+
+    # crickethunt.mix: the tracks, then the notes, cut to 16-bit stereo.
+    def render(run: CricketHunt::Run&, bank: Bank&, begin: f64, end: f64, output: mutable u8&, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 0 if not (end > begin)
+            n: i64 = py_round_half_even((end - begin) * RATE.f64())
+            return 0 if n <= 0 or n > capacity / 4
+            out: mutable darray[f64] = TonePcm::empty(n)
+            for track in 0..<CricketHunt::TRACKS |out, run, bank, begin, n|:
+                continue if track != CricketHunt::HUM and track >= run.room.level.crickets
+                render_track(&out, run, bank, track, begin, n)
+            if run.notes.count > 0:
+                raw: mutable darray[u8] = []
+                for _ in 0..<(4 * n) |raw|:
+                    raw.push(0.u8())
+                written: i64 = DrShapeAudio::write(&run.notes, &bank.patches, begin, end, &raw[0], 4 * n)
+                for j in 0..<(written / 2) |out, raw|:
+                    word: i64 = raw[(2 * j).usize()].i64() + 256 * raw[(2 * j + 1).usize()].i64()
+                    sample: i64 = word - 65536 if word >= 32768 else word
+                    out[j.usize()] <- out[j.usize()] + sample.f64() / 32768.0
+            for j in 0..<(2 * n) |out, output|:
+                v: f64 = out[j.usize()]
+                clipped: f64 = 1.0 if v > 1.0 else (-1.0 if v < -1.0 else v)
+                pcm: u16 = (clipped * 30000.0).i16().u16()
+                output[(2 * j).usize()] <- (pcm & 255.u16()).u8()
+                output[(2 * j + 1).usize()] <- (pcm >> 8).u8()
+            return 4 * n

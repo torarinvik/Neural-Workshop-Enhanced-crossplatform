@@ -1,0 +1,313 @@
+include "../scene_tuner.elisa"
+include "./sdl_agent_pixels.elisa"
+include "./tuner_recordings.elisa"
+
+module SDLTuner:
+    struct Session:
+        run: mutable TunerGame::Session
+        options_row: mutable i64
+        from_hub: mutable bool
+        draft: mutable i64[3]
+        seed: mutable i64
+        audio: mutable void&?
+        pcm: mutable u8[8820]
+        bank_owner: mutable Arena
+        directory: mutable u8[4096]
+        entries: mutable darray[TunerRecordingFiles::Entry]
+        clips: mutable darray[Tuner::Clip]
+        keys: mutable i64
+        fine: mutable bool
+        dragging: mutable bool
+        x: mutable f64
+        y: mutable f64
+
+    def read_settings(data: heap u8&, size: i64, selected: mutable i64&):
+        can Abort.Panic, Unsafe.PointerCast:
+            rung: i64 = sdl_config_option(data, size, "TUNER_RUNG", 0, -1)
+            trials: i64 = sdl_config_option(data, size, "TUNER_TRIALS", 0, -1)
+            adaptive: i64 = sdl_config_option(data, size, "TUNER_ADAPTIVE", 1, -1)
+            selected[0] <- rung if TunerGame::allowed_rung(rung)
+            selected[1] <- trials if TunerGame::allowed_total(trials)
+            selected[2] <- adaptive if adaptive == 0 or adaptive == 1
+
+    def open(seed: i64) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            selected: mutable i64[3] = [1, 5, 1]
+            size: mutable i64 = 0
+            if sdl_media_config(&size) is raw:
+                trusted Unsafe.PointerCast:
+                    read_settings(raw.cast[heap u8&], size, &selected[0])
+                SDL_free(raw)
+            path: mutable u8[4096] = zeroed
+            if sdl_task_profile_sidecar(&path[0], ".tuner-options"):
+                if sdl_read_corpus(&path[0], &size) is raw:
+                    trusted Unsafe.PointerCast:
+                        read_settings(raw.cast[heap u8&], size, &selected[0])
+                    SDL_free(raw)
+            return create(selected[0], selected[1], selected[2], seed)
+
+    def find_bank(owner: mutable Arena&, directory: cstr) -> darray[TunerRecordingFiles::Entry]:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            empty: darray[TunerRecordingFiles::Entry] = []
+            if SDL_GetBasePath() is base:
+                trusted Unsafe.PointerCast:
+                    index: mutable u8[4096] = zeroed
+                    for root in 0..<2 |owner, directory, base, index|:
+                        relative: cstr = "res/misc/esc50/index.tsv" if root == 0 else "../res/misc/esc50/index.tsv"
+                        length: i32 = SDL_snprintf(&index[0], 4096.usize(), "%s%s", base.cast[cstr], relative)
+                        if length > 0.i32() and length < 4096.i32():
+                            entries: darray[TunerRecordingFiles::Entry] = TunerRecordingFiles::bank(owner, (&index[0]).cast[cstr], directory)
+                            return entries if entries.count > 0.usize()
+            return empty
+
+    def metadata(owner: mutable Arena&, entries: darray[TunerRecordingFiles::Entry]&) -> darray[Tuner::Clip]:
+        can Memory.Allocate, Abort.Panic:
+            in owner:
+                return TunerRecordingFiles::clips(entries)
+
+    def create(rung: i64, trials: i64, adaptive: i64, seed: i64) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return 0 if rung < 1 or trials < 1 or (adaptive != 0 and adaptive != 1)
+            if malloc(size_of(Session).usize()) is memory:
+                trusted Unsafe.PointerCast:
+                    session: mutable heap Session& = memory.cast[mutable heap Session&]
+                    session.run <- TunerGame::initialize(rung, trials, adaptive == 1, seed)
+                    session.options_row <- -1
+                    session.from_hub <- false
+                    session.seed <- seed
+                    session.audio <- null
+                    session.bank_owner <- zeroed
+                    session.entries <- []
+                    session.clips <- []
+                    session.keys <- 0
+                    session.fine <- false
+                    session.dragging <- false
+                    session.x <- 0.0
+                    session.y <- 0.0
+                    if sdl_data_path(&session.directory[0], 4096.usize(), "/datasets/esc50", 0, true) != 0.i32():
+                        session.entries <- find_bank(&session.bank_owner, (&session.directory[0]).cast[cstr])
+                        session.clips <- metadata(&session.bank_owner, &session.entries)
+                    return memory.uintptr().i64()
+            return 0
+
+    def stop_tones(session: mutable Session&):
+        if session.audio is stream:
+            SDLAudio::stop(stream)
+            session.audio <- null
+
+    def load_recordings(session: mutable Session&):
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            if session.run.run.radio.heard.bank == Tuner::ESC50:
+                trusted Unsafe.PointerCast:
+                    session.run.audio <- TunerRecordingFiles::prepare(&session.run.owner, (&session.directory[0]).cast[cstr],
+                        &session.entries, &session.run.run.radio)
+
+    def start_tones(session: mutable Session&):
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            stop_tones(session)
+            return if session.run.phase != TunerGame::PLAYING or sdl_headless_environment()
+            session.audio <- SDLAudio::start_pcm(TonePcm::RATE.i32())
+
+    def queue_audio(session: mutable Session&):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            if session.audio is stream:
+                length: i64 = TunerGame::audio_window(&session.run, &session.pcm[0], 8820)
+                if length > 0:
+                    trusted Unsafe.PointerCast:
+                        _ = SDL_PutAudioStreamData(stream, (&session.pcm[0]).uintptr().cast[void&], length.i32())
+
+    def close(handle: i64):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                if handle > 0:
+                    session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                    stop_tones(session)
+                    TunerGame::close(&session.run) can Global{Read,Write}
+                    TunerGame::release_owner(&session.bank_owner) can Global{Read,Write}
+                    free(session.cast[heap void&])
+
+    def control(handle: i64, key: i64, modifiers: u32, pressed: bool) -> bool:
+        can Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                session.fine <- (modifiers & 3.u32()) != 0.u32()
+                mask: i64 = 1 if key == SDLTaskKeys::LEFT else (2 if key == 97 else (4 if key == SDLTaskKeys::RIGHT else (8 if key == 100 else 0)))
+                return false if mask == 0 or session.options_row >= 0 or session.run.phase != TunerGame::PLAYING
+                session.keys <- session.keys | mask if pressed else session.keys & ~mask
+                return true
+
+    def clear_controls(handle: i64):
+        can Abort.Panic, Unsafe.PointerCast:
+            if handle > 0:
+                trusted Unsafe.PointerCast:
+                    session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                    session.keys <- 0
+                    session.fine <- false
+                    session.dragging <- false
+
+    def key(handle: i64, key: i64, now_ms: i64) -> bool:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return false if session.options_row >= 0
+                if (key == 32 or SDLTaskKeys::enter(key)) and (session.run.phase == TunerGame::READY or session.run.phase == TunerGame::DONE):
+                    if TunerGame::start(&session.run, now_ms.f64() / 1000.0, &session.clips) can Global{Read,Write}:
+                        load_recordings(session)
+                        start_tones(session)
+                        return true
+                return TunerGame::event(&session.run, Tuner::LOCK) if key == 32
+                return TunerGame::event(&session.run, Tuner::REPLAY) if key == 114
+                return false
+
+    def pointer(handle: i64, motion: i64, button: i64, x: f32, y: f32, width: i32, height: i32) -> bool:
+        can Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0 or width <= 0.i32() or height <= 0.i32()
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if motion == 2:
+                    session.dragging <- false
+                    return false
+                return false if (motion == 0 and button != 1) or (motion == 1 and not session.dragging)
+                if session.options_row >= 0:
+                    if motion == 0:
+                        row: i64 = sdl_option_row(x, y, width, height, 3)
+                        if row >= 0:
+                            if row == session.options_row:
+                                change_option(session, 1)
+                            session.options_row <- row
+                    return true
+                view: mutable f32[4] = zeroed
+                SDLGeometry::setup(&view[0], width, height)
+                rx: f64 = ((x - view[1]) / view[0]).f64()
+                ry: f64 = ((height.f32() - y - view[2]) / view[0]).f64()
+                dx: f64 = rx - session.x if motion == 1 else 0.0
+                dy: f64 = ry - session.y if motion == 1 else 0.0
+                session.x <- rx
+                session.y <- ry
+                session.dragging <- true
+                return SceneTuner::pointer(&session.run, rx, ry, dx, dy, motion == 1, session.fine)
+
+    def advance(handle: i64, now_ms: i64) -> bool:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                down: i64 = (4 if session.fine else 1) if (session.keys & 3) != 0 else 0
+                up: i64 = (8 if session.fine else 2) if (session.keys & 12) != 0 else 0
+                prior: i64 = session.run.phase
+                changed: bool = TunerGame::advance(&session.run, now_ms.f64() / 1000.0, down | up, &session.clips) can Global{Read,Write}
+                if session.run.phase != prior:
+                    if session.run.phase == TunerGame::PLAYING:
+                        load_recordings(session)
+                        start_tones(session)
+                    else:
+                        stop_tones(session)
+                elif changed and session.run.phase == TunerGame::PLAYING:
+                    queue_audio(session)
+                return changed
+
+    def info(handle: i64, field: i64) -> i64:
+        can Abort.Panic, Unsafe.PointerCast:
+            return -1 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                return (1 if session.run.run.radio.heard.bank == Tuner::ESC50 else 0) if field == 13
+                return TunerGame::info(&session.run, field)
+
+    def frame_write(dest: i64, capacity: i64, handle: i64, black: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if dest <= 0 or capacity <= 0 or handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                run: TunerGame::Session& = &session.run
+                list: mutable Display::DisplayList = Display::DisplayList()
+                if session.options_row >= 0:
+                    sdl_grid_options_frame(&list, black != 0, 80, session.options_row, (&session.draft[0]).cast[i64&])
+                else:
+                    SceneTuner::render(&list, run, black != 0)
+                encoded: darray[u8] = Display::encode_binary(&list)
+                length: i64 = encoded.count.i64()
+                return 0 if length <= 0 or length > capacity
+                memcpy(dest.uintptr().cast[mutable void&], (&encoded[0]).cast[void&], length.usize())
+                return length
+
+    def change_option(session: mutable Session&, direction: i64):
+        can Abort.Panic:
+            row: i64 = session.options_row
+            if row == 2:
+                session.draft[2] <- 1 - session.draft[2]
+                return
+            limit: i64 = 30 if row == 0 else 20
+            value: mutable i64 = session.draft[row.usize()]
+            while true |value, session, row, direction, limit|:
+                value <- (value + direction + limit - 1) % limit + 1
+                if (TunerGame::allowed_rung(value) if row == 0 else TunerGame::allowed_total(value)):
+                    session.draft[row.usize()] <- value
+                    return
+
+    def options_key(handle: i64, key: i64, from_hub: bool = false) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return 0 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if session.options_row < 0:
+                    return 0 if key != 99 or (session.run.phase != TunerGame::READY and session.run.phase != TunerGame::DONE)
+                    session.draft[0] <- session.run.start_rung
+                    session.draft[1] <- session.run.total
+                    session.draft[2] <- 1 if session.run.adaptive else 0
+                    session.options_row <- 0
+                    session.from_hub <- from_hub
+                    return 1
+                apply: bool = SDLTaskKeys::enter(key)
+                if apply:
+                    data: mutable u8[192] = zeroed
+                    length: i32 = SDL_snprintf(&data[0], 192.usize(),
+                        "[DEFAULT]\nTUNER_RUNG = %lld\nTUNER_TRIALS = %lld\nTUNER_ADAPTIVE = %s\n",
+                        session.draft[0], session.draft[1], "True" if session.draft[2] == 1 else "False")
+                    if length <= 0.i32() or length >= 192.i32() or not sdl_save_profile_sidecar(".tuner-options", &data[0], length.usize()):
+                        SDL_Log("Could not save Tuner options")
+                        return 1
+                    TunerGame::close(&session.run) can Global{Read,Write}
+                    session.run <- TunerGame::initialize(session.draft[0], session.draft[1], session.draft[2] == 1, session.seed)
+                if apply or key == 27:
+                    session.options_row <- -1
+                    return 2 if session.from_hub else 1
+                session.options_row <- SDLTaskKeys::option_row(key, session.options_row, 3)
+                if key == SDLTaskKeys::LEFT or key == SDLTaskKeys::RIGHT or key == 32:
+                    change_option(session, -1 if key == SDLTaskKeys::LEFT else 1)
+                return 1
+
+    def agent_start(handle: i64) -> bool:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return agent_event(handle, 0.0, TunerGame::START) can Global{Read,Write}
+
+    def agent_event(handle: i64, now: f64, port: i64) -> bool:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                prior: i64 = session.run.phase
+                changed: bool = TunerGame::agent_event(&session.run, now, port, &session.clips) can Global{Read,Write}
+                if prior != session.run.phase and session.run.phase == TunerGame::PLAYING:
+                    load_recordings(session)
+                return changed
+
+    def audio_window(handle: i64, dest: mutable u8&, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return TunerGame::audio_window(&session.run, dest, capacity)
+
+    def rgba_write(output: mutable u8&?, capacity: i64, handle: i64, black: i64, width: i32, height: i32) -> i64:
+        can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return 0 if output == null or width <= 0.i32() or height <= 0.i32() or width > 536870911.i32()
+            bytes: i64 = width.i64() * height.i64() * 4
+            return 0 if capacity < bytes
+            frame: mutable u8[1048576] = zeroed
+            length: i64 = frame_write((&frame[0]).uintptr().i64(), 1048576, handle, black)
+            return 0 if length <= 0
+            pixels: mutable u8& = output
+            return SDLAgentPixels::draw(pixels, (&frame[0]).uintptr().i64(), length, bytes, black, width, height)

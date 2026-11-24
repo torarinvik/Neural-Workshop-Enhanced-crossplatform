@@ -1,0 +1,186 @@
+include "../tasks/sokoban3d.elisa"
+include "../scene_sokoban3d.elisa"
+include "../tasks/sokoban3d_game.elisa"
+
+struct SDLSokoban3DSession:
+    run: mutable Sokoban3DGame::Run
+    options_row: mutable i64
+    options_from_hub: mutable bool
+    options_draft: mutable i64[5]
+
+def sdl_sokoban3d_option_allowed(row: i64, value: i64) -> bool:
+    return value >= 1 and value <= Sokoban::GRADE_COUNT if row == 0
+    return value == 1 or value == 2 or value == 3 or value == 5 or value == 8 or value == 10 if row == 1
+    return value == 0 or value == 1
+
+def sdl_read_sokoban3d_options(output: mutable i64&):
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        path: mutable u8[4096] = zeroed
+        data: mutable u8[128] = zeroed
+        trusted Unsafe.PointerCast:
+            target: mutable u8& = (&path[0]).uintptr().cast[mutable u8&]
+            return if not sdl_task_profile_sidecar(target, ".sokoban3d-options")
+            if SDL_IOFromFile(target.cast[cstr], "rb") is stream:
+                raw: heap u8& = (&data[0]).uintptr().cast[heap u8&]
+                length: usize = SDL_ReadIO(stream, (&data[0]).cast[mutable void&], 128.usize())
+                status: i32 = SDL_GetIOStatus(stream)
+                closed: bool = SDL_CloseIO(stream)
+                return if not closed or status != 2.i32() or length == 0.usize() or length >= 128.usize()
+                values: mutable i64[5] = zeroed
+                at: mutable i64 = 0
+                for row in 0..<5 |row, values, at, raw, length|:
+                    value: i64 = SyllogismOptions::saved_integer(raw, length.i64(), &at)
+                    valid: bool = sdl_sokoban3d_option_allowed(row, value)
+                    return if not valid
+                    values[row.usize()] <- value
+                while at < length.i64() and SyllogismOptions::whitespace(raw[at.usize()].i64()) |at, length, raw|:
+                    at <- at + 1
+                return if at != length.i64()
+                for row in 0..<5 |row, output, values|:
+                    output[row.usize()] <- values[row.usize()]
+
+def sdl_sokoban3d_option_change(row: i64, current: i64, direction: i64) -> i64:
+    return 1 - current if row >= 2
+    # The Python menu exposes twelve levels. Older profiles may start higher.
+    count: i64 = 12 if row == 0 else 10
+    next: mutable i64 = current if current <= count else (count if direction > 0 else 1)
+    while true |next, count, row, direction|:
+        next <- (next - 1 + direction + count) % count + 1
+        return next if sdl_sokoban3d_option_allowed(row, next)
+    return current
+
+def sdl_sokoban3d_options_key(handle: i64, key: i64, from_hub: bool = false) -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return 0 if handle <= 0
+        trusted Unsafe.PointerCast:
+            session: mutable heap SDLSokoban3DSession& = handle.uintptr().cast[mutable heap SDLSokoban3DSession&]
+            draft: mutable i64& = (&session.options_draft[0]).uintptr().cast[mutable i64&]
+            if session.options_row < 0:
+                return 0 if key != 99
+                draft[0] <- session.run.flat.start_rung
+                draft[1] <- session.run.flat.total_trials
+                draft[2] <- 1 if session.run.flat.adaptive else 0
+                draft[3] <- 1 if session.run.show_marks else 0
+                draft[4] <- 1 if session.run.flat.show_traps else 0
+                session.options_from_hub <- from_hub
+                session.options_row <- 0
+                return 1
+            if SDLTaskKeys::enter(key) or key == 27:
+                close: i64 = 2 if session.options_from_hub else 1
+                if SDLTaskKeys::enter(key):
+                    data: mutable u8[128] = zeroed
+                    length: i32 = SDL_snprintf(&data[0], 128.usize(), "%lld %lld %lld %lld %lld\n", draft[0], draft[1], draft[2], draft[3], draft[4])
+                    if length <= 0.i32() or length >= 128.i32() or not sdl_save_profile_sidecar(".sokoban3d-options", &data[0], length.usize()):
+                        SDL_Log("Could not save 3D Sokoban options")
+                        return 1
+                    Sokoban3DGame::configure(&session.run, draft[0], draft[1], draft[2] != 0, draft[4] != 0, draft[3] != 0)
+                session.options_row <- -1
+                return close
+            session.options_row <- SDLTaskKeys::option_row(key, session.options_row, 5)
+            if key == SDLTaskKeys::LEFT or key == SDLTaskKeys::RIGHT or key == 32:
+                row: i64 = session.options_row
+                draft[row.usize()] <- sdl_sokoban3d_option_change(row, draft[row.usize()], -1 if key == SDLTaskKeys::LEFT else 1)
+            return 1
+
+def sdl_sokoban3d_options_click(handle: i64, x: f32, y: f32, width: i32, height: i32) -> bool:
+    can Abort.Panic, Unsafe.PointerCast:
+        return false if handle <= 0
+        trusted Unsafe.PointerCast:
+            session: mutable heap SDLSokoban3DSession& = handle.uintptr().cast[mutable heap SDLSokoban3DSession&]
+            return false if session.options_row < 0
+            row: i64 = sdl_option_row(x, y, width, height, 5)
+            if row >= 0:
+                if row == session.options_row:
+                    session.options_draft[row.usize()] <- sdl_sokoban3d_option_change(row, session.options_draft[row.usize()], 1)
+                session.options_row <- row
+            return true
+
+def sdl_sokoban3d_profile_create(seed: i64) -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        selected: mutable i64[5] = [2, 3, 1, 1, 0]
+        size: mutable i64 = 0
+        if sdl_media_config(&size) is raw:
+            trusted Unsafe.PointerCast:
+                data: heap u8& = raw.cast[heap u8&]
+                start: i64 = sdl_config_option(data, size, "SOKO3D_LEVEL", 0, 2)
+                count: i64 = sdl_config_option(data, size, "SOKO3D_TRIALS", 0, 3)
+                selected[0] <- start if sdl_sokoban3d_option_allowed(0, start)
+                selected[1] <- count if sdl_sokoban3d_option_allowed(1, count)
+                selected[2] <- sdl_config_option(data, size, "SOKO3D_ADAPTIVE", 1, 1)
+                selected[3] <- sdl_config_option(data, size, "SOKO3D_MARKS", 1, 1)
+                selected[4] <- sdl_config_option(data, size, "SOKO3D_TRAPS", 1, 0)
+            SDL_free(raw)
+        sdl_read_sokoban3d_options(&selected[0])
+        if malloc(size_of(SDLSokoban3DSession).usize()) is memory:
+            trusted Unsafe.PointerCast:
+                session: mutable heap SDLSokoban3DSession& = memory.cast[mutable heap SDLSokoban3DSession&]
+                session.options_row <- -1
+                Sokoban3DGame::initialize(&session.run, selected[0], selected[1], selected[2] != 0, selected[4] != 0, seed, selected[3] != 0)
+                return memory.uintptr().i64()
+        return 0
+
+def sdl_sokoban3d_key(handle: i64, key: i64, now: i64) -> i64:
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        action: mutable i64 = -1
+        action <- Sokoban3DGame::ACTION_START if key == 32
+        action <- Sokoban3DGame::ACTION_AHEAD if key == SDLTaskKeys::UP or key == 119
+        action <- Sokoban3DGame::ACTION_BACK if key == SDLTaskKeys::DOWN or key == 115
+        action <- Sokoban3DGame::ACTION_LEFT if key == SDLTaskKeys::LEFT or key == 97
+        action <- Sokoban3DGame::ACTION_RIGHT if key == SDLTaskKeys::RIGHT or key == 100
+        action <- Sokoban3DGame::ACTION_UNDO if key == 117
+        action <- Sokoban3DGame::ACTION_RESTART if key == 114
+        return 2 if handle <= 0 or action < 0
+        trusted Unsafe.PointerCast:
+            session: mutable heap SDLSokoban3DSession& = handle.uintptr().cast[mutable heap SDLSokoban3DSession&]
+            return Sokoban3DGame::apply(&session.run, action, now)
+
+def sdl_sokoban3d_destroy(handle: i64):
+    can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        if handle > 0:
+            trusted Unsafe.PointerCast:
+                session: mutable heap SDLSokoban3DSession& = handle.uintptr().cast[mutable heap SDLSokoban3DSession&]
+                Sokoban3DGame::dispose(&session.run)
+                free(handle.uintptr().cast[heap void&])
+
+def sdl_sokoban3d_info(handle: i64, field: i64) -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        return -1 if handle <= 0
+        trusted Unsafe.PointerCast:
+            session: heap SDLSokoban3DSession& = handle.uintptr().cast[heap SDLSokoban3DSession&]
+            return Sokoban3DGame::info(session.run, field)
+
+def sdl_sokoban3d_frame_write(dest: i64, capacity: i64, handle: i64, black: i64, width: i64, height: i64) -> i64:
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        return 0 if dest <= 0 or capacity <= 0 or handle <= 0 or width <= 0 or height <= 0
+        trusted Unsafe.PointerCast:
+            session: heap SDLSokoban3DSession& = handle.uintptr().cast[heap SDLSokoban3DSession&]
+            list: mutable Display::DisplayList = Display::DisplayList()
+            if session.options_row >= 0:
+                sdl_grid_options_frame(&list, black != 0, 43, session.options_row, (&session.options_draft[0]).uintptr().cast[i64&])
+            else:
+                Sokoban3DGame::render(session.run, black != 0, width.f64(), height.f64(), &list)
+            encoded: darray[u8] = Display::encode_binary(&list)
+            length: i64 = encoded.count.i64()
+            return 0 if length <= 0 or length > capacity
+            memcpy(dest.uintptr().cast[mutable void&], (&encoded[0]).cast[void&], length.usize())
+            return length
+
+export fn nw_sokoban3d_info(handle: i64, field: i64) -> i64 = sdl_sokoban3d_info
+
+def sdl_sokoban3d_options_note(list: mutable Display::DisplayList&, ink: u32, level: i64):
+    can Memory.Allocate, Abort.Panic:
+        grade: Sokoban::SokobanGrade = Sokoban::grade_of(level)
+        note: mutable dstr = []
+        dstr_append_i64(&note, grade.width)
+        dstr_append_cstr(&note, " × ")
+        dstr_append_i64(&note, grade.height)
+        dstr_append_cstr(&note, " warehouse with ")
+        dstr_append_i64(&note, grade.boxes)
+        dstr_append_cstr(&note, " box" if grade.boxes == 1 else " boxes")
+        if grade.trap_share > 0.0:
+            dstr_append_cstr(&note, " and at least ")
+            dstr_append_i64(&note, (grade.trap_share * 100.0).i64())
+            dstr_append_cstr(&note, "% trap floor")
+        Display::draw_text(list, bytes_view(note), 456.0, 234.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        Display::draw_text(list, "Turning costs one step. The plan shows the starting positions throughout the trial.",
+            456.0, 204.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)

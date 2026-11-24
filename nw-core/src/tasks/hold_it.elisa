@@ -1,0 +1,125 @@
+include "../pyrandom.elisa"
+include "../strings.elisa"
+
+module HoldIt:
+    const COPY: i64 = 0
+    const SCALE: i64 = 1
+    const SUM: i64 = 2
+    const LEAD: f64 = 0.8
+    const GAP: f64 = 0.9
+    const WAIT: f64 = 4.0
+    const PENDING: i64 = 0
+    const PASSED: i64 = 1
+    const SHORT: i64 = 2
+    const LONG: i64 = 3
+    const NO_HOLD: i64 = 4
+
+    struct Grade:
+        rung: i64
+        low: f64
+        high: f64
+        margin: f64
+        ticks: bool
+
+    struct Lamp:
+        on: f64
+        off: f64
+
+    struct Ask:
+        level: Grade
+        kind: i64
+        lamps: Lamp[2]
+        count: i64
+        factor: f64
+        target: f64
+        turn: f64
+        tick: f64
+
+    struct Run:
+        ask: Ask
+        time: mutable f64
+        down: mutable f64
+        held: mutable f64
+        started: mutable bool
+        holding: mutable bool
+        result: mutable i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top_margin: f64 = 0.15 - 0.01 * (r - 16).f64()
+        margin: f64 = 0.25 if r < 4 else (0.18 if r < 13 else (0.16 if r < 16 else (top_margin if top_margin > 0.08 else 0.08)))
+        return Grade{rung: r, low: 0.8 if r < 4 else 1.0,
+            high: 1.6 if r < 4 else 3.0, margin: margin, ticks: r >= 13}
+
+    def deal(rung: i64, seed: i64) -> Ask:
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&rng, magnitude)
+            level: Grade = grade(rung)
+            draw: i64 = py_randbelow(&rng, 3.u64() if level.ticks else 1.u64()).i64()
+            kind: i64 = draw if level.ticks else (COPY if level.rung < 7 else (SCALE if level.rung < 10 else SUM))
+            count: i64 = 2 if kind == SUM else 1
+            lamps: mutable Lamp[2] = zeroed
+            time: mutable f64 = LEAD
+            shown: mutable f64 = 0.0
+            for index in 0..<count |level, count, lamps, time, shown, rng|:
+                span: f64 = py_uniform(&rng, level.low, level.high) * (0.7 if count == 2 else 1.0)
+                duration: f64 = round_half_even(span * 100.0).f64() / 100.0
+                lamps[index.usize()] <- Lamp{on: time, off: time + duration}
+                shown <- shown + (time + duration - time)
+                time <- time + (duration + GAP)
+            factor: mutable f64 = 1.0
+            if kind == SCALE:
+                factor <- 0.5
+                if shown <= 2.0 and py_randbelow(&rng, 2.u64()) == 1.u64():
+                    factor <- 2.0
+            periods: f64[3] = [0.37, 0.61, 0.83]
+            period: f64 = periods[py_randbelow(&rng, 3.u64()).usize()] if level.ticks else 0.0
+            return Ask{level: level, kind: kind, lamps: lamps, count: count, factor: factor,
+                target: round_half_even(shown * factor * 1000.0).f64() / 1000.0, turn: time, tick: period}
+
+    def initialize(ask: Ask) -> Run:
+        return Run{ask: ask, time: 0.0, down: 0.0, held: 0.0,
+            started: false, holding: false, result: PENDING}
+
+    def lamp_lit(run: Run&, lamp: i64) -> bool:
+        can Abort.Panic:
+            return false if lamp < 0 or lamp >= run.ask.count
+            timing: Lamp = run.ask.lamps[lamp.usize()]
+            return run.holding or (run.time >= timing.on and run.time < timing.off)
+
+    def judge(run: Run&) -> i64:
+        off: f64 = (run.held - run.ask.target) / run.ask.target
+        return SHORT if off < -run.ask.level.margin
+        return LONG if off > run.ask.level.margin
+        return PASSED
+
+    def step(run: mutable Run&, dt: f64, pressed: bool):
+        return if run.result != PENDING
+        run.time <- run.time + dt
+        return if run.time < run.ask.turn
+        if pressed and not run.started:
+            run.down <- run.time - dt
+            run.started <- true
+            run.holding <- true
+            return
+        if run.holding and not pressed:
+            run.holding <- false
+            run.held <- run.time - dt - run.down
+            run.result <- judge(run)
+            return
+        run.result <- NO_HOLD if not run.started and run.time > run.ask.turn + WAIT
+
+    def result_text(run: Run&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result == PENDING
+            if run.result == NO_HOLD:
+                dstr_append_cstr(out, "No hold")
+                return
+            dstr_append_fixed(out, run.held, 2)
+            dstr_append_cstr(out, " s for ")
+            dstr_append_fixed(out, run.ask.target, 2)
+            dstr_append_cstr(out, " s")
+            if run.result == SHORT or run.result == LONG:
+                dstr_append_cstr(out, " -- too short" if run.result == SHORT else " -- too long")

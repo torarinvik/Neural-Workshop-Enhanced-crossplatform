@@ -1,0 +1,77 @@
+include "./tuner_audio.elisa"
+
+module TunerRecordings:
+    const RIFF: u32 = 0x46464952
+    const WAVE: u32 = 0x45564157
+    const FORMAT: u32 = 0x20746d66
+    const DATA: u32 = 0x61746164
+
+    struct Pcm:
+        rate: i64
+        channels: i64
+        offset: i64
+        frames: i64
+
+    def little16(bytes: darray[u8]&, offset: i64) -> u16:
+        can Abort.Panic:
+            lo: u8 = bytes[offset.usize()]
+            hi: u8 = bytes[(offset + 1).usize()]
+            return lo.u16() | (hi.u16() << 8)
+
+    def little32(bytes: darray[u8]&, offset: i64) -> u32:
+        can Abort.Panic:
+            lo: u16 = little16(bytes, offset)
+            hi: u16 = little16(bytes, offset + 2)
+            return lo.u32() | (hi.u32() << 16)
+
+    def inspect(bytes: darray[u8]&) -> Pcm:
+        can Abort.Panic:
+            missing: Pcm = zeroed
+            count: i64 = bytes.count.i64()
+            return missing if count < 12 or little32(bytes, 0) != RIFF or little32(bytes, 8) != WAVE
+            declared: i64 = 8 + little32(bytes, 4).i64()
+            end: i64 = declared if declared < count else count
+            pos: mutable i64 = 12
+            channels: mutable i64 = 0
+            rate: mutable i64 = 0
+            while pos + 8 <= end |pos, channels, rate, bytes, end, missing|:
+                tag: u32 = little32(bytes, pos)
+                size: i64 = little32(bytes, pos + 4).i64()
+                start: i64 = pos + 8
+                available: i64 = end - start
+                if tag == FORMAT:
+                    return missing if size < 16 or size > available
+                    return missing if little16(bytes, start) != 1.u16() or little16(bytes, start + 14) != 16.u16()
+                    channels <- little16(bytes, start + 2).i64()
+                    rate <- little32(bytes, start + 4).i64()
+                elif tag == DATA:
+                    return missing if channels <= 0 or rate <= 0
+                    length: i64 = size if size < available else available
+                    return Pcm{rate: rate, channels: channels, offset: start, frames: length / (2 * channels)}
+                pos <- start + size + size % 2
+            return missing
+
+    def silence() -> TunerAudio::Wave:
+        can Abort.Panic, Memory.Allocate:
+            samples: mutable darray[f32] = []
+            _ = samples.reserve(TunerAudio::RATE.usize())
+            for i in 0..<TunerAudio::RATE |samples|:
+                samples.push(0.0.f32())
+            return TunerAudio::Wave{samples: samples}
+
+    def decode(bytes: darray[u8]&, start: f64, end: f64) -> TunerAudio::Wave:
+        can Abort.Panic, Memory.Allocate:
+            pcm: Pcm = inspect(bytes)
+            return silence() if pcm.rate <= 0 or start < 0.0 or end <= start
+            first: i64 = (start * pcm.rate.f64()).i64()
+            return silence() if first > pcm.frames
+            duration: f64 = Tuner::clamp(end - start, 0.0, 3.5)
+            wanted: i64 = (duration * pcm.rate.f64()).i64()
+            remaining: i64 = pcm.frames - first
+            frames: i64 = wanted if wanted < remaining else remaining
+            raw: mutable darray[i16] = []
+            _ = raw.reserve(frames.usize())
+            for i in 0..<frames |raw, bytes, pcm, first|:
+                offset: i64 = pcm.offset + (first + i) * pcm.channels * 2
+                raw.push(little16(bytes, offset).i16())
+            return TunerAudio::recorded_wave(&raw, pcm.rate, 1, 0.0, duration)

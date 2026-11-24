@@ -1,0 +1,292 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module DamKeeper:
+    const MOST: i64 = 3
+    const PORTS: i64 = 6
+    const NOTCHES: i64 = 4
+    const FLOW: f64 = 6.0
+    const BASE: f64 = 0.7
+    const LOW: f64 = 10.0
+    const LOW_GRACE: f64 = 3.0
+    const FLOOD_GRACE: f64 = 1.5
+    const SECONDS: f64 = 90.0
+    const VALLEY: f64 = 100.0
+    const SUBSTEP: f64 = 1.0 / 30.0
+    const RUNNING: i64 = 0
+    const PASSED: i64 = 1
+    const OVERTOPPED: i64 = 2
+    const TOO_LOW: i64 = 3
+    const FLOODED: i64 = 4
+
+    struct Grade:
+        rung: i64
+        dams: i64
+        storms: i64
+        rain: f64
+        delay: f64
+        flood: f64
+        stiff: f64
+        hidden: bool
+
+    struct Storm:
+        start: f64
+        speed: f64
+        width: f64
+        rain: f64
+
+    struct Valley:
+        level: Grade
+        storms: mutable Storm[MOST]
+        initial: mutable f64[MOST]
+
+    struct Release:
+        due: f64
+        volume: f64
+
+    struct Pipe:
+        items: mutable darray[Release]
+        first: mutable i64
+        end: mutable i64
+
+    struct Run:
+        valley: mutable Valley
+        t: mutable f64
+        water: mutable f64[MOST]
+        gate: mutable i64[MOST]
+        opening: mutable f64[MOST]
+        pipes: mutable Pipe[MOST]
+        arriving: mutable f64[MOST]
+        town: mutable f64
+        low_for: mutable f64[MOST]
+        flood_for: mutable f64
+        result: mutable i64
+        fault_dam: mutable i64
+
+    def min(a: f64, b: f64) -> f64:
+        return a if a < b else b
+
+    def max(a: f64, b: f64) -> f64:
+        return a if a > b else b
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: f64 = (r - 20).f64() if r > 20 else 0.0
+        return Grade{rung: r, dams: 2 if r < 4 else 3, storms: 1 if r < 4 else (2 if r < 10 else 3),
+            rain: 4.5 if r < 10 else (4.2 if r < 20 else min(5.5, 4.4 + 0.06 * top)),
+            delay: 5.0 if r < 7 else 8.0,
+            flood: 6.5 if r < 7 else (6.0 if r < 20 else max(5.0, 5.8 - 0.04 * top)),
+            stiff: 0.0 if r < 13 else 1.2, hidden: r >= 16}
+
+    def tenth(value: f64) -> f64:
+        can Abort.Panic:
+            scaled: f64 = value * 10.0
+            integral: f64 = floor(scaled)
+            if scaled - integral == 0.5:
+                # Recover the product's rounding error at a decimal tie.
+                residual: f64 = (value * 8.0 - scaled) + value * 2.0
+                return (integral + 1.0) / 10.0 if residual > 0.0
+                return integral / 10.0 if residual < 0.0
+            return py_round_half_even(scaled).f64() / 10.0
+
+    def build(level: Grade, rng: mutable MT19937&) -> Valley:
+        can Abort.Panic:
+            valley: mutable Valley = Valley{level: level, storms: zeroed, initial: zeroed}
+            start: mutable f64 = py_uniform(rng, 12.0, 22.0)
+            for i in 0..<level.storms |rng, level, valley, start|:
+                speed: f64 = py_uniform(rng, 4.0, 7.0)
+                width: f64 = py_uniform(rng, 25.0, 45.0)
+                rain: f64 = level.rain * py_uniform(rng, 0.85, 1.15)
+                valley.storms[i.usize()] <- Storm{start: tenth(start), speed: speed, width: width, rain: rain}
+                start <- start + (py_uniform(rng, 16.0, 26.0) if level.rung < 10 else py_uniform(rng, 13.0, 20.0))
+            for i in 0..<level.dams |valley, rng|:
+                valley.initial[i.usize()] <- py_uniform(rng, 40.0, 65.0)
+            return valley
+
+    def initialize() -> Run:
+        return Run{valley: zeroed, t: 0.0, water: zeroed, gate: zeroed, opening: zeroed,
+            pipes: [Pipe{items: [], first: 0, end: 0}, Pipe{items: [], first: 0, end: 0}, Pipe{items: [], first: 0, end: 0}],
+            arriving: zeroed, town: 0.0, low_for: zeroed, flood_for: 0.0, result: RUNNING, fault_dam: -1}
+
+    def reset(run: mutable Run&, valley: Valley):
+        can Abort.Panic:
+            run.valley <- valley
+            run.t <- 0.0
+            run.water <- valley.initial
+            run.gate <- zeroed
+            run.opening <- zeroed
+            run.arriving <- zeroed
+            run.town <- 0.0
+            run.low_for <- zeroed
+            run.flood_for <- 0.0
+            run.result <- RUNNING
+            run.fault_dam <- -1
+            for i in 0..<MOST |run|:
+                run.pipes[i.usize()].first <- 0
+                run.pipes[i.usize()].end <- 0
+
+    def enqueue(pipe: mutable Pipe&, due: f64, volume: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if volume == 0.0
+            if pipe.first > 0 and pipe.first >= pipe.end - pipe.first:
+                remaining: i64 = pipe.end - pipe.first
+                for i in 0..<remaining |pipe|:
+                    item: Release = pipe.items[(i + pipe.first).usize()]
+                    pipe.items[i.usize()] <- item
+                pipe.first <- 0
+                pipe.end <- remaining
+            item: Release = Release{due: due, volume: volume}
+            if pipe.end == pipe.items.count.i64():
+                pipe.items.push(item)
+            else:
+                pipe.items[pipe.end.usize()] <- item
+            pipe.end <- pipe.end + 1
+
+    def receive(pipe: mutable Pipe&, now: f64) -> f64:
+        can Abort.Panic:
+            volume: mutable f64 = 0.0
+            while pipe.first < pipe.end |pipe, now, volume|:
+                item: Release = pipe.items[pipe.first.usize()]
+                break if item.due > now
+                volume <- volume + item.volume
+                pipe.first <- pipe.first + 1
+            return volume
+
+    def in_pipe(run: Run&, k: i64) -> f64:
+        can Abort.Panic:
+            pipe: Pipe = run.pipes[k.usize()]
+            total: mutable f64 = 0.0
+            for at in pipe.first..<pipe.end |pipe, total|:
+                total <- total + pipe.items[at.usize()].volume
+            return total
+
+    def storm_front(storm: Storm, t: f64) -> f64:
+        return (t - storm.start) * storm.speed
+
+    def rain_on(valley: Valley&, dam: i64, t: f64) -> f64:
+        can Abort.Panic:
+            cut: f64 = VALLEY / valley.level.dams.f64()
+            lo: f64 = dam.f64() * cut
+            hi: f64 = (dam + 1).f64() * cut
+            total: mutable f64 = 0.0
+            for i in 0..<valley.level.storms |valley, t, lo, hi, total|:
+                storm: Storm = valley.storms[i.usize()]
+                front: f64 = storm_front(storm, t)
+                cover: f64 = max(0.0, min(hi, front) - max(lo, front - storm.width))
+                total <- total + storm.rain * cover / (hi - lo)
+            return total
+
+    def outflow(run: Run&, k: i64) -> f64:
+        can Abort.Panic:
+            return FLOW * run.opening[k.usize()] / NOTCHES.f64() if run.water[k.usize()] > 0.0 else 0.0
+
+    def press(run: mutable Run&, port: i64) -> bool:
+        can Abort.Panic:
+            return false if run.result != RUNNING or port < 0 or port >= run.valley.level.dams * 2
+            k: usize = (port / 2).usize()
+            notch: i64 = run.gate[k] + (1 if port % 2 == 0 else -1)
+            run.gate[k] <- 0 if notch < 0 else (NOTCHES if notch > NOTCHES else notch)
+            run.opening[k] <- run.gate[k].f64() if run.valley.level.stiff == 0.0
+            return true
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != RUNNING or not (dt >= 0.0 and dt <= 1.7976931348623157e308)
+            level: Grade = run.valley.level
+            run.t <- run.t + dt
+            out: mutable f64[MOST] = zeroed
+            for i in 0..<level.dams |run, out, dt, level|:
+                k: usize = i.usize()
+                if level.stiff > 0.0 and run.opening[k] != run.gate[k].f64():
+                    amount: f64 = dt / level.stiff
+                    diff: f64 = run.gate[k].f64() - run.opening[k]
+                    run.opening[k] <- run.opening[k] + max(-amount, min(amount, diff))
+                out[k] <- outflow(run, i)
+            for i in 0..<level.dams |run, out, dt, level|:
+                k: usize = i.usize()
+                arriving: f64 = receive(&run.pipes[k], run.t)
+                run.arriving[k] <- arriving / dt if dt > 0.0 else 0.0
+                inflow: f64 = (BASE if i == 0 else 0.0) + rain_on(&run.valley, i, run.t)
+                run.water[k] <- max(0.0, run.water[k] + ((inflow - out[k]) * dt + arriving))
+                if i + 1 < level.dams:
+                    enqueue(&run.pipes[(i + 1).usize()], run.t + level.delay, out[k] * dt)
+            run.town <- out[(level.dams - 1).usize()]
+            for i in 0..<level.dams |run, dt|:
+                k: usize = i.usize()
+                if run.water[k] >= 100.0:
+                    run.result <- OVERTOPPED
+                    run.fault_dam <- i
+                    return
+                if run.water[k] < LOW:
+                    run.low_for[k] <- run.low_for[k] + dt
+                    if run.low_for[k] > LOW_GRACE:
+                        run.result <- TOO_LOW
+                        run.fault_dam <- i
+                        return
+                else:
+                    run.low_for[k] <- 0.0
+            if run.town > level.flood:
+                run.flood_for <- run.flood_for + dt
+                if run.flood_for > FLOOD_GRACE:
+                    run.result <- FLOODED
+                    return
+            else:
+                run.flood_for <- 0.0
+            run.result <- PASSED if run.t >= SECONDS
+
+    def rain_ahead(run: Run&, k: i64) -> f64:
+        can Abort.Panic:
+            total: mutable f64 = 0.0
+            for i in 0..<60 |run, k, total|:
+                total <- total + rain_on(&run.valley, k, run.t + i.f64() * 0.5) * 0.5
+            return total
+
+    def autopilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != RUNNING
+            level: Grade = run.valley.level
+            upstream: mutable f64 = 0.0
+            for i in 0..<level.dams |run, level, upstream|:
+                k: usize = i.usize()
+                ahead: f64 = rain_ahead(run, i)
+                coming: f64 = (ahead + in_pipe(run, i)) + upstream
+                target: f64 = max(22.0, min(65.0, 85.0 - coming))
+                inflow: f64 = (BASE if i == 0 else run.arriving[k]) + rain_on(&run.valley, i, run.t)
+                flow: mutable f64 = FLOW if run.water[k] > 88.0 else max(0.0, min(FLOW, inflow + (run.water[k] - target) / 6.0))
+                flow <- min(flow, level.flood * 0.92) if i == level.dams - 1
+                notch: mutable i64 = py_round_half_even(flow / FLOW * NOTCHES.f64())
+                if i == level.dams - 1:
+                    while notch > 0 and FLOW * notch.f64() / NOTCHES.f64() > level.flood * 0.97 |notch, level|:
+                        notch <- notch - 1
+                notch <- 0 if run.water[k] < LOW + 3.0
+                notch <- 1 if run.water[k] < LOW + 6.0 and notch > 1
+                return 2 * i if notch > run.gate[k]
+                return 2 * i + 1 if notch < run.gate[k]
+                upstream <- upstream + ahead * 0.6
+            return -1
+
+    def play(run: mutable Run&, valley: Valley, pilot: bool) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            reset(run, valley)
+            while run.result == RUNNING |run, pilot|:
+                if pilot:
+                    _ = press(run, autopilot(run))
+                step(run, SUBSTEP)
+            return run.result == PASSED
+
+    def deal(rung: i64, seed: i64) -> Valley:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            level: Grade = grade(rung)
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            best: mutable Valley = zeroed
+            for attempt in 0..<25 |level, rng, best|:
+                valley: Valley = build(level, &rng)
+                best <- valley if attempt == 0
+                qualifies: mutable bool = false
+                region scratch(65536):
+                    in scratch:
+                        run: mutable Run = initialize()
+                        qualifies <- play(&run, valley, true) and not play(&run, valley, false)
+                return valley if qualifies
+            return best

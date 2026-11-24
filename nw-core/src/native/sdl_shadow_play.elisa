@@ -1,0 +1,282 @@
+include "../scene_shadow_play.elisa"
+include "./sdl_agent_pixels.elisa"
+
+module SDLShadowPlay:
+    struct Session:
+        run: mutable ShadowPlayGame::Session
+        options_row: mutable i64
+        from_hub: mutable bool
+        draft: mutable i64[3]
+        seed: mutable i64
+        audio: mutable void&?
+        pcm: mutable u8[8820]
+        keys: mutable i64
+        shift: mutable bool
+        buttons: mutable i64
+        x: mutable f64
+        y: mutable f64
+
+    def read_settings(data: heap u8&, size: i64, selected: mutable i64&):
+        can Abort.Panic, Unsafe.PointerCast:
+            rung: i64 = sdl_config_option(data, size, "SHADOW_RUNG", 0, -1)
+            trials: i64 = sdl_config_option(data, size, "SHADOW_TRIALS", 0, -1)
+            adaptive: i64 = sdl_config_option(data, size, "SHADOW_ADAPTIVE", 1, -1)
+            selected[0] <- rung if ShadowPlayGame::allowed_rung(rung)
+            selected[1] <- trials if ShadowPlayGame::allowed_total(trials)
+            selected[2] <- adaptive if adaptive == 0 or adaptive == 1
+
+    def open(seed: i64) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            selected: mutable i64[3] = [1, 5, 1]
+            size: mutable i64 = 0
+            if sdl_media_config(&size) is raw:
+                trusted Unsafe.PointerCast:
+                    read_settings(raw.cast[heap u8&], size, &selected[0])
+                SDL_free(raw)
+            path: mutable u8[4096] = zeroed
+            if sdl_task_profile_sidecar(&path[0], ".shadow-play-options"):
+                if sdl_read_corpus(&path[0], &size) is raw:
+                    trusted Unsafe.PointerCast:
+                        read_settings(raw.cast[heap u8&], size, &selected[0])
+                    SDL_free(raw)
+            return create(selected[0], selected[1], selected[2], seed)
+
+    def create(rung: i64, trials: i64, adaptive: i64, seed: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if rung < 1 or trials < 1 or (adaptive != 0 and adaptive != 1)
+            if malloc(size_of(Session).usize()) is memory:
+                trusted Unsafe.PointerCast:
+                    session: mutable heap Session& = memory.cast[mutable heap Session&]
+                    session.run <- ShadowPlayGame::initialize(rung, trials, adaptive == 1, seed)
+                    session.options_row <- -1
+                    session.from_hub <- false
+                    session.seed <- seed
+                    session.audio <- null
+                    session.keys <- 0
+                    session.shift <- false
+                    session.buttons <- 0
+                    return memory.uintptr().i64()
+            return 0
+
+    def stop_tones(session: mutable Session&):
+        if session.audio is stream:
+            SDLAudio::stop(stream)
+            session.audio <- null
+
+    def start_tones(session: mutable Session&):
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            stop_tones(session)
+            return if session.run.phase != ShadowPlayGame::PLAYING or sdl_headless_environment()
+            session.audio <- SDLAudio::start_pcm(TonePcm::RATE.i32())
+
+    def queue_audio(session: mutable Session&):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            if session.audio is stream:
+                length: i64 = ShadowPlayGame::audio_window(&session.run, &session.pcm[0], 8820)
+                if length > 0:
+                    trusted Unsafe.PointerCast:
+                        _ = SDL_PutAudioStreamData(stream, (&session.pcm[0]).uintptr().cast[void&], length.i32())
+
+    def close(handle: i64):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                if handle > 0:
+                    session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                    stop_tones(session)
+                    ShadowPlayGame::close(&session.run) can Global{Read,Write}
+                    free(session.cast[heap void&])
+
+    def control(handle: i64, key: i64, modifiers: u32, pressed: bool) -> bool:
+        can Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                session.shift <- (modifiers & 3.u32()) != 0.u32()
+                port: mutable i64 = -1
+                if key == SDLTaskKeys::LEFT: port <- 0
+                elif key == SDLTaskKeys::RIGHT: port <- 1
+                elif key == SDLTaskKeys::DOWN: port <- 2
+                elif key == SDLTaskKeys::UP: port <- 3
+                elif key == 113: port <- 4 # Q
+                elif key == 101: port <- 5 # E
+                elif key == 97: port <- 6 # A
+                elif key == 100: port <- 7 # D
+                elif key == 115: port <- 8 # S
+                elif key == 119: port <- 9 # W
+                return false if port < 0 or session.options_row >= 0 or session.run.phase != ShadowPlayGame::PLAYING
+                mask: i64 = 1 << port
+                session.keys <- session.keys | mask if pressed else session.keys & ~mask
+                return true
+
+    def clear_controls(handle: i64):
+        can Abort.Panic, Unsafe.PointerCast:
+            if handle > 0:
+                trusted Unsafe.PointerCast:
+                    session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                    session.keys <- 0
+                    session.shift <- false
+                    session.buttons <- 0
+
+    def key(handle: i64, key: i64, now_ms: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0 or (key != 32 and not SDLTaskKeys::enter(key))
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return false if session.options_row >= 0
+                if ShadowPlayGame::start(&session.run, now_ms.f64() / 1000.0) can Global{Read,Write}:
+                    start_tones(session)
+                    return true
+                return false
+
+    def pointer(handle: i64, motion: i64, button: i64, x: f32, y: f32, width: i32, height: i32, now_ms: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0 or width <= 0.i32() or height <= 0.i32()
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                mask: i64 = 1 if button == 1 else (2 if button == 3 else 0)
+                if motion == 2:
+                    session.buttons <- session.buttons & ~mask
+                    return false
+                if session.options_row >= 0:
+                    if motion == 0 and button == 1:
+                        row: i64 = sdl_option_row(x, y, width, height, 3)
+                        if row >= 0:
+                            if row == session.options_row:
+                                change_option(session, 1)
+                            session.options_row <- row
+                        return true
+                    return false
+                return false if (motion == 0 and mask == 0) or (motion == 1 and session.buttons == 0)
+                started: bool = (key(handle, 32, now_ms) can Global{Read,Write}) if motion == 0 and button == 1 else false
+                return started if session.run.phase != ShadowPlayGame::PLAYING
+                view: mutable f32[4] = zeroed
+                SDLGeometry::setup(&view[0], width, height)
+                rx: f64 = ((x - view[1]) / view[0]).f64()
+                ry: f64 = ((height.f32() - y - view[2]) / view[0]).f64()
+                dx: f64 = rx - session.x if motion == 1 else 0.0
+                dy: f64 = ry - session.y if motion == 1 else 0.0
+                session.x <- rx
+                session.y <- ry
+                session.buttons <- session.buttons | mask
+                return ShadowPlayGame::drag(&session.run, dx, dy, session.shift or (session.buttons & 2) != 0) if motion == 1
+                return true
+
+    def advance(handle: i64, now_ms: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                held: i64 = (session.keys | (session.keys >> 6)) & 63
+                prior: i64 = session.run.phase
+                changed: bool = ShadowPlayGame::advance(&session.run, now_ms.f64() / 1000.0, held) can Global{Read,Write}
+                if session.run.phase != prior:
+                    if session.run.phase == ShadowPlayGame::PLAYING:
+                        start_tones(session)
+                    else:
+                        clear_controls(handle)
+                        stop_tones(session)
+                elif changed and session.run.phase == ShadowPlayGame::PLAYING:
+                    queue_audio(session)
+                return changed
+
+    def info(handle: i64, field: i64) -> i64:
+        can Abort.Panic, Unsafe.PointerCast:
+            return -1 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                return ShadowPlayGame::info(&session.run, field)
+
+    def frame_write(dest: i64, capacity: i64, handle: i64, black: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if dest <= 0 or capacity <= 0 or handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                run: ShadowPlayGame::Session& = &session.run
+                list: mutable Display::DisplayList = Display::DisplayList()
+                if session.options_row >= 0:
+                    sdl_grid_options_frame(&list, black != 0, 81, session.options_row, (&session.draft[0]).cast[i64&])
+                else:
+                    SceneShadowPlay::render(&list, run, black != 0)
+                encoded: darray[u8] = Display::encode_binary(&list)
+                length: i64 = encoded.count.i64()
+                return 0 if length <= 0 or length > capacity
+                memcpy(dest.uintptr().cast[mutable void&], (&encoded[0]).cast[void&], length.usize())
+                return length
+
+    def change_option(session: mutable Session&, direction: i64):
+        can Abort.Panic:
+            row: i64 = session.options_row
+            if row == 2:
+                session.draft[2] <- 1 - session.draft[2]
+                return
+            limit: i64 = 30 if row == 0 else 20
+            value: mutable i64 = session.draft[row.usize()]
+            while true |value, session, row, direction, limit|:
+                value <- (value + direction + limit - 1) % limit + 1
+                if (ShadowPlayGame::allowed_rung(value) if row == 0 else ShadowPlayGame::allowed_total(value)):
+                    session.draft[row.usize()] <- value
+                    return
+
+    def options_key(handle: i64, key: i64, from_hub: bool = false) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return 0 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if session.options_row < 0:
+                    return 0 if key != 99 or (session.run.phase != ShadowPlayGame::READY and session.run.phase != ShadowPlayGame::DONE)
+                    session.draft[0] <- session.run.start_rung
+                    session.draft[1] <- session.run.total
+                    session.draft[2] <- 1 if session.run.adaptive else 0
+                    session.options_row <- 0
+                    session.from_hub <- from_hub
+                    return 1
+                apply: bool = SDLTaskKeys::enter(key)
+                if apply:
+                    data: mutable u8[192] = zeroed
+                    length: i32 = SDL_snprintf(&data[0], 192.usize(),
+                        "[DEFAULT]\nSHADOW_RUNG = %lld\nSHADOW_TRIALS = %lld\nSHADOW_ADAPTIVE = %s\n",
+                        session.draft[0], session.draft[1], "True" if session.draft[2] == 1 else "False")
+                    if length <= 0.i32() or length >= 192.i32() or not sdl_save_profile_sidecar(".shadow-play-options", &data[0], length.usize()):
+                        SDL_Log("Could not save Shadow Play options")
+                        return 1
+                    ShadowPlayGame::close(&session.run) can Global{Read,Write}
+                    session.run <- ShadowPlayGame::initialize(session.draft[0], session.draft[1], session.draft[2] == 1, session.seed)
+                if apply or key == 27:
+                    session.options_row <- -1
+                    return 2 if session.from_hub else 1
+                session.options_row <- SDLTaskKeys::option_row(key, session.options_row, 3)
+                if key == SDLTaskKeys::LEFT or key == SDLTaskKeys::RIGHT or key == 32:
+                    change_option(session, -1 if key == SDLTaskKeys::LEFT else 1)
+                return 1
+
+    def agent_start(handle: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return ShadowPlayGame::start(&session.run, 0.0) can Global{Read,Write}
+
+    def agent_event(handle: i64, now: f64, port: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return ShadowPlayGame::agent_event(&session.run, now, port) can Global{Read,Write}
+
+    def audio_window(handle: i64, dest: mutable u8&, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return ShadowPlayGame::audio_window(&session.run, dest, capacity)
+
+    def rgba_write(output: mutable u8&?, capacity: i64, handle: i64, black: i64, width: i32, height: i32) -> i64:
+        can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return 0 if output == null or width <= 0.i32() or height <= 0.i32() or width > 536870911.i32()
+            bytes: i64 = width.i64() * height.i64() * 4
+            return 0 if capacity < bytes
+            frame: mutable u8[1048576] = zeroed
+            length: i64 = frame_write((&frame[0]).uintptr().i64(), 1048576, handle, black)
+            return 0 if length <= 0
+            pixels: mutable u8& = output
+            return SDLAgentPixels::draw(pixels, (&frame[0]).uintptr().i64(), length, bytes, black, width, height)

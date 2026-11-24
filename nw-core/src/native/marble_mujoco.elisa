@@ -1,0 +1,312 @@
+# MuJoCo owns the objects returned by these APIs. Field offsets come from its build headers.
+include "marble_mujoco_layout.elisa"
+extern mj_parseXMLString(xml: cstr, vfs: usize, message: mutable u8&, capacity: i32) -> usize can[Memory.Allocate]
+extern mj_compile(spec: usize, vfs: usize) -> usize can[Memory.Allocate]
+extern mjs_getError(spec: usize) -> cstr
+extern mj_deleteSpec(spec: usize) can[Memory.Release]
+extern mj_makeData(model: usize) -> usize can[Memory.Allocate]
+extern mj_deleteModel(model: usize) can[Memory.Release]
+extern mj_deleteData(data: usize) can[Memory.Release]
+extern mj_step(model: usize, data: usize)
+extern mj_stateSize(model: usize, signature: i32) -> i32
+extern mj_getState(model: usize, data: usize, dest: mutable f64&, signature: i32)
+extern mj_setState(model: usize, data: usize, state: f64&, signature: i32)
+extern mju_rotVecQuat(dest: mutable f64&, vector: f64&, quaternion: f64&)
+extern mju_negQuat(dest: mutable f64&, quaternion: f64&)
+extern mj_version() -> i32
+
+module MarbleMuJoCo:
+    const POSITION_VELOCITY_TIME: i32 = 7
+    const FRAME_INTERVAL: f64 = 1.0 / 60.0
+    const MAX_TILT: f64 = 0.140
+    const TILT_STEP: f64 = 0.006
+    const GRAVITY: f64 = 9.80665
+    const RADIUS: f64 = 0.0075
+    const ROLLING: i64 = 0
+    const FALLING: i64 = 1
+    const HOME: i64 = 2
+    const LOST: i64 = 3
+
+    struct Engine:
+        model: mutable usize
+        data: mutable usize
+        roll: mutable f64
+        pitch: mutable f64
+        nudge_due: mutable f64
+        count: mutable i64
+        first_geom: mutable i64
+        hole_count: mutable i64
+        holes: mutable f64[256]
+        motion: mutable f64[105]
+        status: mutable i64[8]
+        over: mutable i64[8]
+        home: mutable i64
+        lost: mutable i64
+        cupped_this_step: mutable i64
+        lost_this_step: mutable i64
+        struck_this_step: mutable f64
+
+    def close(engine: mutable Engine&):
+        can Memory.Release:
+            if engine.data != 0.usize():
+                mj_deleteData(engine.data)
+                engine.data <- 0.usize()
+            if engine.model != 0.usize():
+                mj_deleteModel(engine.model)
+                engine.model <- 0.usize()
+
+    def open(engine: mutable Engine&, tray: MarbleMaze::MarbleTray&) -> bool:
+        can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            close(engine)
+            if mj_version() != MUJOCO_HEADER_VERSION:
+                SDL_Log("MuJoCo library version differs from its build headers")
+                return false
+            level(engine)
+            engine.nudge_due <- 0.0
+            xml: mutable dstr = MarbleMJCF::build(tray)
+            return false if xml.count == 0.usize()
+            xml.push(0.u8())
+            message: mutable u8[1024] = zeroed
+            trusted Unsafe.PointerCast:
+                spec: usize = mj_parseXMLString((&xml[0]).uintptr().cast[cstr], 0.usize(), &message[0], 1024.i32())
+                if spec == 0.usize():
+                    SDL_Log("Could not parse Marble Maze model: %s", (&message[0]).uintptr().cast[cstr])
+                    return false
+                engine.model <- mj_compile(spec, 0.usize())
+                if engine.model == 0.usize():
+                    SDL_Log("Could not compile Marble Maze model: %s", mjs_getError(spec))
+                mj_deleteSpec(spec)
+            return false if engine.model == 0.usize()
+            engine.data <- mj_makeData(engine.model)
+            if engine.data == 0.usize():
+                close(engine)
+                return false
+            engine.count <- tray.start_n
+            engine.first_geom <- 1 + tray.walls.count
+            engine.hole_count <- tray.holes.count
+            for hole in 0..<engine.hole_count |hole, engine, tray|:
+                at: usize = (4 * hole).usize()
+                engine.holes[at] <- Floats::at(tray.holes.x, hole).f32().f64()
+                engine.holes[at + 1.usize()] <- Floats::at(tray.holes.y, hole).f32().f64()
+                engine.holes[at + 2.usize()] <- Floats::at(tray.holes.radius, hole).f32().f64()
+                engine.holes[at + 3.usize()] <- Ints::at(tray.holes.home, hole).f64()
+            engine.home <- 0
+            engine.lost <- 0
+            reset_feedback(engine)
+            mj_getState(engine.model, engine.data, &engine.motion[0], POSITION_VELOCITY_TIME)
+            for ball in 0..<engine.count |ball, engine, tray|:
+                offset: usize = (1 + ball * 7).usize()
+                engine.status[ball.usize()] <- ROLLING
+                engine.over[ball.usize()] <- -1
+                engine.motion[offset] <- Floats::at(tray.start_x, ball).f32().f64()
+                engine.motion[offset + 1.usize()] <- Floats::at(tray.start_y, ball).f32().f64()
+            mj_setState(engine.model, engine.data, &engine.motion[0], POSITION_VELOCITY_TIME)
+            return true
+
+    def level(engine: mutable Engine&):
+        engine.roll <- 0.0
+        engine.pitch <- 0.0
+
+    def clamp_tilt(angle: f64) -> f64:
+        return -MAX_TILT if angle < -MAX_TILT
+        return MAX_TILT if angle > MAX_TILT
+        return angle
+
+    def hole_at(engine: Engine&, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            for hole in 0..<engine.hole_count |hole, engine, x, y|:
+                at: usize = (4 * hole).usize()
+                dx: f64 = x - engine.holes[at]
+                dy: f64 = y - engine.holes[at + 1.usize()]
+                return hole if py_hypot(dx, dy) < engine.holes[at + 2.usize()]
+            return -1
+
+    def swallow(engine: mutable Engine&, ball: usize, hole: i64):
+        can Abort.Panic:
+            if engine.holes[(4 * hole + 3).usize()] != 0.0:
+                engine.status[ball] <- HOME
+                engine.home <- engine.home + 1
+                engine.cupped_this_step <- engine.cupped_this_step + 1
+            else:
+                engine.status[ball] <- LOST
+                engine.lost <- engine.lost + 1
+                engine.lost_this_step <- engine.lost_this_step + 1
+
+    def reset_feedback(engine: mutable Engine&):
+        engine.cupped_this_step <- 0
+        engine.lost_this_step <- 0
+        engine.struck_this_step <- 0.0
+
+    def record_impact(engine: mutable Engine&, intensity: f64):
+        bounded: f64 = 1.0 if intensity > 1.0 else intensity
+        if bounded > engine.struck_this_step:
+            engine.struck_this_step <- bounded
+
+    def adjust_velocity(engine: mutable Engine&, ball: usize, pos: usize, vel: usize, dt: f64, resting: bool):
+        can Abort.Panic:
+            keep: f64 = 1.0 - 0.22 * dt
+            vx: mutable f64 = engine.motion[vel] * keep
+            vy: mutable f64 = engine.motion[vel + 1.usize()] * keep
+            spin: mutable f64[3] = zeroed
+            inverse: mutable f64[4] = zeroed
+            angular: usize = vel + 3.usize()
+            orientation: usize = pos + 3.usize()
+            mju_rotVecQuat(&spin[0], &engine.motion[angular], &engine.motion[orientation])
+            speed: f64 = py_hypot(vx, vy)
+            if speed > 1.0:
+                scale: f64 = 1.0 / speed
+                vx <- vx * scale
+                vy <- vy * scale
+                spin[0] <- spin[0] * scale
+                spin[1] <- spin[1] * scale
+            if engine.status[ball] == ROLLING:
+                rest_spin: f64 = 0.006 / RADIUS
+                if spin[2] > -rest_spin and spin[2] < rest_spin:
+                    spin[2] <- 0.0
+                if resting and py_hypot(vx, vy) < 0.006 and py_hypot(spin[0], spin[1]) < rest_spin:
+                    vx <- 0.0
+                    vy <- 0.0
+                    spin[0] <- 0.0
+                    spin[1] <- 0.0
+            engine.motion[vel] <- vx
+            engine.motion[vel + 1.usize()] <- vy
+            mju_negQuat(&inverse[0], &engine.motion[orientation])
+            mju_rotVecQuat(&engine.motion[angular], &spin[0], &inverse[0])
+
+    def set_ball_contact(model: usize, geom: usize, enabled: i32):
+        can Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                type_slot: usize& = (model + MUJOCO_MODEL_GEOM_CONTYPE).cast[usize&]
+                affinity_slot: usize& = (model + MUJOCO_MODEL_GEOM_CONAFFINITY).cast[usize&]
+                contact_type: mutable i32& = type_slot[0].cast[mutable i32&]
+                contact_affinity: mutable i32& = affinity_slot[0].cast[mutable i32&]
+                contact_type[geom] <- enabled
+                contact_affinity[geom] <- enabled
+
+    def set_step_options(model: usize, timestep: f64, gx: f64, gy: f64, gz: f64):
+        can Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                interval: mutable f64& = (model + MUJOCO_MODEL_TIMESTEP).cast[mutable f64&]
+                gravity: mutable f64& = (model + MUJOCO_MODEL_GRAVITY).cast[mutable f64&]
+                interval[0] <- timestep
+                gravity[0] <- gx
+                gravity[1] <- gy
+                gravity[2] <- gz
+
+    def substep(engine: mutable Engine&, dt: f64, gx: f64, gy: f64, gn: f64):
+        can Abort.Panic, Unsafe.PointerCast:
+            inputs: mutable f64[105] = engine.motion
+            for index in 0..<engine.count |index, engine, inputs|:
+                ball: usize = index.usize()
+                pos: usize = (1 + 7 * index).usize()
+                vel: usize = (1 + 7 * engine.count + 6 * index).usize()
+                if engine.status[ball] == ROLLING:
+                    hole: i64 = hole_at(engine, engine.motion[pos], engine.motion[pos + 1.usize()])
+                    if hole >= 0:
+                        engine.status[ball] <- FALLING
+                        engine.over[ball] <- hole
+                set_ball_contact(engine.model, (engine.first_geom + index).usize(), 1.i32() if engine.status[ball] == ROLLING else 0.i32())
+                if engine.status[ball] >= HOME:
+                    inputs[pos] <- 10.0 + index.f64()
+                    inputs[pos + 1.usize()] <- 10.0
+                    inputs[pos + 2.usize()] <- 1.0
+                    inputs[pos + 3.usize()] <- 1.0
+                    for axis in 0..<3 |axis, inputs, pos|:
+                        inputs[pos + 4.usize() + axis.usize()] <- 0.0
+                    for axis in 0..<6 |axis, inputs, vel|:
+                        inputs[vel + axis.usize()] <- 0.0
+            mj_setState(engine.model, engine.data, &inputs[0], POSITION_VELOCITY_TIME)
+            mj_step(engine.model, engine.data)
+            mj_getState(engine.model, engine.data, &inputs[0], POSITION_VELOCITY_TIME)
+            engine.motion[0] <- inputs[0]
+            resting: bool = py_hypot(gx, gy) <= 0.008 * gn
+            for index in 0..<engine.count |index, engine, dt, gx, gy, gn, inputs, resting|:
+                ball: usize = index.usize()
+                pos: usize = (1 + 7 * index).usize()
+                vel: usize = (1 + 7 * engine.count + 6 * index).usize()
+                before_x: f64 = engine.motion[vel]
+                before_y: f64 = engine.motion[vel + 1.usize()]
+                if engine.status[ball] < HOME:
+                    for axis in 0..<7 |axis, engine, inputs, pos|:
+                        engine.motion[pos + axis.usize()] <- inputs[pos + axis.usize()]
+                    for axis in 0..<6 |axis, engine, inputs, vel|:
+                        engine.motion[vel + axis.usize()] <- inputs[vel + axis.usize()]
+                if engine.status[ball] == FALLING:
+                    hole: i64 = hole_at(engine, engine.motion[pos], engine.motion[pos + 1.usize()])
+                    if hole >= 0:
+                        engine.over[ball] <- hole
+                        if engine.motion[pos + 2.usize()] <= 0.0:
+                            swallow(engine, ball, hole)
+                    else:
+                        recover_lip(engine, ball, pos, vel, gn)
+                if engine.status[ball] < HOME:
+                    adjust_velocity(engine, ball, pos, vel, dt, resting)
+                    jolt: f64 = py_hypot(engine.motion[vel] - before_x - gx * dt, engine.motion[vel + 1.usize()] - before_y - gy * dt)
+                    if jolt > 0.02:
+                        record_impact(engine, jolt * 1.6)
+
+    def recover_lip(engine: mutable Engine&, ball: usize, pos: usize, vel: usize, gn: f64):
+        can Abort.Panic:
+            drop: f64 = RADIUS - engine.motion[pos + 2.usize()]
+            if engine.over[ball] >= 0 and drop > 0.0:
+                vx: f64 = engine.motion[vel]
+                vy: f64 = engine.motion[vel + 1.usize()]
+                have: f64 = vx * vx + vy * vy
+                need: f64 = 2.0 * gn * drop
+                if have <= need:
+                    swallow(engine, ball, engine.over[ball])
+                    return
+                keep: f64 = sqrt((have - need) / have)
+                engine.motion[vel] <- vx * keep
+                engine.motion[vel + 1.usize()] <- vy * keep
+                record_impact(engine, drop / RADIUS)
+            angular: usize = vel + 3.usize()
+            orientation: usize = pos + 3.usize()
+            spin: mutable f64[3] = zeroed
+            inverse: mutable f64[4] = zeroed
+            mju_rotVecQuat(&spin[0], &engine.motion[angular], &engine.motion[orientation])
+            spin[0] <- -engine.motion[vel + 1.usize()] / RADIUS
+            spin[1] <- engine.motion[vel] / RADIUS
+            mju_negQuat(&inverse[0], &engine.motion[orientation])
+            mju_rotVecQuat(&engine.motion[angular], &spin[0], &inverse[0])
+            engine.motion[pos + 2.usize()] <- RADIUS
+            engine.motion[vel + 2.usize()] <- 0.0
+            engine.over[ball] <- -1
+            engine.status[ball] <- ROLLING
+
+    def advance(engine: mutable Engine&, elapsed: f64, held: i64, dest: mutable f64&, capacity: i64) -> i64:
+        can Abort.Panic, Unsafe.PointerCast:
+            return 0 if engine.data == 0.usize()
+            size: i64 = mj_stateSize(engine.model, POSITION_VELOCITY_TIME).i64()
+            return 0 if capacity < size
+            piece: f64 = 0.0 if not (elapsed > 0.0 and elapsed <= 1.7976931348623157e308) else (0.05 if elapsed > 0.05 else elapsed)
+            if held == 0:
+                engine.nudge_due <- 0.0
+            else:
+                engine.nudge_due <- engine.nudge_due + piece
+                while engine.nudge_due >= FRAME_INTERVAL |engine, held|:
+                    engine.nudge_due <- engine.nudge_due - FRAME_INTERVAL
+                    # Python visits held directions in E, N, S, W order.
+                    if (held & MarbleMazeGame::MASK_EAST) != 0:
+                        engine.roll <- clamp_tilt(engine.roll + TILT_STEP)
+                    if (held & MarbleMazeGame::MASK_NORTH) != 0:
+                        engine.pitch <- clamp_tilt(engine.pitch - TILT_STEP)
+                    if (held & MarbleMazeGame::MASK_SOUTH) != 0:
+                        engine.pitch <- clamp_tilt(engine.pitch + TILT_STEP)
+                    if (held & MarbleMazeGame::MASK_WEST) != 0:
+                        engine.roll <- clamp_tilt(engine.roll - TILT_STEP)
+            cos_roll: f64 = cos(engine.roll)
+            gx: f64 = GRAVITY * sin(engine.roll)
+            gy: f64 = -GRAVITY * cos_roll * sin(engine.pitch)
+            gz: f64 = -GRAVITY * cos_roll * cos(engine.pitch)
+            left: mutable f64 = piece
+            while left > 0.0 |left, engine, gx, gy, gz|:
+                bite: f64 = FRAME_INTERVAL if left > FRAME_INTERVAL else left
+                set_step_options(engine.model, bite / 4.0, gx, gy, gz)
+                reset_feedback(engine)
+                for step in 0..<4 |step, engine, bite, gx, gy, gz|:
+                    substep(engine, bite / 4.0, gx, gy, -gz)
+                left <- left - bite
+            for index in 0..<size |index, engine, dest|:
+                dest[index.usize()] <- engine.motion[index.usize()]
+            return size

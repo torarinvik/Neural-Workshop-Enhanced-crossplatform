@@ -1,0 +1,116 @@
+include "./reading_quiz.elisa"
+
+module BetweenLines:
+    # betweenlines.py: what a reply implies, which remark is sarcastic,
+    # which sentence is ironic; the answers in the order they were written.
+    const ITEMS: i64 = 20
+    const KINDS: i64 = 3
+    const IMPLICATURE: i64 = 0
+    const SARCASM: i64 = 1
+    const IRONY: i64 = 2
+
+    struct Grade:
+        rung: i64
+        kinds: i64
+        pace: ReadingQuiz::Pace
+
+    struct Question:
+        prompt: dstr
+        ask: dstr
+        options: darray[dstr]
+        answer: i64
+
+    struct Corpus:
+        questions: mutable darray[Question][3]
+
+    struct Round:
+        level: Grade
+        quiz: ReadingQuiz::Round
+
+    struct Deck:
+        cards: mutable darray[i64]
+        taken: mutable i64
+        spent: mutable bool
+
+    def grade(requested: i64) -> Grade:
+        rung: i64 = requested if requested > 0 else 1
+        kinds: i64 = 1 if rung < 4 else (2 if rung < 7 else 3)
+        return Grade{rung: rung, kinds: kinds, pace: ReadingQuiz::reading_pace(rung, 2.0, 4.5, 5.0, 2.0)}
+
+    def title(kind: i64) -> cstr:
+        return "What does B mean?" if kind == IMPLICATURE
+        return "Two remarks" if kind == SARCASM
+        return "A sentence"
+
+    def same_prompt(left: dstr, right: dstr) -> bool:
+        can Abort.Panic:
+            return false if left.count != right.count
+            for i in 0..<left.count.i64() |left, right|:
+                return false if left[i.usize()] != right[i.usize()]
+            return true
+
+    def seen_prompt(items: darray[ReadingQuiz::Item]&, prompt: dstr) -> bool:
+        can Abort.Panic:
+            for item in items:
+                return true if same_prompt(item.prompt, prompt)
+            return false
+
+    # quiz.step with keep_order: the answers as written, nothing drawn.
+    def ordered_step(ask: dstr, options: darray[dstr]&, answer: i64) -> ReadingQuiz::Step:
+        can Memory.Allocate, Abort.Panic:
+            picked: mutable darray[dstr] = []
+            wide: mutable bool = false
+            for word in options:
+                wide <- wide or TextMetrics::codepoints(bytes_view(word)) > 30
+                picked.push(word)
+            return ReadingQuiz::Step{ask: ask, options: picked, answer: answer, wide: wide, values: []}
+
+    def next_item(pool: darray[Question]&, deck: mutable Deck&, offered: darray[ReadingQuiz::Item]&, kind: i64,
+            level: Grade, draw: mutable MT19937&) -> ReadingQuiz::Item:
+        can Memory.Allocate, Abort.Panic:
+            count: i64 = pool.count.i64()
+            return zeroed if count == 0
+            first: mutable ReadingQuiz::Item = zeroed
+            limit: i64 = 1 if deck.spent else 400
+            for attempt in 0..<limit |pool, deck, offered, kind, level, draw, first, count|:
+                index: i64 = deck.cards[(deck.taken % count).usize()]
+                question: Question = pool[index.usize()]
+                deck.taken <- deck.taken + 1
+                # Repeated prompts still consume the original option shuffle.
+                choices: ReadingQuiz::Step = ordered_step(question.ask, &question.options, question.answer)
+                steps: darray[ReadingQuiz::Step] = [choices]
+                item: ReadingQuiz::Item = ReadingQuiz::reading_item(question.prompt, steps, level.pace, title(kind))
+                return item if not seen_prompt(offered, question.prompt)
+                first <- item if attempt == 0
+            deck.spent <- true
+            return first
+
+    def build(level: Grade, draw: mutable MT19937&, corpus: Corpus&) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            decks: mutable Deck[3] = zeroed
+            for kind in 0..<level.kinds |decks, corpus, draw|:
+                cards: mutable darray[i64] = ReadingQuiz::indices_of(corpus.questions[kind.usize()].count.i64())
+                py_shuffle_i64(draw, &cards)
+                decks[kind.usize()] <- Deck{cards: cards, taken: 0, spent: false}
+            order: mutable darray[i64] = []
+            for i in 0..<ITEMS |order, level|:
+                order.push(i % level.kinds)
+            py_shuffle_i64(draw, &order)
+            offered: mutable darray[ReadingQuiz::Item] = []
+            for kind in order:
+                item: ReadingQuiz::Item = next_item(&corpus.questions[kind.usize()], &decks[kind.usize()], &offered, kind, level, draw)
+                offered.push(item) if item.steps.count > 0.usize()
+            return zeroed if offered.count.i64() != ITEMS
+            quiz: ReadingQuiz::Round = ReadingQuiz::assemble(offered, 15)
+            return Round{level: level, quiz: quiz}
+
+    def deal(level: Grade, draw: mutable MT19937&, corpus: Corpus&) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            for _ in 0..<40 |level, draw, corpus|:
+                next: mutable MT19937 = zeroed
+                mt_seed_int(&next, py_getrandbits(draw, 32))
+                round: Round = build(level, &next, corpus)
+                # The reference player answers every question immediately, so
+                # every assembled round clears the score and time checks.
+                return round if round.quiz.items.count > 0.usize()
+            return zeroed

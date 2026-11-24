@@ -1,0 +1,100 @@
+include "./ferry.elisa"
+
+module FerryReference:
+    const REACH: f64 = Ferry::BARGE_BEAM + Ferry::HULL + 1.4
+    const DASH: f64 = 3.4
+
+    struct Pilot:
+        committed_lane: mutable i64
+        committed_direction: mutable f64
+
+    def lane_clear(run: Ferry::Run&, barge: Ferry::Barge, seconds: f64) -> bool:
+        can Abort.Panic:
+            t: mutable f64 = 0.0
+            while t <= seconds |run, barge, seconds, t|:
+                for k in 0..<2 |run, barge, t|:
+                    x: f64 = Ferry::barge_x(barge, k, run.t + t)
+                    return false if fabs(x - run.x) < Ferry::BARGE_LENGTH + Ferry::HULL + 2.0
+                t <- t + 0.2
+            return true
+
+    def next_lane(run: Ferry::Run&, pier: Ferry::Point, direction: f64) -> i64:
+        can Abort.Panic:
+            count: i64 = run.river.level.lanes
+            for at in 0..<count |run, pier, direction, count|:
+                i: i64 = at if direction > 0.0 else count - 1 - at
+                y: f64 = run.river.barges[i.usize()].lane_y
+                return i if (y + direction * REACH - run.y) * direction > 0.0 and (pier.y - y) * direction > 0.0
+            return Ferry::NEUTRAL
+
+    def approach(pilot: mutable Pilot&, run: Ferry::Run&, pier: Ferry::Point) -> Ferry::Point:
+        can Abort.Panic:
+            direction: f64 = 1.0 if pier.y > run.y else -1.0
+            lane: i64 = next_lane(run, pier, direction)
+            if lane < 0:
+                dx: f64 = pier.x - run.x
+                dy: f64 = pier.y - run.y
+                distance: f64 = py_hypot(dx, dy)
+                speed: f64 = fmin(3.2, 0.25 + distance * 0.45)
+                return Ferry::Point{x: dx / distance * speed, y: dy / distance * speed} if distance > 0.05
+                return Ferry::Point{x: 0.0, y: 0.0}
+            barge: Ferry::Barge = run.river.barges[lane.usize()]
+            vx: f64 = fmax(-1.5, fmin(1.5, (pier.x - run.x) * 0.3))
+            gate: f64 = barge.lane_y - direction * REACH
+            gap: f64 = gate - run.y
+            dash: Ferry::Point = Ferry::Point{x: vx * 0.3, y: direction * DASH}
+            if pilot.committed_lane == lane and pilot.committed_direction == direction and fabs(run.y - barge.lane_y) < REACH + 0.3:
+                return dash
+            if gap * direction > 0.5:
+                return Ferry::Point{x: vx, y: direction * fmin(3.0, 0.3 + sqrt(2.0 * 0.7 * fabs(gap)))}
+            if lane_clear(run, barge, (2.0 * REACH + fabs(gap)) / DASH + 2.5):
+                pilot.committed_lane <- lane
+                pilot.committed_direction <- direction
+                return dash
+            return Ferry::Point{x: vx * 0.5, y: gap}
+
+    def choose(pilot: mutable Pilot&, run: Ferry::Run&) -> i64:
+        can Abort.Panic:
+            return Ferry::NEUTRAL if run.result != Ferry::LIVE
+            want: Ferry::Point = approach(pilot, run, Ferry::target(run))
+            room: f64 = Ferry::NORTH - 1.2 - run.y if want.y > 0.0 else run.y - Ferry::SOUTH - 1.2
+            limit: f64 = fmax(0.4, room * 0.9)
+            wx: f64 = want.x - Ferry::current_at(&run.river.level, run.y) - Ferry::gust(run, run.t)
+            wy: f64 = fmax(-limit, fmin(limit, want.y))
+            need: f64 = py_hypot(wx, wy)
+            head: f64 = run.heading if need < 0.15 else atan2(wy, wx) * 57.29577951308232
+            err: f64 = Ferry::wrap(head - run.heading + 540.0, 360.0) - 180.0
+            along: f64 = need * cos(Ferry::radians(err))
+            turn: i64 = Ferry::LEFT if err > 6.0 else Ferry::RIGHT if err < -6.0 else Ferry::NEUTRAL
+            if run.speed < along - 0.15 and fabs(err) < 70.0:
+                return Ferry::AHEAD_LEFT if turn == Ferry::LEFT
+                return Ferry::AHEAD_RIGHT if turn == Ferry::RIGHT
+                return Ferry::AHEAD
+            return Ferry::ASTERN if run.speed > along + 0.5 and fabs(err) < 100.0
+            return turn
+
+    def play(river: Ferry::River) -> bool:
+        can Abort.Panic:
+            run: mutable Ferry::Run = Ferry::start(river)
+            pilot: mutable Pilot = Pilot{committed_lane: Ferry::NEUTRAL, committed_direction: 0.0}
+            while run.result == Ferry::LIVE |run, pilot|:
+                port: i64 = choose(&pilot, &run)
+                Ferry::step(&run, 1.0 / 30.0, port)
+            return run.result == Ferry::CLEAR
+
+    def deal_seed(rung: i64, seed: i64) -> Ferry::River:
+        can Abort.Panic:
+            rng: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&rng, magnitude)
+            level: Ferry::Grade = Ferry::grade(rung)
+            first: Ferry::River = Ferry::build(level, &rng)
+            return first if play(first)
+            for _ in 1..<20 |level, rng|:
+                candidate: Ferry::River = Ferry::build(level, &rng)
+                return candidate if play(candidate)
+            return first
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Ferry::River:
+        can Abort.Panic:
+            return deal_seed(rung, py_randbelow(rng, 1073741824.u64()).i64())

@@ -1,0 +1,256 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+# kerbside.py: cross the street with your eyes shut. The screen shows the
+# street from above and you on it, and no cars: only the ear says where they
+# are. Walk across lane by lane; the lines between lanes are safe to stand
+# on, the middle of a lane is not when a car comes.
+#
+# The run keeps what its sound needs, not the sound itself: the reference's
+# livesound tracks are set every step, one setting per car, which at the
+# high rungs is millions of settings. Every setting is a function of the
+# step's time and where the walker stood, so the run logs those two per
+# step and KerbsideAudio works each setting out again when a window asks.
+module Kerbside:
+    const FORWARD: i64 = 0
+    const BACK: i64 = 1
+    const PORTS: i64 = 2
+    const LANE: f64 = 3.2
+    const HALF_CAR: f64 = 1.0
+    const BODY: f64 = 0.3
+    const CAR_LONG: f64 = 4.4
+    const WALK: f64 = 1.4
+    const BACKS: f64 = 1.0
+    const START: f64 = -1.2
+    const SOUND: f64 = 343.0
+    const LIVE: i64 = 0
+    const ACROSS: i64 = 1
+    const HIT: i64 = 2
+    const STILL: i64 = 3
+    const WOOD: i64 = 0
+    const BELL: i64 = 1
+    const GROWL: i64 = 2
+
+    struct Grade:
+        rung: i64
+        lanes: i64
+        speed: f64
+        gap: f64
+        electric: f64
+        vans: bool
+        wind: f64
+
+    struct Car:
+        lane: i64
+        dir: i64
+        speed: f64
+        at: f64
+        electric: bool
+        pitch: f64
+
+    struct Street:
+        level: Grade
+        cars: darray[Car]
+        vans: i64
+        van_a0: f64
+        van_b0: f64
+        van_a1: f64
+        van_b1: f64
+        seconds: f64
+        seed: i64
+        valid: bool
+
+    struct Run:
+        street: Street
+        t: mutable f64
+        y: mutable f64
+        result: mutable i64
+        lane: mutable i64
+        notes: mutable darray[DrShapeDeal::Note]
+        # The sound's log: when each setting was first made, the time the
+        # last word at that moment was worked out for, where the walker
+        # stood then, and the first setting made after the run ended.
+        logging: bool
+        times: mutable darray[f64]
+        said_at: mutable darray[f64]
+        stood: mutable darray[f64]
+        silent_from: mutable i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 1 else 1
+        return Grade{rung: r, lanes: 1, speed: 7.0, gap: 5.0, electric: 0.0, vans: false, wind: 0.0} if r == 1
+        return Grade{rung: r, lanes: 2, speed: 8.0 + r.f64(), gap: 7.0, electric: 0.0, vans: false, wind: 0.0} if r < 4
+        if r < 7:
+            return Grade{rung: r, lanes: 4 if r == 6 else 3, speed: 11.0 + (r - 4).f64(), gap: 8.0, electric: 0.0,
+                vans: false, wind: 0.0}
+        if r < 10:
+            return Grade{rung: r, lanes: 4, speed: 13.0, gap: 8.5, electric: 0.25 + 0.1 * (r - 7).f64(), vans: true, wind: 0.0}
+        lanes: i64 = 4 + (r - 10) / 3
+        speed: f64 = 13.0 + 0.6 * (r - 10).f64()
+        gap: f64 = 8.0 - 0.2 * (r - 10).f64()
+        electric: f64 = 0.45 + 0.03 * (r - 10).f64()
+        wind: f64 = 0.03 * (r - 9).f64()
+        return Grade{rung: r, lanes: 8 if lanes > 8 else lanes, speed: 25.0 if speed > 25.0 else speed,
+            gap: 4.5 if gap < 4.5 else gap, electric: 0.85 if electric > 0.85 else electric, vans: true,
+            wind: 0.25 if wind > 0.25 else wind}
+
+    def car_x(car: Car&, t: f64) -> f64:
+        return car.dir.f64() * car.speed * (t - car.at)
+
+    def lane_centre(lane: i64) -> f64:
+        return LANE * lane.f64() + LANE / 2.0
+
+    def far_side(level: Grade&) -> f64:
+        return LANE * level.lanes.f64() + 1.0
+
+    # The first car, in the street's order, that the walker at y is under at t.
+    def hit(street: Street&, t: f64, y: f64) -> i64:
+        can Abort.Panic:
+            across: f64 = HALF_CAR + BODY
+            along: f64 = CAR_LONG / 2.0 + BODY
+            for k in 0..<street.cars.count.i64() |street, t, y, across, along|:
+                car: Car& = &street.cars[k.usize()]
+                return k if fabs(y - lane_centre(car.lane)) < across and fabs(car_x(car, t)) < along
+            return -1
+
+    # random.expovariate.
+    def expovariate(draw: mutable MT19937&, rate: f64) -> f64:
+        can Abort.Panic:
+            return -log(1.0 - py_random(draw)) / rate
+
+    def build(level: Grade, draw: mutable MT19937&, seed: i64 = 0) -> Street:
+        can Abort.Panic, Memory.Allocate:
+            seconds: f64 = 30.0 + 12.0 * level.lanes.f64()
+            cars: mutable darray[Car] = []
+            for lane in 0..<level.lanes |level, draw, cars, seconds|:
+                d: i64 = 1 if lane % 2 == 0 else -1
+                t: mutable f64 = -py_uniform(draw, 0.0, level.gap)
+                if lane == 0:
+                    t <- py_uniform(draw, 1.0, 2.4)
+                    speed: f64 = level.speed * py_uniform(draw, 0.9, 1.1)
+                    cars.push(Car{lane: 0, dir: d, speed: speed, at: t, electric: false, pitch: py_uniform(draw, 55.0, 85.0)})
+                while t < seconds + 10.0 |level, draw, cars, t, lane, d|:
+                    wait: f64 = expovariate(draw, 1.0 / level.gap)
+                    t <- t + (wait if wait > 2.2 else 2.2)
+                    speed: f64 = level.speed * py_uniform(draw, 0.85, 1.15)
+                    quiet: bool = py_random(draw) < level.electric
+                    cars.push(Car{lane: lane, dir: d, speed: speed, at: t, electric: quiet, pitch: py_uniform(draw, 55.0, 90.0)})
+            a: f64 = py_uniform(draw, 4.0, 9.0) if level.vans else 0.0
+            return Street{level: level, cars: cars, vans: 2 if level.vans else 0, van_a0: -a - 6.0 if level.vans else 0.0,
+                van_b0: -a if level.vans else 0.0, van_a1: a, van_b1: a + 6.0 if level.vans else 0.0, seconds: seconds,
+                seed: seed, valid: true}
+
+    def begin(street: Street, logging: bool = true) -> Run:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = Run{street: street, t: 0.0, y: START, result: LIVE, lane: 0, notes: [], logging: logging,
+                times: [], said_at: [], stood: [], silent_from: -1}
+            sound(&run)
+            return run
+
+    # Run._sound, as far as the run itself goes: one setting of every track
+    # for this moment, the same moment set again leaving the last word.
+    def sound(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            return if not run.logging
+            count: i64 = run.times.count.i64()
+            if count > 0 and run.t <= run.times[(count - 1).usize()] + 1e-9:
+                run.said_at[(count - 1).usize()] <- run.t
+                run.stood[(count - 1).usize()] <- run.y
+                run.silent_from <- count - 1 if run.result != LIVE and run.silent_from < 0
+                return
+            run.times.push(run.t)
+            run.said_at.push(run.t)
+            run.stood.push(run.y)
+            run.silent_from <- count if run.result != LIVE and run.silent_from < 0
+
+    def note(run: mutable Run&, dur: f64, freq: f64, gain: f64, bright: f64, voice: i64, seed: i64):
+        can Abort.Panic, Memory.Allocate:
+            run.notes.push(DrShapeDeal::Note{t: run.t, dur: dur, freq: freq, pan: 0.0, pan2: 0.0, gain: gain, gain2: gain,
+                bright: bright, voice: voice, seed: seed, who: -1, room: 0.0})
+
+    def step(run: mutable Run&, dt: f64, control: i64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            run.t <- run.t + dt
+            if control == FORWARD:
+                run.y <- run.y + WALK * dt
+            elif control == BACK:
+                back: f64 = run.y - BACKS * dt
+                run.y <- back if back > START else START
+            car: i64 = hit(&run.street, run.t, run.y)
+            if car >= 0:
+                run.result <- HIT
+                run.lane <- run.street.cars[car.usize()].lane
+                note(run, 0.5, 90.0, 0.6, 0.5, GROWL, 1)
+            elif run.y >= far_side(&run.street.level):
+                run.result <- ACROSS
+                note(run, 0.3, 1320.0, 0.3, 0.8, BELL, 2)
+            elif run.t > run.street.seconds:
+                run.result <- STILL
+            sound(run)
+
+    # _clear: walking from y0 to y1 from t on is safe all the way, and for a
+    # moment after, standing at y1.
+    def clear(street: Street&, t: f64, y0: f64, y1: f64) -> bool:
+        can Abort.Panic:
+            y: mutable f64 = y0
+            s: mutable f64 = t
+            while y < y1 |street, y, s, y1|:
+                return false if hit(street, s, y) >= 0
+                y <- y + WALK * 0.05
+                s <- s + 0.05
+            for k in 0..<6 |street, s, y1|:
+                return false if hit(street, s + k.f64() * 0.1, y1) >= 0
+            return true
+
+    # The reference autopilot: knows where every car is, walks to the next
+    # line between lanes when the way there is clear, and waits on the line
+    # otherwise. -1 is no port.
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            lanes: i64 = run.street.level.lanes
+            y: f64 = run.y
+            next: mutable f64 = far_side(&run.street.level)
+            for k in 0..<(lanes + 1) |next, y, lanes|:
+                if LANE * k.f64() > y + 0.05:
+                    next <- LANE * k.f64()
+                    break
+            next <- far_side(&run.street.level) if next >= LANE * lanes.f64()
+            return BACK if hit(&run.street, run.t + 0.1, y) >= 0
+            return FORWARD if clear(&run.street, run.t, y, next)
+            return -1
+
+    # play(): one crossing with the sound off, the pilot asked every dt and
+    # the street stepped in `sub` slices of it. wait < 0 is the autopilot;
+    # otherwise the deaf walker who waits that many seconds and walks.
+    def play(street: Street, dt: f64, sub: i64, wait: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            run: mutable Run = begin(street, false)
+            slice: f64 = dt / sub.f64()
+            while run.result == LIVE |run, dt, sub, wait, slice|:
+                port: i64 = pilot(&run) if wait < 0 else (FORWARD if run.t >= wait.f64() else -1)
+                for _ in 0..<sub |run, port, slice|:
+                    step(&run, slice, port)
+                    break if run.result != LIVE
+            return run.result == ACROSS
+
+    def blind(street: Street) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            across: mutable i64 = 0
+            for k in 0..<13 |street, across|:
+                across <- across + 1 if play(street, 1.0 / 30.0, 1, k)
+            return across
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Street:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            level: Grade = grade(rung)
+            for _ in 0..<200 |level, draw|:
+                seed: u64 = py_getrandbits(draw, 32)
+                rng: mutable MT19937 = zeroed
+                mt_seed_int(&rng, seed)
+                street: Street = build(level, &rng, seed.i64())
+                if play(street, 1.0 / 30.0, 1, -1) and play(street, 1.0 / 60.0, 2, -1) and blind(street) <= 3:
+                    return street
+            return zeroed

@@ -1,0 +1,123 @@
+include "./socialsense_corpus.elisa"
+include "./reading_quiz_run.elisa"
+include "../hand_view.elisa"
+
+module SocialSenseGame:
+    const READY: i64 = 0
+    const PLAYING: i64 = 1
+    const JUDGED: i64 = 2
+    const DONE: i64 = 3
+    const FEEDBACK: f64 = 2.5
+
+    struct Session:
+        rng: mutable MT19937
+        start_rung: mutable i64
+        total: mutable i64
+        adaptive: mutable bool
+        rung: mutable i64
+        trial: mutable i64
+        wins: mutable i64
+        best_rung: mutable i64
+        phase: mutable i64
+        time: mutable f64
+        deadline: mutable f64
+        run: mutable ReadingQuiz::Run
+        hand: mutable HandView::Pointer
+        owner: mutable Arena
+
+    def initialize(rung: i64, trials: i64, adaptive: bool, seed: i64) -> Session:
+        rng: mutable MT19937 = zeroed
+        magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+        mt_seed_int(&rng, magnitude)
+        initial: i64 = rung if rung > 0 else 1
+        return Session{rng: rng, start_rung: initial, total: trials, adaptive: adaptive, rung: initial,
+            trial: 0, wins: 0, best_rung: 0, phase: READY, time: 0.0, deadline: 0.0,
+            run: zeroed, hand: HandView::Pointer{x: 500.0, y: 20.0, down: false}, owner: zeroed}
+
+    def release_quiz_trial(session: mutable Session&):
+        can Abort.Panic, Memory.Release:
+            session.run <- zeroed
+            arena_free(&session.owner) can Atomics{Exchange,Load,Store}, Unsafe{Alias,PointerCast,RawExtern,UncheckedIndex}, Global{Read,Write}
+
+    def close(session: mutable Session&):
+        can Abort.Panic, Memory.Release:
+            release_quiz_trial(session) can Global{Read,Write}
+            session.phase <- READY
+
+    def next_round(session: mutable Session&, corpus: SocialSense::Corpus&, now: f64) -> bool:
+        can Abort.Panic, Memory.Release, Memory.Allocate:
+            session.time <- now
+            if session.trial >= session.total:
+                session.phase <- DONE
+                return true
+            release_quiz_trial(session) can Global{Read,Write}
+            owner: mutable Arena& = &session.owner
+            in owner:
+                g: SocialSense::Grade = SocialSense::grade(session.rung)
+                round: SocialSense::Round = SocialSense::deal(g, &session.rng, corpus)
+                if round.quiz.items.count == 0.usize():
+                    session.phase <- READY
+                    return false
+                session.run <- ReadingQuiz::begin(round.quiz)
+                # Each item can produce one cue per answer, plus its verdict.
+                capacity: mutable i64 = 1
+                for item in round.quiz.items:
+                    capacity <- capacity + item.steps.count.i64() + 1
+                _ = arena_da_reserve[ReadingQuiz::Cue](owner, &session.run.cues, capacity.usize()) can Global{Read,Write}
+            session.hand <- HandView::Pointer{x: 500.0, y: 20.0, down: false}
+            session.trial <- session.trial + 1
+            session.phase <- PLAYING
+            return true
+
+    def start(session: mutable Session&, corpus: SocialSense::Corpus&, now: f64) -> bool:
+        can Abort.Panic, Memory.Release, Memory.Allocate:
+            return false if (session.phase != READY and session.phase != DONE) or session.total < 1
+            return false if not valid_time(session, now)
+            session.rung <- session.start_rung
+            session.trial <- 0
+            session.wins <- 0
+            session.best_rung <- 0
+            return next_round(session, corpus, now) can Global{Read,Write}
+
+    def valid_time(session: Session&, now: f64) -> bool:
+        return now >= session.time and now <= 9007199254740.0
+
+    def choose(session: mutable Session&, port: i64) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            return false if session.phase != PLAYING
+            return ReadingQuiz::choose(&session.run, port)
+
+    def pointer(session: mutable Session&, x: f64, y: f64, kind: i64) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            return false if session.phase != PLAYING or kind < 0 or kind > 2
+            HandView::place(&session.hand, (x - HandView::VIEW_LEFT) / HandView::VIEW_SCALE,
+                (y - HandView::VIEW_BOTTOM) / HandView::VIEW_SCALE)
+            if kind == 1:
+                _ = ReadingQuiz::click(&session.run, session.hand.x, session.hand.y)
+            return true
+
+    def advance(session: mutable Session&, corpus: SocialSense::Corpus&, now: f64, stepped: bool = false) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not valid_time(session, now)
+            if session.phase == JUDGED:
+                return false if not stepped and now < session.deadline
+                return next_round(session, corpus, now) can Global{Read,Write}
+            return false if session.phase != PLAYING
+            dt: f64 = fmin(0.1, now - session.time)
+            session.time <- now
+            steps: i64 = fmax(1.0, ceil(dt / (1.0 / 120.0))).i64()
+            quantum: f64 = dt / steps.f64()
+            for _ in 0..<steps |session, quantum|:
+                ReadingQuiz::advance_quiz(&session.run, quantum)
+                break if session.run.result != ReadingQuiz::LIVE
+            if session.run.result != ReadingQuiz::LIVE:
+                passed: bool = session.run.result == ReadingQuiz::PASSED
+                if passed:
+                    session.wins <- session.wins + 1
+                    session.best_rung <- session.rung if session.rung > session.best_rung
+                if session.adaptive:
+                    session.rung <- session.rung + 1 if passed and session.rung < 9223372036854775807
+                    session.rung <- session.rung - 1 if not passed and session.rung > 1
+                session.deadline <- now + FEEDBACK
+                session.phase <- JUDGED
+            return true

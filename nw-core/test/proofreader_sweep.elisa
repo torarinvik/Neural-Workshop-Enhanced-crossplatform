@@ -1,0 +1,136 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/scene_proofreader.elisa"
+
+extern getchar() -> i32 can[Blocking.IO]
+extern dprintf(fd: i32, format: cstr, ...) -> i32 can[Console.Write]
+
+def read_input() -> dstr:
+    can Blocking.IO, Memory.Allocate, Abort.Panic:
+        raw: mutable dstr = []
+        while true |raw|:
+            b: i32 = getchar()
+            break if b < 0.i32() or b == 0.i32()
+            raw.push(b.u8())
+        return raw
+
+def flag(b: bool) -> i64:
+    return 1 if b else 0
+
+def emit_word(text: Passages::Word):
+    can Console.Write, Abort.Panic:
+        for k in 0..<text.length |text|:
+            _ = dprintf(1.i32(), "%c", Passages::letter(text, k).i32())
+        _ = dprintf(1.i32(), " ")
+
+def emit_line(row: MissingWord::Line&):
+    can Console.Write, Abort.Panic:
+        for i in 0..<row.count |row|:
+            word: MissingWord::Token = row.words[i.usize()]
+            _ = dprintf(1.i32(), "%lld:", word.id)
+            emit_word(word.text)
+        _ = dprintf(1.i32(), "\n")
+
+def emit(candidate: Proofreader::Candidate&, draw: mutable MT19937&):
+    can Console.Write, Abort.Panic:
+        _ = dprintf(1.i32(), "deal %lld %.17g\n", flag(candidate.valid), py_random(draw))
+        return if not candidate.valid
+        m: Proofreader::Machine& = &candidate.machine
+        for i in 0..<m.level.sentences |m|:
+            emit_line(&m.original[i.usize()])
+            emit_line(&m.rows[i.usize()])
+            _ = dprintf(1.i32(), "%lld\n", m.row_of[i.usize()])
+            row: MissingWord::Line& = &m.rows[i.usize()]
+            for j in 0..<row.count |row, m|:
+                offer: MissingWord::Offer = m.options[Proofreader::option_index(row.words[j.usize()].id)]
+                for k in 0..<offer.count |offer|:
+                    emit_word(offer.words[k.usize()])
+                _ = dprintf(1.i32(), "\n")
+        for i in 0..<m.count |m|:
+            damage: MissingWord::Damage = m.damage[i.usize()]
+            _ = dprintf(1.i32(), "%lld %lld %lld\n", damage.kind, damage.row, damage.index)
+
+def replay(candidate: Proofreader::Candidate&, policy: i64):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        return if not candidate.valid
+        run: mutable Proofreader::Run = Proofreader::start(candidate.machine)
+        if policy == 1:
+            Proofreader::act(&run, Proofreader::RESET)
+            Proofreader::act(&run, Proofreader::DONE)
+        elif policy == 2:
+            Proofreader::step(&run, candidate.machine.level.seconds)
+        while run.result == Proofreader::LIVE |run|:
+            port: i64 = Proofreader::pilot(&run)
+            Proofreader::act(&run, port)
+            Proofreader::step(&run, 1.0 / 60.0)
+            _ = dprintf(1.i32(), "tick %lld %.17g %.17g %.17g %lld %lld %lld %lld %lld %lld\n", port,
+                run.t, run.hand.x, run.hand.y, flag(run.hand.down), run.carry.kind, run.carry.row, run.carry.index, run.selected, run.moves)
+        _ = dprintf(1.i32(), "result %lld %.17g %lld\n", run.result, run.t, run.moves)
+        for cue in run.cues:
+            _ = dprintf(1.i32(), "cue %.17g %.17g %.17g %lld %.17g %.17g\n", cue.t, cue.duration, cue.frequency, cue.voice, cue.gain, cue.pan)
+
+def emit_page(candidate: Proofreader::Candidate&, mode: i64):
+    can Console.Write, Memory.Allocate, Abort.Panic:
+        return if not candidate.valid
+        run: mutable Proofreader::Run = Proofreader::start(candidate.machine)
+        if mode == 1:
+            HandView::place(&run.hand, Proofreader::HANDLE_X, 540.0)
+            Proofreader::act(&run, HandView::PRESS)
+            HandView::place(&run.hand, Proofreader::HANDLE_X, 520.0)
+        elif mode >= 2:
+            row: MissingWord::Line& = &run.rows[0]
+            tiles: Proofreader::Layout = Proofreader::layout(row)
+            HandView::place(&run.hand, tiles.centres[0], 540.0)
+            Proofreader::act(&run, HandView::PRESS)
+            if mode == 2:
+                HandView::place(&run.hand, 500.0, 520.0)
+            else:
+                Proofreader::act(&run, HandView::RELEASE)
+        list: mutable Display::DisplayList = Display::DisplayList()
+        SceneProofreader::page(&list, &run)
+        for cmd in list.commands |list|:
+            if cmd.kind == Display::CMD_TEXT:
+                _ = dprintf(1.i32(), "text %u %.9g %.9g %.9g ", cmd.color, cmd.a.f64(), cmd.b.f64(), cmd.c.f64())
+                for i in 0..<(cmd.len & 0xffffff.u32()).i64() |cmd, list|:
+                    _ = dprintf(1.i32(), "%c", list.pool[(cmd.ref.i64() + i).usize()].i32())
+                _ = dprintf(1.i32(), "\n")
+            else:
+                _ = dprintf(1.i32(), "draw %u %u %.9g %.9g %.9g %.9g %.9g\n",
+                    cmd.kind.i32(), cmd.color, cmd.a.f64(), cmd.b.f64(), cmd.c.f64(), cmd.d.f64(), cmd.e.f64())
+        _ = dprintf(1.i32(), "end\n")
+
+def main() -> i32:
+    can Blocking.IO, Console.Write, Memory.Allocate, Memory.Release, Abort.Panic:
+        for rung in [1, 4, 7, 10, 13, 16, 20, 25, 30]:
+            note: mutable dstr = []
+            SceneProofreader::option_note(rung, &note)
+            _ = dprintf(1.i32(), "note %lld ", rung)
+            for byte in note:
+                _ = dprintf(1.i32(), "%c", byte.i32())
+            _ = dprintf(1.i32(), "\n")
+        custom: bool = getchar() == 1.i32()
+        passages: dstr = read_input() if custom else []
+        sentences: dstr = read_input() if custom else []
+        vocabulary: dstr = read_input() if custom else []
+        corpus: MissingWordGame::Corpus = MissingWordGame::cache_corpus(bytes_view(passages), bytes_view(sentences), bytes_view(vocabulary))
+        for rung in [0, 1, 2, 4, 7, 10, 13, 16, 19, 22, 25, 28, 30, 41, 99] |corpus|:
+            g: Proofreader::Grade = Proofreader::grade(rung)
+            _ = dprintf(1.i32(), "level %lld %lld %lld %lld %lld %lld %lld %.17g\n",
+                g.rung, g.sentences, g.kinds + flag(g.sentences > 1), g.errors, flag(g.hint), flag(g.whole), flag(g.close), g.seconds)
+            for seed in 0..<24 |g, corpus|:
+                draw: mutable MT19937 = zeroed
+                mt_seed_int(&draw, seed.u64())
+                candidate: Proofreader::Candidate = Proofreader::build(g, &draw, &corpus)
+                emit(&candidate, &draw)
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, 17.u64())
+            screened: Proofreader::Candidate = Proofreader::deal(g, &draw, &corpus)
+            emit(&screened, &draw)
+            replay(&screened, 0)
+            if rung == 1:
+                replay(&screened, 1)
+                replay(&screened, 2)
+            for mode in 0..<4 |screened|:
+                emit_page(&screened, mode)
+        return 0.i32()

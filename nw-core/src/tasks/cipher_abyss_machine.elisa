@@ -1,0 +1,249 @@
+include "./cipher_abyss_twins.elisa"
+
+extend CipherLang:
+    const CRACK: i64 = 0
+    const TWINS: i64 = 1
+    const INVERT: i64 = 2
+    const NO_ELIGIBLE_RULE: i64 = 1
+    const INITIAL_RULE_MISSING: i64 = 2
+    const LOST_RULE: i64 = 3
+    const SIMPLER_RULE: i64 = 4
+
+    struct Machine:
+        level: CipherAbyss::Grade
+        rule: i64
+        tests: darray[Probe]
+        seed: i64
+        plan: darray[Probe]
+        kind: i64
+        other: i64
+        rejected: i64
+
+    struct Workshop:
+        program: mutable darray[Node]
+        rules: Rules
+        looks: darray[RivalSet]
+        pool: darray[i64]
+        level: CipherAbyss::Grade
+
+    def workshop(level: CipherAbyss::Grade) -> Workshop:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            program: mutable darray[Node] = []
+            rules: Rules = families(&program, level)
+            looks: darray[RivalSet] = one_look(&program, &rules, level)
+            pool: mutable darray[i64] = []
+            for i in 0..<looks.count.i64() |looks, pool|:
+                pool.push(i) if looks[i.usize()].entries.count > 0.usize()
+            return Workshop{program: program, rules: rules, looks: looks, pool: pool, level: level}
+
+    def add_unique(entries: mutable darray[i64]&, entry: i64):
+        can Abort.Panic, Memory.Allocate:
+            if not contains(entries, entry):
+                entries.push(entry)
+
+    def rivals_for(book: Workshop&, index: i64, rule: i64, twins: darray[i64]&) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            out: mutable darray[i64] = []
+            for rival in book.looks[index.usize()].entries:
+                add_unique(&out, rival)
+            for i in 0..<CipherAbyss::min(3, book.rules.truths.count.i64()) |book, rule, out|:
+                entry: i64 = book.rules.truths[i.usize()]
+                if entry != rule:
+                    add_unique(&out, entry)
+            for rival in twins:
+                add_unique(&out, rival)
+            return out
+
+    def earlier_rivals(player: Mind&, rivals: darray[i64]&, draw: mutable MT19937&) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            index: i64 = CipherAbyss::max(0, player.snapshots.count.i64() - 3)
+            earlier: Snapshot& = &player.snapshots[index.usize()]
+            count: i64 = earlier.entries.count.i64()
+            out: mutable darray[i64] = []
+            if count > 200:
+                sampled: darray[i64] = py_sample_range(draw, 0, count - 1, 200)
+                for i in sampled:
+                    out.push(earlier.entries[i.usize()])
+            else:
+                append_list(&out, &earlier.entries)
+            for rival in rivals:
+                add_unique(&out, rival)
+            return out
+
+    def rejection(level: CipherAbyss::Grade, why: i64) -> Machine:
+        return Machine{level: level, rule: -1, tests: [], seed: 0, plan: [], kind: CRACK, other: -1, rejected: why}
+
+    def build(book: mutable Workshop&, draw: mutable MT19937&) -> Machine:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            level: CipherAbyss::Grade = book.level
+            return rejection(level, NO_ELIGIBLE_RULE) if book.pool.count == 0.usize()
+            ordinal: i64 = book.pool[py_randbelow(draw, book.pool.count.u64()).usize()]
+            rule: i64 = book.rules.truths[ordinal.usize()]
+            close_rules: darray[i64] = twins(&book.program, &book.rules.hypotheses, rule, level)
+            rivals: darray[i64] = rivals_for(book, ordinal, rule, &close_rules)
+            seed: i64 = py_randbelow(draw, 1073741824.u64()).i64()
+            player: mutable Mind = mind(level, &book.rules.hypotheses, seed)
+            return rejection(level, INITIAL_RULE_MISSING) if not contains(&player.snapshots[0].entries, rule)
+            actual: mutable State = zeroed
+            log: mutable darray[Sample] = []
+            plan: mutable darray[Probe] = []
+            k: i64 = level.symbols
+            program: darray[Node] = book.program
+            for _ in 0..<level.budget |program, player, actual, log, plan, rule, k|:
+                given: darray[i64] = experiment(&program, &player)
+                break if given.count == 0.usize()
+                result: darray[i64] = run(&program, rule, &given, k, &actual)
+                actual <- advance(&program, rule, &actual, &given, &result)
+                log.push(Sample{given: given, result: result})
+                plan.push(Probe{values: given})
+                update(&program, &player, &log)
+            final: Snapshot = snapshot(&player.alive)
+            return rejection(level, LOST_RULE) if not contains(&final.entries, rule)
+            difficulty: i64 = size(&book.program, rule)
+            for entry in final.entries:
+                return rejection(level, SIMPLER_RULE) if size(&book.program, entry) < difficulty
+            earlier: darray[i64] = earlier_rivals(&player, &rivals, draw)
+            if level.stage == 7 and py_random(draw) < 0.4:
+                # Python truncates an unordered set here. Keep a consistent
+                # order so equivalent seeds stay reproducible across hosts.
+                opponents: darray[i64] = sliced(&earlier, 0, CipherAbyss::min(60, earlier.count.i64()))
+                inverse: darray[Probe] = invert_tests(&book.program, rule, &final.entries, &opponents, level, draw)
+                if inverse.count > 0.usize():
+                    return Machine{level: level, rule: rule, tests: inverse, seed: seed, plan: plan, kind: INVERT, other: -1, rejected: 0}
+            questions: QuestionSet = crack_questions(&book.program, rule, &final.entries, &earlier, &rivals, level, draw)
+            return rejection(level, questions.rejected) if questions.rejected != 0
+            other: mutable i64 = -1
+            if level.stage >= 4 and py_random(draw) < 0.25:
+                pair: Twin = twin_for(&book.program, rule, &close_rules, level, draw)
+                other <- pair.entry
+                if other >= 0:
+                    for entry in final.entries:
+                        if same_machine(&book.program, entry, other, level) != pair.same:
+                            other <- -1
+                            break
+            return Machine{level: level, rule: rule, tests: questions.rows, seed: seed,
+                plan: plan, kind: TWINS if other >= 0 else CRACK, other: other, rejected: 0}
+
+    def tell_apart(program: darray[Node]&, player: Mind&, other: i64) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            live: darray[Belief] = player.testing if player.testing.count > 0.usize() else player.alive
+            level: CipherAbyss::Grade = player.level
+            all_same: mutable bool = true
+            for entry in live:
+                if not same_machine(program, entry.entry, other, level):
+                    all_same <- false
+                    break
+            return [] if all_same
+            k: i64 = level.symbols
+            inputs: darray[Probe] = probes(level.length, k, 400, 7)
+            initial: State = zeroed
+            for row in inputs:
+                expected: darray[i64] = run(program, other, &row.values, k, &initial)
+                different: mutable bool = true
+                for entry in live:
+                    if agrees(program, entry.entry, &initial, &row.values, &expected, k):
+                        different <- false
+                        break
+                return row.values if different
+            return []
+
+    def reference_wins(book: Workshop&, machine: Machine&) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if machine.rejected != 0
+            level: CipherAbyss::Grade = book.level
+            rule: i64 = machine.rule
+            player: mutable Mind = mind(level, &book.rules.hypotheses, machine.seed)
+            log: mutable darray[Sample] = []
+            actual: mutable State = zeroed
+            k: i64 = level.symbols
+            elapsed: mutable i64 = 1 if machine.plan.count.i64() < level.budget else 0
+            for input in machine.plan:
+                given: darray[i64] = input.values
+                result: darray[i64] = run(&book.program, rule, &given, k, &actual)
+                actual <- advance(&book.program, rule, &actual, &given, &result)
+                log.push(Sample{given: given, result: result})
+                elapsed <- elapsed + given.count.i64() + 1
+            update(&book.program, &player, &log)
+            survivor_rules: Snapshot = snapshot(&player.alive)
+            states: mutable Tracking = track(&survivor_rules.entries)
+            actual <- zeroed
+            inverse: Inverse = preimages(&book.program, rule, level) if machine.kind == INVERT else zeroed
+            for question in machine.tests:
+                given: darray[i64] = question.values
+                if machine.kind == INVERT:
+                    output: i64 = row_number(&given, k)
+                    input: i64 = inverse_lookup(&inverse, output)
+                    return false if input < 0
+                    for entry in survivor_rules.entries:
+                        return false if encoded_output(&book.program, entry, input, level.length, k) != output
+                    elapsed <- elapsed + level.length + 1
+                else:
+                    correct: darray[i64] = run(&book.program, rule, &given, k, &actual)
+                    for i in 0..<states.entries.count.i64() |book, states, given, correct, k|:
+                        prior: State = tracking_state(&states, i)
+                        return false if not agrees(&book.program, states.entries[i.usize()], &prior, &given, &correct, k)
+                    actual <- advance(&book.program, rule, &actual, &given, &correct)
+                    advance_tracking(&book.program, &states, given, &correct, k)
+                    elapsed <- elapsed + correct.count.i64() + 1
+            return false if (elapsed - 1).f64() / 60.0 >= level.seconds
+            return true if machine.kind != TWINS
+            input: darray[i64] = tell_apart(&book.program, &player, machine.other)
+            if input.count == 0.usize():
+                return elapsed.f64() / 60.0 < level.seconds and same_machine(&book.program, rule, machine.other, level)
+            return false if input.count.i64() != level.length or (elapsed + input.count.i64()).f64() / 60.0 >= level.seconds
+            initial: State = zeroed
+            correct: darray[i64] = run(&book.program, rule, &input, k, &initial)
+            return not agrees(&book.program, machine.other, &initial, &input, &correct, k)
+
+    def copy_probes(source: darray[Probe]&) -> darray[Probe]:
+        can Abort.Panic, Memory.Allocate:
+            out: mutable darray[Probe] = []
+            for row in source:
+                out.push(Probe{values: sliced(&row.values, 0, row.values.count.i64())})
+            return out
+
+    def copy_rule(dest: mutable darray[Node]&, source: darray[Node]&, entry: i64, shared: i64) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            return entry if entry < shared
+            original: Node& = &source[entry.usize()]
+            args: darray[i64] = sliced(&original.args, 0, original.args.count.i64())
+            children: mutable darray[i64] = []
+            for child in original.children:
+                children.push(copy_rule(dest, source, child, shared))
+            return add_node(dest, original.op, args, children)
+
+    def retain_machine(book: mutable Workshop&, source: darray[Node]&, machine: Machine&, owner: mutable Arena&) -> Machine:
+        can Abort.Panic, Memory.Allocate:
+            shared: i64 = book.program.count.i64()
+            # Rewritten twins are the only new nodes the machine can reach.
+            extra: i64 = source.count.i64() - shared
+            needed: i64 = shared + extra
+            if machine.other >= shared:
+                _ = arena_da_reserve[Node](owner, &book.program, needed.usize()) can Global{Read,Write}
+            in owner:
+                other: i64 = copy_rule(&book.program, source, machine.other, shared)
+                return Machine{level: machine.level, rule: machine.rule, tests: copy_probes(&machine.tests),
+                    seed: machine.seed, plan: copy_probes(&machine.plan), kind: machine.kind, other: other, rejected: 0}
+            return rejection(book.level, NO_ELIGIBLE_RULE)
+
+    # The workshop and accepted machine live in the caller's arena.
+    # Candidate experiments and rewritten nodes are temporary.
+    def deal(book: mutable Workshop&, draw: mutable MT19937&, owner: mutable Arena&) -> Machine:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return rejection(book.level, NO_ELIGIBLE_RULE) if book.pool.count == 0.usize()
+            last: mutable i64 = NO_ELIGIBLE_RULE
+            for _ in 0..<200 |book, draw, owner, last|:
+                region candidate(1048576):
+                    in candidate:
+                        nodes: mutable darray[Node] = []
+                        _ = nodes.reserve(book.program.count)
+                        for node in book.program:
+                            nodes.push(node)
+                        trial: mutable Workshop = Workshop{program: nodes, rules: book.rules, looks: book.looks, pool: book.pool, level: book.level}
+                        local_draw: mutable MT19937 = zeroed
+                        mt_seed_int(&local_draw, py_getrandbits(draw, 32))
+                        machine: Machine = build(&trial, &local_draw)
+                        last <- machine.rejected
+                        if reference_wins(&trial, &machine):
+                            return retain_machine(book, &trial.program, &machine, owner) can Global{Read,Write}
+            return rejection(book.level, last if last != 0 else NO_ELIGIBLE_RULE)

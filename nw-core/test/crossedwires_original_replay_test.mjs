@@ -30,13 +30,12 @@ function state(handle) {
     Number(exports.nw_api_v1_crossed_wires_info(handle, BigInt(field))));
 }
 
-function texts(handle) {
+function textCommands(handle) {
   const length = Number(exports.nw_api_v1_render(handle, BigInt(framePtr),
     1048576n, 0n, 912n, 684n));
   assert.ok(length > 0, `render failed: ${length}`);
   const view = new Uint8Array(instance.exports.memory.buffer, framePtr, length).slice();
-  return decode(view).filter(({ kind }) => kind === Kind.TEXT)
-    .map(({ text }) => text);
+  return decode(view).filter(({ kind }) => kind === Kind.TEXT);
 }
 
 function runReplay(replay) {
@@ -55,7 +54,18 @@ function runReplay(replay) {
         `source ${record.action}(${record.value}) result at trace ${index}`);
       assert.deepEqual(state(handle), record.state,
         `source UI/Env state mismatch after trace ${index}`);
-      const message = texts(handle);
+      const commands = textCommands(handle);
+      const message = commands.map(({ text }) => text);
+      const verdicts = commands.filter(({ color }) => color === 0x40ff40ff || color === 0xff4040ff);
+      if (record.verdict === null) {
+        assert.equal(verdicts.length, 0, `verdict appears before settlement at trace ${index}`);
+      } else {
+        const [correct, text] = record.verdict;
+        assert.equal(verdicts.length, 1, `expected one verdict at trace ${index}`);
+        assert.equal(verdicts[0].text, text, `verdict text at trace ${index}`);
+        assert.equal(verdicts[0].color, correct ? 0x40ff40ff : 0xff4040ff, `verdict color at trace ${index}`);
+        assert.equal(verdicts[0].b, 60, `verdict position at trace ${index}`);
+      }
       assert.ok(message.some(line => line.includes(record.message)),
         `source message missing at trace ${index}: ${JSON.stringify(record.message)}; got ${JSON.stringify(message)}`);
       assert.ok(!message.some(line => line.toLowerCase().includes("wiring")),
@@ -72,7 +82,7 @@ function runReplay(replay) {
     assert.equal(final[26], replay.score.perfect);
     assert.equal(exports.nw_api_v1_crossed_wires_info(handle, 27n), -1n,
       "no public information field may expose the private wire state");
-    assert.ok(texts(handle).some(line => line.includes(replay.message)),
+    assert.ok(textCommands(handle).some(({ text }) => text.includes(replay.message)),
       "DONE display must use the source rounds/accuracy/highest-rung summary");
   } finally {
     assert.equal(exports.nw_api_v1_destroy(handle), 0n);
@@ -83,4 +93,4 @@ assert.equal(task, 2239133075n, "Crossed Wires keeps its stable task ID");
 assert.equal(Number(exports.nw_api_v1_supports(task)), 1);
 for (const replay of oracle.replays) runReplay(replay);
 console.log(`crossedwires_original_replay_test: PASS (${oracle.replays.map(r =>
-  `${r.trace.length} actions/${r.score.accuracy}%`).join(", ")}; UI keys, Env ports, 800 ms pause, adaptive levels, score and hidden-wiring boundary)`);
+  `${r.trace.length} actions/${r.score.accuracy}%`).join(", ")}; UI keys, Env ports, 800 ms pause, adaptive levels, verdict, score and hidden-wiring boundary)`);

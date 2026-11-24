@@ -1,0 +1,236 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+include "../strings.elisa"
+
+module Catch:
+    const HALF: f64 = 10.0
+    const LONG: f64 = 40.0
+    const FOG: f64 = 21.0
+    const GRAVITY: f64 = 9.8
+    const RIM: f64 = 0.6
+    const SPEED: f64 = 12.0
+    const PENDING: i64 = 0
+    const CAUGHT: i64 = 1
+    const DROPPED: i64 = 2
+    const TAU: f64 = 6.283185307179586
+
+    struct Grade:
+        rung: i64
+        count: i64
+        flight_min: f64
+        flight_max: f64
+        radius: f64
+        shadow: bool
+        spin: f64
+        walls: bool
+        overlap: f64
+        two: bool
+        fog: bool
+        swing: f64
+        wind: f64
+
+    struct Point:
+        x: f64
+        z: f64
+
+    struct Position:
+        x: f64
+        y: f64
+        z: f64
+
+    struct Ball:
+        t0: f64
+        x0: f64
+        vx: f64
+        vy: f64
+        vz: f64
+        ax: f64
+        flight: f64
+        land: Point
+        colour: i64
+
+    struct Court:
+        level: Grade
+        balls: mutable Ball[14]
+
+    struct Run:
+        court: Court
+        time: mutable f64
+        baskets: mutable Point[2]
+        aim: mutable Point[2]
+        aimed: mutable bool[2]
+        fate: mutable i64[14]
+        caught: mutable i64
+        missed: mutable i64
+        result: mutable i64
+
+    def clamp(x: f64, low: f64, high: f64) -> f64:
+        return low if x < low else (high if x > high else x)
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = 1 if rung < 1 else rung
+        top: i64 = 0 if r < 20 else r - 20
+        t: f64 = top.f64()
+        return Grade{rung: r,
+            count: 5 if r < 4 else (6 if r < 13 else (8 if r < 20 else (14 if top >= 12 else 8 + top / 2))),
+            flight_min: 2.0 if r < 4 else (1.5 if r < 20 else clamp(1.4 - 0.03 * t, 1.1, 1.4)),
+            flight_max: 2.5 if r < 4 else (2.0 if r < 20 else clamp(1.9 - 0.03 * t, 1.5, 1.9)),
+            radius: 2.3 if r < 4 else (1.9 if r < 7 else (1.7 if r < 13 else (1.6 if r < 20 else clamp(1.5 - 0.04 * t, 1.1, 1.5)))),
+            shadow: r < 7, spin: 0.0 if r < 7 else 5.0, walls: r >= 10,
+            overlap: 1.3 if r < 10 else (0.6 if r < 20 else clamp(0.55 - 0.02 * t, 0.35, 0.55)),
+            two: r >= 13, fog: r >= 16, swing: 0.0 if r < 20 else clamp(18.0 + 2.0 * t, 18.0, 35.0),
+            wind: 0.0 if r < 20 else clamp(1.5 + 0.25 * t, 1.5, 4.0)}
+
+    def fold(x: f64) -> f64:
+        period: f64 = 4.0 * HALF
+        u: f64 = x + HALF
+        v: f64 = u - floor(u / period) * period
+        return (period - v if v > 2.0 * HALF else v) - HALF
+
+    def where(ball: Ball, time: f64, walls: bool) -> Position:
+        t: f64 = time - ball.t0 if time > ball.t0 else 0.0
+        x: f64 = ball.x0 + ball.vx * t + 0.5 * ball.ax * t * t
+        y: f64 = 2.0 + ball.vy * t - 0.5 * GRAVITY * t * t
+        return Position{x: fold(x) if walls else x, y: y if y > 0.0 else 0.0, z: LONG + ball.vz * t}
+
+    def trial(court: Court) -> Run:
+        red: Point = Point{x: -3.0 if court.level.two else 0.0, z: 6.0}
+        blue: Point = Point{x: 3.0, z: 6.0}
+        return Run{court: court, time: 0.0, baskets: [red, blue],
+            aim: zeroed, aimed: zeroed, fate: zeroed, caught: 0, missed: 0, result: PENDING}
+
+    def aim(run: mutable Run&, x: f64, z: f64):
+        can Abort.Panic:
+            index: usize = 1.usize() if run.court.level.two else 0.usize()
+            run.aim[index] <- Point{x: x, z: z}
+            run.aimed[index] <- true
+
+    def active(mask: i64, port: i64) -> i64:
+        return 1 if (mask & (1 << port.u64())) != 0 else 0
+
+    def move_baskets(run: mutable Run&, dt: f64, mask: i64):
+        can Abort.Panic:
+            baskets: i64 = 2 if run.court.level.two else 1
+            for i in 0..<baskets |run, dt, mask|:
+                slot: usize = i.usize()
+                p: Point = run.baskets[slot]
+                dx: f64 = (active(mask, 4 * i + 1) - active(mask, 4 * i)).f64()
+                dz: f64 = (active(mask, 4 * i + 3) - active(mask, 4 * i + 2)).f64()
+                speed: f64 = SPEED * dt
+                x: mutable f64 = p.x + dx * speed
+                z: mutable f64 = p.z + dz * speed
+                if dx == 0.0 and dz == 0.0 and run.aimed[slot]:
+                    target: Point = run.aim[slot]
+                    ex: f64 = target.x - p.x
+                    ez: f64 = target.z - p.z
+                    distance: f64 = py_hypot(ex, ez)
+                    if distance > 0.000001:
+                        travel: f64 = distance if distance < speed else speed
+                        x <- p.x + ex / distance * travel
+                        z <- p.z + ez / distance * travel
+                run.baskets[slot] <- Point{x: clamp(x, -8.5, 8.5), z: clamp(z, 2.0, 15.0)}
+
+    def step(run: mutable Run&, dt: f64, mask: i64):
+        can Abort.Panic:
+            return if run.result != PENDING
+            run.time <- run.time + dt
+            move_baskets(run, dt, mask)
+            court: Court& = &run.court
+            for k in 0..<court.level.count |run, court|:
+                ball: Ball = court.balls[k.usize()]
+                landing: f64 = ball.t0 + ball.flight
+                continue if run.fate[k.usize()] != PENDING or run.time < landing
+                p: Position = where(ball, landing, court.level.walls)
+                basket: Point = run.baskets[ball.colour.usize()]
+                ok: bool = py_hypot(p.x - basket.x, p.z - basket.z) <= court.level.radius
+                run.fate[k.usize()] <- CAUGHT if ok else DROPPED
+                run.caught <- run.caught + 1 if ok
+                run.missed <- run.missed + 1 if not ok
+            if run.missed > 1:
+                run.result <- DROPPED
+            elif run.caught + run.missed == court.level.count:
+                run.result <- CAUGHT
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            court: Court& = &run.court
+            baskets: i64 = 2 if court.level.two else 1
+            mask: mutable i64 = 0
+            for b in 0..<baskets |mask, court, run|:
+                soon: mutable f64 = 1e12
+                index: mutable i64 = -1
+                for i in 0..<court.level.count |b, court, run, index, soon|:
+                    ball: Ball = court.balls[i.usize()]
+                    time: f64 = ball.t0 + ball.flight
+                    if run.fate[i.usize()] == PENDING and ball.colour == b and time < soon:
+                        soon <- time
+                        index <- i
+                if index >= 0:
+                    p: Position = where(court.balls[index.usize()], soon, court.level.walls)
+                    basket: Point = run.baskets[b.usize()]
+                    dx: f64 = p.x - basket.x
+                    dz: f64 = p.z - basket.z
+                    if dx > 0.12 or dx < -0.12:
+                        mask <- mask | (1 << (4 * b + (1 if dx > 0.0 else 0)).u64())
+                    if dz > 0.12 or dz < -0.12:
+                        mask <- mask | (1 << (4 * b + (3 if dz > 0.0 else 2)).u64())
+            return mask
+
+    def uniform(rng: mutable MT19937&, low: f64, high: f64) -> f64:
+        return low + (high - low) * py_random(rng)
+
+    def build(level: Grade, rng: mutable MT19937&) -> Court:
+        can Abort.Panic:
+            court: mutable Court = Court{level: level, balls: zeroed}
+            time: mutable f64 = 1.2
+            wind: f64 = uniform(rng, -level.wind, level.wind)
+            last: mutable Point = Point{x: 0.0, z: 0.0}
+            for k in 0..<level.count |court, time, wind, last, level, rng|:
+                flight: f64 = uniform(rng, level.flight_min, level.flight_max)
+                lx: mutable f64 = uniform(rng, -8.0, 8.0)
+                lz: mutable f64 = uniform(rng, 2.5, 14.5)
+                if k != 0 and not level.two:
+                    for _attempt in 0..<20 |lx, lz, last, rng|:
+                        break if py_hypot(lx - last.x, lz - last.z) > 5.0
+                        lx <- uniform(rng, -8.0, 8.0)
+                        lz <- uniform(rng, 2.5, 14.5)
+                last <- Point{x: lx, z: lz}
+                x: f64 = uniform(rng, -HALF * 0.6, HALF * 0.6)
+                ax: f64 = uniform(rng, -level.spin, level.spin) + wind
+                target: mutable f64 = lx
+                if level.walls and py_random(rng) < 0.6:
+                    target <- 2.0 * HALF - lx if py_random(rng) < 0.5 else -2.0 * HALF - lx
+                colour: i64 = py_randbelow(rng, 2.u64()).i64() if level.two else 0
+                court.balls[k.usize()] <- Ball{t0: py_round_half_even(time * 1000.0).f64() / 1000.0,
+                    x0: x, vx: (target - x - 0.5 * ax * flight * flight) / flight,
+                    vy: (RIM - 2.0 + 0.5 * GRAVITY * flight * flight) / flight,
+                    vz: (lz - LONG) / flight, ax: ax, flight: flight, land: last, colour: colour}
+                time <- time + (flight * level.overlap + uniform(rng, 0.2, 0.6))
+            return court
+
+    def deal(rung: i64, seed: i64) -> Court:
+        can Abort.Panic:
+            level: Grade = grade(rung)
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            first: mutable Court = zeroed
+            for attempt in 0..<30 |rng, level, first|:
+                court: Court = build(level, &rng)
+                first <- court if attempt == 0
+                run: mutable Run = trial(court)
+                while run.result == PENDING |run|:
+                    mask: i64 = pilot(&run)
+                    step(&run, 1.0 / 60.0, mask)
+                return court if run.result == CAUGHT
+            return first
+
+    def result_text(run: Run&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if run.result == CAUGHT:
+                dstr_append_i64(out, run.caught)
+                dstr_append_cstr(out, " of ")
+                dstr_append_i64(out, run.court.level.count)
+                dstr_append_cstr(out, " caught")
+            elif run.result == DROPPED:
+                dstr_append_i64(out, run.missed)
+                dstr_append_cstr(out, " balls dropped")

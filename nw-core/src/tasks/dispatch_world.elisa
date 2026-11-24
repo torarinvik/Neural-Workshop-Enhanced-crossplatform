@@ -1,0 +1,249 @@
+include "./dispatch.elisa"
+
+module DispatchWorld:
+    const SIM_DT: f64 = 0.05
+    const CREW_SPEED: f64 = 0.12
+    const SCOUT_SPEED: f64 = 0.40
+    const LOSS: f64 = 20.0
+    const HEAVY: f64 = 2.0
+    const UNITS: i64 = 4
+    const IDLE: i64 = 0
+    const INCIDENT: i64 = 1
+    const STATION: i64 = 2
+    const REFIT: i64 = 3
+    const SAVED: i64 = 1
+    const LOST: i64 = 2
+    const FALSE_ALARM: i64 = 3
+    const REPORT: i64 = 4
+    const REFITTED: i64 = 5
+    const EXPIRED: i64 = 6
+
+    struct Incident:
+        id: i64
+        report: Dispatch::Report
+        need: mutable f64
+        confirmed: mutable bool
+
+    struct Unit:
+        scout: bool
+        x: mutable f64
+        y: mutable f64
+        kind: mutable i64
+        target: mutable i64
+        working: mutable bool
+        heavy: mutable bool
+        refit: mutable f64
+
+    struct Event:
+        kind: i64
+        x: f64
+        y: f64
+
+    struct World:
+        dealt: Dispatch::Deal
+        time: mutable f64
+        carry: mutable f64
+        next_report: mutable i64
+        incidents: mutable Incident[Dispatch::SLOTS]
+        order: mutable i64[Dispatch::SLOTS]
+        open_count: mutable i64
+        units: mutable Unit[UNITS]
+        unit_count: i64
+        damage: mutable f64
+        saved: mutable i64
+        lost: mutable i64
+        false_alarms: mutable i64
+        record_events: bool
+        events: mutable darray[Event]
+        over: mutable bool
+
+    def initialize(dealt: Dispatch::Deal, record_events: bool = true) -> World:
+        can Abort.Panic:
+            count: i64 = dealt.level.crews + (1 if dealt.level.scout else 0)
+            depots: Dispatch::Point[3] = Dispatch::stations()
+            units: mutable Unit[UNITS] = zeroed
+            for i in 0..<count |units, depots, dealt|:
+                depot: Dispatch::Point = depots[(i % 3).usize()]
+                units[i.usize()] <- Unit{scout: i >= dealt.level.crews, x: depot.x, y: depot.y,
+                    kind: IDLE, target: 0, working: false, heavy: false, refit: 0.0}
+            incidents: mutable Incident[Dispatch::SLOTS] = zeroed
+            for slot in 0..<Dispatch::SLOTS |incidents|:
+                incidents[slot.usize()] <- Incident{id: -1, report: zeroed, need: 0.0, confirmed: false}
+            return World{dealt: dealt, time: 0.0, carry: 0.0, next_report: 0, incidents: incidents,
+                order: zeroed, open_count: 0, units: units, unit_count: count,
+                damage: 0.0, saved: 0, lost: 0, false_alarms: 0, record_events: record_events, events: [], over: false}
+
+    def speed(unit: Unit) -> f64:
+        return SCOUT_SPEED if unit.scout else CREW_SPEED
+
+    def can_refit(world: World&, unit: Unit) -> bool:
+        return world.dealt.level.refit > 0.0 and not unit.scout and not unit.heavy
+
+    def send(world: mutable World&, unit: i64, kind: i64, index: i64) -> bool:
+        can Abort.Panic:
+            return false if world.over or unit < 0 or unit >= world.unit_count
+            slot: usize = unit.usize()
+            target: mutable i64 = index
+            if kind == INCIDENT:
+                return false if index < 0 or index >= Dispatch::SLOTS
+                target <- world.incidents[index.usize()].id
+                return false if target < 0
+            else:
+                return false if index < 0 or index >= 3
+                return false if kind != STATION and (kind != REFIT or not can_refit(world, world.units[slot]))
+            return true if world.units[slot].kind == kind and world.units[slot].target == target
+            world.units[slot].kind <- kind
+            world.units[slot].target <- target
+            world.units[slot].working <- false
+            world.units[slot].refit <- 0.0
+            return true
+
+    def slot_for(world: World&, id: i64) -> i64:
+        can Abort.Panic:
+            for i in 0..<world.open_count |world, id|:
+                slot: i64 = world.order[i.usize()]
+                return slot if world.incidents[slot.usize()].id == id
+            return -1
+
+    def emit(world: mutable World&, kind: i64, x: f64, y: f64):
+        can Abort.Panic, Memory.Allocate:
+            if world.record_events:
+                world.events.push(Event{kind: kind, x: x, y: y})
+
+    def take_events(world: mutable World&) -> darray[Event]:
+        events: darray[Event] = world.events
+        world.events <- []
+        return events
+
+    def appear(world: mutable World&, id: i64, report: Dispatch::Report):
+        can Abort.Panic, Memory.Allocate:
+            for slot in 0..<Dispatch::SLOTS |world, id, report|:
+                if world.incidents[slot.usize()].id < 0:
+                    world.incidents[slot.usize()] <- Incident{id: id, report: report, need: report.need, confirmed: false}
+                    world.order[world.open_count.usize()] <- slot
+                    world.open_count <- world.open_count + 1
+                    emit(world, REPORT, report.x, report.y)
+                    return
+            if not report.false_alarm:
+                world.lost <- world.lost + 1
+                world.damage <- world.damage + LOSS
+                emit(world, LOST, report.x, report.y)
+
+    def close_incident(world: mutable World&, slot: i64, how: i64):
+        can Abort.Panic, Memory.Allocate:
+            incident: Incident = world.incidents[slot.usize()]
+            if how == SAVED:
+                world.saved <- world.saved + 1
+            elif how == LOST:
+                world.lost <- world.lost + 1
+                world.damage <- world.damage + LOSS
+            elif how == FALSE_ALARM:
+                world.false_alarms <- world.false_alarms + 1
+            if how != EXPIRED:
+                emit(world, how, incident.report.x, incident.report.y)
+            world.incidents[slot.usize()] <- Incident{id: -1, report: zeroed, need: 0.0, confirmed: false}
+            at: mutable i64 = 0
+            while world.order[at.usize()] != slot |world, at, slot|:
+                at <- at + 1
+            world.open_count <- world.open_count - 1
+            for i in at..<world.open_count |world|:
+                world.order[i.usize()] <- world.order[(i + 1).usize()]
+            for i in 0..<world.unit_count |world, incident|:
+                index: usize = i.usize()
+                if world.units[index].kind == INCIDENT and world.units[index].target == incident.id:
+                    world.units[index].kind <- IDLE
+                    world.units[index].working <- false
+
+    def move_unit(world: mutable World&, index: usize, depots: Dispatch::Point[3]):
+        can Abort.Panic, Memory.Allocate:
+            unit: Unit = world.units[index]
+            return if unit.kind == IDLE or unit.working
+            slot: i64 = slot_for(world, unit.target) if unit.kind == INCIDENT else -1
+            if unit.kind == INCIDENT and slot < 0:
+                world.units[index].kind <- IDLE
+                return
+            point: Dispatch::Point = Dispatch::Point{x: world.incidents[slot.usize()].report.x,
+                y: world.incidents[slot.usize()].report.y} if slot >= 0 else depots[unit.target.usize()]
+            dx: f64 = point.x - unit.x
+            dy: f64 = point.y - unit.y
+            gap: f64 = hypot(dx, dy)
+            reach: f64 = speed(unit) * SIM_DT
+            if gap > reach:
+                world.units[index].x <- unit.x + dx / gap * reach
+                world.units[index].y <- unit.y + dy / gap * reach
+                return
+            world.units[index].x <- point.x
+            world.units[index].y <- point.y
+            if unit.kind == STATION:
+                world.units[index].kind <- IDLE
+            elif unit.kind == REFIT:
+                world.units[index].working <- true
+            else:
+                world.incidents[slot.usize()].confirmed <- true
+                if world.incidents[slot.usize()].report.false_alarm:
+                    close_incident(world, slot, FALSE_ALARM)
+                elif unit.scout:
+                    world.units[index].kind <- IDLE
+                else:
+                    world.units[index].working <- true
+
+    def hands_at_incidents(world: mutable World&) -> f64[Dispatch::SLOTS]:
+        can Abort.Panic, Memory.Allocate:
+            hands: mutable f64[Dispatch::SLOTS] = zeroed
+            for i in 0..<world.unit_count |world, hands|:
+                at: usize = i.usize()
+                unit: Unit = world.units[at]
+                continue if not unit.working
+                if unit.kind == REFIT:
+                    progress: f64 = unit.refit + SIM_DT
+                    if progress >= world.dealt.level.refit - 1e-9:
+                        world.units[at].heavy <- true
+                        world.units[at].refit <- 0.0
+                        world.units[at].kind <- IDLE
+                        world.units[at].working <- false
+                        emit(world, REFITTED, unit.x, unit.y)
+                    else:
+                        world.units[at].refit <- progress
+                elif unit.kind == INCIDENT:
+                    slot: i64 = slot_for(world, unit.target)
+                    if slot >= 0:
+                        hands[slot.usize()] <- hands[slot.usize()] + (HEAVY if unit.heavy else 1.0)
+            return hands
+
+    def tick(world: mutable World&):
+        can Abort.Panic, Memory.Allocate:
+            world.time <- world.time + SIM_DT
+            count: i64 = world.dealt.reports.count.i64()
+            while world.next_report < count |world, count|:
+                id: i64 = world.next_report
+                report: Dispatch::Report = world.dealt.reports[id.usize()]
+                break if report.at > world.time
+                appear(world, id, report)
+                world.next_report <- id + 1
+            depots: Dispatch::Point[3] = Dispatch::stations()
+            for i in 0..<world.unit_count |world, depots|:
+                move_unit(world, i.usize(), depots)
+            hands: f64[Dispatch::SLOTS] = hands_at_incidents(world)
+            # Work in report order even when a later report reused an earlier slot.
+            order: i64[Dispatch::SLOTS] = world.order
+            for i in 0..<world.open_count |world, order, hands|:
+                slot: i64 = order[i.usize()]
+                incident: Incident = world.incidents[slot.usize()]
+                crews: f64 = hands[slot.usize()]
+                need: f64 = incident.need - crews * Dispatch::WORK * SIM_DT if crews > 0.0 else incident.need + incident.report.growth * SIM_DT
+                world.incidents[slot.usize()].need <- need
+                if not incident.report.false_alarm:
+                    world.damage <- world.damage + SIM_DT
+                if need <= 0.0:
+                    close_incident(world, slot, SAVED)
+                elif need >= Dispatch::BURN:
+                    close_incident(world, slot, EXPIRED if incident.report.false_alarm else LOST)
+            world.over <- world.next_report >= count and world.open_count == 0
+
+    def step(world: mutable World&, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if world.over
+            world.carry <- world.carry + dt
+            while world.carry >= SIM_DT - 1e-12 and not world.over |world|:
+                world.carry <- world.carry - SIM_DT
+                tick(world)

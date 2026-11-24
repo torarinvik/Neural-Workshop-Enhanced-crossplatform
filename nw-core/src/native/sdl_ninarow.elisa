@@ -1,0 +1,217 @@
+include "../tasks/ninarow.elisa"
+include "../scene_ninarow.elisa"
+include "../tasks/ninarow_game.elisa"
+
+def sdl_ninarow_option_allowed(row: i64, value: i64) -> bool:
+    return value >= 1 and value <= NinaRow::GRADE_COUNT if row == 0
+    return value == 1 or value == 2 or value == 3 or value == 5 or value == 8 or value == 10 or value == 15 if row == 1
+    return NinaRowGame::allowed_grid(value) if row == 2
+    return NinaRowGame::allowed_pellets(value) if row == 3
+    return NinaRowGame::allowed_length(value) if row == 4
+    return value == 0 or value == 1
+
+def sdl_read_ninarow_options(output: mutable i64&):
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        path: mutable u8[4096] = zeroed
+        data: mutable u8[128] = zeroed
+        trusted Unsafe.PointerCast:
+            target: mutable u8& = (&path[0]).uintptr().cast[mutable u8&]
+            return if not sdl_task_profile_sidecar(target, ".ninarow-options")
+            if SDL_IOFromFile(target.cast[cstr], "rb") is stream:
+                raw: heap u8& = (&data[0]).uintptr().cast[heap u8&]
+                length: usize = SDL_ReadIO(stream, (&data[0]).cast[mutable void&], 128.usize())
+                status: i32 = SDL_GetIOStatus(stream)
+                closed: bool = SDL_CloseIO(stream)
+                return if not closed or status != 2.i32() or length == 0.usize() or length >= 128.usize()
+                values: mutable i64[7] = zeroed
+                at: mutable i64 = 0
+                for row in 0..<7 |row, values, at, raw, length|:
+                    value: i64 = SyllogismOptions::saved_integer(raw, length.i64(), &at)
+                    valid: bool = sdl_ninarow_option_allowed(row, value)
+                    return if not valid
+                    values[row.usize()] <- value
+                while at < length.i64() and SyllogismOptions::whitespace(raw[at.usize()].i64()) |at, length, raw|:
+                    at <- at + 1
+                return if at != length.i64()
+                for row in 0..<7 |row, output, values|:
+                    output[row.usize()] <- values[row.usize()]
+
+def sdl_ninarow_option_change(row: i64, current: i64, direction: i64) -> i64:
+    return 1 - current if row >= 5
+    low: i64 = 1 if row < 2 else 0
+    high: mutable i64 = NinaRow::GRADE_COUNT
+    high <- 15 if row == 1
+    high <- 128 if row == 2
+    high <- 6000 if row == 3
+    high <- 100 if row == 4
+    count: i64 = high - low + 1
+    next: mutable i64 = current
+    while true |next, count, low, row, direction|:
+        next <- (next - low + direction + count) % count + low
+        return next if sdl_ninarow_option_allowed(row, next)
+    return current
+
+def sdl_ninarow_options_key(handle: i64, key: i64, from_hub: bool = false) -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return 0 if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: mutable heap NinaRowGame::Run& = handle.uintptr().cast[mutable heap NinaRowGame::Run&]
+            draft: mutable i64& = (&run.options_draft[0]).uintptr().cast[mutable i64&]
+            if run.options_row < 0:
+                return 0 if run.phase == NinaRowGame::PHASE_ASKING or key != (99 if from_hub else 111)
+                draft[0] <- run.start_rung
+                draft[1] <- run.total_trials
+                draft[2] <- run.grid_option
+                draft[3] <- run.pellets_option
+                draft[4] <- run.length_option
+                draft[5] <- 1 if run.show_answer else 0
+                draft[6] <- 1 if run.adaptive else 0
+                run.options_from_hub <- from_hub
+                run.options_row <- 0
+                return 1
+            if SDLTaskKeys::enter(key) or key == 27:
+                close: i64 = 2 if run.options_from_hub else 1
+                if SDLTaskKeys::enter(key):
+                    data: mutable u8[128] = zeroed
+                    length: i32 = SDL_snprintf(&data[0], 128.usize(), "%lld %lld %lld %lld %lld %lld %lld\n",
+                        draft[0], draft[1], draft[2], draft[3], draft[4], draft[5], draft[6])
+                    if length <= 0.i32() or length >= 128.i32() or not sdl_save_profile_sidecar(".ninarow-options", &data[0], length.usize()):
+                        SDL_Log("Could not save N-in-a-row options")
+                        return 1
+                    NinaRowGame::configure(run, draft[0], draft[1], draft[2], draft[3], draft[4], draft[5] + 2 * draft[6])
+                run.options_row <- -1
+                return close
+            run.options_row <- SDLTaskKeys::option_row(key, run.options_row, 7)
+            if key == SDLTaskKeys::LEFT or key == SDLTaskKeys::RIGHT or key == 32:
+                row: i64 = run.options_row
+                draft[row.usize()] <- sdl_ninarow_option_change(row, draft[row.usize()], -1 if key == SDLTaskKeys::LEFT else 1)
+            return 1
+
+def sdl_ninarow_options_click(handle: i64, x: f32, y: f32, width: i32, height: i32) -> bool:
+    can Abort.Panic, Unsafe.PointerCast:
+        return false if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: mutable heap NinaRowGame::Run& = handle.uintptr().cast[mutable heap NinaRowGame::Run&]
+            return false if run.options_row < 0
+            row: i64 = sdl_option_row(x, y, width, height, 7)
+            if row >= 0:
+                if row == run.options_row:
+                    run.options_draft[row.usize()] <- sdl_ninarow_option_change(row, run.options_draft[row.usize()], 1)
+                run.options_row <- row
+            return true
+
+def sdl_ninarow_options_note(list: mutable Display::DisplayList&, ink: u32, draft: i64&):
+    can Memory.Allocate, Abort.Panic:
+        grade: NinaRow::Grade = NinaRow::grade_at(draft[0])
+        size: i64 = grade.size if draft[2] == 0 else draft[2]
+        pellets: i64 = grade.pellets if draft[3] == 0 else draft[3]
+        length: i64 = grade.length if draft[4] == 0 else draft[4]
+        note: mutable dstr = []
+        dstr_append_i64(&note, size)
+        dstr_append_cstr(&note, " × ")
+        dstr_append_i64(&note, size)
+        dstr_append_cstr(&note, " board with about ")
+        dstr_append_i64(&note, pellets)
+        dstr_append_cstr(&note, " pellets. Find ")
+        dstr_append_i64(&note, length)
+        dstr_append_cstr(&note, " in a row.")
+        Display::draw_text(list, bytes_view(note), 456.0, 213.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        Display::draw_text(list, "Find the empty cell that completes the line.",
+            456.0, 184.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        if draft[6] != 0:
+            Display::draw_text(list, "A right answer raises the level. A miss lowers it.",
+                456.0, 155.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+
+def sdl_ninarow_profile_create(seed: i64) -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        selected: mutable i64[7] = [1, 5, 0, 0, 0, 1, 1]
+        size: mutable i64 = 0
+        if sdl_media_config(&size) is raw:
+            trusted Unsafe.PointerCast:
+                data: heap u8& = raw.cast[heap u8&]
+                level: i64 = sdl_config_option(data, size, "NINAROW_LEVEL", 0, 1)
+                trials: i64 = sdl_config_option(data, size, "NINAROW_TRIALS", 0, 5)
+                grid: i64 = sdl_config_option(data, size, "NINAROW_GRID", 0, 0)
+                pellets: i64 = sdl_config_option(data, size, "NINAROW_PELLETS", 0, 0)
+                length: i64 = sdl_config_option(data, size, "NINAROW_LENGTH", 0, 0)
+                selected[0] <- level if sdl_ninarow_option_allowed(0, level)
+                selected[1] <- trials if sdl_ninarow_option_allowed(1, trials)
+                selected[2] <- grid if sdl_ninarow_option_allowed(2, grid)
+                selected[3] <- pellets if sdl_ninarow_option_allowed(3, pellets)
+                selected[4] <- length if sdl_ninarow_option_allowed(4, length)
+                selected[5] <- sdl_config_option(data, size, "NINAROW_SHOW_ANSWER", 1, 1)
+                selected[6] <- sdl_config_option(data, size, "NINAROW_ADAPTIVE", 1, 1)
+            SDL_free(raw)
+        sdl_read_ninarow_options(&selected[0])
+        if malloc(size_of(NinaRowGame::Run).usize()) is memory:
+            trusted Unsafe.PointerCast:
+                run: mutable heap NinaRowGame::Run& = memory.cast[mutable heap NinaRowGame::Run&]
+                NinaRowGame::initialize(run, selected[0], selected[1], selected[2], selected[3], selected[4],
+                    selected[5] + 2 * selected[6], seed)
+                return memory.uintptr().i64()
+        return 0
+
+def sdl_ninarow_key(handle: i64, key: i64, now: i64) -> i64:
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        action: mutable i64 = -1
+        action <- NinaRowGame::ACTION_START if key == 32
+        action <- NinaRowGame::ACTION_SUBMIT if SDLTaskKeys::enter(key)
+        action <- NinaRowGame::ACTION_UP if key == SDLTaskKeys::UP
+        action <- NinaRowGame::ACTION_DOWN if key == SDLTaskKeys::DOWN
+        action <- NinaRowGame::ACTION_LEFT if key == SDLTaskKeys::LEFT
+        action <- NinaRowGame::ACTION_RIGHT if key == SDLTaskKeys::RIGHT
+        return 2 if handle <= 0 or action < 0
+        trusted Unsafe.PointerCast:
+            run: mutable heap NinaRowGame::Run& = handle.uintptr().cast[mutable heap NinaRowGame::Run&]
+            return NinaRowGame::apply(run, action, 0, now)
+
+def sdl_ninarow_pointer(handle: i64, x: f32, y: f32, width: i32, height: i32, now: i64):
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        return if handle <= 0 or width <= 0.i32() or height <= 0.i32()
+        view: mutable f32[4] = zeroed
+        SDLGeometry::setup(&view[0], width, height)
+        px: f64 = ((x - view[1]) / view[0]).f64() * width.f64() / Display::REFERENCE_WIDTH
+        py: f64 = ((view[3] - view[2] - y) / view[0]).f64() * height.f64() / Display::REFERENCE_HEIGHT
+        trusted Unsafe.PointerCast:
+            run: mutable heap NinaRowGame::Run& = handle.uintptr().cast[mutable heap NinaRowGame::Run&]
+            if run.phase != NinaRowGame::PHASE_ASKING:
+                _ = NinaRowGame::apply(run, NinaRowGame::ACTION_START, 0, now)
+                return
+            area: mutable SceneNinaRow::Board = zeroed
+            SceneNinaRow::board_box(&area, width.f64(), height.f64())
+            return if px < area.left or px >= area.left + area.side or py < area.bottom or py >= area.bottom + area.side
+            column: i64 = ((px - area.left) * run.size.f64() / area.side).i64()
+            row: i64 = run.size - 1 - ((py - area.bottom) * run.size.f64() / area.side).i64()
+            _ = NinaRowGame::apply(run, NinaRowGame::ACTION_SELECT, row * run.size + column, now)
+
+def sdl_ninarow_destroy(handle: i64):
+    can Memory.Release, Unsafe.PointerCast:
+        if handle > 0:
+            trusted Unsafe.PointerCast:
+                free(handle.uintptr().cast[heap void&])
+
+def sdl_ninarow_info(handle: i64, field: i64) -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        return -1 if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: heap NinaRowGame::Run& = handle.uintptr().cast[heap NinaRowGame::Run&]
+            return NinaRowGame::info(run, field)
+
+def sdl_ninarow_frame_write(dest: i64, capacity: i64, handle: i64, black: i64, width: i64, height: i64) -> i64:
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        return 0 if dest <= 0 or capacity <= 0 or handle <= 0 or width <= 0 or height <= 0
+        trusted Unsafe.PointerCast:
+            run: heap NinaRowGame::Run& = handle.uintptr().cast[heap NinaRowGame::Run&]
+            list: mutable Display::DisplayList = Display::DisplayList()
+            if run.options_row >= 0:
+                sdl_grid_options_frame(&list, black != 0, 41, run.options_row, &run.options_draft[0])
+            else:
+                NinaRowGame::render(run, black != 0, width.f64(), height.f64(), &list)
+            encoded: darray[u8] = Display::encode_binary(&list)
+            length: i64 = encoded.count.i64()
+            return 0 if length <= 0 or length > capacity
+            memcpy(dest.uintptr().cast[mutable void&], (&encoded[0]).cast[void&], length.usize())
+            return length
+
+export fn nw_ninarow_info(handle: i64, field: i64) -> i64 = sdl_ninarow_info
+

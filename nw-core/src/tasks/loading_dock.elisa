@@ -1,0 +1,618 @@
+include "../hand_view.elisa"
+include "../pymath.elisa"
+include "../strings.elisa"
+
+extern atan2(y: f64, x: f64) -> f64
+
+module LoadingDock:
+    const FWD: i64 = HandView::KEYS
+    const BACK: i64 = FWD + 1
+    const LEFT: i64 = FWD + 2
+    const RIGHT: i64 = FWD + 3
+    const FWD_LEFT: i64 = FWD + 4
+    const FWD_RIGHT: i64 = FWD + 5
+    const PORTS: i64 = FWD + 6
+    const SHELF_Z: f64 = -6.6
+    const TRUCK_Z: f64 = 6.8
+    const GRAB: f64 = 46.0
+    const LAMP: f64 = 24.0
+    const NO_DRAG: i64 = 0
+    const FROM_FORK: i64 = 1
+    const FROM_SHELF: i64 = 2
+    const PENDING: i64 = 0
+    const SUCCESS: i64 = 1
+    const WRONG_CRATE: i64 = 2
+    const SHORT_SEND: i64 = 3
+    const SHORT_AUTO: i64 = 4
+    const HORN: i64 = 0
+    const THUD: i64 = 1
+    const DING: i64 = 2
+    const BUZZ: i64 = 3
+    const ENGINE: i64 = 4
+    const BEEP: i64 = 5
+    const RADIO: i64 = 6
+
+    struct Grade:
+        rung: i64
+        trucks: i64
+        wave: i64
+        most: i64
+        kinds: i64
+        tags: bool
+        nots: bool
+        cameras: i64
+        cut: f64
+        busy: bool
+        each: f64
+
+    struct Need:
+        colour: i64
+        tag: i64
+        excluded: i64
+
+    struct Truck:
+        city: i64
+        bay: i64
+        arrive: f64
+        leave: mutable f64
+        count: i64
+        needs: mutable Need[3]
+        text: mutable dstr
+
+    struct Cut:
+        time: f64
+        camera: i64
+
+    struct Dock:
+        level: Grade
+        valid: mutable bool
+        shelf: mutable i64[8]
+        trucks: mutable darray[Truck]
+        cuts: mutable darray[Cut]
+        seconds: mutable f64
+        seed: mutable i64
+
+    struct Cargo:
+        met: mutable i64
+        count: mutable i64
+        loads: mutable i64[3]
+        sent: mutable bool
+        horned: mutable bool
+
+    struct Cue:
+        time: f64
+        duration: f64
+        pitch: f64
+        voice: i64
+        gain: f64
+        pan: f64
+        seed: i64
+
+    struct ForkPose:
+        x: f64
+        z: f64
+        heading: f64
+
+    struct Run:
+        dock: Dock
+        hand: mutable HandView::Pointer
+        time: mutable f64
+        x: mutable f64
+        z: mutable f64
+        heading: mutable f64
+        speed: mutable f64
+        carried: mutable i64[2]
+        carried_count: mutable i64
+        cargo: mutable Cargo[30]
+        empty_until: mutable f64[8]
+        drag: mutable i64
+        drag_kind: mutable i64
+        drag_slot: mutable i64
+        pressed: mutable i64
+        cut_no: mutable i64
+        camera: mutable i64
+        hum_at: mutable f64
+        beep_at: mutable f64
+        radio_rng: mutable MT19937
+        radio_at: mutable f64
+        notes: mutable darray[Cue]
+        record_audio: bool
+        result: mutable i64
+        failed_truck: mutable i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: i64 = r - 20 if r >= 20 else 0
+        return Grade{rung: r, trucks: 1 if r < 4 else (2 if r < 7 else (3 if r < 16 else (4 if r < 20 else 5 + top / 3))),
+            wave: 1 if r < 4 else (2 if r < 7 else (3 if r < 16 else (2 if r < 20 else 3))),
+            most: 1 if r < 4 else (2 if r < 10 else 3), kinds: 3 if r < 4 else (4 if r < 10 else (6 if r < 13 else 8)),
+            tags: r >= 10, nots: r >= 13, cameras: 1 if r < 7 else (3 if r < 13 else 5),
+            cut: 0.0 if r < 7 else (7.0 if r < 13 else (5.5 if r < 20 else HandView::clamp(5.0 - 0.1 * top.f64(), 2.5, 5.0))),
+            busy: r >= 16, each: 22.0 if r < 4 else (18.0 if r < 10 else (15.0 if r < 20 else HandView::clamp(14.5 - 0.1 * top.f64(), 10.0, 14.5)))}
+
+    def city_name(city: i64) -> cstr:
+        return "OSLO" if city == 0
+        return "BERGEN" if city == 1
+        return "ROME" if city == 2
+        return "LIMA" if city == 3
+        return "CAIRO" if city == 4
+        return "KYOTO" if city == 5
+        return "QUITO" if city == 6
+        return "TURIN" if city == 7
+        return "DELHI" if city == 8
+        return "MALMO"
+
+    def colour_name(colour: i64) -> cstr:
+        return "red" if colour == 0
+        return "blue" if colour == 1
+        return "green" if colour == 2
+        return "yellow"
+
+    def fits(need: Need, kind: i64) -> bool:
+        colour: i64 = kind / 3
+        return (need.colour < 0 or need.colour == colour) and (need.tag < 0 or need.tag == kind % 3) and need.excluded != colour
+
+    def same_need(a: Need, b: Need) -> bool:
+        return a.colour == b.colour and a.tag == b.tag and a.excluded == b.excluded
+
+    def rank(need: Need) -> i64:
+        return 1 if need.excluded >= 0 else (-(1 if need.colour >= 0 else 0) - (1 if need.tag >= 0 else 0))
+
+    def append_need(text: mutable dstr&, need: Need, count: i64):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_cstr(text, "a " if count == 1 else ("two " if count == 2 else "three "))
+            if need.excluded >= 0:
+                dstr_append_cstr(text, "crate that is not " if count == 1 else "crates that are not ")
+                dstr_append_cstr(text, colour_name(need.excluded))
+            else:
+                if need.tag > 0:
+                    dstr_append_cstr(text, "fragile " if need.tag == 1 else "heavy ")
+                if need.colour >= 0:
+                    dstr_append_cstr(text, colour_name(need.colour))
+                    dstr_append_cstr(text, " ")
+                dstr_append_cstr(text, "crate" if count == 1 else "crates")
+
+    def describe(truck: mutable Truck&):
+        can Memory.Allocate, Abort.Panic:
+            distinct: mutable Need[3] = zeroed
+            counts: mutable i64[3] = zeroed
+            groups: mutable i64 = 0
+            for index in 0..<truck.count |truck, distinct, counts, groups|:
+                need: Need = truck.needs[index.usize()]
+                group: mutable i64 = 0
+                while group < groups and not same_need(distinct[group.usize()], need) |group, groups, distinct, need|:
+                    group <- group + 1
+                if group == groups:
+                    distinct[group.usize()] <- need
+                    groups <- groups + 1
+                counts[group.usize()] <- counts[group.usize()] + 1
+            dstr_append_cstr(&truck.text, city_name(truck.city))
+            dstr_append_cstr(&truck.text, ": ")
+            for group in 0..<groups |truck, distinct, counts, groups|:
+                if group > 0:
+                    dstr_append_cstr(&truck.text, " and " if group == groups - 1 else ", ")
+                append_need(&truck.text, distinct[group.usize()], counts[group.usize()])
+            dstr_append_cstr(&truck.text, ".")
+
+    def uniform(rng: mutable MT19937&, low: f64, high: f64) -> f64:
+        can Abort.Panic:
+            return low + (high - low) * py_random(rng)
+
+    def empty(level: Grade) -> Dock:
+        can Memory.Allocate:
+            return Dock{level: level, valid: false, shelf: zeroed, trucks: [], cuts: [], seconds: 0.0, seed: 0}
+
+    def build(level: Grade, seed: i64) -> Dock:
+        can Memory.Allocate, Abort.Panic:
+            dock: mutable Dock = empty(level)
+            # The Python builder supplies at most three copies of its ten-city sample.
+            return dock if level.trucks > 30
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            shelf: darray[i64] = py_sample_range(&rng, 0, 11 if level.tags else 3, level.kinds)
+            for i in 0..<level.kinds |dock, shelf, level|:
+                pick: i64 = get shelf[i.usize()] else 0
+                dock.shelf[i.usize()] <- pick if level.tags else 3 * pick
+            city_count: i64 = 10 if level.trucks > 10 else level.trucks
+            cities: darray[i64] = py_sample_range(&rng, 0, 9, city_count)
+            t: mutable f64 = 0.0
+            first: mutable i64 = 0
+            while first < level.trucks |first, level, t, dock, rng, cities, city_count|:
+                leave: mutable f64 = t + 5.0
+                bays: darray[i64] = py_sample_range(&rng, 0, 2, level.wave)
+                for bay_index in 0..<level.wave |first, level, t, dock, rng, cities, city_count, leave, bays|:
+                    index: i64 = first + bay_index
+                    break if index >= level.trucks
+                    count: i64 = py_randint(&rng, 1, level.most)
+                    truck: mutable Truck = Truck{city: get cities[(index % city_count).usize()] else 0,
+                        bay: get bays[bay_index.usize()] else 0, arrive: t, leave: 0.0,
+                        count: count, needs: zeroed, text: []}
+                    for n in 0..<count |truck, level, dock, rng|:
+                        kind: i64 = dock.shelf[py_choice_index(&rng, level.kinds).usize()]
+                        roll: f64 = py_random(&rng)
+                        tag: i64 = kind % 3
+                        need: mutable Need = Need{colour: kind / 3, tag: tag if level.tags else -1, excluded: -1}
+                        if level.nots and roll < 0.25:
+                            # Eight distinct kinds cannot all have the same colour.
+                            need <- Need{colour: -1, tag: -1, excluded: py_choice_index(&rng, 4)}
+                        elif level.tags and tag > 0 and roll < 0.55:
+                            need <- Need{colour: -1, tag: tag, excluded: -1}
+                        truck.needs[n.usize()] <- need
+                    leave <- leave + level.each * count.f64()
+                    truck.leave <- leave
+                    describe(&truck)
+                    for n in 1..<count |truck|:
+                        part: Need = truck.needs[n.usize()]
+                        slot: mutable i64 = n
+                        while slot > 0 and rank(truck.needs[(slot - 1).usize()]) > rank(part) |slot, truck, part|:
+                            truck.needs[slot.usize()] <- truck.needs[(slot - 1).usize()]
+                            slot <- slot - 1
+                        truck.needs[slot.usize()] <- part
+                    dock.trucks.push(truck)
+                t <- leave + 3.0
+                first <- first + level.wave
+            at: mutable f64 = 0.0
+            camera: mutable i64 = 0
+            while level.cut > 0.0 and at < t |dock, rng, level, t, at, camera|:
+                at <- at + level.cut * uniform(&rng, 0.8, 1.25)
+                pick: i64 = py_choice_index(&rng, level.cameras - 1)
+                camera <- pick + (1 if pick >= camera else 0)
+                dock.cuts.push(Cut{time: at, camera: camera})
+            dock.seconds <- t
+            dock.seed <- py_randbelow(&rng, (1 << 30).u64()).i64()
+            dock.valid <- true
+            return dock
+
+    def initialize(dock: Dock, record_audio: bool) -> Run:
+        can Memory.Allocate, Abort.Panic:
+            radio_rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&radio_rng, dock.seed.u64())
+            return Run{dock: dock, hand: HandView::initialize(), time: 0.0, x: 0.0, z: 0.0,
+                heading: 3.141592653589793, speed: 0.0, carried: zeroed, carried_count: 0,
+                cargo: zeroed, empty_until: zeroed, drag: NO_DRAG, drag_kind: 0, drag_slot: -1, pressed: -1,
+                cut_no: 0, camera: 0, hum_at: 0.0, beep_at: 0.0, radio_rng: radio_rng, radio_at: 2.0,
+                notes: [], record_audio: record_audio, result: PENDING, failed_truck: -1}
+
+    def view(run: Run&) -> HandView::Lens:
+        can Abort.Panic:
+            eyes: RoomsView::Vec[5] = [RoomsView::vec(0.0, 15.0, 17.0), RoomsView::vec(-15.0, 12.0, 13.0),
+                RoomsView::vec(15.0, 12.0, 13.0), RoomsView::vec(0.0, 26.0, 2.5), RoomsView::vec(0.0, 14.0, -17.0)]
+            focals: f64[5] = [640.0, 600.0, 600.0, 640.0, 620.0]
+            return HandView::lens(eyes[run.camera.usize()], RoomsView::vec(0.0, 0.0, 0.5), focals[run.camera.usize()], 500.0, 320.0)
+
+    def slot(run: Run&, index: i64) -> RoomsView::Vec:
+        count: f64 = (run.dock.level.kinds - 1).f64()
+        gap: f64 = HandView::clamp(18.0 / count, 0.0, 2.4)
+        return RoomsView::vec((index.f64() - count / 2.0) * gap, 1.0, SHELF_Z)
+
+    def bed(truck: Truck&) -> RoomsView::Vec:
+        return RoomsView::vec((truck.bay - 1).f64() * 6.0, 1.3, TRUCK_Z)
+
+    def lamp(truck: Truck&) -> RoomsView::Vec:
+        return RoomsView::vec((truck.bay - 1).f64() * 6.0 + 2.3, 3.3, TRUCK_Z + 0.6)
+
+    def fork(run: Run&) -> RoomsView::Vec:
+        return RoomsView::vec(run.x, 0.9, run.z)
+
+    def other_fork(run: Run&) -> ForkPose:
+        cycle: f64 = run.time * 0.09
+        u: f64 = cycle - 2.0 * (cycle / 2.0).i64().f64()
+        x: f64 = -10.0 + 20.0 * (u if u < 1.0 else 2.0 - u)
+        return ForkPose{x: x, z: 1.2 * sin(run.time * 0.7),
+            heading: 1.5707963267948966 if u < 1.0 else -1.5707963267948966}
+
+    def near_slot(run: Run&, index: i64) -> bool:
+        can Abort.Panic:
+            return py_hypot(run.x - slot(run, index).x, run.z - (SHELF_Z + 1.6)) <= 3.0
+
+    def near_truck(run: Run&, truck: Truck&) -> bool:
+        can Abort.Panic:
+            return py_hypot(run.x - bed(truck).x, run.z - (TRUCK_Z - 1.8)) <= 3.6
+
+    def off(run: Run&, camera: HandView::Lens&, point: RoomsView::Vec) -> f64:
+        can Abort.Panic:
+            q: RoomsView::Vec = HandView::see(camera, point)
+            return 1e9 if q.z < 0.05 else py_hypot(run.hand.x - q.x, run.hand.y - q.y)
+
+    def here(run: Run&, truck: Truck&, index: i64) -> bool:
+        return truck.arrive <= run.time and not run.cargo[index.usize()].sent
+
+    def complete(run: Run&, truck: Truck&, index: i64) -> bool:
+        return run.cargo[index.usize()].met == (1 << truck.count) - 1
+
+    def note(run: mutable Run&, time: f64, duration: f64, pitch: f64, voice: i64, gain: f64, pan: f64 = 0.0):
+        can Memory.Allocate, Abort.Panic:
+            return if not run.record_audio
+            index: mutable i64 = run.notes.count.i64()
+            cue: Cue = Cue{time: time, duration: duration, pitch: pitch, voice: voice, gain: gain,
+                pan: HandView::clamp(pan, -1.0, 1.0), seed: index + 1}
+            run.notes.push(cue)
+            while index > 0 |index, run, time|:
+                previous: Cue = get run.notes[(index - 1).usize()] else zeroed
+                break if previous.time <= time
+                run.notes[index.usize()] <- previous
+                index <- index - 1
+            run.notes[index.usize()] <- cue
+
+    def fail(run: mutable Run&, reason: i64, index: i64):
+        can Memory.Allocate, Abort.Panic:
+            note(run, run.time, 0.4, 100.0, BUZZ, 0.6)
+            run.result <- reason
+            run.failed_truck <- index
+
+    def send_truck(run: mutable Run&, truck: Truck&, index: i64):
+        can Memory.Allocate, Abort.Panic:
+            if not complete(run, truck, index):
+                fail(run, SHORT_SEND, index)
+                return
+            run.cargo[index.usize()].sent <- true
+            note(run, run.time, 0.25, 587.0, DING, 0.5)
+            note(run, run.time + 0.1, 0.25, 587.0 * 1.4983070768766815, DING, 0.5)
+            for k in 0..<run.dock.level.trucks |run|:
+                return if not run.cargo[k.usize()].sent
+            run.result <- SUCCESS
+
+    def load_crate(run: mutable Run&, truck: Truck&, index: i64, kind: i64):
+        can Memory.Allocate, Abort.Panic:
+            for n in 0..<truck.count |run, truck, index, kind|:
+                mask: i64 = 1 << n
+                if (run.cargo[index.usize()].met & mask) == 0 and fits(truck.needs[n.usize()], kind):
+                    run.cargo[index.usize()].met <- run.cargo[index.usize()].met | mask
+                    position: i64 = run.cargo[index.usize()].count
+                    run.cargo[index.usize()].loads[position.usize()] <- kind
+                    run.cargo[index.usize()].count <- position + 1
+                    note(run, run.time, 0.12, 130.0, THUD, 0.6)
+                    return
+            fail(run, WRONG_CRATE, index)
+
+    def press(run: mutable Run&):
+        can Abort.Panic:
+            return if run.result != PENDING or run.hand.down
+            run.hand.down <- true
+            camera: HandView::Lens = view(run)
+            # Resolve equal distances in Python's tuple order: fork, lamp, shelf.
+            best: mutable f64 = 2.0
+            selected: mutable i64 = -1
+            target: mutable i64 = NO_DRAG
+            if run.carried_count > 0:
+                best <- off(run, &camera, fork(run)) / GRAB
+                target <- FROM_FORK
+            index: mutable i64 = 0
+            for truck in run.dock.trucks |run, camera, best, selected, target, index|:
+                if here(run, &truck, index):
+                    distance: f64 = off(run, &camera, lamp(&truck)) / LAMP
+                    if distance < best:
+                        best <- distance
+                        selected <- index
+                        target <- NO_DRAG
+                index <- index + 1
+            for k in 0..<run.dock.level.kinds |run, camera, best, selected, target|:
+                if run.time >= run.empty_until[k.usize()] and near_slot(run, k):
+                    distance: f64 = off(run, &camera, slot(run, k)) / GRAB
+                    if distance < best:
+                        best <- distance
+                        selected <- k
+                        target <- FROM_SHELF
+            return if best > 1.0
+            if target == FROM_FORK:
+                run.carried_count <- run.carried_count - 1
+                run.drag_kind <- run.carried[run.carried_count.usize()]
+            elif target == FROM_SHELF:
+                run.drag_kind <- run.dock.shelf[selected.usize()]
+                run.drag_slot <- selected
+                run.empty_until[selected.usize()] <- 1e9
+            else:
+                run.pressed <- selected
+            run.drag <- target
+
+    def release(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            return if not run.hand.down
+            run.hand.down <- false
+            pressed: i64 = run.pressed
+            drag: i64 = run.drag
+            run.pressed <- -1
+            run.drag <- NO_DRAG
+            return if run.result != PENDING
+            camera: HandView::Lens = view(run)
+            if pressed >= 0:
+                truck: Truck = get run.dock.trucks[pressed.usize()] else zeroed
+                if here(run, &truck, pressed) and off(run, &camera, lamp(&truck)) <= LAMP:
+                    send_truck(run, &truck, pressed)
+                return
+            return if drag == NO_DRAG
+            if drag == FROM_SHELF:
+                if run.carried_count < 2 and off(run, &camera, fork(run)) <= GRAB:
+                    run.carried[run.carried_count.usize()] <- run.drag_kind
+                    run.carried_count <- run.carried_count + 1
+                    run.empty_until[run.drag_slot.usize()] <- run.time + 1.5
+                    note(run, run.time, 0.1, 170.0, THUD, 0.5)
+                else:
+                    run.empty_until[run.drag_slot.usize()] <- 0.0
+                return
+            best: mutable f64 = 61.0
+            selected: mutable i64 = -1
+            index: mutable i64 = 0
+            for truck in run.dock.trucks |run, camera, best, selected, index|:
+                if here(run, &truck, index) and near_truck(run, &truck):
+                    distance: f64 = off(run, &camera, bed(&truck))
+                    if distance < best:
+                        best <- distance
+                        selected <- index
+                index <- index + 1
+            if best <= 60.0:
+                truck: Truck = get run.dock.trucks[selected.usize()] else zeroed
+                load_crate(run, &truck, selected, run.drag_kind)
+                return
+            for k in 0..<run.dock.level.kinds |run, camera|:
+                if near_slot(run, k) and off(run, &camera, slot(run, k)) <= GRAB:
+                    note(run, run.time, 0.1, 150.0, THUD, 0.4)
+                    return
+            run.carried[run.carried_count.usize()] <- run.drag_kind
+            run.carried_count <- run.carried_count + 1
+
+    def act(run: mutable Run&, port: i64):
+        can Memory.Allocate, Abort.Panic:
+            if port >= 0 and port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                press(run)
+            elif port == HandView::RELEASE:
+                release(run)
+
+    def sound(run: mutable Run&, go: f64):
+        can Memory.Allocate, Abort.Panic:
+            if go != 0.0 and run.time >= run.hum_at:
+                run.hum_at <- run.time + 0.25
+                note(run, run.time, 0.27, 70.0 if go > 0.0 else 60.0, ENGINE, 0.18)
+            if go < 0.0 and run.time >= run.beep_at:
+                run.beep_at <- run.time + 0.5
+                note(run, run.time, 0.2, 1000.0, BEEP, 0.2)
+            if run.dock.level.busy and run.time >= run.radio_at:
+                run.radio_at <- run.time + uniform(&run.radio_rng, 0.8, 2.5)
+                if py_random(&run.radio_rng) < 0.5:
+                    pan: f64 = uniform(&run.radio_rng, -1.0, 1.0)
+                    note(run, run.time, 0.2, 1000.0, BEEP, 0.12, pan)
+                else:
+                    count: i64 = py_randint(&run.radio_rng, 2, 4)
+                    pitches: f64[3] = [330.0, 392.0, 494.0]
+                    for j in 0..<count |j, run, pitches|:
+                        pitch: f64 = pitches[py_choice_index(&run.radio_rng, 3).usize()]
+                        note(run, run.time + 0.09 * j.f64(), 0.07, pitch, RADIO, 0.2)
+
+    def tick(run: mutable Run&, dt: f64, controls: i64):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != PENDING
+            run.time <- run.time + dt
+            while run.cut_no < run.dock.cuts.count.i64() |run|:
+                cut: Cut = get run.dock.cuts[run.cut_no.usize()] else zeroed
+                break if cut.time > run.time
+                run.camera <- cut.camera
+                run.cut_no <- run.cut_no + 1
+            go: mutable f64 = 0.0
+            turn: mutable f64 = 0.0
+            if run.drag == NO_DRAG:
+                for key in 0..<6 |key, go, turn, controls|:
+                    if (controls & (1 << key)) != 0:
+                        go <- go + (1.0 if key == 0 or key >= 4 else (-1.0 if key == 1 else 0.0))
+                        turn <- turn + (1.0 if key == 2 or key == 4 else (-1.0 if key == 3 or key == 5 else 0.0))
+            go <- HandView::clamp(go, -1.0, 1.0)
+            turn <- HandView::clamp(turn, -1.0, 1.0)
+            run.heading <- run.heading + (170.0 * 0.017453292519943295) * turn * dt
+            run.speed <- 6.5 * go * (1.0 if go > 0.0 else 0.6)
+            run.x <- HandView::clamp(run.x + sin(run.heading) * run.speed * dt, -10.0, 10.0)
+            run.z <- HandView::clamp(run.z + cos(run.heading) * run.speed * dt, -5.0, 5.0)
+            sound(run, go)
+            for index in 0..<run.dock.level.trucks |run|:
+                truck: Truck = get run.dock.trucks[index.usize()] else zeroed
+                if here(run, &truck, index):
+                    if not run.cargo[index.usize()].horned and run.time >= truck.leave - 3.0:
+                        run.cargo[index.usize()].horned <- true
+                        camera: HandView::Lens = view(run)
+                        q: RoomsView::Vec = HandView::see(&camera, bed(&truck))
+                        pan: f64 = (q.x - 500.0) / 500.0 if q.z >= 0.05 else 0.0
+                        intervals: f64[3] = [1.0, 1.2599210498948732, 1.5874010519681994]
+                        pitch: f64 = 146.8 * intervals[truck.bay.usize()]
+                        note(run, run.time, 0.35, pitch, HORN, 0.6, pan)
+                        note(run, run.time + 0.5, 0.35, pitch, HORN, 0.6, pan)
+                    if run.time >= truck.leave:
+                        if complete(run, &truck, index):
+                            send_truck(run, &truck, index)
+                        else:
+                            fail(run, SHORT_AUTO, index)
+                        return if run.result != PENDING
+
+    def drive(run: Run&, x: f64, z: f64, close: f64) -> i64:
+        can Abort.Panic:
+            dx: f64 = x - run.x
+            dz: f64 = z - run.z
+            distance: f64 = py_hypot(dx, dz)
+            return -1 if distance <= close
+            fx: f64 = sin(run.heading)
+            fz: f64 = cos(run.heading)
+            ahead: f64 = (dx * fx + dz * fz) / distance
+            side: f64 = (dx * -fz + dz * fx) / distance
+            angle: f64 = atan2(side, ahead) * 57.29577951308232
+            absolute: f64 = HandView::absolute(angle)
+            return (RIGHT if angle > 0.0 else LEFT) if absolute > 35.0
+            return (FWD_RIGHT if angle > 0.0 else FWD_LEFT) if absolute > 7.0
+            return FWD
+
+    def point(run: Run&, camera: HandView::Lens&, at: RoomsView::Vec, tolerance: f64, fallback: i64) -> i64:
+        q: RoomsView::Vec = HandView::see(camera, at)
+        return fallback if q.z < 0.05
+        port: i64 = HandView::toward(&run.hand, q.x, q.y, tolerance)
+        return port if port >= 0 else fallback
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != PENDING
+            index: mutable i64 = 0
+            # Generation gives trucks increasing deadlines in array order.
+            for truck in run.dock.trucks |run, index|:
+                break if here(run, &truck, index)
+                index <- index + 1
+            return (HandView::RELEASE if run.hand.down else -1) if index >= run.dock.level.trucks
+            truck: Truck = get run.dock.trucks[index.usize()] else zeroed
+            camera: HandView::Lens = view(run)
+            if complete(run, &truck, index):
+                return HandView::RELEASE if run.drag != NO_DRAG or run.hand.down
+                return point(run, &camera, lamp(&truck), 5.0, HandView::PRESS)
+            if run.drag == FROM_SHELF:
+                return point(run, &camera, fork(run), 5.0, HandView::RELEASE)
+            if run.drag == FROM_FORK:
+                return point(run, &camera, bed(&truck), 8.0, HandView::RELEASE)
+            return HandView::RELEASE if run.hand.down
+            met: mutable i64 = run.cargo[index.usize()].met
+            for c in 0..<run.carried_count |run, truck, met|:
+                for n in 0..<truck.count |run, truck, met, c|:
+                    mask: i64 = 1 << n
+                    if (met & mask) == 0 and fits(truck.needs[n.usize()], run.carried[c.usize()]):
+                        met <- met | mask
+                        break
+            if run.carried_count < 2:
+                for n in 0..<truck.count |run, truck, met, camera|:
+                    continue if (met & (1 << n)) != 0
+                    for k in 0..<run.dock.level.kinds |run, truck, n, camera|:
+                        if fits(truck.needs[n.usize()], run.dock.shelf[k.usize()]):
+                            target: RoomsView::Vec = slot(run, k)
+                            port: i64 = drive(run, target.x, SHELF_Z + 2.4, 1.0)
+                            return port if port >= 0
+                            return -1 if run.time < run.empty_until[k.usize()]
+                            return point(run, &camera, target, 5.0, HandView::PRESS)
+            target: RoomsView::Vec = bed(&truck)
+            port: i64 = drive(run, target.x, TRUCK_Z - 2.6, 1.2)
+            return port if port >= 0
+            return point(run, &camera, fork(run), 5.0, HandView::PRESS)
+
+    def play(dock: Dock) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return SHORT_AUTO if not dock.valid
+            run: mutable Run = initialize(dock, false)
+            while run.result == PENDING |run|:
+                port: i64 = pilot(&run)
+                act(&run, port)
+                tick(&run, 1.0 / 60.0, (1 << (port - FWD)) if port >= FWD else 0)
+            return run.result
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Dock:
+        can Memory.Allocate, Abort.Panic:
+            level: Grade = grade(rung)
+            return empty(level) if level.trucks > 30
+            for attempt in 0..<60 |level, draw|:
+                dock: Dock = build(level, py_getrandbits(draw, 32).i64())
+                return dock if play(dock) == SUCCESS
+            return empty(level)
+
+    def result_text(run: Run&) -> dstr:
+        can Memory.Allocate, Abort.Panic:
+            text: mutable dstr = []
+            return text if run.result == PENDING
+            if run.result == SUCCESS:
+                dstr_append_cstr(&text, "Every truck left with its order")
+            else:
+                truck: Truck = get run.dock.trucks[run.failed_truck.usize()] else zeroed
+                dstr_append_cstr(&text, city_name(truck.city))
+                dstr_append_cstr(&text, " did not order that crate" if run.result == WRONG_CRATE else
+                    (" was sent without its order" if run.result == SHORT_SEND else " left without its order"))
+            return text

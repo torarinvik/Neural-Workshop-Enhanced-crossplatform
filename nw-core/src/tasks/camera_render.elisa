@@ -1,0 +1,137 @@
+include "./camera_game.elisa"
+include "./camera_view.elisa"
+include "../strings.elisa"
+include "../display.elisa"
+
+module CameraRender:
+    const FRAME_MAGIC: u32 = 1178818382 # NWCF
+    const MESH_MAGIC: u32 = 1296258894 # NWCM
+    const VERSION: u32 = 1
+    const FRAME_HEADER: i64 = 216
+    const PASS_BYTES: i64 = 92
+    const DRAW_BYTES: i64 = 96
+    const MESH_HEADER: i64 = 20
+    const VERTEX_BYTES: i64 = 24
+
+    struct Pass:
+        x: i64
+        y: i64
+        width: i64
+        height: i64
+        eye: RoomsView::Vec
+        projection: CameraView::Matrix
+
+    struct Frame:
+        width: i64
+        height: i64
+        field: f64
+        light: CameraView::Lighting
+        live: Pass
+        photo: Pass
+        passes: i64
+        draws: mutable darray[CameraView::Draw]
+
+    def raster_pass(rect: CameraView::Rect&, pose: Camera::Pose&, field: f64) -> Pass:
+        can Abort.Panic:
+            w: i64 = rect.width.i64()
+            h: i64 = rect.height.i64()
+            aspect: f64 = w.f64() / (h.f64() if h > 0 else 1.0)
+            return Pass{x: rect.left.i64(), y: rect.bottom.i64(), width: w, height: h,
+                eye: RoomsView::vec(pose.x, pose.y, pose.z), projection: CameraView::perspective(pose, aspect, field)}
+
+    def visible(item: Pass&, width: i64, height: i64) -> bool:
+        return item.x >= 0 and item.y >= 0 and item.width >= 8 and item.height >= 8 and item.x + item.width <= width and item.y + item.height <= height
+
+    def frame(session: CameraGame::Session&, width: i64, height: i64) -> Frame:
+        can Memory.Allocate, Abort.Panic:
+            if not session.scene.valid or width < 8 or height < 8 or width > 32768 or height > 32768:
+                return zeroed
+            field: f64 = session.scene.level.field
+            rect: CameraView::Rect = CameraView::live_rect(width.f64(), height.f64())
+            photo_box: CameraView::Rect = CameraView::photo_rect(&rect)
+            pose: Camera::Pose = session.scene.target if session.peek else session.pose
+            live: Pass = raster_pass(&rect, &pose, field)
+            photo: Pass = raster_pass(&photo_box, &session.scene.target, field)
+            return zeroed if not visible(&live, width, height)
+            draws: mutable darray[CameraView::Draw] = []
+            _ = draws.reserve((session.scene.things.count.i64() + 2).usize())
+            draws.push(CameraView::ground(CameraMesh::OUTSIDE))
+            draws.push(CameraView::ground(CameraMesh::FIELD))
+            for item in session.scene.things |draws|:
+                draws.push(CameraView::draw(&item))
+            return Frame{width: width, height: height, field: field, light: CameraView::lighting(field),
+                live: live, photo: photo, passes: 1 if session.peek or not visible(&photo, width, height) else 2, draws: draws}
+
+    def vector(out: mutable darray[u8]&, value: RoomsView::Vec):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            Display::put_f32(out, value.x.f32())
+            Display::put_f32(out, value.y.f32())
+            Display::put_f32(out, value.z.f32())
+
+    def matrix(out: mutable darray[u8]&, value: CameraView::Matrix&):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            for entry in value.column |out|:
+                Display::put_f32(out, entry.f32())
+
+    def encode_pass(out: mutable darray[u8]&, item: Pass&):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            Display::put_u32(out, item.x.u32())
+            Display::put_u32(out, item.y.u32())
+            Display::put_u32(out, item.width.u32())
+            Display::put_u32(out, item.height.u32())
+            vector(out, item.eye)
+            matrix(out, &item.projection)
+
+    # Header (magic, version, canvas width/height, pass/draw counts, field,
+    # light vectors, clip-space and texture-space shadow matrices), then
+    # live/photo passes and a shared array of draw instances.
+    def encode_frame(scene: Frame&) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            out: mutable darray[u8] = []
+            return out if scene.passes == 0
+            total: i64 = FRAME_HEADER + PASS_BYTES * scene.passes + DRAW_BYTES * scene.draws.count.i64()
+            _ = out.reserve(total.usize())
+            Display::put_u32(&out, FRAME_MAGIC)
+            Display::put_u32(&out, VERSION)
+            Display::put_u32(&out, scene.width.u32())
+            Display::put_u32(&out, scene.height.u32())
+            Display::put_u32(&out, scene.passes.u32())
+            Display::put_u32(&out, scene.draws.count.u32())
+            Display::put_f32(&out, scene.field.f32())
+            vector(&out, scene.light.direction)
+            vector(&out, scene.light.colour)
+            vector(&out, scene.light.sky)
+            vector(&out, scene.light.ground)
+            vector(&out, scene.light.background)
+            matrix(&out, &scene.light.clip)
+            matrix(&out, &scene.light.shadow)
+            encode_pass(&out, &scene.live)
+            if scene.passes == 2:
+                encode_pass(&out, &scene.photo)
+            for item in scene.draws |out|:
+                Display::put_u32(&out, item.mesh.u32())
+                Display::put_u32(&out, 1.u32() if item.casts else 0.u32())
+                matrix(&out, &item.model)
+                vector(&out, item.normal_scale)
+                vector(&out, item.colour)
+            return out
+
+    def encode_mesh(kind: i64, field: f64) -> darray[u8]:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            out: mutable darray[u8] = []
+            return out if kind < CameraMesh::BOX or kind > CameraMesh::OUTSIDE or not (field > 0.0 and field <= 120.0)
+            mesh: CameraMesh::Mesh = CameraMesh::build(kind, field)
+            count: i64 = mesh.vertices.count.i64()
+            indices: i64 = mesh.indices.count.i64()
+            _ = out.reserve((MESH_HEADER + VERTEX_BYTES * count + 4 * indices).usize())
+            Display::put_u32(&out, MESH_MAGIC)
+            Display::put_u32(&out, VERSION)
+            Display::put_u32(&out, kind.u32())
+            Display::put_u32(&out, count.u32())
+            Display::put_u32(&out, indices.u32())
+            for vertex in mesh.vertices |out|:
+                vector(&out, vertex.position)
+                vector(&out, vertex.normal)
+            for index in mesh.indices |out|:
+                Display::put_u32(&out, index)
+            return out

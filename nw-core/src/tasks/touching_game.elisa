@@ -1,0 +1,159 @@
+include "./touching.elisa"
+
+module TouchingGame:
+    const READY: i64 = 0
+    const PLAYING: i64 = 1
+    const JUDGED: i64 = 2
+    const DONE: i64 = 3
+    const FLAGGED: i64 = 4
+    const START: i64 = 6
+    const FEEDBACK_MS: i64 = 2500
+
+    struct Run:
+        rng: mutable MT19937
+        start_rung: i64
+        total: i64
+        adaptive: bool
+        rung: mutable i64
+        trial: mutable i64
+        phase: mutable i64
+        puzzle: mutable Touching::Puzzle
+        chosen: mutable i64
+        has_verdict: mutable bool
+        passed: mutable bool
+        scored_count: mutable i64
+        passed_count: mutable i64
+        best_rung: mutable i64
+        deadline: mutable i64
+        think_capacity: mutable f64
+        think_refill: mutable f64
+        think_left: mutable f64
+        forfeits: mutable i64
+        verdict_published: mutable bool
+
+    def allowed_rung(rung: i64) -> bool:
+        return rung == 1 or rung == 4 or rung == 7 or rung == 10 or rung == 13 or rung == 16 or rung == 20 or rung == 25 or rung == 30
+
+    def allowed_total(total: i64) -> bool:
+        return total == 1 or total == 3 or total == 5 or total == 10 or total == 20
+
+    def initialize(rung: i64, total: i64, adaptive: bool, seed: i64) -> Run:
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&rng, magnitude)
+            start_rung: i64 = rung if rung > 0 else 1
+            return Run{rng: rng, start_rung: start_rung, total: total, adaptive: adaptive,
+                rung: start_rung, trial: 0, phase: READY, puzzle: zeroed, chosen: -1, has_verdict: false, passed: false,
+                scored_count: 0, passed_count: 0, best_rung: 0, deadline: 0, think_capacity: 0.0, think_refill: 0.0,
+                think_left: 0.0, forfeits: 0, verdict_published: false}
+
+    def next_trial(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            run.verdict_published <- false
+            if run.trial >= run.total:
+                run.phase <- DONE
+                return
+            run.has_verdict <- false
+            run.chosen <- -1
+            run.passed <- false
+            seed: i64 = py_randbelow(&run.rng, 1073741824.u64()).i64()
+            run.puzzle <- Touching::deal(run.rung, seed)
+            if run.puzzle.count == 0:
+                run.phase <- READY
+                return
+            run.trial <- run.trial + 1
+            run.phase <- PLAYING
+
+    def start(run: mutable Run&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            return false if run.phase != READY and run.phase != DONE
+            run.rung <- run.start_rung
+            run.trial <- 0
+            run.has_verdict <- false
+            run.chosen <- -1
+            run.passed <- false
+            run.scored_count <- 0
+            run.passed_count <- 0
+            run.best_rung <- 0
+            run.think_left <- run.think_capacity
+            run.forfeits <- 0
+            next_trial(run)
+            return run.phase != READY
+
+    def choices(puzzle: Touching::Puzzle&) -> i64:
+        return START if puzzle.level.count > 0 else 3
+
+    def steer(run: mutable Run&, port: i64, now_ms: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            return start(run) if port == START
+            return false if run.phase != PLAYING
+            return false if port < 0 or port >= choices(&run.puzzle)
+            run.chosen <- port
+            run.has_verdict <- true
+            run.scored_count <- run.scored_count + 1
+            run.passed <- port == run.puzzle.answer
+            if run.passed:
+                run.passed_count <- run.passed_count + 1
+                run.best_rung <- run.rung if run.rung > run.best_rung
+            if run.adaptive:
+                run.rung <- run.rung + 1 if run.passed and run.rung < 9223372036854775807
+                run.rung <- run.rung - 1 if not run.passed and run.rung > 1
+            run.phase <- JUDGED
+            run.deadline <- now_ms + FEEDBACK_MS
+            return true
+
+    def advance(run: mutable Run&, now_ms: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            return false if run.phase != JUDGED or now_ms < run.deadline
+            next_trial(run)
+            return true
+
+    def configure_think(run: mutable Run&, capacity: f64, refill: f64) -> bool:
+        return false if run.phase != READY or not (capacity >= 0.0 and capacity <= 1.7976931348623157e308)
+        return false if not (refill >= 0.0 and refill <= 1.7976931348623157e308)
+        run.think_capacity <- capacity
+        run.think_refill <- refill if refill < capacity else capacity
+        run.think_left <- capacity
+        return true
+
+    # A stepped host publishes one frame per call. The verdict survives the
+    # first call after grading and the next call deals without a wall-clock wait.
+    def step(run: mutable Run&, elapsed_seconds: f64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            return false if not (elapsed_seconds > 0.0 and elapsed_seconds <= 1.7976931348623157e308)
+            if run.phase == PLAYING:
+                if run.think_capacity > 0.0:
+                    run.think_left <- run.think_left - elapsed_seconds
+                    if run.think_left <= 0.000000001:
+                        run.think_left <- 0.0
+                        run.forfeits <- run.forfeits + 1
+                        run.phase <- FLAGGED
+                return true
+            if run.phase == JUDGED and not run.verdict_published:
+                run.verdict_published <- true
+                return true
+            if run.phase == JUDGED or run.phase == FLAGGED:
+                next_trial(run)
+                if run.phase == PLAYING:
+                    room: f64 = run.think_capacity - run.think_left
+                    run.think_left <- run.think_left + (run.think_refill if run.think_refill < room else room)
+                return true
+            return false
+
+    def info(run: Run&, field: i64) -> i64:
+        return run.phase if field == 0
+        return run.rung if field == 1
+        return run.trial if field == 2
+        return run.total if field == 3
+        return choices(&run.puzzle) if field == 4
+        return run.puzzle.count if field == 5
+        return (1 if run.puzzle.level.thick else 0) if field == 6
+        return run.chosen if field == 7
+        return (1 if run.passed else 0) if field == 8 and run.has_verdict
+        return run.passed_count if field == 9
+        return run.best_rung if field == 10
+        return run.scored_count if field == 11
+        return run.forfeits if field == 12
+        return run.deadline if field == 13 and run.phase == JUDGED
+        return -1

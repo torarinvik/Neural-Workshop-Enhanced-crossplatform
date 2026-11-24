@@ -1,0 +1,89 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_json.elisa"
+include "./howstrongly.elisa"
+
+extend HowStrongly:
+    def copy_text(text: sview) -> dstr:
+        can Abort.Panic, Memory.Allocate:
+            result: mutable dstr = []
+            dstr_append_sview(&result, text)
+            return result
+
+    struct Decoded:
+        dialogue: Dialogue
+        valid: bool
+
+    # One line of eqbench.jsonl: text, who, emotions and scores, as
+    # emotiondata writes them. Lines the reference could not read are
+    # skipped, as are dialogues it could not ask about (fewer than two
+    # emotions, more than the eight answer ports, or scores that do not
+    # pair with the emotions).
+    def decode_dialogue[@r](arena: mutable Arena& @r, line: sview) -> Decoded:
+        can Memory.Allocate, Abort.Panic:
+            parsed: JsonParseResult[r] = json_parse_checked(arena, line) can Global{Read,Write}
+            return zeroed if parsed.code != JsonErrorCode.OK
+            root: JsonValueHandle[r] = json_handle_from_result(parsed)
+            text_node: JsonValueHandle[r] = try json_handle_get(root, "text") else json_handle_null(root)
+            who_node: JsonValueHandle[r] = try json_handle_get(root, "who") else json_handle_null(root)
+            emotions_node: JsonValueHandle[r] = try json_handle_get(root, "emotions") else json_handle_null(root)
+            scores_node: JsonValueHandle[r] = try json_handle_get(root, "scores") else json_handle_null(root)
+            return zeroed if not json_handle_is_string(text_node) or not json_handle_is_string(who_node)
+            count: i64 = json_handle_array_len(emotions_node)
+            return zeroed if count < 2 or count > ReadingQuiz::PORTS or json_handle_array_len(scores_node) != count
+            emotions: mutable darray[dstr] = []
+            scores: mutable darray[f64] = []
+            for i in 0..<count |root, emotions_node, scores_node, emotions, scores|:
+                emotion: JsonValueHandle[r] = try json_handle_at(emotions_node, i) else json_handle_null(root)
+                score: JsonValueHandle[r] = try json_handle_at(scores_node, i) else json_handle_null(root)
+                return zeroed if not json_handle_is_string(emotion) or not json_handle_is_number(score)
+                name: sview @r = try json_handle_as_string(emotion) else ""
+                emotions.push(copy_text(name))
+                scores.push(try json_handle_as_number(score) else 0.0)
+            text: sview @r = try json_handle_as_string(text_node) else ""
+            who: sview @r = try json_handle_as_string(who_node) else ""
+            return Decoded{dialogue: Dialogue{text: copy_text(text), who: copy_text(who), emotions: emotions, scores: scores}, valid: true}
+
+    def words_of(words: cstr) -> dstr:
+        can Abort.Panic, Memory.Allocate:
+            result: mutable dstr = []
+            dstr_append_cstr(&result, words)
+            return result
+
+    def put(corpus: mutable Corpus&, text: cstr, who: cstr, a: cstr, b: cstr, c: cstr, d: cstr, sa: f64, sb: f64, sc: f64, sd: f64):
+        can Abort.Panic, Memory.Allocate:
+            emotions: darray[dstr] = [words_of(a), words_of(b), words_of(c), words_of(d)]
+            scores: darray[f64] = [sa, sb, sc, sd]
+            corpus.dialogues.push(Dialogue{text: words_of(text), who: words_of(who), emotions: emotions, scores: scores})
+
+    # emotiondata.SEED_DIALOGUES.
+    def seed_dialogues() -> Corpus:
+        can Abort.Panic, Memory.Allocate:
+            corpus: mutable Corpus = zeroed
+            put(&corpus, "Mara: I kept your seat for you all evening.\nTom: I told you I had to work late.\nMara: You told me after the play had started.\nTom: I said I was sorry.\nMara: You did. Twice.",
+                "Mara", "Hurt", "Grateful", "Amused", "Resigned", 7.0, 0.0, 0.0, 5.0)
+            put(&corpus, "Ivo: They picked my design for the new library.\nLena: Ivo! After three tries!\nIvo: I almost did not send it this time.\nLena: I am so glad you did.",
+                "Ivo", "Proud", "Anxious", "Relieved", "Bored", 8.0, 1.0, 6.0, 0.0)
+            put(&corpus, "Petra: Who moved my notes from the desk?\nKai: I tidied a bit. They are in the drawer.\nPetra: I had them in order for the exam tomorrow.\nKai: Oh. I did not know.",
+                "Kai", "Guilty", "Annoyed", "Embarrassed", "Joyful", 6.0, 1.0, 5.0, 0.0)
+            return corpus
+
+    # emotiondata.dialogues(): eqbench.jsonl, one dialogue a line, or the
+    # seed dialogues when it holds none. Lines end at "\n", "\r\n" or "\r".
+    def from_dialogue_cache(owner: mutable Arena&, text: sview) -> Corpus:
+        can Memory.Allocate, Abort.Panic:
+            corpus: mutable Corpus = zeroed
+            size: i64 = sview_len(text).i64()
+            start: mutable i64 = 0
+            i: mutable i64 = 0
+            in owner:
+                while i <= size |corpus, size, start, i, text, owner|:
+                    code: u8 = 10.u8() if i == size else sview_at(text, i.usize())
+                    if code == 10.u8() or code == 13.u8():
+                        if i > start:
+                            decoded: Decoded = decode_dialogue(owner, string_view_slice(text, start, i)) can Global{Read,Write}
+                            corpus.dialogues.push(decoded.dialogue) if decoded.valid
+                        if code == 13.u8() and i + 1 < size and sview_at(text, (i + 1).usize()) == 10.u8():
+                            i <- i + 1
+                        start <- i + 1
+                    i <- i + 1
+                return corpus if corpus.dialogues.count > 0.usize()
+                return seed_dialogues()

@@ -1,0 +1,272 @@
+# Decode the same bounded RGB clip as the Python task. SDL passes each
+# argument directly to ffmpeg and owns the child and its output pipe.
+extern SDL_CreateProcess(args: usize&, pipe_stdio: bool) -> mutable void&? can[Blocking.IO, Memory.Allocate]
+extern SDL_GetProcessOutput(process: mutable void&) -> mutable void&? can[Blocking.IO]
+extern SDL_KillProcess(process: mutable void&, force: bool) -> bool can[Blocking.IO]
+extern SDL_WaitProcess(process: mutable void&, block: bool, exit_code: mutable i32&?) -> bool can[Blocking.IO]
+extern SDL_DestroyProcess(process: mutable void&) can[Memory.Release]
+extern SDL_UpdateTexture(texture: mutable void&, rect: i32&?, pixels: void&, pitch: i32) -> bool
+extern SDL_CreateTexture(renderer: mutable void&, format: u32, access: i32, width: i32, height: i32) -> mutable void&? can[Memory.Allocate]
+
+module SDLVideoJigsaw:
+    const WIDTH: i64 = JigsawPhotoAssets::VIDEO_WIDTH
+    const HEIGHT: i64 = JigsawPhotoAssets::VIDEO_HEIGHT
+    const FRAME_BYTES: i64 = WIDTH * HEIGHT * 3
+    const SEQUENCE_WIDTH: i64 = 160
+    const SEQUENCE_HEIGHT: i64 = 120
+    const SEQUENCE_FRAME_BYTES: i64 = SEQUENCE_WIDTH * SEQUENCE_HEIGHT * 3
+    const FPS: i64 = 15
+    const MAX_FRAMES: i64 = FPS * 8
+    const TIMEOUT_MS: u64 = 30000
+
+    def read_frames(process: mutable void&, buffer: mutable heap u8&, frame_bytes: i64) -> i64:
+        can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+            output: mutable void&? = SDL_GetProcessOutput(process)
+            return 0 if output == null
+            stream: mutable void& = output
+            deadline: u64 = SDL_GetTicks() + TIMEOUT_MS
+            used: mutable i64 = 0
+            trusted Unsafe.PointerCast:
+                while used < frame_bytes * MAX_FRAMES and SDL_GetTicks() < deadline |used, stream, buffer, deadline, frame_bytes|:
+                    amount: usize = SDL_ReadIO(stream, (&buffer[used.usize()]).cast[mutable void&],
+                        (frame_bytes * MAX_FRAMES - used).usize())
+                    if amount != 0.usize():
+                        used <- used + amount.i64()
+                    elif SDL_GetIOStatus(stream) == 3.i32(): # SDL_IO_STATUS_NOT_READY
+                        SDL_Delay(2.u32())
+                    else:
+                        break
+            return 0 if SDL_GetTicks() >= deadline
+            return used / frame_bytes
+
+    def packaged_program(path: mutable u8&) -> bool:
+        can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                if SDL_GetBasePath() is base:
+                    windows: bool = syllogism_argument_is(SDL_GetPlatform().uintptr().i64(), "Windows")
+                    name: cstr = "ffmpeg.exe" if windows else "ffmpeg"
+                    length: i32 = SDL_snprintf(path, 4096.usize(), "%s%s", base.cast[cstr], name)
+                    if length > 0.i32() and length < 4096.i32():
+                        if SDL_IOFromFile(path.cast[cstr], "rb") is file:
+                            return SDL_CloseIO(file)
+                return false
+
+    def arg(value: cstr) -> usize:
+        return value.uintptr()
+
+    # Negative means ffmpeg could not be launched. Zero means the file
+    # failed to decode or contained too few frames to animate.
+    def decode(path: cstr, buffer: mutable heap u8&, packaged_only: bool = false, sequence: bool = false) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            program_path: mutable u8[4096] = zeroed
+            program: mutable usize = arg("ffmpeg")
+            if packaged_program(&program_path[0]):
+                program <- (&program_path[0]).uintptr()
+            elif packaged_only:
+                return -1
+            args: mutable usize[21] = zeroed
+            args[0] <- program
+            args[1] <- arg("-v")
+            args[2] <- arg("error")
+            args[3] <- arg("-nostdin")
+            args[4] <- arg("-protocol_whitelist")
+            args[5] <- arg("file,pipe")
+            args[6] <- arg("-i")
+            args[7] <- path.uintptr()
+            args[8] <- arg("-t")
+            args[9] <- arg("8.00")
+            args[10] <- arg("-an")
+            args[11] <- arg("-vf")
+            args[12] <- arg("fps=15,scale=160:120:force_original_aspect_ratio=increase,crop=160:120") if sequence else arg("fps=15,scale=320:240:force_original_aspect_ratio=increase,crop=320:240")
+            args[13] <- arg("-pix_fmt")
+            args[14] <- arg("rgb24")
+            args[15] <- arg("-threads")
+            args[16] <- arg("1")
+            args[17] <- arg("-f")
+            args[18] <- arg("rawvideo")
+            args[19] <- arg("-")
+            if SDL_CreateProcess(&args[0], true) is process:
+                frames: i64 = read_frames(process, buffer, SEQUENCE_FRAME_BYTES if sequence else FRAME_BYTES)
+                if not SDL_WaitProcess(process, false, null):
+                    _ = SDL_KillProcess(process, true)
+                    _ = SDL_WaitProcess(process, true, null)
+                SDL_DestroyProcess(process)
+                return frames if frames >= 2 else 0
+            return -1
+
+    def difference_sum(buffer: heap u8&, first: i64, second: i64, frame_bytes: i64) -> i64:
+        can Abort.Panic:
+            at: mutable i64 = 0
+            total: mutable i64 = 0
+            while at < frame_bytes |at, total, buffer, first, second, frame_bytes|:
+                delta: i64 = buffer[(first * frame_bytes + at).usize()].i64() - buffer[(second * frame_bytes + at).usize()].i64()
+                total <- total + (-delta if delta < 0 else delta)
+                at <- at + 97
+            return total
+
+    def different(buffer: heap u8&, first: i64, second: i64) -> bool:
+        can Abort.Panic:
+            return difference_sum(buffer, first, second, FRAME_BYTES) >= 4 * ((FRAME_BYTES + 96) / 97)
+
+    # All comparisons use the same number of samples, so comparing sums
+    # gives the same ordering as comparing the Python means.
+    const SEQUENCE_MOTION_FLOOR: i64 = 4 * ((SEQUENCE_FRAME_BYTES + 96) / 97)
+
+    def sequence_motion(buffer: heap u8&, frames: i64, pieces: i64) -> i64:
+        can Abort.Panic:
+            return -1 if pieces < 2 or frames < pieces
+            span: i64 = frames / pieces
+            lowest: mutable i64 = 255 * ((SEQUENCE_FRAME_BYTES + 96) / 97)
+            for piece in 1..<pieces |piece, buffer, span, lowest|:
+                score: i64 = difference_sum(buffer, (piece - 1) * span, piece * span, SEQUENCE_FRAME_BYTES)
+                lowest <- score if score < lowest
+            return lowest
+
+    def lively(buffer: heap u8&, frames: i64) -> bool:
+        can Abort.Panic:
+            span: i64 = frames / 3
+            return span > 0 and different(buffer, 0, span) and different(buffer, span, 2 * span)
+
+    def frame_at(elapsed_ms: i64, frames: i64) -> i64:
+        return (elapsed_ms * FPS / 1000) % frames
+
+def sdl_jigsaw_clear_video_texture(properties: u32):
+    can Memory.Release:
+        return if SDL_GetNumberProperty(properties, "nw.jigsaw.video", 0) == 0
+        if SDL_GetPointerProperty(properties, "nw.jigsaw.texture", null) is texture:
+            _ = SDL_ClearProperty(properties, "nw.jigsaw.texture")
+            SDL_DestroyTexture(texture)
+        _ = SDL_ClearProperty(properties, "nw.jigsaw.video")
+
+def sdl_jigsaw_free_clip(run: mutable JigsawGame::JigsawRun&):
+    can Memory.Release, Unsafe.PointerCast:
+        trusted Unsafe.PointerCast:
+            if run.video_pixels != 0.usize():
+                free(run.video_pixels.cast[heap void&])
+                run.video_pixels <- 0.usize()
+        run.video_frames <- 0
+        run.video_index <- -1
+
+def sdl_jigsaw_video_catalog(run: mutable JigsawGame::JigsawRun&, target: mutable u8&):
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        return if run.photo_catalog_loaded
+        run.photo_catalog_loaded <- true
+        if sdl_data_path(target, 4096.usize(), "/datasets/ucf101", 0, true) != 0.i32():
+            count: mutable i32 = 0.i32()
+            trusted Unsafe.PointerCast:
+                if SDL_GlobDirectory(target.cast[cstr], "*.avi", 0.u32(), (&count).uintptr()) is files:
+                    SDL_qsort(files, count.usize(), size_of(usize).usize(), sdl_compare_media_name)
+                    run.photo_files <- files.uintptr()
+                    run.photo_count <- count.i64()
+
+def sdl_jigsaw_load_clip(run: mutable JigsawGame::JigsawRun&) -> bool:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        sdl_jigsaw_free_clip(run)
+        path: mutable u8[4096] = zeroed
+        sdl_jigsaw_video_catalog(run, &path[0])
+        run.video_error <- 1
+        return false if run.photo_count <= 0
+        run.video_error <- 3
+        attempts: i64 = run.photo_count if run.photo_count < 4 else 4
+        trusted Unsafe.PointerCast:
+            target: mutable u8& = &path[0]
+            for attempt in 0..<attempts |attempt, run, target|:
+                candidate: i64 = sdl_jigsaw_choose_photo(run, "/datasets/ucf101/seen_jigsaw.txt")
+                if sdl_catalog_path(target, "/datasets/ucf101/", run.photo_files, candidate):
+                    if malloc((SDLVideoJigsaw::FRAME_BYTES * SDLVideoJigsaw::MAX_FRAMES).usize()) is data:
+                        pixels: mutable heap u8& = data.cast[mutable heap u8&]
+                        frames: i64 = SDLVideoJigsaw::decode(target.cast[cstr], pixels)
+                        if frames > 0:
+                            sdl_jigsaw_free_clip(run)
+                            run.video_pixels <- data.uintptr()
+                            run.video_frames <- frames
+                            run.video_error <- 0
+                            if SDLVideoJigsaw::lively(pixels, frames):
+                                break
+                        else:
+                            free(data)
+                            if frames < 0:
+                                run.video_error <- 2
+                                break
+        return run.video_frames > 0
+
+def sdl_jigsaw_video(renderer: mutable void&, properties: u32, run: mutable JigsawGame::JigsawRun&) -> bool:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        if run.phase != JigsawGame::PHASE_SOLVING and run.phase != JigsawGame::PHASE_SOLVED:
+            sdl_jigsaw_clear_video_texture(properties)
+            sdl_jigsaw_free_clip(run)
+            return false
+        if not run.photo_timed:
+            if not sdl_jigsaw_load_clip(run):
+                sdl_jigsaw_clear_video_texture(properties)
+                run.phase <- JigsawGame::PHASE_READY
+                run.puzzle <- run.puzzle - 1
+                run.rng <- run.before_deal
+                trusted Unsafe.PointerCast:
+                    if run.photo_files != 0.usize():
+                        SDL_free(run.photo_files.cast[heap void&])
+                run.photo_files <- 0.usize()
+                run.photo_count <- 0
+                run.photo_catalog_loaded <- false
+                return false
+            _ = JigsawGame::apply(run, JigsawGame::ACTION_FIT_PHOTO, SDLVideoJigsaw::HEIGHT, SDL_GetTicks().i64())
+        return false if run.video_frames <= 0
+        if SDL_GetNumberProperty(properties, "nw.jigsaw.video", 0) == 0:
+            if SDL_GetPointerProperty(properties, "nw.jigsaw.texture", null) is old:
+                _ = SDL_ClearProperty(properties, "nw.jigsaw.texture")
+                SDL_DestroyTexture(old)
+            _ = SDL_ClearProperty(properties, "nw.jigsaw.path")
+            if SDL_CreateTexture(renderer, 0x17101803.u32(), 1.i32(), SDLVideoJigsaw::WIDTH.i32(), SDLVideoJigsaw::HEIGHT.i32()) is texture:
+                if SDL_SetPointerProperty(properties, "nw.jigsaw.texture", texture):
+                    _ = SDL_SetNumberProperty(properties, "nw.jigsaw.video", 1)
+                else:
+                    SDL_DestroyTexture(texture)
+        if SDL_GetPointerProperty(properties, "nw.jigsaw.texture", null) is texture:
+            index: i64 = SDLVideoJigsaw::frame_at(SDL_GetTicks().i64() - run.started_at_ms, run.video_frames)
+            if index != run.video_index:
+                trusted Unsafe.PointerCast:
+                    pixels: void& = (run.video_pixels + (index * SDLVideoJigsaw::FRAME_BYTES).usize()).cast[void&]
+                    return false if not SDL_UpdateTexture(texture, null, pixels, (SDLVideoJigsaw::WIDTH * 3).i32())
+                run.video_index <- index
+            _ = SDL_SetNumberProperty(properties, "nw.jigsaw.columns", run.trial_side)
+            _ = SDL_SetNumberProperty(properties, "nw.jigsaw.rows", run.trial_rows)
+            return true
+        return false
+
+def sdl_video_jigsaw_create(seed: i64) -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        options: mutable i64[9] = [0, 0, 0, 0, Jigsaw::PIECE_OPTION_BASE + 6, 3, 1, 0, 0]
+        size: mutable i64 = 0
+        if sdl_media_config(&size) is raw:
+            trusted Unsafe.PointerCast:
+                data: heap u8& = raw.cast[heap u8&]
+                pieces: i64 = sdl_config_option(data, size, "VIDEO_JIGSAW_PIECES", 0, -1)
+                if Jigsaw::allowed_pieces(pieces):
+                    options[4] <- Jigsaw::PIECE_OPTION_BASE + Jigsaw::bounded_pieces(pieces, true)
+                puzzles: i64 = sdl_config_option(data, size, "VIDEO_JIGSAW_PUZZLES", 0, -1)
+                options[5] <- puzzles if JigsawGame::allowed_puzzles(puzzles)
+                adaptive: i64 = sdl_config_option(data, size, "VIDEO_JIGSAW_ADAPTIVE", 1, -1)
+                preview: i64 = sdl_config_option(data, size, "VIDEO_JIGSAW_PREVIEW", 1, -1)
+                placed: i64 = sdl_config_option(data, size, "VIDEO_JIGSAW_MARK_PLACED", 1, -1)
+                options[6] <- adaptive if JigsawGame::allowed_flag(adaptive)
+                options[7] <- preview if JigsawGame::allowed_flag(preview)
+                options[8] <- placed if JigsawGame::allowed_flag(placed)
+            SDL_free(raw)
+        sdl_read_jigsaw_options(&options[0], true)
+        return jigsaw_create_grid(3, options[5], options[6], options[7], options[8], seed, options[4] - Jigsaw::PIECE_OPTION_BASE, true)
+
+def sdl_video_jigsaw_package_selftest(path: cstr) -> i32:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        if malloc((SDLVideoJigsaw::FRAME_BYTES * SDLVideoJigsaw::MAX_FRAMES).usize()) is data:
+            trusted Unsafe.PointerCast:
+                pixels: mutable heap u8& = data.cast[mutable heap u8&]
+                frames: i64 = SDLVideoJigsaw::decode(path, pixels, true)
+                valid: bool = frames == 3 and SDLVideoJigsaw::lively(pixels, frames)
+                sequence_frames: i64 = SDLVideoJigsaw::decode(path, pixels, true, true)
+                sequence_valid: bool = sequence_frames == 3 and SDLVideoJigsaw::sequence_motion(pixels, sequence_frames, 3) >= SDLVideoJigsaw::SEQUENCE_MOTION_FLOOR
+                free(data)
+                if valid and sequence_valid:
+                    _ = printf("Packaged Video Jigsaw ffmpeg selftest: PASS\n")
+                    return 0.i32()
+        SDL_Log("Could not decode the Video Jigsaw fixture with bundled ffmpeg")
+        return 1.i32()

@@ -1,0 +1,386 @@
+include "../hand_view.elisa"
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "../strings.elisa"
+include "./drshape_deal.elisa"
+
+module Bartender:
+    const ICE: i64 = HandView::KEYS
+    const PORTS: i64 = ICE + 1
+    const TOP: f64 = 1.0
+    const LEFT: f64 = -2.2
+    const RIGHT: f64 = 1.2
+    const END: f64 = 10.4
+    const SLIDE: f64 = 4.0
+    const POUR: f64 = 0.4
+    const NEAR: f64 = 44.0
+    const OVER: f64 = 50.0
+
+    const POURING: i64 = 0
+    const DING: i64 = 1
+    const CRASH: i64 = 2
+    const SLIDING: i64 = 3
+    const CLINK: i64 = 4
+    const GRUMBLE: i64 = 5
+
+    const LIVE: i64 = 0
+    const GOOD_NIGHT: i64 = 1
+    const SPILT: i64 = 2
+    const FLOOR: i64 = 3
+    const WALKOUT: i64 = 4
+    const UNSERVED: i64 = 5
+    const WRONG_DRINK: i64 = 6
+    const EMPTY_SEAT: i64 = 7
+
+    const PENDING: i64 = 0
+    const SERVED: i64 = 1
+    const GONE: i64 = 2
+    const EMPTY_HAND: i64 = -1
+    const HELD_GLASS: i64 = 5
+
+    struct Grade:
+        rung: i64
+        customers: i64
+        bottles: i64
+        doubles: bool
+        ice: bool
+        pewter: bool
+        usual: bool
+        strikes: i64
+        patience: f64
+
+    struct Recipe:
+        drink: i64
+        double: bool
+        ice: bool
+
+    struct Order:
+        seat: i64
+        hat: i64
+        recipe: Recipe
+        usual: bool
+        arrive: f64
+        leave: f64
+
+    struct Night:
+        level: mutable Grade
+        orders: mutable darray[Order]
+        seed: mutable i64
+
+    struct Run:
+        night: Night
+        hand: mutable HandView::Pointer
+        camera: HandView::Lens
+        status: mutable darray[i64]
+        first_open: mutable i64
+        served: mutable i64
+        gone: mutable i64
+        strikes: mutable i64
+        glass_x: mutable f64
+        level_in: mutable f64
+        drink: mutable i64
+        ice: mutable bool
+        held: mutable i64
+        drawn_back: mutable bool
+        trail_x: mutable f64
+        sliding: mutable bool
+        slide_to: mutable f64
+        slide_speed: mutable f64
+        pour_at: mutable f64
+        time: mutable f64
+        seconds: f64
+        result: mutable i64
+        audible: bool
+        notes: mutable darray[DrShapeDeal::Note]
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: i64 = r - 20 if r > 20 else 0
+        customers: i64 = 1 if r < 4 else (2 if r < 7 else (3 if r < 13 else (4 if r < 16 else (5 if r < 20 else 6 + top / 3))))
+        bottles: i64 = 2 if r < 4 else (3 if r < 10 else (4 if r < 20 else 5))
+        patience: f64 = 30.0 if r < 4 else (26.0 if r < 10 else (22.0 if r < 16 else (18.0 if r < 20 else fmax(10.0, 17.0 - 0.2 * top.f64()))))
+        return Grade{rung: r, customers: customers, bottles: bottles, doubles: r >= 4, ice: r >= 7,
+            pewter: r >= 10, usual: r >= 13, strikes: 3 if r < 10 else 2, patience: patience}
+
+    def draw_order(draw: mutable MT19937&, level: Grade&, known: mutable bool[5]&, recipes: mutable Recipe[5]&,
+                   time: f64) -> Order:
+        can Abort.Panic:
+            seat: i64 = py_randbelow(draw, 5.u64()).i64()
+            hat: i64 = py_randbelow(draw, 5.u64()).i64()
+            usual: bool = level.usual and known[hat.usize()]
+            if not usual:
+                drink: i64 = py_randbelow(draw, level.bottles.u64()).i64()
+                double: bool = level.doubles and mt_random_res53(draw) < 0.5
+                ice: bool = level.ice and mt_random_res53(draw) < 0.5
+                recipes[hat.usize()] <- Recipe{drink: drink, double: double, ice: ice}
+                known[hat.usize()] <- true
+            return Order{seat: seat, hat: hat, recipe: recipes[hat.usize()], usual: usual, arrive: time, leave: time + level.patience}
+
+    def build(night: mutable Night&, level: Grade, seed: u64):
+        can Abort.Panic, Memory.Allocate:
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, seed)
+            night.level <- level
+            known: mutable bool[5] = zeroed
+            recipes: mutable Recipe[5] = zeroed
+            time: mutable f64 = 1.0
+            for i in 0..<level.customers |night, draw, level, known, recipes, time|:
+                order: Order = draw_order(&draw, &level, &known, &recipes, time)
+                if i < night.orders.count.i64():
+                    night.orders[i.usize()] <- order
+                else:
+                    night.orders.push(order)
+                time <- time + level.patience * 0.75
+            night.orders.count <- level.customers.usize()
+            night.seed <- py_randbelow(&draw, 1073741824.u64()).i64()
+
+    def drink_name(index: i64) -> cstr:
+        return "red" if index == 0
+        return "green" if index == 1
+        return "blue" if index == 2
+        return "amber" if index == 3
+        return "violet"
+
+    def hat_name(index: i64) -> cstr:
+        return "black" if index == 0
+        return "white" if index == 1
+        return "brown" if index == 2
+        return "grey" if index == 3
+        return "green"
+
+    def order_text(out: mutable dstr&, order: Order&, level: Grade&):
+        can Abort.Panic, Memory.Allocate:
+            dstr_append_cstr(out, "Seat ")
+            dstr_append_i64(out, order.seat + 1)
+            if level.usual:
+                dstr_append_cstr(out, ", ")
+                dstr_append_cstr(out, hat_name(order.hat))
+                dstr_append_cstr(out, " hat")
+            dstr_append_cstr(out, ": ")
+            if order.usual:
+                dstr_append_cstr(out, "the usual.")
+                return
+            dstr_append_cstr(out, "a double " if order.recipe.double else "a ")
+            dstr_append_cstr(out, drink_name(order.recipe.drink))
+            dstr_append_cstr(out, " on the rocks") if order.recipe.ice
+            dstr_append_cstr(out, ".")
+
+    def view() -> HandView::Lens:
+        can Abort.Panic:
+            return HandView::lens(RoomsView::vec(3.2, 5.2, 9.5), RoomsView::vec(4.0, 0.9, 0.0), 640.0, 500.0, 300.0)
+
+    def bottle_at(index: i64) -> RoomsView::Vec:
+        return RoomsView::vec(-1.6 + 0.75 * index.f64(), 1.9, -1.3)
+
+    def seat_at(index: i64) -> f64:
+        return 3.0 + 1.5 * index.f64()
+
+    def glass_at(x: f64) -> RoomsView::Vec:
+        return RoomsView::vec(x, TOP + 0.3, 0.4)
+
+    def begin(night: Night, status: darray[i64] = [], audible: bool = true) -> Run:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = Run{night: night, hand: HandView::initialize(), camera: view(), status: status,
+                first_open: 0, served: 0, gone: 0, strikes: 0, glass_x: 0.0, level_in: 0.0, drink: -1,
+                ice: false, held: EMPTY_HAND, drawn_back: false, trail_x: 0.0, sliding: false, slide_to: 0.0,
+                slide_speed: 0.0, pour_at: 0.0, time: 0.0, seconds: night.orders[(night.level.customers - 1).usize()].leave + 1.0,
+                result: LIVE, audible: audible, notes: []}
+            for i in 0..<night.level.customers |run|:
+                if i < run.status.count.i64():
+                    run.status[i.usize()] <- PENDING
+                else:
+                    run.status.push(PENDING)
+            return run
+
+    def off(run: Run&, point: RoomsView::Vec) -> f64:
+        p: RoomsView::Vec = HandView::see(&run.camera, point)
+        return 1000000000.0 if p.z < 0.05
+        return py_hypot(run.hand.x - p.x, run.hand.y - p.y)
+
+    def was(run: Run&) -> f64:
+        return run.trail_x if run.drawn_back else run.glass_x
+
+    def note(run: mutable Run&, duration: f64, frequency: f64, voice: i64, gain: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if not run.audible
+            run.notes.push(DrShapeDeal::Note{t: run.time, dur: duration, freq: frequency, voice: voice,
+                gain: gain, gain2: gain, pan: 0.0, pan2: 0.0, bright: 0.8, seed: 1 + run.notes.count.i64(), who: -1, room: 0.0})
+
+    def strike(run: mutable Run&, verdict: i64):
+        can Abort.Panic, Memory.Allocate:
+            run.strikes <- run.strikes + 1
+            note(run, 0.3, 100.0, GRUMBLE, 0.5)
+            run.result <- verdict if run.strikes >= run.night.level.strikes
+
+    def fresh(run: mutable Run&):
+        run.glass_x <- 0.0
+        run.level_in <- 0.0
+        run.drink <- -1
+        run.ice <- false
+        run.sliding <- false
+        run.drawn_back <- false
+
+    def press(run: mutable Run&):
+        return if run.result != LIVE or run.hand.down
+        run.hand.down <- true
+        return if run.sliding
+        best: mutable f64 = NEAR
+        held: mutable i64 = EMPTY_HAND
+        for k in 0..<run.night.level.bottles |run, best, held|:
+            distance: f64 = off(run, bottle_at(k))
+            if distance < best or (held == EMPTY_HAND and distance == best):
+                best <- distance
+                held <- k
+        distance: f64 = off(run, glass_at(run.glass_x))
+        held <- HELD_GLASS if distance < best or (held == EMPTY_HAND and distance == best)
+        if held != EMPTY_HAND:
+            run.held <- held
+            run.drawn_back <- false
+
+    def release(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            return if not run.hand.down
+            run.hand.down <- false
+            held: i64 = run.held
+            run.held <- EMPTY_HAND
+            return if run.result != LIVE or held != HELD_GLASS
+            push: f64 = run.glass_x - was(run)
+            if push > 0.05:
+                run.sliding <- true
+                run.slide_to <- run.glass_x + push * SLIDE
+                run.slide_speed <- 3.0 + 3.0 * push
+                note(run, 0.4, 200.0, SLIDING, 0.3)
+
+    def act(run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate:
+            if port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                press(run)
+            elif port == HandView::RELEASE:
+                release(run)
+            elif port == ICE and run.result == LIVE and not run.sliding:
+                run.ice <- not run.ice
+                note(run, 0.06, 1500.0, CLINK, 0.4)
+
+    def bounds(double: bool) -> RoomsView::Point:
+        return RoomsView::Point{x: 0.78, y: 1.0} if double else RoomsView::Point{x: 0.38, y: 0.62}
+
+    def arrive(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            x: f64 = run.glass_x
+            drink: i64 = run.drink
+            fill: f64 = run.level_in
+            ice: bool = run.ice
+            fresh(run)
+            for i in run.first_open..<run.night.level.customers |run, x, drink, fill, ice|:
+                order: Order = run.night.orders[i.usize()]
+                break if order.arrive > run.time
+                if run.status[i.usize()] == PENDING and fabs(seat_at(order.seat) - x) <= 0.55:
+                    range: RoomsView::Point = bounds(order.recipe.double)
+                    if drink == order.recipe.drink and range.x <= fill and fill <= range.y and ice == order.recipe.ice:
+                        run.status[i.usize()] <- SERVED
+                        run.served <- run.served + 1
+                        note(run, 0.3, 880.0, DING, 0.5)
+                    else:
+                        strike(run, WRONG_DRINK)
+                    return
+            strike(run, EMPTY_SEAT)
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            run.time <- run.time + dt
+            if run.held == HELD_GLASS:
+                hit: HandView::Intersection = HandView::on_plane(&run.camera, run.hand.x, run.hand.y,
+                    glass_at(0.0), RoomsView::vec(0.0, 0.0, 1.0))
+                run.glass_x <- HandView::clamp(hit.point.x, LEFT, RIGHT) if hit.valid
+                run.trail_x <- fmin(run.glass_x, was(run))
+                run.drawn_back <- true
+            elif run.held != EMPTY_HAND and not run.sliding and off(run, glass_at(run.glass_x)) <= OVER:
+                run.drink <- run.held if run.drink == -1 or run.drink == run.held else -2
+                run.level_in <- run.level_in + POUR * dt
+                if run.time >= run.pour_at:
+                    run.pour_at <- run.time + 0.09
+                    note(run, 0.1, 300.0 * pow(2.0, 1.5 * run.level_in), POURING, 0.35)
+                if run.level_in > 1.04:
+                    fresh(run)
+                    strike(run, SPILT)
+            if run.sliding:
+                run.glass_x <- fmin(run.slide_to, run.glass_x + fmax(2.0, run.slide_speed) * 2.0 * dt)
+                if run.glass_x >= END:
+                    note(run, 0.5, 900.0, CRASH, 0.6)
+                    fresh(run)
+                    strike(run, FLOOR)
+                elif run.glass_x >= run.slide_to:
+                    arrive(run)
+            while run.first_open < run.night.level.customers |run|:
+                i: usize = run.first_open.usize()
+                if run.status[i] == PENDING:
+                    break if run.time < run.night.orders[i].leave
+                    run.status[i] <- GONE
+                    run.gone <- run.gone + 1
+                    strike(run, WALKOUT)
+                run.first_open <- run.first_open + 1
+            if run.result == LIVE and run.served + run.gone == run.night.level.customers:
+                run.result <- GOOD_NIGHT if run.gone == 0 else UNSERVED
+
+    def direction(run: Run&, world: RoomsView::Vec, tolerance: f64 = 6.0) -> i64:
+        projected: RoomsView::Vec = HandView::see(&run.camera, world)
+        return HandView::toward(&run.hand, projected.x, projected.y, tolerance)
+
+    def grab(run: Run&, world: RoomsView::Vec) -> i64:
+        return HandView::RELEASE if run.hand.down
+        port: i64 = direction(run, world)
+        return port if port >= 0 else HandView::PRESS
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            return (HandView::RELEASE if run.hand.down else -1) if run.sliding
+            index: i64 = run.first_open
+            return (HandView::RELEASE if run.hand.down else -1) if index >= run.night.level.customers
+            order: Order = run.night.orders[index.usize()]
+            return (HandView::RELEASE if run.hand.down else -1) if order.arrive > run.time
+            limit: RoomsView::Point = bounds(order.recipe.double)
+            target: f64 = (limit.x + limit.y) / 2.0
+            if run.level_in < target - 0.03:
+                if run.held == EMPTY_HAND:
+                    return grab(run, bottle_at(order.recipe.drink))
+                return HandView::RELEASE if run.held != order.recipe.drink
+                return direction(run, glass_at(run.glass_x), 12.0)
+            return HandView::RELEASE if run.held != EMPTY_HAND and run.held != HELD_GLASS
+            return ICE if run.ice != order.recipe.ice
+            return grab(run, glass_at(run.glass_x)) if run.held == EMPTY_HAND
+            a: RoomsView::Vec = HandView::see(&run.camera, glass_at(0.0))
+            b: RoomsView::Vec = HandView::see(&run.camera, glass_at(1.0))
+            per: f64 = b.x - a.x
+            x: f64 = run.glass_x
+            back: f64 = was(run)
+            if x <= back + 0.000001:
+                gap: f64 = (x - (LEFT + 0.1)) * per
+                return 6 + (0 if gap > 85.0 else (1 if gap > 22.0 else 2)) if gap > 12.0
+            stop: f64 = x + (x - back) * SLIDE
+            target_x: f64 = seat_at(order.seat) + 0.2
+            for port in 9..<12 |stop, per, target_x|:
+                units: f64 = HandView::displacement(port).x
+                return port if stop + units / per * (1.0 + SLIDE) <= target_x
+            return HandView::RELEASE
+
+    def reference_wins(night: Night) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            region replay(65536):
+                in replay:
+                    run: mutable Run = begin(night, [], false)
+                    while run.result == LIVE |run|:
+                        act(&run, pilot(&run))
+                        step(&run, 1.0 / 60.0)
+                    return run.result == GOOD_NIGHT
+
+    def deal(night: mutable Night&, rung: i64, draw: mutable MT19937&) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            level: Grade = grade(rung)
+            for _ in 0..<80 |night, level, draw|:
+                build(night, level, py_getrandbits(draw, 32))
+                return true if reference_wins(night[0])
+            return false

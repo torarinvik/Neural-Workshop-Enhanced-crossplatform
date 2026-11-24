@@ -1,0 +1,447 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+# freekick.py: bend the ball into the lit part of the goal. Set the kick --
+# its direction, how high, how much curl and how hard -- and kick. The air
+# slows the ball, spin bends it, wind carries it. It has to cross the goal
+# line inside the ring, past the wall and out of the keeper's reach. One kick
+# a round. Ports 0-7 turn the dials for the step they are sent in; port 8
+# kicks, at once.
+module FreeKick:
+    const AIM_L: i64 = 0
+    const AIM_R: i64 = 1
+    const RAISE: i64 = 2
+    const LOWER: i64 = 3
+    const CURL_L: i64 = 4
+    const CURL_R: i64 = 5
+    const HARDER: i64 = 6
+    const SOFTER: i64 = 7
+    const KICK: i64 = 8
+    const PORTS: i64 = 9
+    const WIDE: f64 = 7.32
+    const HIGH: f64 = 2.44
+    const BALL: f64 = 0.11
+    const DRAG: f64 = 0.013
+    const LIFT: f64 = 0.012
+    const WALL_AT: f64 = 9.15
+    const PI: f64 = 3.141592653589793
+    # math.radians multiplies by pi / 180.
+    const DEGREE: f64 = 0.017453292519943295
+    # How the flight ended: into the wall, short of the line, or over it.
+    const INTO: i64 = 0
+    const SHORT: i64 = 1
+    const LINE: i64 = 2
+    # Results; LIVE while the round goes on.
+    const LIVE: i64 = 0
+    const IN_RING: i64 = 1
+    const INTO_WALL: i64 = 2
+    const FELL_SHORT: i64 = 3
+    const WIDE_OF_GOAL: i64 = 4
+    const OVER_BAR: i64 = 5
+    const SAVED: i64 = 6
+    const OFF_RING: i64 = 7
+    const OUT_OF_TIME: i64 = 8
+    const WOOD: i64 = 0
+    const BELL: i64 = 1
+    const GROWL: i64 = 2
+
+    struct Grade:
+        rung: i64
+        guide: bool
+        ring: f64
+        wall: i64
+        jump: f64
+        keeper: f64
+        wind: f64
+        side: f64
+        distance: f64
+
+    struct Pitch:
+        level: mutable Grade
+        spot_x: mutable f64
+        spot_z: mutable f64
+        goal_x: mutable f64
+        ring_x: mutable f64
+        ring_y: mutable f64
+        ring_r: mutable f64
+        wall_x: mutable f64
+        wall_z: mutable f64
+        wall_w: mutable f64
+        wall_h: mutable f64
+        keeper: mutable f64
+        wind_x: mutable f64
+        wind_z: mutable f64
+        seconds: mutable f64
+        valid: mutable bool
+
+    struct Kick:
+        aim: mutable f64
+        lift: mutable f64
+        curl: mutable f64
+        power: mutable f64
+
+    struct Point:
+        t: f64
+        x: f64
+        y: f64
+        z: f64
+
+    # Where the ball crossed the wall's plane or the goal line, and when; and
+    # the time of the flight's last point.
+    struct Flight:
+        how: i64
+        x: f64
+        y: f64
+        t: f64
+        last: f64
+
+    struct Verdict:
+        code: i64
+        miss: f64
+
+    struct Found:
+        kick: Kick
+        ok: bool
+
+    struct Run:
+        pitch: Pitch
+        t: mutable f64
+        kick: mutable Kick
+        kicked: mutable f64
+        struck: mutable bool
+        path: mutable darray[Point]
+        outcome: mutable Verdict
+        result: mutable i64
+        miss: mutable f64
+        notes: mutable darray[DrShapeDeal::Note]
+        want: mutable Kick
+        wanted: mutable bool
+        tries: mutable i64
+
+    @inline(never)
+    def sine(angle: f64) -> f64:
+        return sin(angle)
+
+    @inline(never)
+    def cosine(angle: f64) -> f64:
+        return cos(angle)
+
+    # Python's min and max of two: the first unless the second is strictly
+    # less (more).
+    def py_min(a: f64, b: f64) -> f64:
+        return b if b < a else a
+
+    def py_max(a: f64, b: f64) -> f64:
+        return b if b > a else a
+
+    def start() -> Kick:
+        return Kick{aim: 0.0, lift: 12.0, curl: 0.0, power: 18.0}
+
+    def rate(port: i64) -> f64:
+        return -6.0 if port == AIM_L
+        return 6.0 if port == AIM_R
+        return 5.0 if port == RAISE
+        return -5.0 if port == LOWER
+        return 8.0 if port == CURL_L
+        return -8.0 if port == CURL_R
+        return 6.0 if port == HARDER
+        return -6.0
+
+    def grade(rung: i64) -> Grade:
+        can Abort.Panic:
+            r: i64 = rung if rung > 1 else 1
+            if r == 1:
+                return Grade{rung: r, guide: true, ring: 1.2, wall: 0, jump: 0.0, keeper: 0.0, wind: 0.0, side: 0.0, distance: 18.0}
+            if r < 4:
+                return Grade{rung: r, guide: r == 2, ring: 1.0 if r == 2 else 0.9, wall: 0, jump: 0.0, keeper: 0.0,
+                    wind: 0.0, side: 0.0, distance: 19.0}
+            if r < 7:
+                return Grade{rung: r, guide: false, ring: 0.85 - 0.05 * (r - 4).f64(), wall: 3, jump: 0.0, keeper: 2.5,
+                    wind: 0.0, side: 0.0, distance: 20.0}
+            if r < 10:
+                return Grade{rung: r, guide: false, ring: 0.65 - 0.03 * (r - 7).f64(), wall: 4, jump: 0.0, keeper: 3.0,
+                    wind: 2.0 + (r - 7).f64(), side: 0.0, distance: 21.0}
+            if r < 13:
+                return Grade{rung: r, guide: false, ring: 0.55 - 0.03 * (r - 10).f64(), wall: 4, jump: 0.25, keeper: 3.5,
+                    wind: 4.0, side: 6.0, distance: 22.0}
+            k: f64 = (r - 13).f64()
+            return Grade{rung: r, guide: false, ring: py_max(0.16, 0.48 * pow(0.92, k)), wall: 4, jump: 0.3,
+                keeper: py_min(4.0, 3.6 + 0.02 * k), wind: py_min(8.0, 4.0 + 0.2 * k), side: 8.0,
+                distance: py_min(25.0, 22.0 + 0.2 * k)}
+
+    # The flight at 1/120 s a step for at most four seconds. *walled* false
+    # flies as if there were no wall (the reference's level with wall=0);
+    # *keep* records every point into *path*.
+    def fly(p: Pitch&, k: Kick, walled: bool, keep: bool, path: mutable darray[Point]&) -> Flight:
+        can Abort.Panic, Memory.Allocate:
+            dt: f64 = 1.0 / 120.0
+            x: mutable f64 = p.spot_x
+            y: mutable f64 = BALL
+            z: mutable f64 = p.spot_z
+            base: f64 = atan2(p.goal_x - p.spot_x, p.spot_z)
+            a: f64 = base + k.aim * DEGREE
+            e: f64 = k.lift * DEGREE
+            vx: mutable f64 = k.power * cosine(e) * sine(a)
+            vy: mutable f64 = k.power * sine(e)
+            vz: mutable f64 = -k.power * cosine(e) * cosine(a)
+            w: f64 = k.curl
+            spin: f64 = LIFT * -w
+            drag: f64 = -DRAG
+            passed: mutable bool = not walled or p.level.wall == 0
+            path.push(Point{t: 0.0, x: x, y: y, z: z}) if keep
+            t: mutable f64 = 0.0
+            while t < 4.0 |p, keep, path, dt, x, y, z, vx, vy, vz, spin, drag, passed, t|:
+                rx: f64 = vx - p.wind_x
+                ry: f64 = vy
+                rz: f64 = vz - p.wind_z
+                sp: f64 = sqrt(rx * rx + ry * ry + rz * rz)
+                ax: f64 = drag * sp * rx + spin * rz * -1.0
+                az: f64 = drag * sp * rz + spin * -rx * -1.0
+                ay: f64 = drag * sp * ry - 9.81
+                vx <- vx + ax * dt
+                vy <- vy + ay * dt
+                vz <- vz + az * dt
+                nx: f64 = x + vx * dt
+                ny: f64 = y + vy * dt
+                nz: f64 = z + vz * dt
+                t <- t + dt
+                if not passed and nz <= p.wall_z and p.wall_z < z:
+                    s: f64 = (z - p.wall_z) / (z - nz)
+                    cx: f64 = x + (nx - x) * s
+                    cy: f64 = y + (ny - y) * s
+                    if fabs(cx - p.wall_x) < p.wall_w + BALL and cy < p.wall_h + BALL:
+                        path.push(Point{t: t, x: cx, y: cy, z: p.wall_z}) if keep
+                        return Flight{how: INTO, x: cx, y: cy, t: t, last: t}
+                    passed <- true
+                if nz <= 0.0 and 0.0 < z:
+                    s: f64 = z / (z - nz)
+                    cx: f64 = x + (nx - x) * s
+                    cy: f64 = y + (ny - y) * s
+                    path.push(Point{t: t, x: cx, y: cy, z: 0.0}) if keep
+                    return Flight{how: LINE, x: cx, y: cy, t: t - dt * (1.0 - s), last: t}
+                x <- nx
+                y <- py_max(BALL, ny)
+                z <- nz
+                if ny < BALL:
+                    vy <- -vy * 0.5
+                    vx <- vx * 0.8
+                    vz <- vz * 0.8
+                path.push(Point{t: t, x: x, y: y, z: z}) if keep
+            return Flight{how: SHORT, x: 0.0, y: 0.0, t: 0.0, last: t}
+
+    def flight(p: Pitch&, k: Kick, walled: bool) -> Flight:
+        can Abort.Panic, Memory.Allocate:
+            none: mutable darray[Point] = []
+            return fly(p, k, walled, false, &none)
+
+    # Whether the keeper gets to a ball crossing at (x, y) at time t.
+    def keeper_reach(p: Pitch&, x: f64, y: f64, t: f64) -> bool:
+        return false if p.level.keeper == 0.0
+        covered: f64 = py_max(0.0, t - 0.3) * p.level.keeper
+        gap: f64 = fabs(x - p.keeper)
+        reach: f64 = 1.0 if y < 1.9 else 0.7
+        return gap - covered < reach and y < 2.6
+
+    def judge(p: Pitch&, k: Kick) -> Verdict:
+        can Abort.Panic, Memory.Allocate:
+            f: Flight = flight(p, k, true)
+            return Verdict{code: INTO_WALL, miss: 0.0} if f.how == INTO
+            return Verdict{code: FELL_SHORT, miss: 0.0} if f.how == SHORT
+            if fabs(f.x - p.goal_x) > WIDE / 2.0 - BALL or f.y > HIGH - BALL:
+                return Verdict{code: WIDE_OF_GOAL if f.y <= HIGH - BALL else OVER_BAR, miss: 0.0}
+            return Verdict{code: SAVED, miss: 0.0} if keeper_reach(p, f.x, f.y, f.t)
+            off: f64 = py_hypot(f.x - p.ring_x, f.y - p.ring_y)
+            return Verdict{code: OFF_RING, miss: off - p.ring_r} if off > p.ring_r
+            return Verdict{code: IN_RING, miss: 0.0}
+
+    # _solve: aim and lift that put the ball on the ring's middle, by Newton,
+    # from (0, 12) or from *first* when *seeded*.
+    def solve(p: Pitch&, curl: f64, power: f64, seeded: bool, first: Kick) -> Found:
+        can Abort.Panic, Memory.Allocate:
+            aim: mutable f64 = first.aim if seeded else 0.0
+            lift: mutable f64 = first.lift if seeded else 12.0
+            for _ in 0..<12 |p, curl, power, aim, lift|:
+                k: Kick = Kick{aim: aim, lift: lift, curl: curl, power: power}
+                c: mutable Flight = flight(p, k, true)
+                if c.how != LINE:
+                    c <- flight(p, k, false)
+                    if c.how != LINE:
+                        lift <- lift + 4.0
+                        continue
+                ex: f64 = p.ring_x - c.x
+                ey: f64 = p.ring_y - c.y
+                if fabs(ex) < 0.01 and fabs(ey) < 0.01:
+                    return Found{kick: k, ok: true}
+                c1: Flight = flight(p, Kick{aim: aim + 0.2, lift: lift, curl: curl, power: power}, false)
+                c2: Flight = flight(p, Kick{aim: aim, lift: lift + 0.2, curl: curl, power: power}, false)
+                if c1.how != LINE or c2.how != LINE:
+                    lift <- lift + 2.0
+                    continue
+                j0: f64 = (c1.x - c.x) / 0.2
+                j1: f64 = (c2.x - c.x) / 0.2
+                j2: f64 = (c1.y - c.y) / 0.2
+                j3: f64 = (c2.y - c.y) / 0.2
+                det: f64 = j0 * j3 - j1 * j2
+                return Found{kick: k, ok: false} if fabs(det) < 1e-9
+                da: f64 = (ex * j3 - j1 * ey) / det
+                dl: f64 = (j0 * ey - ex * j2) / det
+                aim <- aim + py_max(-8.0, py_min(8.0, da))
+                lift <- lift + py_max(-8.0, py_min(8.0, dl))
+                if not (-35.0 <= aim and aim <= 35.0) or not (0.0 <= lift and lift <= 40.0):
+                    return Found{kick: k, ok: false}
+            return Found{kick: start(), ok: false}
+
+    # plan: a kick that scores, if one is found.
+    def plan(p: Pitch&) -> Found:
+        can Abort.Panic, Memory.Allocate:
+            powers: f64[6] = [22.0, 26.0, 30.0, 18.0, 33.0, 15.0]
+            curls: f64[7] = [0.0, 6.0, -6.0, 10.0, -10.0, 3.0, -3.0]
+            for i in 0..<6 |p, powers, curls|:
+                for j in 0..<7 |p, powers, curls, i|:
+                    k: Found = solve(p, curls[j.usize()], powers[i.usize()], false, start())
+                    if k.ok and judge(p, k.kick).code == IN_RING:
+                        return k
+            return Found{kick: start(), ok: false}
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Pitch:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            level: Grade = grade(rung)
+            for _ in 0..<200 |rung, draw, level|:
+                p: mutable Pitch = zeroed
+                p.level <- level
+                p.spot_x <- py_uniform(draw, -1.0, 1.0) * level.side
+                p.spot_z <- level.distance
+                p.goal_x <- 0.0
+                corner: f64 = -1.0 if py_choice_index(draw, 2) == 0 else 1.0
+                if level.keeper != 0.0:
+                    p.ring_x <- corner * py_uniform(draw, 1.6, WIDE / 2.0 - level.ring * 0.5 - 0.2)
+                    p.ring_y <- py_uniform(draw, py_max(0.4, level.ring * 0.7), HIGH - 0.35)
+                else:
+                    p.ring_x <- py_uniform(draw, -WIDE / 2.0 + level.ring, WIDE / 2.0 - level.ring)
+                    p.ring_y <- py_uniform(draw, py_max(0.4, level.ring * 0.7), py_max(0.5, HIGH - level.ring * 0.7))
+                p.ring_r <- level.ring
+                # the wall stands on the line from the ball to the ring's side
+                to_x: f64 = p.ring_x - p.spot_x
+                frac: f64 = (p.spot_z - WALL_AT) / p.spot_z
+                p.wall_x <- p.spot_x + to_x * (1.0 - frac) + py_uniform(draw, -0.4, 0.4)
+                p.wall_z <- WALL_AT if level.wall != 0 else -99.0
+                p.wall_w <- 0.3 * level.wall.f64()
+                p.wall_h <- 1.8 + level.jump
+                p.keeper <- -corner * py_uniform(draw, 0.0, 0.8) if level.keeper != 0.0 else 0.0
+                a: f64 = py_uniform(draw, 0.0, 2.0 * PI)
+                p.wind_x <- level.wind * cosine(a)
+                p.wind_z <- level.wind * sine(a)
+                p.seconds <- 30.0
+                p.valid <- true
+                continue if judge(&p, start()).code == IN_RING
+                if plan(&p).ok and play(p) == IN_RING:
+                    return p
+            return zeroed
+
+    def begin(p: Pitch) -> Run:
+        can Abort.Panic, Memory.Allocate:
+            return Run{pitch: p, t: 0.0, kick: start(), kicked: 0.0, struck: false, path: [],
+                outcome: Verdict{code: LIVE, miss: 0.0}, result: LIVE, miss: 0.0, notes: [], want: start(),
+                wanted: false, tries: 0}
+
+    def ball(run: Run&) -> Point:
+        can Abort.Panic:
+            if not run.struck or run.path.count == 0:
+                return Point{t: 0.0, x: run.pitch.spot_x, y: BALL, z: run.pitch.spot_z}
+            dt: f64 = run.t - run.kicked
+            for at in run.path:
+                return at if at.t >= dt
+            return run.path[run.path.count - 1]
+
+    def keeper_x(run: Run&) -> f64:
+        can Abort.Panic:
+            p: Pitch& = &run.pitch
+            return p.keeper if not run.struck or p.level.keeper == 0.0 or run.path.count == 0
+            dt: f64 = run.t - run.kicked
+            goal: f64 = run.path[run.path.count - 1].x
+            covered: f64 = py_max(0.0, dt - 0.3) * p.level.keeper
+            gap: f64 = goal - p.keeper
+            return p.keeper + copysign(py_min(fabs(gap), covered), gap)
+
+    def step(run: mutable Run&, dt: f64, control: i64):
+        can Abort.Panic:
+            return if run.result != LIVE
+            run.t <- run.t + dt
+            if not run.struck:
+                if control >= 0 and control < KICK:
+                    change: f64 = rate(control) * dt
+                    if control == AIM_L or control == AIM_R:
+                        run.kick.aim <- py_max(-35.0, py_min(35.0, run.kick.aim + change))
+                    elif control == RAISE or control == LOWER:
+                        run.kick.lift <- py_max(0.0, py_min(40.0, run.kick.lift + change))
+                    elif control == CURL_L or control == CURL_R:
+                        run.kick.curl <- py_max(-14.0, py_min(14.0, run.kick.curl + change))
+                    else:
+                        run.kick.power <- py_max(8.0, py_min(34.0, run.kick.power + change))
+                if run.t > run.pitch.seconds:
+                    run.result <- OUT_OF_TIME
+                return
+            if run.path.count > 0 and run.t - run.kicked >= run.path[run.path.count - 1].t + 0.6:
+                run.result <- run.outcome.code
+                run.miss <- run.outcome.miss
+
+    def strike(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            return if run.struck or run.result != LIVE
+            run.struck <- true
+            run.kicked <- run.t
+            run.outcome <- judge(&run.pitch, run.kick)
+            _ = fly(&run.pitch, run.kick, true, true, &run.path)
+            run.notes.push(DrShapeDeal::Note{t: run.t, dur: 0.12, freq: 160.0, pan: 0.0, pan2: 0.0, gain: 0.5,
+                gain2: 0.5, bright: 0.8, voice: WOOD, seed: run.notes.count.i64() + 1, who: -1, room: 0.0})
+            won: bool = run.outcome.code == IN_RING
+            run.notes.push(DrShapeDeal::Note{t: run.t + run.path[run.path.count - 1].t, dur: 0.3,
+                freq: 1320.0 if won else 110.0, pan: 0.0, pan2: 0.0, gain: 0.3, gain2: 0.3, bright: 0.8,
+                voice: BELL if won else GROWL, seed: run.notes.count.i64() + 1, who: -1, room: 0.0})
+
+    def act(run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate:
+            strike(run) if port == KICK
+
+    # The reference autopilot: finds a kick that scores, sets each dial to it
+    # in turn, checks the kick as set, and kicks. -1 is no port.
+    def pilot(run: mutable Run&) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            return -1 if run.result != LIVE or run.struck
+            if not run.wanted:
+                found: Found = plan(&run.pitch)
+                return KICK if not found.ok
+                run.want <- found.kick
+                run.wanted <- true
+            k: Kick = run.kick
+            want: Kick = run.want
+            ups: i64[4] = [HARDER, CURL_L, AIM_R, RAISE]
+            downs: i64[4] = [SOFTER, CURL_R, AIM_L, LOWER]
+            errs: f64[4] = [want.power - k.power, want.curl - k.curl, want.aim - k.aim, want.lift - k.lift]
+            for i in 0..<4 |ups, downs, errs|:
+                size: f64 = fabs(rate(ups[i.usize()])) / 30.0
+                err: f64 = errs[i.usize()]
+                if fabs(err) > size / 2.0:
+                    return ups[i.usize()] if err > 0.0 else downs[i.usize()]
+            return KICK if judge(&run.pitch, k).code == IN_RING
+            # the dials could not land exactly: aim again from where they are
+            again: mutable Found = solve(&run.pitch, k.curl, k.power, true, k)
+            again <- plan(&run.pitch) if not again.ok
+            if not again.ok:
+                run.wanted <- false
+                return KICK
+            run.want <- again.kick
+            run.tries <- run.tries + 1
+            return KICK if run.tries > 6
+            return -1
+
+    # play(): one round at 1/30 s a step, the autopilot asked every step.
+    def play(p: Pitch) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            run: mutable Run = begin(p)
+            while run.result == LIVE |run|:
+                port: i64 = pilot(&run)
+                act(&run, port)
+                step(&run, 1.0 / 30.0, -1 if port == KICK else port)
+            return run.result

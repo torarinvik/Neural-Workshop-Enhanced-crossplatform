@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { decode, Kind } from "../shells/web/display-list.js";
 import { instantiateElisa } from "../shells/web/elisa-wasm-runtime.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -21,7 +22,7 @@ const INFO = Object.freeze({
   verdict: 6, width: 7, height: 8, start: 9, wayOut: 10, doorCount: 11,
   held: 12, minimum: 13, greedy: 14, adaptive: 15, showTrail: 16,
   solvedCount: 17, totalPar: 18, totalSteps: 19, bestRung: 20,
-  takenSeconds: 21, message: 22,
+  takenSeconds: 21, message: 22, perfectCount: 23,
 });
 const CELL = Object.freeze({ wall: 0n, walked: 1n, door: 2n, key: 3n });
 const STATE_BYTES = 112;
@@ -56,6 +57,12 @@ function render(handle) {
   assert.ok(length > 0n);
   return new Uint8Array(instance.exports.memory.buffer, FRAME_BUFFER,
     Number(length)).slice();
+}
+
+function verdicts(handle) {
+  return decode(render(handle)).filter(({ kind, color }) =>
+    kind === Kind.TEXT && (color === 0x40ff40ff || color === 0xff4040ff))
+    .map(({ text, color, b }) => ({ text, color, y: b }));
 }
 
 function info(handle, field) {
@@ -164,6 +171,9 @@ assert.equal(info(run, INFO.steps), BigInt(path.length));
 assert.equal(info(run, INFO.steps), info(run, INFO.minimum),
   "the BFS route matches the controller's shortest-path certificate");
 assert.equal(info(run, INFO.verdict), 1n);
+assert.equal(info(run, INFO.perfectCount), 1n);
+const perfect = { text: `Perfect — the minimum ${path.length} steps, 0s`, color: 0x40ff40ff, y: 60 };
+assert.deepEqual(verdicts(run), [perfect]);
 assert.deepEqual(render(run), render(run),
   "Maze rendering is observational and deterministic");
 
@@ -172,6 +182,12 @@ assert.equal(event(run, EVENT.keyDown, timestamp++, sequence++, KEY.enter, 13n),
 assert.equal(info(run, INFO.phase), PHASE.done);
 assert.equal(info(run, INFO.solvedCount), 1n);
 assert.equal(info(run, INFO.bestRung), 1n);
+assert.equal(info(run, INFO.perfectCount), 1n);
+assert.deepEqual(verdicts(run), [perfect]);
+assert.ok(decode(render(run)).some(({ text }) => text === "1 mazes, 100% step efficiency, highest rung 1"));
+assert.equal(event(run, EVENT.keyDown, timestamp++, sequence++, KEY.space, 32n), STATUS.accepted);
+assert.equal(info(run, INFO.perfectCount), 0n);
+assert.deepEqual(verdicts(run), []);
 assert.equal(exports.nw_api_v1_destroy(run), 0n);
 assert.equal(exports.nw_api_v1_destroy(run), 0n,
   "common v1 destruction remains idempotent for Maze");
@@ -186,13 +202,26 @@ assert.equal(info(lockedRun, INFO.doorCount), 1n);
 const lockedPath = solvePath(lockedRun);
 let lockedTimestamp = 101;
 let lockedSequence = 1;
+// Take the first legal step and walk back to force a suboptimal solve.
+const back = [0, 2, 1, 4, 3][lockedPath[0]];
+for (const action of [lockedPath[0], back]) {
+  assert.equal(event(lockedRun, EVENT.action, lockedTimestamp++, lockedSequence++, BigInt(action)),
+    STATUS.accepted);
+}
 for (const action of lockedPath) {
   assert.equal(event(lockedRun, EVENT.action, lockedTimestamp++, lockedSequence++, BigInt(action)),
     STATUS.accepted);
 }
 assert.equal(info(lockedRun, INFO.phase), PHASE.solved,
   "a key-aware route opens the door and reaches the exit");
-assert.equal(info(lockedRun, INFO.steps), info(lockedRun, INFO.minimum));
+assert.equal(info(lockedRun, INFO.steps), info(lockedRun, INFO.minimum) + 2n);
+assert.equal(info(lockedRun, INFO.perfectCount), 0n);
+const extra = { text: `Out in ${lockedPath.length + 2} steps — the minimum was ${lockedPath.length}`,
+  color: 0xff4040ff, y: 60 };
+assert.deepEqual(verdicts(lockedRun), [extra]);
+assert.equal(event(lockedRun, EVENT.keyDown, lockedTimestamp++, lockedSequence++, KEY.space, 32n), STATUS.accepted);
+assert.equal(info(lockedRun, INFO.phase), PHASE.done);
+assert.deepEqual(verdicts(lockedRun), [extra]);
 assert.equal(info(lockedRun, INFO.held), 1n);
 assert.equal(exports.nw_api_v1_destroy(lockedRun), 0n);
 

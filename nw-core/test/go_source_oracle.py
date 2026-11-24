@@ -110,6 +110,7 @@ def snapshot(ui):
         "cursorY": ui.cursor_y,
         "correct": ui.correct,
         "verdict": source_verdict,
+        "verdictText": None if ui.verdict_shown is None else ui.verdict_shown[1],
         "captured": captured,
         "captureOptions": problem.capture_options if problem else 0,
         "captureGoal": problem.capture_goal if problem else 0,

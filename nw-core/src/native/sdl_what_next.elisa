@@ -1,0 +1,461 @@
+include "../scene_what_next.elisa"
+
+module SDLWhatNext:
+    const ATTEMPTS: i64 = 5
+    const NO_LIBRARY: i64 = 1
+    const NO_FFMPEG: i64 = 2
+    const BAD_CLIPS: i64 = 3
+    const NO_MEMORY: i64 = 4
+    const RGB_BYTES: i64 = SDLVideoJigsaw::SEQUENCE_FRAME_BYTES
+    const GROUP_BYTES: i64 = WhatNext::MAX_CLIPS * WhatNextGame::MAX_FRAMES * WhatNextGame::SAMPLES
+    const SHOWN_LIMIT: i64 = ATTEMPTS * WhatNextGame::MAX_TRIALS * WhatNext::MAX_CLIPS
+
+    struct Session:
+        run: mutable WhatNextGame::Run
+        files: mutable usize
+        count: mutable i64
+        shown: mutable usize[SHOWN_LIMIT]
+        shown_count: mutable i64
+        pixels: mutable usize[WhatNext::MAX_CLIPS]
+        notice: mutable i64
+        options_row: mutable i64
+        options_from_hub: mutable bool
+        draft: mutable i64[3]
+
+    def read_settings(data: heap u8&, length: i64, selected: mutable i64&):
+        can Abort.Panic, Unsafe.PointerCast:
+            rung: i64 = sdl_config_option(data, length, "WHAT_NEXT_RUNG", 0, -1)
+            trials: i64 = sdl_config_option(data, length, "WHAT_NEXT_TRIALS", 0, -1)
+            adaptive: i64 = sdl_config_option(data, length, "WHAT_NEXT_ADAPTIVE", 1, -1)
+            selected[0] <- rung if WhatNextGame::allowed_rung(rung)
+            selected[1] <- trials if WhatNextGame::allowed_total(trials)
+            selected[2] <- adaptive if adaptive == 0 or adaptive == 1
+
+    def open(seed: i64) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            selected: mutable i64[3] = [1, 10, 1]
+            size: mutable i64 = 0
+            if sdl_media_config(&size) is raw:
+                trusted Unsafe.PointerCast:
+                    read_settings(raw.cast[heap u8&], size, &selected[0])
+                SDL_free(raw)
+            path: mutable u8[4096] = zeroed
+            if sdl_task_profile_sidecar(&path[0], ".what-next-options"):
+                if sdl_read_corpus(&path[0], &size) is raw:
+                    trusted Unsafe.PointerCast:
+                        read_settings(raw.cast[heap u8&], size, &selected[0])
+                    SDL_free(raw)
+            if malloc(size_of(Session).usize()) is data:
+                trusted Unsafe.PointerCast:
+                    session: mutable heap Session& = data.cast[mutable heap Session&]
+                    session.run <- WhatNextGame::initialize(selected[0], selected[1], selected[2] != 0, seed)
+                    session.files <- 0.usize()
+                    session.count <- 0
+                    session.shown_count <- 0
+                    session.pixels <- zeroed
+                    session.notice <- 0
+                    session.options_row <- -1
+                    session.options_from_hub <- false
+                    return data.uintptr().i64()
+            return 0
+
+    def clear_pixels(session: mutable Session&):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                for clip in 0..<WhatNext::MAX_CLIPS |session|:
+                    data: usize = session.pixels[clip.usize()]
+                    if data != 0.usize():
+                        free(data.cast[heap void&])
+                        session.pixels[clip.usize()] <- 0.usize()
+
+    def clear_catalog(session: mutable Session&):
+        can Memory.Release, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                if session.files != 0.usize():
+                    SDL_free(session.files.cast[heap void&])
+                    session.files <- 0.usize()
+                    session.count <- 0
+
+    def clear_shown(session: mutable Session&):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                for index in 0..<session.shown_count |session|:
+                    SDL_free(session.shown[index.usize()].cast[heap void&])
+            session.shown_count <- 0
+
+    def close(handle: i64):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                clear_pixels(session)
+                clear_catalog(session)
+                clear_shown(session)
+                free(handle.uintptr().cast[heap void&])
+
+    def start(session: mutable Session&) -> bool:
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if not WhatNextGame::start(&session.run)
+            clear_shown(session)
+            session.notice <- 0
+            return true
+
+    def catalog(session: mutable Session&, shuffle: bool = true):
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            clear_catalog(session)
+            path: mutable u8[4096] = zeroed
+            return if sdl_data_path(&path[0], 4096.usize(), "/datasets/ucf101", 0, true) == 0.i32()
+            count: mutable i32 = 0.i32()
+            trusted Unsafe.PointerCast:
+                if SDL_GlobDirectory((&path[0]).cast[cstr], "*.avi", 0.u32(), (&count).uintptr()) is files:
+                    SDL_qsort(files, count.usize(), size_of(usize).usize(), sdl_compare_media_name)
+                    session.files <- files.uintptr()
+                    session.count <- count.i64()
+                    # MediaPool reload consumes a shuffle of its spare list.
+                    return if not shuffle
+                    for index in 1..<session.count |session|:
+                        _ = py_randbelow(&session.run.rng, (session.count - index + 1).u64())
+
+    def take(session: mutable Session&) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            path: mutable u8[4096] = zeroed
+            size: mutable i64 = 0
+            unseen: mutable darray[i64] = []
+            fresh: mutable darray[i64] = []
+            trusted Unsafe.PointerCast:
+                target: mutable u8& = &path[0]
+                has_history: bool = sdl_data_path(target, 4096.usize(), "/datasets/ucf101/seen_next.txt", 0, true) != 0.i32()
+                raw: mutable heap void&? = sdl_read_corpus(target, &size) if has_history else null
+                files: heap usize& = session.files.cast[heap usize&]
+                for item in 0..<session.count |raw, size, files, session, unseen, fresh|:
+                    name: cstr = files[item.usize()].cast[cstr]
+                    seen: mutable bool = false
+                    if raw != null:
+                        data: heap void& = raw
+                        seen <- sdl_jigsaw_seen(data.cast[heap u8&], size, name)
+                    unseen.push(item) if not seen
+                    shown: mutable bool = false
+                    for prior in 0..<session.shown_count |session, name, shown|:
+                        if SDL_strcmp(session.shown[prior.usize()].cast[cstr], name) == 0.i32():
+                            shown <- true
+                            break
+                    fresh.push(item) if not shown
+                SDL_free(raw) if raw != null
+                reset: bool = unseen.count == 0
+                pick: mutable i64 = 0
+                if not reset:
+                    pick <- unseen[py_randbelow(&session.run.rng, unseen.count.u64()).usize()]
+                elif fresh.count != 0:
+                    pick <- fresh[py_randbelow(&session.run.rng, fresh.count.u64()).usize()]
+                else:
+                    pick <- py_randbelow(&session.run.rng, session.count.u64()).i64()
+                name: cstr = files[pick.usize()].cast[cstr]
+                if has_history:
+                    sdl_jigsaw_note_photo(target, name, reset)
+                if session.shown_count < SHOWN_LIMIT:
+                    if SDL_strdup(name) is remembered:
+                        session.shown[session.shown_count.usize()] <- remembered.uintptr()
+                        session.shown_count <- session.shown_count + 1
+                return pick
+
+    def decode_clip(session: mutable Session&, group: mutable WhatNext::Group&, samples: mutable heap u8&) -> bool:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            item: i64 = take(session)
+            path: mutable u8[4096] = zeroed
+            trusted Unsafe.PointerCast:
+                target: mutable u8& = &path[0]
+                return false if not sdl_catalog_path(target, "/datasets/ucf101/", session.files, item)
+                if malloc((RGB_BYTES * WhatNextGame::MAX_FRAMES).usize()) is data:
+                    pixels: mutable heap u8& = data.cast[mutable heap u8&]
+                    frames: i64 = SDLVideoJigsaw::decode(target.cast[cstr], pixels, false, true)
+                    if frames <= 0:
+                        free(data)
+                        session.notice <- NO_FFMPEG if frames < 0
+                        return false
+                    clip: i64 = group.count
+                    offset: i64 = clip * WhatNextGame::MAX_FRAMES * WhatNextGame::SAMPLES
+                    for frame in 0..<frames |samples, offset, pixels|:
+                        src: i64 = frame * RGB_BYTES
+                        dest: i64 = offset + frame * WhatNextGame::SAMPLES
+                        for byte in 0..<WhatNextGame::SAMPLES |samples, pixels, src, dest|:
+                            samples[(dest + byte).usize()] <- pixels[(src + byte * 97).usize()]
+                    session.pixels[clip.usize()] <- data.uintptr()
+                    group.clips[clip.usize()] <- WhatNext::Clip{frames: frames, stride: WhatNextGame::SAMPLES, offset: offset}
+                    group.count <- group.count + 1
+                    return true
+            session.notice <- NO_MEMORY
+            return false
+
+    def build_group(session: mutable Session&, samples: mutable heap u8&) -> bool:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            extra: i64 = WhatNextGame::other_clips(session.run.rung) if session.count > 1 else 0
+            for _attempt in 0..<ATTEMPTS |session, samples, extra|:
+                clear_pixels(session)
+                group: mutable WhatNext::Group = zeroed
+                if not decode_clip(session, &group, samples):
+                    break if session.notice == NO_FFMPEG or session.notice == NO_MEMORY
+                    continue
+                for _other in 0..<extra |session, group, samples|:
+                    _ = decode_clip(session, &group, samples)
+                    break if session.notice == NO_FFMPEG or session.notice == NO_MEMORY
+                break if session.notice == NO_FFMPEG or session.notice == NO_MEMORY
+                level: WhatNext::Grade = WhatNext::grade(session.run.rung)
+                puzzle: WhatNext::Puzzle = WhatNext::build(&group, samples, GROUP_BYTES, &level, &session.run.rng)
+                if WhatNextGame::accept_puzzle(&session.run, puzzle, SDL_GetTicks().f64() / 1000.0):
+                    session.notice <- 0
+                    return true
+            clear_pixels(session)
+            return false
+
+    def deal(session: mutable Session&) -> bool:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if session.run.phase != WhatNextGame::LOADING
+            catalog(session)
+            session.notice <- NO_LIBRARY if session.count == 0 else BAD_CLIPS
+            if session.count > 0:
+                if malloc(GROUP_BYTES.usize()) is data:
+                    trusted Unsafe.PointerCast:
+                        success: bool = build_group(session, data.cast[mutable heap u8&])
+                        free(data)
+                        return true if success
+                else:
+                    session.notice <- NO_MEMORY
+            _ = WhatNextGame::unavailable(&session.run)
+            return false
+
+    def key(handle: i64, code: i64):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if code == 32:
+                    _ = start(session)
+                elif code >= 49 and code <= 54:
+                    _ = WhatNextGame::choose(&session.run, code - 49, SDL_GetTicks().f64() / 1000.0)
+
+    def pointer(handle: i64, x: f32, y: f32, width: i32, height: i32):
+        can Abort.Panic, Unsafe.PointerCast:
+            return if handle <= 0 or width <= 0.i32() or height <= 0.i32()
+            view: mutable f32[4] = zeroed
+            SDLGeometry::setup(&view[0], width, height)
+            px: f64 = ((x - view[1]) / view[0]).f64()
+            py: f64 = ((height.f32() - y - view[2]) / view[0]).f64()
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if session.options_row >= 0:
+                    row: i64 = sdl_option_row(x, y, width, height, 3)
+                    if row >= 0:
+                        if row == session.options_row:
+                            change_option(session, 1)
+                        session.options_row <- row
+                    return
+                choice: i64 = SceneWhatNext::hit(&session.run, px, py)
+                _ = WhatNextGame::choose(&session.run, choice, SDL_GetTicks().f64() / 1000.0)
+
+    def upload_texture(renderer: mutable void&, properties: u32, stream: i64, source: usize):
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            key_name: mutable u8[48] = zeroed
+            SDLFrame::what_next_texture_name(&key_name[0], stream)
+            trusted Unsafe.PointerCast:
+                name: cstr = (&key_name[0]).cast[cstr]
+                if SDL_GetPointerProperty(properties, name, null) == null:
+                    if SDL_CreateTexture(renderer, 0x17101803.u32(), 1.i32(), SDLVideoJigsaw::SEQUENCE_WIDTH.i32(), SDLVideoJigsaw::SEQUENCE_HEIGHT.i32()) is texture:
+                        if not SDL_SetPointerProperty(properties, name, texture):
+                            SDL_DestroyTexture(texture)
+                if SDL_GetPointerProperty(properties, name, null) is texture:
+                    _ = SDL_UpdateTexture(texture, null, source.cast[void&], (SDLVideoJigsaw::SEQUENCE_WIDTH * 3).i32())
+
+    def clear_textures(properties: u32, keep: i64):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            prior: i64 = SDL_GetNumberProperty(properties, "nw.video.what_next.streams", 0)
+            return if keep == prior
+            trusted Unsafe.PointerCast:
+                for stream in keep..<prior |properties|:
+                    key_name: mutable u8[48] = zeroed
+                    SDLFrame::what_next_texture_name(&key_name[0], stream)
+                    name: cstr = (&key_name[0]).cast[cstr]
+                    if SDL_GetPointerProperty(properties, name, null) is texture:
+                        _ = SDL_ClearProperty(properties, name)
+                        SDL_DestroyTexture(texture)
+                _ = SDL_SetNumberProperty(properties, "nw.video.what_next.streams", keep)
+
+    def prepare(renderer: mutable void&, handle: i64):
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            properties: u32 = SDL_GetRendererProperties(renderer)
+            if handle <= 0:
+                clear_textures(properties, 0)
+                return
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if WhatNextGame::advance(&session.run, SDL_GetTicks().f64() / 1000.0):
+                    clear_pixels(session)
+                if session.run.phase == WhatNextGame::LOADING:
+                    _ = deal(session)
+                if session.run.phase != WhatNextGame::CHOOSING and session.run.phase != WhatNextGame::JUDGED:
+                    clear_textures(properties, 0)
+                    return
+                streams: i64 = session.run.puzzle.count + 1
+                clear_textures(properties, streams)
+                now: f64 = SDL_GetTicks().f64() / 1000.0
+                for stream in 0..<streams |session, renderer, properties, now|:
+                    frame: i64 = WhatNextGame::frame(&session.run, stream, now)
+                    if frame >= 0:
+                        clip: i64 = 0 if stream == 0 else session.run.puzzle.options[(stream - 1).usize()].slice.clip
+                        source: usize = session.pixels[clip.usize()] + (frame * RGB_BYTES).usize()
+                        upload_texture(renderer, properties, stream, source)
+
+    def frame_write(dest: i64, capacity: i64, handle: i64, black: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if dest <= 0 or capacity <= 0 or handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                notice: cstr = "No video library yet — see the Readme" if session.notice == NO_LIBRARY else ("What Happens Next needs the ffmpeg program — see the Readme" if session.notice == NO_FFMPEG else ("None of the downloaded clips would make a puzzle" if session.notice == BAD_CLIPS else ("Could not allocate video frames" if session.notice == NO_MEMORY else "")))
+                list: mutable Display::DisplayList = Display::DisplayList()
+                if session.options_row >= 0:
+                    sdl_grid_options_frame(&list, black != 0, 76, session.options_row, &session.draft[0])
+                    note: mutable dstr = []
+                    SceneWhatNext::option_note(session.draft[0], session.count, &note)
+                    ink: u32 = Display::rgba(255, 255, 255, 255) if black != 0 else Display::rgba(20, 24, 32, 255)
+                    Display::draw_text(&list, bytes_view(note), 456.0, 254.0, 10.0, ink, Display::ANCHOR_CENTER_CENTER)
+                else:
+                    SceneWhatNext::render(&list, &session.run, black != 0, sview(notice, 0, -1))
+                encoded: darray[u8] = Display::encode_binary(&list)
+                length: i64 = encoded.count.i64()
+                return 0 if length <= 0 or length > capacity
+                memcpy(dest.uintptr().cast[mutable void&], (&encoded[0]).cast[void&], length.usize())
+                return length
+
+    def change_option(session: mutable Session&, direction: i64):
+        can Abort.Panic:
+            row: i64 = session.options_row
+            if row == 2:
+                session.draft[2] <- 1 - session.draft[2]
+                return
+            rungs: i64[8] = [1, 4, 8, 12, 16, 20, 24, 30]
+            totals: i64[5] = [1, 5, 10, 20, 40]
+            if row == 0:
+                for at in 0..<8 |session, rungs, direction|:
+                    if rungs[at.usize()] == session.draft[0]:
+                        session.draft[0] <- rungs[((at + 8 + direction) % 8).usize()]
+                        return
+            else:
+                for at in 0..<5 |session, totals, direction|:
+                    if totals[at.usize()] == session.draft[1]:
+                        session.draft[1] <- totals[((at + 5 + direction) % 5).usize()]
+                        return
+
+    def options_key(handle: i64, code: i64, from_hub: bool = false) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return 0 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if session.options_row < 0:
+                    return 0 if code != 99 or (session.run.phase != WhatNextGame::READY and session.run.phase != WhatNextGame::DONE)
+                    session.draft[0] <- session.run.start_rung
+                    session.draft[1] <- session.run.total
+                    session.draft[2] <- 1 if session.run.adaptive else 0
+                    session.options_row <- 0
+                    session.options_from_hub <- from_hub
+                    catalog(session, false)
+                    return 1
+                if SDLTaskKeys::enter(code):
+                    data: mutable u8[256] = zeroed
+                    length: i32 = SDL_snprintf(&data[0], 256.usize(),
+                        "[DEFAULT]\nWHAT_NEXT_RUNG = %lld\nWHAT_NEXT_TRIALS = %lld\nWHAT_NEXT_ADAPTIVE = %s\n",
+                        session.draft[0], session.draft[1], "True" if session.draft[2] != 0 else "False")
+                    if length <= 0.i32() or length >= 256.i32() or not sdl_save_profile_sidecar(".what-next-options", &data[0], length.usize()):
+                        SDL_Log("Could not save What Happens Next options")
+                        return 1
+                    session.run.start_rung <- session.draft[0]
+                    session.run.rung <- session.draft[0]
+                    session.run.total <- session.draft[1]
+                    session.run.adaptive <- session.draft[2] != 0
+                    session.run.phase <- WhatNextGame::READY
+                    session.notice <- 0
+                if code == 27 or SDLTaskKeys::enter(code):
+                    session.options_row <- -1
+                    return 2 if session.options_from_hub else 1
+                session.options_row <- SDLTaskKeys::option_row(code, session.options_row, 3)
+                if code == SDLTaskKeys::LEFT or code == SDLTaskKeys::RIGHT or code == 32:
+                    change_option(session, -1 if code == SDLTaskKeys::LEFT else 1)
+                return 1
+
+    def info(handle: i64, field: i64) -> i64:
+        can Unsafe.PointerCast:
+            return 0 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                return session.run.phase if field == 0
+                return session.run.rung if field == 1
+                return session.run.trial if field == 2
+                return session.run.total if field == 3
+                return session.run.passed if field == 4
+                return session.notice if field == 5
+                return 1 if field == 6 and session.run.adaptive else 0
+
+def sdl_what_next_render_selftest(handle: i64) -> bool:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        state: mutable usize[3] = zeroed
+        surface: usize = sdl_screenshot_open(&state[0], 912.i32(), 684.i32(), 65536, 373694468.u32())
+        return false if surface == 0.usize()
+        good: mutable bool = false
+        trusted Unsafe.PointerCast:
+            renderer: mutable void& = state[1].cast[mutable void&]
+            SDLWhatNext::prepare(renderer, handle)
+            length: i64 = SDLWhatNext::frame_write(state[2].i64(), 65536, handle, 0)
+            good <- sdl_finish_frame(renderer, state[2].cast[u8&], length, 912.i32(), 684.i32(), 1, 0,
+                surface, 0.usize(), 0.usize()) == -1.i32()
+            session: mutable heap SDLWhatNext::Session& = handle.uintptr().cast[mutable heap SDLWhatNext::Session&]
+            target: mutable void& = surface.cast[mutable void&]
+            opening_channel: mutable bool = false
+            for stream in 0..<3 |session, target, good, opening_channel|:
+                box: SceneWhatNext::Tile = SceneWhatNext::tile(stream, session.run.puzzle.count)
+                x: i32 = (box.left + box.width / 2.0).i32()
+                y: i32 = (684.0 - box.bottom - box.height / 2.0).i32()
+                red: mutable u8 = 0.u8()
+                green: mutable u8 = 0.u8()
+                blue: mutable u8 = 0.u8()
+                alpha: mutable u8 = 0.u8()
+                good <- false if not SDL_ReadSurfacePixel(target, x, y, &red, &green, &blue, &alpha)
+                red_clip: bool = red >= 200.u8() and blue < 40.u8()
+                blue_clip: bool = blue >= 200.u8() and red < 40.u8()
+                good <- false if not red_clip and not blue_clip
+                if stream == 0:
+                    opening_channel <- red_clip
+                else:
+                    source: i64 = session.run.puzzle.options[(stream - 1).usize()].slice.clip
+                    good <- false if (source == 0) != (red_clip == opening_channel)
+            answer: SceneWhatNext::Tile = SceneWhatNext::tile(session.run.puzzle.answer + 1, session.run.puzzle.count)
+            SDLWhatNext::pointer(handle, (answer.left + answer.width / 2.0).f32(),
+                (684.0 - answer.bottom - answer.height / 2.0).f32(), 912.i32(), 684.i32())
+            good <- good and session.run.phase == WhatNextGame::JUDGED and session.run.passed == 1
+            SDLWhatNext::prepare(renderer, 0)
+            good <- good and SDL_GetNumberProperty(SDL_GetRendererProperties(renderer), "nw.video.what_next.streams", -1) == 0
+        sdl_screenshot_close(&state[0], surface)
+        return good
+
+def sdl_what_next_media_selftest(expect_library: bool) -> i32:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        handle: i64 = SDLWhatNext::open(17)
+        return 1.i32() if handle <= 0
+        good: mutable bool = false
+        trusted Unsafe.PointerCast:
+            session: mutable heap SDLWhatNext::Session& = handle.uintptr().cast[mutable heap SDLWhatNext::Session&]
+            _ = SDLWhatNext::start(session)
+            loaded: bool = SDLWhatNext::deal(session)
+            if expect_library:
+                good <- loaded and session.notice == 0 and session.count == 2
+                good <- good and session.run.rung == 1 and session.run.total == 1 and not session.run.adaptive
+                good <- good and session.run.puzzle.count == 2 and session.run.trial == 1
+                good <- good and session.pixels[0] != 0.usize() and session.pixels[1] != 0.usize()
+            else:
+                good <- not loaded and session.notice == SDLWhatNext::NO_LIBRARY and session.run.phase == WhatNextGame::READY
+        if expect_library and good:
+            good <- sdl_what_next_render_selftest(handle)
+            trusted Unsafe.PointerCast:
+                session: mutable heap SDLWhatNext::Session& = handle.uintptr().cast[mutable heap SDLWhatNext::Session&]
+                good <- good and WhatNextGame::advance(&session.run, session.run.deadline) and session.run.phase == WhatNextGame::DONE
+        SDLWhatNext::close(handle)
+        if good:
+            _ = printf("What Happens Next native media selftest: PASS\n")
+        return 0.i32() if good else 1.i32()

@@ -1,0 +1,157 @@
+include "./bluff.elisa"
+
+module BluffReference:
+    const BUCKETS: i64 = 3
+    const CELLS: i64 = BUCKETS * 2
+    const PRIOR: f64 = 0.3
+    const KEEP: f64 = 0.97
+
+    struct Model:
+        cards: i64
+        yes: mutable f64[CELLS]
+        no: mutable f64[CELLS]
+
+    def bucket(card: i64, cards: i64) -> i64:
+        b: i64 = (Bluff::strength(card, cards) * BUCKETS.f64()).i64()
+        return b if b < BUCKETS else BUCKETS - 1
+
+    def initialize(cards: i64) -> Model:
+        can Abort.Panic:
+            sound: Bluff::Habits = Bluff::Habits{kind: Bluff::SOUND, bets: 0, bluffs: 0, shown: 0, folds: 0, faced: 0}
+            model: mutable Model = Model{cards: cards, yes: zeroed, no: zeroed}
+            for key in 0..<CELLS |model, sound|:
+                strength: f64 = ((key % BUCKETS).f64() + 0.5) / BUCKETS.f64()
+                p: f64 = Bluff::aggression(sound, strength, Bluff::OPEN if key < BUCKETS else Bluff::BET)
+                model.yes[key.usize()] <- p + PRIOR
+                model.no[key.usize()] <- 1.0 - p + PRIOR
+            return model
+
+    def length(spot: i64) -> i64:
+        if spot == Bluff::OPEN:
+            return 0
+        if spot == Bluff::CHECK or spot == Bluff::BET:
+            return 1
+        return 3 if spot == Bluff::CHECK_BET_CALL or spot == Bluff::CHECK_BET_FOLD else 2
+
+    def began_with_bet(spot: i64) -> bool:
+        return spot == Bluff::BET or spot == Bluff::BET_CALL or spot == Bluff::BET_FOLD
+
+    def before(spot: i64, index: i64) -> i64:
+        if index == 0:
+            return Bluff::OPEN
+        if index == 1:
+            return Bluff::BET if began_with_bet(spot) else Bluff::CHECK
+        return Bluff::CHECK_BET
+
+    def aggressive_at(spot: i64, index: i64) -> bool:
+        if index == 0:
+            return began_with_bet(spot)
+        if index == 1:
+            return spot != Bluff::CHECK_CHECK and spot != Bluff::BET_FOLD
+        return spot == Bluff::CHECK_BET_CALL
+
+    def probability(model: Model&, spot: i64, b: i64) -> f64:
+        can Abort.Panic:
+            key: usize = (b if Bluff::opening(spot) else b + BUCKETS).usize()
+            return model.yes[key] / (model.yes[key] + model.no[key])
+
+    def saw(model: mutable Model&, record: Bluff::Record):
+        can Abort.Panic:
+            for key in 0..<CELLS |model|:
+                at: usize = key.usize()
+                model.yes[at] <- PRIOR + (model.yes[at] - PRIOR) * KEEP
+                model.no[at] <- PRIOR + (model.no[at] - PRIOR) * KEEP
+            if record.shown < 0:
+                folder_first: bool = record.spot == Bluff::CHECK_BET_FOLD
+                return if folder_first == record.player_first
+                for b in 0..<BUCKETS |model|:
+                    at: usize = (BUCKETS + b).usize()
+                    model.no[at] <- model.no[at] + 0.3 * (BUCKETS - b).f64() / BUCKETS.f64()
+                return
+            b: i64 = bucket(record.shown, model.cards)
+            for i in 0..<length(record.spot) |model, record, b|:
+                continue if (i % 2 == 0) == record.player_first
+                at: usize = (b if Bluff::opening(before(record.spot, i)) else b + BUCKETS).usize()
+                if aggressive_at(record.spot, i):
+                    model.yes[at] <- model.yes[at] + 1.0
+                else:
+                    model.no[at] <- model.no[at] + 1.0
+
+    def likelihood(model: Model&, spot: i64, player_first: bool, theirs: i64) -> f64:
+        can Abort.Panic:
+            weight: mutable f64 = 1.0
+            b: i64 = bucket(theirs, model.cards)
+            for i in 0..<length(spot) |model, spot, player_first, b, weight|:
+                continue if (i % 2 == 0) == player_first
+                p: f64 = probability(model, before(spot, i), b)
+                weight <- weight * (p if aggressive_at(spot, i) else 1.0 - p)
+            return weight
+
+    def after(model: Model&, spot: i64, player_first: bool, mine: i64, theirs: i64) -> f64:
+        can Abort.Panic:
+            return Bluff::won(spot, player_first, mine, theirs).f64() if spot >= Bluff::CHECK_CHECK
+            if Bluff::first_actor(spot) == player_first:
+                pick: i64 = best_choice(model, spot, player_first, mine)
+                return after(model, Bluff::next_spot(spot, pick == 1), player_first, mine, theirs)
+            p: f64 = probability(model, spot, bucket(theirs, model.cards))
+            return (p * after(model, Bluff::next_spot(spot, true), player_first, mine, theirs) +
+                (1.0 - p) * after(model, Bluff::next_spot(spot, false), player_first, mine, theirs))
+
+    def best_choice(model: Model&, spot: i64, player_first: bool, mine: i64) -> i64:
+        can Abort.Panic:
+            aggressive: i64 = Bluff::next_spot(spot, true)
+            passive: i64 = Bluff::next_spot(spot, false)
+            norm: mutable f64 = 0.0
+            correction: mutable f64 = 0.0
+            aggressive_total: mutable f64 = 0.0
+            passive_total: mutable f64 = 0.0
+            for theirs in 0..<model.cards |model, spot, player_first, mine, aggressive, passive, norm, correction, aggressive_total, passive_total|:
+                continue if theirs == mine
+                weight: f64 = likelihood(model, spot, player_first, theirs)
+                next: f64 = norm + weight
+                correction <- correction + Bluff::correction(norm, weight, next)
+                norm <- next
+                aggressive_total <- aggressive_total + weight * after(model, aggressive, player_first, mine, theirs)
+                passive_total <- passive_total + weight * after(model, passive, player_first, mine, theirs)
+            divisor: f64 = norm + correction if norm > 0.0 else 1.0
+            return 1 if aggressive_total / divisor >= passive_total / divisor - 1e-9 else 0
+
+    def reference_move(model: Model&, round: Bluff::Match&) -> i64:
+        can Abort.Panic:
+            hand: Bluff::Hand = round.dealt.hands[round.records.count]
+            return best_choice(model, round.spot, hand.player_first, hand.player)
+
+    def sound_move(round: Bluff::Match&) -> i64:
+        can Abort.Panic:
+            hand: Bluff::Hand = round.dealt.hands[round.records.count]
+            sound: Bluff::Habits = Bluff::Habits{kind: Bluff::SOUND, bets: 0, bluffs: 0, shown: 0, folds: 0, faced: 0}
+            p: f64 = Bluff::aggression(sound, Bluff::strength(hand.player, round.dealt.level.cards), round.spot)
+            coin: f64 = hand.coins[0] + 0.5
+            return 1 if (coin - 1.0 if coin >= 1.0 else coin) < p else 0
+
+    def reference_round(dealt: Bluff::Deal) -> Bluff::Match:
+        can Memory.Allocate, Abort.Panic:
+            round: mutable Bluff::Match = Bluff::initialize(dealt)
+            model: mutable Model = initialize(dealt.level.cards)
+            while not Bluff::over(&round) |round, model|:
+                index: usize = round.records.count
+                _ = Bluff::act(&round, reference_move(&model, &round))
+                if round.records.count > index:
+                    saw(&model, round.records[index])
+            return round
+
+    def sound_round(dealt: Bluff::Deal) -> Bluff::Match:
+        can Memory.Allocate, Abort.Panic:
+            round: mutable Bluff::Match = Bluff::initialize(dealt)
+            while not Bluff::over(&round) |round|:
+                _ = Bluff::act(&round, sound_move(&round))
+            return round
+
+    def par(dealt: Bluff::Deal) -> f64:
+        can Memory.Allocate, Abort.Panic:
+            ref: Bluff::Match = reference_round(dealt)
+            value: f64 = Bluff::value(&ref)
+            if dealt.level.allow >= 0.0:
+                base: Bluff::Match = sound_round(dealt)
+                return value - dealt.level.allow * fmax(0.0, value - Bluff::value(&base))
+            return value - dealt.level.allow * dealt.level.hands.f64()

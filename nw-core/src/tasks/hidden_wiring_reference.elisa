@@ -1,0 +1,142 @@
+include "./hidden_wiring.elisa"
+
+module HiddenWiringReference:
+    struct Belief:
+        settings: i64
+        gates: i64
+        truth: darray[u8]
+        misses: mutable darray[i64]
+        live: mutable darray[i64]
+        lit: mutable darray[i64]
+        certain_on: mutable darray[i64]
+        uncertain: mutable darray[i64]
+
+    def initialize(level: HiddenWiring::Grade&, gates: darray[HiddenWiring::Gate]&) -> Belief:
+        can Memory.Allocate, Abort.Panic:
+            settings: i64 = 1 << level.switches.u64()
+            count: i64 = gates.count.i64()
+            truth: mutable darray[u8] = Bytes::zeros(settings * count)
+            for gate in 0..<count |gate, gates, settings, truth|:
+                wiring: HiddenWiring::Gate = gates[gate.usize()]
+                for setting in 0..<settings |setting, settings, gate, wiring, truth|:
+                    truth[(gate * settings + setting).usize()] <- 1.u8() if HiddenWiring::evaluate(wiring, setting) else 0.u8()
+            return Belief{settings: settings, gates: count, truth: truth,
+                misses: Ints::zeros(level.lamps * count), live: Ints::zeros(level.lamps),
+                lit: Ints::zeros(level.lamps * settings), certain_on: Ints::zeros(settings),
+                uncertain: Ints::zeros(settings)}
+
+    def saw(belief: mutable Belief&, lamps: i64, setting: i64, pattern: i64):
+        can Abort.Panic:
+            for lamp in 0..<lamps |lamp, belief, setting, pattern|:
+                shown: i64 = (pattern >> lamp.u64()) & 1
+                for gate in 0..<belief.gates |gate, belief, lamp, setting, shown|:
+                    if belief.truth[(gate * belief.settings + setting).usize()].i64() != shown:
+                        at: i64 = lamp * belief.gates + gate
+                        Ints::put(&belief.misses, at, Ints::at_ref(&belief.misses, at) + 1)
+
+    def tally_lamp(belief: mutable Belief&, lamp: i64, allowance: i64):
+        can Abort.Panic:
+            base: i64 = lamp * belief.gates
+            least: mutable i64 = HiddenWiring::MAX_LOOKS
+            for gate in 0..<belief.gates |gate, belief, base, least|:
+                misses: i64 = Ints::at_ref(&belief.misses, base + gate)
+                least <- misses if misses < least
+
+            # Leading candidates set certainty. One extra miss is tolerated
+            # for noisy observations when estimating likelihood or split.
+            count: mutable i64 = 0
+            for gate in 0..<belief.gates |gate, belief, lamp, base, least, allowance, count|:
+                misses: i64 = Ints::at_ref(&belief.misses, base + gate)
+                continue if misses > least + allowance
+                count <- count + 1
+                for setting in 0..<belief.settings |setting, belief, lamp, gate, misses, least|:
+                    bit: i64 = belief.truth[(gate * belief.settings + setting).usize()].i64()
+                    slot: i64 = lamp * belief.settings + setting
+                    Ints::put(&belief.lit, slot, Ints::at_ref(&belief.lit, slot) + bit)
+                    if misses == least:
+                        mask: i64 = 1 << lamp.u64()
+                        table: mutable darray[i64]& = &belief.certain_on if bit != 0 else &belief.uncertain
+                        Ints::put(table, setting, Ints::at_ref(table, setting) | mask)
+            Ints::put(&belief.live, lamp, count)
+
+    def tally(belief: mutable Belief&, level: HiddenWiring::Grade&):
+        can Abort.Panic:
+            for setting in 0..<belief.settings |setting, belief|:
+                Ints::put(&belief.certain_on, setting, 0)
+                Ints::put(&belief.uncertain, setting, 0)
+            for slot in 0..<(belief.settings * level.lamps) |slot, belief|:
+                Ints::put(&belief.lit, slot, 0)
+            for lamp in 0..<level.lamps |lamp, belief, level|:
+                tally_lamp(belief, lamp, 1 if level.noise > 0.0 else 0)
+            # While tallying, uncertain recorded the existence of an off
+            # candidate. A lamp is uncertain only when both states occurred.
+            for setting in 0..<belief.settings |setting, belief|:
+                on: i64 = Ints::at_ref(&belief.certain_on, setting)
+                off: i64 = Ints::at_ref(&belief.uncertain, setting)
+                Ints::put(&belief.uncertain, setting, on & off)
+
+    def certain(belief: Belief&, pattern: i64) -> i64:
+        can Abort.Panic:
+            for setting in 0..<belief.settings |setting, belief, pattern|:
+                return setting if Ints::at_view(&belief.uncertain, setting) == 0 and Ints::at_view(&belief.certain_on, setting) == pattern
+            return -1
+
+    def next_look(belief: Belief&, level: HiddenWiring::Grade&, dealt: HiddenWiring::Deal&) -> i64:
+        can Abort.Panic:
+            ready: mutable bool = true
+            for index in 0..<dealt.questions |index, belief, dealt, ready|:
+                if certain(belief, dealt.exam[index.usize()]) < 0:
+                    ready <- false
+                    break
+            return -1 if ready
+            best: mutable i64 = -1
+            maximum: mutable f64 = 0.0
+            for setting in 0..<belief.settings |setting, belief, level, best, maximum|:
+                gain: mutable f64 = 0.0
+                for lamp in 0..<level.lamps |lamp, setting, belief, gain|:
+                    count: i64 = Ints::at_view(&belief.live, lamp)
+                    lit: i64 = Ints::at_view(&belief.lit, lamp * belief.settings + setting)
+                    if lit > 0 and lit < count:
+                        p: f64 = lit.f64() / count.f64()
+                        other: f64 = 1.0 - p
+                        gain <- gain - (p * log2(p) + other * log2(other))
+                if gain > maximum:
+                    maximum <- gain
+                    best <- setting
+            return best
+
+    def guess(belief: Belief&, lamps: i64, pattern: i64) -> i64:
+        can Abort.Panic:
+            sure: i64 = certain(belief, pattern)
+            return sure if sure >= 0
+            best: mutable i64 = 0
+            maximum: mutable f64 = -1000000000.0
+            for setting in 0..<belief.settings |setting, belief, lamps, pattern, best, maximum|:
+                score: mutable f64 = 0.0
+                for lamp in 0..<lamps |lamp, setting, belief, pattern, score|:
+                    count: i64 = Ints::at_view(&belief.live, lamp)
+                    lit: i64 = Ints::at_view(&belief.lit, lamp * belief.settings + setting)
+                    agree: i64 = lit if (pattern & (1 << lamp.u64())) != 0 else count - lit
+                    score <- score + log((agree.f64() + 0.01) / (count.f64() + 0.02))
+                if score > maximum:
+                    maximum <- score
+                    best <- setting
+            return best
+
+    def play(level: HiddenWiring::Grade&, gates: darray[HiddenWiring::Gate]&, dealt: HiddenWiring::Deal&, round: mutable HiddenWiring::Round&):
+        can Memory.Allocate, Abort.Panic:
+            belief: mutable Belief = initialize(level, gates)
+            tally(&belief, level)
+            limit: i64 = HiddenWiring::budget(level)
+            while round.looks < limit |round, belief, level, dealt, limit|:
+                setting: i64 = next_look(&belief, level, dealt)
+                break if setting < 0
+                shown: i64 = HiddenWiring::look(round, level, dealt, setting)
+                saw(&belief, level.lamps, setting, shown)
+                tally(&belief, level)
+            round.examining <- true
+            for index in 0..<dealt.questions |index, dealt, belief, level, round|:
+                _ = HiddenWiring::answer(round, level, dealt, guess(&belief, level.lamps, dealt.exam[index.usize()]))
+
+    def par(level: HiddenWiring::Grade&, round: HiddenWiring::Round&) -> f64:
+        return HiddenWiring::cost(round, level).f64() * level.factor + level.slack

@@ -1,0 +1,117 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { decode } from "../shells/web/display-list.js";
+import { instantiateElisa } from "../shells/web/elisa-wasm-runtime.js";
+import { TASK_IDS_BY_CATEGORY } from "../shells/web/task-registry.js";
+
+const bytes = fs.readFileSync(process.env.NWCORE_WASM_PATH ?? new URL("../build/nwcore.wasm", import.meta.url));
+const { exports: api, createSokobanLiveEnvironment } = await instantiateElisa(bytes, { warn: false });
+const task = api.nw_api_v1_task_sokobanlive();
+assert.equal(task, 95000669n);
+assert.equal(api.nw_api_v1_supports(task, 1n), 1n);
+assert.equal(api.nw_api_v1_create(task, 1n, 2n, 1n, 0n, 0n, 0n, 0n, 17n), -3n);
+const handle = api.nw_api_v1_create(task, 1n, 1n, 1n, 0n, 0n, 0n, 0n, 17n);
+assert.ok(handle > 0n);
+const capacity = 1048576n;
+const pointer = api.nw_frame_alloc(capacity);
+let sequence = 0n;
+const info = field => api.nw_api_v1_sokobanlive_info(handle, BigInt(field));
+function view(length) {
+  assert.ok(length > 0n && length <= capacity);
+  return new Uint8Array(api.memory.buffer, Number(pointer), Number(length));
+}
+function labels(dark = 0n) {
+  return decode(view(api.nw_api_v1_render(handle, pointer, capacity, dark, 912n, 684n)))
+    .map(command => command.text).filter(text => text !== undefined);
+}
+function dispatch(kind, code, time, mods = 0n, x = 0, y = 0) {
+  return api.nw_api_v1_dispatch(handle, kind, BigInt(time), sequence++, code, 0n, mods, 0n,
+    BigInt(Math.round(x * 1e6 / 912)), BigInt(Math.round(y * 1e6 / 684)), 0n);
+}
+const advance = (time, dt) => api.nw_api_v1_advance(handle, BigInt(time), BigInt(dt), sequence++);
+
+try {
+  assert.equal(TASK_IDS_BY_CATEGORY[5][11], "sokoban_live");
+  const hub = decode(view(api.nw_taskhub_write(pointer, capacity, 5n, 11n, 0n, 912n, 684n)));
+  assert.ok(hub.some(command => command.text === "Sokoban Live"));
+  const note = new TextDecoder().decode(view(api.nw_sokobanlive_options_note(pointer, capacity, 16n)));
+  assert.match(note, /4 crate.*2 guard.*0.50 s.*Shutters open and shut/);
+  assert.ok(labels().includes("Press Space or click to start"));
+  assert.equal(dispatch(5n, 2n, 0), 2n);
+  assert.equal(dispatch(5n, 0n, 0, 0n, 456, 342), 1n);
+  assert.equal(dispatch(5n, 0n, 0, 0n, 456, 342), 2n);
+  const keyForDirection = [4n, 6n, 3n, 5n];
+  // Original Python solution for rung 1, seed 17, with 200 ms per move.
+  const route = [1, 1, 1, 2, 1, 3, 3, 3, 3, 1, 3, 0, 0, 0, 0];
+  let now = 0;
+  for (const direction of route) {
+    assert.equal(dispatch(2n, keyForDirection[direction], now), 1n);
+    now += 100;
+    assert.equal(advance(now, 100), 1n);
+    if (info(0) === 2n) break;
+    now += 100;
+    assert.equal(advance(now, 100), 1n);
+  }
+  assert.equal(info(0), 2n);
+  assert.equal(info(7), 1n);
+  assert.equal(info(4), 11n);
+  assert.equal(info(5), 15n);
+  assert.equal(info(6), 1n);
+  assert.equal(now, 2900);
+  assert.ok(labels(1n).includes("Every pad covered in 3 s"));
+  assert.equal(advance(now + 2999, 2999), 2n);
+  assert.equal(advance(now + 3000, 1), 1n);
+  assert.ok(labels().includes("1 of 1 passed   highest rung passed 1"));
+  assert.equal(api.nw_sokobanlive_options_apply(handle, 4n, 1n, 0n), 1n);
+  assert.equal(dispatch(5n, 0n, now + 3001, 0n, 456, 342), 1n);
+  assert.equal(info(0), 1n);
+} finally {
+  assert.equal(api.nw_api_v1_destroy(handle), 0n);
+  assert.equal(info(0), -1n);
+  api.nw_frame_free(pointer);
+}
+console.log("Sokoban Live WASM: hub, keyboard, clocked solution, verdict, and restart pass");
+
+const canvas = { width: 228, height: 171 };
+const pixels = new Uint8ClampedArray(canvas.width * canvas.height * 4);
+const context = {
+  canvas, labels: [],
+  save() {}, restore() {}, setTransform() {}, translate() {}, scale() {}, rotate() {},
+  strokeRect() {}, beginPath() {}, arc() {}, fill() {}, stroke() {}, moveTo() {}, lineTo() {}, closePath() {},
+  clearRect() { pixels.fill(0); this.labels.length = 0; },
+  fillRect() {},
+  fillText(text) {
+    this.labels.push(text);
+    const rgba = this.fillStyle === "rgba(64,255,64,1.000)" ? [64, 255, 64, 255]
+      : this.fillStyle === "rgba(255,64,64,1.000)" ? [255, 64, 64, 255] : null;
+    if (rgba) {
+      pixels.set(rgba, pixels.length - 4);
+      pixels.set(rgba, pixels.length - 4 - canvas.width * 4);
+    }
+  },
+  getImageData() { return { data: pixels }; },
+};
+
+assert.throws(() => createSokobanLiveEnvironment(context, { thinkSeconds: 1 }), /already clocked/);
+const run = createSokobanLiveEnvironment(context, { seed: 17, rung: 1, trials: 1, frameHz: 20 });
+try {
+  assert.equal(run.n_actions, 4);
+  assert.ok(context.labels.includes("Push every crate onto a pad; keep clear of guards"));
+  // Python at 20 Hz with repeated down moves.
+  for (let tick = 0; tick < 11; tick++) {
+    assert.equal(run.step(1)[0].outcome, undefined);
+  }
+  const receipt = run.act(1);
+  assert.ok(receipt.ok);
+  assert.equal(run.act(1).ok, false);
+  const verdict = run.advance();
+  assert.equal(verdict.outcome.receipt_id, receipt.receipt_id);
+  assert.equal(verdict.outcome.scalar, -1);
+  assert.ok(run.verify(verdict.outcome, verdict));
+  assert.ok(context.labels.includes("A crate is stuck for good"));
+  assert.ok(run.advance().done);
+  assert.equal(run.reset(17).done, false);
+} finally {
+  run.close();
+}
+console.log("Sokoban Live stepped WASM: 4 ports, 12 clocked ticks, verified verdict, completion, and reset pass");

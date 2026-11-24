@@ -11,13 +11,14 @@
 # compiler under our feet -- and it is built from THEIR branch, not ours.
 # Two sessions were spent chasing results that came from that.
 #
-# Ours are built here, from the selected Elisa-core and Elisa-compiler
-# checkouts, and nothing else writes to them. Three artefacts, because stage1
+# Ours are built from the selected Elisa-core and Elisa-compiler checkouts.
+# The output directory exposes three artefacts, because stage1
 # bootstraps through stage0 and then builds its runtime from the resulting
 # product:
 #
 #   elisac-stage0        Go + cgo over the LLVM C API
 #   elisac-stage1        the self-hosted compiler, seeded by stage0
+#                       (linked to the private product under the Stage1 checkout)
 #   elisacore_runtime.o  the runtime, compiled by that stage1 product
 set -euo pipefail
 
@@ -34,7 +35,6 @@ fi
 CORE="${ELISA_CORE:-$DEFAULT_CORE}"
 STAGE1_ROOT="${ELISA_STAGE1_ROOT:-$DEFAULT_STAGE1_ROOT}"
 export ELISA_CORE="$CORE"
-export ELISA_STAGE1_ROOT="$STAGE1_ROOT"
 export ELISACORE_STRICT_FP=1
 export ELISA_STAGE1_SEMANTIC_GATE=1
 # Overridable so a candidate toolchain (an integration branch, say) can be built
@@ -45,6 +45,9 @@ FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 
 mkdir -p "$OUT"
+OUT="$(cd -- "$OUT" && pwd -P)"
+STAGE1_ROOT="$(cd -- "$STAGE1_ROOT" && pwd -P)"
+export ELISA_STAGE1_ROOT="$STAGE1_ROOT"
 export ELISACORE_BIN="$OUT/elisac-stage0"
 export ELISA_STAGE1_BIN="$OUT/elisac-stage1"
 export ELISA_RUNTIME_OBJ="$OUT/elisacore_runtime.o"
@@ -62,6 +65,18 @@ sha256_file() {
         shasum -a 256 "$1" | awk '{print $1}'
     fi
 }
+
+# Stage1 authenticates standard-library paths from its resolved executable
+# location. Keep the real binary under the selected checkout's bin directory,
+# even when the configured toolchain output is elsewhere.
+stage1_build_bin="$ELISA_STAGE1_BIN"
+case "$OUT" in
+    "$STAGE1_ROOT/bin"|"$STAGE1_ROOT/bin/"*) ;;
+    *)
+        output_key="$(printf '%s' "$OUT" | sha256_file /dev/stdin)"
+        stage1_build_bin="$STAGE1_ROOT/bin/nw-toolchains/$output_key/elisac-stage1"
+        ;;
+esac
 
 # Stage1 carries a copy of the core runtime. Refuse to replace any compiler
 # binary until the copy is either identical or consists only of the reviewed,
@@ -81,7 +96,8 @@ want="$(printf 'stage0_branch=%s\nstage0_commit=%s\nstage0_source_fingerprint=%s
     "$(branch_of "$CORE")" "$core_head" "$core_fingerprint" \
     "$(branch_of "$STAGE1_ROOT")" "$stage1_head" "$stage1_fingerprint")"
 
-if (( ! FORCE )) && [[ -x "$ELISACORE_BIN" && -x "$ELISA_STAGE1_BIN" && -f "$ELISA_RUNTIME_OBJ" ]] \
+if (( ! FORCE )) && [[ -x "$ELISACORE_BIN" && -x "$ELISA_STAGE1_BIN" && -f "$ELISA_RUNTIME_OBJ" &&
+                         "$ELISA_STAGE1_BIN" -ef "$stage1_build_bin" ]] \
    && [[ -f "$stamp" ]] && [[ "$(sed -n '1,6p' "$stamp")" == "$want" ]]; then
     recorded_stage0="$(sed -n '7s/^stage0_sha256=//p' "$stamp")"
     recorded_runtime="$(sed -n '8s/^runtime_sha256=//p' "$stamp")"
@@ -95,17 +111,28 @@ if (( ! FORCE )) && [[ -x "$ELISACORE_BIN" && -x "$ELISA_STAGE1_BIN" && -f "$ELI
     fi
 fi
 
+rebuild_with_deadline() {
+    python3 "$STAGE1_ROOT/scripts/run_with_timeout.py" 30 -- "$@"
+}
+
 echo "==> stage0  (go build, from $CORE @ $core_head)"
-go build -C "$CORE/compiler" -o "$ELISACORE_BIN" ./src
+rebuild_with_deadline go -C "$CORE/compiler" build -o "$ELISACORE_BIN" ./src
 
 echo "==> stage1 + runtime (seeded by stage0, then built by stage1, from $STAGE1_ROOT @ $stage1_head)"
-# The seed compiles the whole self-hosted compiler with stage0: a minute or
-# two, and several thousand advisory warnings about its own sources. Only real
-# errors are worth showing here.
+# The seed can emit several thousand advisory warnings about its own sources.
 # The seed publishes the Stage1 product before building its matching runtime.
 # Building that runtime before the seed creates a bootstrap cycle because the
 # runtime builder correctly requires the Stage1 product.
-"$STAGE1_ROOT/scripts/elisac_stage1.sh" --seed 2>&1 | grep -v "warning:" | sed 's/^/    /'
+rebuild_with_deadline env ELISA_REBUILD_SUPERVISED=1 ELISA_STAGE1_BIN="$stage1_build_bin" \
+    "$STAGE1_ROOT/scripts/elisac_stage1.sh" --seed 2>&1 | sed '/warning:/d; s/^/    /'
+
+if [[ "$stage1_build_bin" != "$ELISA_STAGE1_BIN" ]]; then
+    for suffix in .provenance.json ""; do
+        alias_tmp="$ELISA_STAGE1_BIN$suffix.$$.tmp"
+        ln -s "$stage1_build_bin$suffix" "$alias_tmp"
+        mv -f "$alias_tmp" "$ELISA_STAGE1_BIN$suffix"
+    done
+fi
 
 stamp_tmp="$stamp.$$.tmp"
 {

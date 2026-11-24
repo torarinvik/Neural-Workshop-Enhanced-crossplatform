@@ -1,0 +1,243 @@
+include "./passages.elisa"
+include "../hand_view.elisa"
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module FullStop:
+    const MOST: i64 = 12
+    const WORDS_MAX: i64 = 112
+    const DONE: i64 = HandView::KEYS
+    const RESET: i64 = DONE + 1
+    const PORTS: i64 = RESET + 1
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const WRONG: i64 = 2
+    const TIMEOUT: i64 = 3
+    const DONE_X: f64 = 900.0
+    const RESET_X: f64 = 760.0
+    const BUTTON_Y: f64 = 44.0
+    const TILE_H: f64 = 34.0
+    const GAP: f64 = 10.0
+
+    struct Grade:
+        rung: i64
+        sentences: i64
+        hint: bool
+        flat: bool
+        short: bool
+        pace: f64
+
+    struct Machine:
+        level: Grade
+        words: Passages::Word[112]
+        stops: bool[112]
+        count: i64
+        seconds: f64
+
+    struct Candidate:
+        valid: bool
+        machine: Machine
+
+    struct Tile:
+        x: f64
+        y: f64
+        width: f64
+
+    struct Layout:
+        tiles: Tile[112]
+        scale: f64
+
+    struct Cue:
+        t: f64
+        duration: f64
+        frequency: f64
+        voice: i64
+        gain: f64
+        pan: f64
+
+    struct Run:
+        machine: Machine
+        layout: Layout
+        hand: mutable HandView::Pointer
+        stops: mutable bool[112]
+        t: mutable f64
+        result: mutable i64
+        missing: mutable i64
+        extra: mutable i64
+        count: mutable i64
+        notes: mutable darray[Cue]
+        record_notes: bool
+
+    def grade(requested: i64) -> Grade:
+        can Abort.Panic:
+            r: i64 = requested if requested > 0 else 1
+            n: i64 = 2 + (r - 1) / 2
+            pace: f64 = 0.9 if r <= 22 else 0.9 * fmax(0.2, 1.0 - 0.025 * (r - 22).f64())
+            return Grade{rung: r, sentences: n if n < MOST else MOST, hint: r < 10,
+                flat: r >= 14, short: r >= 20, pace: py_round_decimal(pace, 1000.0)}
+
+    def build(level: Grade, rng: mutable MT19937&, bank: Passages::Bank&, pairs: Passages::Index&, known: Passages::Index&) -> Candidate:
+        can Abort.Panic:
+            invalid: Candidate = zeroed
+            bank_size: i64 = bank.passages.count.i64()
+            return invalid if bank_size == 0
+            size: mutable i64 = 0
+            selected: mutable Passages::Row[12] = zeroed
+            lo: i64 = 4 if level.short else 5
+            hi: i64 = 8 if level.short else 12
+            for _ in 0..<400 |size, selected, level, rng, bank, bank_size, lo, hi|:
+                break if size >= level.sentences
+                row: Passages::Row = bank.passages[py_randbelow(rng, bank_size.u64()).usize()]
+                for k in row.start..<row.stop |size, selected, level, bank, lo, hi|:
+                    break if size >= level.sentences
+                    sent: Passages::Row = bank.sentences[k.usize()]
+                    length: i64 = sent.stop - sent.start
+                    break if length < lo or length > hi
+                    selected[size.usize()] <- sent
+                    size <- size + 1
+            return invalid if size < level.sentences
+            count: mutable i64 = 0
+            words: mutable Passages::Word[112] = zeroed
+            stops: mutable bool[112] = zeroed
+            for k in 0..<size |selected, bank, pairs, known, count, words, stops, level, invalid|:
+                sent: Passages::Row = selected[k.usize()]
+                return invalid if count + sent.stop - sent.start > WORDS_MAX
+                first: Passages::Word = bank.words[sent.start.usize()]
+                return invalid if count > 0 and Passages::contains(pairs, words[(count - 1).usize()], first)
+                for at in sent.start..<sent.stop |sent, count, words, level, bank, known|:
+                    words[count.usize()] <- Passages::normalized(bank.words[at.usize()], at == sent.start, level.flat, known)
+                    count <- count + 1
+                stops[(count - 1).usize()] <- true
+            stops[(count - 1).usize()] <- false
+            seconds: f64 = py_round_decimal(20.0 + level.pace * count.f64() + 4.0 * size.f64(), 10.0)
+            return Candidate{valid: true, machine: Machine{level: level, words: words, stops: stops, count: count, seconds: seconds}}
+
+    def layout(machine: Machine&) -> Layout:
+        can Abort.Panic:
+            tiles: mutable Tile[112] = zeroed
+            scale: mutable f64 = 1.0
+            while true |machine, tiles, scale|:
+                x: mutable f64 = 60.0
+                y: mutable f64 = 520.0
+                for i in 0..<machine.count |machine, tiles, scale, x, y|:
+                    width: f64 = (machine.words[i.usize()].length.f64() * 10.5 + 16.0) * scale
+                    if x + width > 940.0 and x > 60.0:
+                        x <- 60.0
+                        y <- y - 62.0 * scale
+                    tiles[i.usize()] <- Tile{x: x + width / 2.0, y: y, width: width}
+                    x <- x + (width + GAP * scale)
+                return Layout{tiles: tiles, scale: scale} if y >= 130.0 or scale <= 0.5
+                scale <- scale - 0.05
+
+    def start(machine: Machine, record_notes: bool = true) -> Run:
+        can Memory.Allocate, Abort.Panic:
+            blank: bool[112] = zeroed
+            return Run{machine: machine, layout: layout(&machine), hand: HandView::initialize(),
+                stops: blank, t: 0.0, result: LIVE, missing: 0, extra: 0, count: 0, notes: [], record_notes: record_notes}
+
+    def note(run: mutable Run&, duration: f64, frequency: f64, voice: i64, gain: f64, pan: f64 = 0.0):
+        can Memory.Allocate, Abort.Panic:
+            return if not run.record_notes
+            run.notes.push(Cue{t: run.t, duration: duration, frequency: frequency, voice: voice, gain: gain, pan: pan})
+
+    def submit(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != LIVE
+            for i in 0..<run.machine.count |run|:
+                expected: bool = run.machine.stops[i.usize()]
+                chosen: bool = run.stops[i.usize()]
+                run.missing <- run.missing + 1 if expected and not chosen
+                run.extra <- run.extra + 1 if chosen and not expected
+            if run.missing == 0 and run.extra == 0:
+                note(run, 0.6, 880.0, 2, 0.5)
+                run.result <- CLEAR
+            else:
+                note(run, 0.5, 90.0, 3, 0.5)
+                run.result <- WRONG
+
+    def reset(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            run.stops <- zeroed
+            run.count <- 0
+            note(run, 0.1, 200.0, 1, 0.3)
+
+    def word_at(run: Run&, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            for i in 0..<run.machine.count |run, x, y|:
+                tile: Tile = run.layout.tiles[i.usize()]
+                if fabs(x - tile.x) <= tile.width / 2.0 + GAP * run.layout.scale / 2.0 and fabs(y - tile.y) <= TILE_H * run.layout.scale / 2.0 + 4.0:
+                    return i
+            return -1
+
+    def press(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != LIVE or run.hand.down
+            run.hand.down <- true
+            x: f64 = run.hand.x
+            y: f64 = run.hand.y
+            if fabs(y - BUTTON_Y) <= 20.0:
+                if fabs(x - DONE_X) <= 60.0:
+                    submit(run)
+                    return
+                if fabs(x - RESET_X) <= 60.0:
+                    reset(run)
+                    return
+            i: i64 = word_at(run, x, y)
+            return if i < 0 or i == run.machine.count - 1
+            prior: bool = run.stops[i.usize()]
+            run.stops[i.usize()] <- not prior
+            run.count <- run.count + (-1 if prior else 1)
+            note(run, 0.06, 330.0 if prior else 660.0, 1 if prior else 0, 0.3, (x - 500.0) / 500.0)
+
+    def act(run: mutable Run&, port: i64):
+        can Memory.Allocate, Abort.Panic:
+            return if port < 0 or port >= PORTS
+            if port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                press(run)
+            elif port == HandView::RELEASE:
+                run.hand.down <- false
+            elif run.result == LIVE:
+                if port == DONE:
+                    submit(run)
+                else:
+                    reset(run)
+
+    def step(run: mutable Run&, dt: f64):
+        return if run.result != LIVE
+        run.t <- run.t + dt
+        run.result <- TIMEOUT if run.t >= run.machine.seconds
+
+    def click_port(run: Run&, x: f64, y: f64) -> i64:
+        return HandView::RELEASE if run.hand.down
+        port: i64 = HandView::toward(&run.hand, x, y)
+        return port if port >= 0 else HandView::PRESS
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            for i in 0..<run.machine.count |run|:
+                if run.stops[i.usize()] != run.machine.stops[i.usize()]:
+                    tile: Tile = run.layout.tiles[i.usize()]
+                    return click_port(run, tile.x, tile.y)
+            return click_port(run, DONE_X, BUTTON_Y)
+
+    def play(machine: Machine) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            run: mutable Run = start(machine, false)
+            while run.result == LIVE |run|:
+                act(&run, pilot(&run))
+                step(&run, 1.0 / 60.0)
+            return run.result == CLEAR
+
+    def deal(rung: i64, rng: mutable MT19937&, bank: Passages::Bank&, pairs: Passages::Index&, known: Passages::Index&) -> Candidate:
+        can Memory.Allocate, Abort.Panic:
+            level: Grade = grade(rung)
+            candidate_rng: mutable MT19937 = zeroed
+            for _ in 0..<200 |bank, pairs, known, rng, candidate_rng, level|:
+                mt_seed_int(&candidate_rng, py_getrandbits(rng, 32))
+                candidate: Candidate = build(level, &candidate_rng, bank, pairs, known)
+                return candidate if candidate.valid and play(candidate.machine)
+            invalid: Candidate = zeroed
+            return invalid

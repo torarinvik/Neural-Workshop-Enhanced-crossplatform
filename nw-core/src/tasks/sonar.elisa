@@ -1,0 +1,143 @@
+include "../pyrandom.elisa"
+
+module Sonar:
+    const MAX_SIDE: i64 = 24
+    const MAX_CELLS: i64 = MAX_SIDE * MAX_SIDE
+    const MAX_ACTIONS: i64 = MAX_CELLS + 10
+    const PING: i64 = 1
+    const WRONG_DIG: i64 = -1
+
+    struct Grade:
+        rung: i64
+        side: i64
+        width: i64
+        bands: i64
+        noise: f64
+        drift: f64
+        penalty: i64
+        slack: f64
+
+    # Cells are encoded y * side + x. The path contains the initial cell and
+    # one cell per simulated action, including the source's extra final draw.
+    struct Deal:
+        level: Grade
+        budget: i64
+        path: mutable i64[MAX_ACTIONS + 2]
+        lies: mutable i64[MAX_ACTIONS + 1]
+
+    struct Observation:
+        cell: i64
+        reading: i64
+
+    struct Round:
+        dealt: Deal
+        actions: mutable i64
+        observations: mutable Observation[MAX_ACTIONS]
+        cost: mutable i64
+        found: mutable bool
+        over: mutable bool
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        return Grade{
+            rung: r, side: 24 if r >= 20 else 4 + r,
+            width: 1 if r <= 2 else (2 if r <= 6 else 3),
+            bands: 64 if r <= 2 else (5 if r <= 6 else 4),
+            noise: 0.0 if r < 5 else (0.30 if r >= 10 else 0.05 * (r - 4).f64()),
+            drift: 0.0 if r < 8 else (0.45 if r >= 15 else 0.06 * (r - 7).f64()),
+            penalty: 24 if r >= 22 else 2 + r,
+            slack: (4 - r / 3).f64() if r < 12 else (0.0 if r <= 20 else -0.5 * (r - 20).f64())
+        }
+
+    def band(level: Grade, first: i64, second: i64) -> i64:
+        can Abort.Panic:
+            dx: i64 = first % level.side - second % level.side
+            dy: i64 = first / level.side - second / level.side
+            ax: i64 = -dx if dx < 0 else dx
+            ay: i64 = -dy if dy < 0 else dy
+            distance: i64 = ax if ax > ay else ay
+            group: i64 = distance / level.width
+            return group if group < level.bands else level.bands - 1
+
+    def likelihood(level: Grade, reading: i64, true_band: i64) -> f64:
+        return 1.0 - level.noise if reading == true_band
+        return 0.0 if reading < 0 or reading >= level.bands
+        return 0.0 if reading != true_band - 1 and reading != true_band + 1
+        return level.noise if true_band == 0 or true_band == level.bands - 1 else level.noise / 2.0
+
+    def neighbours(cell: i64, side: i64, cells: mutable i64&) -> i64:
+        can Abort.Panic:
+            x: i64 = cell % side
+            y: i64 = cell / side
+            count: mutable i64 = 0
+            if x + 1 < side:
+                cells[count.usize()] <- cell + 1
+                count <- count + 1
+            if x > 0:
+                cells[count.usize()] <- cell - 1
+                count <- count + 1
+            if y + 1 < side:
+                cells[count.usize()] <- cell + side
+                count <- count + 1
+            if y > 0:
+                cells[count.usize()] <- cell - side
+                count <- count + 1
+            return count
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Deal:
+        can Abort.Panic:
+            level: Grade = grade(rung)
+            side: i64 = level.side
+            budget: i64 = side * side + 10
+            dealt: mutable Deal = Deal{level: level, budget: budget, path: zeroed, lies: zeroed}
+            x: i64 = py_randbelow(rng, side.u64()).i64()
+            y: i64 = py_randbelow(rng, side.u64()).i64()
+            cell: mutable i64 = y * side + x
+            dealt.path[0] <- cell
+            for at in 0..<(budget + 1) |rng, level, side, cell, dealt|:
+                if level.drift > 0.0 and py_random(rng) < level.drift:
+                    options: mutable i64[4] = zeroed
+                    count: i64 = neighbours(cell, side, &options[0])
+                    cell <- options[py_randbelow(rng, count.u64()).usize()]
+                dealt.path[(at + 1).usize()] <- cell
+            for at in 0..<(budget + 1) |rng, level, dealt|:
+                if py_random(rng) < level.noise:
+                    dealt.lies[at.usize()] <- 2 * py_randbelow(rng, 2.u64()).i64() - 1
+            return dealt
+
+    def initialize(dealt: Deal) -> Round:
+        return Round{dealt: dealt, actions: 0, observations: zeroed, cost: 0, found: false, over: false}
+
+    def target(round: Round&) -> i64:
+        can Abort.Panic:
+            return round.dealt.path[round.actions.usize()]
+
+    def record(round: mutable Round&, cell: i64, reading: i64, cost: i64):
+        can Abort.Panic:
+            round.observations[round.actions.usize()] <- Observation{cell: cell, reading: reading}
+            round.cost <- round.cost + cost
+            round.actions <- round.actions + 1
+            round.over <- round.actions >= round.dealt.budget
+
+    def can_probe(round: Round&, cell: i64) -> bool:
+        side: i64 = round.dealt.level.side
+        return not round.over and cell >= 0 and cell < side * side
+
+    def ping(round: mutable Round&, cell: i64) -> i64:
+        can Abort.Panic:
+            return -1 if not can_probe(round, cell)
+            level: Grade = round.dealt.level
+            raw: i64 = band(level, cell, target(round)) + round.dealt.lies[round.actions.usize()]
+            reading: i64 = 0 if raw < 0 else (level.bands - 1 if raw >= level.bands else raw)
+            record(round, cell, reading, PING)
+            return reading
+
+    def dig(round: mutable Round&, cell: i64) -> bool:
+        can Abort.Panic:
+            return false if not can_probe(round, cell)
+            if cell == target(round):
+                round.found <- true
+                round.over <- true
+                return true
+            record(round, cell, WRONG_DIG, round.dealt.level.penalty)
+            return false

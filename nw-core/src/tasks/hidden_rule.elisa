@@ -1,0 +1,245 @@
+include "./ints.elisa"
+include "../pyrandom.elisa"
+
+module HiddenRule:
+    const BUDGET: i64 = 48
+    const MAX_EXAM: i64 = 10
+    const MAX_ITEMS: i64 = 384
+    const MAX_RULES: i64 = 5360
+    const WORDS: i64 = 6
+    const BUCKETS: i64 = 16384
+    const ATOM_STRIDE: i64 = 8
+
+    struct Grade:
+        rung: i64
+        values: i64[6]
+        features: i64
+        items: i64
+        forms: i64
+        nots: i64
+        noise: f64
+        exam: i64
+        penalty: i64
+        slack: f64
+        factor: f64
+
+    struct Space:
+        count: mutable i64
+        masks: mutable darray[i64]
+        rules: mutable darray[i64]
+
+    struct Deal:
+        rule: mutable i64
+        mask: mutable i64[WORDS]
+        seeds: mutable i64[2]
+        lies: mutable bool[BUDGET]
+        exam: mutable i64[MAX_EXAM]
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        features: i64 = 2 if r <= 2 else (3 if r <= 5 else (4 if r <= 9 else (5 if r <= 14 else 6)))
+        wide: i64 = 2 if r <= 3 else (3 if r <= 7 else 4)
+        counts: i64 = 2 if r <= 11 else 3
+        items: i64 = wide * wide * (2 if features >= 3 else 1) * (counts if features >= 4 else 1) * (2 if features >= 5 else 1) * (2 if features >= 6 else 1)
+        forms: i64 = 1 if r < 6 else (2 if r < 8 else (3 if r < 10 else (4 if r < 13 else (6 if r < 16 else 9))))
+        factor: f64 = 2.0 - (r - 1).f64() / 11.0 if r < 12 else (1.0 if r <= 20 else 1.0 / (1.0 + 0.04 * (r - 20).f64()))
+        return Grade{rung: r, values: [wide, wide, 2, counts, 2, 2], features: features,
+            items: items, forms: forms, nots: 0 if r < 4 else (1 if r < 19 else 2),
+            noise: 0.0 if r < 12 else (0.10 if r >= 16 else 0.02 * (r - 11).f64()),
+            exam: 6 if r <= 4 else (8 if r <= 11 else 10), penalty: 24 if r >= 21 else r + 3,
+            slack: 1.0 if r < 12 else 0.0, factor: factor}
+
+    def feature_value(level: Grade&, item: i64, feature: i64) -> i64:
+        can Abort.Panic:
+            remainder: mutable i64 = item
+            slot: mutable i64 = level.features - 1
+            while slot > feature |slot, remainder, level, feature|:
+                remainder <- remainder / level.values[slot.usize()]
+                slot <- slot - 1
+            return remainder % level.values[feature.usize()]
+
+    def combine(form: i64, a: i64, b: i64, c: i64) -> i64:
+        return a if form == 0
+        return a & b if form == 1
+        return a | b if form == 2
+        return a ^ b if form == 3
+        return a & b & c if form == 4
+        return a | b | c if form == 5
+        return (a & b) | (a & c) | (b & c) if form == 6
+        return (a & b) | c if form == 7
+        return (a | b) & c
+
+    def add_rule(space: mutable Space&, atoms: darray[i64]&, full: darray[i64]&, table: mutable darray[i64]&, form: i64, a: i64, b: i64, c: i64):
+        can Abort.Panic:
+            mask: mutable i64[WORDS] = zeroed
+            empty: mutable bool = true
+            every: mutable bool = true
+            hash: mutable u64 = 1.u64()
+            for word in 0..<WORDS |word, mask, atoms, full, form, a, b, c, empty, every, hash|:
+                value: i64 = combine(form, Ints::at_view(atoms, a * WORDS + word),
+                    Ints::at_view(atoms, b * WORDS + word), Ints::at_view(atoms, c * WORDS + word))
+                mask[word.usize()] <- value
+                empty <- false if value != 0
+                every <- false if value != Ints::at_view(full, word)
+                bits: u64 = value.u64()
+                hash <- (hash * 16777619.u64() ^ bits ^ (bits >> 19) ^ (bits >> 37) ^ (bits >> 53)) & 4294967295.u64()
+            return if empty or every
+            bucket: mutable i64 = (hash & (BUCKETS - 1).u64()).i64()
+            while Ints::at_ref(table, bucket) != 0 |bucket, table, space, mask|:
+                rule: i64 = Ints::at_ref(table, bucket) - 1
+                same: mutable bool = true
+                for word in 0..<WORDS |word, space, mask, rule, same|:
+                    if mask[word.usize()] != Ints::at_view(&space.masks, rule * WORDS + word):
+                        same <- false
+                        break
+                return if same
+                bucket <- (bucket + 1) % BUCKETS
+            index: i64 = space.count
+            Ints::put(table, bucket, index + 1)
+            for word in 0..<WORDS |word, space, index, mask|:
+                Ints::put(&space.masks, index * WORDS + word, mask[word.usize()])
+            Ints::put(&space.rules, index * 4, form)
+            Ints::put(&space.rules, index * 4 + 1, a)
+            Ints::put(&space.rules, index * 4 + 2, b)
+            Ints::put(&space.rules, index * 4 + 3, c)
+            space.count <- index + 1
+
+    def build(level: Grade&) -> Space:
+        can Memory.Allocate, Abort.Panic:
+            world: mutable Space = Space{count: 0, masks: Ints::zeros(MAX_RULES * WORDS), rules: Ints::zeros(MAX_RULES * 4)}
+            table: mutable darray[i64] = Ints::zeros(BUCKETS)
+            full: mutable darray[i64] = Ints::zeros(WORDS)
+            atoms: mutable darray[i64] = Ints::zeros(6 * ATOM_STRIDE * WORDS)
+            plain: mutable darray[i64] = []
+            negated: mutable darray[i64] = []
+            for item in 0..<level.items |item, full, atoms, level|:
+                word: i64 = item / 64
+                bit: i64 = (1.u64() << (item % 64).u64()).i64()
+                Ints::put(&full, word, Ints::at_ref(&full, word) | bit)
+                for feature in 0..<level.features |feature, atoms, level, item, word, bit|:
+                    offset: i64 = (feature * ATOM_STRIDE + feature_value(level, item, feature)) * WORDS + word
+                    Ints::put(&atoms, offset, Ints::at_ref(&atoms, offset) | bit)
+            for feature in 0..<level.features |feature, level, plain, negated, atoms, full|:
+                count: i64 = level.values[feature.usize()]
+                for value in 0..<count |value, feature, count, plain, negated, atoms, full|:
+                    atom: i64 = feature * ATOM_STRIDE + value
+                    plain.push(atom)
+                    if count >= 3:
+                        negated.push(atom + 4)
+                        for word in 0..<WORDS |word, atoms, full, atom|:
+                            Ints::put(&atoms, (atom + 4) * WORDS + word,
+                                Ints::at_ref(&full, word) ^ Ints::at_ref(&atoms, atom * WORDS + word))
+            positives: i64 = plain.count.i64()
+            for index in 0..<negated.count.i64() |index, plain, negated|:
+                plain.push(Ints::at_ref(&negated, index))
+            for form in 0..<level.forms |form, world, level, table, full, atoms, plain, positives|:
+                pool: i64 = plain.count.i64() if (form == 0 and level.nots >= 1) or (form > 0 and form < 4 and level.nots >= 2) else positives
+                for first in 0..<pool |first, pool, world, table, full, atoms, plain, form|:
+                    a: i64 = Ints::at_ref(&plain, first)
+                    if form == 0:
+                        add_rule(&world, &atoms, &full, &table, form, a, 0, 0)
+                        continue
+                    for second in (first + 1)..<pool |second, pool, world, table, full, atoms, plain, form, a|:
+                        b: i64 = Ints::at_ref(&plain, second)
+                        if form < 4:
+                            add_rule(&world, &atoms, &full, &table, form, a, b, 0)
+                            continue
+                        for third in (second + 1)..<pool |third, world, table, full, atoms, plain, form, a, b|:
+                            c: i64 = Ints::at_ref(&plain, third)
+                            add_rule(&world, &atoms, &full, &table, form, a, b, c)
+                            if form >= 7:
+                                add_rule(&world, &atoms, &full, &table, form, a, c, b)
+                                add_rule(&world, &atoms, &full, &table, form, b, c, a)
+            return world
+
+    def lit(world: Space&, rule: i64, item: i64) -> bool:
+        can Abort.Panic:
+            word: u64 = Ints::at_view(&world.masks, rule * WORDS + item / 64).u64()
+            return ((word >> (item % 64).u64()) & 1.u64()) != 0.u64()
+
+    def draw(pool: darray[i64]&, count: i64, rng: mutable MT19937&, exam: mutable darray[i64]&, offset: i64):
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = pool.count.i64()
+            scratch: mutable darray[i64] = Ints::zeros(size)
+            taken: mutable i64 = 0
+            while taken < count |taken, count, pool, rng, scratch, exam, offset, size|:
+                for index in 0..<size |index, pool, scratch|:
+                    Ints::put(&scratch, index, Ints::at_view(pool, index))
+                py_shuffle_i64_prefix(rng, &scratch, size)
+                for index in 0..<size |index, taken, count, exam, offset, scratch|:
+                    break if taken == count
+                    Ints::put(exam, offset + taken, Ints::at_ref(&scratch, index))
+                    taken <- taken + 1
+
+    def deal(level: Grade&, world: Space&, rng: mutable MT19937&, result: mutable Deal&):
+        can Memory.Allocate, Abort.Panic:
+            rule: i64 = py_randbelow(rng, world.count.u64()).i64()
+            bright: mutable darray[i64] = []
+            dark: mutable darray[i64] = []
+            for index in 0..<level.items |index, rule, world, bright, dark|:
+                if lit(world, rule, index):
+                    bright.push(index)
+                else:
+                    dark.push(index)
+            result.rule <- rule
+            for word in 0..<WORDS |word, result, world, rule|:
+                result.mask[word.usize()] <- Ints::at_view(&world.masks, rule * WORDS + word)
+            result.seeds[0] <- Ints::at_ref(&bright, py_randbelow(rng, bright.count.u64()).i64())
+            result.seeds[1] <- Ints::at_ref(&dark, py_randbelow(rng, dark.count.u64()).i64())
+            for test in 0..<BUDGET |test, rng, level, result|:
+                result.lies[test.usize()] <- py_random(rng) < level.noise
+            exam: mutable darray[i64] = Ints::zeros(level.exam)
+            half: i64 = level.exam / 2
+            draw(&bright, half, rng, &exam, 0)
+            draw(&dark, level.exam - half, rng, &exam, half)
+            py_shuffle_i64_prefix(rng, &exam, level.exam)
+            for index in 0..<level.exam |index, exam, result|:
+                result.exam[index.usize()] <- Ints::at_ref(&exam, index)
+
+    struct Round:
+        tests: mutable i64[BUDGET]
+        readings: mutable bool[BUDGET]
+        test_count: mutable i64
+        answers: mutable bool[MAX_EXAM]
+        answer_count: mutable i64
+        wrong: mutable i64
+        examining: mutable bool
+        over: mutable bool
+
+    def deal_lit(dealt: Deal&, item: i64) -> bool:
+        can Abort.Panic:
+            return ((dealt.mask[(item / 64).usize()].u64() >> (item % 64).u64()) & 1.u64()) != 0.u64()
+
+    # Return the displayed reading, or -1 if testing is unavailable.
+    def test(round: mutable Round&, level: Grade&, dealt: Deal&, item: i64) -> i64:
+        can Abort.Panic:
+            return -1 if round.examining or round.over or round.test_count >= BUDGET or item < 0 or item >= level.items
+            index: usize = round.test_count.usize()
+            shown: bool = deal_lit(dealt, item) != dealt.lies[index]
+            round.tests[index] <- item
+            round.readings[index] <- shown
+            round.test_count <- round.test_count + 1
+            return 1 if shown else 0
+
+    def start_exam(round: mutable Round&) -> bool:
+        return false if round.examining or round.over
+        round.examining <- true
+        return true
+
+    def question(round: Round&, dealt: Deal&) -> i64:
+        can Abort.Panic:
+            return -1 if not round.examining or round.over
+            return dealt.exam[round.answer_count.usize()]
+
+    def answer(round: mutable Round&, level: Grade&, dealt: Deal&, call: bool) -> bool:
+        can Abort.Panic:
+            item: i64 = question(round, dealt)
+            return false if item < 0
+            round.answers[round.answer_count.usize()] <- call
+            round.answer_count <- round.answer_count + 1
+            round.wrong <- round.wrong + 1 if call != deal_lit(dealt, item)
+            round.over <- round.answer_count >= level.exam
+            return true
+
+    def cost(round: Round&, level: Grade&) -> i64:
+        return round.test_count + round.wrong * level.penalty

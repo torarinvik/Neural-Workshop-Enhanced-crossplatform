@@ -68,7 +68,7 @@ assert (s.state[0], s.state[1], s.state[2], s.state[7]) == (1, 2, 1, 0)
 s.close()
 s.close()
 hub = app.TaskHubSession(core, args)
-hub.category, hub.selected = 4, 8
+hub.category, hub.selected = 4, 9
 hub.key(keys.C, keys)
 assert isinstance(hub.child, app.ScrambleSession) and hub.child.options_draft is not None
 hub.key(keys.ESCAPE, keys)

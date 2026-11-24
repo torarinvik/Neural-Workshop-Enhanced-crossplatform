@@ -1,0 +1,268 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+include "../strings.elisa"
+
+module Lander:
+    const WIDTH: f64 = 100.0
+    const HEIGHT: f64 = 70.0
+    const TURN: f64 = 2.2
+    const HALF_W: f64 = 1.6
+    const HIGH: f64 = 3.2
+    const TAU: f64 = 6.283185307179586
+    const RAD: f64 = 0.017453292519943295
+    const THRUST: i64 = 0
+    const LEFT: i64 = 1
+    const RIGHT: i64 = 2
+    const THRUST_LEFT: i64 = 3
+    const THRUST_RIGHT: i64 = 4
+    const COAST: i64 = -1
+    const PENDING: i64 = 0
+    const LANDED: i64 = 1
+    const OFF_MAP: i64 = 2
+    const TIMEOUT: i64 = 3
+    const OFF_PAD: i64 = 4
+    const TOO_FAST_DOWN: i64 = 5
+    const TOO_FAST_ACROSS: i64 = 6
+    const TILTED: i64 = 7
+
+    struct Grade:
+        rung: i64
+        pad: f64
+        offset_min: f64
+        offset_max: f64
+        start_speed: f64
+        fuel: f64
+        rough: bool
+        wind: f64
+        gusts: bool
+        hidden: bool
+        moving: f64
+        max_down: f64
+        max_across: f64
+        max_tilt: f64
+
+    struct Point:
+        x: f64
+        y: f64
+
+    struct Flight:
+        level: Grade
+        gravity: f64
+        ratio: f64
+        ground: mutable Point[23]
+        count: mutable i64
+        pad_x: f64
+        pad_y: f64
+        start_x: mutable f64
+        start_vx: mutable f64
+        wind: mutable f64
+        phase: mutable f64
+
+    struct Craft:
+        flight: Flight
+        x: mutable f64
+        y: mutable f64
+        vx: mutable f64
+        vy: mutable f64
+        angle: mutable f64
+        fuel: mutable f64
+        time: mutable f64
+        firing: mutable bool
+        result: mutable i64
+
+    def maximum(a: f64, b: f64) -> f64:
+        return a if a > b else b
+
+    def minimum(a: f64, b: f64) -> f64:
+        return a if a < b else b
+
+    def clamp(value: f64, lo: f64, hi: f64) -> f64:
+        return maximum(lo, minimum(hi, value))
+
+    def magnitude(value: f64) -> f64:
+        return -value if value < 0.0 else value
+
+    def degrees(angle: f64) -> i64:
+        return py_round_half_even(angle * 57.29577951308232)
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: f64 = (r - 20).f64() if r > 20 else 0.0
+        easy: bool = r < 4
+        return Grade{rung: r, pad: 24.0 if easy else (16.0 if r < 7 else (12.0 if r < 20 else maximum(6.0, 9.0 - 0.3 * top))),
+            offset_min: 0.0 if easy else 20.0, offset_max: 5.0 + 5.0 * (r - 1).f64() if easy else 32.0,
+            start_speed: 0.0 if easy else 3.0, fuel: -1.0 if easy else (25.0 if r < 20 else maximum(15.0, 22.0 - 0.4 * top)),
+            rough: r >= 7, wind: 0.0 if r < 10 else 0.5, gusts: r >= 13, hidden: r >= 16, moving: 0.0 if r < 20 else 8.0,
+            max_down: 3.5 if easy else (3.0 if r < 7 else (2.5 if r < 20 else maximum(1.4, 2.0 - 0.06 * top))),
+            max_across: 2.0 if easy else 1.5, max_tilt: (15.0 if easy else (12.0 if r < 20 else 8.0)) * RAD}
+
+    def uniform(rng: mutable MT19937&, lo: f64, hi: f64) -> f64:
+        return lo + (hi - lo) * py_random(rng)
+
+    def side(rng: mutable MT19937&) -> f64:
+        can Abort.Panic:
+            return -1.0 if py_randbelow(rng, 2.u64()) == 0.u64() else 1.0
+
+    def ground_insert(flight: mutable Flight&, p: Point):
+        can Abort.Panic:
+            at: mutable i64 = flight.count
+            while at > 0 |at, flight, p|:
+                prior: Point = flight.ground[(at - 1).usize()]
+                break if prior.x < p.x or (prior.x == p.x and prior.y <= p.y)
+                flight.ground[at.usize()] <- prior
+                at <- at - 1
+            flight.ground[at.usize()] <- p
+            flight.count <- flight.count + 1
+
+    def deal(rung: i64, seed: i64) -> Flight:
+        can Abort.Panic:
+            level: Grade = grade(rung)
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            gravity: f64 = uniform(&rng, 1.0, 3.7) if level.hidden else 1.62
+            ratio: f64 = uniform(&rng, 1.8, 3.0) if level.hidden else 2.6
+            drawn_x: f64 = uniform(&rng, 25.0, 75.0)
+            drawn_y: f64 = uniform(&rng, 4.0, 16.0) if level.rough else 4.0
+            px: f64 = drawn_x if level.moving == 0.0 else 50.0
+            py: f64 = drawn_y if level.moving == 0.0 else 4.0
+            flight: mutable Flight = Flight{level: level, gravity: gravity, ratio: ratio, ground: zeroed, count: 0,
+                pad_x: px, pad_y: py, start_x: 0.0, start_vx: 0.0, wind: 0.0, phase: 0.0}
+            half: f64 = level.pad / 2.0 + level.moving
+            for i in 0..<21 |rng, px, py, half, level, flight|:
+                x: f64 = i.f64() * 5.0
+                distance: f64 = magnitude(x - px)
+                y: f64 = py if distance <= half + 2.5 else (uniform(&rng, 2.0, py + 14.0) if level.rough and level.moving == 0.0 else 4.0)
+                if distance > half + 0.01:
+                    ground_insert(&flight, Point{x: x, y: y})
+            ground_insert(&flight, Point{x: px - half, y: py})
+            ground_insert(&flight, Point{x: px + half, y: py})
+            sign: f64 = side(&rng)
+            flight.start_x <- clamp(px + uniform(&rng, level.offset_min, level.offset_max) * sign, 8.0, WIDTH - 8.0)
+            flight.start_vx <- -sign * uniform(&rng, 0.0, level.start_speed)
+            wind_sign: f64 = side(&rng)
+            flight.wind <- level.wind * wind_sign * uniform(&rng, 0.6, 1.2)
+            flight.phase <- uniform(&rng, 0.0, TAU)
+            return flight
+
+    def ground_at(flight: Flight&, x: f64) -> f64:
+        can Abort.Panic:
+            first: Point = flight.ground[0.usize()]
+            return first.y if x <= first.x
+            for i in 1..<flight.count |flight, x|:
+                a: Point = flight.ground[(i - 1).usize()]
+                b: Point = flight.ground[i.usize()]
+                if x <= b.x:
+                    return a.y + (b.y - a.y) * (x - a.x) / (b.x - a.x)
+            return flight.ground[(flight.count - 1).usize()].y
+
+    def pad_centre(flight: Flight&, time: f64) -> f64:
+        return flight.pad_x if flight.level.moving == 0.0
+        return flight.pad_x + flight.level.moving * sin(TAU * time / 16.0)
+
+    def pad_speed(flight: Flight&, time: f64) -> f64:
+        return 0.0 if flight.level.moving == 0.0
+        w: f64 = TAU / 16.0
+        return flight.level.moving * w * cos(w * time)
+
+    def wind_at(flight: Flight&, time: f64) -> f64:
+        return flight.wind if not flight.level.gusts
+        return flight.wind * (1.0 + 0.8 * sin(0.7 * time + flight.phase) + 0.4 * sin(2.3 * time + 2.0 * flight.phase))
+
+    def trial(flight: Flight) -> Craft:
+        return Craft{flight: flight, x: flight.start_x, y: HEIGHT - 12.0, vx: flight.start_vx, vy: 0.0,
+            angle: 0.0, fuel: flight.level.fuel, time: 0.0, firing: false, result: PENDING}
+
+    def contact(craft: Craft&) -> i64:
+        can Abort.Panic:
+            return OFF_MAP if craft.x < -5.0 or craft.x > WIDTH + 5.0 or craft.y > HEIGHT + 20.0
+            return TIMEOUT if craft.time >= 60.0
+            f: Flight& = &craft.flight
+            offset: f64 = HALF_W * cos(craft.angle)
+            under: f64 = ground_at(f, craft.x)
+            return PENDING if craft.y > maximum(under, maximum(ground_at(f, craft.x - offset), ground_at(f, craft.x + offset)))
+            return OFF_PAD if magnitude(craft.x - pad_centre(f, craft.time)) > f.level.pad / 2.0 - 0.5 or magnitude(under - f.pad_y) >= 0.01
+            return TOO_FAST_DOWN if -craft.vy > f.level.max_down
+            return TOO_FAST_ACROSS if magnitude(craft.vx - pad_speed(f, craft.time)) > f.level.max_across
+            return TILTED if magnitude(craft.angle) > f.level.max_tilt
+            return LANDED
+
+    def step(craft: mutable Craft&, dt: f64, control: i64):
+        can Abort.Panic:
+            return if craft.result != PENDING
+            rotating: f64 = 1.0 if control == LEFT or control == THRUST_LEFT else (-1.0 if control == RIGHT or control == THRUST_RIGHT else 0.0)
+            unlimited: bool = craft.flight.level.fuel < 0.0
+            craft.firing <- (unlimited or craft.fuel > 0.0) and (control == THRUST or control == THRUST_LEFT or control == THRUST_RIGHT)
+            craft.angle <- clamp(craft.angle + rotating * TURN * dt, -TAU / 4.0, TAU / 4.0)
+            ax: mutable f64 = wind_at(&craft.flight, craft.time)
+            ay: mutable f64 = -craft.flight.gravity
+            if craft.firing:
+                push: f64 = craft.flight.gravity * craft.flight.ratio
+                ax <- ax + -sin(craft.angle) * push
+                ay <- ay + cos(craft.angle) * push
+                craft.fuel <- maximum(0.0, craft.fuel - dt) if not unlimited
+            craft.vx <- craft.vx + ax * dt
+            craft.vy <- craft.vy + ay * dt
+            craft.x <- craft.x + craft.vx * dt
+            craft.y <- craft.y + craft.vy * dt
+            craft.time <- craft.time + dt
+            craft.result <- contact(craft)
+
+    def control(fire: bool, turn_left: bool, turn_right: bool) -> i64:
+        if turn_left == turn_right:
+            return THRUST if fire else COAST
+        if turn_left:
+            return THRUST_LEFT if fire else LEFT
+        return THRUST_RIGHT if fire else RIGHT
+
+    def pilot(craft: Craft&) -> i64:
+        can Abort.Panic:
+            f: Flight& = &craft.flight
+            level: Grade = f.level
+            t: f64 = craft.time
+            moving: bool = level.moving != 0.0
+            near: bool = magnitude(craft.x - pad_centre(f, t)) < level.pad
+            target: f64 = pad_centre(f, t if near else t + 1.5)
+            pad_v: f64 = pad_speed(f, t)
+            height: f64 = craft.y - f.pad_y
+            away: f64 = magnitude(craft.x - target)
+            clear: f64 = maximum(maximum(ground_at(f, craft.x - 6.0), ground_at(f, craft.x)),
+                maximum(ground_at(f, craft.x + 6.0), ground_at(f, craft.x + craft.vx * 2.0)))
+            gain: f64 = 0.8 if moving else 0.35
+            want_vx: f64 = clamp(gain * (target - craft.x), -6.0, 6.0) + pad_v
+            settled: bool = magnitude(craft.vx - pad_v) < 1.0
+            floor_y: f64 = maximum(clear + 6.0, f.pad_y + 8.0)
+            want_vy: f64 = maximum(-3.0, 0.8 * (floor_y - craft.y)) if away > level.pad / 2.0 - 1.5 or (moving and not settled) else -maximum(0.6 * level.max_down, minimum(6.0, 0.4 * height))
+            ax: f64 = 1.2 * (want_vx - craft.vx) - wind_at(f, t)
+            ay: f64 = maximum(0.05, 1.5 * (want_vy - craft.vy) + f.gravity)
+            limit: f64 = 0.6 if height > (2.5 if moving else 6.0) else level.max_tilt * 0.5
+            err: f64 = clamp(atan2(-ax, ay), -limit, limit) - craft.angle
+            push: f64 = f.gravity * f.ratio
+            fire: bool = (level.fuel < 0.0 or craft.fuel > 0.0) and (ay > 0.5 * push * cos(craft.angle) or craft.vy < want_vy - 0.3)
+            return control(fire, err >= TURN / 60.0, err <= -TURN / 60.0)
+
+    def result_text(craft: Craft&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if craft.result == LANDED:
+                dstr_append_cstr(out, "Landed: ")
+                dstr_append_fixed(out, -craft.vy, 1)
+                dstr_append_cstr(out, " m/s down")
+            elif craft.result == OFF_MAP:
+                dstr_append_cstr(out, "Flew off the map")
+            elif craft.result == TIMEOUT:
+                dstr_append_cstr(out, "Out of time")
+            elif craft.result == OFF_PAD:
+                dstr_append_cstr(out, "Came down off the pad")
+            elif craft.result == TOO_FAST_DOWN or craft.result == TOO_FAST_ACROSS:
+                down: bool = craft.result == TOO_FAST_DOWN
+                dstr_append_cstr(out, "Too fast down: " if down else "Too fast across: ")
+                speed: f64 = -craft.vy if down else magnitude(craft.vx - pad_speed(&craft.flight, craft.time))
+                dstr_append_fixed(out, speed, 1)
+                dstr_append_cstr(out, " m/s (limit ")
+                dstr_append_fixed(out, craft.flight.level.max_down if down else craft.flight.level.max_across, 1)
+                dstr_append_cstr(out, ")")
+            elif craft.result == TILTED:
+                dstr_append_cstr(out, "Tilted ")
+                dstr_append_i64(out, degrees(magnitude(craft.angle)))
+                dstr_append_cstr(out, " degrees (limit ")
+                dstr_append_i64(out, degrees(craft.flight.level.max_tilt))
+                dstr_append_cstr(out, ")")

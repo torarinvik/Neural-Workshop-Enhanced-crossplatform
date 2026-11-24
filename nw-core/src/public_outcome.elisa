@@ -1,0 +1,165 @@
+# The public outcome reader consumes top-down RGBA pixels. It has no access
+# to the controller or the action that produced the frame.
+module PublicOutcome:
+    const INVALID_FRAME: i64 = -1
+    const NO_LABEL: i64 = 0
+    const HAS_LABEL: i64 = 1
+
+    struct Labels:
+        positive: mutable i64
+        negative: mutable i64
+        oops: mutable i64
+        scalar: mutable f64
+
+    def column_colour(rgba: u8&, width: i64, height: i64, x: i64, first: i64) -> i64:
+        can Abort.Panic:
+            pos: mutable i64 = 0
+            neg: mutable i64 = 0
+            oops: mutable i64 = 0
+            for y in first..<height |y, rgba, width, x, pos, neg, oops|:
+                pixel: usize = ((y * width + x) * 4).usize()
+                red: u8 = rgba[pixel]
+                green: u8 = rgba[pixel + 1.usize()]
+                blue: u8 = rgba[pixel + 2.usize()]
+                if green >= 180.u8() and red <= 140.u8() and blue <= 140.u8():
+                    pos <- pos + 1
+                elif red >= 180.u8() and green <= 140.u8() and blue <= 140.u8():
+                    neg <- neg + 1
+                elif blue >= 180.u8() and red <= 140.u8() and green <= 140.u8():
+                    oops <- oops + 1
+            return 1 if pos >= 2 and pos >= neg and pos >= oops
+            return 2 if neg >= 2 and neg >= oops
+            return 3 if oops >= 2
+            return 0
+
+    def read(rgba: u8&, bytes: i64, width: i64, height: i64, labels: mutable Labels&) -> i64:
+        can Abort.Panic:
+            return INVALID_FRAME if width <= 0 or height <= 0 or bytes < 4 or width > bytes / 4 / height
+            labels.positive <- 0
+            labels.negative <- 0
+            labels.oops <- 0
+            labels.scalar <- 0.0
+            first: i64 = height * 3 / 4
+            gap: i64 = width / 40 if width / 40 > 8 else 8
+            previous: mutable i64 = 0
+            last_column: mutable i64 = 0
+            for x in 0..<width |x, rgba, width, height, first, gap, previous, last_column, labels|:
+                colour: i64 = column_colour(rgba, width, height, x, first)
+                continue if colour == 0
+                # Count a new run after a colour change or a gap too wide
+                # to be an intra-caption gap. Only the last occupied
+                # column is needed, so reading a frame uses constant space.
+                if colour != previous or x - last_column - 1 >= gap:
+                    labels.positive <- labels.positive + 1 if colour == 1
+                    labels.negative <- labels.negative + 1 if colour == 2
+                    labels.oops <- labels.oops + 1 if colour == 3
+                previous <- colour
+                last_column <- x
+            bad: i64 = labels.negative + labels.oops
+            total: i64 = labels.positive + bad
+            return NO_LABEL if total == 0
+            labels.scalar <- (labels.positive - bad).f64() / total.f64()
+            return HAS_LABEL
+
+def public_outcome_read(rgba: u8&?, bytes: i64, width: i64, height: i64, output: mutable PublicOutcome::Labels&?) -> i64:
+    can Abort.Panic:
+        return PublicOutcome::INVALID_FRAME if rgba == null or output == null
+        frame: u8& = rgba
+        result: mutable PublicOutcome::Labels& = output
+        return PublicOutcome::read(frame, bytes, width, height, result)
+
+# Verify the last evidence frame's digest and re-derive its scalar. A host
+# with multiple evidence frames still has to verify its archive and receipt.
+def public_outcome_frame_matches(rgba: u8&, bytes: i64, expected: u8&) -> bool:
+    can Abort.Panic:
+        hex: mutable u8[64] = zeroed
+        Sha256::digest(rgba, bytes, &hex[0])
+        for index in 0..<64 |index, hex, expected|:
+            return false if hex[index.usize()] != expected[index.usize()]
+        return true
+
+def public_outcome_verify_frame(rgba: u8&?, bytes: i64, width: i64, height: i64, expected: u8&?, scalar: f64) -> i64:
+    can Abort.Panic:
+        return PublicOutcome::INVALID_FRAME if rgba == null or expected == null or bytes > Sha256::MAX_BYTES
+        frame: u8& = rgba
+        expected_hex: u8& = expected
+        labels: mutable PublicOutcome::Labels = zeroed
+        status: i64 = PublicOutcome::read(frame, bytes, width, height, &labels)
+        return status if status != PublicOutcome::HAS_LABEL
+        return 0 if labels.scalar != scalar
+        return 1 if public_outcome_frame_matches(frame, bytes, expected_hex) else 0
+
+module OutcomeEvidence:
+    # A host resolves the original archive and ledger mappings before passing
+    # them across the ABI. Archive rows follow the order of the digest list.
+    const DIGEST_BYTES: i64 = 64
+    const FRAME_WORDS: i64 = 2
+    const RECEIPT_WORDS: i64 = 7
+
+    def equal_bytes(left: u8&, right: u8&, length: i64) -> bool:
+        can Abort.Panic:
+            for at in 0..<length |at, left, right|:
+                return false if left[at.usize()] != right[at.usize()]
+            return true
+
+    def bound(receipt_id: i64, receipt: i64&, evidence: u8&, count: i64) -> bool:
+        can Abort.Panic, Unsafe.PointerCast:
+            return false if receipt[0] != receipt_id or receipt[3] <= 0 or receipt[4] < 0 or receipt[5] < 0
+            # The source checks the stored receipt id against the trial only
+            # when both fields are present. Missing ids are encoded as -1.
+            return false if receipt[1] != -1 and receipt[2] != -1 and receipt[1] != receipt[2]
+            trusted Unsafe.PointerCast:
+                stimulus: u8& = receipt[3].uintptr().cast[u8&]
+                return false if not equal_bytes(stimulus, evidence, DIGEST_BYTES)
+                if receipt[4] != 0:
+                    feedback: u8& = receipt[4].uintptr().cast[u8&]
+                    last: u8& = (&evidence[((count - 1) * DIGEST_BYTES).usize()]).uintptr().cast[u8&]
+                    return false if not equal_bytes(feedback, last, DIGEST_BYTES)
+                if receipt[5] != 0:
+                    return false if receipt[6] != count
+                    sequence: u8& = receipt[5].uintptr().cast[u8&]
+                    return false if not equal_bytes(sequence, evidence, count * DIGEST_BYTES)
+                return true
+
+def public_outcome_verify_evidence_mode(rgba: u8&?, bytes: i64, width: i64, height: i64,
+                                   evidence: u8&?, count: i64, archive: i64&?,
+                                   receipt_id: i64, receipt: i64&?, scalar: f64, allow_concession: bool) -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        return -1 if rgba == null or evidence == null or count <= 0 or count > 9223372036854775807 / OutcomeEvidence::DIGEST_BYTES or receipt_id < -1
+        return 0 if archive == null and (count > 1 or receipt_id >= 0)
+        return 0 if receipt == null and receipt_id >= 0
+        digests: u8& = evidence
+        if receipt_id >= 0 and receipt is row:
+            return 0 if not OutcomeEvidence::bound(receipt_id, row, digests, count)
+        trusted Unsafe.PointerCast:
+            if archive is frames:
+                computed: mutable u8[64] = zeroed
+                for index in 0..<count |index, frames, digests, computed|:
+                    offset: usize = (index * OutcomeEvidence::FRAME_WORDS).usize()
+                    address: i64 = frames[offset]
+                    length: i64 = frames[offset + 1.usize()]
+                    return 0 if address == 0
+                    return -1 if address < 0 or length < 0 or length > Sha256::MAX_BYTES
+                    input: u8& = address.uintptr().cast[u8&]
+                    Sha256::digest(input, length, &computed[0])
+                    expected: u8& = (&digests[(index * OutcomeEvidence::DIGEST_BYTES).usize()]).uintptr().cast[u8&]
+                    return 0 if not OutcomeEvidence::equal_bytes(&computed[0], expected, OutcomeEvidence::DIGEST_BYTES)
+            expected: u8& = (&digests[((count - 1) * OutcomeEvidence::DIGEST_BYTES).usize()]).uintptr().cast[u8&]
+            if allow_concession and scalar == 0.0 and rgba is frame:
+                return -1 if width <= 0 or height <= 0 or bytes < 4 or bytes > Sha256::MAX_BYTES or width > bytes / 4 / height
+                return 1 if public_outcome_frame_matches(frame, bytes, expected) else 0
+            return public_outcome_verify_frame(rgba, bytes, width, height, expected, scalar)
+
+def public_outcome_verify_evidence(rgba: u8&?, bytes: i64, width: i64, height: i64,
+                                   evidence: u8&?, count: i64, archive: i64&?,
+                                   receipt_id: i64, receipt: i64&?, scalar: f64) -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        return public_outcome_verify_evidence_mode(rgba, bytes, width, height, evidence,
+            count, archive, receipt_id, receipt, scalar, false)
+
+def public_outcome_verify_task_evidence(rgba: u8&?, bytes: i64, width: i64, height: i64,
+                                        evidence: u8&?, count: i64, archive: i64&?,
+                                        receipt_id: i64, receipt: i64&?, scalar: f64) -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        return public_outcome_verify_evidence_mode(rgba, bytes, width, height, evidence,
+            count, archive, receipt_id, receipt, scalar, true)

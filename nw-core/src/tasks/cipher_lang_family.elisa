@@ -1,0 +1,132 @@
+include "./cipher_lang_code.elisa"
+include "../pyrandom.elisa"
+
+extend CipherLang:
+    struct Probe:
+        values: darray[i64]
+
+    struct Behavior:
+        hash: u64
+        identity: bool
+
+    def probes(n: i64, k: i64, count: i64 = 48, seed: i64 = 1) -> darray[Probe]:
+        can Abort.Panic, Memory.Allocate:
+            draw: mutable MT19937 = zeroed
+            key: i64 = seed * 1000 + n * 10 + k
+            magnitude: u64 = (-(key + 1)).u64() + 1.u64() if key < 0 else key.u64()
+            mt_seed_int(&draw, magnitude)
+            rows: mutable darray[Probe] = []
+            for _ in 0..<count |n, k, rows, draw|:
+                values: mutable darray[i64] = []
+                for _ in 0..<n |values, draw, k|:
+                    values.push(py_randbelow(&draw, k.u64()).i64())
+                rows.push(Probe{values: values})
+            for symbol in 0..<k |n, rows|:
+                values: mutable darray[i64] = []
+                for _ in 0..<n |values, symbol|:
+                    values.push(symbol)
+                rows.push(Probe{values: values})
+            pattern: mutable darray[i64] = []
+            first: mutable darray[i64] = []
+            last: mutable darray[i64] = []
+            for i in 0..<n |n, k, pattern, first, last|:
+                pattern.push(i % k)
+                first.push(1 % k if i == 0 else 0)
+                last.push(1 % k if i == n - 1 else 0)
+            if n == 0:
+                first.push(1 % k)
+                last.push(1 % k)
+            rows.push(Probe{values: pattern})
+            rows.push(Probe{values: first})
+            rows.push(Probe{values: last})
+            return rows
+
+    def same_row(a: darray[i64]&, b: darray[i64]&) -> bool:
+        can Abort.Panic:
+            return false if a.count != b.count
+            for i in 0..<a.count.i64() |a, b|:
+                return false if a[i.usize()] != b[i.usize()]
+            return true
+
+    def behavior(program: darray[Node]&, entry: i64, inputs: darray[Probe]&, k: i64) -> Behavior:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            hash: mutable u64 = 14695981039346656037.u64()
+            identity: mutable bool = true
+            region scratch(16384):
+                in scratch:
+                    state: mutable State = zeroed
+                    for input in inputs:
+                        output: darray[i64] = run(program, entry, &input.values, k, &state)
+                        hash <- (hash ^ output.count.u64()) * 1099511628211.u64()
+                        for value in output:
+                            hash <- (hash ^ value.u64()) * 1099511628211.u64()
+                        identity <- identity and same_row(&input.values, &output)
+                        state <- advance(program, entry, &state, &input.values, &output)
+            return Behavior{hash: hash, identity: identity}
+
+    def equivalent(program: darray[Node]&, a: i64, b: i64, inputs: darray[Probe]&, k: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return true if equal(program, a, b)
+            region scratch(32768):
+                in scratch:
+                    sa: mutable State = zeroed
+                    sb: mutable State = zeroed
+                    for input in inputs:
+                        ra: darray[i64] = run(program, a, &input.values, k, &sa)
+                        rb: darray[i64] = run(program, b, &input.values, k, &sb)
+                        return false if not same_row(&ra, &rb)
+                        sa <- advance(program, a, &sa, &input.values, &ra)
+                        sb <- advance(program, b, &sb, &input.values, &rb)
+            return true
+
+    def code_less(a: dstr&, b: dstr&) -> bool:
+        can Abort.Panic:
+            i: mutable usize = 0.usize()
+            while i < a.count and i < b.count |i, a, b|:
+                return a[i] < b[i] if a[i] != b[i]
+                i <- i + 1.usize()
+            return a.count < b.count
+
+    def simpler(program: darray[Node]&, a: i64, b: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            small: i64 = size(program, a)
+            large: i64 = size(program, b)
+            return small < large if small != large
+            region scratch(4096):
+                in scratch:
+                    left: mutable dstr = []
+                    right: mutable dstr = []
+                    write_code(&left, program, a)
+                    write_code(&right, program, b)
+                    return code_less(&left, &right)
+            return false
+
+    def dedupe(program: mutable darray[Node]&, family: darray[i64]&, n: i64, k: i64) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            inputs: darray[Probe] = probes(n, k)
+            capacity: mutable i64 = 1
+            while capacity <= 2 * family.count.i64() |capacity, family|:
+                capacity <- capacity * 2
+            mask: u64 = (capacity - 1).u64()
+            slots: mutable darray[i64] = []
+            hashes: mutable darray[u64] = []
+            for _ in 0..<capacity |slots, hashes|:
+                slots.push(-1)
+                hashes.push(0.u64())
+            best: mutable darray[i64] = []
+            for entry in family:
+                candidate: i64 = canonical(program, entry, n, k)
+                result: Behavior = behavior(program, candidate, &inputs, k)
+                continue if result.identity
+                slot: mutable usize = (result.hash & mask).usize()
+                while slots[slot] >= 0 |slots, hashes, slot, result, best, program, candidate, inputs, k, mask|:
+                    break if hashes[slot] == result.hash and equivalent(program, candidate, best[slots[slot].usize()], &inputs, k)
+                    slot <- ((slot.u64() + 1.u64()) & mask).usize()
+                old: i64 = slots[slot]
+                if old < 0:
+                    slots[slot] <- best.count.i64()
+                    hashes[slot] <- result.hash
+                    best.push(candidate)
+                elif simpler(program, candidate, best[old.usize()]):
+                    best[old.usize()] <- candidate
+            return best

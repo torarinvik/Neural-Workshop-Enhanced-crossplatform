@@ -1,0 +1,270 @@
+include "./tasks/gamble_game.elisa"
+include "./scene_polish.elisa"
+include "./scene_verdict.elisa"
+include "./verdict.elisa"
+include "./geometry.elisa"
+
+module SceneGamble:
+    const CENTER: u32 = Display::ANCHOR_CENTER_CENTER
+    const TABLE_WIDTH: f64 = 912.0 * 0.92
+    const TABLE_LEFT: f64 = (912.0 - TABLE_WIDTH) / 2.0
+    const GAP: f64 = TABLE_WIDTH * 0.015
+    const LAST: u32 = 0x285adcff
+    const BITE: u32 = 0xd6403aff
+    const STRIP: i64 = 12
+
+    struct History:
+        seen: mutable i64
+        wins: mutable i64
+        worst: mutable i64
+        recent: mutable i64[STRIP]
+
+    def maximum(a: f64, b: f64) -> f64:
+        return a if a > b else b
+
+    def table() -> SceneHiddenRule::Rect:
+        can Abort.Panic:
+            bottom: f64 = Verdict::above_the_band(684.0, Geometry::from_bottom_edge(684.0, 58.0).f64()).f64()
+            return SceneHiddenRule::Rect{x: TABLE_LEFT, y: bottom, w: TABLE_WIDTH,
+                h: maximum(40.0, Geometry::from_top_edge(684.0, 116.0).f64() - bottom)}
+
+    def machine_box(area: SceneHiddenRule::Rect&, arms: i64, arm: i64) -> SceneHiddenRule::Rect:
+        can Abort.Panic:
+            width: f64 = SceneHiddenRule::minimum((area.w - GAP * (arms - 1).f64()) / arms.f64(), area.h * 0.7)
+            left: f64 = area.x + (area.w - (width * arms.f64() + GAP * (arms - 1).f64())) / 2.0
+            return SceneHiddenRule::Rect{x: left + arm.f64() * (width + GAP), y: area.y + area.h * 0.12,
+                w: width, h: area.h * 0.84}
+
+    def stop_box(area: SceneHiddenRule::Rect&, machine_width: f64) -> SceneHiddenRule::Rect:
+        width: f64 = maximum(machine_width * 0.9, area.w * 0.12)
+        return SceneHiddenRule::Rect{x: area.x + (area.w - width) / 2.0, y: area.y, w: width, h: area.h * 0.09}
+
+    def hit(session: GambleGame::Session&, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            return GambleGame::START if session.phase == GambleGame::READY or session.phase == GambleGame::DONE
+            return -1 if session.phase != GambleGame::PULLING
+            area: SceneHiddenRule::Rect = table()
+            arms: i64 = session.dealt.level.arms
+            for arm in 0..<arms |area, arms, x, y|:
+                box: SceneHiddenRule::Rect = machine_box(&area, arms, arm)
+                return arm if SceneHiddenRule::contains(&box, x, y)
+            if session.dealt.level.price > 0:
+                first: SceneHiddenRule::Rect = machine_box(&area, arms, 0)
+                stop: SceneHiddenRule::Rect = stop_box(&area, first.w)
+                return GambleGame::STOP if SceneHiddenRule::contains(&stop, x, y)
+            return -1
+
+    def face(list: mutable Display::DisplayList&, box: SceneHiddenRule::Rect&, arm: i64, lit: bool, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            hues: u32[8] = [0x5676c4ff, 0x34968cff, 0xcc7a4aff, 0x8c66bcff, 0x549656ff, 0xc45c80ff, 0x687c94ff, 0xb89634ff]
+            hue: u32 = hues[arm.usize()]
+            body: u32 = ScenePolish::mix_rgb(0x262b38ff if dark else 0xffffffff, hue, 0.08)
+            edge: u32 = 0x424a5cff if dark else 0xd2d8e4ff
+            radius: f64 = SceneHiddenRule::minimum(box.w, box.h) * 0.08
+            ScenePolish::card_face(list, box, radius, body, edge, LAST if lit else 0.u32(), dark)
+            header_h: f64 = box.h * 0.21
+            header_y: f64 = box.y + box.h - header_h
+            header: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: box.x, y: header_y, w: box.w, h: header_h}
+            ScenePolish::rounded(list, &header, radius, hue)
+            Display::draw_rect(list, box.x, header_y, box.w, header_h * 0.5, hue)
+            margin: f64 = box.w * 0.08
+            screen_h: f64 = box.h * 0.66
+            screen: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: box.x + margin, y: header_y - margin * 0.7 - screen_h,
+                w: box.w - 2.0 * margin, h: screen_h}
+            ScenePolish::rounded(list, &screen, radius * 0.6, 0x1b1e27ff if dark else 0xdee2e7ff)
+
+    def history(round: Gamble::Round&, arm: i64, price: i64) -> History:
+        can Abort.Panic:
+            result: mutable History = zeroed
+            for event in round.history |result, arm, price|:
+                if event.arm == arm:
+                    gross: i64 = event.won + price
+                    result.wins <- result.wins + 1 if gross > 0
+                    result.worst <- gross if gross < result.worst
+                    result.recent[(result.seen % STRIP).usize()] <- gross
+                    result.seen <- result.seen + 1
+            return result
+
+    def text(list: mutable Display::DisplayList&, words: sview, x: f64, y: f64, size: f64, ink: u32, bold: bool = false):
+        can Abort.Panic, Memory.Allocate:
+            Display::draw_text_weight(list, words, x, y, maximum(6.0, size), ink, CENTER, bold)
+
+    def number_label(list: mutable Display::DisplayList&, prefix: cstr, number: i64,
+                     x: f64, y: f64, size: f64, ink: u32, bold: bool = false):
+        can Abort.Panic, Memory.Allocate:
+            label: mutable dstr = []
+            dstr_append_cstr(&label, prefix)
+            dstr_append_i64(&label, number)
+            text(list, bytes_view(label), x, y, size, ink, bold)
+
+    def strip(list: mutable Display::DisplayList&, box: SceneHiddenRule::Rect&, events: History&):
+        can Abort.Panic, Memory.Allocate:
+            first: i64 = events.seen - STRIP if events.seen > STRIP else 0
+            cell: f64 = SceneHiddenRule::minimum(box.w * 0.7 / 4.0, box.h * 0.4 / 3.0)
+            for i in first..<events.seen |list, box, events, first, cell|:
+                index: i64 = i - first
+                gross: i64 = events.recent[(i % STRIP).usize()]
+                color: u32 = 0x3caa5aff if gross > 0 else (BITE if gross < 0 else 0x969aa2ff)
+                tile: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: box.x + box.w * 0.15 + (index % 4).f64() * cell,
+                    y: box.y + box.h * 0.47 - (index / 4 + 1).f64() * cell * 1.05, w: cell * 0.85, h: cell * 0.85}
+                ScenePolish::rounded(list, &tile, cell * 0.2, color)
+
+    def draw_machine(list: mutable Display::DisplayList&, session: GambleGame::Session&,
+                     box: SceneHiddenRule::Rect&, arm: i64, last: i64, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            face(list, box, arm, arm == last, dark)
+            ink: u32 = 0xffffffff if dark else 0x000000ff
+            cx: f64 = box.x + box.w / 2.0
+            top: f64 = box.y + box.h
+            size: f64 = SceneHiddenRule::minimum(13.0, box.w * 0.075)
+            level: Gamble::Grade = session.dealt.level
+            number_label(list, "Machine " if box.w > 160.0 else "", arm + 1, cx, top - box.h * 0.06, size * 1.15, 0xffffffff, true)
+            number_label(list, "pays ", session.dealt.machines[arm.usize()].pays, cx, top - box.h * 0.155, size, 0xffffffe6)
+            if level.price > 0:
+                number_label(list, "costs ", level.price, cx, top - box.h * 0.23, size, ink)
+            events: History = history(&session.round, arm, level.price)
+            number_label(list, "pulled ", events.seen, cx, top - box.h * 0.32, size, ink)
+            if events.seen > 0:
+                label: mutable dstr = []
+                dstr_append_cstr(&label, "won ")
+                dstr_append_i64(&label, events.wins)
+                dstr_append_cstr(&label, " of ")
+                dstr_append_i64(&label, events.seen)
+                text(list, bytes_view(label), cx, top - box.h * 0.4, size, ink)
+                if events.worst < 0:
+                    number_label(list, "once lost ", -events.worst, cx, top - box.h * 0.48, size, BITE)
+            strip(list, box, &events)
+            label: mutable dstr = []
+            if session.phase == GambleGame::JUDGED:
+                t: i64 = session.round.history.count.i64()
+                at: i64 = t if t < level.pulls else level.pulls - 1
+                worth: f64 = Gamble::worth(&session.dealt, at, arm)
+                dstr_append_cstr(&label, "-" if copysign(1.0, worth) < 0.0 else "+")
+                dstr_append_fixed(&label, fabs(worth), 2)
+                dstr_append_cstr(&label, " a pull")
+            else:
+                dstr_append_cstr(&label, "pull (")
+                dstr_append_i64(&label, arm + 1)
+                dstr_append_cstr(&label, ")")
+            text(list, bytes_view(label), cx, box.y + box.h * 0.05, size, ink, true)
+
+    def button(list: mutable Display::DisplayList&, box: SceneHiddenRule::Rect&, size: f64, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            back: u32 = 0x2e323aff if dark else 0xe8ebf0ff
+            radius: f64 = box.h * 0.3
+            lip: f64 = maximum(2.0, SceneHiddenRule::minimum(5.0, box.h * 0.08))
+            ScenePolish::shadow(list, box, radius, 3.0, dark)
+            ScenePolish::rounded(list, box, radius, ScenePolish::mix_rgb(back, 0x000000ff, 0.18))
+            cap: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: box.x, y: box.y + lip, w: box.w, h: box.h - lip}
+            ScenePolish::rounded(list, &cap, radius, back)
+            text(list, "Stop (S)", box.x + box.w / 2.0, box.y + box.h * 0.55, size, 0xffffffff if dark else 0x000000ff, true)
+
+    def draw_table(list: mutable Display::DisplayList&, session: GambleGame::Session&, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            area: SceneHiddenRule::Rect = table()
+            level: Gamble::Grade = session.dealt.level
+            latest: Gamble::Pull = get session.round.history[(session.round.history.count.i64() - 1).usize()] else Gamble::Pull{arm: -1, won: 0}
+            for arm in 0..<level.arms |list, session, area, level, latest, dark|:
+                box: SceneHiddenRule::Rect = machine_box(&area, level.arms, arm)
+                draw_machine(list, session, &box, arm, latest.arm, dark)
+            if level.price > 0 and (session.phase == GambleGame::PULLING or session.phase == GambleGame::FLAGGED):
+                first: SceneHiddenRule::Rect = machine_box(&area, level.arms, 0)
+                stop: SceneHiddenRule::Rect = stop_box(&area, first.w)
+                button(list, &stop, SceneHiddenRule::minimum(13.0, first.w * 0.075), dark)
+
+    def points(out: mutable dstr&, value: f64, judged: bool = false):
+        can Abort.Panic, Memory.Allocate:
+            tenths: i64 = round_half_even(fabs(value) * 10.0)
+            integral: bool = tenths % 10 == 0 if judged else value == trunc(value)
+            dstr_append_fixed(out, value, 0 if integral else 1)
+
+    def verdict(out: mutable dstr&, session: GambleGame::Session&):
+        can Abort.Panic, Memory.Allocate:
+            if session.busted:
+                dstr_append_cstr(out, "Bust: the bankroll ran dry")
+                return
+            dstr_append_cstr(out, "Your pulls were worth ")
+            points(out, session.verdict_value, true)
+            dstr_append_cstr(out, " against a par of ")
+            points(out, session.par, true)
+            dstr_append_cstr(out, "   (coins won ")
+            dstr_append_i64(out, session.verdict_coins)
+            dstr_append_cstr(out, ")")
+
+    def facts(out: mutable dstr&, session: GambleGame::Session&):
+        can Abort.Panic, Memory.Allocate:
+            level: Gamble::Grade = session.dealt.level
+            dstr_append_cstr(out, "rung ")
+            dstr_append_i64(out, level.rung)
+            dstr_append_cstr(out, "  ")
+            dstr_append_i64(out, session.trial)
+            dstr_append_cstr(out, "/")
+            dstr_append_i64(out, session.total)
+            dstr_append_cstr(out, "  pulls left ")
+            dstr_append_i64(out, 0 if session.round.stopped else level.pulls - session.round.history.count.i64())
+            dstr_append_cstr(out, "  coins ")
+            dstr_append_cstr(out, "+") if session.round.total >= 0
+            dstr_append_i64(out, session.round.total)
+            if level.bankroll > 0:
+                dstr_append_cstr(out, "  bankroll ")
+                dstr_append_i64(out, level.bankroll + session.round.total)
+            if level.drift > 0.0 or level.jumps > 0:
+                dstr_append_cstr(out, "  the odds move")
+
+    def message(out: mutable dstr&, session: GambleGame::Session&):
+        can Abort.Panic, Memory.Allocate:
+            if session.phase == GambleGame::READY:
+                dstr_append_cstr(out, "Press Space or click to start")
+            elif session.phase == GambleGame::DONE:
+                dstr_append_i64(out, session.wins)
+                dstr_append_cstr(out, " of ")
+                dstr_append_i64(out, session.trial - session.forfeits)
+                dstr_append_cstr(out, " at par or better   highest rung passed ")
+                dstr_append_i64(out, session.best_rung)
+            elif session.phase == GambleGame::JUDGED:
+                verdict(out, session)
+            else:
+                dstr_append_cstr(out, "Make your pulls worth ")
+                points(out, session.par)
+                dstr_append_cstr(out, " or more")
+
+    def render(list: mutable Display::DisplayList&, session: GambleGame::Session&, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            ink: u32 = 0xffffffff if dark else 0x000000ff
+            text(list, "Gamble", 456.0, 648.0, 22.0, ink, true)
+            text(list, "click a machine or press 1-8 to pull it   S: stop   Esc: menu", 456.0, 26.0, 12.0, ink)
+            status: mutable dstr = []
+            message(&status, session)
+            text(list, bytes_view(status), 456.0, 614.0, 14.0, ink)
+            return if session.phase == GambleGame::READY
+            if session.phase == GambleGame::DONE:
+                return if not session.has_verdict
+                status <- []
+                verdict(&status, session)
+            else:
+                details: mutable dstr = []
+                facts(&details, session)
+                text(list, bytes_view(details), 456.0, 588.0, 12.0, ink)
+                draw_table(list, session, dark)
+            if session.phase == GambleGame::FLAGGED:
+                SceneVerdict::put(list, 912.0, 684.0, 1.0, 1.0, false, "Out of time", 60.0, 16.0)
+            elif session.has_verdict:
+                SceneVerdict::put(list, 912.0, 684.0, 1.0, 1.0, session.passed, bytes_view(status), 60.0, 16.0)
+
+    def option_note(rung: i64, out: mutable dstr&):
+        can Abort.Panic, Memory.Allocate:
+            level: Gamble::Grade = Gamble::grade(rung)
+            dstr_append_cstr(out, "Rung ")
+            dstr_append_i64(out, level.rung)
+            dstr_append_cstr(out, ": ")
+            dstr_append_i64(out, level.arms)
+            dstr_append_cstr(out, " machines, ")
+            dstr_append_i64(out, level.pulls)
+            dstr_append_cstr(out, " pulls.")
+            if level.drift > 0.0:
+                dstr_append_cstr(out, "  With odds that drift")
+                dstr_append_cstr(out, ", machines that bite") if level.biters > 0
+                dstr_append_cstr(out, ", odds that jump") if level.jumps > 0
+                dstr_append_cstr(out, ", pulls that cost, a bankroll and Stop") if level.price > 0
+                dstr_append_cstr(out, ".")
+            dstr_append_cstr(out, "  You must beat the reference.") if level.allow < 0.0

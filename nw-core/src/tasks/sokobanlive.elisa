@@ -1,0 +1,343 @@
+include "./ints.elisa"
+include "./pyset.elisa"
+include "../pyrandom.elisa"
+include "./sokoban.elisa"
+
+module SokobanLive:
+    const PORTS: i64 = 4
+    const MOST_CELLS: i64 = 140
+    const MOST_GUARDS: i64 = 3
+    const MOST_SHUTTERS: i64 = 2
+    const MOST_RUNS: i64 = 2 * MOST_CELLS / 3
+
+    struct Grade:
+        rung: i64
+        width: i64
+        height: i64
+        crates: i64
+        guards: i64
+        beat: f64
+        shutters: i64
+        pulls: i64
+        floor: i64
+
+    struct Lane:
+        start: i64
+        stride: i64
+        length: i64
+
+    struct Patrol:
+        lane: Lane
+        start: i64
+        heading: i64
+        phase: f64
+
+    struct Shutter:
+        cell: i64
+        period: f64
+        open_share: f64
+        phase: f64
+
+    struct Warehouse:
+        level: Grade
+        walls: bool[MOST_CELLS]
+        goals: bool[MOST_CELLS]
+        boxes: bool[MOST_CELLS]
+        alive: bool[MOST_CELLS]
+        player: mutable i64
+        crate_slots: mutable u64
+        minimum: mutable i64
+        lower_bound: mutable i64
+        bound: mutable i64
+        patrols: Patrol[MOST_GUARDS]
+        shutters: Shutter[MOST_SHUTTERS]
+        seconds: mutable f64
+        valid: mutable bool
+
+    def grade(rung: i64) -> Grade:
+        can Abort.Panic:
+            r: i64 = rung if rung > 0 else 1
+            crates: i64 = 1 if r < 4 else (2 if r < 10 else (3 if r < 16 else 4))
+            return Grade{rung: r, width: (10 + crates), height: 8 if r < 4 else (9 if r < 16 else 10),
+                crates: crates, guards: 0 if r == 1 else (1 if r < 7 else (2 if r < 20 else 3)),
+                beat: 0.75 if r < 4 else (0.65 if r < 10 else (0.6 if r < 16 else (0.5 if r < 20 else fmax(0.32, 0.48 - 0.012 * (r - 20).f64())))),
+                shutters: 0 if r < 13 else (1 if r < 16 else 2), pulls: 20 + 18 * crates,
+                floor: 3 + 3 * crates}
+
+    def lane_distance(lane: Lane, width: i64, player: i64) -> i64:
+        can Abort.Panic:
+            pr: i64 = player / width
+            pc: i64 = player % width
+            near: mutable i64 = MOST_CELLS
+            for i in 0..<lane.length |lane, width, pr, pc, near|:
+                cell: i64 = lane.start + lane.stride * i
+                dx: i64 = cell % width - pc
+                dy: i64 = cell / width - pr
+                distance: i64 = (dx if dx >= 0 else -dx) + (dy if dy >= 0 else -dy)
+                near <- distance if distance < near
+            return near
+
+    def lanes(warehouse: Warehouse&, out: mutable Lane&) -> i64:
+        can Abort.Panic:
+            width: i64 = warehouse.level.width
+            height: i64 = warehouse.level.height
+            count: mutable i64 = 0
+            for axis in 0..<2 |warehouse, out, width, height, count|:
+                across: i64 = height if axis == 0 else width
+                along: i64 = width if axis == 0 else height
+                row_stride: i64 = width if axis == 0 else 1
+                stride: i64 = 1 if axis == 0 else width
+                for row in 0..<across |warehouse, out, width, along, row_stride, stride, count|:
+                    start: i64 = row * row_stride
+                    i: mutable i64 = 0
+                    while i < along |warehouse, out, width, along, start, stride, count, i|:
+                        first: i64 = start + i * stride
+                        if warehouse.walls[first.usize()]:
+                            i <- i + 1
+                            continue
+                        start_index: i64 = i
+                        while i < along and not warehouse.walls[(start + i * stride).usize()] |warehouse, along, start, stride, i|:
+                            i <- i + 1
+                        lane: Lane = Lane{start: first, stride: stride, length: i - start_index}
+                        if lane.length >= 3 and lane_distance(lane, width, warehouse.player) >= 3:
+                            out[count.usize()] <- lane
+                            count <- count + 1
+            return count
+
+    def patrols(warehouse: mutable Warehouse&, draw: mutable MT19937&) -> bool:
+        can Abort.Panic:
+            runs: mutable Lane[MOST_RUNS] = zeroed
+            count: i64 = lanes(warehouse, &runs[0])
+            i: mutable i64 = count - 1
+            while i > 0 |i, runs, draw|:
+                swap: usize = py_randbelow(draw, (i + 1).u64()).usize()
+                old: Lane = runs[i.usize()]
+                runs[i.usize()] <- runs[swap]
+                runs[swap] <- old
+                i <- i - 1
+            chosen: mutable i64 = 0
+            used: mutable bool[MOST_CELLS] = zeroed
+            # Iterate by descending length, preserving the shuffled order for
+            # ties as Python's stable sort does.
+            max_length: i64 = warehouse.level.width
+            for descending in 0..<(max_length - 2) |warehouse, draw, count, runs, used, chosen, max_length|:
+                length: i64 = max_length - descending
+                for k in 0..<count |warehouse, draw, runs, used, chosen, length|:
+                    return true if chosen == warehouse.level.guards
+                    row: Lane = runs[k.usize()]
+                    continue if row.length != length
+                    occupied: mutable bool = false
+                    for at in 0..<row.length |row, used, occupied|:
+                        if used[(row.start + row.stride * at).usize()]:
+                            occupied <- true
+                            break
+                    continue if occupied
+                    start: i64 = py_randbelow(draw, row.length.u64()).i64()
+                    continue if warehouse.boxes[(row.start + row.stride * start).usize()]
+                    heading: i64 = 1 if py_randbelow(draw, 2.u64()) == 0.u64() else -1
+                    phase: f64 = py_uniform(draw, 0.0, warehouse.level.beat)
+                    warehouse.patrols[chosen.usize()] <- Patrol{lane: row, start: start, heading: heading, phase: phase}
+                    chosen <- chosen + 1
+                    for at in 0..<row.length |row, used|:
+                        used[(row.start + row.stride * at).usize()] <- true
+            return chosen == warehouse.level.guards
+
+    def shutters(warehouse: mutable Warehouse&, draw: mutable MT19937&) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            return true if warehouse.level.shutters == 0
+            doors: mutable darray[i64] = []
+            w: i64 = warehouse.level.width
+            for i in 0..<(w * warehouse.level.height) |warehouse, doors, w|:
+                idx: usize = i.usize()
+                continue if warehouse.walls[idx] or warehouse.boxes[idx] or warehouse.goals[idx] or i == warehouse.player
+                if ((warehouse.walls[(i - 1).usize()] and warehouse.walls[(i + 1).usize()]) or
+                    (warehouse.walls[(i - w).usize()] and warehouse.walls[(i + w).usize()])):
+                    doors.push(i)
+            py_shuffle_i64(draw, &doors)
+            limit: i64 = warehouse.level.shutters
+            n: i64 = doors.count.i64()
+            for j in 0..<(n if n < limit else limit) |warehouse, draw, doors|:
+                period: f64 = py_uniform(draw, 3.5, 5.0)
+                share: f64 = py_uniform(draw, 0.45, 0.6)
+                warehouse.shutters[j.usize()] <- Shutter{cell: doors[j.usize()], period: period,
+                    open_share: share, phase: py_uniform(draw, 0.0, period)}
+            return n >= limit
+
+    def build(work: mutable Sokoban::SokobanWork&, search: mutable Sokoban::Search&, level: Grade,
+              draw: mutable MT19937&) -> Warehouse:
+        can Abort.Panic, Memory.Allocate:
+            floor: mutable Warehouse = Warehouse{level: level, walls: zeroed, goals: zeroed,
+                boxes: zeroed, alive: zeroed, player: 0, crate_slots: 0.u64(), minimum: -1, lower_bound: 0, bound: 0,
+                patrols: zeroed, shutters: zeroed, seconds: 0.0, valid: false}
+            spec: Sokoban::SokobanGrade = Sokoban::SokobanGrade{width: level.width, height: level.height,
+                boxes: level.crates, floor_share: 0.78, pulls: level.pulls, floor: level.floor,
+                trap_share: 0.0, deceit: 0.0}
+            work.width <- level.width
+            work.height <- level.height
+            work.cells <- level.width * level.height
+            room: mutable Sokoban::Level = Sokoban::Level()
+            return floor if not Sokoban::deal(work, search, &spec, draw, 200, &room)
+            floor.player <- room.player
+            floor.crate_slots <- room.crate_slots
+            floor.minimum <- room.minimum
+            floor.lower_bound <- room.at_least
+            floor.bound <- room.bound
+            solved: mutable bool = true
+            for i in 0..<room.cells |floor, room, solved|:
+                idx: usize = i.usize()
+                wall: bool = room.walls_in[idx] == 1
+                goal: bool = room.goals_in[idx] == 1
+                box: bool = room.boxes_in[idx] == 1
+                floor.walls[idx] <- wall
+                floor.goals[idx] <- goal
+                floor.boxes[idx] <- box
+                floor.alive[idx] <- not wall and room.traps_in[idx] == 0
+                solved <- false if box and not goal
+            return floor if solved or not patrols(&floor, draw) or not shutters(&floor, draw)
+            pushes: i64 = room.minimum if room.minimum > 0 else room.bound
+            floor.seconds <- fmin((30 + pushes * 3 + level.crates * 10).f64(), (45 + level.crates * 35).f64())
+            floor.valid <- true
+            return floor
+
+    const STEP: f64 = 0.18
+    const DOWN: i64 = 1
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const CAUGHT: i64 = 2
+    const STUCK: i64 = 3
+    const TIMEOUT: i64 = 4
+
+    struct Guard:
+        lane: Lane
+        at: mutable i64
+        heading: mutable i64
+        next_beat: mutable f64
+
+    struct Run:
+        warehouse: Warehouse
+        elapsed: mutable f64
+        player: mutable i64
+        boxes: bool[MOST_CELLS]
+        guards: Guard[MOST_GUARDS]
+        shut: bool[MOST_SHUTTERS]
+        ready_at: mutable f64
+        queued: mutable i64
+        result: mutable i64
+        facing: mutable i64
+        pushes: mutable i64
+        push_from: mutable i64
+        push_into: mutable i64
+        steps: mutable i64
+
+    def guard_cell(guard: Guard) -> i64:
+        return guard.lane.start + guard.lane.stride * guard.at
+
+    def guards_at(run: Run&, cell: i64) -> bool:
+        can Abort.Panic:
+            for i in 0..<run.warehouse.level.guards |run, cell|:
+                return true if guard_cell(run.guards[i.usize()]) == cell
+            return false
+
+    def shutter_open(shutter: Shutter, time: f64) -> bool:
+        return fmod(time + shutter.phase, shutter.period) < shutter.open_share * shutter.period
+
+    def update_shutters(run: mutable Run&):
+        can Abort.Panic:
+            for i in 0..<run.warehouse.level.shutters |run|:
+                index: usize = i.usize()
+                shutter: Shutter = run.warehouse.shutters[index]
+                cell: i64 = shutter.cell
+                occupied: bool = run.boxes[cell.usize()] or run.player == cell or guards_at(run, cell)
+                run.shut[index] <- not shutter_open(shutter, run.elapsed) and (run.shut[index] or not occupied)
+
+    def initialize(warehouse: Warehouse&) -> Run:
+        can Abort.Panic:
+            run: mutable Run = Run{warehouse: warehouse[0], elapsed: 0.0, player: warehouse.player,
+                boxes: warehouse.boxes, guards: zeroed, shut: zeroed, ready_at: 0.0, queued: -1,
+                result: LIVE, facing: DOWN, pushes: 0, push_from: -1, push_into: -1, steps: 0}
+            for i in 0..<warehouse.level.guards |warehouse, run|:
+                patrol: Patrol = warehouse.patrols[i.usize()]
+                run.guards[i.usize()] <- Guard{lane: patrol.lane, at: patrol.start, heading: patrol.heading, next_beat: patrol.phase}
+            update_shutters(&run)
+            return run
+
+    def solid(run: Run&, cell: i64) -> bool:
+        can Abort.Panic:
+            return true if cell < 0 or cell >= run.warehouse.level.width * run.warehouse.level.height
+            return true if run.warehouse.walls[cell.usize()]
+            for i in 0..<run.warehouse.level.shutters |run, cell|:
+                return true if run.shut[i.usize()] and run.warehouse.shutters[i.usize()].cell == cell
+            return false
+
+    def press(run: mutable Run&, direction: i64) -> bool:
+        return false if run.result != LIVE or direction < 0 or direction >= PORTS
+        run.queued <- direction
+        return true
+
+    def move_worker(run: mutable Run&, direction: i64):
+        can Abort.Panic:
+            run.facing <- direction
+            stride: i64 = Sokoban::step_of(run.warehouse.level.width, direction)
+            destination: i64 = run.player + stride
+            return if solid(run, destination)
+            if run.boxes[destination.usize()]:
+                beyond: i64 = destination + stride
+                return if solid(run, beyond) or run.boxes[beyond.usize()] or guards_at(run, beyond)
+                run.boxes[destination.usize()] <- false
+                run.boxes[beyond.usize()] <- true
+                run.pushes <- run.pushes + 1
+                run.push_from <- destination
+                run.push_into <- beyond
+            run.player <- destination
+            run.steps <- run.steps + 1
+            run.ready_at <- run.elapsed + STEP
+
+    def move_guard(run: Run&, guard: Guard, boxes: bool[MOST_CELLS]&) -> Guard:
+        can Abort.Panic:
+            next: mutable Guard = guard
+            for _ in 0..<2 |run, next, boxes|:
+                at: i64 = next.at + next.heading
+                if at >= 0 and at < next.lane.length:
+                    cell: i64 = next.lane.start + next.lane.stride * at
+                    if not solid(run, cell) and not boxes[cell.usize()]:
+                        next.at <- at
+                        return next
+                next.heading <- -next.heading
+            return next
+
+    def advance_guard(run: Run&, guard: Guard) -> Guard:
+        can Abort.Panic:
+            next: mutable Guard = move_guard(run, guard, &run.boxes)
+            next.next_beat <- next.next_beat + run.warehouse.level.beat
+            return next
+
+    def verdict(run: Run&) -> i64:
+        can Abort.Panic:
+            return CAUGHT if guards_at(run, run.player)
+            all_covered: mutable bool = true
+            stuck: mutable bool = false
+            for i in 0..<(run.warehouse.level.width * run.warehouse.level.height) |run, all_covered, stuck|:
+                index: usize = i.usize()
+                if run.warehouse.goals[index] and not run.boxes[index]:
+                    all_covered <- false
+                if run.boxes[index] and not run.warehouse.alive[index]:
+                    stuck <- true
+            return CLEAR if all_covered
+            return STUCK if stuck
+            return TIMEOUT if run.elapsed >= run.warehouse.seconds
+            return LIVE
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic:
+            return if run.result != LIVE
+            run.elapsed <- run.elapsed + dt
+            update_shutters(run)
+            if run.queued >= 0 and run.elapsed >= run.ready_at:
+                direction: i64 = run.queued
+                run.queued <- -1
+                move_worker(run, direction)
+            for i in 0..<run.warehouse.level.guards |run|:
+                guard: Guard = run.guards[i.usize()]
+                if run.elapsed >= guard.next_beat:
+                    run.guards[i.usize()] <- advance_guard(run, guard)
+            run.result <- verdict(run)

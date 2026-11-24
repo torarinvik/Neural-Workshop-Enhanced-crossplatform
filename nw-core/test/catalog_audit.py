@@ -19,6 +19,9 @@ WEB_SHELL = ROOT / "nw-core/shells/web/index.html"
 PYTHON_SHELL = ROOT / "nw-core/shells/python/app.py"
 SDL_SHELL = ROOT / "nw-core/shells/sdl3/main.c"
 IMPLEMENTATION_PLAN = ROOT / "IMPLEMENTATION_PLAN.md"
+sys.path.insert(0, str(ROOT / "nw-core/scripts"))
+from generate_task_registry import hub_categories, hub_groups
+
 PYMODULE_EXPORTS = ROOT / "nw-core/src/pymodule_exports.elisa"
 WASM_EXPORTS = ROOT / "nw-core/src/wasm/wasm_exports.elisa"
 TASKOPTIONS_SOURCE = ORIGINAL / "neural_workshop/ui/taskoptions.py"
@@ -59,9 +62,9 @@ def source_option_value(node: ast.expr, symbols: dict[str, object]):
     raise ValueError(f"unsupported source option expression: {ast.dump(node)}")
 
 
-def source_task_options() -> dict[str, dict[str, dict[str, object]]]:
+def source_task_options(revision: str) -> dict[str, dict[str, dict[str, object]]]:
     """Read the pinned UI's declarative option lists without importing pyglet."""
-    source = ast.parse(TASKOPTIONS_SOURCE.read_text())
+    source = ast.parse(reference_text(TASKOPTIONS_SOURCE, revision))
     specs = {
         statement.targets[0].id: statement.value
         for statement in source.body
@@ -78,7 +81,7 @@ def source_task_options() -> dict[str, dict[str, dict[str, object]]]:
         ("marblemaze.py", "GRADES", "_MARBLE_GRADES"),
         ("go.py", "DIFFICULTIES", "_GO_LADDER"),
     ):
-        module = ast.parse((ORIGINAL / "neural_workshop" / module_name).read_text())
+        module = ast.parse(reference_text(ORIGINAL / "neural_workshop" / module_name, revision))
         values = assignment(module, constant_name)
         if not isinstance(values, (ast.Tuple, ast.List)):
             raise ValueError(f"{module_name}.{constant_name} must remain a literal sequence")
@@ -148,11 +151,11 @@ def source_task_options() -> dict[str, dict[str, dict[str, object]]]:
     return result
 
 
-def source_nback_options() -> dict[str, dict[str, object]]:
+def source_nback_options(revision: str) -> dict[str, dict[str, object]]:
     """Describe the port-scoped 3D N-Back controls from GameSelect."""
-    game_select = ast.parse(GAMESELECT_SOURCE.read_text())
+    game_select = ast.parse(reference_text(GAMESELECT_SOURCE, revision))
     trial_values = literal(assignment(game_select, "_TRIAL_MS_VALUES"))
-    config_text = CONFIGDEFAULTS_SOURCE.read_text()
+    config_text = reference_text(CONFIGDEFAULTS_SOURCE, revision)
     cube_default_match = re.search(r"^GRID_3D_CUBES = (\d+)\s*$", config_text, re.M)
     if cube_default_match is None:
         raise ValueError("config defaults must retain GRID_3D_CUBES")
@@ -217,9 +220,16 @@ def literal(node: ast.expr):
     raise ValueError(f"catalog value is not literal data: {ast.dump(node)}")
 
 
-def original_tables():
-    catalog_tree = ast.parse((ORIGINAL / "nwenv/catalog.py").read_text())
-    ui_tree = ast.parse((ORIGINAL / "neural_workshop/ui/taskhub.py").read_text())
+def reference_text(path: Path, revision: str) -> str:
+    return subprocess.check_output(
+        ["git", "-C", str(ORIGINAL), "show", f"{revision}:{path.relative_to(ORIGINAL)}"],
+        encoding="utf-8",
+    )
+
+
+def original_tables(revision: str):
+    catalog_tree = ast.parse(reference_text(ORIGINAL / "nwenv/catalog.py", revision))
+    ui_tree = ast.parse(reference_text(ORIGINAL / "neural_workshop/ui/taskhub.py", revision))
     catalog = [
         {"id": literal(row.args[0]), "label": literal(row.args[1])}
         for row in assignment(catalog_tree, "CATALOG").elts
@@ -268,13 +278,168 @@ def parse_core_menu():
                 tasks[current_category] = {}
                 current_task = None
                 continue
-            match = re.match(r"\s{12}(?:if|elif) which == (\d+):", line)
+            match = re.match(r"\s{12}(?:if|elif) which == (\d+)(?: and has_(?:signals|fold_it|beliefs))?:", line)
             if match:
                 current_task = int(match.group(1))
                 continue
             label = re.match(r'\s{16}return "([^"]*)"', line)
             if label and label.group(1) and current_category is not None and current_task is not None:
                 tasks[current_category][current_task] = label.group(1)
+    # Some controllers are available only in the newer hosts. Include their
+    # conditional insertions when auditing the full task hub.
+    for name, category, position in reversed(re.findall(
+        r'^        return "([^"]+)" if (?:has_video_sequence|has_hidden_rule|has_hidden_wiring|has_triage|has_delay|has_stop_switch|has_hold_it|has_notebook|has_where_was_it|has_which_is_nearer|has_same_or_mirror|has_point_of_view|has_inside_or_out|has_touching|has_crossings|has_time_it|has_balance|has_juggler|has_lander|has_beat|has_glider|has_catch|has_echo_cave|has_drone_hoops|has_field_manual|has_safecracker|has_stagehand|has_loading_dock|has_gunslinger|has_potters_wheel|has_railyard|has_airtraffic|has_escort|has_sokobanlive|has_kitchen|has_crane|has_ferry|has_docking|has_rover|has_unicycle|has_morning_round|has_heavier|has_full_stop|has_missing_word|has_proofreader|has_figures_of_speech|has_crazy_cog|has_camera|has_what_next|has_falls) and category == (\d+) and (?:source|index|position|self_control_index|hold_index|perception_index) == (\d+)(?: and has_camera)?(?: and has_what_next)?(?: \+ \(1 if has_(?:railyard|airtraffic|escort|sokobanlive|kitchen|crane|ferry|docking|rover) else 0\))*$',
+        source, re.M,
+    )):
+        cards = tasks.get(int(category), {})
+        ordered = [cards[index] for index in range(len(cards))]
+        ordered.insert(int(position), name)
+        tasks[int(category)] = dict(enumerate(ordered))
+    cipher_card = re.search(r'^        return "([^"]+)" if has_cipher_abyss and category == 4', source, re.M)
+    if cipher_card:
+        cards = list(tasks[4].values())
+        cards.insert(cards.index("Crazy Cog") + 1, cipher_card.group(1))
+        tasks[4] = dict(enumerate(cards))
+    conductor_card = re.search(r'^        return "([^"]+)" if has_conductor and category == 2', source, re.M)
+    if conductor_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Potter's Wheel") + 1, conductor_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    tightrope_card = re.search(r'^        return "([^"]+)" if has_tightrope and category == 2', source, re.M)
+    if tightrope_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Conductor") + 1, tightrope_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    sign_painter_card = re.search(r'^        return "([^"]+)" if has_sign_painter and category == 2', source, re.M)
+    if sign_painter_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Tightrope") + 1, sign_painter_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    bartender_card = re.search(r'^        return "([^"]+)" if has_bartender and category == 2', source, re.M)
+    if bartender_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Sign Painter") + 1, bartender_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    lock_pick_card = re.search(r'^        return "([^"]+)" if has_lock_pick and category == 2', source, re.M)
+    if lock_pick_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Bartender") + 1, lock_pick_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    air_hockey_card = re.search(r'^        return "([^"]+)" if has_air_hockey and category == 2', source, re.M)
+    if air_hockey_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Lock Pick") + 1, air_hockey_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    semaphore_card = re.search(r'^        return "([^"]+)" if has_semaphore and category == 2', source, re.M)
+    if semaphore_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Air Hockey") + 1, semaphore_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    shadow_puppets_card = re.search(r'^        return "([^"]+)" if has_shadow_puppets and category == 2', source, re.M)
+    if shadow_puppets_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Semaphore") + 1, shadow_puppets_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    night_watch_card = re.search(r'^        return "([^"]+)" if has_night_watch and category == 2', source, re.M)
+    if night_watch_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Shadow Puppets") + 1, night_watch_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    kerbside_card = re.search(r'^        return "([^"]+)" if has_kerbside and category == 2', source, re.M)
+    if kerbside_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Night Watch") + 1, kerbside_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    steadicam_card = re.search(r'^        return "([^"]+)" if has_steadicam and category == 2', source, re.M)
+    if steadicam_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Kerbside") + 1, steadicam_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    free_kick_card = re.search(r'^        return "([^"]+)" if has_free_kick and category == 2', source, re.M)
+    if free_kick_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Steadicam") + 1, free_kick_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    glove_card = re.search(r'^        return "([^"]+)" if has_glove and category == 2', source, re.M)
+    if glove_card:
+        cards = list(tasks[2].values())
+        cards.insert(cards.index("Free Kick") + 1, glove_card.group(1))
+        tasks[2] = dict(enumerate(cards))
+    motion_card = re.search(
+        r'if has_sfm and category == 3:\n            return "([^"]+)" if falls_index == sfm_card',
+        source,
+    )
+    if motion_card:
+        cards = list(tasks[3].values())
+        cards.insert(cards.index("Which Is Nearer?") + 1, motion_card.group(1))
+        tasks[3] = dict(enumerate(cards))
+    drshape_card = re.search(r'return "([^"]+)" if perception_index == drshape_card', source)
+    if drshape_card:
+        cards = list(tasks[3].values())
+        cards.insert(cards.index("Point of View") + 1, drshape_card.group(1))
+        tasks[3] = dict(enumerate(cards))
+    tuner_card = re.search(r'return "([^"]+)" if (?:has_tuner and )?perception_index == tuner_card', source)
+    if tuner_card:
+        cards = list(tasks[3].values())
+        cards.insert(cards.index("Time It") + 1, tuner_card.group(1))
+        tasks[3] = dict(enumerate(cards))
+    shadow_play_card = re.search(
+        r'return "([^"]+)" if has_shadow_play and perception_index == shadow_play_card', source,
+    )
+    if shadow_play_card:
+        cards = list(tasks[3].values())
+        cards.insert(cards.index("Tuner") + 1, shadow_play_card.group(1))
+        tasks[3] = dict(enumerate(cards))
+    captcha_card = re.search(
+        r'return "([^"]+)" if has_captcha and perception_index == captcha_card', source,
+    )
+    if captcha_card:
+        cards = list(tasks[3].values())
+        cards.insert(cards.index("Shadow Play") + 1, captcha_card.group(1))
+        tasks[3] = dict(enumerate(cards))
+    by_ear_card = re.search(
+        r'return "([^"]+)" if has_by_ear and perception_index == by_ear_card', source,
+    )
+    if by_ear_card:
+        cards = list(tasks[3].values())
+        cards.insert(cards.index("Captcha") + 1, by_ear_card.group(1))
+        tasks[3] = dict(enumerate(cards))
+    piano_tuner_card = re.search(
+        r'return "([^"]+)" if has_piano_tuner and perception_index == piano_tuner_card', source,
+    )
+    if piano_tuner_card:
+        cards = list(tasks[3].values())
+        cards.insert(cards.index("By Ear") + 1, piano_tuner_card.group(1))
+        tasks[3] = dict(enumerate(cards))
+    cricket_hunt_card = re.search(
+        r'return "([^"]+)" if has_cricket_hunt and perception_index == cricket_hunt_card', source,
+    )
+    if cricket_hunt_card:
+        cards = list(tasks[3].values())
+        cards.insert(cards.index("Piano Tuner") + 1, cricket_hunt_card.group(1))
+        tasks[3] = dict(enumerate(cards))
+    claw_machine_card = re.search(
+        r'return "([^"]+)" if has_claw_machine and perception_index == claw_machine_card', source,
+    )
+    if claw_machine_card:
+        cards = list(tasks[3].values())
+        cards.insert(cards.index("Cricket Hunt") + 1, claw_machine_card.group(1))
+        tasks[3] = dict(enumerate(cards))
+    decisions = re.search(r'^        if category == 7:\n((?: {12}[^\n]+\n)+)', source, re.M)
+    if decisions:
+        # This comparison is against the web registry. A shared scene may
+        # already support a card on SDL before its WASM selector ships.
+        web_exports = WASM_EXPORTS.read_text()
+        cards = [
+            label for label, feature in re.findall(r'return "([^"]+)" if has_(\w+)', decisions.group(1))
+            if f"export fn nw_api_v1_task_{feature}(" in web_exports
+        ]
+        tasks[7] = dict(enumerate(cards))
+    # The tabs after Decisions name each card by its position.
+    for name, category, position in re.findall(
+        r'^        return "([^"]+)" if has_\w+ and category == (8|9|10|11) and position == (\d+)$', source, re.M,
+    ):
+        tasks.setdefault(int(category), {})[int(position)] = name
     return categories, tasks
 
 
@@ -291,15 +456,9 @@ def parse_web_menu(fixture):
     return [
         {
             "label": category["label"],
-            "tasks": [
-                overrides.get(task["id"], {}).get("label", task["label"])
-                for task in sorted(
-                    (row for row in fixture["tasks"] if row["category"] == category["id"]),
-                    key=lambda row: row["position"],
-                )
-            ],
+            "tasks": [overrides.get(task["id"], {}).get("label", task["label"]) for task in tasks],
         }
-        for category in fixture["categories"]
+        for category, tasks in zip(hub_categories(fixture), hub_groups(fixture))
     ]
 
 
@@ -448,8 +607,8 @@ def audit_task_capabilities(fixture, task_ids):
     if missing:
         raise ValueError(f"capabilities are missing task IDs: {sorted(missing)}")
 
-    expected_options = source_task_options()
-    expected_options["nback"] = source_nback_options()
+    expected_options = source_task_options(fixture["reference_revision"])
+    expected_options["nback"] = source_nback_options(fixture["reference_revision"])
     if set(expected_options) != set(task_ids):
         raise ValueError(
             "source option contracts do not match the reviewed catalog: "
@@ -527,16 +686,7 @@ def main() -> int:
     fixture = json.loads(FIXTURE.read_text())
     if fixture.get("schema_version") != 5:
         raise ValueError("task fixture schema version must be 5")
-    revision = subprocess.check_output(
-        ["git", "-C", str(ORIGINAL), "-c", "core.hooksPath=/dev/null", "rev-parse", "HEAD"],
-        text=True,
-    ).strip()
-    if revision != fixture["reference_revision"]:
-        raise ValueError(
-            f"reference revision is {revision}, fixture pins {fixture['reference_revision']}; review and update deliberately"
-        )
-
-    original_catalog, original_groups = original_tables()
+    original_catalog, original_groups = original_tables(fixture["reference_revision"])
     rows = fixture["tasks"]
     ids = [row["id"] for row in rows]
     if len(rows) != 45 or len(set(ids)) != len(ids):
@@ -566,12 +716,12 @@ def main() -> int:
         for path in [*anchors["kernels"], *anchors["scenes"]]:
             if not (ROOT / path).is_file():
                 raise ValueError(f"missing plan anchor for {task_id}: {path}")
-    audit_runtime_coverage(fixture, ids)
+    audit_runtime_coverage(fixture, [*ids, *(row["id"] for row in fixture["hub_additions"])])
     audit_task_capabilities(fixture, ids)
 
     core_categories, core_tasks = parse_core_menu()
     web_groups = parse_web_menu(fixture)
-    expected_categories = [group["label"] for group in original_groups]
+    expected_categories = [group["label"] for group in hub_categories(fixture)]
     # The frozen reference keeps the stable task id/label pair `nback` for
     # catalog comparison. The port deliberately narrows that one visible
     # capability to the 3D face-pattern/cube task; all other N-Back variants
@@ -579,11 +729,11 @@ def main() -> int:
     overrides = fixture["port_overrides"]
     expected_groups = [[
         overrides.get(task["id"], {}).get("label", task["label"])
-        for task in group["tasks"]
-    ] for group in original_groups]
+        for task in group
+    ] for group in hub_groups(fixture)]
     actual_core_categories = [core_categories.get(index) for index in range(len(expected_categories))]
     actual_core_groups = [
-        [core_tasks.get(index, {}).get(position) for position in range(len(group))]
+        [core_tasks.get(index, {}).get(position) for position in range(len(core_tasks.get(index, {})))]
         for index, group in enumerate(expected_groups)
     ]
     actual_web_categories = [group["label"] for group in web_groups]

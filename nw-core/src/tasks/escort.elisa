@@ -1,0 +1,463 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module Escort:
+    const COLS: i64 = 26
+    const ROWS: i64 = 15
+    const DOOR: i64 = 0
+    const BRIDGE: i64 = 1
+    const JET: i64 = 2
+    const MOST_LEVERS: i64 = 6
+    const PORTS: i64 = MOST_LEVERS
+    const MOST_WALKERS: i64 = 3
+    const MOST_DEVICES: i64 = 12
+    const MOST_PACES: i64 = 40
+    const MAX_VERTICAL: i64 = 4
+    const MOST_PATH_CELLS: i64 = COLS + MAX_VERTICAL * (COLS - 3)
+    const SLIDE: f64 = 0.7
+    const SWING: f64 = 0.35
+    const WARN: f64 = 0.7
+    const REACH: f64 = 0.42
+
+    struct Grade:
+        rung: i64
+        walkers: i64
+        devices: i64
+        jets: i64
+        levers: i64
+        coupled: bool
+        speed: f64
+        wobble: bool
+
+    struct Cell:
+        column: i64
+        row: i64
+
+    struct Path:
+        cells: Cell[MOST_PATH_CELLS]
+        count: mutable i64
+
+    struct Device:
+        kind: i64
+        walker: i64
+        at: i64
+        lever: mutable i64
+        period: f64
+        duty: f64
+        phase: f64
+
+    struct Lever:
+        devices: i64[2]
+        count: mutable i64
+
+    struct PaceChange:
+        time: f64
+        factor: f64
+
+    struct Pace:
+        changes: PaceChange[MOST_PACES]
+        count: mutable i64
+
+    struct Temple:
+        level: Grade
+        paths: Path[MOST_WALKERS]
+        devices: Device[MOST_DEVICES]
+        levers: Lever[MOST_LEVERS]
+        start: bool[MOST_DEVICES]
+        delays: f64[MOST_WALKERS]
+        paces: Pace[MOST_WALKERS]
+        count: mutable i64
+        seconds: mutable f64
+        valid: mutable bool
+
+    def grade(rung: i64) -> Grade:
+        can Abort.Panic:
+            r: i64 = rung if rung > 0 else 1
+            walkers: i64 = 1 if r < 13 else (2 if r < 20 else 3)
+            devices: i64 = ((2 + (1 if r > 1 else 0)) if r < 4 else
+                ((3 + (1 if r > 5 else 0)) if r < 7 else (5 if r < 10 else (6 if r < 13 else 4))))
+            jets: i64 = 0 if r < 4 else (1 if r < 7 or (r >= 13 and r < 16) else 2)
+            total: i64 = walkers * (devices - jets)
+            coupled: bool = r >= 10
+            levers: mutable i64 = (total * 2 + 2) / 3 if coupled else total
+            if coupled and levers < 2:
+                levers <- 2
+            levers <- MOST_LEVERS if levers > MOST_LEVERS
+            levers <- total if levers > total
+            speed: f64 = 1.5 + 0.03 * (r if r < 12 else 12).f64() + 0.04 * (r - 20 if r > 20 else 0).f64()
+            return Grade{rung: r, walkers: walkers, devices: devices, jets: jets, levers: levers,
+                coupled: coupled, speed: py_round_decimal(speed, 1000.0) if speed < 9.0e12 else speed, wobble: r >= 16}
+
+    def shuffle(draw: mutable MT19937&, values: mutable i64&, count: i64):
+        can Abort.Panic:
+            index: mutable i64 = count - 1
+            while index > 0 |draw, values, index|:
+                other: usize = py_randbelow(draw, (index + 1).u64()).usize()
+                tmp: i64 = values[index.usize()]
+                values[index.usize()] <- values[other]
+                values[other] <- tmp
+                index <- index - 1
+
+    def path(draw: mutable MT19937&, low: i64, high: i64) -> Path:
+        can Abort.Panic:
+            initial: i64 = (low + high) / 2 + py_randbelow(draw, 5.u64()).i64() - 2
+            row: mutable i64 = low if initial < low else (high if initial > high else initial)
+            column: mutable i64 = 0
+            vertical: mutable i64 = 0
+            result: mutable Path = zeroed
+            seen: mutable bool[COLS * ROWS] = zeroed
+            result.cells[0] <- Cell{column: 0, row: row}
+            result.count <- 1
+            seen[(row * COLS).usize()] <- true
+            while column < COLS - 1 |draw, low, high, row, column, vertical, result, seen|:
+                moves: mutable i64[4] = [0, 0, 1, -1]
+                count: i64 = 4 if vertical < MAX_VERTICAL else 2
+                shuffle(draw, &moves[0], count)
+                chosen: mutable i64 = 0
+                for i in 0..<count |moves, row, column, low, high, seen, chosen|:
+                    dr: i64 = moves[i.usize()]
+                    nc: i64 = column + (1 if dr == 0 else 0)
+                    nr: i64 = row + dr
+                    continue if nr < low or nr > high
+                    continue if seen[(nr * COLS + nc).usize()]
+                    if dr != 0:
+                        continue if column == 0 or column == COLS - 2
+                        continue if seen[(nr * COLS + nc - 1).usize()] or seen[(nr * COLS + nc + 1).usize()]
+                    chosen <- dr
+                    break
+                row <- row + chosen
+                column <- column + (1 if chosen == 0 else 0)
+                vertical <- vertical + 1 if chosen != 0 else 0
+                seen[(row * COLS + column).usize()] <- true
+                result.cells[result.count.usize()] <- Cell{column: column, row: row}
+                result.count <- result.count + 1
+            return result
+
+    def device(temple: mutable Temple&, kind: i64, walker: i64, at: i64, period: f64 = 0.0,
+               duty: f64 = 0.0, phase: f64 = 0.0):
+        can Abort.Panic:
+            temple.devices[temple.count.usize()] <- Device{kind: kind, walker: walker, at: at, lever: -1,
+                period: period, duty: duty, phase: phase}
+            temple.count <- temple.count + 1
+
+    def devices_for(temple: mutable Temple&, draw: mutable MT19937&, walker: i64, path_length: i64) -> bool:
+        can Abort.Panic:
+            level: Grade = temple.level
+            rest: i64 = level.devices - 2 * level.jets
+            count: i64 = level.jets + rest
+            plan: mutable i64[6] = [JET, JET, JET, JET, JET, JET]
+            pool: mutable i64[8] = [DOOR, BRIDGE, DOOR, BRIDGE, DOOR, BRIDGE, DOOR, BRIDGE]
+            # CPython samples this small population by replacing each picked
+            # pool entry with the final remaining item.
+            for i in 0..<rest |draw, plan, pool, rest, level|:
+                remaining: i64 = 2 * rest - i
+                selected: usize = py_randbelow(draw, remaining.u64()).usize()
+                plan[(level.jets + i).usize()] <- pool[selected]
+                pool[selected] <- pool[(remaining - 1).usize()]
+            shuffle(draw, &plan[0], count)
+            cursor: mutable i64 = 3
+            span: f64 = (path_length - 6).f64() / count.f64()
+            for i in 0..<count |temple, draw, walker, path_length, span, cursor, plan|:
+                raw: i64 = (3.0 + span * i.f64() + py_uniform(draw, 0.0, fmax(0.0, span - 4.0))).i64()
+                at: i64 = raw if raw > cursor else cursor
+                kind: i64 = plan[i.usize()]
+                if kind == JET:
+                    return false if at + 2 >= path_length - 2
+                    device(temple, DOOR, walker, at)
+                    period: f64 = py_uniform(draw, 2.6, 3.8)
+                    duty: f64 = py_uniform(draw, 0.35, 0.5)
+                    phase: f64 = py_uniform(draw, 0.0, period)
+                    device(temple, JET, walker, at + 2, period, duty, phase)
+                    cursor <- at + 5
+                else:
+                    return false if at >= path_length - 2
+                    device(temple, kind, walker, at)
+                    cursor <- at + 4
+            return true
+
+    def wire(temple: mutable Temple&, draw: mutable MT19937&):
+        can Abort.Panic:
+            indices: mutable i64[MOST_DEVICES] = zeroed
+            count: mutable i64 = 0
+            for i in 0..<temple.count |temple, indices, count|:
+                if temple.devices[i.usize()].kind != JET:
+                    indices[count.usize()] <- i
+                    count <- count + 1
+            shuffle(draw, &indices[0], count)
+            levers: i64 = temple.level.levers
+            groups: mutable Lever[MOST_LEVERS] = zeroed
+            for i in 0..<count |indices, groups, levers|:
+                group: usize = (i % levers).usize()
+                groups[group].devices[groups[group].count.usize()] <- indices[i.usize()]
+                groups[group].count <- groups[group].count + 1
+            order: mutable i64[MOST_LEVERS] = [0, 1, 2, 3, 4, 5]
+            shuffle(draw, &order[0], levers)
+            for i in 0..<levers |temple, groups, order|:
+                group: Lever = groups[order[i.usize()].usize()]
+                temple.levers[i.usize()] <- group
+                for j in 0..<group.count |temple, group, i|:
+                    temple.devices[group.devices[j.usize()].usize()].lever <- i
+
+    def build(level: Grade, draw: mutable MT19937&) -> Temple:
+        can Abort.Panic:
+            temple: mutable Temple = Temple{level: level, paths: zeroed, devices: zeroed, levers: zeroed,
+                start: zeroed, delays: zeroed, paces: zeroed, count: 0, seconds: 0.0, valid: false}
+            band: f64 = (ROWS - 1).f64() / level.walkers.f64()
+            longest: mutable i64 = 0
+            for w in 0..<level.walkers |level, draw, temple, band, longest|:
+                low: i64 = py_round_half_even(w.f64() * band) + (1 if w > 0 else 0)
+                high: i64 = py_round_half_even((w + 1).f64() * band) - (1 if w < level.walkers - 1 else 0)
+                route: Path = path(draw, low, high)
+                temple.paths[w.usize()] <- route
+                return temple if not devices_for(&temple, draw, w, route.count)
+                longest <- route.count if route.count > longest
+            wire(&temple, draw)
+            for i in 0..<temple.count |temple, draw|:
+                temple.start[i.usize()] <- py_random(draw) < 0.5
+            for i in 0..<temple.count |temple, draw|:
+                if temple.devices[i.usize()].kind == DOOR and py_random(draw) < 0.7:
+                    temple.start[i.usize()] <- false
+            latest: mutable f64 = 0.0
+            for w in 0..<level.walkers |temple, draw, latest|:
+                delay: f64 = w.f64() * py_uniform(draw, 1.5, 3.5)
+                temple.delays[w.usize()] <- delay
+                latest <- fmax(latest, delay)
+            if level.wobble:
+                factors: f64[4] = [0.65, 0.8, 1.25, 1.45]
+                for w in 0..<level.walkers |temple, draw, factors|:
+                    time: mutable f64 = py_uniform(draw, 3.0, 7.0)
+                    pace: mutable Pace& = &temple.paces[w.usize()]
+                    while time < 120.0 |pace, draw, time, factors|:
+                        factor: f64 = factors[py_randbelow(draw, 4.u64()).usize()]
+                        pace.changes[pace.count.usize()] <- PaceChange{time: time, factor: factor}
+                        pace.count <- pace.count + 1
+                        time <- time + py_uniform(draw, 3.0, 7.0)
+            temple.seconds <- py_round_decimal(longest.f64() / level.speed * 2.4 + latest + 12.0, 10.0)
+            temple.valid <- true
+            return temple
+
+    const WALKING: i64 = 0
+    const WAITING: i64 = 1
+    const QUEUED: i64 = 2
+    const FELL: i64 = 3
+    const BURNED: i64 = 4
+    const ARRIVED: i64 = 5
+
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const PIT_LOSS: i64 = 2
+    const FIRE_LOSS: i64 = 3
+    const TIMEOUT: i64 = 4
+
+    struct Run:
+        temple: Temple
+        elapsed: mutable f64
+        targets: bool[MOST_DEVICES]
+        progress: f64[MOST_DEVICES]
+        positions: f64[MOST_WALKERS]
+        states: i64[MOST_WALKERS]
+        paces: f64[MOST_WALKERS]
+        next_pace: i64[MOST_WALKERS]
+        result: mutable i64
+        pulled: f64[MOST_LEVERS]
+
+    struct JetCycle:
+        next_on: f64
+        next_off: f64
+
+    struct Position:
+        column: f64
+        row: f64
+
+    struct Need:
+        state: bool
+        weight: f64
+
+    def initialize(temple: Temple&) -> Run:
+        can Abort.Panic:
+            run: mutable Run = Run{temple: temple[0], elapsed: 0.0, targets: temple.start, progress: zeroed,
+                positions: zeroed, states: [QUEUED, QUEUED, QUEUED], paces: [1.0, 1.0, 1.0],
+                next_pace: zeroed, result: LIVE, pulled: zeroed}
+            for i in 0..<temple.count |temple, run|:
+                run.progress[i.usize()] <- 1.0 if temple.start[i.usize()] else 0.0
+            return run
+
+    def pull(run: mutable Run&, lever: i64) -> bool:
+        can Abort.Panic:
+            return false if lever < 0 or lever >= run.temple.level.levers or run.result != LIVE
+            run.pulled[lever.usize()] <- run.elapsed
+            group: Lever = run.temple.levers[lever.usize()]
+            for i in 0..<group.count |run, group|:
+                device: usize = group.devices[i.usize()].usize()
+                run.targets[device] <- not run.targets[device]
+            return true
+
+    def jet_on(device: Device, time: f64) -> bool:
+        return fmod(time + device.phase, device.period) < device.duty * device.period
+
+    def jet_next(device: Device, time: f64) -> JetCycle:
+        into: f64 = fmod(time + device.phase, device.period)
+        on: f64 = device.duty * device.period
+        return JetCycle{next_on: 0.0, next_off: on - into} if into < on
+        return JetCycle{next_on: device.period - into, next_off: device.period - into + on}
+
+    def where(run: Run&, walker: i64) -> Position:
+        can Abort.Panic:
+            path: Path& = &run.temple.paths[walker.usize()]
+            p: f64 = fmax(0.0, fmin(path.count.f64() - 1.0, run.positions[walker.usize()]))
+            k: i64 = p.i64() if p.i64() < path.count - 1 else path.count - 2
+            f: f64 = p - k.f64()
+            a: Cell = path.cells[k.usize()]
+            b: Cell = path.cells[(k + 1).usize()]
+            return Position{column: a.column.f64() + (b.column - a.column).f64() * f,
+                row: a.row.f64() + (b.row - a.row).f64() * f}
+
+    def walk(run: mutable Run&, walker: i64, dt: f64):
+        can Abort.Panic:
+            w: usize = walker.usize()
+            pace: Pace& = &run.temple.paces[w]
+            while run.next_pace[w] < pace.count and pace.changes[run.next_pace[w].usize()].time <= run.elapsed |run, w, pace|:
+                run.paces[w] <- pace.changes[run.next_pace[w].usize()].factor
+                run.next_pace[w] <- run.next_pace[w] + 1
+            return if run.states[w] >= FELL or run.elapsed < run.temple.delays[w]
+            position: f64 = run.positions[w]
+            goal: mutable f64 = position + run.temple.level.speed * run.paces[w] * dt
+            state: mutable i64 = WALKING
+            for i in 0..<run.temple.count |run, walker, position, goal, state|:
+                d: Device = run.temple.devices[i.usize()]
+                continue if d.walker != walker or d.kind != DOOR or run.progress[i.usize()] >= 0.999
+                stop: f64 = d.at.f64() - 0.5
+                if position <= stop + 0.000000001 and stop + 0.000000001 < goal + 0.000000001:
+                    goal <- fmin(goal, stop)
+                    state <- WAITING
+            for i in 0..<run.temple.count |run, walker, goal, state|:
+                d: Device = run.temple.devices[i.usize()]
+                continue if d.walker != walker or fabs(goal - d.at.f64()) > REACH
+                if d.kind == BRIDGE and run.progress[i.usize()] < 0.999:
+                    state <- FELL
+                elif d.kind == JET and jet_on(d, run.elapsed):
+                    state <- BURNED
+            finish: f64 = (run.temple.paths[w].count - 1).f64()
+            run.positions[w] <- fmin(goal, finish)
+            run.states[w] <- ARRIVED if goal >= finish else state
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic:
+            return if run.result != LIVE
+            run.elapsed <- run.elapsed + dt
+            for i in 0..<run.temple.count |run, dt|:
+                index: usize = i.usize()
+                kind: i64 = run.temple.devices[index].kind
+                continue if kind == JET
+                rate: f64 = dt / (SWING if kind == DOOR else SLIDE)
+                progress: f64 = run.progress[index]
+                run.progress[index] <- fmin(1.0, progress + rate) if run.targets[index] else fmax(0.0, progress - rate)
+            failure: mutable i64 = LIVE
+            complete: mutable bool = true
+            for w in 0..<run.temple.level.walkers |run, dt, failure, complete|:
+                walk(run, w, dt)
+                state: i64 = run.states[w.usize()]
+                if state != ARRIVED:
+                    complete <- false
+                if state == FELL:
+                    failure <- PIT_LOSS
+                elif state == BURNED and failure == LIVE:
+                    failure <- FIRE_LOSS
+            run.result <- failure if failure != LIVE else (CLEAR if complete else (TIMEOUT if run.elapsed >= run.temple.seconds else LIVE))
+
+    def jet_after(run: Run&, door: Device) -> i64:
+        can Abort.Panic:
+            for i in 0..<run.temple.count |run, door|:
+                d: Device = run.temple.devices[i.usize()]
+                return i if d.walker == door.walker and d.kind == JET and d.at == door.at + 2
+            return -1
+
+    def clear(run: Run&, jet: Device, enter: f64, leave: f64) -> bool:
+        can Abort.Panic:
+            t: mutable f64 = enter
+            while t <= leave |run, jet, t|:
+                return false if jet_on(jet, run.elapsed + t)
+                t <- t + 0.05
+            return not jet_on(jet, run.elapsed + leave)
+
+    def want(run: Run&, index: i64) -> Need:
+        can Abort.Panic:
+            none: Need = Need{state: false, weight: 0.0}
+            d: Device = run.temple.devices[index.usize()]
+            w: usize = d.walker.usize()
+            return none if d.kind == JET or run.states[w] >= FELL
+            ahead: f64 = d.at.f64() - run.positions[w]
+            return none if ahead < -REACH - 0.05
+            speed: f64 = fmax(0.3, run.temple.level.speed * run.paces[w])
+            delay: f64 = fmax(0.0, run.temple.delays[w] - run.elapsed)
+            reach: f64 = delay + fmax(0.0, ahead - REACH) / speed
+            if d.kind == BRIDGE:
+                return Need{state: true, weight: 1000.0} if ahead <= REACH + 0.05
+                return Need{state: true, weight: 200.0 / (1.0 + reach)} if reach < SLIDE * 1.6 + 0.6
+                return Need{state: true, weight: 5.0 / (1.0 + reach)} if reach < 6.0
+                return none
+            return none if ahead < -0.5 + 0.000001
+            jet: i64 = jet_after(run, d)
+            if jet < 0:
+                return Need{state: true, weight: 4.0 / (1.0 + reach)} if reach < 6.0 else none
+            held: bool = ahead <= 0.5 + 0.02
+            enter: f64 = ((delay + SWING * (1.0 - run.progress[index.usize()]) + (2.5 - REACH) / speed) if held
+                else (delay + (ahead + 2.0 - REACH) / speed))
+            leave: f64 = enter + 2.0 * REACH / speed
+            start: f64 = enter - 0.15 if run.temple.level.wobble else enter
+            stop: f64 = leave + 0.25 if run.temple.level.wobble else leave
+            ok: bool = clear(run, run.temple.devices[jet.usize()], fmax(0.0, start - 0.35), stop + 0.35)
+            return Need{state: ok, weight: 60.0 if ok else 300.0} if held
+            if not ok:
+                return Need{state: false, weight: 300.0 if (ahead - 0.5) / speed < SWING * 1.4 + 0.35 else 3.0}
+            return Need{state: true, weight: 2.0} if reach < 4.0 else none
+
+    def autopilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            needs: mutable Need[MOST_DEVICES] = zeroed
+            for i in 0..<run.temple.count |run, needs|:
+                needs[i.usize()] <- want(run, i)
+            best: mutable i64 = -1
+            weight: mutable f64 = 0.5
+            for i in 0..<run.temple.level.levers |run, needs, best, weight|:
+                continue if run.elapsed - run.pulled[i.usize()] < 0.25
+                group: Lever = run.temple.levers[i.usize()]
+                score: mutable f64 = 0.0
+                for j in 0..<group.count |run, needs, group, score|:
+                    index: usize = group.devices[j.usize()].usize()
+                    need: Need = needs[index]
+                    score <- score + (need.weight if (not run.targets[index]) == need.state else -need.weight)
+                if score > weight:
+                    best <- i
+                    weight <- score
+            return best
+
+    def play(temple: Temple&, reference: bool) -> bool:
+        can Abort.Panic:
+            run: mutable Run = initialize(temple)
+            while run.result == LIVE |run, reference|:
+                if reference:
+                    _ = pull(&run, autopilot(&run))
+                step(&run, 1.0 / 30.0)
+            return run.result == CLEAR
+
+    def deal_seed(rung: i64, seed: i64) -> Temple:
+        can Abort.Panic:
+            draw: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&draw, magnitude)
+            level: Grade = grade(rung)
+            first: mutable Temple = zeroed
+            for _ in 0..<60 |draw, level, first|:
+                temple: Temple = build(level, &draw)
+                continue if not temple.valid
+                first <- temple if not first.valid
+                return temple if play(&temple, true) and not play(&temple, false)
+            return first if first.valid
+            mt_seed_int(&draw, magnitude - 1.u64() if seed < 0 else magnitude + 1.u64())
+            return build(level, &draw)
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Temple:
+        can Abort.Panic:
+            return deal_seed(rung, py_randbelow(rng, 1073741824.u64()).i64())

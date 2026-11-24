@@ -1,0 +1,195 @@
+include "./drshape_audio.elisa"
+
+module DrShapePuzzle:
+    const LEAD_IN: f64 = 0.4
+    const HOLD: f64 = 0.9
+
+    struct Span:
+        who: i64
+        start: f64
+        end: f64
+
+    struct Puzzle:
+        level: DrShape::Grade
+        seed: i64
+        mode: mutable i64
+        match_cards: mutable DrShapeDeal::Match
+        platform: mutable DrShapeDeal::Platform
+        count: mutable i64
+        answer: mutable i64
+        bank: mutable DrShapeAudio::Bank
+        notes: mutable darray[DrShapeDeal::Note]
+        drawn_by: mutable f64[DrShape::MAX_STROKES]
+        spans: mutable Span[DrShape::MOST * 2]
+        span_count: mutable i64
+        hues: mutable i64[DrShape::TINTS]
+        show_end: mutable f64
+        choose: mutable f64
+
+    def scene(mode: i64) -> bool:
+        return mode == DrShape::SCENE or mode == DrShape::HEAR_SCENE
+
+    def sound_cards(mode: i64) -> bool:
+        return mode == DrShape::SING or mode == DrShape::ECHO
+
+    def add_song(p: mutable Puzzle&, song: DrShapeDeal::Song&):
+        can Memory.Allocate, Abort.Panic:
+            for i in 0..<song.count |p, song|:
+                p.notes.push(song.notes[i.usize()])
+
+    def add_span(p: mutable Puzzle&, who: i64, start: f64, end: f64):
+        can Abort.Panic:
+            p.spans[p.span_count.usize()] <- Span{who: who, start: start, end: end}
+            p.span_count <- p.span_count + 1
+
+    def noise(p: mutable Puzzle&, until: f64, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            first: i64 = p.bank.count
+            DrShapeAudio::add_noise_patches(&p.bank, rng)
+            overload: f64 = p.level.overload
+            gain: f64 = 0.12 + 0.22 * overload
+            t: mutable f64 = 0.2
+            while t < until |t, until, p, rng, overload, gain, first|:
+                pan: f64 = py_uniform(rng, -1.0, 1.0)
+                pan2: f64 = py_uniform(rng, -1.0, 1.0)
+                dur: f64 = py_uniform(rng, 0.05, 0.3)
+                freq: f64 = py_uniform(rng, 150.0, 1600.0)
+                end_gain: f64 = gain * py_uniform(rng, 0.3, 1.0)
+                bright: f64 = py_random(rng)
+                voice: i64 = first + py_choice_index(rng, 3)
+                seed: i64 = py_choice_index(rng, 1048576)
+                p.notes.push(DrShapeDeal::Note{t: t, dur: dur, freq: freq, pan: pan, pan2: pan2,
+                    gain: gain, gain2: end_gain, bright: bright, voice: voice, seed: seed, who: -2, room: 0.0})
+                t <- t - log(1.0 - py_random(rng)) / (2.0 + 8.0 * overload)
+
+    def play_platform(p: mutable Puzzle&):
+        can Memory.Allocate, Abort.Panic:
+            camera: DrShapeDeal::Eye = DrShapeDeal::eye(p.platform.look)
+            t: mutable f64 = LEAD_IN
+            for i in 0..<3 |p, camera, t|:
+                place: DrShapeDeal::Place = p.platform.target.places[i.usize()]
+                thing: DrShapeDeal::Thing& = &p.platform.things[place.thing.usize()]
+                lift: f64 = DrShapeDeal::ground_lift(thing)
+                where: RoomsView::Vec = DrShapeDeal::seen_from(camera, RoomsView::vec(place.x, lift, place.z))
+                distance: f64 = sqrt(RoomsView::dot(where, where))
+                pan: f64 = DrShapeDeal::clamp(2.2 * where.x / where.z, -1.0, 1.0)
+                voice: DrShapeDeal::Voice = DrShapeDeal::Voice{offset: 0, spare: -1, pan_shift: pan,
+                    pan_width: 0.15, gain: 1.0, transpose: 0, who: -10 - place.thing, distance: distance}
+                song: DrShapeDeal::Song = DrShapeDeal::sing(&thing.form, DrShape::matmul(camera.view, thing.turn),
+                    t, p.level.tempo, voice, DrShapeDeal::ORBIT)
+                add_song(p, &song)
+                add_span(p, place.thing, t, song.end)
+                t <- song.end + 0.5
+            p.show_end <- t + HOLD
+
+    def play_sound_cards(p: mutable Puzzle&, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            shifts: i64[6] = [-12, -7, -5, 5, 7, 12]
+            echo: bool = p.mode == DrShape::ECHO
+            shift: i64 = shifts[py_choice_index(rng, 6).usize()] if echo and p.level.echo_key else 0
+            offset: i64 = DrShape::TINTS if echo else 0
+            t: mutable f64 = p.show_end + 0.5
+            for pass_index in 0..<2 |p, t, shift, offset|:
+                for i in 0..<p.count |p, t, shift, offset|:
+                    card: DrShapeDeal::Candidate& = &p.match_cards.cards[i.usize()]
+                    voice: DrShapeDeal::Voice = DrShapeDeal::Voice{offset: offset, spare: -1, pan_shift: 0.0,
+                        pan_width: 1.0, gain: 1.0, transpose: shift, who: i, distance: 0.0}
+                    song: DrShapeDeal::Song = DrShapeDeal::sing(&card.form, p.match_cards.view, t, p.level.tempo * 1.15, voice)
+                    add_song(p, &song)
+                    add_span(p, i, t, song.end)
+                    t <- song.end + 0.45
+                t <- t + 0.6
+            deadline: f64 = t - p.show_end + 2.5
+            p.choose <- deadline if deadline > p.choose
+
+    def play_chorus(p: mutable Puzzle&):
+        can Memory.Allocate, Abort.Panic:
+            t: mutable f64 = p.show_end + 0.6
+            for i in 0..<p.count |p, t|:
+                card: DrShapeDeal::Candidate& = &p.match_cards.cards[i.usize()]
+                pan: f64 = -0.8 + 1.6 * i.f64() / (p.count - 1).f64()
+                voice: DrShapeDeal::Voice = DrShapeDeal::Voice{offset: 0, spare: -1, pan_shift: pan,
+                    pan_width: 0.2, gain: 0.55, transpose: 0, who: i, distance: card.depth}
+                song: DrShapeDeal::Song = DrShapeDeal::sing(&card.form, card.view, t, 1.3, voice)
+                add_song(p, &song)
+                add_span(p, i, t, song.end)
+                t <- song.end + 0.25 if p.level.overload < 0.5 else t + 0.6
+
+    def schedule(p: mutable Puzzle&, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            p.bank <- DrShapeAudio::patches(&p.level, rng)
+            hue: i64 = py_choice_index(rng, 12)
+            step: i64 = 4 if py_choice_index(rng, 2) == 0 else -4
+            for i in 0..<DrShape::TINTS |p, hue, step|:
+                p.hues[i.usize()] <- (hue + step * i + 12) % 12
+            if scene(p.mode):
+                play_platform(p)
+            else:
+                changing: bool = p.level.overload >= 0.5 and (p.mode == DrShape::SEE or p.mode == DrShape::HEAR)
+                spare: i64 = DrShapeAudio::SPARE + py_choice_index(rng, 4) if changing else -1
+                voice: DrShapeDeal::Voice = DrShapeDeal::Voice{offset: 0, spare: spare, pan_shift: 0.0,
+                    pan_width: 1.0, gain: 1.0, transpose: 0, who: -1,
+                    distance: DrShapeDeal::SHOW_DEPTH if p.level.floor and p.mode == DrShape::SEE else 0.0}
+                song: DrShapeDeal::Song = DrShapeDeal::sing(&p.match_cards.target, p.match_cards.view, LEAD_IN, p.level.tempo, voice)
+                p.drawn_by <- song.drawn_by
+                p.show_end <- song.end + HOLD
+                if p.mode != DrShape::SING:
+                    add_song(p, &song)
+                if sound_cards(p.mode):
+                    play_sound_cards(p, rng)
+                elif p.level.chorus and p.mode == DrShape::SEE:
+                    play_chorus(p)
+            if p.level.overload > 0.0:
+                noise(p, p.show_end + p.choose, rng)
+            sort_notes(&p.notes)
+
+    def before(a: DrShapeDeal::Note, b: DrShapeDeal::Note) -> bool:
+        return a.t < b.t if a.t != b.t
+        return a.dur < b.dur if a.dur != b.dur
+        return a.freq < b.freq if a.freq != b.freq
+        return a.pan < b.pan if a.pan != b.pan
+        return a.pan2 < b.pan2 if a.pan2 != b.pan2
+        return a.gain < b.gain if a.gain != b.gain
+        return a.gain2 < b.gain2 if a.gain2 != b.gain2
+        return a.bright < b.bright if a.bright != b.bright
+        return a.voice < b.voice if a.voice != b.voice
+        return a.seed < b.seed if a.seed != b.seed
+        return a.who < b.who if a.who != b.who
+        return a.room < b.room
+
+    def sort_notes(notes: mutable darray[DrShapeDeal::Note]&):
+        can Abort.Panic:
+            for i in 1..<notes.count |notes|:
+                value: DrShapeDeal::Note = notes[i]
+                spot: mutable usize = i
+                while spot > 0 |notes, value, spot|:
+                    preceding: DrShapeDeal::Note = notes[spot - 1]
+                    break if not before(value, preceding)
+                    notes[spot] <- preceding
+                    spot <- spot - 1
+                notes[spot] <- value
+
+    def deal(rung: i64, seed: i64, forced_mode: i64 = -1) -> Puzzle:
+        can Memory.Allocate, Abort.Panic:
+            level: DrShape::Grade = DrShape::grade(rung)
+            out: mutable Puzzle = Puzzle{level: level, seed: seed, mode: 0, match_cards: zeroed, platform: zeroed,
+                count: 0, answer: -1, bank: zeroed, notes: [], drawn_by: zeroed, spans: zeroed, span_count: 0,
+                hues: zeroed, show_end: 0.0, choose: level.choose}
+            rng: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&rng, magnitude)
+            for attempt in 0..<80 |rng, out, level, forced_mode|:
+                out.mode <- forced_mode if forced_mode >= 0 else DrShape::pick_mode(&level, &rng)
+                if scene(out.mode):
+                    out.platform <- DrShapeDeal::build_platform(&level, out.mode, &rng)
+                    out.count <- out.platform.count
+                    out.answer <- out.platform.answer
+                else:
+                    out.match_cards <- DrShapeDeal::build_match(&level, out.mode, &rng)
+                    out.count <- out.match_cards.count
+                    out.answer <- out.match_cards.answer
+                if out.count > 0:
+                    schedule(&out, &rng)
+                    return out
+            out.answer <- -1
+            return out

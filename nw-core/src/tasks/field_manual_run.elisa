@@ -1,0 +1,446 @@
+include "./field_manual.elisa"
+
+module FieldManualRun:
+    const PENDING: i64 = 0
+    const PASSED: i64 = 1
+    const WRONG_CONTROL: i64 = 2
+    const TOO_SOON: i64 = 3
+    const SHIFT_MISSING: i64 = 4
+    const WRONG_KEY: i64 = 5
+    const TIMEOUT: i64 = 6
+    const CLICK: i64 = 0
+    const TICK: i64 = 1
+    const TOCK: i64 = 2
+    const TONE: i64 = 3
+    const HUM: i64 = 4
+    const BEEP: i64 = 5
+    const BUZZ: i64 = 6
+    const TURN: f64 = 0.45
+    const NOTCH: f64 = 14.0
+    const GRAB_NONE: i64 = -1
+    const GRAB_TURN: i64 = -2
+
+    struct Face:
+        normal: RoomsView::Vec
+        right: RoomsView::Vec
+        up: RoomsView::Vec
+
+    struct Spot:
+        x: f64
+        y: f64
+        radius: f64
+
+    struct Track:
+        start: RoomsView::Vec
+        stop: RoomsView::Vec
+
+    struct Cue:
+        time: f64
+        duration: f64
+        pitch: f64
+        voice: i64
+        gain: f64
+        pan: f64
+        seed: i64
+
+    struct Run:
+        job: FieldManual::Job
+        lens: HandView::Lens
+        hand: mutable HandView::Pointer
+        time: mutable f64
+        yaw: mutable f64
+        pitch: mutable f64
+        state: mutable f64[22]
+        step_no: mutable i64
+        done: mutable i64
+        typed: mutable i64
+        since: mutable f64
+        grab: mutable i64
+        pull: mutable f64
+        from_notch: mutable i64
+        last_x: mutable f64
+        last_y: mutable f64
+        beeped: mutable i64
+        hum_at: mutable f64
+        tone_at: mutable f64
+        noise: mutable MT19937
+        noise_at: mutable f64
+        shift_until: mutable f64
+        record_audio: bool
+        notes: mutable darray[Cue]
+        result: mutable i64
+
+    def eye() -> RoomsView::Vec:
+        return RoomsView::vec(0.0, 0.0, 6.5)
+
+    def face(index: i64) -> Face:
+        x: RoomsView::Vec = RoomsView::vec(1.0, 0.0, 0.0)
+        y: RoomsView::Vec = RoomsView::vec(0.0, 1.0, 0.0)
+        z: RoomsView::Vec = RoomsView::vec(0.0, 0.0, 1.0)
+        return Face{normal: z, right: x, up: y} if index == 0
+        return Face{normal: x, right: RoomsView::mul(z, -1.0), up: y} if index == 1
+        return Face{normal: RoomsView::mul(z, -1.0), right: RoomsView::mul(x, -1.0), up: y} if index == 2
+        return Face{normal: RoomsView::mul(x, -1.0), right: z, up: y} if index == 3
+        return Face{normal: y, right: x, up: RoomsView::mul(z, -1.0)} if index == 4
+        return Face{normal: RoomsView::mul(y, -1.0), right: x, up: z}
+
+    def initialize(job: FieldManual::Job, record_audio: bool = true) -> Run:
+        can Abort.Panic, Memory.Allocate:
+            noise: mutable MT19937 = mt19937_new()
+            mt_seed_int(&noise, job.seed.u64())
+            beginner: bool = job.level.rung < 4
+            hand: HandView::Pointer = HandView::initialize()
+            lens: HandView::Lens = HandView::lens(eye(), RoomsView::vec(0.0, 0.0, 0.0), 1100.0, 500.0, 275.0)
+            return Run{job: job, lens: lens, hand: hand, time: 0.0, yaw: 18.0 if beginner else 25.0,
+                pitch: 14.0 if beginner else 20.0, state: job.start, step_no: 0, done: 0, typed: 0,
+                since: 0.0, grab: GRAB_NONE, pull: 0.0, from_notch: 0, last_x: hand.x, last_y: hand.y,
+                beeped: 0, hum_at: 0.4, tone_at: 0.0, noise: noise, noise_at: 1.0, shift_until: -1.0,
+                record_audio: record_audio, notes: [], result: PENDING}
+
+    def world(run: Run&, point: RoomsView::Vec) -> RoomsView::Vec:
+        a: f64 = run.yaw * (3.141592653589793 / 180.0)
+        b: f64 = run.pitch * (3.141592653589793 / 180.0)
+        x: f64 = point.x * cos(a) + point.z * sin(a)
+        z: f64 = -point.x * sin(a) + point.z * cos(a)
+        return RoomsView::vec(x, point.y * cos(b) - z * sin(b), point.y * sin(b) + z * cos(b))
+
+    def wrap(angle: f64) -> f64:
+        shifted: f64 = angle + 180.0
+        return shifted - floor(shifted / 360.0) * 360.0 - 180.0
+
+    def local(part: FieldManual::Part, along: f64 = 0.0) -> RoomsView::Vec:
+        frame: Face = face(part.face)
+        return RoomsView::add(RoomsView::add(frame.normal, RoomsView::mul(frame.right, part.col.f64() * FieldManual::PITCH)),
+            RoomsView::mul(frame.up, part.row.f64() * FieldManual::PITCH + along))
+
+    def facing(run: Run&, index: i64) -> f64:
+        can Abort.Panic:
+            normal: RoomsView::Vec = world(run, face(index).normal)
+            return RoomsView::dot(normal, RoomsView::unit(RoomsView::sub(eye(), normal)))
+
+    def track(run: Run&, part: FieldManual::Part) -> Track:
+        return Track{start: HandView::see(&run.lens, world(run, local(part, -FieldManual::TRACK))),
+            stop: HandView::see(&run.lens, world(run, local(part, FieldManual::TRACK)))}
+
+    def spot(run: Run&, index: i64) -> Spot:
+        can Abort.Panic:
+            part: FieldManual::Part = run.job.parts[index.usize()]
+            return Spot{x: 0.0, y: 0.0, radius: 0.0} if facing(run, part.face) < 0.12
+            along: f64 = (2.0 * run.state[index.usize()] - 1.0) * FieldManual::TRACK if part.kind == FieldManual::SLIDER else 0.0
+            projected: RoomsView::Vec = HandView::see(&run.lens, world(run, local(part, along)))
+            return Spot{x: 0.0, y: 0.0, radius: 0.0} if projected.z < 0.05
+            size: f64 = 0.24 if part.kind == FieldManual::DIAL else (0.13 if part.kind == FieldManual::SLIDER else 0.17)
+            radius: f64 = run.lens.focal * size / projected.z
+            return Spot{x: projected.x, y: projected.y, radius: radius if radius >= 13.0 else 13.0}
+
+    def hit(run: Run&) -> i64:
+        can Abort.Panic:
+            best: mutable i64 = -1
+            depth: mutable f64 = 1000000000.0
+            for i in 0..<run.job.count |run, best, depth|:
+                s: Spot = spot(run, i)
+                continue if s.radius == 0.0 or py_hypot(run.hand.x - s.x, run.hand.y - s.y) > s.radius
+                z: f64 = -world(run, local(run.job.parts[i.usize()])).z
+                if z < depth:
+                    best <- i
+                    depth <- z
+            return best
+
+    def reading(run: Run&) -> sview:
+        can Abort.Panic:
+            return "" if run.step_no >= run.job.orders.count.i64()
+            return "" if run.job.level.show > 0.0 and run.time - run.since > run.job.level.show
+            order: FieldManual::Order = get run.job.orders[run.step_no.usize()] else zeroed
+            return bytes_view(order.text)
+
+    def counted(run: Run&, order: FieldManual::Order&) -> i64:
+        can Abort.Panic:
+            return 0 if order.wait == 0
+            return run.beeped if order.tone < 0
+            count: mutable i64 = 0
+            for i in 0..<run.beeped |order, count|:
+                tone: i64 = get order.beeps[i.usize()] else -1
+                count <- count + 1 if tone == order.tone
+            return count
+
+    def note(run: mutable Run&, time: f64, duration: f64, pitch: f64, voice: i64, gain: f64, pan: f64 = 0.0):
+        can Memory.Allocate, Abort.Panic:
+            return if not run.record_audio
+            position: mutable i64 = run.notes.count.i64()
+            cue: Cue = Cue{time: time, duration: duration, pitch: pitch, voice: voice, gain: gain, pan: pan, seed: position + 1}
+            run.notes.push(cue)
+            while position > 0 |run, position|:
+                before: Cue = get run.notes[(position - 1).usize()] else zeroed
+                break if before.time <= time
+                run.notes[position.usize()] <- before
+                position <- position - 1
+            run.notes[position.usize()] <- cue
+
+    def failure(run: mutable Run&, cause: i64):
+        can Memory.Allocate, Abort.Panic:
+            note(run, run.time, 0.4, 90.0, BUZZ, 0.6)
+            run.result <- cause
+
+    def next_order(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            run.step_no <- run.step_no + 1
+            run.done <- 0
+            run.typed <- 0
+            run.since <- run.time
+            run.beeped <- 0
+            run.hum_at <- run.time + 0.4
+            note(run, run.time, 0.2, 660.0, TOCK, 0.45)
+            note(run, run.time + 0.08, 0.2, 660.0 * pow(2.0, 7.0 / 12.0), TOCK, 0.45)
+            run.result <- PASSED if run.step_no >= run.job.orders.count.i64()
+
+    def press(run: mutable Run&):
+        can Abort.Panic:
+            return if run.result != PENDING or run.hand.down
+            run.hand.down <- true
+            run.last_x <- run.hand.x
+            run.last_y <- run.hand.y
+            index: i64 = hit(run)
+            run.grab <- index if index >= 0 else GRAB_TURN
+            if index >= 0 and run.job.parts[index.usize()].kind == FieldManual::DIAL:
+                run.pull <- 0.0
+                run.from_notch <- run.state[index.usize()].i64()
+
+    def holding_shift(run: Run&) -> bool:
+        return run.shift_until >= run.time
+
+    def release(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            return if not run.hand.down
+            run.hand.down <- false
+            grab: i64 = run.grab
+            run.grab <- GRAB_NONE
+            return if run.result != PENDING or grab < 0
+            part: FieldManual::Part = run.job.parts[grab.usize()]
+            order: FieldManual::Order = get run.job.orders[run.step_no.usize()] else zeroed
+            bit: i64 = 1 << grab.u64()
+            if part.kind == FieldManual::BUTTON or part.kind == FieldManual::SWITCH:
+                return if hit(run) != grab
+                if part.kind == FieldManual::SWITCH:
+                    run.state[grab.usize()] <- 1.0 - run.state[grab.usize()]
+                note(run, run.time, 0.08, 300.0 if part.kind == FieldManual::BUTTON else 420.0, CLICK, 0.6)
+                if (order.kind != FieldManual::PRESS and order.kind != FieldManual::FLIP) or (order.targets & bit) == 0 or (run.done & bit) != 0:
+                    failure(run, WRONG_CONTROL)
+                elif order.wait != 0 and counted(run, &order) < order.wait:
+                    failure(run, TOO_SOON)
+                elif order.shift and not holding_shift(run):
+                    failure(run, SHIFT_MISSING)
+                else:
+                    run.done <- run.done | bit
+                    if run.done == order.targets:
+                        next_order(run)
+                return
+            return if order.targets != bit
+            value: f64 = run.state[grab.usize()]
+            if order.kind == FieldManual::TURN_DIAL or order.kind == FieldManual::LISTEN:
+                if value == order.value:
+                    next_order(run)
+            elif order.kind == FieldManual::SLIDE:
+                if FieldManual::third(value).f64() == order.value:
+                    next_order(run)
+            elif order.kind == FieldManual::MATCH and HandView::absolute(value - order.value) <= run.job.level.slack:
+                next_order(run)
+
+    def digits(value: i64) -> i64:
+        return 3 if value < 1000
+        return 4 if value < 10000
+        return 5
+
+    def digit(value: i64, position: i64) -> i64:
+        can Abort.Panic:
+            remaining: mutable i64 = value
+            for _at in (position + 1)..<digits(value) |remaining|:
+                remaining <- remaining / 10
+            return remaining % 10
+
+    def key(run: mutable Run&, value: i64):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != PENDING or run.step_no >= run.job.orders.count.i64()
+            order: FieldManual::Order = get run.job.orders[run.step_no.usize()] else zeroed
+            note(run, run.time, 0.05, 500.0, CLICK, 0.4)
+            if order.kind != FieldManual::TYPE or digit(order.digits, run.typed) != value:
+                failure(run, WRONG_KEY)
+                return
+            run.typed <- run.typed + 1
+            if run.typed == digits(order.digits):
+                next_order(run)
+
+    def frequency(value: f64) -> f64:
+        return 220.0 * pow(2.0, 1.5 * value)
+
+    def drag(run: mutable Run&, dx: f64, hx: f64, hy: f64, order: FieldManual::Order&):
+        can Memory.Allocate, Abort.Panic:
+            index: usize = run.grab.usize()
+            part: FieldManual::Part = run.job.parts[index]
+            if part.kind == FieldManual::DIAL:
+                run.pull <- run.pull + dx
+                raw: i64 = run.from_notch + py_round_half_even(run.pull / NOTCH)
+                notch: i64 = ((raw % FieldManual::NOTCHES) + FieldManual::NOTCHES) % FieldManual::NOTCHES
+                if notch.f64() != run.state[index]:
+                    run.state[index] <- notch.f64()
+                    if notch == run.job.secrets[index] and order.kind == FieldManual::LISTEN:
+                        note(run, run.time, 0.3, 880.0, TOCK, 0.6)
+                    else:
+                        note(run, run.time, 0.04, 700.0, TICK, 0.35)
+            elif part.kind == FieldManual::SLIDER:
+                rail: Track = track(run, part)
+                if rail.start.z >= 0.05 and rail.stop.z >= 0.05:
+                    vx: f64 = rail.stop.x - rail.start.x
+                    vy: f64 = rail.stop.y - rail.start.y
+                    d2: f64 = vx * vx + vy * vy
+                    if d2 > 16.0:
+                        run.state[index] <- HandView::clamp(((hx - rail.start.x) * vx + (hy - rail.start.y) * vy) / d2, 0.0, 1.0)
+                if run.time >= run.tone_at:
+                    run.tone_at <- run.time + 0.12
+                    note(run, run.time, 0.14, frequency(run.state[index]), TONE, 0.4)
+
+    def tick(run: mutable Run&, dt: f64, shift: bool = false):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != PENDING
+            run.shift_until <- run.time + HandView::LATCH if shift
+            run.time <- run.time + dt
+            hx: f64 = run.hand.x
+            hy: f64 = run.hand.y
+            dx: f64 = hx - run.last_x
+            dy: f64 = hy - run.last_y
+            run.last_x <- hx
+            run.last_y <- hy
+            if run.grab == GRAB_TURN:
+                run.yaw <- wrap(run.yaw + dx * TURN)
+                run.pitch <- HandView::clamp(run.pitch - dy * TURN, -90.0, 90.0)
+            else:
+                run.yaw <- wrap(run.yaw + run.job.level.spin * dt)
+            order: FieldManual::Order = get run.job.orders[run.step_no.usize()] else zeroed
+            if run.grab >= 0:
+                drag(run, dx, hx, hy, &order)
+            while run.beeped < order.beeps.count.i64() and run.time >= run.since + FieldManual::BEEP_FIRST + FieldManual::BEEP_GAP * run.beeped.f64() |run, order|:
+                high: i64 = get order.beeps[run.beeped.usize()] else 0
+                note(run, run.time, 0.15, 1320.0 if high == 1 else 660.0, BEEP, 0.5)
+                run.beeped <- run.beeped + 1
+            if order.kind == FieldManual::MATCH and run.time >= run.hum_at:
+                run.hum_at <- run.time + 0.9
+                note(run, run.time, 0.5, frequency(order.value), HUM, 0.3)
+            if run.job.level.noise and run.time >= run.noise_at:
+                run.noise_at <- run.time + FieldManual::uniform(&run.noise, 0.4, 1.6)
+                pitches: f64[4] = [240.0, 380.0, 520.0, 990.0]
+                pitch: f64 = pitches[py_choice_index(&run.noise, 4).usize()]
+                note(run, run.time, 0.06, pitch, TICK, 0.25, FieldManual::uniform(&run.noise, -1.0, 1.0))
+            if run.time >= run.job.seconds:
+                failure(run, TIMEOUT)
+
+    def act(run: mutable Run&, port: i64):
+        can Memory.Allocate, Abort.Panic:
+            if port >= 0 and port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                press(run)
+            elif port == HandView::RELEASE:
+                release(run)
+            elif port >= FieldManual::DIGIT and port < FieldManual::SHIFT:
+                key(run, port - FieldManual::DIGIT)
+
+    def result_text(result: i64) -> sview:
+        return "Every order carried out" if result == PASSED
+        return "That was the wrong control" if result == WRONG_CONTROL
+        return "Too soon" if result == TOO_SOON
+        return "Shift was not held" if result == SHIFT_MISSING
+        return "That was the wrong key" if result == WRONG_KEY
+        return "Out of time" if result == TIMEOUT
+        return ""
+
+    def movement_size(distance: f64) -> i64:
+        return 0 if distance >= 80.0
+        return 1 if distance >= 20.0
+        return 2
+
+    def turn_port(run: Run&, dyaw: f64, dpitch: f64) -> i64:
+        if run.hand.down and run.grab != GRAB_TURN:
+            return HandView::RELEASE
+        if not run.hand.down:
+            anchor: f64 = 70.0 if dyaw > 0.0 else HandView::WIDTH - 70.0
+            port: i64 = HandView::toward(&run.hand, anchor, 300.0)
+            return port if port >= 0 else HandView::PRESS
+        if HandView::absolute(dyaw) >= HandView::absolute(dpitch):
+            stuck: bool = run.hand.x >= HandView::WIDTH - 1.0 if dyaw > 0.0 else run.hand.x <= 1.0
+            return HandView::RELEASE if stuck
+            return (3 if dyaw > 0.0 else 2) * 3 + movement_size(HandView::absolute(dyaw) / TURN)
+        stuck: bool = run.hand.y <= 1.0 if dpitch > 0.0 else run.hand.y >= HandView::HEIGHT - 1.0
+        return HandView::RELEASE if stuck
+        return (1 if dpitch > 0.0 else 0) * 3 + movement_size(HandView::absolute(dpitch) / TURN)
+
+    def slider_port(run: Run&, order: FieldManual::Order&, part: FieldManual::Part, index: i64) -> i64:
+        can Abort.Panic:
+            slide: bool = order.kind == FieldManual::SLIDE
+            want: f64 = order.value / 2.0 if slide else order.value
+            slack: f64 = 0.08 if slide else 0.6 * run.job.level.slack
+            rail: Track = track(run, part)
+            return HandView::RELEASE if rail.start.z < 0.05 or rail.stop.z < 0.05
+            difference: f64 = want - run.state[index.usize()]
+            return HandView::RELEASE if HandView::absolute(difference) <= slack
+            vx: f64 = rail.stop.x - rail.start.x
+            vy: f64 = rail.stop.y - rail.start.y
+            size: i64 = movement_size(HandView::absolute(difference) * py_hypot(vx, vy))
+            if HandView::absolute(vy) >= HandView::absolute(vx):
+                return (0 if difference * vy > 0.0 else 1) * 3 + size
+            return (3 if difference * vx > 0.0 else 2) * 3 + size
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != PENDING or run.step_no >= run.job.orders.count.i64()
+            order: FieldManual::Order = get run.job.orders[run.step_no.usize()] else zeroed
+            if order.kind == FieldManual::TYPE and order.targets == 0:
+                return FieldManual::DIGIT + digit(order.digits, run.typed)
+            targets: i64 = order.targets ^ (order.targets & run.done)
+            index: mutable i64 = 0
+            while index < run.job.count and (targets & (1 << index.u64())) == 0 |index, run, targets|:
+                index <- index + 1
+            return -1 if index >= run.job.count
+            part: FieldManual::Part = run.job.parts[index.usize()]
+            yaws: f64[4] = [0.0, -90.0, 180.0, 90.0]
+            yaw: f64 = yaws[part.face.usize()] if part.face < 4 else py_round_half_even(run.yaw / 90.0).f64() * 90.0
+            pitch: f64 = 0.0 if part.face < 4 else (90.0 if part.face == 4 else -90.0)
+            dyaw: f64 = wrap(yaw - run.job.level.spin * 0.4 - run.yaw)
+            dpitch: f64 = pitch - run.pitch
+            turning: bool = run.grab == GRAB_TURN
+            if facing(run, part.face) < 0.8 or (turning and (HandView::absolute(dyaw) > 6.0 or HandView::absolute(dpitch) > 6.0)):
+                return turn_port(run, dyaw, dpitch)
+            return HandView::RELEASE if turning
+            if order.kind == FieldManual::TYPE:
+                return FieldManual::DIGIT + digit(order.digits, run.typed)
+            s: Spot = spot(run, index)
+            return -1 if s.radius == 0.0
+            if not run.hand.down:
+                port: i64 = HandView::toward(&run.hand, s.x, s.y, 4.0)
+                return port if port >= 0
+                return -1 if order.wait != 0 and counted(run, &order) < order.wait
+                return FieldManual::SHIFT if order.shift and not holding_shift(run)
+                return HandView::PRESS
+            return HandView::RELEASE if run.grab != index or part.kind == FieldManual::BUTTON or part.kind == FieldManual::SWITCH
+            if part.kind == FieldManual::DIAL:
+                gap: i64 = (order.value.i64() - run.state[index.usize()].i64() + FieldManual::NOTCHES) % FieldManual::NOTCHES
+                return HandView::RELEASE if gap == 0
+                return 11 if gap <= FieldManual::NOTCHES / 2 else 8
+            return slider_port(run, &order, part, index)
+
+    def play(job: FieldManual::Job) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            run: mutable Run = initialize(job, false)
+            while run.result == PENDING |run|:
+                port: i64 = pilot(&run)
+                act(&run, port)
+                tick(&run, 1.0 / 60.0, port == FieldManual::SHIFT)
+            return run.result
+
+    def deal(rung: i64, draw: mutable MT19937&) -> FieldManual::Job:
+        can Memory.Allocate, Abort.Panic:
+            level: FieldManual::Grade = FieldManual::grade(rung)
+            for _attempt in 0..<60 |level, draw|:
+                job: FieldManual::Job = FieldManual::build(level, py_getrandbits(draw, 32).i64())
+                if job.valid and play(job) == PASSED:
+                    return job
+            return FieldManual::Job{level: level, valid: false, parts: zeroed, count: 0,
+                numbers: zeroed, secrets: zeroed, start: zeroed, orders: [], seconds: 0.0, seed: 0}

@@ -186,6 +186,34 @@ assert.equal(info(pointerRun, INFO.routeCount), 5n);
 assert.equal(info(pointerRun, INFO.phase), PHASE.toured);
 assert.ok(containsText(frame(pointerRun), "Traveling Salesman"));
 
+function verdicts(handle) {
+  return decode(frame(handle)).filter(({ kind, color }) =>
+    kind === Kind.TEXT && (color === 0x40ff40ff || color === 0xff4040ff))
+    .map(({ text, color, b }) => ({ text, color, y: b }));
+}
+
+assert.equal(verdicts(pointerRun)[0].color, 0xff4040ff);
+let finalSequence = 6;
+let finalTime;
+for (let round = 2; round <= 3; round += 1) {
+  finalTime = Number(info(pointerRun, INFO.feedbackUntilMs));
+  assert.equal(advance(pointerRun, finalTime, finalSequence++), STATUS.accepted);
+  assert.deepEqual(verdicts(pointerRun), [], "the next route clears the verdict");
+  const optimum = Array.from({ length: 5 }, (_, city) => value(pointerRun, VALUE.best, city));
+  for (const city of optimum) {
+    assert.equal(action(pointerRun, ACTION.pick, ++finalTime, finalSequence++, city), STATUS.accepted);
+  }
+}
+const finalVerdict = { text: "The shortest route there is — in 0s", color: 0x40ff40ff, y: 60 };
+assert.deepEqual(verdicts(pointerRun), [finalVerdict]);
+finalTime = Number(info(pointerRun, INFO.feedbackUntilMs));
+assert.equal(advance(pointerRun, finalTime, finalSequence++), STATUS.accepted);
+assert.equal(info(pointerRun, INFO.phase), PHASE.done);
+assert.ok(containsText(frame(pointerRun), "3 routes, "));
+assert.deepEqual(verdicts(pointerRun), [finalVerdict], "the summary retains the final route verdict");
+assert.equal(keyDown(pointerRun, KEY.enter, finalTime + 1, finalSequence++), STATUS.accepted);
+assert.deepEqual(verdicts(pointerRun), [], "a new run clears the verdict");
+
 for (const handle of [run, replay, pointerRun]) {
   assert.equal(exports.nw_api_v1_destroy(handle), 0n);
   assert.equal(exports.nw_api_v1_destroy(handle), 0n, "destroy is idempotent");

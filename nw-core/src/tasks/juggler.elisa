@@ -1,0 +1,258 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+include "../strings.elisa"
+
+module Juggler:
+    const WIDTH: f64 = 32.0
+    const HEIGHT: f64 = 24.0
+    const TRAY_Y: f64 = 1.6
+    const RADIUS: f64 = 0.6
+    const GRAVITY: f64 = 9.0
+    const FLIGHT: f64 = 3.4
+    const TOP: f64 = 20.0
+    const LEFT: i64 = 0
+    const RIGHT: i64 = 1
+    const BRAKE: i64 = -1
+    const PENDING: i64 = 0
+    const PASSED: i64 = 1
+    const DROPPED: i64 = 2
+
+    struct Grade:
+        rung: i64
+        count: i64
+        mixed: bool
+        draught: f64
+        tray: f64
+        seconds: f64
+
+    struct Drop:
+        time: f64
+        x: f64
+        weight: f64
+
+    struct Act:
+        level: Grade
+        drops: mutable Drop[5]
+        draught_seed: mutable i64
+
+    struct Point:
+        x: f64
+        y: f64
+
+    struct Flash:
+        time: f64
+        x: f64
+
+    struct Ball:
+        x: mutable f64
+        y: mutable f64
+        vx: mutable f64
+        vy: mutable f64
+        weight: f64
+        live: mutable bool
+        catches: mutable i64
+        trail: mutable Point[8]
+        trail_count: mutable i64
+        trail_next: mutable i64
+
+    struct Trial:
+        act: Act
+        time: mutable f64
+        x: mutable f64
+        velocity: mutable f64
+        balls: mutable Ball[5]
+        result: mutable i64
+        flashes: mutable Flash[8]
+        flash_count: mutable i64
+        flash_next: mutable i64
+
+    def clamp(value: f64, low: f64, high: f64) -> f64:
+        return low if value < low else (high if value > high else value)
+
+    def magnitude(value: f64) -> f64:
+        return -value if value < 0.0 else value
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: f64 = (r - 20).f64() if r > 20 else 0.0
+        count: i64 = 1 if r < 2 else (2 if r < 4 else (3 if r < 10 else (4 if r < 20 else 5)))
+        return Grade{rung: r, count: count, mixed: r >= 7, draught: 0.0 if r < 13 else 0.9 + 0.05 * top,
+            tray: 5.0 if r < 16 else (4.2 if r < 20 else clamp(3.8 - 0.06 * top, 3.0, 3.8)),
+            seconds: 25.0 + 3.0 * count.f64() + 0.6 * top}
+
+    def uniform(rng: mutable MT19937&, a: f64, b: f64) -> f64:
+        return a + (b - a) * py_random(rng)
+
+    def build(level: Grade, rng: mutable MT19937&) -> Act:
+        can Abort.Panic:
+            act: mutable Act = Act{level: level, drops: zeroed, draught_seed: 0}
+            weights: mutable f64[5] = zeroed
+            variants: f64[3] = [0.7, 1.0, 1.35]
+            for i in 0..<level.count |rng, weights, variants, level|:
+                weights[i.usize()] <- variants[py_randbelow(rng, 3.u64()).usize()] if level.mixed else 1.0
+            for i in 0..<level.count |rng, level, act, weights|:
+                w: f64 = weights[i.usize()]
+                lands: f64 = 2.8 + i.f64() * FLIGHT / level.count.f64() * uniform(rng, 0.9, 1.1)
+                fall: f64 = sqrt(2.0 * (HEIGHT - 1.0 - TRAY_Y - RADIUS) / (GRAVITY * w))
+                onset: f64 = lands - fall if lands > fall else 0.0
+                act.drops[i.usize()] <- Drop{time: py_round_half_even(onset * 100.0).f64() / 100.0,
+                    x: uniform(rng, 8.0, WIDTH - 8.0), weight: w}
+            act.draught_seed <- py_randbelow(rng, 1048576.u64()).i64()
+            return act
+
+    def trial(act: Act) -> Trial:
+        can Abort.Panic:
+            run: mutable Trial = Trial{act: act, time: 0.0, x: WIDTH / 2.0, velocity: 0.0,
+                balls: zeroed, result: PENDING, flashes: zeroed, flash_count: 0, flash_next: 0}
+            for i in 0..<act.level.count |act, run|:
+                drop: Drop = act.drops[i.usize()]
+                run.balls[i.usize()] <- Ball{x: drop.x, y: HEIGHT - 1.0, vx: 0.0, vy: 0.0, weight: drop.weight,
+                    live: false, catches: 0, trail: zeroed, trail_count: 0, trail_next: 0}
+            return run
+
+    def draught(act: Act&, time: f64) -> f64:
+        return 0.0 if act.level.draught == 0.0
+        return act.level.draught * sin(time * 0.3 + (act.draught_seed % 13).f64())
+
+    def trail(ball: mutable Ball&):
+        can Abort.Panic:
+            if ball.trail_count > 0:
+                prior: Point = ball.trail[((ball.trail_next + 7) % 8).usize()]
+                return if magnitude(prior.y - ball.y) + magnitude(prior.x - ball.x) <= 0.7
+            ball.trail[ball.trail_next.usize()] <- Point{x: ball.x, y: ball.y}
+            ball.trail_next <- (ball.trail_next + 1) % 8
+            ball.trail_count <- ball.trail_count + 1 if ball.trail_count < 8
+
+    def step(run: mutable Trial&, dt: f64, control: i64):
+        can Abort.Panic:
+            return if run.result != PENDING
+            run.time <- run.time + dt
+            if control == LEFT:
+                run.velocity <- clamp(run.velocity - 70.0 * dt, -TOP, TOP)
+            elif control == RIGHT:
+                run.velocity <- clamp(run.velocity + 70.0 * dt, -TOP, TOP)
+            else:
+                slow: f64 = 60.0 * dt
+                braked: f64 = run.velocity - slow if run.velocity > 0.0 else run.velocity + slow
+                run.velocity <- 0.0 if magnitude(run.velocity) <= slow else braked
+            run.x <- run.x + run.velocity * dt
+            half: f64 = run.act.level.tray / 2.0
+            if run.x < half or run.x > WIDTH - half:
+                run.x <- clamp(run.x, half, WIDTH - half)
+                run.velocity <- 0.0
+            wind: f64 = draught(&run.act, run.time)
+            for i in 0..<run.act.level.count |run, dt, half, wind|:
+                ball: mutable Ball& = &run.balls[i.usize()]
+                if not ball.live:
+                    ball.live <- true if run.time >= run.act.drops[i.usize()].time
+                    continue
+                g: f64 = GRAVITY * ball.weight
+                ball.vy <- ball.vy - g * dt
+                ball.vx <- ball.vx + wind * dt
+                ball.x <- ball.x + ball.vx * dt
+                ball.y <- ball.y + ball.vy * dt
+                if ball.x < RADIUS or ball.x > WIDTH - RADIUS:
+                    ball.x <- clamp(ball.x, RADIUS, WIDTH - RADIUS)
+                    ball.vx <- -ball.vx
+                if ball.y > HEIGHT - RADIUS and ball.vy > 0.0:
+                    ball.y <- HEIGHT - RADIUS
+                    ball.vy <- -ball.vy
+                contact: f64 = ball.y - RADIUS
+                if ball.vy < 0.0 and contact >= TRAY_Y and contact < TRAY_Y + 0.6 and magnitude(ball.x - run.x) <= half + RADIUS * 0.5:
+                    offset: f64 = (ball.x - run.x) / half
+                    ball.vy <- g * FLIGHT / 2.0
+                    ball.vx <- clamp(offset * 6.0 + run.velocity * 0.25, -9.0, 9.0)
+                    ball.y <- TRAY_Y + RADIUS
+                    ball.catches <- ball.catches + 1
+                    run.flashes[run.flash_next.usize()] <- Flash{time: run.time, x: ball.x}
+                    run.flash_next <- (run.flash_next + 1) % 8
+                    run.flash_count <- run.flash_count + 1 if run.flash_count < 8
+                if ball.y < RADIUS:
+                    run.result <- DROPPED
+                    return
+                trail(ball)
+            run.result <- PASSED if run.time >= run.act.level.seconds
+
+    struct Landing:
+        time: f64
+        x: f64
+
+    def landing(run: Trial&, index: i64) -> Landing:
+        can Abort.Panic:
+            b: Ball = run.balls[index.usize()]
+            wait: f64 = 0.0 if b.live else run.act.drops[index.usize()].time - run.time
+            x: mutable f64 = b.x
+            y: mutable f64 = b.y
+            vx: mutable f64 = b.vx if b.live else 0.0
+            vy: mutable f64 = b.vy if b.live else 0.0
+            t: mutable f64 = 0.0
+            dt: f64 = 1.0 / 30.0
+            gravity: f64 = GRAVITY * b.weight
+            while t < 8.0 |run, wait, x, y, vx, vy, t, dt, gravity|:
+                vy <- vy - gravity * dt
+                vx <- vx + draught(&run.act, run.time + wait + t) * dt
+                x <- x + vx * dt
+                y <- y + vy * dt
+                if x < RADIUS or x > WIDTH - RADIUS:
+                    x <- clamp(x, RADIUS, WIDTH - RADIUS)
+                    vx <- -vx
+                # The reference predictor reflects velocity without snapping
+                # the position to the roof. The actual simulation snaps both.
+                vy <- -vy if y > HEIGHT - RADIUS and vy > 0.0
+                t <- t + dt
+                break if vy < 0.0 and y - RADIUS <= TRAY_Y + 0.3
+            return Landing{time: wait + t, x: x}
+
+    def earlier(a: Landing, b: Landing) -> bool:
+        return a.time < b.time or (a.time == b.time and a.x < b.x)
+
+    def pilot(run: Trial&) -> i64:
+        can Abort.Panic:
+            first: mutable Landing = Landing{time: 1e100, x: 0.0}
+            second: mutable Landing = first
+            for i in 0..<run.act.level.count |run, first, second|:
+                next: Landing = landing(run, i)
+                if earlier(next, first):
+                    second <- first
+                    first <- next
+                elif earlier(next, second):
+                    second <- next
+            x: f64 = second.x if first.time < 0.02 and run.act.level.count > 1 else first.x
+            centre: f64 = WIDTH / 2.0
+            aim: f64 = centre + (x - centre) * 0.2
+            off: f64 = clamp((aim - x) / FLIGHT / 6.0, -0.85, 0.85)
+            target: f64 = x - off * (run.act.level.tray / 2.0)
+            want: f64 = clamp((target - run.x) * 9.0, -TOP, TOP)
+            return RIGHT if want > run.velocity + 1.0
+            return LEFT if want < run.velocity - 1.0
+            return BRAKE
+
+    def play(act: Act) -> Trial:
+        can Abort.Panic:
+            run: mutable Trial = trial(act)
+            while run.result == PENDING |run|:
+                control: i64 = pilot(&run)
+                step(&run, 1.0 / 60.0, control)
+            return run
+
+    def deal(rung: i64, seed: i64) -> Act:
+        can Abort.Panic:
+            level: Grade = grade(rung)
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            first: Act = build(level, &rng)
+            return first if play(first).result == PASSED
+            for _attempt in 1..<30 |level, rng|:
+                candidate: Act = build(level, &rng)
+                return candidate if play(candidate).result == PASSED
+            return first
+
+    def result_text(run: Trial&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if run.result == PASSED:
+                dstr_append_i64(out, run.act.level.count)
+                dstr_append_cstr(out, " balls kept up for ")
+                dstr_append_i64(out, py_round_half_even(run.act.level.seconds))
+                dstr_append_cstr(out, " s")
+            elif run.result == DROPPED:
+                dstr_append_cstr(out, "A ball hit the floor")

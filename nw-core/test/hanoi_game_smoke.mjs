@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { decode, Kind } from "../shells/web/display-list.js";
 import { instantiateElisa } from "../shells/web/elisa-wasm-runtime.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -49,6 +50,12 @@ function render(handle) {
     Number(length)).slice();
 }
 
+function verdicts(handle) {
+  return decode(render(handle)).filter(({ kind, color }) =>
+    kind === Kind.TEXT && (color === 0x40ff40ff || color === 0xff4040ff))
+    .map(({ text, color, b }) => ({ text, color, y: b }));
+}
+
 assert.equal(TASK, 1419634454n, "Tower of Hanoi keeps its stable task ID");
 assert.equal(Number(exports.nw_api_v1_supports(TASK)), 1);
 assert.equal(create([4n, 4n, 2n, 0n, 0n, 0n]), -3n,
@@ -78,8 +85,14 @@ assert.equal(solved[4], 7n);
 assert.equal(solved[5], 7n);
 assert.equal(solved[7], 1n);
 assert.deepEqual(render(run), render(run), "Hanoi rendering is observational and stable");
+const perfectVerdict = { text: "Solved in 7 moves — the minimum is 7 — in 0s", color: 0x40ff40ff, y: 60 };
+assert.deepEqual(verdicts(run), [perfectVerdict]);
 assert.equal(exports.nw_api_v1_advance(run, 2000n, 0n, BigInt(sequence++)), STATUS.accepted);
 assert.equal(state(run)[0], 3n, "feedback advances to the run summary");
+assert.deepEqual(verdicts(run), [perfectVerdict], "the final screen retains the verdict");
+assert.ok(decode(render(run)).some(({ text }) => text === "1 towers, 100% move efficiency, 0s each, largest tower 3 disks"));
+assert.equal(event(run, EVENT.keyDown, 2001, sequence++, KEY.space, 32n), STATUS.accepted);
+assert.deepEqual(verdicts(run), [], "restarting clears the previous verdict");
 assert.equal(exports.nw_api_v1_destroy(run), 0n);
 
 const illegal = create();
@@ -93,6 +106,17 @@ assert.equal(action(illegal, ACTION.pick1, 5, 4), STATUS.accepted,
   "an illegal set-down is consumed as a cancelled selection");
 assert.equal(state(illegal)[6], -1n);
 assert.equal(state(illegal)[4], 1n, "an illegal set-down is not scored as a move");
+// Return the disk to its starting peg, then solve with the two extra moves.
+let extraSequence = 5;
+let extraTimestamp = 6;
+for (const [source, target] of [[1, 0], ...solution]) {
+  assert.equal(action(illegal, ACTION[`pick${source}`], extraTimestamp++, extraSequence++), STATUS.accepted);
+  assert.equal(action(illegal, ACTION[`pick${target}`], extraTimestamp++, extraSequence++), STATUS.accepted);
+}
+const extraVerdict = { text: "Solved in 9 moves — the minimum is 7 — in 0s", color: 0xff4040ff, y: 60 };
+assert.deepEqual(verdicts(illegal), [extraVerdict]);
+assert.equal(exports.nw_api_v1_advance(illegal, 2000n, 0n, BigInt(extraSequence++)), STATUS.accepted);
+assert.deepEqual(verdicts(illegal), [extraVerdict]);
 assert.equal(exports.nw_api_v1_destroy(illegal), 0n);
 
 console.log("PASS: Tower of Hanoi source-backed lifecycle, exact solution, illegal move, feedback, render, and cleanup");

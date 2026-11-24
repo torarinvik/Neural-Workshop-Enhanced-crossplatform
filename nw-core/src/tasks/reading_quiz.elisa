@@ -1,0 +1,177 @@
+include "../strings.elisa"
+include "../pyrandom.elisa"
+include "../textmetrics.elisa"
+
+module ReadingQuiz:
+    const PORTS: i64 = 8
+    const SHOW: f64 = 1.4
+
+    struct Pace:
+        base: f64
+        wps: f64
+
+    struct Step:
+        ask: dstr
+        options: darray[dstr]
+        answer: i64
+        wide: bool
+        # For intensities: what each option is worth (feelings.Step.value).
+        values: darray[f64]
+
+    struct Item:
+        prompt: dstr
+        steps: darray[Step]
+        seconds: f64
+        title: cstr
+        # Said after the answer; empty says the right options.
+        truth: dstr
+        # scored: the steps are intensities, right when their summed error
+        # is within tolerance (feelings.judge); the answer buttons are not
+        # shown again with the verdict.
+        tolerance: f64
+        scored: bool
+
+    struct Round:
+        items: darray[Item]
+        need: i64
+
+    struct Box:
+        x: f64
+        y: f64
+        width: f64
+        height: f64
+
+    def option_box(index: i64, count: i64, wide: bool) -> Box:
+        can Abort.Panic:
+            return Box{x: 60.0, y: 219.0 - index.f64() * 40.0, width: 880.0, height: 34.0} if wide
+            per: i64 = count if count <= 4 else (count + 1) / 2
+            column: i64 = index % per
+            y: f64 = 84.0 if count <= 4 else (112.0 if index < per else 56.0)
+            fit: f64 = (960.0 - 12.0 * (per - 1).f64()) / per.f64()
+            width: f64 = 220.0 if fit > 220.0 else fit
+            total: f64 = per.f64() * width + 12.0 * (per - 1).f64()
+            return Box{x: 500.0 - total / 2.0 + column.f64() * (width + 12.0), y: y - 22.0, width: width, height: 44.0}
+
+    def reading_pace(rung: i64, slow: f64, fast: f64, base: f64, floor: f64) -> Pace:
+        t: f64 = 0.0 if rung <= 1 else (1.0 if rung >= 24 else (rung - 1).f64() / 23.0)
+        return Pace{base: base + (floor - base) * t, wps: slow + (fast - slow) * t}
+
+    def indices_of(count: i64) -> darray[i64]:
+        can Memory.Allocate, Abort.Panic:
+            items: mutable darray[i64] = []
+            _ = items.reserve(count.usize())
+            for i in 0..<count |items|:
+                items.push(i)
+            return items
+
+    def option_index_less(a: i64, b: i64) -> bool:
+        return a < b
+
+    def shuffled_step(ask: dstr, options: darray[dstr]&, answer: i64, rng: mutable MT19937&, most: i64 = 0) -> Step:
+        can Memory.Allocate, Abort.Panic:
+            count: i64 = options.count.i64()
+            indices: mutable darray[i64] = []
+            if most > 0 and count > most:
+                others: mutable darray[i64] = []
+                for i in 0..<count |others, answer|:
+                    others.push(i) if i != answer
+                py_shuffle_i64(rng, &others)
+                indices.push(answer)
+                for i in 0..<(most - 1) |indices, others|:
+                    indices.push(others[i.usize()])
+                indices.sort(option_index_less)
+            else:
+                indices <- indices_of(count)
+            py_shuffle_i64(rng, &indices)
+            picked: mutable darray[dstr] = []
+            right: mutable i64 = -1
+            wide: mutable bool = false
+            for i in indices:
+                word: dstr = options[i.usize()]
+                wide <- wide or TextMetrics::codepoints(bytes_view(word)) > 30
+                right <- picked.count.i64() if i == answer
+                picked.push(word)
+            return Step{ask: ask, options: picked, answer: right, wide: wide, values: []}
+
+    # Python str.split treats these Unicode characters as whitespace.
+    def word_space(code: i64) -> bool:
+        return (code >= 9 and code <= 13) or (code >= 28 and code <= 32) or code == 133 or code == 160 or
+            code == 5760 or (code >= 8192 and code <= 8202) or code == 8232 or code == 8233 or
+            code == 8239 or code == 8287 or code == 12288
+
+    def word_count(text: sview) -> i64:
+        can Abort.Panic:
+            count: mutable i64 = 0
+            inside: mutable bool = false
+            at: mutable i64 = 0
+            length: i64 = sview_len(text).i64()
+            while at < length |at, length, text, count, inside|:
+                first: i64 = sview_at(text, at.usize()).i64()
+                size: mutable i64 = 1 if first < 192 else (2 if first < 224 else (3 if first < 240 else 4))
+                size <- 1 if at + size > length
+                code: mutable i64 = first if size == 1 else first & (127 >> size)
+                for j in 1..<size |code, text, at|:
+                    code <- (code << 6) | (sview_at(text, (at + j).usize()).i64() & 63)
+                word: bool = not word_space(code)
+                count <- count + 1 if word and not inside
+                inside <- word
+                at <- at + size
+            return count
+
+    def reading_item(prompt: dstr, steps: darray[Step], pace: Pace, title: cstr) -> Item:
+        can Abort.Panic:
+            words: mutable i64 = word_count(bytes_view(prompt))
+            for step in steps:
+                words <- words + word_count(bytes_view(step.ask))
+                for option in step.options:
+                    words <- words + word_count(bytes_view(option))
+            time: f64 = pace.base + words.f64() / pace.wps + 1.5 * (steps.count.i64() - 1).f64()
+            return Item{prompt: prompt, steps: steps, seconds: time, title: title, truth: [], tolerance: 0.0, scored: false}
+
+    def chance(item: Item&) -> f64:
+        can Abort.Panic:
+            result: mutable f64 = 1.0
+            for step in item.steps:
+                result <- result / step.options.count.i64().f64()
+            return result
+
+    def need_mixed(items: darray[Item]&, ceiling: f64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            dist: mutable darray[f64] = [1.0]
+            for item in items:
+                probability: f64 = chance(&item)
+                next: mutable darray[f64] = [0.0]
+                for j in 0..<dist.count.i64() |dist, next, probability|:
+                    mass: f64 = dist[j.usize()]
+                    next[j.usize()] <- next[j.usize()] + mass * (1.0 - probability)
+                    next.push(mass * probability)
+                dist <- next
+            upper_mass: mutable f64 = 0.0
+            for offset in 0..<dist.count.i64() |upper_mass, dist, ceiling|:
+                need: i64 = dist.count.i64() - 1 - offset
+                mass: f64 = dist[need.usize()]
+                return need + 1 if upper_mass + mass > ceiling
+                upper_mass <- upper_mass + mass
+            return 0
+
+    def fixed_guess_passes(items: darray[Item]&, need: i64) -> bool:
+        can Abort.Panic:
+            for port in 0..<PORTS |items, need|:
+                count: mutable i64 = 0
+                for item in items:
+                    right: mutable bool = true
+                    for step in item.steps:
+                        last: i64 = step.options.count.i64() - 1
+                        right <- false if step.answer != (port if port <= last else last)
+                    count <- count + 1 if right
+                return true if count >= need
+            return false
+
+    def assemble(items: darray[Item], minimum: i64) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            count: i64 = items.count.i64()
+            threshold: i64 = need_mixed(&items, 0.03)
+            need: mutable i64 = threshold if threshold > minimum else minimum
+            need <- count if need > count
+            return zeroed if fixed_guess_passes(&items, need)
+            return Round{items: items, need: need}

@@ -1,0 +1,266 @@
+include "./camera.elisa"
+
+module CameraGame:
+    const READY: i64 = 0
+    const SEARCHING: i64 = 1
+    const JUDGED: i64 = 2
+    const DONE: i64 = 3
+    const SUBMIT: i64 = Camera::MOVES * 3
+    const START: i64 = SUBMIT + 1
+    const PORTS: i64 = SUBMIT + 1
+    const WALK: f64 = 3.2
+    const TURN: f64 = 80.0
+    const SLOW: f64 = 0.12
+    const DRAG: f64 = 0.22
+    const FEEDBACK: f64 = 1.8
+
+    struct Result:
+        rung: i64
+        matched: bool
+        distance: f64
+        angle: f64
+        seconds: f64
+
+    struct Session:
+        rng: mutable MT19937
+        start_rung: i64
+        total: i64
+        adaptive: bool
+        rung: mutable i64
+        trial: mutable i64
+        phase: mutable i64
+        owner: mutable Arena
+        scene: mutable Camera::Scene
+        pose: mutable Camera::Pose
+        steps: mutable i64
+        held: mutable i64
+        slow: mutable bool
+        peek: mutable bool
+        started_at: mutable f64
+        last_tick: mutable f64
+        deadline: mutable f64
+        result_owner: mutable Arena
+        results: mutable darray[Result]
+        scored: mutable i64
+        matched: mutable i64
+        best: mutable i64
+        seconds: mutable f64
+        verdict_published: mutable bool
+        deal_failed: mutable bool
+
+    def allowed_rung(rung: i64) -> bool:
+        return (rung >= 1 and rung <= 6) or rung == 8 or rung == 10 or rung == 12 or rung == 15 or rung == 20 or rung == 25 or rung == 30 or rung == 40 or rung == 60 or rung == 100
+
+    def allowed_total(total: i64) -> bool:
+        return total == 1 or total == 3 or total == 5 or total == 8 or total == 12 or total == 20 or total == 30
+
+    def initialize(rung: i64, total: i64, adaptive: bool, seed: i64) -> Session:
+        can Abort.Panic, Memory.Allocate:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            initial: i64 = rung if rung > 0 else 1
+            return Session{rng: rng, start_rung: initial, total: total, adaptive: adaptive,
+                rung: initial, trial: 0, phase: READY, owner: zeroed, scene: zeroed, pose: zeroed,
+                steps: 0, held: 0, slow: false, peek: false, started_at: 0.0, last_tick: 0.0, deadline: 0.0,
+                result_owner: zeroed, results: [], scored: 0, matched: 0, best: 0, seconds: 0.0,
+                verdict_published: false, deal_failed: false}
+
+    def release_scene(owner: mutable Arena&):
+        can Memory.Release, Abort.Panic:
+            arena_free(owner) can Atomics{Exchange,Load,Store}, Unsafe{Alias,PointerCast,RawExtern,UncheckedIndex}, Global{Read,Write}
+
+    def make_scene(owner: mutable Arena&, rng: mutable MT19937&, rung: i64) -> Camera::Scene:
+        can Memory.Allocate, Abort.Panic:
+            in owner:
+                scene: Camera::Scene = Camera::deal(rung, rng)
+                return scene if scene.valid
+                return Camera::deal(rung - 1 if rung > 1 else 1, rng)
+
+    def next_trial(session: mutable Session&, now: f64):
+        can Memory.Allocate, Memory.Release, Abort.Panic:
+            release_scene(&session.owner) can Global{Read,Write}
+            session.scene <- zeroed
+            session.held <- 0
+            session.peek <- false
+            session.verdict_published <- false
+            session.last_tick <- now
+            if session.trial >= session.total:
+                session.phase <- DONE
+                return
+            session.scene <- make_scene(&session.owner, &session.rng, session.rung)
+            session.deal_failed <- not session.scene.valid
+            if session.deal_failed:
+                session.phase <- READY
+                return
+            session.trial <- session.trial + 1
+            session.pose <- session.scene.start
+            session.steps <- 0
+            session.started_at <- now
+            session.phase <- SEARCHING
+
+    def valid_time(now: f64) -> bool:
+        return now >= 0.0 and now <= 9007199254740.0
+
+    def start(session: mutable Session&, now: f64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic:
+            return false if not valid_time(now) or session.total < 1
+            return false if session.phase != READY and session.phase != DONE
+            release_scene(&session.result_owner) can Global{Read,Write}
+            session.results <- zeroed
+            session.rung <- session.start_rung
+            session.trial <- 0
+            session.scored <- 0
+            session.matched <- 0
+            session.best <- 0
+            session.seconds <- 0.0
+            next_trial(session, now) can Global{Read,Write}
+            return session.phase == SEARCHING
+
+    def close(session: mutable Session&):
+        can Memory.Release, Abort.Panic:
+            release_scene(&session.owner) can Global{Read,Write}
+            release_scene(&session.result_owner) can Global{Read,Write}
+            session.scene <- zeroed
+            session.results <- zeroed
+            session.phase <- READY
+
+    def finest(level: Camera::Grade&, movement: i64) -> f64:
+        size: f64 = Camera::STEP_RISE if movement >= Camera::RISE else Camera::STEP_METRES
+        return Camera::min_value(1.0 / 64.0, 0.5 * level.aim / Camera::STEP_DEGREES) if movement >= Camera::TURN_LEFT and movement <= Camera::LOOK_DOWN
+        return Camera::min_value(1.0 / 64.0, 0.5 * level.reach / size)
+
+    def record_result(owner: mutable Arena&, results: mutable darray[Result]&, value: Result):
+        can Memory.Allocate, Abort.Panic:
+            in owner:
+                results.push(value)
+
+    def submit(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            return false if session.phase != SEARCHING or not valid_time(now) or now < session.last_tick
+            level: Camera::Grade = session.scene.level
+            metres: f64 = Camera::distance(&session.pose, &session.scene.target)
+            off: f64 = Camera::angle(&session.pose, &session.scene.target)
+            matched: bool = metres <= level.reach and off <= level.aim
+            took: f64 = now - session.started_at
+            record_result(&session.result_owner, &session.results, Result{rung: level.rung, matched: matched,
+                distance: metres, angle: off, seconds: took})
+            session.scored <- session.scored + 1
+            session.seconds <- session.seconds + took
+            session.matched <- session.matched + 1 if matched
+            session.best <- level.rung if matched and level.rung > session.best
+            if session.adaptive:
+                session.rung <- session.rung + 1 if matched and session.rung < 9223372036854775807
+                session.rung <- session.rung - 1 if not matched and session.rung > 1
+            session.phase <- JUDGED
+            session.held <- 0
+            session.peek <- false
+            session.last_tick <- now
+            session.deadline <- now + FEEDBACK
+            return true
+
+    def press(session: mutable Session&, port: i64, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return (start(session, now) can Global{Read,Write}) if port == START
+            return submit(session, now) if port == SUBMIT
+            return false if session.phase != SEARCHING or port < 0 or port >= SUBMIT or not valid_time(now) or now < session.last_tick
+            movement: i64 = port / 3
+            scale: i64 = port % 3
+            amount: f64 = 1.0 if scale == 0 else (0.125 if scale == 1 else finest(&session.scene.level, movement))
+            session.pose <- Camera::moved(&session.pose, movement, amount, &session.scene.level)
+            session.steps <- session.steps + 1
+            return true
+
+    def set_held(session: mutable Session&, movement: i64, is_down: bool) -> bool:
+        return false if movement < 0 or movement >= Camera::MOVES or session.phase != SEARCHING
+        bit: i64 = 1 << movement
+        held: i64 = (session.held | bit) if is_down else (session.held & (1023 - bit))
+        return false if held == session.held
+        session.held <- held
+        return true
+
+    def set_slow(session: mutable Session&, slow: bool) -> bool:
+        return false if slow == session.slow
+        session.slow <- slow
+        return true
+
+    def set_peek(session: mutable Session&, peek: bool) -> bool:
+        return false if (session.phase != SEARCHING and session.phase != JUDGED) or peek == session.peek
+        session.peek <- peek
+        return true
+
+    def clear_controls(session: mutable Session&) -> bool:
+        changed: bool = session.held != 0 or session.slow or session.peek
+        session.held <- 0
+        session.slow <- false
+        session.peek <- false
+        return changed
+
+    def drag_view(session: mutable Session&, dx: f64, dy: f64, slow: bool) -> bool:
+        return false if session.phase != SEARCHING or not (dx >= -1000000.0 and dx <= 1000000.0 and dy >= -1000000.0 and dy <= 1000000.0)
+        rate: f64 = DRAG * (SLOW if slow else 1.0) / Camera::STEP_DEGREES
+        level: Camera::Grade = session.scene.level
+        pose: Camera::Pose = Camera::moved(&session.pose, Camera::TURN_LEFT, -dx * rate, &level)
+        session.pose <- Camera::moved(&pose, Camera::LOOK_UP, dy * rate, &level)
+        return dx != 0.0 or dy != 0.0
+
+    def advance(session: mutable Session&, now: f64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic:
+            return false if not valid_time(now) or now < session.last_tick
+            dt: f64 = Camera::min_value(0.1, now - session.last_tick)
+            session.last_tick <- now
+            if session.phase == JUDGED and now >= session.deadline:
+                next_trial(session, now) can Global{Read,Write}
+                return true
+            return false if session.phase != SEARCHING or session.held == 0 or dt == 0.0
+            slow: f64 = SLOW if session.slow else 1.0
+            level: Camera::Grade = session.scene.level
+            for movement in 0..<Camera::MOVES |session, dt, slow, level|:
+                if (session.held & (1 << movement)) != 0:
+                    amount: mutable f64 = WALK * dt * slow / Camera::STEP_METRES
+                    if movement >= Camera::RISE:
+                        amount <- WALK * 0.5 * dt * slow / Camera::STEP_RISE
+                    elif movement >= Camera::TURN_LEFT:
+                        amount <- TURN * dt * slow / Camera::STEP_DEGREES
+                    session.pose <- Camera::moved(&session.pose, movement, amount, &level)
+            return true
+
+    def agent_advance(session: mutable Session&, now: f64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic:
+            return false if not valid_time(now) or now < session.last_tick or session.phase == READY or session.phase == DONE
+            if session.phase == JUDGED:
+                if session.verdict_published:
+                    next_trial(session, now) can Global{Read,Write}
+                else:
+                    session.verdict_published <- true
+            session.last_tick <- now
+            return true
+
+    def mean_seconds(session: Session&) -> f64:
+        return session.seconds / session.scored.f64() if session.scored > 0 else 0.0
+
+    # The host sends movement transitions, pointer deltas in thousandths of a
+    # logical pixel (positive Y points up), and stepped or submit/start ports.
+    const HOLD_ACTION: i64 = START + 1
+    const RELEASE_ACTION: i64 = HOLD_ACTION + Camera::MOVES
+    const SLOW_ACTION: i64 = RELEASE_ACTION + Camera::MOVES
+    const PEEK_ACTION: i64 = SLOW_ACTION + 1
+    const CLEAR_ACTION: i64 = PEEK_ACTION + 1
+    const DRAG_ACTION: i64 = CLEAR_ACTION + 1
+
+    def valid_input(action: i64, value: i64, aux: i64) -> bool:
+        if action == DRAG_ACTION:
+            return value >= -1000000000 and value <= 1000000000 and aux >= -1000000000 and aux <= 1000000000
+        if action == SLOW_ACTION or action == PEEK_ACTION:
+            return (value == 0 or value == 1) and aux == 0
+        return value == 0 and aux == 0
+
+    def input(session: mutable Session&, action: i64, value: i64, aux: i64, now: f64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic:
+            return (press(session, action, now) can Global{Read,Write}) if action <= START
+            return set_held(session, action - HOLD_ACTION, true) if action < RELEASE_ACTION
+            return set_held(session, action - RELEASE_ACTION, false) if action < SLOW_ACTION
+            return set_slow(session, value != 0) if action == SLOW_ACTION
+            return set_peek(session, value != 0) if action == PEEK_ACTION
+            return clear_controls(session) if action == CLEAR_ACTION
+            return drag_view(session, value.f64() / 1000.0, aux.f64() / 1000.0, session.slow) if action == DRAG_ACTION
+            return false

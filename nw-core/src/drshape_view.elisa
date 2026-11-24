@@ -1,0 +1,176 @@
+include "./tasks/drshape_game.elisa"
+
+module DrShapeView:
+    const ORBIT: i64 = 0
+    const FLOOR: i64 = 1
+    const PLATFORM: i64 = 2
+    const LENS: f64 = 3.4
+    const FLOOR_EYE: f64 = 1.1
+    const MAX_ITEMS: i64 = DrShape::MAX_STROKES + 8
+
+    struct Rect:
+        x: f64
+        y: f64
+        w: f64
+        h: f64
+
+    struct Camera:
+        kind: i64
+        view: DrShape::Matrix
+        eye: DrShapeDeal::Eye
+        x: f64
+        y: f64
+        focal: f64
+        size: f64
+        side: f64
+        depth: f64
+        lift: f64
+
+    struct Point:
+        x: f64
+        y: f64
+        depth: f64
+        near: f64
+        camera: RoomsView::Vec
+
+    struct Item:
+        vertices: mutable Point[6]
+        count: mutable i64
+        depth: mutable f64
+        tint: i64
+        stroke: bool
+
+    struct Figure:
+        items: mutable Item[MAX_ITEMS]
+        count: mutable i64
+        pen: mutable Point
+        has_pen: mutable bool
+
+    def min(a: f64, b: f64) -> f64:
+        return a if a < b else b
+
+    def max(a: f64, b: f64) -> f64:
+        return a if a > b else b
+
+    def panel(p: DrShapePuzzle::Puzzle&) -> bool:
+        return p.level.keep or p.mode == DrShape::SING
+
+    def cell(area: Rect, n: i64, index: i64, has_panel: bool) -> Rect:
+        grid_x: f64 = area.x + area.w * 0.28 if has_panel else area.x
+        width: f64 = area.w * 0.72 if has_panel else area.w
+        height: f64 = area.h * 0.93
+        cols: i64 = n if n <= 4 else 3
+        rows: i64 = 1 if n <= 4 else 2
+        gap: f64 = min(width, area.h) * 0.03
+        w: f64 = (width - gap * (cols + 1).f64()) / cols.f64()
+        h: f64 = (height - gap * (rows + 1).f64()) / rows.f64()
+        cw: f64 = min(w, h * 1.25)
+        ch: f64 = min(h, cw)
+        span_w: f64 = cols.f64() * cw + (cols - 1).f64() * gap
+        span_h: f64 = rows.f64() * ch + (rows - 1).f64() * gap
+        return Rect{x: grid_x + (width - span_w) / 2.0 + (index % cols).f64() * (cw + gap),
+            y: area.y + (height - span_h) / 2.0 + (rows - 1 - index / cols).f64() * (ch + gap), w: cw, h: ch}
+
+    def shake_seed(t: f64, index: i64) -> u64:
+        return ((t * 15.0).i64() * 31 + index).u64()
+
+    def shaken(rect: Rect, overload: f64, rng: mutable MT19937&) -> Rect:
+        can Abort.Panic:
+            return rect if overload == 0.0
+            x: f64 = rect.x + py_uniform(rng, -1.0, 1.0) * overload * rect.w * 0.04
+            y: f64 = rect.y + py_uniform(rng, -1.0, 1.0) * overload * rect.h * 0.04
+            return Rect{x: x, y: y, w: rect.w, h: rect.h}
+
+    def hit(area: Rect, session: DrShapeGame::Session&, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            return DrShapeGame::START if session.phase == DrShapeGame::READY or session.phase == DrShapeGame::DONE
+            return -1 if session.phase != DrShapeGame::PLAYING or not DrShapeGame::choosing(session) or session.result != DrShapeGame::PENDING
+            for i in 0..<session.puzzle.count |area, session, x, y|:
+                rng: mutable MT19937 = zeroed
+                mt_seed_int(&rng, shake_seed(session.elapsed, i))
+                box: Rect = shaken(cell(area, session.puzzle.count, i, panel(&session.puzzle)), session.puzzle.level.overload, &rng)
+                return i if x >= box.x and x <= box.x + box.w and y >= box.y and y <= box.y + box.h
+            return -1
+
+    def sway(view: DrShape::Matrix, t: f64, index: i64 = 0) -> DrShape::Matrix:
+        return DrShape::matmul(DrShape::axis_turn(RoomsView::vec(0.0, 1.0, 0.0), 0.12 * sin(t * 0.9 + index.f64())), view)
+
+    def orbit_camera(view: DrShape::Matrix, x: f64, y: f64, scale: f64) -> Camera:
+        return Camera{kind: ORBIT, view: view, eye: zeroed, x: x, y: y,
+            focal: scale, size: 1.0, side: 0.0, depth: 0.0, lift: 0.0}
+
+    def floor_camera(card: Rect, view: DrShape::Matrix, size: f64, side: f64, depth: f64, lift: f64) -> Camera:
+        return Camera{kind: FLOOR, view: view, eye: zeroed, x: card.x + card.w / 2.0, y: card.y + card.h * 0.62,
+            focal: min(card.w, card.h) * 0.9, size: size, side: side, depth: depth, lift: lift}
+
+    def platform_camera(view: DrShape::Matrix, eye: DrShapeDeal::Eye, x: f64, y: f64, focal: f64, place: DrShapeDeal::Place, lift: f64) -> Camera:
+        return Camera{kind: PLATFORM, view: view, eye: eye, x: x, y: y, focal: focal,
+            size: DrShapeDeal::OBJECT, side: place.x, depth: place.z, lift: lift}
+
+    def project(cam: Camera&, input: RoomsView::Vec, shadow: bool = false) -> Point:
+        q: RoomsView::Vec = DrShape::apply(cam.view, input)
+        if cam.kind == ORBIT:
+            f: f64 = LENS / (LENS - q.z)
+            return Point{x: cam.x + q.x * cam.focal * f, y: cam.y + q.y * cam.focal * f,
+                depth: -q.z, near: DrShapeDeal::clamp((q.z + 1.0) / 2.0, 0.0, 1.0),
+                camera: RoomsView::vec(q.x, q.y, -q.z)}
+        w: RoomsView::Vec = RoomsView::vec(q.x * cam.size + cam.side,
+            0.0 if shadow else q.y * cam.size + cam.lift, q.z * cam.size + cam.depth)
+        if cam.kind == FLOOR:
+            z: f64 = max(0.3, w.z) + (0.15 if shadow else 0.0)
+            x: f64 = w.x + (0.12 if shadow else 0.0)
+            return Point{x: cam.x + cam.focal * x / z, y: cam.y + cam.focal * (w.y - FLOOR_EYE) / z,
+                depth: z, near: DrShapeDeal::clamp(1.0 - (z - 1.8) / 6.0, 0.0, 1.0),
+                camera: RoomsView::vec(x, w.y, z)}
+        c: RoomsView::Vec = DrShapeDeal::seen_from(cam.eye, w)
+        z: f64 = max(0.5, c.z)
+        return Point{x: cam.x + cam.focal * c.x / z, y: cam.y + cam.focal * c.y / z,
+            depth: z, near: DrShapeDeal::clamp(1.0 - (z - DrShapeDeal::ORBIT + 2.5) / 5.0, 0.0, 1.0), camera: c}
+
+    def jitter(p: Point, scale: f64, rng: mutable MT19937&) -> Point:
+        can Abort.Panic:
+            return p if scale == 0.0
+            x: f64 = p.x + py_uniform(rng, -1.0, 1.0) * scale
+            y: f64 = p.y + py_uniform(rng, -1.0, 1.0) * scale
+            return Point{x: x, y: y, depth: p.depth, near: p.near, camera: p.camera}
+
+    def sorted_insert(out: mutable Figure&, item: Item):
+        can Abort.Panic:
+            at: mutable i64 = out.count
+            while at > 0 |out, item, at|:
+                prior: Item = out.items[(at - 1).usize()]
+                break if prior.depth > item.depth or (prior.depth == item.depth and (not prior.stroke or item.stroke))
+                out.items[at.usize()] <- prior
+                at <- at - 1
+            out.items[at.usize()] <- item
+            out.count <- out.count + 1
+
+    def figure(form: DrShape::Form&, cam: Camera&, upto: f64, wobble: f64, seed: u64) -> Figure:
+        can Abort.Panic:
+            out: mutable Figure = zeroed
+            full: f64 = min(form.path.count.f64(), upto)
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, seed)
+            for i in 0..<form.path.count |out, cam, form, full, wobble, rng|:
+                break if i.f64() >= full
+                k: usize = i.usize()
+                stroke: DrShape::Segment = form.path.segments[k]
+                share: f64 = min(1.0, full - i.f64())
+                end: RoomsView::Vec = RoomsView::add(stroke.a, RoomsView::mul(RoomsView::sub(stroke.b, stroke.a), share)) if share < 1.0 else stroke.b
+                a: Point = jitter(project(cam, stroke.a), wobble, &rng)
+                b: Point = jitter(project(cam, end), wobble, &rng)
+                sorted_insert(&out, Item{vertices: [a, b, zeroed, zeroed, zeroed, zeroed],
+                    count: 2, depth: (a.depth + b.depth) / 2.0, tint: form.tints[k], stroke: true})
+                out.pen <- b
+                out.has_pen <- true
+            if full >= form.path.count.f64():
+                for i in 0..<form.face_count |out, cam, form, wobble, rng|:
+                    face: DrShape::Face& = &form.faces[i.usize()]
+                    item: mutable Item = Item{vertices: zeroed, count: face.count, depth: 0.0, tint: face.tint, stroke: false}
+                    for j in 0..<face.count |item, cam, face, wobble, rng|:
+                        p: Point = jitter(project(cam, face.vertices[j.usize()]), wobble, &rng)
+                        item.vertices[j.usize()] <- p
+                        item.depth <- item.depth + p.depth
+                    item.depth <- item.depth / face.count.f64() + 0.05
+                    sorted_insert(&out, item)
+            return out

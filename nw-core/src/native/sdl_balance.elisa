@@ -1,0 +1,214 @@
+include "../scene_balance.elisa"
+include "./sdl_agent_pixels.elisa"
+
+module SDLBalance:
+    struct Session:
+        run: mutable BalanceGame::Session
+        options_row: mutable i64
+        from_hub: mutable bool
+        draft: mutable i64[3]
+        seed: mutable i64
+        keys: mutable i64
+
+    def read_settings(data: heap u8&, size: i64, selected: mutable i64&):
+        can Abort.Panic, Unsafe.PointerCast:
+            rung: i64 = sdl_config_option(data, size, "BALANCE_RUNG", 0, -1)
+            trials: i64 = sdl_config_option(data, size, "BALANCE_TRIALS", 0, -1)
+            adaptive: i64 = sdl_config_option(data, size, "BALANCE_ADAPTIVE", 1, -1)
+            selected[0] <- rung if BalanceGame::allowed_rung(rung)
+            selected[1] <- trials if BalanceGame::allowed_total(trials)
+            selected[2] <- adaptive if adaptive == 0 or adaptive == 1
+
+    def open(seed: i64) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            selected: mutable i64[3] = [1, 5, 1]
+            size: mutable i64 = 0
+            if sdl_media_config(&size) is raw:
+                trusted Unsafe.PointerCast:
+                    read_settings(raw.cast[heap u8&], size, &selected[0])
+                SDL_free(raw)
+            path: mutable u8[4096] = zeroed
+            if sdl_task_profile_sidecar(&path[0], ".balance-options"):
+                if sdl_read_corpus(&path[0], &size) is raw:
+                    trusted Unsafe.PointerCast:
+                        read_settings(raw.cast[heap u8&], size, &selected[0])
+                    SDL_free(raw)
+            return create(selected[0], selected[1], selected[2], seed)
+
+    def create(rung: i64, trials: i64, adaptive: i64, seed: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if adaptive != 0 and adaptive != 1
+            if malloc(size_of(Session).usize()) is memory:
+                trusted Unsafe.PointerCast:
+                    session: mutable heap Session& = memory.cast[mutable heap Session&]
+                    session.run <- BalanceGame::initialize(rung, trials, adaptive == 1, seed)
+                    session.options_row <- -1
+                    session.from_hub <- false
+                    session.seed <- seed
+                    session.keys <- 0
+                    return memory.uintptr().i64()
+            return 0
+
+    def close(handle: i64):
+        can Memory.Release, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                if handle > 0:
+                    session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                    free(session.cast[heap void&])
+
+    def control_key(key: i64) -> i64:
+        return 1 if key == SDLTaskKeys::LEFT
+        return 2 if key == 97
+        return 4 if key == SDLTaskKeys::RIGHT
+        return 8 if key == 100
+        return 0
+
+    def control(session: mutable Session&, key: i64, held: bool, now: f64) -> bool:
+        can Abort.Panic:
+            bit: i64 = control_key(key)
+            return false if bit == 0
+            session.keys <- (session.keys | bit) if held else (session.keys ^ (session.keys & bit))
+            left: bool = (session.keys & 3) != 0
+            right: bool = (session.keys & 12) != 0
+            state: i64 = (Balance::LEFT if left else BalanceGame::LEFT_UP) if bit < 4 else (Balance::RIGHT if right else BalanceGame::RIGHT_UP)
+            return BalanceGame::input(&session.run, state, now)
+
+    def key(handle: i64, key: i64, now_ms: i64) -> bool:
+        can Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return false if session.options_row >= 0
+                now: f64 = now_ms.f64() / 1000.0
+                return BalanceGame::start(&session.run, now) if key == 32
+                return control(session, key, true, now)
+
+    def release(handle: i64, key: i64, lost: bool, now_ms: i64):
+        can Abort.Panic, Unsafe.PointerCast:
+            return if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                now: f64 = now_ms.f64() / 1000.0
+                if lost:
+                    session.keys <- 0
+                    _ = BalanceGame::input(&session.run, BalanceGame::CLEAR, now)
+                else:
+                    _ = control(session, key, false, now)
+
+    def pointer(handle: i64, x: f32, y: f32, width: i32, height: i32, now_ms: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0 or width <= 0.i32() or height <= 0.i32()
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                run: mutable BalanceGame::Session& = &session.run
+                if session.options_row >= 0:
+                    row: i64 = sdl_option_row(x, y, width, height, 3)
+                    if row >= 0:
+                        if row == session.options_row:
+                            change_option(session, 1)
+                        session.options_row <- row
+                    return true
+                now: f64 = now_ms.f64() / 1000.0
+                return BalanceGame::start(run, now)
+
+    def advance(handle: i64, now_ms: i64) -> bool:
+        can Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return BalanceGame::advance(&session.run, now_ms.f64() / 1000.0)
+
+    def info(handle: i64, field: i64) -> i64:
+        can Abort.Panic, Unsafe.PointerCast:
+            return -1 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                return BalanceGame::info(&session.run, field)
+
+    def frame_write(dest: i64, capacity: i64, handle: i64, black: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if dest <= 0 or capacity <= 0 or handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                run: BalanceGame::Session& = &session.run
+                list: mutable Display::DisplayList = Display::DisplayList()
+                if session.options_row >= 0:
+                    sdl_grid_options_frame(&list, black != 0, 62, session.options_row, (&session.draft[0]).cast[i64&])
+                else:
+                    SceneBalance::render(&list, run, black != 0)
+                encoded: darray[u8] = Display::encode_binary(&list)
+                length: i64 = encoded.count.i64()
+                return 0 if length <= 0 or length > capacity
+                memcpy(dest.uintptr().cast[mutable void&], (&encoded[0]).cast[void&], length.usize())
+                return length
+
+    def change_option(session: mutable Session&, direction: i64):
+        can Abort.Panic:
+            row: i64 = session.options_row
+            if row == 2:
+                session.draft[2] <- 1 - session.draft[2]
+                return
+            limit: i64 = 30 if row == 0 else 20
+            value: mutable i64 = session.draft[row.usize()]
+            while true |value, session, row, direction, limit|:
+                value <- (value + direction + limit - 1) % limit + 1
+                if (BalanceGame::allowed_rung(value) if row == 0 else BalanceGame::allowed_total(value)):
+                    session.draft[row.usize()] <- value
+                    return
+
+    def options_key(handle: i64, key: i64, from_hub: bool = false) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return 0 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if session.options_row < 0:
+                    return 0 if key != 99 or (session.run.phase != BalanceGame::READY and session.run.phase != BalanceGame::DONE)
+                    session.draft[0] <- session.run.start_rung
+                    session.draft[1] <- session.run.total
+                    session.draft[2] <- 1 if session.run.adaptive else 0
+                    session.options_row <- 0
+                    session.from_hub <- from_hub
+                    return 1
+                apply: bool = SDLTaskKeys::enter(key)
+                if apply:
+                    data: mutable u8[192] = zeroed
+                    length: i32 = SDL_snprintf(&data[0], 192.usize(),
+                        "[DEFAULT]\nBALANCE_RUNG = %lld\nBALANCE_TRIALS = %lld\nBALANCE_ADAPTIVE = %s\n",
+                        session.draft[0], session.draft[1], "True" if session.draft[2] == 1 else "False")
+                    if length <= 0.i32() or length >= 192.i32() or not sdl_save_profile_sidecar(".balance-options", &data[0], length.usize()):
+                        SDL_Log("Could not save Balance options")
+                        return 1
+                    session.run <- BalanceGame::initialize(session.draft[0], session.draft[1], session.draft[2] == 1, session.seed)
+                    session.keys <- 0
+                if apply or key == 27:
+                    session.options_row <- -1
+                    return 2 if session.from_hub else 1
+                session.options_row <- SDLTaskKeys::option_row(key, session.options_row, 3)
+                if key == SDLTaskKeys::LEFT or key == SDLTaskKeys::RIGHT or key == 32:
+                    change_option(session, -1 if key == SDLTaskKeys::LEFT else 1)
+                return 1
+
+    def agent_start(handle: i64) -> bool:
+        can Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return BalanceGame::start(&session.run, 0.0)
+
+    def agent_event(handle: i64, now: f64, port: i64) -> bool:
+        can Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return BalanceGame::agent_event(&session.run, now, port)
+
+    def rgba_write(output: mutable u8&?, capacity: i64, handle: i64, black: i64, width: i32, height: i32) -> i64:
+        can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return 0 if output == null or width <= 0.i32() or height <= 0.i32() or width > 536870911.i32()
+            bytes: i64 = width.i64() * height.i64() * 4
+            return 0 if capacity < bytes
+            frame: mutable u8[65536] = zeroed
+            length: i64 = frame_write((&frame[0]).uintptr().i64(), 65536, handle, black)
+            return 0 if length <= 0
+            pixels: mutable u8& = output
+            return SDLAgentPixels::draw(pixels, (&frame[0]).uintptr().i64(), length, bytes, black, width, height)

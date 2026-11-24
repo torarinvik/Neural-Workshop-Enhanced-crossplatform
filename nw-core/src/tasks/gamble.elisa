@@ -1,0 +1,161 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module Gamble:
+    const ARMS: i64 = 8
+
+    struct Grade:
+        rung: i64
+        arms: i64
+        pulls: i64
+        spread: f64
+        drift: f64
+        biters: i64
+        jumps: i64
+        price: i64
+        bankroll: i64
+        allow: f64
+
+    struct Machine:
+        pays: i64
+        bite_rate: f64
+        bite: i64
+
+    struct Deal:
+        level: Grade
+        machines: mutable Machine[ARMS]
+        odds: mutable darray[f64]
+        draws: mutable darray[f64]
+        jumps: mutable darray[i64]
+        seed: mutable i64
+
+    struct Pull:
+        arm: i64
+        won: i64
+
+    struct Round:
+        history: mutable darray[Pull]
+        total: mutable i64
+        score: mutable f64
+        correction: mutable f64
+        stopped: mutable bool
+
+    def cap(value: f64, low: f64, high: f64) -> f64:
+        return low if value < low else (high if value > high else value)
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        arms: i64 = ARMS if r >= 19 else 2 + (r - 1) / 3
+        return Grade{rung: r, arms: arms, pulls: 15 + 5 * arms + r / 2,
+            spread: cap(0.6 - 0.035 * (r - 1).f64(), 0.12, 0.6),
+            drift: 0.0 if r < 6 else cap(0.015 + 0.004 * (r - 6).f64(), 0.0, 0.06),
+            biters: 0 if r < 10 else (3 if r >= 18 else 1 + (r - 10) / 4),
+            jumps: 0 if r < 14 else (3 if r >= 24 else 1 + (r - 14) / 5),
+            price: 1 if r >= 18 else 0, bankroll: 30 if r >= 18 else 0,
+            allow: (0.5 * (21 - r).f64()) / 20.0 if r <= 20 else -0.02 * (r - 20).f64()}
+
+    def shuffle(rng: mutable MT19937&, rates: mutable f64&, count: i64):
+        can Abort.Panic:
+            i: mutable i64 = count - 1
+            while i > 0 |i, rng, rates|:
+                j: usize = py_randbelow(rng, (i + 1).u64()).usize()
+                saved: f64 = rates[i.usize()]
+                rates[i.usize()] <- rates[j]
+                rates[j] <- saved
+                i <- i - 1
+
+    def initial_machines(level: Grade, rng: mutable MT19937&, rates: mutable f64&) -> Machine[ARMS]:
+        can Memory.Allocate, Abort.Panic:
+            machines: mutable Machine[ARMS] = zeroed
+            centre: f64 = py_uniform(rng, 0.35, 0.55)
+            largest: mutable f64 = 0.0
+            for arm in 0..<level.arms |rng, level, centre, rates, largest|:
+                rate: f64 = cap(centre + level.spread * (py_random(rng) - 0.5), 0.05, 0.9)
+                rates[arm.usize()] <- rate
+                largest <- rate if rate > largest
+            best: i64 = py_randbelow(rng, level.arms.u64()).i64()
+            rates[best.usize()] <- cap(largest + level.spread * 0.25, 0.0, 0.92)
+            for arm in 0..<level.arms |rng, machines, level, best|:
+                pays: mutable i64 = 1 if level.price == 0 else 2 + py_randbelow(rng, 3.u64()).i64()
+                pays <- 3 if level.price != 0 and arm == best and pays < 3
+                machines[arm.usize()] <- Machine{pays: pays, bite_rate: 0.0, bite: 0}
+            biters: darray[i64] = py_sample_range(rng, 0, level.arms - 2, level.biters)
+            for pick in biters |rng, machines, rates, best|:
+                arm: usize = (pick + 1 if pick >= best else pick).usize()
+                rate: f64 = cap(rates[best.usize()] + 0.15, 0.0, 0.95)
+                rates[arm] <- rate
+                bite_rate: f64 = py_uniform(rng, 0.05, 0.1)
+                pays: i64 = machines[arm].pays
+                excess: f64 = rate * pays.f64() - rates[best.usize()] * machines[best.usize()].pays.f64()
+                bite: i64 = (excess / bite_rate).i64() + 3 + py_randbelow(rng, 4.u64()).i64()
+                machines[arm] <- Machine{pays: pays, bite_rate: bite_rate, bite: bite if bite >= 4 else 4}
+            return machines
+
+    def deal(rung: i64, rng: mutable MT19937&, gauss: mutable GaussCache&) -> Deal:
+        can Memory.Allocate, Abort.Panic:
+            level: Grade = grade(rung)
+            rates: mutable f64[ARMS] = zeroed
+            machines: Machine[ARMS] = initial_machines(level, rng, &rates[0])
+            odds: mutable darray[f64] = []
+            draws: mutable darray[f64] = []
+            jumps: mutable darray[i64] = []
+            sampled: darray[i64] = py_sample_range(rng, level.pulls / 4, level.pulls - 4, level.jumps)
+            for t in 0..<level.pulls |sampled, rng, gauss, rates, odds, jumps, level|:
+                for jump in sampled |t, rng, rates, level, jumps|:
+                    if jump == t:
+                        jumps.push(t)
+                        shuffle(rng, &rates[0], level.arms)
+                for arm in 0..<level.arms |rates, odds|:
+                    odds.push(rates[arm.usize()])
+                if level.drift > 0.0:
+                    for arm in 0..<level.arms |rates, rng, gauss, level|:
+                        rates[arm.usize()] <- cap(rates[arm.usize()] + py_gauss(rng, gauss, 0.0, level.drift), 0.03, 0.95)
+            for _ in 0..<(level.pulls * level.arms) |rng, draws|:
+                draws.push(py_random(rng))
+            seed: i64 = py_randbelow(rng, 1073741824.u64()).i64()
+            return Deal{level: level, machines: machines, odds: odds, draws: draws, jumps: jumps, seed: seed}
+
+    def payout(dealt: Deal&, t: i64, arm: i64) -> i64:
+        can Abort.Panic:
+            machine: Machine = dealt.machines[arm.usize()]
+            at: usize = (t * dealt.level.arms + arm).usize()
+            draw: f64 = get dealt.draws[at] else 0.0
+            odds: f64 = get dealt.odds[at] else 0.0
+            gross: i64 = machine.pays if draw < odds else (-machine.bite if draw > 1.0 - machine.bite_rate else 0)
+            return gross - dealt.level.price
+
+    def worth(dealt: Deal&, t: i64, arm: i64) -> f64:
+        can Abort.Panic:
+            machine: Machine = dealt.machines[arm.usize()]
+            odds: f64 = get dealt.odds[(t * dealt.level.arms + arm).usize()] else 0.0
+            return odds * machine.pays.f64() - machine.bite_rate * machine.bite.f64() - dealt.level.price.f64()
+
+    def initialize() -> Round:
+        return Round{history: [], total: 0, score: 0.0, correction: 0.0, stopped: false}
+
+    def value(round: Round&) -> f64:
+        return round.score + round.correction
+
+    def bust(round: Round&, level: Grade) -> bool:
+        return level.bankroll > 0 and level.bankroll + round.total <= 0
+
+    def over(round: Round&, level: Grade) -> bool:
+        return round.stopped or round.history.count.i64() >= level.pulls or bust(round, level)
+
+    def pull(round: mutable Round&, dealt: Deal&, arm: i64) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            return false if arm < 0 or arm >= dealt.level.arms or over(round, dealt.level)
+            t: i64 = round.history.count.i64()
+            won: i64 = payout(dealt, t, arm)
+            round.history.push(Pull{arm: arm, won: won})
+            round.total <- round.total + won
+            value: f64 = worth(dealt, t, arm)
+            next: f64 = round.score + value
+            round.correction <- round.correction + (((round.score - next) + value) if fabs(round.score) >= fabs(value) else ((value - next) + round.score))
+            round.score <- next
+            return true
+
+    def stop(round: mutable Round&, level: Grade) -> bool:
+        return false if level.price == 0 or over(round, level)
+        round.stopped <- true
+        return true

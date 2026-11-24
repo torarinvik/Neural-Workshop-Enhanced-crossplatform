@@ -70,6 +70,7 @@ ELISA_RUNTIME_OBJ="$RUNTIME_OBJ" ELISA_STAGE1_SEMANTIC_GATE=1 \
     "$UPSTREAM/scripts/elisac_stage1.sh" \
     -emit pymodule-so "$PYMODULE_SOURCE"
 PYTHON_TEST_BIN="${PYTHON_BIN:-python3}"
+"$PYTHON_TEST_BIN" "$ROOT/test/pymodule_runtime_shim_test.py"
 ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/shells/python/test_marble.py"
 ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/sudoku_python_host_options_test.py"
 ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/go_python_host_options_test.py"
@@ -82,6 +83,8 @@ ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/algebra_python_options_
 ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/numberology_exact_python_test.py"
 ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/numberology_python_host_test.py"
 ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/syllogism_python_host_test.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/syllogism_python_results_test.py"
+ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/syllogism_python_results_native_test.py"
 ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/syllogism_python_native_test.py"
 ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/numberology_paging_hosts_test.py"
 ELISA_PYMODULE_DIR="$OUT" "$PYTHON_TEST_BIN" "$ROOT/test/numberology_paging_native_test.py"

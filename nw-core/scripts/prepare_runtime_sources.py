@@ -29,7 +29,10 @@ def prepare(source_root: Path, output_root: Path, compiler_root: Path) -> int:
         source = source_root / name
         if not source.is_dir():
             raise FileNotFoundError(f"source tree is missing {source}")
-        shutil.copytree(source, output_root / name)
+        # Parallel WebAssembly builds place their already-resolved entry
+        # points beside the original source so relative includes still work.
+        shutil.copytree(source, output_root / name,
+                        ignore=shutil.ignore_patterns("wasm_exports_stage[01].*"))
 
     replacements = 0
     for source in sorted(output_root.rglob("*.elisa")):

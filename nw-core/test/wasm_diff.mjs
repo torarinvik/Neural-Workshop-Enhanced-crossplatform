@@ -123,8 +123,14 @@ function taskhubFrame(category, selected, black) {
 const taskhubCases = [
     [0, 0, 0, "Working memory", "3D N-Back"],
     [2, 4, 0, "Attention", "Pursuit"],
-    [4, 10, 1, "Reasoning", "Numberology"],
+    [4, 2, 0, "Reasoning", "Hidden Rule"],
+    [4, 3, 0, "Reasoning", "Hidden Wiring"],
+    [4, 5, 0, "Reasoning", "Video Jigsaw"],
+    [4, 6, 0, "Reasoning", "Video Sequence"],
+    [4, 14, 1, "Reasoning", "Numberology"],
     [6, 0, 0, "Self-control", "Cookie Thief"],
+    [6, 1, 0, "Self-control", "Delay"],
+    [7, 0, 0, "Decisions", "Triage"],
 ];
 let taskhubBad = 0;
 for (const [category, selected, black, categoryName, taskName] of taskhubCases) {

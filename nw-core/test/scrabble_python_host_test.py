@@ -68,7 +68,7 @@ with tempfile.TemporaryDirectory() as directory:
         session.close()
         session.close()
         hub = app.TaskHubSession(core, args)
-        hub.category, hub.selected = 4, 7
+        hub.category, hub.selected = 4, 8
         hub.key(key.C, key)
         assert isinstance(hub.child, app.ScrabbleSession) and hub.child.options_draft is not None
         hub.key(key.ESCAPE, key)

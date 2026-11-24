@@ -1,0 +1,233 @@
+include "./drshape_audio.elisa"
+include "./kerbside.elisa"
+
+# livesound.py for Kerbside: one continuous track per car and one for the
+# wind, each set once a step, sliding in a straight line between settings,
+# its phase the integral of its pitch, played by table lookup. Then the
+# run's two synth notes, and the whole cut to 16-bit stereo.
+#
+# The reference keeps every setting. This works each one out again from the
+# run's log (Kerbside::Run.times, said_at, stood): the settings are a
+# function of the step's time and where the walker stood. The phases are a
+# running sum over every setting before, so Phases carries them forward
+# from one window to the next, the way a speaker asks for its sound.
+module KerbsideAudio:
+    const RATE: i64 = 22050
+    const TABLE: i64 = 4096
+    const MASK: i64 = 4095
+    const HOLD: f64 = 0.25
+    const PI: f64 = 3.141592653589793
+
+    struct Bank:
+        patches: DrShapeAudio::Bank
+        # livesound's _SIN, an array('f'): kept at single precision, as the
+        # reference keeps it. Its _NOISE is one value throughout (see bank).
+        sine: darray[f64]
+        noise: f64
+
+    struct Setting:
+        f: f64
+        l: f64
+        r: f64
+
+    # The phase of every track at log entry `at`, and the pitch it was set to there.
+    struct Phases:
+        at: mutable i64
+        ph: mutable darray[f64]
+        freq: mutable darray[f64]
+
+    @inline(never)
+    def sine(angle: f64) -> f64:
+        return sin(angle)
+
+    @inline(never)
+    def cosine(angle: f64) -> f64:
+        return cos(angle)
+
+    def bank() -> Bank:
+        can Abort.Panic, Memory.Allocate:
+            patches: mutable DrShapeAudio::Bank = zeroed
+            patches.count <- 3
+            voices: i64[3] = [DrShapeAudio::WOOD, DrShapeAudio::BELL, DrShapeAudio::GROWL]
+            draw: mutable MT19937 = zeroed
+            for i in 0..<3 |patches, draw, voices|:
+                mt_seed_int(&draw, (i + 1).u64())
+                patches.patches[i.usize()] <- DrShapeAudio::make_patch(voices[i.usize()], &draw, 0.0)
+            table: mutable darray[f64] = []
+            for i in 0..<TABLE |table|:
+                table.push(sine(2.0 * PI * i.f64() / TABLE.f64()).f32().f64())
+            # The reference draws every _NOISE entry from a fresh
+            # random.Random(7), so its noise is one value, a steady offset.
+            mt_seed_int(&draw, 7.u64())
+            noise: f64 = py_uniform(&draw, -1.0, 1.0).f32().f64()
+            return Bank{patches: patches, sine: table, noise: noise}
+
+    # Room for every track's phase; the caller's region holds it.
+    def phases(count: i64) -> Phases:
+        can Abort.Panic, Memory.Allocate:
+            ph: mutable darray[f64] = []
+            freq: mutable darray[f64] = []
+            for _ in 0..<count |ph, freq|:
+                ph.push(0.0)
+                freq.push(0.0)
+            return Phases{at: -1, ph: ph, freq: freq}
+
+    def tracks(run: Kerbside::Run&) -> i64:
+        return run.street.cars.count.i64() + 1
+
+    # livesound.pan: loudness in each ear for a gain heard from a side.
+    def pan(gain: f64, side: f64) -> Setting:
+        can Abort.Panic:
+            near: f64 = side if side < 1.0 else 1.0
+            a: f64 = ((-1.0 if -1.0 > near else near) + 1.0) * PI / 4.0
+            return Setting{f: 0.0, l: gain * cosine(a), r: gain * sine(a)}
+
+    # Run._sound's setting of one track at one log entry.
+    def setting(run: Kerbside::Run&, track: i64, k: i64) -> Setting:
+        can Abort.Panic:
+            silent: bool = run.silent_from >= 0 and k >= run.silent_from
+            cars: i64 = run.street.cars.count.i64()
+            if track == cars:
+                w: f64 = 0.0 if silent else run.street.level.wind
+                return Setting{f: 1.0, l: w, r: w}
+            car: Kerbside::Car& = &run.street.cars[track.usize()]
+            t: f64 = run.said_at[k.usize()]
+            x: f64 = Kerbside::car_x(car, t)
+            dy: f64 = Kerbside::lane_centre(car.lane) - run.stood[k.usize()]
+            r: f64 = py_hypot(x, dy)
+            return Setting{f: 100.0, l: 0.0, r: 0.0} if r > 90.0 or silent
+            reach: f64 = 0.5 if 0.5 > r else r
+            radial: f64 = car.dir.f64() * car.speed * x / reach
+            f: f64 = (600.0 if car.electric else car.pitch) * Kerbside::SOUND / (Kerbside::SOUND + radial)
+            g: mutable f64 = (0.18 if car.electric else 0.5) / (1.0 + r / 4.0)
+            if run.street.vans > 0:
+                g <- g * 0.35 if run.street.van_a0 <= x and x <= run.street.van_b0 and dy > 0.0
+                g <- g * 0.35 if run.street.van_a1 <= x and x <= run.street.van_b1 and dy > 0.0
+            ears: Setting = pan(g, x / reach)
+            return Setting{f: f, l: ears.l, r: ears.r}
+
+    # Carry every track's phase forward to log entry k, from the start if
+    # the cache is already past it.
+    def advance(run: Kerbside::Run&, cache: mutable Phases&, k: i64):
+        can Abort.Panic:
+            count: i64 = tracks(run)
+            if cache.at < 0 or cache.at > k:
+                for j in 0..<count |run, cache|:
+                    cache.ph[j.usize()] <- 0.0
+                    cache.freq[j.usize()] <- setting(run, j, 0).f
+                cache.at <- 0
+            while cache.at < k |run, cache, count|:
+                next: i64 = cache.at + 1
+                gap: f64 = run.times[next.usize()] - run.times[cache.at.usize()]
+                for j in 0..<count |run, cache, next, gap|:
+                    f: f64 = setting(run, j, next).f
+                    cache.ph[j.usize()] <- cache.ph[j.usize()] + 0.5 * (cache.freq[j.usize()] + f) * gap
+                    cache.freq[j.usize()] <- f
+                cache.at <- next
+
+    # bisect.bisect_right(times, t) - 1, at least 0.
+    def segment_at(times: darray[f64]&, t: f64) -> i64:
+        can Abort.Panic:
+            low: mutable i64 = 0
+            high: mutable i64 = times.count.i64()
+            while low < high |times, t, low, high|:
+                middle: i64 = (low + high) / 2
+                if t < times[middle.usize()]:
+                    high <- middle
+                else:
+                    low <- middle + 1
+            return low - 1 if low > 0 else 0
+
+    # Track.render for one track, from log entry k0 whose phase is ph0.
+    def render_track(out: mutable darray[f64]&, run: Kerbside::Run&, bank: Bank&, track: i64, k0: i64, ph0: f64,
+            t0: f64, n: i64):
+        can Abort.Panic:
+            times: darray[f64]& = &run.times
+            count: i64 = times.count.i64()
+            return if count == 0
+            cars: i64 = run.street.cars.count.i64()
+            wind: bool = track == cars
+            electric: bool = not wind and run.street.cars[track.usize()].electric
+            parts: i64 = 1 if wind else (2 if electric else 4)
+            mults: f64[4] = [1.0, 2.0, 3.0, 4.0]
+            amps: mutable f64[4] = [1.0, 0.7, 0.45, 0.3]
+            if wind:
+                amps <- [0.0, 0.0, 0.0, 0.0]
+            elif electric:
+                amps <- [0.25, 0.1, 0.0, 0.0]
+            noise: f64 = 1.0 if wind else (0.9 if electric else 0.25)
+            end: f64 = times[(count - 1).usize()] + HOLD
+            k: mutable i64 = k0
+            i: mutable i64 = ceil((times[0] - t0) * RATE.f64()).i64()
+            i <- 0 if i < 0
+            here: mutable Setting = setting(run, track, k)
+            ph: mutable f64 = ph0
+            while i < n and k < count |out, run, bank, track, times, count, k, i, here, ph, t0, n, end, parts, mults, amps, noise|:
+                ta: f64 = times[k.usize()]
+                last: bool = k + 1 >= count
+                tb: f64 = end if last else times[(k + 1).usize()]
+                there: Setting = here if last else setting(run, track, k + 1)
+                stop_at: i64 = ceil((tb - t0) * RATE.f64()).i64()
+                stop: i64 = n if n < stop_at else stop_at
+                if stop > i:
+                    width: f64 = tb - ta
+                    span: f64 = width if width > 1e-9 else 1e-9
+                    f0: f64 = here.f
+                    f1: f64 = f0 if last else there.f
+                    l0: f64 = here.l
+                    r0: f64 = here.r
+                    l1: f64 = 0.0 if last else there.l
+                    r1: f64 = 0.0 if last else there.r
+                    loud: f64 = fmax(fmax(l0, l1), fmax(r0, r1))
+                    if loud >= 1e-4:
+                        slope: f64 = (f1 - f0) / span
+                        for j in i..<stop |out, bank, t0, ta, span, l0, l1, r0, r1, ph, f0, slope, parts, mults, amps, noise|:
+                            s: f64 = t0 + j.f64() / RATE.f64() - ta
+                            continue if s < 0.0
+                            w: f64 = s / span
+                            gl: f64 = l0 + (l1 - l0) * w
+                            gr: f64 = r0 + (r1 - r0) * w
+                            continue if gl <= 1e-5 and gr <= 1e-5
+                            turn: f64 = ph + f0 * s + 0.5 * slope * s * s
+                            v: mutable f64 = 0.0
+                            for p in 0..<parts |bank, turn, mults, amps, v|:
+                                index: i64 = (turn * mults[p.usize()] * TABLE.f64()).i64() & MASK
+                                v <- v + amps[p.usize()] * bank.sine[index.usize()]
+                            v <- v + noise * bank.noise
+                            out[(2 * j).usize()] <- out[(2 * j).usize()] + v * gl
+                            out[(2 * j + 1).usize()] <- out[(2 * j + 1).usize()] + v * gr
+                    i <- stop
+                break if last
+                # The next setting's phase, as Track.set worked it out.
+                ph <- ph + 0.5 * (here.f + there.f) * (times[(k + 1).usize()] - ta)
+                here <- there
+                k <- k + 1
+
+    # livesound.mix: the tracks, then the notes, cut to 16-bit stereo.
+    def render(run: Kerbside::Run&, bank: Bank&, cache: mutable Phases&, begin: f64, end: f64,
+            output: mutable u8&, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 0 if not (end > begin) or run.times.count == 0 or cache.ph.count.i64() != tracks(run)
+            n: i64 = py_round_half_even((end - begin) * RATE.f64())
+            return 0 if n <= 0 or n > capacity / 4
+            out: mutable darray[f64] = TonePcm::empty(n)
+            k0: i64 = segment_at(&run.times, begin)
+            advance(run, cache, k0)
+            for track in 0..<tracks(run) |out, run, bank, cache, k0, begin, n|:
+                render_track(&out, run, bank, track, k0, cache.ph[track.usize()], begin, n)
+            if run.notes.count > 0:
+                raw: mutable darray[u8] = []
+                for _ in 0..<(4 * n) |raw|:
+                    raw.push(0.u8())
+                written: i64 = DrShapeAudio::write(&run.notes, &bank.patches, begin, end, &raw[0], 4 * n)
+                for j in 0..<(written / 2) |out, raw|:
+                    word: i64 = raw[(2 * j).usize()].i64() + 256 * raw[(2 * j + 1).usize()].i64()
+                    sample: i64 = word - 65536 if word >= 32768 else word
+                    out[j.usize()] <- out[j.usize()] + sample.f64() / 32768.0
+            for j in 0..<(2 * n) |out, output|:
+                v: f64 = out[j.usize()]
+                clipped: f64 = 1.0 if v > 1.0 else (-1.0 if v < -1.0 else v)
+                pcm: u16 = (clipped * 30000.0).i16().u16()
+                output[(2 * j).usize()] <- (pcm & 255.u16()).u8()
+                output[(2 * j + 1).usize()] <- (pcm >> 8).u8()
+            return 4 * n

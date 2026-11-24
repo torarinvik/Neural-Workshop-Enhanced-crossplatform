@@ -1,0 +1,165 @@
+include "./cipher_abyss_inverse.elisa"
+
+extend CipherLang:
+    const QUESTION: i64 = 5
+    const RIVALS: i64 = 6
+    const FIXED_SIZE: i64 = 7
+    const LONGER_ROW: i64 = 8
+
+    struct QuestionSet:
+        rows: darray[Probe]
+        rejected: i64
+
+    struct Tracking:
+        entries: darray[i64]
+        meta: mutable darray[i64]
+        echo: mutable darray[i64]
+        beaten: mutable darray[i64]
+        input: mutable darray[i64]
+        turns: mutable i64
+
+    def track(entries: darray[i64]&) -> Tracking:
+        can Abort.Panic, Memory.Allocate:
+            count: i64 = entries.count.i64()
+            echo: mutable darray[i64] = []
+            for _ in 0..<count |echo|:
+                echo.push(-1)
+            return Tracking{entries: sliced(entries, 0, count), meta: Ints::zeros(count),
+                echo: echo, beaten: Ints::zeros(count), input: [], turns: 0}
+
+    def tracking_state(tracked: Tracking&, at: i64) -> State:
+        can Abort.Panic, Memory.Allocate:
+            # The only access to the previous output is echo(), which
+            # observes whether it has a first symbol and what that symbol is.
+            first: i64 = tracked.echo[at.usize()]
+            last: darray[i64] = [first] if first >= 0 else []
+            return State{runs: tracked.turns, last_in: tracked.input, last_out: last,
+                meta: tracked.meta[at.usize()]}
+
+    def prefix_match(row: darray[i64]&, answer: darray[i64]&) -> bool:
+        can Abort.Panic:
+            return false if row.count < answer.count
+            for i in 0..<answer.count.i64() |row, answer|:
+                return false if row[i.usize()] != answer[i.usize()]
+            return true
+
+    def advance_tracking(program: darray[Node]&, tracked: mutable Tracking&, given: darray[i64], answer: darray[i64]&,
+                         k: i64):
+        can Memory.Allocate, Abort.Panic:
+            for i in 0..<tracked.entries.count.i64() |program, tracked, given, answer, k|:
+                prior: State = tracking_state(tracked, i)
+                entry: i64 = tracked.entries[i.usize()]
+                result: darray[i64] = run(program, entry, &given, k, &prior)
+                tracked.meta[i.usize()] <- prior.meta + meta_bump(program, entry, &given, &prior)
+                tracked.echo[i.usize()] <- result[0] if result.count > 0.usize() else -1
+                if tracked.beaten[i.usize()] == 1 and not prefix_match(&result, answer):
+                    tracked.beaten[i.usize()] <- 2
+            tracked.input <- given
+            tracked.turns <- tracked.turns + 1
+
+    def asked_before(asked: darray[Probe]&, row: darray[i64]&) -> bool:
+        can Abort.Panic:
+            for earlier in asked:
+                return true if same_row(&earlier.values, row)
+            return false
+
+    def normal_candidates(draw: mutable MT19937&, n: i64, k: i64, flat_only: bool) -> darray[Probe]:
+        can Abort.Panic, Memory.Allocate:
+            rows: mutable darray[Probe] = []
+            for _ in 0..<90 |rows, draw, n, k|:
+                rows.push(Probe{values: random_row(draw, n, k)})
+            if flat_only:
+                value: i64 = py_randbelow(draw, k.u64()).i64()
+                flat: mutable darray[i64] = []
+                for _ in 0..<n |flat, value|:
+                    flat.push(value)
+                return [Probe{values: flat}]
+            for symbol in 0..<k |rows, n|:
+                flat: mutable darray[i64] = []
+                for _ in 0..<n |flat, symbol|:
+                    flat.push(symbol)
+                rows.push(Probe{values: flat})
+            for i in 0..<20 |rows, n|:
+                values: mutable darray[i64] = sliced(&rows[i.usize()].values, 0, n)
+                Ints::sort_prefix(&values, n)
+                rows.push(Probe{values: values})
+            for i in 20..<40 |rows, n|:
+                half: i64 = n / 2
+                prefix: i64 = (n + 1) / 2
+                source: Probe = rows[i.usize()]
+                values: mutable darray[i64] = sliced(&source.values, 0, half)
+                for j in 0..<prefix |values, source, prefix|:
+                    values.push(source.values[(prefix - 1 - j).usize()])
+                rows.push(Probe{values: values})
+            return rows
+
+    def value_of_question(program: darray[Node]&, rule: i64, given: darray[i64]&, truth: State&, states: Tracking&,
+                          early: Tracking&, last: darray[i64]&, k: i64, longer: bool) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            region scratch(32768):
+                in scratch:
+                    answer: darray[i64] = run(program, rule, given, k, truth)
+                    return -1 if answer.count == 0.usize() or same_row(given, &answer) or (not longer and same_row(&answer, last))
+                    for i in 0..<states.entries.count.i64() |program, given, states, answer, k|:
+                        prior: State = tracking_state(states, i)
+                        result: darray[i64] = run(program, states.entries[i.usize()], given, k, &prior)
+                        return -1 if not same_row(&result, &answer)
+                    gain: mutable i64 = 0
+                    for i in 0..<early.entries.count.i64() |program, given, early, answer, k, gain, longer|:
+                        prior: State = tracking_state(early, i)
+                        result: darray[i64] = run(program, early.entries[i.usize()], given, k, &prior)
+                        if not prefix_match(&result, &answer):
+                            gain <- gain + (1000 if not longer and early.beaten[i.usize()] == 1 else 1)
+                    return gain
+            return -1
+
+    def crack_questions(program: darray[Node]&, rule: i64, survivors: darray[i64]&, earlier: darray[i64]&, rivals: darray[i64]&,
+                        level: CipherAbyss::Grade, draw: mutable MT19937&) -> QuestionSet:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            states: mutable Tracking = track(survivors)
+            early: mutable Tracking = track(earlier)
+            for i in 0..<earlier.count.i64() |earlier, rivals, early|:
+                early.beaten[i.usize()] <- 1 if contains(rivals, earlier[i.usize()])
+            truth: mutable State = zeroed
+            initial: State = zeroed
+            asked: mutable darray[Probe] = []
+            last: mutable darray[i64] = []
+            k: i64 = level.symbols
+            flat: mutable bool = false
+            for q in 0..<level.tests |program, rule, draw, level, states, early, truth, initial, asked, last, k, flat|:
+                candidates: darray[Probe] = normal_candidates(draw, level.length, k, level.stage >= 10 and q == 0)
+                best: mutable i64 = -1
+                score: mutable i64 = -1
+                for i in 0..<candidates.count.i64() |program, rule, asked, states, early, truth, last, candidates, k, best, score, flat|:
+                    given: Probe& = &candidates[i.usize()]
+                    continue if asked_before(&asked, &given.values) or (flat and uniform(&given.values))
+                    gain: i64 = value_of_question(program, rule, &given.values, &truth, &states, &early, &last, k, false)
+                    if gain > score:
+                        best <- i
+                        score <- gain
+                return QuestionSet{rows: [], rejected: QUESTION} if best < 0
+                selected: Probe = candidates[best.usize()]
+                answer: darray[i64] = run(program, rule, &selected.values, k, &truth)
+                truth <- advance(program, rule, &truth, &selected.values, &answer)
+                advance_tracking(program, &states, selected.values, &answer, k)
+                advance_tracking(program, &early, selected.values, &answer, k)
+                asked.push(selected)
+                flat <- flat or uniform(&selected.values)
+                last <- run(program, rule, &selected.values, k, &initial)
+            for verdict in early.beaten:
+                return QuestionSet{rows: [], rejected: RIVALS} if verdict == 1
+            if level.stage >= 9:
+                for entry in survivors:
+                    return QuestionSet{rows: [], rejected: FIXED_SIZE} if fixed_length(program, entry)
+                best: mutable darray[i64] = []
+                score: mutable i64 = -1
+                for _ in 0..<60 |program, rule, draw, level, states, early, truth, asked, last, k, best, score|:
+                    input: darray[i64] = random_row(draw, level.length + 2, k)
+                    continue if uniform(&input) or asked_before(&asked, &input)
+                    gain: i64 = value_of_question(program, rule, &input, &truth, &states, &early, &last, k, true)
+                    if gain > score:
+                        best <- input
+                        score <- gain
+                return QuestionSet{rows: [], rejected: LONGER_ROW} if score < 0
+                asked.push(Probe{values: best})
+            return QuestionSet{rows: asked, rejected: 0}

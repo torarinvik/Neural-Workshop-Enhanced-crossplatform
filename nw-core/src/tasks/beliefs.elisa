@@ -1,0 +1,252 @@
+include "../pyrandom.elisa"
+
+module Beliefs:
+    const PUT: i64 = 0
+    const MOVE: i64 = 1
+    const LEAVE: i64 = 2
+    const ENTER: i64 = 3
+    const CALL: i64 = 4
+    const LIE: i64 = 5
+    const PEEK: i64 = 6
+
+    const TRUTH: i64 = 0
+    const FIRST: i64 = 1
+    const SECOND: i64 = 2
+    const UNKNOWN: i64 = -1
+    const MAX_EVENTS: i64 = 16
+
+    struct Grade:
+        rung: i64
+        people: i64
+        containers: i64
+        things: i64
+        short: i64
+        long: i64
+        second: f64
+        calls: bool
+        lies: bool
+        peeks: bool
+
+    struct Event:
+        kind: i64
+        who: i64
+        other: i64
+        thing: i64
+        where: i64
+
+    struct Tracker:
+        people: i64
+        present: mutable i64
+        truth: mutable i64[3]
+        belief: mutable i64[12]
+        second: mutable i64[48]
+
+    struct Panel:
+        event: Event
+        present: i64
+        places: i64[3]
+
+    struct Question:
+        kind: i64
+        who: i64
+        other: i64
+        thing: i64
+
+    struct Story:
+        level: Grade
+        names: mutable i64[4]
+        panels: mutable Panel[MAX_EVENTS]
+        count: mutable i64
+        question: mutable Question
+        answer: mutable i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        return Grade{rung: r, people: 2 if r < 6 else (3 if r < 17 else 4),
+            containers: 2 if r < 3 else (3 if r < 17 else 4),
+            things: 1 if r < 6 else (2 if r < 21 else 3),
+            short: 4 if r < 6 else (6 if r < 13 else (7 if r < 21 else 10)),
+            long: 4 if r < 3 else (6 if r < 6 else (8 if r < 13 else (10 if r < 21 else 13))),
+            second: 0.0 if r < 9 else 0.5, calls: r >= 13, lies: r >= 17, peeks: r >= 21}
+
+    def tracker(people: i64) -> Tracker:
+        can Abort.Panic:
+            out: mutable Tracker = Tracker{people: people, present: (1 << people) - 1,
+                truth: [UNKNOWN, UNKNOWN, UNKNOWN], belief: zeroed, second: zeroed}
+            for i in 0..<12 |out|:
+                out.belief[i.usize()] <- UNKNOWN
+            for i in 0..<48 |out|:
+                out.second[i.usize()] <- UNKNOWN
+            return out
+
+    def belief_at(person: i64, thing: i64) -> usize:
+        return (person * 3 + thing).usize()
+
+    def second_at(person: i64, other: i64, thing: i64) -> usize:
+        return ((person * 4 + other) * 3 + thing).usize()
+
+    def inside(mask: i64, person: i64) -> bool:
+        return (mask & (1 << person)) != 0
+
+    def apply(t: mutable Tracker&, e: Event):
+        can Abort.Panic:
+            bit: i64 = 1 << e.who
+            if e.kind == LEAVE:
+                t.present <- t.present & (15 - bit)
+                return
+            if e.kind == ENTER:
+                t.present <- t.present | bit
+                return
+            if e.kind == CALL or e.kind == LIE:
+                t.belief[belief_at(e.other, e.thing)] <- e.where
+                t.second[second_at(e.who, e.other, e.thing)] <- e.where
+                t.second[second_at(e.other, e.who, e.thing)] <- e.where
+                return
+            if e.kind == PEEK:
+                seen: usize = belief_at(e.who, e.thing)
+                if t.truth[e.thing.usize()] == e.where:
+                    t.belief[seen] <- e.where
+                    for a in 0..<t.people |t, e|:
+                        if inside(t.present, a) and t.belief[belief_at(a, e.thing)] == e.where:
+                            t.second[second_at(a, e.who, e.thing)] <- e.where
+                elif t.belief[seen] == e.where:
+                    t.belief[seen] <- UNKNOWN
+                return
+            t.truth[e.thing.usize()] <- e.where
+            for a in 0..<t.people |t, e|:
+                if inside(t.present, a):
+                    t.belief[belief_at(a, e.thing)] <- e.where
+                    for b in 0..<t.people |t, e, a|:
+                        if inside(t.present, b):
+                            t.second[second_at(a, b, e.thing)] <- e.where
+
+    def event(kind: i64, who: i64, thing: i64 = -1, where: i64 = -1, other: i64 = -1) -> Event:
+        return Event{kind: kind, who: who, other: other, thing: thing, where: where}
+
+    def record(story: mutable Story&, t: mutable Tracker&, e: Event):
+        can Abort.Panic:
+            apply(t, e)
+            story.panels[story.count.usize()] <- Panel{event: e, present: t.present, places: t.truth}
+            story.count <- story.count + 1
+
+    def choose(rng: mutable MT19937&, count: i64) -> i64:
+        can Abort.Panic:
+            return py_randbelow(rng, count.u64()).i64()
+
+    def except(rng: mutable MT19937&, count: i64, excluded: i64) -> i64:
+        can Abort.Panic:
+            pick: i64 = choose(rng, count - 1)
+            return pick + 1 if pick >= excluded else pick
+
+    def people(rng: mutable MT19937&, mask: i64, count: i64) -> i64:
+        can Abort.Panic:
+            rank: mutable i64 = choose(rng, count)
+            for p in 0..<4 |mask, rank|:
+                if inside(mask, p):
+                    return p if rank == 0
+                    rank <- rank - 1
+            return UNKNOWN
+
+    def event_kind(rng: mutable MT19937&, level: Grade, count: i64) -> i64:
+        can Abort.Panic:
+            away: bool = count < level.people
+            moving: i64 = 4
+            leaving: i64 = moving + (3 if count > 1 else 0)
+            entering: i64 = leaving + (2 if away else 0)
+            calling: i64 = entering + (2 if away and level.calls else 0)
+            lying: i64 = calling + (1 if away and level.lies else 0)
+            pick: i64 = choose(rng, lying + (1 if away and level.peeks else 0))
+            return MOVE if pick < moving
+            return LEAVE if pick < leaving
+            return ENTER if pick < entering
+            return CALL if pick < calling
+            return LIE if pick < lying
+            return PEEK
+
+    def events(rng: mutable MT19937&, story: mutable Story&, t: mutable Tracker&):
+        can Abort.Panic:
+            level: Grade = story.level
+            for thing in 0..<level.things |story, t, rng, level|:
+                who: i64 = choose(rng, level.people)
+                record(story, t, event(PUT, who, thing, choose(rng, level.containers)))
+            length: i64 = py_randint(rng, level.short, level.long) + level.things - 1
+            all: i64 = t.present
+            count: mutable i64 = level.people
+            while story.count < length |rng, story, t, level, length, all, count|:
+                kind: i64 = event_kind(rng, level, count)
+                thing: i64 = choose(rng, level.things)
+                outside: i64 = all - t.present
+                if kind == MOVE:
+                    who: i64 = people(rng, t.present, count)
+                    where: i64 = except(rng, level.containers, t.truth[thing.usize()])
+                    record(story, t, event(MOVE, who, thing, where))
+                elif kind == LEAVE:
+                    who: i64 = people(rng, t.present, count)
+                    record(story, t, event(LEAVE, who))
+                    count <- count - 1
+                elif kind == ENTER or kind == PEEK:
+                    who: i64 = people(rng, outside, level.people - count)
+                    record(story, t, event(ENTER, who))
+                    count <- count + 1
+                    if kind == PEEK:
+                        pick: i64 = choose(rng, level.containers + 2)
+                        where: i64 = t.truth[thing.usize()] if pick < 2 else pick - 2
+                        record(story, t, event(PEEK, who, thing, where))
+                else:
+                    caller: mutable i64 = people(rng, t.present, count)
+                    listener: mutable i64 = people(rng, outside, level.people - count)
+                    if kind == CALL and py_random(rng) < 0.5:
+                        swap: i64 = caller
+                        caller <- listener
+                        listener <- swap
+                    where: i64 = except(rng, level.containers, t.truth[thing.usize()]) if kind == LIE else t.belief[belief_at(caller, thing)]
+                    if where != UNKNOWN:
+                        record(story, t, event(kind, caller, thing, where, listener))
+
+    def classic(rng: mutable MT19937&, story: mutable Story&, t: mutable Tracker&) -> Question:
+        can Abort.Panic:
+            # Sampling both elements consumes a second draw even though one remains.
+            who: i64 = choose(rng, 2)
+            _ = choose(rng, 1)
+            where: i64 = choose(rng, 2)
+            _ = choose(rng, 1)
+            record(story, t, event(PUT, who, 0, where))
+            record(story, t, event(LEAVE, who))
+            record(story, t, event(MOVE, 1 - who, 0, 1 - where))
+            record(story, t, event(ENTER, who))
+            first: bool = py_random(rng) < 0.75
+            return Question{kind: FIRST if first else TRUTH, who: who if first else -1, other: -1, thing: 0}
+
+    def answer(t: Tracker&, q: Question) -> i64:
+        can Abort.Panic:
+            return t.truth[q.thing.usize()] if q.kind == TRUTH
+            return t.belief[belief_at(q.who, q.thing)] if q.kind == FIRST
+            return t.second[second_at(q.who, q.other, q.thing)]
+
+    def deal(rung: i64, seed: i64) -> Story:
+        can Abort.Panic, Memory.Allocate:
+            level: Grade = grade(rung)
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            want_false: bool = level.rung >= 3 and py_random(&rng) < 0.7
+            want_second: bool = py_random(&rng) < level.second
+            story: mutable Story = Story{level: level, names: zeroed, panels: zeroed, count: 0, question: zeroed, answer: UNKNOWN}
+            for _attempt in 0..<2000 |rng, story, level, want_false, want_second|:
+                story.count <- 0
+                t: mutable Tracker = tracker(level.people)
+                if level.rung < 3:
+                    story.question <- classic(&rng, &story, &t)
+                else:
+                    events(&rng, &story, &t)
+                    thing: i64 = choose(&rng, level.things)
+                    who: i64 = choose(&rng, level.people)
+                    other: i64 = except(&rng, level.people, who) if want_second else -1
+                    story.question <- Question{kind: SECOND if want_second else FIRST, who: who, other: other, thing: thing}
+                story.answer <- answer(&t, story.question)
+                if story.answer != UNKNOWN and (level.rung < 3 or ((story.answer != t.truth[story.question.thing.usize()]) == want_false)):
+                    break
+            names: mutable darray[i64] = [0, 1, 2, 3, 4]
+            py_shuffle_i64(&rng, &names)
+            for i in 0..<level.people |story, names|:
+                story.names[i.usize()] <- names[i.usize()]
+            return story

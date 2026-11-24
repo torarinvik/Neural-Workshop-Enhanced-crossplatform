@@ -1,0 +1,201 @@
+include "jigsaw.elisa"
+include "../video_sequence_assets.elisa"
+
+module VideoSequence:
+    const FEWEST: i64 = 3
+    const MOST: i64 = VideoSequenceAssets::SEGMENT_LIMIT
+    const FPS: i64 = 15
+    const MAX_FRAMES: i64 = FPS * 8
+    const ASPECT: f64 = 4.0 / 3.0
+    const SEAM: f64 = 6.0
+    const PHASE_LOADING: i64 = 4
+    const ACTION_START: i64 = 0
+    const ACTION_PICK: i64 = 1
+    const ACTION_CLIP_READY: i64 = 2
+    const ACTION_CLIP_UNAVAILABLE: i64 = 3
+
+    def allowed_clips(count: i64) -> bool:
+        return count == 1 or count == 3 or count == 5 or count == 8 or count == 12 or count == 20
+
+    struct Result:
+        pieces: i64
+        efficiency: f64
+        elapsed: f64
+
+    struct Run:
+        active_pieces: mutable i64
+        pieces: mutable i64
+        start_pieces: mutable i64
+        puzzles: mutable i64
+        adaptive: mutable bool
+        mark_placed: mutable bool
+        rng: mutable MT19937
+        order: mutable i64[MOST]
+        puzzle: mutable i64
+        frames_per_piece: mutable i64
+        swaps: mutable i64
+        par: mutable i64
+        picked: mutable i64
+        hovered: mutable i64
+        started_at_ms: mutable i64
+        feedback_until_ms: mutable i64
+        phase: mutable i64
+        results: mutable Result[Jigsaw::MOST_PUZZLES]
+        result_count: mutable i64
+
+    def clamped(pieces: i64) -> i64:
+        return FEWEST if pieces < FEWEST
+        return MOST if pieces > MOST else pieces
+
+    def initialize(pieces: i64, puzzles: i64, adaptive: bool, mark_placed: bool, seed: i64) -> Run:
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            clamped_pieces: i64 = clamped(pieces)
+            return Run{active_pieces: clamped_pieces, pieces: clamped_pieces, start_pieces: clamped_pieces,
+                puzzles: 1 if puzzles < 1 else (Jigsaw::MOST_PUZZLES if puzzles > Jigsaw::MOST_PUZZLES else puzzles), adaptive: adaptive, mark_placed: mark_placed, rng: rng, order: zeroed,
+                puzzle: 0, frames_per_piece: 0, swaps: 0, par: 0, picked: -1, hovered: -1,
+                started_at_ms: 0, feedback_until_ms: 0, phase: Jigsaw::PHASE_READY,
+                results: zeroed, result_count: 0}
+
+    def reset(run: mutable Run&):
+        run.phase <- Jigsaw::PHASE_READY
+        run.pieces <- run.start_pieces
+        run.active_pieces <- run.pieces
+        run.result_count <- 0
+        run.puzzle <- 0
+        run.picked <- -1
+        run.hovered <- -1
+        run.frames_per_piece <- 0
+
+    def start(run: mutable Run&) -> bool:
+        return false if run.phase != Jigsaw::PHASE_READY and run.phase != Jigsaw::PHASE_DONE
+        reset(run)
+        run.phase <- PHASE_LOADING
+        return true
+
+    # The host supplies a decoded clip. Drop any remainder so all pieces
+    # have the same duration. Begin the solve clock only once it is ready.
+    def load_clip(run: mutable Run&, frames: i64, now_ms: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            return false if run.phase != PHASE_LOADING or frames < run.pieces or frames > MAX_FRAMES
+            run.active_pieces <- run.pieces
+            run.frames_per_piece <- frames / run.active_pieces
+            region scratch(1048576):
+                in scratch:
+                    order: mutable darray[i64] = Ints::zeros(run.active_pieces)
+                    seen: mutable darray[i64] = Ints::zeros(run.active_pieces)
+                    Jigsaw::scramble(&order, run.active_pieces, &run.rng, 1)
+                    run.par <- Jigsaw::minimum_swaps(&order, run.active_pieces, &seen)
+                    for at in 0..<run.active_pieces |at, run, order|:
+                        run.order[at.usize()] <- Ints::at(order, at)
+                destroy scratch
+            run.puzzle <- run.puzzle + 1
+            run.phase <- Jigsaw::PHASE_SOLVING
+            run.started_at_ms <- now_ms
+            run.swaps <- 0
+            run.picked <- -1
+            run.hovered <- -1
+            return true
+
+    def unavailable(run: mutable Run&) -> bool:
+        return false if run.phase != PHASE_LOADING
+        run.phase <- Jigsaw::PHASE_READY
+        return true
+
+    def source_frame(run: Run&, piece: i64, now_ms: i64) -> i64:
+        return -1 if piece < 0 or piece >= run.active_pieces or run.frames_per_piece <= 0
+        elapsed: i64 = now_ms - run.started_at_ms if now_ms >= run.started_at_ms else 0
+        # Split the elapsed time before multiplying to keep the clock bounded.
+        milliseconds: i64 = elapsed % (run.frames_per_piece * 1000)
+        return piece * run.frames_per_piece + (milliseconds * FPS / 1000) % run.frames_per_piece
+
+    def pick(run: mutable Run&, position: i64, now_ms: i64) -> bool:
+        can Abort.Panic:
+            return false if run.phase != Jigsaw::PHASE_SOLVING or position < 0 or position >= run.active_pieces
+            first: i64 = run.picked
+            run.picked <- position if first < 0 else -1
+            if first < 0 or first == position:
+                return true
+            piece: i64 = run.order[first.usize()]
+            run.order[first.usize()] <- run.order[position.usize()]
+            run.order[position.usize()] <- piece
+            run.swaps <- run.swaps + 1
+            for at in 0..<run.active_pieces |at, run|:
+                return true if run.order[at.usize()] != at
+            efficiency: f64 = run.par.f64() / run.swaps.f64()
+            elapsed: f64 = (now_ms - run.started_at_ms).f64() / 1000.0
+            run.results[run.result_count.usize()] <- Result{pieces: run.active_pieces, efficiency: efficiency, elapsed: elapsed}
+            run.result_count <- run.result_count + 1
+            if run.adaptive:
+                if efficiency >= Jigsaw::GROW_AT:
+                    run.pieces <- clamped(run.pieces + 1)
+                elif efficiency < Jigsaw::SHRINK_AT:
+                    run.pieces <- clamped(run.pieces - 1)
+            run.phase <- Jigsaw::PHASE_SOLVED
+            run.feedback_until_ms <- now_ms + 1600
+            return true
+
+    def advance(run: mutable Run&, now_ms: i64) -> bool:
+        return false if run.phase != Jigsaw::PHASE_SOLVED or now_ms < run.feedback_until_ms
+        run.frames_per_piece <- 0
+        run.active_pieces <- run.pieces
+        run.phase <- Jigsaw::PHASE_DONE if run.puzzle >= run.puzzles else PHASE_LOADING
+        return true
+
+    def score(run: Run&) -> Jigsaw::JigsawScore:
+        can Abort.Panic:
+            total_efficiency: mutable f64 = 0.0
+            total_seconds: mutable f64 = 0.0
+            most_pieces: mutable i64 = 0
+            for at in 0..<run.result_count |at, run, total_efficiency, total_seconds, most_pieces|:
+                result: Result = run.results[at.usize()]
+                total_efficiency <- total_efficiency + result.efficiency
+                total_seconds <- total_seconds + result.elapsed
+                most_pieces <- result.pieces if result.pieces > most_pieces
+            count: i64 = run.result_count
+            return Jigsaw::JigsawScore{puzzles: count,
+                efficiency: py_round_half_even(100.0 * total_efficiency / count.f64()) if count > 0 else 0,
+                mean_seconds: total_seconds / count.f64() if count > 0 else 0.0,
+                most_pieces: most_pieces, best_side: 0}
+
+    def columns(pieces: i64, width: f64, height: f64) -> i64:
+        can Abort.Panic:
+            best: mutable i64 = 1
+            best_size: mutable f64 = -1.0
+            for across in 1..<(pieces + 1) |across, pieces, width, height, best, best_size|:
+                down: i64 = (pieces + across - 1) / across
+                size: f64 = tile_width(width, height, across, down)
+                if size > best_size:
+                    best <- across
+                    best_size <- size
+            return best
+
+    def tile_width(width: f64, height: f64, columns: i64, rows: i64) -> f64:
+        across: f64 = (width - SEAM * (columns - 1).f64()) / columns.f64()
+        down: f64 = (height - SEAM * (rows - 1).f64()) / rows.f64() * ASPECT
+        return across if across < down else down
+
+    def tile_rect(width: f64, height: f64, pieces: i64, position: i64) -> Jigsaw::Rect:
+        can Abort.Panic:
+            room: Jigsaw::JigsawKernelCanvas = Jigsaw::canvas(width, height)
+            across: i64 = columns(pieces, room.width, room.height)
+            rows: i64 = (pieces + across - 1) / across
+            span: f64 = tile_width(room.width, room.height, across, rows)
+            down: f64 = span / ASPECT
+            block: f64 = rows.f64() * down + SEAM * (rows - 1).f64()
+            row: i64 = position / across
+            remaining: i64 = pieces - row * across
+            in_row: i64 = remaining if remaining < across else across
+            row_width: f64 = in_row.f64() * span + SEAM * (in_row - 1).f64()
+            return Jigsaw::Rect{
+                left: room.left + (room.width - row_width) / 2.0 + (position % across).f64() * (span + SEAM),
+                bottom: room.bottom + (room.height + block) / 2.0 - row.f64() * (down + SEAM) - down,
+                width: span, height: down}
+
+    def tile_at(width: f64, height: f64, pieces: i64, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            for position in 0..<pieces |position, width, height, pieces, x, y|:
+                box: Jigsaw::Rect = tile_rect(width, height, pieces, position)
+                return position if box.left <= x and x <= box.left + box.width and box.bottom <= y and y <= box.bottom + box.height
+            return -1

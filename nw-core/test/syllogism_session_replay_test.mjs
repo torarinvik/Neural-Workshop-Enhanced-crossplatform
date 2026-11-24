@@ -93,4 +93,18 @@ assert.equal(info(adaptive,7),0n); assert.equal(info(adaptive,1),1n);
 assert.equal(action(adaptive,0),1n);
 assert.ok(labels(adaptive).includes('1 of 2 right, highest level 1'));
 assert.equal(e.nw_api_v1_destroy(adaptive),0n);
+// Result history uses event timestamps, and a restarted run starts a new tally.
+const timed=e.nw_api_v1_create(task,1n,1n,1n,0n,1n,0n,0n,17n);
+const timedAction=(code,value,when)=>e.nw_api_v1_dispatch(timed,1n,BigInt(when),sequence++,BigInt(code),BigInt(value),0n,0n,0n,0n,0n);
+assert.ok(timed>0n); assert.equal(timedAction(0,0,1000),1n);
+assert.equal(timedAction(6,0,2750),1n);
+assert.equal(info(timed,14),1n); assert.equal(info(timed,15),1n);
+assert.equal(e.nw_api_v1_syllogism_value(timed,2n,0n),1n);
+assert.equal(e.nw_api_v1_syllogism_value(timed,4n,0n),1750n);
+assert.equal(e.nw_api_v1_syllogism_value(timed,2n,1n),-1n);
+assert.equal(timedAction(0,0,3000),1n); assert.equal(info(timed,0),3n);
+assert.equal(timedAction(0,0,4000),1n);
+assert.equal(info(timed,14),0n); assert.equal(info(timed,15),0n);
+assert.equal(e.nw_api_v1_syllogism_value(timed,2n,0n),-1n);
+assert.equal(e.nw_api_v1_destroy(timed),0n);
 console.log(`Syllogism source sessions: ${cases.length} levels, question seeds, working and scores match`);

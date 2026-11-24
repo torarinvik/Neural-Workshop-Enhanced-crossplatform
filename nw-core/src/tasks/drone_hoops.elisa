@@ -1,0 +1,513 @@
+include "../rooms_view.elisa"
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module DroneHoops:
+    const HALF: f64 = 18.0
+    const CEILING: f64 = 11.0
+    const FLOOR: f64 = 0.35
+    const ACC: f64 = 15.0
+    const CLIMB: f64 = 11.0
+    const DRONE: f64 = 0.35
+    const RIM: f64 = 0.22
+    const TAU: f64 = 6.283185307179586
+    const LOOK: i64 = 0
+    const FOLLOW: i64 = 1
+    const CUTS: i64 = 2
+    const CIRCLE: i64 = 3
+    const PENDING: i64 = 0
+    const PASSED: i64 = 1
+    const WRONG: i64 = 2
+    const TIMEOUT: i64 = 3
+
+    struct Grade:
+        rung: i64
+        hoops: i64
+        radius: f64
+        drag: f64
+        lit: bool
+        camera: i64
+        cut: f64
+        angle: f64
+        bob: f64
+        spin: f64
+        wind: f64
+        birds: i64
+        lightning: bool
+        decoy: bool
+        seconds: f64
+
+    struct Hoop:
+        centre: RoomsView::Vec
+        yaw: f64
+        radius: f64
+        amplitude: f64
+        rate: f64
+        phase: f64
+        sideways: bool
+        spin: f64
+
+    struct Gust:
+        time: f64
+        duration: f64
+        heading: f64
+        strength: f64
+
+    struct Bird:
+        time: f64
+        duration: f64
+        a: RoomsView::Vec
+        b: RoomsView::Vec
+
+    struct Cut:
+        time: f64
+        camera: i64
+
+    struct Course:
+        level: Grade
+        valid: mutable bool
+        hoops: mutable Hoop[9]
+        gusts: mutable Gust[24]
+        gust_count: mutable i64
+        birds: mutable Bird[32]
+        flashes: mutable f64[32]
+        flash_count: mutable i64
+        cuts: mutable Cut[64]
+        cut_count: mutable i64
+        decoy: mutable i64
+        circle_angle: mutable f64
+        circle_rate: mutable f64
+        seed: mutable i64
+
+    struct Hooped:
+        centre: RoomsView::Vec
+        normal: RoomsView::Vec
+
+    def clamp(value: f64, low: f64, high: f64) -> f64:
+        return low if value < low else (high if value > high else value)
+
+    def abs_value(value: f64) -> f64:
+        return -value if value < 0.0 else value
+
+    def minimum(a: f64, b: f64) -> f64:
+        return a if a < b else b
+
+    def radians(degrees: f64) -> f64:
+        return degrees * 0.017453292519943295
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: i64 = r - 20 if r >= 20 else 0
+        t: f64 = top.f64()
+        return Grade{rung: r,
+            hoops: 3 if r < 4 else (4 if r < 7 else (5 if r < 13 else (6 if r < 20 else (9 if top >= 9 else 6 + top / 3)))),
+            radius: 2.6 if r < 4 else (2.1 if r < 7 else (1.9 if r < 13 else (1.7 if r < 20 else clamp(1.6 - 0.03 * t, 1.15, 1.6)))),
+            drag: 3.0 if r < 4 else (2.2 if r < 10 else (1.7 if r < 20 else clamp(1.6 - 0.03 * t, 1.1, 1.6))),
+            lit: r < 10, camera: LOOK if r < 4 else (FOLLOW if r < 7 else (CUTS if r < 20 else CIRCLE)),
+            cut: 6.0 if r < 13 else (4.5 if r < 20 else clamp(4.0 - 0.1 * t, 2.5, 4.0)),
+            angle: 15.0 if r < 4 else (35.0 if r < 13 else 55.0),
+            bob: 0.0 if r < 13 else (1.0 if r < 20 else minimum(2.2, 1.4 + 0.05 * t)),
+            spin: 0.0 if r < 13 else (14.0 if r < 20 else minimum(30.0, 16.0 + t)),
+            wind: 0.0 if r < 16 else (9.0 if r < 20 else minimum(13.0, 9.5 + 0.2 * t)),
+            birds: 0 if r < 16 else (3 if r < 20 else (8 if top >= 12 else 4 + top / 3)),
+            lightning: r >= 20, decoy: r >= 24,
+            seconds: 15.0 if r < 4 else (13.0 if r < 10 else (12.0 if r < 20 else clamp(11.5 - 0.15 * t, 8.5, 11.5)))}
+
+    def start() -> RoomsView::Vec:
+        return RoomsView::vec(0.0, 2.5, -HALF + 3.0)
+
+    def norm(p: RoomsView::Vec) -> f64:
+        return sqrt(RoomsView::dot(p, p))
+
+    def unit(p: RoomsView::Vec) -> RoomsView::Vec:
+        length: f64 = norm(p)
+        return p if length == 0.0
+        return RoomsView::vec(p.x / length, p.y / length, p.z / length)
+
+    def fixed(index: i64) -> RoomsView::Vec:
+        far: f64 = HALF * 1.25
+        if index < 4:
+            x: f64 = far if index == 1 or index == 2 else -far
+            z: f64 = far if index >= 2 else -far
+            return RoomsView::vec(x, 9.5, z)
+        edge: f64 = far * 1.1
+        x: f64 = edge if index == 5 else (-edge if index == 7 else 0.0)
+        z: f64 = edge if index == 6 else (-edge if index == 4 else 0.0)
+        return RoomsView::vec(x, 11.5, z)
+
+    def uniform(rng: mutable MT19937&, low: f64, high: f64) -> f64:
+        return low + (high - low) * py_random(rng)
+
+    def sign(rng: mutable MT19937&) -> f64:
+        can Abort.Panic:
+            return -1.0 if py_randbelow(rng, 2.u64()) == 0.u64() else 1.0
+
+    def rounded(time: f64) -> f64:
+        can Abort.Panic:
+            return py_round_half_even(time * 100.0).f64() / 100.0
+
+    def clear_hoop(course: Course&, passed: i64, x: f64, z: f64) -> bool:
+        can Abort.Panic:
+            return false if abs_value(x) >= HALF - 4.5 or abs_value(z) >= HALF - 4.5
+            for i in 0..<passed |course, x, z|:
+                h: Hoop = course.hoops[i.usize()]
+                if py_hypot(x - h.centre.x, z - h.centre.z) < 7.5:
+                    return false
+            return true
+
+    def place_hoops(course: mutable Course&, rng: mutable MT19937&) -> bool:
+        can Abort.Panic:
+            level: Grade = course.level
+            at: mutable RoomsView::Vec = start()
+            heading: mutable f64 = 0.0
+            for i in 0..<level.hoops |course, rng, level, at, heading|:
+                found: mutable bool = false
+                h: mutable f64 = 0.0
+                x: mutable f64 = 0.0
+                z: mutable f64 = 0.0
+                for tries in 0..<80 |course, rng, level, at, heading, i, found, h, x, z|:
+                    limit: f64 = (25.0 if level.rung < 4 or i == 0 else 60.0) + 2.0 * tries.f64()
+                    h <- heading + radians(uniform(rng, -limit, limit))
+                    distance: f64 = uniform(rng, 8.5, 12.5)
+                    x <- at.x + sin(h) * distance
+                    z <- at.z + cos(h) * distance
+                    if clear_hoop(course, i, x, z):
+                        found <- true
+                        break
+                return false if not found
+                y: f64 = uniform(rng, 2.6, 4.2) if level.rung < 4 else uniform(rng, level.radius + 0.6, CEILING - level.radius - 1.4)
+                yaw: f64 = h + radians(uniform(rng, -level.angle, level.angle))
+                sideways: bool = py_randbelow(rng, 2.u64()) != 0.u64()
+                amplitude: f64 = level.bob * uniform(rng, 0.7, 1.0)
+                rate: f64 = uniform(rng, 0.5, 0.9)
+                phase: f64 = uniform(rng, 0.0, TAU)
+                spin: f64 = radians(level.spin) * sign(rng) * uniform(rng, 0.7, 1.0)
+                at <- RoomsView::vec(x, y, z)
+                heading <- h
+                course.hoops[i.usize()] <- Hoop{centre: at, yaw: yaw, radius: level.radius, amplitude: amplitude, rate: rate, phase: phase, sideways: sideways, spin: spin}
+            return true
+
+    def bird_before(a: Bird, b: Bird) -> bool:
+        return a.time < b.time if a.time != b.time
+        return a.duration < b.duration if a.duration != b.duration
+        return a.a.x < b.a.x if a.a.x != b.a.x
+        return a.a.y < b.a.y if a.a.y != b.a.y
+        return a.a.z < b.a.z if a.a.z != b.a.z
+        return a.b.x < b.b.x if a.b.x != b.b.x
+        return a.b.y < b.b.y if a.b.y != b.b.y
+        return a.b.z < b.b.z
+
+    def build(level: Grade, rng: mutable MT19937&) -> Course:
+        can Abort.Panic:
+            course: mutable Course = Course{level: level, valid: false, hoops: zeroed, gusts: zeroed,
+                gust_count: 0, birds: zeroed, flashes: zeroed, flash_count: 0, cuts: zeroed, cut_count: 0,
+                decoy: -1, circle_angle: 0.0, circle_rate: 0.0, seed: 0}
+            return course if not place_hoops(&course, rng)
+            total: f64 = level.seconds * level.hoops.f64()
+            if level.wind != 0.0:
+                time: mutable f64 = uniform(rng, 4.0, 8.0)
+                while time < total |time, total, rng, course, level|:
+                    course.gusts[course.gust_count.usize()] <- Gust{time: rounded(time), duration: uniform(rng, 1.4, 2.4),
+                        heading: uniform(rng, 0.0, TAU), strength: level.wind * uniform(rng, 0.8, 1.0)}
+                    course.gust_count <- course.gust_count + 1
+                    time <- time + uniform(rng, 5.0, 9.0)
+            for i in 0..<(level.birds * 4) |rng, total, course|:
+                time: f64 = uniform(rng, 0.5, total)
+                side: f64 = uniform(rng, 0.0, TAU)
+                a: RoomsView::Vec = RoomsView::vec(sin(side) * HALF * 1.4, uniform(rng, 4.0, 10.0), cos(side) * HALF * 1.4)
+                b: RoomsView::Vec = RoomsView::vec(-a.x + uniform(rng, -8.0, 8.0), uniform(rng, 4.0, 10.0), -a.z + uniform(rng, -8.0, 8.0))
+                bird: Bird = Bird{time: rounded(time), duration: uniform(rng, 6.0, 10.0), a: a, b: b}
+                at: mutable i64 = i
+                while at > 0 |at, course, bird|:
+                    previous: Bird = course.birds[(at - 1).usize()]
+                    break if not bird_before(bird, previous)
+                    course.birds[at.usize()] <- previous
+                    at <- at - 1
+                course.birds[at.usize()] <- bird
+            if level.lightning:
+                time: mutable f64 = uniform(rng, 3.0, 6.0)
+                while time < total |time, total, rng, course|:
+                    course.flashes[course.flash_count.usize()] <- rounded(time)
+                    course.flash_count <- course.flash_count + 1
+                    time <- time + uniform(rng, 4.0, 8.0)
+            if level.camera >= CUTS:
+                time: mutable f64 = 0.0
+                last: mutable i64 = -2
+                while time < total |time, total, rng, course, last, level|:
+                    pick: mutable i64 = py_randbelow(rng, 8.u64()).i64()
+                    if level.camera == CIRCLE and py_random(rng) < 0.4:
+                        pick <- -1
+                    if pick == last:
+                        pick <- (pick + 1) % 8 if pick >= 0 else 0
+                    course.cuts[course.cut_count.usize()] <- Cut{time: rounded(time), camera: pick}
+                    last <- pick
+                    course.cut_count <- course.cut_count + 1
+                    time <- time + level.cut * uniform(rng, 0.75, 1.25)
+            if level.decoy:
+                course.decoy <- 1 + py_randbelow(rng, (level.hoops - 1).u64()).i64()
+            course.circle_angle <- uniform(rng, 0.0, TAU)
+            course.circle_rate <- radians(uniform(rng, 18.0, 30.0)) * sign(rng)
+            course.seed <- py_randbelow(rng, 1048576.u64()).i64()
+            course.valid <- true
+            return course
+
+    def hoop_at(h: Hoop, t: f64) -> Hooped:
+        offset: f64 = h.amplitude * sin(h.rate * t + h.phase)
+        centre: RoomsView::Vec = RoomsView::add(h.centre,
+            RoomsView::vec(cos(h.yaw) * offset, 0.0, -sin(h.yaw) * offset) if h.sideways else RoomsView::vec(0.0, offset, 0.0))
+        yaw: f64 = h.yaw + h.spin * t
+        return Hooped{centre: centre, normal: RoomsView::vec(sin(yaw), 0.0, cos(yaw))}
+
+    def bird_visible(bird: Bird, t: f64) -> bool:
+        return t >= bird.time and t <= bird.time + bird.duration
+
+    def bird_at(bird: Bird, t: f64) -> RoomsView::Vec:
+        u: f64 = (t - bird.time) / bird.duration
+        p: RoomsView::Vec = RoomsView::add(RoomsView::mul(bird.a, 1.0 - u), RoomsView::mul(bird.b, u))
+        return RoomsView::vec(p.x, p.y + 0.6 * sin(u * 9.0), p.z)
+
+    def gust_vector(course: Course&, time: f64) -> RoomsView::Vec:
+        can Abort.Panic:
+            for i in 0..<course.gust_count |course, time|:
+                gust: Gust = course.gusts[i.usize()]
+                if gust.time <= time and time < gust.time + gust.duration:
+                    return RoomsView::vec(sin(gust.heading) * gust.strength, 0.0, cos(gust.heading) * gust.strength)
+            return RoomsView::vec(0.0, 0.0, 0.0)
+
+    const KNOCK_EVENT: i64 = 0
+    const PASS_EVENT: i64 = 1
+
+    struct FlightEvent:
+        kind: i64
+        value: f64
+
+    struct Run:
+        course: Course
+        time: mutable f64
+        p: mutable RoomsView::Vec
+        v: mutable RoomsView::Vec
+        thrust: mutable RoomsView::Vec
+        next_hoop: mutable i64
+        passed: mutable f64[9]
+        bumps: mutable i64
+        events: mutable FlightEvent[12]
+        event_count: mutable i64
+        aim: mutable RoomsView::Vec
+        aimed: mutable bool
+        aimed_y: mutable bool
+        yaw: mutable f64
+        heading: mutable f64
+        eye: mutable RoomsView::Vec
+        look: mutable RoomsView::Vec
+        camera: mutable i64
+        result: mutable i64
+
+    struct Frame:
+        forward: RoomsView::Vec
+        right: RoomsView::Vec
+
+    def camera_now(run: mutable Run&, dt: f64):
+        can Abort.Panic:
+            course: Course& = &run.course
+            p: RoomsView::Vec = run.p
+            cut: mutable i64 = -2
+            for i in 0..<course.cut_count |run, course, cut|:
+                entry: Cut = course.cuts[i.usize()]
+                break if entry.time > run.time
+                cut <- entry.camera
+            run.camera <- cut
+            if cut >= 0:
+                run.eye <- fixed(cut)
+                run.look <- RoomsView::vec(p.x, p.y * 0.6, p.z)
+                return
+            if cut == -1:
+                angle: f64 = course.circle_angle + course.circle_rate * run.time
+                run.eye <- RoomsView::vec(p.x + sin(angle) * 9.0, p.y + 4.5, p.z + cos(angle) * 9.0)
+                run.look <- p
+                return
+            want: mutable f64 = run.heading
+            if course.level.camera == LOOK and run.next_hoop < course.level.hoops:
+                h: Hooped = hoop_at(course.hoops[run.next_hoop.usize()], run.time)
+                want <- atan2(h.centre.x - p.x, h.centre.z - p.z)
+            delta: f64 = want - run.yaw + TAU / 2.0
+            turn: f64 = delta - floor(delta / TAU) * TAU - TAU / 2.0
+            run.yaw <- run.yaw + turn * minimum(1.0, 2.2 * dt)
+            x: f64 = sin(run.yaw)
+            z: f64 = cos(run.yaw)
+            run.eye <- RoomsView::vec(p.x - x * 7.5, p.y + 3.2, p.z - z * 7.5)
+            run.look <- RoomsView::vec(p.x + x * 3.0, p.y + 0.3, p.z + z * 3.0)
+
+    def trial(course: Course) -> Run:
+        can Abort.Panic:
+            run: mutable Run = Run{course: course, time: 0.0, p: start(), v: zeroed, thrust: zeroed,
+                next_hoop: 0, passed: zeroed, bumps: 0, events: zeroed, event_count: 0, aim: zeroed, aimed: false, aimed_y: false,
+                yaw: 0.0, heading: 0.0, eye: zeroed, look: zeroed, camera: -2, result: PENDING}
+            camera_now(&run, 0.0)
+            return run
+
+    def controls(run: Run&) -> Frame:
+        d: RoomsView::Vec = RoomsView::sub(run.look, run.eye)
+        forward: RoomsView::Vec = unit(RoomsView::vec(d.x, 0.0, d.z))
+        return Frame{forward: forward, right: RoomsView::vec(-forward.z, 0.0, forward.x)}
+
+    def push(port: i64) -> RoomsView::Vec:
+        return RoomsView::vec(0.0, 0.0, 1.0 if port == 8 else -1.0) if port >= 8
+        a: f64 = 1.0 if port == 0 else (-1.0 if port == 1 else (0.0 if port < 4 else (0.7071 if port < 6 else -0.7071)))
+        b: f64 = -1.0 if port == 2 else (1.0 if port == 3 else (0.0 if port < 4 else (-0.7071 if port % 2 == 0 else 0.7071)))
+        return RoomsView::vec(a, b, 0.0)
+
+    def acceleration(run: mutable Run&, mask: i64) -> RoomsView::Vec:
+        can Abort.Panic:
+            chart: Frame = controls(run)
+            input: mutable RoomsView::Vec = zeroed
+            for i in 0..<10 |mask, input|:
+                if (mask & (1 << i.u64())) != 0:
+                    input <- RoomsView::add(input, push(i))
+            if mask != 0:
+                run.aimed <- false
+                run.aimed_y <- false
+            k: f64 = py_hypot(input.x, input.y)
+            a: f64 = input.x / k if k > 1.0 else input.x
+            b: f64 = input.y / k if k > 1.0 else input.y
+            acc: mutable RoomsView::Vec = RoomsView::add(RoomsView::mul(chart.forward, a * ACC), RoomsView::mul(chart.right, b * ACC))
+            if run.aimed:
+                want: RoomsView::Vec = RoomsView::vec(run.aim.x - run.p.x, 0.0, run.aim.z - run.p.z)
+                pull: RoomsView::Vec = RoomsView::sub(RoomsView::mul(want, 3.0), RoomsView::mul(RoomsView::vec(run.v.x, 0.0, run.v.z), 1.6))
+                n: f64 = norm(pull)
+                acc <- RoomsView::mul(pull, ACC / n) if n > ACC else pull
+            y: f64 = clamp(4.0 * (run.aim.y - run.p.y) - 2.0 * run.v.y, -CLIMB, CLIMB) if run.aimed_y else clamp(input.z, -1.0, 1.0) * CLIMB
+            return RoomsView::vec(acc.x, y, acc.z)
+
+    def event(run: mutable Run&, kind: i64, value: f64):
+        can Abort.Panic:
+            run.events[run.event_count.usize()] <- FlightEvent{kind: kind, value: value}
+            run.event_count <- run.event_count + 1
+
+    def cross_hoops(run: mutable Run&, old: RoomsView::Vec, p: RoomsView::Vec, v: RoomsView::Vec):
+        can Abort.Panic:
+            course: Course& = &run.course
+            run.p <- p
+            run.v <- v
+            for i in 0..<course.level.hoops |run, course, old|:
+                hoop: Hoop = course.hoops[i.usize()]
+                h: Hooped = hoop_at(hoop, run.time)
+                a: f64 = RoomsView::dot(RoomsView::sub(old, h.centre), h.normal)
+                b: f64 = RoomsView::dot(RoomsView::sub(run.p, h.centre), h.normal)
+                continue if (a > 0.0) == (b > 0.0) or a == b
+                point: RoomsView::Vec = RoomsView::add(old, RoomsView::mul(RoomsView::sub(run.p, old), a / (a - b)))
+                d: f64 = norm(RoomsView::sub(point, h.centre))
+                continue if d > hoop.radius + RIM + DRONE
+                if d < hoop.radius - RIM - DRONE * 0.4:
+                    if i == run.next_hoop:
+                        run.passed[i.usize()] <- run.time
+                        run.next_hoop <- run.next_hoop + 1
+                        event(run, PASS_EVENT, run.next_hoop.f64())
+                    elif i > run.next_hoop and not course.level.lit:
+                        run.result <- WRONG
+                    continue
+                run.bumps <- run.bumps + 1
+                event(run, KNOCK_EVENT, 0.7)
+                vn: f64 = RoomsView::dot(run.v, h.normal)
+                run.v <- RoomsView::sub(run.v, RoomsView::mul(h.normal, 1.6 * vn))
+                side: f64 = 1.0 if a > 0.0 else -1.0
+                run.p <- RoomsView::add(RoomsView::sub(run.p, RoomsView::mul(h.normal, b)), RoomsView::mul(h.normal, side * 0.05))
+
+    def step(run: mutable Run&, dt: f64, mask: i64):
+        can Abort.Panic:
+            return if run.result != PENDING
+            run.time <- run.time + dt
+            run.event_count <- 0
+            run.thrust <- acceleration(run, mask)
+            course: Course& = &run.course
+            acc: RoomsView::Vec = RoomsView::add(run.thrust, gust_vector(course, run.time))
+            v: RoomsView::Vec = RoomsView::mul(RoomsView::add(run.v, RoomsView::mul(acc, dt)), exp(-course.level.drag * dt))
+            old: RoomsView::Vec = run.p
+            p: RoomsView::Vec = RoomsView::add(old, RoomsView::mul(v, dt))
+            edge: f64 = HALF - DRONE
+            x: bool = abs_value(p.x) > edge
+            y: bool = p.y < FLOOR or p.y > CEILING
+            z: bool = abs_value(p.z) > edge
+            if x:
+                event(run, KNOCK_EVENT, 0.4)
+            if z:
+                event(run, KNOCK_EVENT, 0.4)
+            if y and abs_value(v.y) > 2.0:
+                event(run, KNOCK_EVENT, 0.3)
+            velocity: RoomsView::Vec = RoomsView::vec(-0.3 * v.x if x else v.x, -0.3 * v.y if y else v.y, -0.3 * v.z if z else v.z)
+            if py_hypot(velocity.x, velocity.z) > 0.8:
+                run.heading <- atan2(velocity.x, velocity.z)
+            cross_hoops(run, old, RoomsView::vec(clamp(p.x, -edge, edge), clamp(p.y, FLOOR, CEILING), clamp(p.z, -edge, edge)), velocity)
+            camera_now(run, dt)
+            return if run.result != PENDING
+            if run.next_hoop >= course.level.hoops:
+                run.result <- PASSED
+            elif run.time >= course.level.seconds * course.level.hoops.f64():
+                run.result <- TIMEOUT
+
+    def choose(run: Run&, want: RoomsView::Vec) -> i64:
+        can Abort.Panic:
+            chart: Frame = controls(run)
+            a: f64 = RoomsView::dot(want, chart.forward)
+            b: f64 = RoomsView::dot(want, chart.right)
+            h: f64 = py_hypot(a, b)
+            threshold: f64 = 0.8 if h * 0.9 < 0.8 else h * 0.9
+            return 8 if want.y > threshold
+            return 9 if want.y < -threshold
+            return -1 if h < 0.6
+            best: mutable i64 = 0
+            score: mutable f64 = -1e9
+            for port in 0..<8 |a, b, best, score|:
+                motion: RoomsView::Vec = push(port)
+                alignment: f64 = (motion.x * a + motion.y * b) / py_hypot(motion.x, motion.y)
+                if alignment > score:
+                    best <- port
+                    score <- alignment
+            return best
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != PENDING or run.next_hoop >= run.course.level.hoops
+            hoop: Hoop = run.course.hoops[run.next_hoop.usize()]
+            h: Hooped = hoop_at(hoop, run.time)
+            q: RoomsView::Vec = RoomsView::sub(run.p, h.centre)
+            along: f64 = RoomsView::dot(q, h.normal)
+            side: f64 = 1.0 if along > 0.0 else -1.0
+            off: RoomsView::Vec = RoomsView::sub(q, RoomsView::mul(h.normal, along))
+            lined: bool = norm(off) < 0.42 * hoop.radius and abs_value(along) < 4.5
+            aim: f64 = -side * 3.0 if lined else side * 3.5
+            speed: f64 = 5.5 if lined else 8.0
+            target: RoomsView::Vec = RoomsView::add(h.centre, RoomsView::mul(h.normal, aim))
+            future: Hooped = hoop_at(hoop, run.time + 0.1)
+            drift: RoomsView::Vec = RoomsView::mul(RoomsView::sub(RoomsView::add(future.centre, RoomsView::mul(future.normal, aim)), target), 10.0)
+            want: RoomsView::Vec = RoomsView::sub(target, run.p)
+            top: f64 = ACC / run.course.level.drag
+            wanted_v: RoomsView::Vec = RoomsView::add(RoomsView::mul(unit(want), minimum(speed, minimum(top * 0.8, 2.0 * norm(want)))), drift)
+            need: RoomsView::Vec = RoomsView::mul(RoomsView::sub(wanted_v, run.v), 5.0)
+            return choose(run, RoomsView::sub(need, gust_vector(&run.course, run.time)))
+
+    def deal(rung: i64, seed: i64) -> Course:
+        can Abort.Panic:
+            level: Grade = grade(rung)
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            first: mutable Course = zeroed
+            for _attempt in 0..<30 |rng, level, first|:
+                course: Course = build(level, &rng)
+                continue if not course.valid
+                first <- course if not first.valid
+                run: mutable Run = trial(course)
+                while run.result == PENDING |run|:
+                    port: i64 = pilot(&run)
+                    step(&run, 1.0 / 30.0, 0 if port < 0 else 1 << port.u64())
+                return course if run.result == PASSED
+            return first
+
+    def flash(course: Course&, time: f64) -> f64:
+        can Abort.Panic:
+            for i in 0..<course.flash_count |course, time|:
+                t: f64 = course.flashes[i.usize()]
+                if t <= time and time < t + 0.35:
+                    u: f64 = (time - t) / 0.35
+                    wave: f64 = sin(u * 40.0)
+                    return (1.0 - u) * (0.6 + 0.4 * wave * wave)
+            return 0.0

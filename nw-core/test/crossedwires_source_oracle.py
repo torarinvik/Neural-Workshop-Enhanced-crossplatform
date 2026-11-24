@@ -67,6 +67,11 @@ taskoptions.settings = lambda _spec: {
 }
 taskoptions.open_task_options = lambda *_args, **_kwargs: None
 sys.modules[taskoptions.__name__] = taskoptions
+# The controller replay bypasses construction and redraw, so the
+# decoration module does not need to import the OpenGL-backed Group class.
+polish = types.ModuleType("neural_workshop.ui.polish")
+sys.modules[polish.__name__] = polish
+ui_package.polish = polish
 ui_package.cursor = cursor
 ui_package.taskoptions = taskoptions
 
@@ -213,7 +218,7 @@ def run(seed=SEED, level=LEVEL, trials=TRIALS, policy="oracle"):
     ui.on_key_press(key.SPACE, 0)
     assert snapshot(env_ui) == snapshot(ui), "source UI seeded deals diverged"
     trace = [{"action": "start", "value": 0, "now": 1000,
-              "result": 1, "state": snapshot(ui), "message": ui.message}]
+              "result": 1, "state": snapshot(ui), "message": ui.message, "verdict": ui.verdict_shown}]
     sequence = 0
 
     policy_rng = random.Random(seed * 71 + level)
@@ -236,7 +241,7 @@ def run(seed=SEED, level=LEVEL, trials=TRIALS, policy="oracle"):
             assert snapshot(env_ui) == expected, "UI key and Env port routes diverged"
             trace.append({"action": "press", "value": keyed,
                           "now": ui.now_ms, "result": 1, "state": expected,
-                          "message": ui.message})
+                          "message": ui.message, "verdict": ui.verdict_shown})
 
         deadline_ms = int(round(ui.until * 1000))
         ui.now_ms = deadline_ms - 1
@@ -247,7 +252,7 @@ def run(seed=SEED, level=LEVEL, trials=TRIALS, policy="oracle"):
         assert snapshot(env_ui) == expected
         trace.append({"action": "start", "value": 0,
                       "now": ui.now_ms, "result": 2, "state": expected,
-                      "message": ui.message})
+                      "message": ui.message, "verdict": ui.verdict_shown})
 
         ui.now_ms = deadline_ms
         ui.on_key_press(key.SPACE, 0)
@@ -257,7 +262,7 @@ def run(seed=SEED, level=LEVEL, trials=TRIALS, policy="oracle"):
         assert snapshot(env_ui) == expected
         trace.append({"action": "start", "value": 0,
                       "now": ui.now_ms, "result": 1, "state": expected,
-                      "message": ui.message})
+                      "message": ui.message, "verdict": ui.verdict_shown})
         sequence += 1
 
     return {"seed": seed, "level": level, "trials": trials, "policy": policy,

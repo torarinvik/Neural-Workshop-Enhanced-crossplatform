@@ -28,25 +28,33 @@ assert.deepEqual(catalog.task_capabilities.nback.options_schema.grid_3d_cubes, {
   type: "enum", value_type: "integer", default: 1, values: [1, 2, 3, 4, 5, 6],
 }, "3D N-Back cube-count choices must remain explicit in the manifest");
 
-const catalogCategories = catalog.categories.map((category) => category.id);
-const expectedIds = catalogCategories.map((category) => catalog.tasks
-  .filter((task) => task.category === category)
-  .sort((left, right) => left.position - right.position)
-  .map((task) => catalog.port_overrides[task.id]?.id ?? task.id));
+const catalogCategories = [...catalog.categories, ...(catalog.hub_categories ?? [])];
+const catalogGroups = new Map(catalogCategories.map(({ id }) => [id, catalog.tasks
+  .filter((task) => task.category === id)
+  .sort((left, right) => left.position - right.position)]));
+for (const task of catalog.hub_additions ?? []) {
+  const group = catalogGroups.get(task.category);
+  assert.ok(group, `unknown hub category ${task.category}`);
+  if (task.after === undefined) {
+    assert.equal(group.length, 0, `missing insertion anchor for ${task.id}`);
+    group.push(task);
+  } else {
+    const anchor = group.findIndex(({ id }) => id === task.after);
+    assert.ok(anchor >= 0, `missing insertion anchor ${task.after}`);
+    group.splice(anchor + 1, 0, task);
+  }
+}
 assert.equal(categories.length, catalogCategories.length);
 for (let category = 0; category < categories.length; category++) {
-  assert.equal(categories[category].name, catalog.categories[category].label,
-    `menu category label drifted in ${catalogCategories[category]}`);
-  assert.equal(categories[category].tasks.length, expectedIds[category].length,
-    `menu/catalog task-count mismatch in ${catalogCategories[category]}`);
-  assert.deepEqual([...idsByCategory[category]], expectedIds[category],
-    `stable menu IDs/order drifted from catalog in ${catalogCategories[category]}`);
-  const expectedLabels = catalog.tasks
-    .filter((task) => task.category === catalogCategories[category])
-    .sort((left, right) => left.position - right.position)
-    .map((task) => catalog.port_overrides[task.id]?.label ?? task.label);
+  const { id, label } = catalogCategories[category];
+  const group = catalogGroups.get(id);
+  assert.equal(categories[category].name, label, `menu category label drifted in ${id}`);
+  const expectedIds = group.map((task) => catalog.port_overrides[task.id]?.id ?? task.id);
+  assert.deepEqual([...idsByCategory[category]], expectedIds,
+    `stable menu IDs/order drifted from catalog in ${id}`);
+  const expectedLabels = group.map((task) => catalog.port_overrides[task.id]?.label ?? task.label);
   assert.deepEqual([...categories[category].tasks], expectedLabels,
-    `visible menu labels drifted from catalog in ${catalogCategories[category]}`);
+    `visible menu labels drifted from catalog in ${id}`);
 }
 
 assert.match(web, /function currentTaskId\(\)\s*\{\s*return TASK_IDS_BY_CATEGORY\[taskCategory\]\?\.\[taskSelected\] \?\? "";/,
@@ -56,4 +64,4 @@ assert.doesNotMatch(web, /taskCategory === \d+\s*&&\s*taskSelected === \d+/,
 assert.doesNotMatch(web, /taskSelected === \d+/, 
   "launch routing must not special-case a task by menu index");
 
-console.log("task_registry_test: PASS (generated 45-task menu, IDs/order, overrides, and stable-ID routing)");
+console.log(`task_registry_test: PASS (generated ${idsByCategory.flat().length}-task menu, IDs/order, overrides, and stable-ID routing)`);

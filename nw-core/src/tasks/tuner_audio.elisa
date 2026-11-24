@@ -1,0 +1,221 @@
+include "./tuner.elisa"
+include "./drshape_audio.elisa"
+
+module TunerAudio:
+    const RATE: i64 = TonePcm::RATE
+    const LOUDNESS: f64 = 0.12
+
+    struct Wave:
+        samples: darray[f32]
+
+    struct Audio:
+        heard: mutable Wave
+        stations: mutable darray[Wave]
+        hiss: mutable Wave
+
+    def normalise(samples: mutable darray[f32]&, fade: i64 = 0):
+        can Abort.Panic:
+            return if samples.count == 0.usize()
+            sum: mutable f64 = 0.0
+            for sample in samples |sum|:
+                value: f64 = sample.f64()
+                sum <- sum + value * value
+            rms: f64 = sqrt(sum / samples.count.f64())
+            return if rms <= 0.00001 and fade == 0
+            gain: f64 = LOUDNESS / rms if rms > 0.00001 else 0.0
+            count: i64 = samples.count.i64()
+            for i in 0..<count |samples, gain, count, fade|:
+                envelope: f64 = i.f64() / fade.f64() if i < fade else (
+                    (count - 1 - i).f64() / fade.f64() if i >= count - fade else 1.0)
+                value: f32 = samples[i.usize()]
+                samples[i.usize()] <- Tuner::clamp(value.f64() * (gain * envelope), -1.0, 1.0).f32()
+
+    def recorded_wave(pcm: darray[i16]&, rate: i64, channels: i64, start: f64, end: f64) -> Wave:
+        can Memory.Allocate, Abort.Panic:
+            samples: mutable darray[f32] = []
+            if channels <= 0 or rate <= 0 or start < 0.0 or end <= start:
+                return Wave{samples: samples}
+            begin: i64 = (start * rate.f64()).i64()
+            available: i64 = pcm.count.i64() / channels - begin
+            return Wave{samples: samples} if available <= 0
+            duration: f64 = Tuner::clamp(end - start, 0.0, 3.5)
+            wanted: i64 = (duration * rate.f64()).i64()
+            frames: i64 = wanted if wanted < available else available
+            step: f64 = rate.f64() / RATE.f64()
+            count: i64 = (frames.f64() / step).i64()
+            _ = samples.reserve(count.usize())
+            for i in 0..<count |samples, pcm, frames, begin, channels, step|:
+                lo: i64 = (i.f64() * step).i64()
+                next: i64 = ((i + 1).f64() * step).i64()
+                hi: i64 = lo + 1 if next <= lo else next
+                limit: i64 = hi if hi < frames else frames
+                sum: mutable i64 = 0
+                for j in lo..<limit |sum, pcm, begin, channels|:
+                    value: i16 = pcm[((begin + j) * channels).usize()]
+                    sum <- sum + value.i64()
+                samples.push((sum.f64() / (32768.0 * (hi - lo).f64())).f32())
+            normalise(&samples, (0.012 * RATE.f64()).i64())
+            return Wave{samples: samples}
+
+    def tune_wave(sound: Tuner::Sound&) -> Wave:
+        can Memory.Allocate, Abort.Panic:
+            voices: i64[8] = [DrShapeAudio::FLUTE, DrShapeAudio::ORGAN, DrShapeAudio::CLARINET, DrShapeAudio::PLUCK,
+                DrShapeAudio::BELL, DrShapeAudio::BRASS, DrShapeAudio::GLASS, DrShapeAudio::SQUARE]
+            major: i64[9] = [0, 2, 4, 5, 7, 9, 11, 12, 14]
+            tune: Tuner::Tune = sound.tune
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, tune.voice.u64())
+            bank: mutable DrShapeAudio::Bank = zeroed
+            bank.count <- 1
+            bank.patches[0] <- DrShapeAudio::make_patch(voices[tune.voice.usize()], &rng, 0.0)
+            notes: mutable darray[DrShapeDeal::Note] = []
+            beats: i64[5] = Tuner::rhythm(tune.rhythm)
+            t: mutable f64 = 0.0
+            for i in 0..<5 |t, tune, notes, beats, major|:
+                step: f64 = beats[i.usize()].f64() * Tuner::BEAT
+                pitch: i64 = major[tune.degrees[i.usize()].usize()]
+                freq: f64 = tune.root * pow(2.0, pitch.f64() / 12.0)
+                notes.push(DrShapeDeal::Note{t: t, dur: step * 0.9, freq: freq,
+                    pan: 0.0, pan2: 0.0, gain: 0.8, gain2: 0.8, bright: 0.8, voice: 0,
+                    seed: i, who: -1, room: 0.0})
+                t <- t + step
+            samples: mutable darray[f32] = []
+            frames: i64 = py_round_half_even((t + Tuner::TAIL_TIME) * RATE.f64())
+            _ = samples.reserve(frames.usize())
+            for i in 0..<frames |samples|:
+                samples.push(0.0.f32())
+            region synth_scratch(8388608):
+                in synth_scratch:
+                    bytes: mutable u8[160000] = zeroed
+                    length: i64 = DrShapeAudio::write(&notes, &bank, 0.0, t + Tuner::TAIL_TIME, &bytes[0], 160000)
+                    for i in 0..<(length / 4) |bytes, samples|:
+                        k: usize = (i * 4).usize()
+                        sample: i16 = (bytes[k].u16() | (bytes[k + 1].u16() << 8)).i16()
+                        samples[i.usize()] <- (sample.f64() / 32768.0).f32()
+            normalise(&samples)
+            return Wave{samples: samples}
+
+    def playback(base: Wave&, speed: f64, backward: bool) -> Wave:
+        can Memory.Allocate, Abort.Panic:
+            return base[0] if (speed == 1.0 and not backward) or base.samples.count == 0.usize()
+            src: darray[f32] = base.samples
+            n: i64 = (src.count.f64() / speed).i64()
+            out: mutable darray[f32] = []
+            _ = out.reserve(n.usize())
+            for i in 0..<n |src, n, speed, backward, out|:
+                index: f64 = (n - 1 - i).f64() * speed if backward else i.f64() * speed
+                k: usize = index.usize()
+                next: usize = k + 1 if k + 1 < src.count else k
+                share: f64 = index - k.f64()
+                a: f32 = src[k]
+                b: f32 = src[next]
+                out.push((a.f64() * (1.0 - share) + b.f64() * share).f32())
+            return Wave{samples: out}
+
+    def hiss(seed: i64) -> Wave:
+        can Memory.Allocate, Abort.Panic:
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, seed.u64())
+            out: mutable darray[f32] = []
+            _ = out.reserve(RATE.usize())
+            last: mutable f64 = 0.0
+            for i in 0..<RATE |rng, out, last|:
+                last <- 0.6 * last + 0.4 * py_uniform(&rng, -1.0, 1.0)
+                out.push((last * 0.5).f32())
+            return Wave{samples: out}
+
+    def prepare_tunes(radio: Tuner::Radio&) -> Audio:
+        can Memory.Allocate, Abort.Panic:
+            stations: mutable darray[Wave] = []
+            for i in 0..<radio.count |stations, radio|:
+                s: Tuner::Sound& = &radio.stations[i.usize()].sound
+                raw: Wave = tune_wave(s)
+                stations.push(playback(&raw, s.speed, s.backward))
+            raw: Wave = tune_wave(&radio.heard)
+            return Audio{heard: playback(&raw, radio.heard.speed, radio.heard.backward), stations: stations, hiss: hiss(radio.seed)}
+
+    def first_frame(gains: darray[Tuner::GainFrame]&, t: f64) -> i64:
+        can Abort.Panic:
+            lo: mutable i64 = 0
+            hi: mutable i64 = gains.count.i64()
+            while lo < hi |lo, hi, gains, t|:
+                mid: i64 = lo + (hi - lo) / 2
+                frame: Tuner::GainFrame = gains[mid.usize()]
+                if frame.time <= t:
+                    lo <- mid + 1
+                else:
+                    hi <- mid
+            return lo - 1 if lo > 0 else 0
+
+    def pcm(out: darray[f64]&, frames: i64, dest: mutable u8&) -> i64:
+        can Abort.Panic:
+            for i in 0..<frames |out, dest|:
+                value: f64 = out[i.usize()]
+                s: u16 = (Tuner::clamp(value, -1.0, 1.0) * 32000.0).i16().u16()
+                lo: u8 = (s & 255.u16()).u8()
+                hi: u8 = (s >> 8).u8()
+                k: usize = (i * 4).usize()
+                dest[k] <- lo
+                dest[k + 1] <- hi
+                dest[k + 2] <- lo
+                dest[k + 3] <- hi
+            return frames * 4
+
+    def mix(run: Tuner::Run&, audio: Audio&, t0: f64, t1: f64, dest: mutable u8&, capacity: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            return 0 if not (t1 > t0) or capacity < 4 or run.gains.count == 0.usize()
+            requested: f64 = (t1 - t0) * RATE.f64()
+            return 0 if requested > (capacity / 4).f64() + 0.5
+            frames: i64 = py_round_half_even(requested)
+            return 0 if frames <= 0 or frames > capacity / 4
+            out: mutable darray[f64] = []
+            _ = out.reserve(frames.usize())
+            for i in 0..<frames |out|:
+                out.push(0.0)
+            for at in run.plays |audio, t0, frames, out|:
+                a: i64 = py_round_half_even((at - t0) * RATE.f64())
+                lo: i64 = a if a > 0 else 0
+                end: i64 = a + audio.heard.samples.count.i64()
+                hi: i64 = end if end < frames else frames
+                if hi > lo:
+                    for i in lo..<hi |out, audio, a|:
+                        k: usize = i.usize()
+                        sample: f32 = audio.heard.samples[(i - a).usize()]
+                        out[k] <- out[k] + sample.f64()
+            gap: i64 = (Tuner::GAP * RATE.f64()).i64()
+            start: i64 = py_round_half_even(t0 * RATE.f64())
+            first: i64 = first_frame(&run.gains, t0)
+            for j in first..<run.gains.count.i64() |first, run, t0, t1, frames, out, audio, gap, start|:
+                a: Tuner::GainFrame = run.gains[j.usize()]
+                has_next: bool = j + 1 < run.gains.count.i64()
+                b: Tuner::GainFrame = run.gains[(j + 1).usize()] if has_next else a
+                end_time: f64 = b.time if has_next else (t1 if t1 > a.time else a.time) + 1.0
+                base: f64 = (a.time - t0) * RATE.f64()
+                left: i64 = ceil(base).i64()
+                right: i64 = ceil((end_time - t0) * RATE.f64()).i64()
+                lo: i64 = 0 if left < 0 or j == first else left
+                hi: i64 = right if right < frames else frames
+                if hi > lo:
+                    duration: f64 = (end_time - a.time) * RATE.f64()
+                    span: f64 = duration if duration > 0.000000001 else 0.000000001
+                    for station in 0..<(run.radio.count + 1) |run, audio, a, b, out, span, base, lo, hi, gap, start|:
+                        g0: f64 = a.levels[station.usize()]
+                        g1: f64 = b.levels[station.usize()]
+                        continue if g0 < 0.004 and g1 < 0.004
+                        noise: bool = station == run.radio.count
+                        wave: Wave = audio.hiss if noise else audio.stations[station.usize()]
+                        size: i64 = wave.samples.count.i64()
+                        continue if size <= 0
+                        period: i64 = size if noise else size + gap
+                        skew: i64 = 0 if noise else py_round_half_even(run.radio.stations[station.usize()].phase * RATE.f64())
+                        slope: f64 = (g1 - g0) / span
+                        for i in lo..<hi |out, wave, size, period, skew, start, g0, slope, base|:
+                            pos: mutable i64 = (start + skew + i) % period
+                            pos <- pos + period if pos < 0
+                            if pos < size:
+                                gain: f64 = g0 + slope * (i.f64() - base)
+                                sample: f32 = wave.samples[pos.usize()]
+                                k: usize = i.usize()
+                                out[k] <- out[k] + sample.f64() * (gain if gain < 1.0 else 1.0)
+                break if not has_next or end_time >= t1
+            return pcm(&out, frames, dest)

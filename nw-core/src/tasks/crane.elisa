@@ -1,0 +1,276 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module Crane:
+    const LEFT: i64 = 0
+    const RIGHT: i64 = 1
+    const UP: i64 = 2
+    const DOWN: i64 = 3
+    const GRAB: i64 = 4
+    const PORTS: i64 = 5
+    const NEUTRAL: i64 = -1
+
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const HARD_DROP: i64 = 2
+    const WRONG_BAY: i64 = 3
+    const OUTSIDE_BAY: i64 = 4
+    const COLLISION: i64 = 5
+    const TIMEOUT: i64 = 6
+    const SHIP: i64 = -1
+    const HELD: i64 = -2
+
+    const WIDTH: f64 = 44.0
+    const HEIGHT: f64 = 24.0
+    const RAIL: f64 = 22.0
+    const BOX_W: f64 = 3.0
+    const BOX_H: f64 = 1.6
+    const DECK: f64 = 2.2
+    const G: f64 = 9.8
+    const PUSH: f64 = 3.0
+    const FRICTION: f64 = 0.8
+    const HOIST: f64 = 4.0
+
+    struct Grade:
+        rung: i64
+        boxes: i64
+        damping: f64
+        wall: f64
+        wind: f64
+        gusts: f64
+        roll: f64
+        speed: f64
+        seconds: f64
+        two_high: bool
+
+    struct Bay:
+        x: f64
+        colour: i64
+
+    struct Box:
+        colour: i64
+        column: i64
+        level: i64
+
+    struct Yard:
+        level: Grade
+        bays: mutable Bay[4]
+        boxes: mutable Box[4]
+        bay_count: i64
+        wall_x: f64
+        wind_sign: f64
+        gust_seed: i64
+
+    struct Position:
+        x: f64
+        y: f64
+
+    struct Run:
+        yard: Yard
+        t: mutable f64
+        x: mutable f64
+        v: mutable f64
+        cable: mutable f64
+        theta: mutable f64
+        omega: mutable f64
+        held: mutable i64
+        # Nonnegative locations name a bay. A separate depth records
+        # placement order within each bay.
+        location: mutable i64[4]
+        depth: mutable i64[4]
+        bay_height: mutable i64[4]
+        placed: mutable i64
+        result: mutable i64
+        last_grab: mutable f64
+
+    def grade(requested: i64) -> Grade:
+        rung: i64 = requested if requested > 1 else 1
+        top: f64 = (rung - 20).f64() if rung > 20 else 0.0
+        boxes: i64 = 2 if rung < 4 else 3 if rung < 13 else 4
+        return Grade{rung: rung, boxes: boxes,
+            damping: 0.8 if rung < 4 else 0.35 if rung < 10 else 0.2,
+            wall: 0.0 if rung < 7 else 3.0 * BOX_H if rung < 20 else 4.0 * BOX_H,
+            wind: 0.0 if rung < 10 else 0.6 + 0.04 * top,
+            gusts: 0.0 if rung < 20 else 0.35 + 0.04 * top,
+            roll: 0.0 if rung < 16 else 0.35 + 0.02 * top,
+            speed: 5.0 + 0.15 * top, seconds: fmax(90.0, 60.0 * boxes.f64() - 2.5 * top),
+            two_high: rung >= 13}
+
+    def shuffled(values: mutable i64[4]&, count: i64, rng: mutable MT19937&):
+        can Abort.Panic:
+            for i in 1..<count |values, count, rng|:
+                at: usize = (count - i).usize()
+                pick: usize = py_randbelow(rng, (at + 1.usize()).u64()).usize()
+                item: i64 = values[at]
+                values[at] <- values[pick]
+                values[pick] <- item
+
+    def build(level: Grade, rng: mutable MT19937&) -> Yard:
+        can Abort.Panic:
+            count: i64 = (level.boxes + 1) / 2 if level.two_high else level.boxes
+            colours: mutable i64[4] = [0, 1, 2, 3]
+            shuffled(&colours, count, rng)
+            bays: mutable Bay[4] = zeroed
+            for i in 0..<count |bays, colours|:
+                bays[i.usize()] <- Bay{x: 41.0 - 4.2 * i.f64(), colour: colours[i.usize()]}
+            paint: mutable i64[4] = zeroed
+            for i in 0..<level.boxes |paint, colours, count|:
+                paint[i.usize()] <- colours[(i % count).usize()]
+            shuffled(&paint, level.boxes, rng)
+            heights: mutable i64[3] = zeroed
+            boxes: mutable Box[4] = zeroed
+            for i in 0..<level.boxes |boxes, heights, paint, rng|:
+                col: i64 = py_randbelow(rng, 3.u64()).i64()
+                boxes[i.usize()] <- Box{colour: paint[i.usize()], column: col, level: heights[col.usize()]}
+                heights[col.usize()] <- heights[col.usize()] + 1
+            wall_x: f64 = 22.0 + py_uniform(rng, -1.5, 1.5)
+            wind_sign: f64 = -1.0 if py_randbelow(rng, 2.u64()) == 0.u64() else 1.0
+            gust_seed: i64 = py_randbelow(rng, 1048576.u64()).i64()
+            return Yard{level: level, bays: bays, boxes: boxes, bay_count: count,
+                wall_x: wall_x, wind_sign: wind_sign, gust_seed: gust_seed}
+
+    def start(yard: Yard) -> Run:
+        return Run{yard: yard, t: 0.0, x: 16.0, v: 0.0, cable: 6.0, theta: 0.0, omega: 0.0,
+            held: NEUTRAL, location: [SHIP, SHIP, SHIP, SHIP], depth: zeroed, bay_height: zeroed,
+            placed: 0, result: LIVE, last_grab: -1.0}
+
+    def roll(run: Run&) -> f64:
+        return run.yard.level.roll * sin(run.t * 0.9)
+
+    def column_x(column: i64) -> f64:
+        return 4.5 + 4.0 * column.f64()
+
+    def hook(run: Run&) -> Position:
+        return Position{x: run.x + run.cable * sin(run.theta), y: RAIL - run.cable * cos(run.theta)}
+
+    def velocity(run: Run&) -> Position:
+        return Position{x: run.v + run.cable * cos(run.theta) * run.omega,
+            y: run.cable * sin(run.theta) * run.omega}
+
+    def box_rect(run: Run&, index: i64) -> Position:
+        can Abort.Panic:
+            i: usize = index.usize()
+            location: i64 = run.location[i]
+            if location == HELD:
+                tip: Position = hook(run)
+                return Position{x: tip.x, y: tip.y - BOX_H}
+            if location == SHIP:
+                box: Box = run.yard.boxes[i]
+                return Position{x: column_x(box.column), y: DECK + roll(run) + BOX_H * box.level.f64()}
+            return Position{x: run.yard.bays[location.usize()].x, y: BOX_H * run.depth[i].f64()}
+
+    def surface(run: Run&, x: f64, half: f64 = 1.5) -> f64:
+        can Abort.Panic:
+            roof: mutable f64 = DECK + roll(run) if x > 2.0 - half and x < 15.0 + half else 0.0
+            for i in 0..<run.yard.level.boxes |run, roof, x, half|:
+                if run.location[i.usize()] != HELD:
+                    at: Position = box_rect(run, i)
+                    if fabs(at.x - x) < BOX_W / 2.0 + half - 0.05:
+                        roof <- fmax(roof, at.y + BOX_H)
+            if run.yard.level.wall > 0.0 and fabs(x - run.yard.wall_x) < 1.6 + half:
+                roof <- fmax(roof, run.yard.level.wall)
+            return roof
+
+    def top_box(run: Run&, column: i64) -> i64:
+        can Abort.Panic:
+            top: mutable i64 = NEUTRAL
+            for i in 0..<run.yard.level.boxes |run, column, top|:
+                if run.location[i.usize()] == SHIP and run.yard.boxes[i.usize()].column == column:
+                    top <- i
+            return top
+
+    def grabbable(run: Run&) -> i64:
+        can Abort.Panic:
+            tip: Position = hook(run)
+            for i in 0..<run.yard.level.boxes |run, tip|:
+                if run.location[i.usize()] == SHIP and top_box(run, run.yard.boxes[i.usize()].column) == i:
+                    at: Position = box_rect(run, i)
+                    return i if fabs(tip.x - at.x) < 0.7 and fabs(tip.y - (at.y + BOX_H)) < 0.45
+            return NEUTRAL
+
+    def grab(run: mutable Run&):
+        can Abort.Panic:
+            return if run.result != LIVE
+            run.last_grab <- run.t
+            if run.held == NEUTRAL:
+                index: i64 = grabbable(run)
+                if index >= 0:
+                    run.location[index.usize()] <- HELD
+                    run.held <- index
+                return
+            index: usize = run.held.usize()
+            at: Position = box_rect(run, run.held)
+            vel: Position = velocity(run)
+            if at.y - surface(run, at.x) > 1.2 or py_hypot(vel.x, vel.y) > 1.6:
+                run.result <- HARD_DROP
+                return
+            for k in 0..<run.yard.bay_count |run, index, at|:
+                bay: Bay = run.yard.bays[k.usize()]
+                if fabs(at.x - bay.x) < 0.9:
+                    if bay.colour != run.yard.boxes[index].colour:
+                        run.result <- WRONG_BAY
+                        return
+                    run.location[index] <- k
+                    run.depth[index] <- run.bay_height[k.usize()]
+                    run.bay_height[k.usize()] <- run.bay_height[k.usize()] + 1
+                    run.held <- NEUTRAL
+                    run.placed <- run.placed + 1
+                    return
+            run.result <- OUTSIDE_BAY
+
+    def wind(run: Run&) -> f64:
+        base: f64 = run.yard.level.wind * run.yard.wind_sign
+        return base + run.yard.level.gusts * sin(run.t * 0.37 + (run.yard.gust_seed % 7).f64()) * run.yard.wind_sign
+
+    def acceleration(run: Run&, control: i64) -> f64:
+        return (-PUSH if run.v > -run.yard.level.speed else 0.0) if control == LEFT
+        return (PUSH if run.v < run.yard.level.speed else 0.0) if control == RIGHT
+        return -FRICTION if run.v > 0.0 else FRICTION if run.v < 0.0 else 0.0
+
+    def collide(run: mutable Run&):
+        can Abort.Panic:
+            tip: Position = hook(run)
+            if run.held != NEUTRAL:
+                base: f64 = tip.y - BOX_H
+                roof: f64 = surface(run, tip.x)
+                if base < roof - 0.08:
+                    vel: Position = velocity(run)
+                    if py_hypot(vel.x, vel.y) > 0.6 or base < roof - 0.5:
+                        run.result <- COLLISION
+                    else:
+                        run.cable <- run.cable - (roof - 0.02 - base)
+            else:
+                floor_y: f64 = surface(run, tip.x, 0.3)
+                if tip.y < floor_y:
+                    run.cable <- run.cable - (floor_y - tip.y)
+
+    def step(run: mutable Run&, dt: f64, control: i64):
+        can Abort.Panic:
+            return if run.result != LIVE
+            level: Grade = run.yard.level
+            run.t <- run.t + dt
+            accel: mutable f64 = acceleration(run, control)
+            run.v <- fmax(-level.speed, fmin(level.speed, run.v + accel * dt))
+            if control != LEFT and control != RIGHT and fabs(run.v) < FRICTION * dt:
+                run.v <- 0.0
+                accel <- 0.0
+            run.x <- run.x + run.v * dt
+            if run.x < 1.0 or run.x > WIDTH - 1.0:
+                run.x <- fmax(1.0, fmin(WIDTH - 1.0, run.x))
+                run.v <- 0.0
+                accel <- 0.0
+            if control == UP:
+                run.cable <- fmax(2.0, run.cable - HOIST * dt)
+            elif control == DOWN:
+                run.cable <- fmin(RAIL - 0.3, run.cable + HOIST * dt)
+            length: f64 = run.cable
+            alpha: f64 = (-(G / length) * sin(run.theta) -
+                (accel - wind(run)) / length * cos(run.theta) - level.damping * run.omega)
+            run.omega <- run.omega + alpha * dt
+            run.theta <- run.theta + run.omega * dt
+            collide(run)
+            if run.result == LIVE:
+                if run.placed == level.boxes:
+                    run.result <- CLEAR
+                elif run.t >= level.seconds:
+                    run.result <- TIMEOUT

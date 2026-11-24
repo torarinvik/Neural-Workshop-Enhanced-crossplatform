@@ -1,0 +1,199 @@
+include "../pyrandom.elisa"
+
+module Signals:
+    const GLYPHS: i64 = 8
+    const MOST_OBJECTS: i64 = 8
+    const MOST_EXCHANGES: i64 = 16
+    const LISTEN: i64 = 0
+    const SPEAK: i64 = 1
+    const BOTH: i64 = 2
+    const UNKNOWN: i64 = -1
+
+    struct Grade:
+        rung: i64
+        objects: i64
+        exchanges: i64
+        roles: i64
+        shapes: bool
+        length: i64
+        swaps: i64
+
+    # Things encode colour in the high pair of bits and shape in the low pair.
+    # Code values 0–3 name colours, and values 4–7 name shapes.
+    struct Exchange:
+        role: mutable i64
+        objects: mutable i64[MOST_OBJECTS]
+        target: mutable i64
+        coin: mutable i64
+
+    struct Deal:
+        seed: i64
+        level: Grade
+        meaning: i64[GLYPHS]
+        changed: mutable i64[GLYPHS]
+        exchanges: mutable Exchange[MOST_EXCHANGES]
+        change_at: mutable i64
+
+    struct Message:
+        first: i64
+        second: i64
+        length: i64
+
+    struct Result:
+        signal: Message
+        picked: i64
+        right: bool
+
+    struct Game:
+        deal: Deal
+        at: mutable i64
+        drafted: mutable i64
+        history: mutable Result[MOST_EXCHANGES]
+        score: mutable i64
+
+    def minimum(a: i64, b: i64) -> i64:
+        return a if a < b else b
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        objects: i64 = minimum(4, 2 + r - 1) if r < 4 else (
+            minimum(4, 2 + r - 4) if r < 8 else (
+            minimum(5, 3 + (r - 8) / 2) if r < 12 else minimum(MOST_OBJECTS, 4 + (r - 12) / 3)))
+        return Grade{rung: r, objects: objects, exchanges: 16 if r <= 20 else (8 if r >= 28 else 36 - r),
+            roles: LISTEN if r < 4 else (SPEAK if r < 8 else BOTH), shapes: r >= 8,
+            length: 2 if r >= 12 else 1, swaps: 0 if r < 16 else (2 if r < 20 else 3)}
+
+    def has(thing: i64, value: i64) -> bool:
+        return thing / 4 == value if value < 4 else thing % 4 == value - 4
+
+    def count_value(exchange: Exchange&, count: i64, value: i64) -> i64:
+        can Abort.Panic:
+            matches: mutable i64 = 0
+            for i in 0..<count |exchange, value, matches, i|:
+                matches <- matches + 1 if has(exchange.objects[i.usize()], value)
+            return matches
+
+    def scene(level: Grade&, rng: mutable MT19937&) -> Exchange:
+        can Abort.Panic, Memory.Allocate:
+            exchange: mutable Exchange = zeroed
+            count: i64 = level.objects
+            if not level.shapes:
+                colours: darray[i64] = py_sample_range(rng, 0, 3, count)
+                for i in 0..<count |i, exchange, colours, rng|:
+                    exchange.objects[i.usize()] <- colours[i.usize()] * 4 + py_choice_index(rng, 4)
+                exchange.target <- py_choice_index(rng, count)
+                return exchange
+            for _ in 0..<200 |rng, exchange, count, level|:
+                present: mutable i64 = 0
+                used: mutable i64 = 0
+                while used < count |present, used, count, rng, exchange|:
+                    colour: i64 = py_choice_index(rng, 4)
+                    shape: i64 = py_choice_index(rng, 4)
+                    thing: i64 = colour * 4 + shape
+                    mask: i64 = 1 << thing
+                    if (present & mask) == 0:
+                        exchange.objects[used.usize()] <- thing
+                        present <- present | mask
+                        used <- used + 1
+                exchange.target <- py_choice_index(rng, count)
+                mine: i64 = exchange.objects[exchange.target.usize()]
+                colour_unique: bool = count_value(&exchange, count, mine / 4) == 1
+                shape_unique: bool = count_value(&exchange, count, 4 + mine % 4) == 1
+                accepted: bool = (colour_unique or shape_unique) if level.length == 1 else (not colour_unique and not shape_unique)
+                return exchange if accepted
+            exchange.target <- -1
+            return exchange
+
+    def deal(rung: i64, seed: i64) -> Deal:
+        can Abort.Panic, Memory.Allocate:
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            level: Grade = grade(rung)
+            meanings: mutable darray[i64] = []
+            for g in 0..<GLYPHS |meanings, level, g|:
+                meanings.push(g if level.shapes or g < 4 else UNKNOWN)
+            py_shuffle_i64(&rng, &meanings)
+            meaning: mutable i64[GLYPHS] = zeroed
+            for g in 0..<GLYPHS |meanings, meaning, g|:
+                meaning[g.usize()] <- meanings[g.usize()]
+            result: mutable Deal = Deal{seed: seed, level: level, meaning: meaning, changed: meaning,
+                exchanges: zeroed, change_at: level.exchanges}
+            at: mutable i64 = 0
+            while at < level.exchanges |level, rng, result, at|:
+                exchange: mutable Exchange = scene(&level, &rng)
+                continue if exchange.target < 0
+                exchange.role <- at % 2 if level.roles == BOTH else level.roles
+                exchange.coin <- py_choice_index(&rng, 65536)
+                result.exchanges[at.usize()] <- exchange
+                at <- at + 1
+            if level.swaps > 0:
+                result.change_at <- level.exchanges / 2 - 2 + py_choice_index(&rng, 4)
+                moved: darray[i64] = py_sample_range(&rng, 0, GLYPHS - 1, level.swaps)
+                for i in 0..<level.swaps |result, meaning, moved, level, i|:
+                    start: i64 = moved[i.usize()]
+                    next: i64 = moved[((i + 1) % level.swaps).usize()]
+                    result.changed[start.usize()] <- meaning[next.usize()]
+            return result
+
+    def code(dealt: Deal&, at: i64, glyph: i64) -> i64:
+        return dealt.changed[glyph.usize()] if at >= dealt.change_at else dealt.meaning[glyph.usize()]
+
+    def glyph_for(dealt: Deal&, at: i64, value: i64) -> i64:
+        for g in 0..<GLYPHS |dealt, at, value, g|:
+            return g if code(dealt, at, g) == value
+        return -1
+
+    def partner_says(dealt: Deal&, at: i64) -> Message:
+        can Abort.Panic:
+            ex: Exchange& = &dealt.exchanges[at.usize()]
+            mine: i64 = ex.objects[ex.target.usize()]
+            colour: i64 = mine / 4
+            shape: i64 = 4 + mine % 4
+            if dealt.level.length == 2:
+                return Message{first: glyph_for(dealt, at, colour), second: glyph_for(dealt, at, shape), length: 2}
+            value: i64 = colour if not dealt.level.shapes or count_value(ex, dealt.level.objects, colour) == 1 else shape
+            return Message{first: glyph_for(dealt, at, value), second: -1, length: 1}
+
+    def partner_picks(dealt: Deal&, at: i64, signal: Message) -> i64:
+        ex: Exchange& = &dealt.exchanges[at.usize()]
+        count: i64 = dealt.level.objects
+        a: i64 = code(dealt, at, signal.first) if signal.length > 0 else UNKNOWN
+        b: i64 = code(dealt, at, signal.second) if signal.length == 2 else UNKNOWN
+        return ex.coin % count if a == UNKNOWN and b == UNKNOWN
+        fits: mutable i64[MOST_OBJECTS] = zeroed
+        used: mutable i64 = 0
+        for i in 0..<count |fits, used, ex, a, b, i|:
+            thing: i64 = ex.objects[i.usize()]
+            if (a == UNKNOWN or has(thing, a)) and (b == UNKNOWN or has(thing, b)):
+                fits[used.usize()] <- i
+                used <- used + 1
+        return fits[(ex.coin % used).usize()] if used > 0 else ex.coin % count
+
+    def initialize(dealt: Deal) -> Game:
+        return Game{deal: dealt, at: 0, drafted: -1, history: zeroed, score: 0}
+
+    def finish(game: mutable Game&, signal: Message, picked: i64) -> bool:
+        right: bool = picked == game.deal.exchanges[game.at.usize()].target
+        game.history[game.at.usize()] <- Result{signal: signal, picked: picked, right: right}
+        game.score <- game.score + 1 if right
+        game.at <- game.at + 1
+        game.drafted <- -1
+        return true
+
+    # Returns whether an exchange closed. A valid first glyph of a
+    # two-glyph message is retained in drafted until the second arrives.
+    def pick(game: mutable Game&, index: i64) -> bool:
+        can Abort.Panic:
+            return false if game.at >= game.deal.level.exchanges or index < 0 or index >= game.deal.level.objects
+            return false if game.deal.exchanges[game.at.usize()].role != LISTEN
+            return finish(game, partner_says(&game.deal, game.at), index)
+
+    def say(game: mutable Game&, glyph: i64) -> bool:
+        return false if game.at >= game.deal.level.exchanges or glyph < 0 or glyph >= GLYPHS
+        return false if game.deal.exchanges[game.at.usize()].role != SPEAK
+        if game.deal.level.length == 2 and game.drafted < 0:
+            game.drafted <- glyph
+            return false
+        signal: Message = Message{first: glyph, second: -1, length: 1} if game.drafted < 0 else (
+            Message{first: game.drafted, second: glyph, length: 2})
+        return finish(game, signal, partner_picks(&game.deal, game.at, signal))

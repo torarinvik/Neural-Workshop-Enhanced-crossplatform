@@ -1,6 +1,33 @@
+extern SDL_LoadFile(path: cstr, length: mutable usize&) -> mutable heap void&? can[Blocking.IO, Memory.Allocate]
 # Bounded binary corpus reads. The caller owns successful buffers and releases
 # them with SDL_free. Length 0 means open failed; -1 means an invalid read.
 extern SDL_GetIOSize(stream: mutable void&) -> i64 can[Blocking.IO]
+extern SDL_GetEnvironment() -> mutable void&?
+extern SDL_SetEnvironmentVariable(environment: mutable void&, name: cstr, value: cstr, overwrite: bool) -> bool
+
+def sdl_first_option_value(argc: i64, argv: usize&?, name: cstr) -> usize:
+    can Abort.Panic, Unsafe.PointerCast:
+        return 0.usize() if argv == null
+        args: usize& = argv
+        at: mutable i64 = 1
+        while at < argc |at, argc, args, name|:
+            arg: i64 = args[at.usize()].i64()
+            break if syllogism_argument_is(arg, "--")
+            arity: i64 = sdl_cli_option_arity(arg)
+            break if arity < 0
+            if syllogism_argument_is(arg, name):
+                return args[(at + 1).usize()] if at + 1 < argc else 0.usize()
+            at <- at + 1 + arity
+        return 0.usize()
+
+def sdl_apply_data_directory(argc: i64, argv: usize&?) -> bool:
+    can Abort.Panic, Unsafe.PointerCast:
+        directory: usize = sdl_first_option_value(argc, argv, "--datadir")
+        return true if directory == 0.usize()
+        trusted Unsafe.PointerCast:
+            if SDL_GetEnvironment() is environment:
+                return SDL_SetEnvironmentVariable(environment, "NW_DATA_DIRECTORY", directory.cast[cstr], true)
+        return false
 
 def sdl_read_corpus(path: u8&?, length: mutable i64&?) -> mutable heap void&?:
     can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
@@ -32,22 +59,26 @@ def sdl_read_corpus(path: u8&?, length: mutable i64&?) -> mutable heap void&?:
 
 export fn nw_sdl_read_corpus(path: u8&?, length: mutable i64&?) -> mutable heap void&? = sdl_read_corpus
 
-# Select the original application's corpus location using SDL's platform name.
+# Select the original application's data location using SDL's platform name.
 # missing_base permits Scramble's historical empty-base fallback.
-def sdl_corpus_path(dest: mutable u8&?, capacity: usize, kind: i64, missing_base: i64) -> i32:
+def sdl_data_path(dest: mutable u8&?, capacity: usize, suffix: cstr, missing_base: i64, use_windows_profile: bool) -> i32:
     can Abort.Panic, Unsafe.PointerCast:
-        return 0 if dest == null or capacity == 0.usize() or capacity > 2147483647.usize() or kind < 0 or kind > 1
+        return 0 if dest == null or capacity == 0.usize() or capacity > 2147483647.usize()
         trusted Unsafe.PointerCast:
             output: mutable u8& = dest
             address: i64 = output.uintptr().i64()
-            platform: cstr = SDL_GetPlatform()
-            platform_address: i64 = platform.uintptr().i64()
+            selected: i64 = SyllogismOptionsHost::data_path(address, capacity.i64(), suffix)
+            return (1 if selected >= 0 else 0) if selected != -2
+            platform_address: i64 = SDL_GetPlatform().uintptr().i64()
             windows: bool = syllogism_argument_is(platform_address, "Windows")
             mac: bool = syllogism_argument_is(platform_address, "macOS")
             base: mutable i64 = 0
             if windows:
                 if getenv("APPDATA") is found:
                     base <- found.uintptr().i64()
+                if base == 0 and use_windows_profile:
+                    if getenv("USERPROFILE") is profile:
+                        base <- profile.uintptr().i64()
             else:
                 if getenv("HOME") is found:
                     base <- found.uintptr().i64()
@@ -56,10 +87,24 @@ def sdl_corpus_path(dest: mutable u8&?, capacity: usize, kind: i64, missing_base
             if base != 0:
                 end <- SyllogismOptionsHost::append(address, capacity.i64(), 0, base.uintptr().cast[cstr])
                 return 0 if end < 0
-            folder: cstr = "/Brain Workshop/data/words" if windows else ("/Library/Application Support/Brain Workshop/data/words" if mac else "/.brainworkshop/data/words")
+            folder: cstr = "/Brain Workshop/data" if windows else ("/Library/Application Support/Brain Workshop/data" if mac else "/.brainworkshop/data")
             end <- SyllogismOptionsHost::append(address, capacity.i64(), end, folder)
             return 0 if end < 0
-            end <- SyllogismOptionsHost::append(address, capacity.i64(), end, "/lexicon.tsv" if kind == 0 else "/sentences.txt")
-            return 1 if end >= 0 else 0
+            return 1 if SyllogismOptionsHost::append(address, capacity.i64(), end, suffix) >= 0 else 0
+
+def sdl_corpus_path(dest: mutable u8&?, capacity: usize, kind: i64, missing_base: i64) -> i32:
+    can Abort.Panic, Unsafe.PointerCast:
+        return 0 if kind < 0 or kind > 2
+        suffix: cstr = "/words/lexicon.tsv" if kind == 0 else ("/words/sentences.txt" if kind == 1 else "/trivia/questions.tsv")
+        return sdl_data_path(dest, capacity, suffix, missing_base, kind == 2)
 
 export fn nw_sdl_corpus_path(dest: mutable u8&?, capacity: usize, kind: i64, missing_base: i64) -> i32 = sdl_corpus_path
+
+def sdl_append_file(filename: cstr, bytes: u8&, length: usize) -> bool:
+    can Blocking.IO, Unsafe.PointerCast:
+        if SDL_IOFromFile(filename, "ab") is stream:
+            trusted Unsafe.PointerCast:
+                written: usize = SDL_WriteIO(stream, bytes.cast[void&], length)
+                closed: bool = SDL_CloseIO(stream)
+                return closed and written == length
+        return false

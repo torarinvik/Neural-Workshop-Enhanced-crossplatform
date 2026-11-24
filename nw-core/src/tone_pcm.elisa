@@ -1,0 +1,156 @@
+include "./strings.elisa"
+
+module TonePcm:
+    const RATE: i64 = 22050
+    const FRAME_BYTES: i64 = 4
+    const TAU: f64 = 6.283185307179586
+    const BRIGHT_PARTIAL: f64 = 0.8553876799929505
+
+    struct Partial:
+        ratio: f64
+        gain: f64
+        decay: f64
+
+    struct Patch:
+        partials: Partial[6]
+        count: i64
+        attack: f64
+        decay: f64
+        release: f64
+        sustain: f64
+        tremolo_rate: f64
+        tremolo_depth: f64
+
+    struct Modulation:
+        fm_ratio: f64
+        fm_index: f64
+        fm_decay: f64
+        drive: f64
+        ring_ratio: f64
+        ring_mix: f64
+        extra_partial: Partial
+
+    struct Note:
+        onset: f64
+        duration: f64
+        frequency: f64
+        pan: f64
+        end_pan: f64
+        gain: f64
+        end_gain: f64
+        vibrato_rate: f64
+        vibrato_depth: f64
+        noise: f64
+        glide: f64
+        glide_time: f64
+        seed: i64
+
+    def wood(frequency: f64, bright_factor: f64 = BRIGHT_PARTIAL) -> Patch:
+        partials: mutable Partial[6] = zeroed
+        partials[0] <- Partial{ratio: 1.0, gain: 1.0, decay: 0.0}
+        partials[1] <- Partial{ratio: 3.7574020552038365, gain: 0.5 * bright_factor, decay: 6.0}
+        partials[2] <- Partial{ratio: 9.519639037982254, gain: 0.25 * bright_factor, decay: 12.0}
+        count: i64 = 3 if 9.519639037982254 * frequency < RATE.f64() * 0.42 else 2
+        return Patch{partials: partials, count: count, attack: 0.002, decay: 9.474794314157906, release: 0.05, sustain: 0.0, tremolo_rate: 0.0, tremolo_depth: 0.0}
+
+    def noise_at(seed: i64, q: i64) -> f64:
+        raw: u32 = (q * 2654435761 + seed * 40503 + 12345).u32()
+        hashed: u32 = ((raw ^ (raw >> 15)) * 2246822519.u32())
+        return (hashed ^ (hashed >> 13)).f64() / 2147483648.0 - 1.0
+
+    def sample(patch: Patch&, norm: f64, wave: f64, note: Note&, q: i64, fx: Modulation&, fold: f64 = 0.0) -> f64:
+        can Abort.Panic:
+            time: f64 = q.f64() / RATE.f64()
+            phase: mutable f64 = wave * time
+            if note.glide != 0.0:
+                phase <- phase + wave * note.glide * note.glide_time * (1.0 - exp(-time / note.glide_time))
+            if note.vibrato_depth != 0.0:
+                rate: f64 = TAU * note.vibrato_rate
+                phase <- phase + wave * note.vibrato_depth * (1.0 - cos(rate * time)) / rate
+            modulation: f64 = fx.fm_index * exp(-fx.fm_decay * time) * sin(fx.fm_ratio * phase) if fx.fm_index != 0.0 else 0.0
+            sound: mutable f64 = 0.0
+            for i in 0..<patch.count |patch, sound, phase, time, modulation|:
+                part: Partial = patch.partials[i.usize()]
+                gain: f64 = part.gain * exp(-part.decay * time) if part.decay != 0.0 else part.gain
+                sound <- sound + gain * sin(part.ratio * phase + modulation)
+            part: Partial = fx.extra_partial
+            if part.gain != 0.0:
+                gain: f64 = part.gain * exp(-part.decay * time) if part.decay != 0.0 else part.gain
+                sound <- sound + gain * sin(part.ratio * phase + modulation)
+            attack: f64 = time / patch.attack if time < patch.attack else 1.0
+            envelope: mutable f64 = attack * (patch.sustain + (1.0 - patch.sustain) * exp(-patch.decay * time)) if patch.decay != 0.0 else attack
+            if time > note.duration:
+                release_gain: f64 = 1.0 - (time - note.duration) / patch.release
+                envelope <- envelope * release_gain if release_gain > 0.0 else 0.0
+            if patch.tremolo_depth != 0.0:
+                envelope <- envelope * (1.0 - patch.tremolo_depth * (0.5 + 0.5 * sin(TAU * patch.tremolo_rate * time)))
+            voice: mutable f64 = sound * norm
+            if note.noise != 0.0:
+                voice <- voice + note.noise * noise_at(note.seed, q)
+            if fx.ring_mix != 0.0:
+                voice <- voice * (1.0 - fx.ring_mix) + voice * sin(fx.ring_ratio * phase) * fx.ring_mix
+            if fx.drive != 0.0:
+                voice <- tanh(voice * fx.drive) / tanh(fx.drive)
+            voice <- sin(fold * voice) if fold != 0.0
+            return voice * envelope
+
+    def mix(output: mutable darray[f64]&, frames: i64, begin: f64, end: f64, patch: Patch&,
+            onset: f64, duration: f64, frequency: f64, pan: f64, gain: f64):
+        can Abort.Panic:
+            note: Note = Note{onset: onset, duration: duration, frequency: frequency, pan: pan, end_pan: pan,
+                gain: gain, end_gain: gain, vibrato_rate: 0.0, vibrato_depth: 0.0, noise: 0.0, glide: 0.0, glide_time: 0.0, seed: 0}
+            mix_note(output, frames, begin, end, patch, &note)
+
+    def mix_note(output: mutable darray[f64]&, frames: i64, begin: f64, end: f64, patch: Patch&, note: Note&, fx: Modulation = zeroed):
+        can Abort.Panic:
+            span: f64 = note.duration + patch.release
+            return if note.onset >= end or note.onset + span <= begin
+            base: i64 = floor((begin - note.onset) * RATE.f64() + 0.5 + 0.000000001).i64()
+            last: i64 = (span * RATE.f64()).i64()
+            mid: f64 = 0.5 * (note.pan + note.end_pan)
+            lag: i64 = round_half_even(0.0006 * (mid if mid >= 0.0 else -mid) * RATE.f64())
+            left_lag: i64 = lag if mid > 0.0 else 0
+            right_lag: i64 = lag if mid < 0.0 else 0
+            start_angle: f64 = (note.pan + 1.0) * 3.141592653589793 / 4.0
+            end_angle: f64 = (note.end_pan + 1.0) * 3.141592653589793 / 4.0
+            left_gain: f64 = cos(start_angle) * note.gain
+            right_gain: f64 = sin(start_angle) * note.gain
+            left_change: f64 = cos(end_angle) * note.end_gain - left_gain
+            right_change: f64 = sin(end_angle) * note.end_gain - right_gain
+            duration_samples: f64 = note.duration * RATE.f64()
+            span_samples: f64 = duration_samples if duration_samples > 1.0 else 1.0
+            sum_gain: mutable f64 = 0.0
+            for i in 0..<patch.count |patch, sum_gain|:
+                sum_gain <- sum_gain + patch.partials[i.usize()].gain
+            sum_gain <- sum_gain + fx.extra_partial.gain
+            norm: f64 = 1.0 / sum_gain if sum_gain != 0.0 else 1.0
+            wave: f64 = TAU * note.frequency
+            first: i64 = 0 if base >= 0 else -base
+            end_frame: i64 = last - base + lag
+            past: i64 = frames if frames < end_frame else end_frame
+            for frame in first..<past |output, patch, note, fx, base, last, left_lag, right_lag, left_gain, right_gain, left_change, right_change, span_samples, norm, wave|:
+                ql: i64 = base + frame - left_lag
+                qr: i64 = base + frame - right_lag
+                offset: usize = (frame * 2).usize()
+                if ql >= 0 and ql < last:
+                    share: f64 = 1.0 if ql.f64() > span_samples else ql.f64() / span_samples
+                    output[offset] <- output[offset] + (left_gain + left_change * share) * sample(patch, norm, wave, note, ql, &fx)
+                if qr >= 0 and qr < last:
+                    share: f64 = 1.0 if qr.f64() > span_samples else qr.f64() / span_samples
+                    output[offset + 1.usize()] <- output[offset + 1.usize()] + (right_gain + right_change * share) * sample(patch, norm, wave, note, qr, &fx)
+
+    def empty(frames: i64) -> darray[f64]:
+        can Memory.Allocate, Abort.Panic:
+            stereo: mutable darray[f64] = []
+            for sample_index in 0..<(frames * 2) |stereo|:
+                stereo.push(0.0)
+            return stereo
+
+    def write(stereo: darray[f64], frames: i64, dest: mutable u8&) -> i64:
+        can Abort.Panic:
+            for index in 0..<(frames * 2) |stereo, dest|:
+                pcm: u16 = (tanh(stereo[index.usize()] * 0.8) * 30000.0).i16().u16()
+                offset: usize = (index * 2).usize()
+                dest[offset] <- (pcm & 255.u16()).u8()
+                dest[offset + 1.usize()] <- (pcm >> 8).u8()
+            return frames * FRAME_BYTES

@@ -1,0 +1,575 @@
+include "../hand_view.elisa"
+include "../pymath.elisa"
+include "../strings.elisa"
+
+module Stagehand:
+    const COLS: i64 = 5
+    const ROWS: i64 = 3
+    const GAP: f64 = 2.2
+    const KEY: i64 = HandView::KEYS
+    const PORTS: i64 = KEY + 5
+    const MOVE: i64 = 0
+    const CUE: i64 = 1
+    const SPOT: i64 = 2
+    const NOW: i64 = 0
+    const WAIT_BELL: i64 = 1
+    const WAIT_ACTOR: i64 = 2
+    const WAIT_DRUM: i64 = 3
+    const BELL: i64 = 0
+    const DRUM: i64 = 1
+    const WHISTLE: i64 = 2
+    const DONE: i64 = 3
+    const BUZZ: i64 = 4
+    const TUNE: i64 = 5
+    const STEP: i64 = 6
+    const RING: f64 = 0.38
+    const PENDING: i64 = 0
+    const SUCCESS: i64 = 1
+    const WRONG_PROP: i64 = 2
+    const EARLY: i64 = 3
+    const WRONG_CUE: i64 = 4
+    const MISSED: i64 = 5
+
+    struct Grade:
+        rung: i64
+        lines: i64
+        props: i64
+        spot: bool
+        waits: i64
+        decoy: bool
+        named: bool
+        cameras: i64
+        cut: f64
+        window: f64
+        pace: f64
+
+    struct Line:
+        kind: i64
+        text: mutable dstr
+        prop: mutable i64
+        mark: mutable i64
+        key: mutable i64
+        wait: mutable i64
+        count: mutable i64
+        decoy: mutable i64
+        destination: mutable i64
+        via: mutable i64
+
+    struct Cut:
+        time: f64
+        camera: i64
+
+    struct Show:
+        level: Grade
+        valid: mutable bool
+        props: mutable i64[6]
+        marks: mutable i64[6]
+        lines: mutable darray[Line]
+        cuts: mutable darray[Cut]
+        seconds: mutable f64
+        seed: mutable i64
+
+    struct Cue:
+        time: f64
+        duration: f64
+        voice: i64
+        pitch: f64
+        gain: f64
+        seed: i64
+
+    struct Run:
+        show: Show
+        hand: mutable HandView::Pointer
+        time: mutable f64
+        marks: mutable i64[6]
+        line_no: mutable i64
+        opens: mutable f64
+        due: mutable f64
+        pending: mutable Cue[6]
+        pending_count: mutable i64
+        pending_head: mutable i64
+        drag: mutable i64
+        held_at: mutable RoomsView::Vec
+        pressed: mutable RoomsView::Point
+        lit: mutable i64
+        on: mutable i64
+        actor: mutable RoomsView::Vec
+        path: mutable RoomsView::Vec[2]
+        path_head: mutable i64
+        path_count: mutable i64
+        walking: mutable bool
+        idle: mutable MT19937
+        cut_no: mutable i64
+        camera: mutable i64
+        notes: mutable darray[Cue]
+        record_audio: bool
+        result: mutable i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: i64 = r - 20 if r >= 20 else 0
+        t: f64 = top.f64()
+        return Grade{rung: r, lines: 2 if r < 4 else (3 if r < 7 else (4 if r < 13 else (5 if r < 20 else 6 + top / 3))),
+            props: 3 if r < 4 else (4 if r < 7 else (5 if r < 13 else 6)),
+            spot: r >= 4, waits: 0 if r < 4 else (1 if r < 7 else (2 if r < 13 else 3)),
+            decoy: r >= 10, named: r < 10, cameras: 1 if r < 7 else (4 if r < 13 else 5),
+            cut: 0.0 if r < 7 else (6.0 if r < 13 else (4.5 if r < 16 else (3.5 if r < 20 else HandView::clamp(3.2 - 0.05 * t, 2.0, 3.2)))),
+            window: 2.2 if r < 10 else (1.8 if r < 16 else (1.4 if r < 20 else HandView::clamp(1.3 - 0.03 * t, 0.7, 1.3))),
+            pace: 14.0 if r < 4 else (12.0 if r < 10 else (10.0 if r < 20 else HandView::clamp(9.5 - 0.15 * t, 5.0, 9.5)))}
+
+    def prop_name(kind: i64) -> cstr:
+        return "chair" if kind == 0
+        return "table" if kind == 1
+        return "lamp" if kind == 2
+        return "crate" if kind == 3
+        return "plant" if kind == 4
+        return "barrel"
+
+    def cue_name(kind: i64) -> cstr:
+        return "lights" if kind == 0
+        return "curtain" if kind == 1
+        return "music" if kind == 2
+        return "smoke" if kind == 3
+        return "thunder"
+
+    def letter(kind: i64) -> cstr:
+        return "L" if kind == 0
+        return "C" if kind == 1
+        return "M" if kind == 2
+        return "S" if kind == 3
+        return "T"
+
+    def relation(kind: i64) -> cstr:
+        return " to the left of the " if kind == 0
+        return " to the right of the " if kind == 1
+        return " behind the " if kind == 2
+        return " in front of the "
+
+    def uniform(rng: mutable MT19937&, low: f64, high: f64) -> f64:
+        can Abort.Panic:
+            return low + (high - low) * py_random(rng)
+
+    def spot_of(mark: i64) -> RoomsView::Vec:
+        return RoomsView::vec(((mark / ROWS).f64() - 2.0) * GAP, 0.0, ((mark % ROWS).f64() - 1.0) * GAP)
+
+    def occupied(marks: i64[6]&, count: i64, mark: i64) -> bool:
+        can Abort.Panic:
+            for i in 0..<count |marks, mark|:
+                return true if marks[i.usize()] == mark
+            return false
+
+    def empty(level: Grade) -> Show:
+        can Memory.Allocate, Abort.Panic:
+            return Show{level: level, valid: false, props: zeroed, marks: zeroed, lines: [], cuts: [], seconds: 0.0, seed: 0}
+
+    def make_move(line: mutable Line&, props: i64[6]&, marks: mutable i64[6]&, count: i64, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            p: i64 = py_choice_index(rng, count)
+            picks: mutable darray[i64] = []
+            for i in 0..<count |picks, p|:
+                if i != p:
+                    for rel in 0..<4 |picks, i|:
+                        picks.push(i * 4 + rel)
+            py_shuffle_i64(rng, &picks)
+            for pick in picks |line, props, marks, p, count|:
+                other: i64 = pick / 4
+                rel: i64 = pick % 4
+                origin: i64 = marks[other.usize()]
+                col: i64 = origin / ROWS + (-1 if rel == 0 else (1 if rel == 1 else 0))
+                row: i64 = origin % ROWS + (-1 if rel == 2 else (1 if rel == 3 else 0))
+                continue if col < 0 or col >= COLS or row < 0 or row >= ROWS
+                goal: i64 = col * ROWS + row
+                continue if occupied(marks, count, goal)
+                marks[p.usize()] <- goal
+                line.prop <- p
+                line.mark <- goal
+                dstr_append_cstr(&line.text, "Move the ")
+                dstr_append_cstr(&line.text, prop_name(props[p.usize()]))
+                dstr_append_cstr(&line.text, relation(rel))
+                dstr_append_cstr(&line.text, prop_name(props[other.usize()]))
+                dstr_append_cstr(&line.text, ".")
+                return true
+            return false
+
+    def wait_text(line: mutable Line&, show: Show&, rng: mutable MT19937&):
+        can Memory.Allocate, Abort.Panic:
+            if line.wait == WAIT_BELL:
+                line.count <- py_randint(rng, 1, 2 if show.level.rung < 10 else 3)
+                if show.level.decoy and py_random(rng) < 0.7:
+                    roll: i64 = py_randint(rng, 1, 2)
+                    line.decoy <- roll + 1 if roll >= line.count else roll
+                dstr_append_cstr(&line.text, "When the bell rings ")
+                dstr_append_cstr(&line.text, "once" if line.count == 1 else ("twice" if line.count == 2 else "three times"))
+                dstr_append_cstr(&line.text, ", ")
+            elif line.wait == WAIT_DRUM:
+                line.decoy <- 1 if py_random(rng) < 0.7 else 0
+                dstr_append_cstr(&line.text, "On the drum, ")
+            elif line.wait == WAIT_ACTOR:
+                line.destination <- py_choice_index(rng, show.level.props)
+                if show.level.decoy:
+                    roll: i64 = py_choice_index(rng, show.level.props - 1)
+                    line.via <- roll + 1 if roll >= line.destination else roll
+                dstr_append_cstr(&line.text, "When the actor reaches the ")
+                dstr_append_cstr(&line.text, prop_name(show.props[line.destination.usize()]))
+                dstr_append_cstr(&line.text, ", ")
+
+    def build(level: Grade, seed: i64) -> Show:
+        can Memory.Allocate, Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            show: mutable Show = empty(level)
+            kinds: darray[i64] = py_sample_range(&rng, 0, 5, level.props)
+            cells: darray[i64] = py_sample_range(&rng, 0, 14, level.props)
+            for i in 0..<level.props |show, kinds, cells|:
+                show.props[i.usize()] <- get kinds[i.usize()] else 0
+                show.marks[i.usize()] <- get cells[i.usize()] else 0
+            marks: mutable i64[6] = show.marks
+            last: mutable i64 = -1
+            for _attempt in 0..<(level.lines * 8) |show, marks, rng, level, last|:
+                break if show.lines.count.i64() == level.lines
+                options: i64[4] = [MOVE, MOVE, CUE, SPOT]
+                picks: mutable i64[4] = zeroed
+                count: mutable i64 = 0
+                for i in 0..<(4 if level.spot else 3) |picks, count, options, last|:
+                    if options[i.usize()] != last:
+                        picks[count.usize()] <- options[i.usize()]
+                        count <- count + 1
+                kind: i64 = picks[py_choice_index(&rng, count).usize()]
+                wait: i64 = py_randint(&rng, 1, level.waits) if kind != MOVE and level.waits > 0 and py_random(&rng) < 0.7 else NOW
+                line: mutable Line = Line{kind: kind, text: [], prop: -1, mark: 0, key: -1,
+                    wait: wait, count: 0, decoy: 0, destination: -1, via: -1}
+                wait_text(&line, &show, &rng)
+                if kind == MOVE:
+                    continue if not make_move(&line, &show.props, &marks, level.props, &rng)
+                elif kind == SPOT:
+                    line.prop <- py_choice_index(&rng, level.props)
+                    continue if wait == WAIT_ACTOR and line.prop == line.destination
+                    dstr_append_cstr(&line.text, "Put the spotlight on the " if wait == NOW else "put the spotlight on the ")
+                    dstr_append_cstr(&line.text, prop_name(show.props[line.prop.usize()]))
+                    dstr_append_cstr(&line.text, ".")
+                else:
+                    line.key <- py_choice_index(&rng, 5)
+                    dstr_append_cstr(&line.text, "Cue the " if wait == NOW else "cue the ")
+                    dstr_append_cstr(&line.text, cue_name(line.key))
+                    if level.named:
+                        dstr_append_cstr(&line.text, ": press ")
+                        dstr_append_cstr(&line.text, letter(line.key))
+                    dstr_append_cstr(&line.text, ".")
+                show.seconds <- show.seconds + (level.pace if wait == NOW else 14.0)
+                show.lines.push(line)
+                last <- kind
+            return show if show.lines.count.i64() < level.lines
+            time: mutable f64 = 0.0
+            camera: mutable i64 = 0
+            while level.cut > 0.0 and time < show.seconds |level, show, rng, time, camera|:
+                time <- time + level.cut * uniform(&rng, 0.8, 1.25)
+                pick: i64 = py_choice_index(&rng, level.cameras - 1)
+                camera <- pick + 1 if pick >= camera else pick
+                show.cuts.push(Cut{time: time, camera: camera})
+            show.seed <- py_choice_index(&rng, 1073741824)
+            show.valid <- true
+            return show
+
+    def view(run: Run&) -> HandView::Lens:
+        can Abort.Panic:
+            c: i64 = run.camera
+            eye: RoomsView::Vec[5] = [RoomsView::vec(0.0, 4.0, 12.0),
+                RoomsView::vec(-9.0, 4.5, 8.0), RoomsView::vec(9.0, 4.5, 8.0),
+                RoomsView::vec(0.0, 10.0, 7.5), RoomsView::vec(0.0, 4.5, -12.0)]
+            return HandView::lens(eye[c.usize()], RoomsView::vec(0.0, 0.6, 0.0),
+                660.0 if c == 3 else 640.0, 500.0, 285.0)
+
+    def place(run: Run&, prop: i64) -> RoomsView::Vec:
+        can Abort.Panic:
+            return run.held_at if run.drag == prop
+            return spot_of(run.marks[prop.usize()])
+
+    def body(run: Run&, camera: HandView::Lens&, prop: i64) -> RoomsView::Vec:
+        can Abort.Panic:
+            p: RoomsView::Vec = place(run, prop)
+            return HandView::see(camera, RoomsView::vec(p.x, 0.7, p.z))
+
+    def over(run: Run&) -> i64:
+        can Abort.Panic:
+            camera: HandView::Lens = view(run)
+            chosen: mutable i64 = -1
+            near: mutable f64 = 34.0
+            for prop in 0..<run.show.level.props |run, camera, chosen, near|:
+                p: RoomsView::Vec = body(run, &camera, prop)
+                continue if p.z < 0.05
+                d: f64 = py_hypot(run.hand.x - p.x, run.hand.y - p.y)
+                if d < near:
+                    chosen <- prop
+                    near <- d
+            return chosen
+
+    def open(run: Run&) -> bool:
+        return run.opens >= 0.0 and run.time >= run.opens
+
+    def note(run: mutable Run&, time: f64, duration: f64, voice: i64, pitch: f64, gain: f64):
+        can Memory.Allocate, Abort.Panic:
+            return if not run.record_audio
+            index: mutable i64 = run.notes.count.i64()
+            cue: Cue = Cue{time: time, duration: duration, voice: voice, pitch: pitch, gain: gain, seed: index + 1}
+            run.notes.push(cue)
+            while index > 0 |run, index, time|:
+                previous: Cue = get run.notes[(index - 1).usize()] else zeroed
+                break if previous.time <= time
+                run.notes[index.usize()] <- previous
+                index <- index - 1
+            run.notes[index.usize()] <- cue
+
+    def schedule(run: mutable Run&, time: f64, duration: f64, voice: i64, pitch: f64, gain: f64):
+        can Abort.Panic:
+            run.pending[run.pending_count.usize()] <- Cue{time: time, duration: duration, voice: voice, pitch: pitch, gain: gain, seed: 0}
+            run.pending_count <- run.pending_count + 1
+
+    def beside(run: Run&, prop: i64) -> RoomsView::Vec:
+        can Abort.Panic:
+            spot: RoomsView::Vec = spot_of(run.marks[prop.usize()])
+            return RoomsView::vec(spot.x + 0.9, 0.0, spot.z + 0.35)
+
+    def begin(run: mutable Run&):
+        can Abort.Panic:
+            run.line_no <- run.line_no + 1
+            if run.line_no >= run.show.lines.count.i64():
+                run.result <- SUCCESS
+                return
+            line: Line = get run.show.lines[run.line_no.usize()] else zeroed
+            level: Grade = run.show.level
+            run.walking <- false
+            run.pending_head <- 0
+            run.pending_count <- 0
+            if line.wait == NOW:
+                run.opens <- run.time
+                run.due <- run.time + level.pace
+            elif line.wait == WAIT_BELL:
+                at: mutable f64 = run.time + 1.2
+                for k in 0..<line.decoy |run, at|:
+                    schedule(run, at + k.f64() * RING, 0.3, BELL, 988.0, 0.55)
+                if line.decoy > 0:
+                    at <- at + (line.decoy.f64() * RING + 1.4)
+                for k in 0..<line.count |run, at|:
+                    schedule(run, at + k.f64() * RING, 0.3, BELL, 988.0, 0.55)
+                run.opens <- at + (line.count - 1).f64() * RING
+                window: f64 = level.window if level.window > RING + 0.6 else RING + 0.6
+                run.due <- run.opens + window
+            elif line.wait == WAIT_DRUM:
+                at: mutable f64 = run.time + 1.2
+                if line.decoy > 0:
+                    schedule(run, at, 0.3, WHISTLE, 1568.0, 0.4)
+                    at <- at + 1.3
+                schedule(run, at, 0.4, DRUM, 62.0, 0.7)
+                run.opens <- at
+                run.due <- at + level.window
+            else:
+                run.path_head <- 0
+                run.path_count <- 1
+                if line.via >= 0:
+                    run.path[0] <- beside(run, line.via)
+                    run.path_count <- 2
+                run.path[(run.path_count - 1).usize()] <- beside(run, line.destination)
+                run.walking <- true
+                run.opens <- -1.0
+                run.due <- run.time + 60.0
+
+    def initialize(show: Show, record_audio: bool = true) -> Run:
+        can Abort.Panic, Memory.Allocate:
+            idle: mutable MT19937 = mt19937_new()
+            mt_seed_int(&idle, show.seed.u64())
+            run: mutable Run = Run{show: show, hand: HandView::initialize(), time: 0.0, marks: show.marks,
+                line_no: -1, opens: -1.0, due: 0.0, pending: zeroed, pending_count: 0, pending_head: 0, drag: -1,
+                held_at: zeroed, pressed: zeroed, lit: -1, on: 0, actor: RoomsView::vec(-6.5, 0.0, 2.0),
+                path: zeroed, path_head: 0, path_count: 0, walking: false, idle: idle, cut_no: 0,
+                camera: 0, notes: [], record_audio: record_audio, result: PENDING}
+            begin(&run)
+            return run
+
+    def complete(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            note(run, run.time, 0.2, DONE, 660.0, 0.4)
+            note(run, run.time + 0.08, 0.2, DONE, 660.0 * pow(2.0, 5.0 / 12.0), 0.4)
+            begin(run)
+
+    def fail(run: mutable Run&, result: i64):
+        can Memory.Allocate, Abort.Panic:
+            note(run, run.time, 0.4, BUZZ, 110.0, 0.5)
+            run.result <- result
+
+    def press(run: mutable Run&):
+        can Abort.Panic:
+            return if run.result != PENDING or run.hand.down
+            run.hand.down <- true
+            run.pressed <- RoomsView::Point{x: run.hand.x, y: run.hand.y}
+            prop: i64 = over(run)
+            if prop >= 0:
+                run.drag <- prop
+                run.held_at <- spot_of(run.marks[prop.usize()])
+
+    def dragged_distance(run: Run&) -> f64:
+        can Abort.Panic:
+            return py_hypot(run.hand.x - run.pressed.x, run.hand.y - run.pressed.y)
+
+    def release(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            return if not run.hand.down
+            run.hand.down <- false
+            prop: i64 = run.drag
+            run.drag <- -1
+            return if run.result != PENDING or prop < 0
+            line: Line = get run.show.lines[run.line_no.usize()] else zeroed
+            if dragged_distance(run) < 8.0:
+                run.lit <- prop
+                note(run, run.time, 0.1, DONE, 1200.0, 0.3)
+                return if line.kind != SPOT
+                if prop != line.prop:
+                    fail(run, WRONG_PROP)
+                elif not open(run):
+                    fail(run, EARLY)
+                else:
+                    complete(run)
+                return
+            held: RoomsView::Vec = run.held_at
+            col: i64 = py_round_half_even(held.x / GAP + 2.0)
+            row: i64 = py_round_half_even(held.z / GAP + 1.0)
+            return if col < 0 or col >= COLS or row < 0 or row >= ROWS
+            mark: i64 = col * ROWS + row
+            snap: RoomsView::Vec = spot_of(mark)
+            return if occupied(&run.marks, run.show.level.props, mark) or py_hypot(held.x - snap.x, held.z - snap.z) > 1.0
+            run.marks[prop.usize()] <- mark
+            note(run, run.time, 0.08, STEP, 200.0, 0.5)
+            if line.kind == MOVE and run.marks[line.prop.usize()] == line.mark:
+                complete(run)
+
+    def key(run: mutable Run&, key: i64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != PENDING
+            line: Line = get run.show.lines[run.line_no.usize()] else zeroed
+            run.on <- run.on ^ (1 << key.u64())
+            if key == 4:
+                note(run, run.time, 0.9, DRUM, 55.0, 0.35)
+            elif key == 2:
+                steps: f64[4] = [0.0, 4.0, 7.0, 12.0]
+                for i in 0..<4 |run, steps|:
+                    note(run, run.time + 0.12 * i.f64(), 0.18, TUNE, 392.0 * pow(2.0, steps[i.usize()] / 12.0), 0.35)
+            if line.kind != CUE or key != line.key:
+                fail(run, WRONG_CUE)
+            elif not open(run):
+                fail(run, EARLY)
+            else:
+                complete(run)
+
+    def walk(run: mutable Run&, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            if run.path_head >= run.path_count:
+                if run.walking:
+                    if run.opens < 0.0:
+                        run.opens <- run.time
+                        run.due <- run.time + run.show.level.window + 0.4
+                    return
+                return if run.show.level.rung < 4
+                x: f64 = uniform(&run.idle, -5.0, 5.0)
+                z: f64 = uniform(&run.idle, -2.6, 3.0)
+                run.path[0] <- RoomsView::vec(x, 0.0, z)
+                run.path_head <- 0
+                run.path_count <- 1
+            point: RoomsView::Vec = run.path[run.path_head.usize()]
+            dx: f64 = point.x - run.actor.x
+            dz: f64 = point.z - run.actor.z
+            distance: f64 = py_hypot(dx, dz)
+            speed: f64 = 2.4 if run.walking else 1.2
+            if distance <= speed * dt:
+                run.actor <- point
+                run.path_head <- run.path_head + 1
+                if run.walking:
+                    note(run, run.time, 0.05, STEP, 150.0, 0.3)
+            else:
+                run.actor <- RoomsView::vec(run.actor.x + dx / distance * speed * dt, 0.0,
+                    run.actor.z + dz / distance * speed * dt)
+
+    def tick(run: mutable Run&, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != PENDING
+            run.time <- run.time + dt
+            while run.cut_no < run.show.cuts.count.i64() |run|:
+                cut: Cut = get run.show.cuts[run.cut_no.usize()] else zeroed
+                break if cut.time > run.time
+                run.camera <- cut.camera
+                run.cut_no <- run.cut_no + 1
+            while run.pending_head < run.pending_count |run|:
+                cue: Cue = run.pending[run.pending_head.usize()]
+                break if cue.time > run.time
+                note(run, run.time, cue.duration, cue.voice, cue.pitch, cue.gain)
+                run.pending_head <- run.pending_head + 1
+            if run.drag >= 0 and dragged_distance(run) >= 8.0:
+                camera: HandView::Lens = view(run)
+                hit: HandView::Intersection = HandView::on_plane(&camera, run.hand.x, run.hand.y,
+                    RoomsView::vec(0.0, 0.0, 0.0), RoomsView::vec(0.0, 1.0, 0.0))
+                if hit.valid:
+                    x_limit: f64 = COLS.f64() * GAP / 2.0 + 1.0
+                    z_limit: f64 = ROWS.f64() * GAP / 2.0 + 1.0
+                    run.held_at <- RoomsView::vec(HandView::clamp(hit.point.x, -x_limit, x_limit), 0.0,
+                        HandView::clamp(hit.point.z, -z_limit, z_limit))
+            walk(run, dt)
+            if run.time >= run.due:
+                fail(run, MISSED)
+
+    def act(run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate:
+            if port >= 0 and port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                press(run)
+            elif port == HandView::RELEASE:
+                release(run)
+            elif port >= KEY and port < PORTS:
+                key(run, port - KEY)
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != PENDING
+            line: Line = get run.show.lines[run.line_no.usize()] else zeroed
+            if line.kind == CUE:
+                return HandView::RELEASE if run.hand.down
+                return KEY + line.key if open(run) else -1
+            return HandView::RELEASE if run.hand.down and run.drag != line.prop
+            camera: HandView::Lens = view(run)
+            if not run.hand.down:
+                q: RoomsView::Vec = body(run, &camera, line.prop)
+                return -1 if q.z < 0.05
+                port: i64 = HandView::toward(&run.hand, q.x, q.y, 5.0)
+                return port if port >= 0
+                return -1 if over(run) != line.prop or (line.kind == SPOT and not open(run))
+                return HandView::PRESS
+            return HandView::RELEASE if line.kind == SPOT
+            mark: RoomsView::Vec = spot_of(line.mark)
+            target: RoomsView::Vec = HandView::see(&camera, mark)
+            return -1 if target.z < 0.05
+            return HandView::RELEASE if py_hypot(run.held_at.x - mark.x, run.held_at.z - mark.z) < 0.45
+            port: i64 = HandView::toward(&run.hand, target.x, target.y, 2.6)
+            return port if port >= 0 else HandView::RELEASE
+
+    def play(show: Show) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = initialize(show, false)
+            while run.result == PENDING |run|:
+                act(&run, pilot(&run))
+                tick(&run, 1.0 / 60.0)
+            return run.result
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Show:
+        can Abort.Panic, Memory.Allocate:
+            level: Grade = grade(rung)
+            for _attempt in 0..<60 |level, draw|:
+                show: Show = build(level, py_getrandbits(draw, 32).i64())
+                if show.valid and play(show) == SUCCESS:
+                    return show
+            return empty(level)
+
+    def result_text(result: i64) -> sview:
+        return "The show went off without a hitch" if result == SUCCESS
+        return "The spotlight went on the wrong prop" if result == WRONG_PROP
+        return "Too early" if result == EARLY
+        return "That was the wrong cue" if result == WRONG_CUE
+        return "Missed the cue" if result == MISSED
+        return ""

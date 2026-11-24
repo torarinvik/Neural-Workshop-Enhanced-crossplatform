@@ -1,0 +1,276 @@
+include "../scene_full_stop.elisa"
+include "../tasks/full_stop_audio.elisa"
+include "./sdl_agent_pixels.elisa"
+include "./sdl_passage_files.elisa"
+include "../tasks/full_stop_host.elisa"
+
+module SDLFullStop:
+    struct Session:
+        host: mutable FullStopHost::Run
+        options_row: mutable i64
+        from_hub: mutable bool
+        draft: mutable i64[3]
+        audio: mutable void&?
+        heard_to: mutable f64
+        pcm: mutable u8[8820]
+
+    def read_settings(data: heap u8&, size: i64, selected: mutable i64&):
+        can Abort.Panic, Unsafe.PointerCast:
+            rung: i64 = sdl_config_option(data, size, "STOP_RUNG", 0, -1)
+            trials: i64 = sdl_config_option(data, size, "STOP_TRIALS", 0, -1)
+            adaptive: i64 = sdl_config_option(data, size, "STOP_ADAPTIVE", 1, -1)
+            selected[0] <- rung if FullStopGame::allowed_rung(rung)
+            selected[1] <- trials if FullStopGame::allowed_total(trials)
+            selected[2] <- adaptive if adaptive == 0 or adaptive == 1
+
+    def open(seed: i64) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            selected: mutable i64[3] = [1, 5, 1]
+            size: mutable i64 = 0
+            if sdl_media_config(&size) is raw:
+                trusted Unsafe.PointerCast:
+                    read_settings(raw.cast[heap u8&], size, &selected[0])
+                SDL_free(raw)
+            path: mutable u8[4096] = zeroed
+            if sdl_task_profile_sidecar(&path[0], ".full-stop-options"):
+                if sdl_read_corpus(&path[0], &size) is raw:
+                    trusted Unsafe.PointerCast:
+                        read_settings(raw.cast[heap u8&], size, &selected[0])
+                    SDL_free(raw)
+            handle: i64 = create(selected[0], selected[1], selected[2], seed)
+            if handle > 0:
+                trusted Unsafe.PointerCast:
+                    session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                    load_caches(&session.host) can Global{Read,Write}
+            return handle
+
+    def load_caches(host: mutable FullStopHost::Run&):
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            p_len: mutable i64 = 0
+            s_len: mutable i64 = 0
+            l_len: mutable i64 = 0
+            p: mutable heap void&? = SDLPassageFiles::read_cache("/words/passages.txt", &p_len)
+            s: mutable heap void&? = SDLPassageFiles::read_cache("/words/sentences.txt", &s_len)
+            index: i64 = SDLPassageFiles::modified("/words/lexicon.tsv")
+            fresh: bool = index >= 0 and index >= SDLPassageFiles::modified("/words/valid_words_sorted_by_frequency.csv") and index >= SDLPassageFiles::modified("/words/vocab.jsonl")
+            l: mutable heap void&? = SDLPassageFiles::read_cache("/words/lexicon.tsv", &l_len) if fresh else null
+            _ = FullStopHost::import_caches(host, SDLPassageFiles::as_view(p, p_len), SDLPassageFiles::as_view(s, s_len), SDLPassageFiles::as_view(l, l_len)) can Global{Read,Write}
+            if p is raw:
+                SDL_free(raw)
+            if s is raw:
+                SDL_free(raw)
+            if l is raw:
+                SDL_free(raw)
+
+    def create(rung: i64, trials: i64, adaptive: i64, seed: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if rung < 1 or trials < 1 or (adaptive != 0 and adaptive != 1)
+            if malloc(size_of(Session).usize()) is memory:
+                trusted Unsafe.PointerCast:
+                    session: mutable heap Session& = memory.cast[mutable heap Session&]
+                    session.host <- FullStopHost::initialize(rung, trials, adaptive == 1, seed)
+                    session.options_row <- -1
+                    session.from_hub <- false
+                    session.audio <- null
+                    session.heard_to <- 0.0
+                    return memory.uintptr().i64()
+            return 0
+
+    def stop_audio(session: mutable Session&):
+        if session.audio is stream:
+            SDLAudio::stop(stream)
+            session.audio <- null
+
+    def start_audio(session: mutable Session&):
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            stop_audio(session)
+            session.heard_to <- 0.0
+            if not sdl_headless_environment():
+                session.audio <- SDLAudio::start_pcm(TonePcm::RATE.i32())
+
+    def queue_audio(session: mutable Session&, now: f64):
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            if session.audio is stream:
+                run: FullStopGame::Session& = &session.host.session
+                end: mutable f64 = run.run.t
+                if run.phase == FullStopGame::JUDGED:
+                    end <- end + fmin(0.8, fmax(0.0, now - (run.deadline - FullStopGame::FEEDBACK)))
+                end <- fmin(end, session.heard_to + 0.1)
+                return if end <= session.heard_to
+                region scratch(1048576):
+                    in scratch:
+                        length: i64 = FullStopAudio::render(&run.run, session.heard_to - 0.15, end - 0.15, &session.pcm[0], 8820)
+                        if length > 0:
+                            session.heard_to <- end
+                            trusted Unsafe.PointerCast:
+                                _ = SDL_PutAudioStreamData(stream, (&session.pcm[0]).uintptr().cast[void&], length.i32())
+
+    def close(handle: i64):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            if handle > 0:
+                trusted Unsafe.PointerCast:
+                    session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                    stop_audio(session)
+                    FullStopHost::close(&session.host) can Global{Read,Write}
+                    free(session.cast[heap void&])
+
+    def key(handle: i64, symbol: i64, now_ms: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return false if session.options_row >= 0
+                if symbol == 32:
+                    started: bool = FullStopHost::start(&session.host, now_ms.f64() / 1000.0) can Global{Read,Write}
+                    start_audio(session) if started
+                    return started
+                return FullStopGame::input(&session.host.session, FullStop::DONE) if SDLTaskKeys::enter(symbol)
+                return FullStopGame::input(&session.host.session, FullStop::RESET) if symbol == 114
+                return false
+
+    def release(handle: i64, lost: bool):
+        can Abort.Panic, Unsafe.PointerCast:
+            return if handle <= 0 or not lost
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                _ = FullStopGame::clear_controls(&session.host.session)
+
+    def pointer(handle: i64, x: f32, y: f32, width: i32, height: i32, motion: i64, button: i64, now_ms: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0 or width <= 0.i32() or height <= 0.i32()
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if session.options_row >= 0:
+                    return false if motion != 0 or button != 1
+                    row: i64 = sdl_option_row(x, y, width, height, 3)
+                    if row >= 0:
+                        if row == session.options_row:
+                            change_option(session, 1)
+                        session.options_row <- row
+                    return true
+                return false if motion != 1 and button != 1
+                view: mutable f32[4] = zeroed
+                SDLGeometry::setup(&view[0], width, height)
+                return false if view[0] <= 0.0.f32()
+                rx: f64 = ((x - view[1]) / view[0]).f64()
+                ry: f64 = ((height.f32() - y - view[2]) / view[0]).f64()
+                before: i64 = session.host.session.phase
+                changed: bool = FullStopHost::pointer(&session.host, rx, ry, 1 if motion == 0 else (2 if motion == 2 else 0),
+                    now_ms.f64() / 1000.0) can Global{Read,Write}
+                if changed and before != FullStopGame::PLAYING and session.host.session.phase == FullStopGame::PLAYING:
+                    start_audio(session)
+                return changed
+
+    def advance(handle: i64, now_ms: i64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return false if session.options_row >= 0
+                before: i64 = session.host.session.phase
+                now: f64 = now_ms.f64() / 1000.0
+                changed: bool = FullStopGame::advance(&session.host.session, &session.host.corpus, now) can Global{Read,Write}
+                if before != session.host.session.phase:
+                    if session.host.session.phase == FullStopGame::PLAYING:
+                        start_audio(session)
+                    elif session.host.session.phase != FullStopGame::JUDGED:
+                        stop_audio(session)
+                queue_audio(session, now)
+                return changed
+
+    def info(handle: i64, field: i64) -> i64:
+        can Abort.Panic, Unsafe.PointerCast:
+            return -1 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                run: FullStopGame::Session& = &session.host.session
+                return FullStopGame::info(run, field)
+
+    def frame_write(dest: i64, capacity: i64, handle: i64, black: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if dest <= 0 or capacity <= 0 or handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                run: FullStopGame::Session& = &session.host.session
+                region scratch(2097152):
+                    in scratch:
+                        list: mutable Display::DisplayList = Display::DisplayList()
+                        if session.options_row >= 0:
+                            sdl_grid_options_frame(&list, black != 0, 106, session.options_row, (&session.draft[0]).cast[i64&])
+                        else:
+                            SceneFullStop::render(&list, run, black != 0)
+                        encoded: darray[u8] = Display::encode_binary(&list)
+                        length: i64 = encoded.count.i64()
+                        return 0 if length <= 0 or length > capacity
+                        memcpy(dest.uintptr().cast[mutable void&], (&encoded[0]).cast[void&], length.usize())
+                        return length
+
+    def change_option(session: mutable Session&, direction: i64):
+        can Abort.Panic:
+            row: i64 = session.options_row
+            if row == 2:
+                session.draft[2] <- 1 - session.draft[2]
+                return
+            limit: i64 = 30 if row == 0 else 20
+            value: mutable i64 = session.draft[row.usize()]
+            while true |value, session, row, direction, limit|:
+                value <- (value + direction + limit - 1) % limit + 1
+                if (FullStopGame::allowed_rung(value) if row == 0 else FullStopGame::allowed_total(value)):
+                    session.draft[row.usize()] <- value
+                    return
+
+    def options_key(handle: i64, key: i64, from_hub: bool = false) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return 0 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if session.options_row < 0:
+                    return 0 if key != 99 or (session.host.session.phase != FullStopGame::READY and session.host.session.phase != FullStopGame::DONE)
+                    session.draft[0] <- session.host.session.start_rung
+                    session.draft[1] <- session.host.session.total
+                    session.draft[2] <- 1 if session.host.session.adaptive else 0
+                    session.options_row <- 0
+                    session.from_hub <- from_hub
+                    return 1
+                apply: bool = SDLTaskKeys::enter(key)
+                if apply:
+                    data: mutable u8[192] = zeroed
+                    length: i32 = SDL_snprintf(&data[0], 192.usize(),
+                        "[DEFAULT]\nSTOP_RUNG = %lld\nSTOP_TRIALS = %lld\nSTOP_ADAPTIVE = %s\n",
+                        session.draft[0], session.draft[1], "True" if session.draft[2] == 1 else "False")
+                    if length <= 0.i32() or length >= 192.i32() or not sdl_save_profile_sidecar(".full-stop-options", &data[0], length.usize()):
+                        SDL_Log("Could not save Full Stop options")
+                        return 1
+                    _ = FullStopGame::reconfigure(&session.host.session, session.draft[0], session.draft[1],
+                        session.draft[2] == 1) can Global{Read,Write}
+                if apply or key == 27:
+                    session.options_row <- -1
+                    return 2 if session.from_hub else 1
+                session.options_row <- SDLTaskKeys::option_row(key, session.options_row, 3)
+                if key == SDLTaskKeys::LEFT or key == SDLTaskKeys::RIGHT or key == 32:
+                    change_option(session, -1 if key == SDLTaskKeys::LEFT else 1)
+                return 1
+
+    def agent_event(handle: i64, now: f64, port: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+            return false if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                return FullStopHost::agent_event(&session.host, now, port) can Global{Read,Write}
+
+    def rgba_write(output: mutable u8&?, capacity: i64, handle: i64, black: i64, width: i32, height: i32) -> i64:
+        can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return 0 if output == null or handle <= 0 or width <= 0.i32() or height <= 0.i32() or width > 536870911.i32()
+            bytes: i64 = width.i64() * height.i64() * 4
+            return 0 if capacity < bytes
+            pixels: mutable u8& = output
+            drawn: mutable i64 = 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                region scratch(2097152):
+                    in scratch:
+                        list: mutable Display::DisplayList = Display::DisplayList()
+                        SceneFullStop::render(&list, &session.host.session, black != 0)
+                        encoded: darray[u8] = Display::encode_binary(&list)
+                        drawn <- SDLAgentPixels::draw(pixels, (&encoded[0]).uintptr().i64(), encoded.count.i64(), bytes, black, width, height)
+            return drawn

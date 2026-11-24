@@ -1,0 +1,260 @@
+include "./reading_quiz.elisa"
+include "./feeling_odds.elisa"
+
+module ToneOfVoice:
+    # toneofvoice.py: an ordinary sentence said angry, disgusted, afraid,
+    # happy, sad or plainly; only the voice tells which. Without CREMA-D's
+    # clips the voice is a hum made here, six syllables whose pitch, pace,
+    # loudness and fall follow the emotion.
+    const RATE: i64 = 22050
+    const GAP: f64 = 0.6
+    const LEAD: f64 = 0.4
+    const EMOTIONS: i64 = 6
+    const NEUTRAL: i64 = 4
+    # Hums made of each emotion, seeds 0 to 39.
+    const SEEDS: i64 = 40
+    const HUMS: i64 = 240
+    const FADE: i64 = 441
+    # math.pi
+    const PI: f64 = 3.141592653589793
+
+    struct Grade:
+        rung: i64
+        choices: i64
+        plain: bool
+        agree: f64
+        hiss: f64
+        cut: f64
+        answer: f64
+        items: i64
+
+    # A hum's length in frames, and where its voice starts (the first
+    # sample louder than 0.02).
+    struct Shape:
+        frames: i64
+        start: i64
+
+    struct Corpus:
+        shapes: mutable darray[Shape]
+
+    struct Round:
+        level: Grade
+        quiz: ReadingQuiz::Round
+        # Each item's hum: emotion * SEEDS + seed.
+        hums: darray[i64]
+        # quiz.fixed_pass, worked out while building (see deal).
+        fixed: bool
+
+    def grade(requested: i64) -> Grade:
+        r: i64 = requested if requested > 0 else 1
+        choices: i64 = 2 if r == 1 else (3 if r < 4 else (4 if r < 7 else 6))
+        agree: f64 = 0.85 if r == 1 else (0.8 if r < 4 else (0.7 if r < 7 else (0.65 if r < 10 else (0.55 if r < 16 else 0.5))))
+        hiss: f64 = 0.0 if r < 10 else (0.12 if r < 13 else (0.2 if r < 16 else 0.28))
+        cut: f64 = 0.0 if r < 13 else (1.2 if r < 16 else 0.9)
+        raw: f64 = 6.0 - 0.2 * (r - 1).f64()
+        return Grade{rung: r, choices: choices, plain: r >= 7, agree: agree, hiss: hiss, cut: cut,
+            answer: raw if raw > 2.5 else 2.5, items: 20 if choices == 2 else 10}
+
+    # SAID, by CREMA-D's emotion order.
+    def said(emotion: i64) -> cstr:
+        return "angry" if emotion == 0
+        return "disgusted" if emotion == 1
+        return "afraid" if emotion == 2
+        return "happy" if emotion == 3
+        return "plain, no feeling" if emotion == 4
+        return "sad"
+
+    # HUM: pitch in Hz, pitch swing, syllables a second, loudness, fall over
+    # the phrase, roughness.
+    def hum_value(emotion: i64, field: i64) -> f64:
+        table: f64[36] = [190.0, 0.35, 5.0, 1.0, 0.25, 0.5,
+            140.0, 0.15, 2.8, 0.6, 0.3, 0.3,
+            260.0, 0.25, 6.0, 0.5, -0.15, 0.1,
+            240.0, 0.45, 4.5, 0.85, -0.05, 0.0,
+            160.0, 0.08, 3.8, 0.6, 0.1, 0.0,
+            130.0, 0.06, 2.4, 0.35, 0.35, 0.0]
+        return table[(6 * emotion + field).usize()]
+
+    # _hum: the voice before it is cut and brought to one loudness. With
+    # `keep` false only the shape is worked out: every draw is still made,
+    # but no sample past the start is computed.
+    def hum(emotion: i64, seed: i64, keep: bool, out: mutable darray[f64]&) -> Shape:
+        can Abort.Panic, Memory.Allocate:
+            pitch_base: f64 = hum_value(emotion, 0)
+            swing: f64 = hum_value(emotion, 1)
+            rate: f64 = hum_value(emotion, 2)
+            loud: f64 = hum_value(emotion, 3)
+            fall: f64 = hum_value(emotion, 4)
+            rough: f64 = hum_value(emotion, 5)
+            d: mutable MT19937 = zeroed
+            mt_seed_int(&d, seed.u64())
+            pitch: f64 = pitch_base * py_uniform(&d, 0.9, 1.1)
+            frames: mutable i64 = 0
+            start: mutable i64 = -1
+            for k in 0..<6 |d, out, frames, start, pitch, swing, rate, loud, fall, rough, keep|:
+                dur: f64 = py_uniform(&d, 0.75, 1.25) / rate
+                f0: f64 = pitch * (1.0 + swing * py_uniform(&d, -1.0, 1.0)) * (1.0 - fall * k.f64() / 6.0)
+                n: i64 = (dur * RATE.f64()).i64()
+                ph: mutable f64 = 0.0
+                for i in 0..<n |d, out, frames, start, f0, n, ph, loud, rough, keep|:
+                    if keep or start < 0:
+                        env: f64 = pow(sin(PI * i.f64() / n.f64()), 0.6)
+                        f: f64 = f0 * (1.0 + 0.04 * sin(2.0 * PI * 5.0 * i.f64() / RATE.f64()))
+                        ph <- ph + 2.0 * PI * f / RATE.f64()
+                        v: mutable f64 = sin(ph) + 0.5 * sin(2.0 * ph) + 0.25 * sin(3.0 * ph)
+                        if rough != 0.0:
+                            v <- v + rough * py_uniform(&d, -1.0, 1.0) * 0.6
+                        sample: f64 = loud * env * v / 1.75
+                        start <- frames if start < 0 and fabs(sample) > 0.02
+                        out.push(sample) if keep
+                    elif rough != 0.0:
+                        _ = py_uniform(&d, -1.0, 1.0)
+                    frames <- frames + 1
+                for _ in 0..<(0.04 * RATE.f64()).i64() |out, frames, keep|:
+                    out.push(0.0) if keep
+                    frames <- frames + 1
+            return Shape{frames: frames, start: start if start >= 0 else 0}
+
+    # The frames _samples keeps: from the start of the voice, `cut`
+    # seconds of it, or all of it.
+    def kept(shape: Shape, cut: f64) -> i64:
+        return shape.frames if cut <= 0.0
+        most: i64 = (cut * RATE.f64()).i64()
+        rest: i64 = shape.frames - shape.start
+        return rest if rest < most else most
+
+    def length(shape: Shape, cut: f64) -> f64:
+        return kept(shape, cut).f64() / RATE.f64()
+
+    # _samples: the hum cut, at one loudness, faded in and out.
+    def samples(hum_index: i64, cut: f64) -> darray[f64]:
+        can Abort.Panic, Memory.Allocate:
+            raw: mutable darray[f64] = []
+            shape: Shape = hum(hum_index / SEEDS, hum_index % SEEDS, true, &raw)
+            first: i64 = shape.start if cut > 0.0 else 0
+            n: i64 = kept(shape, cut)
+            peak: mutable f64 = 0.0
+            for i in 0..<n |peak, raw, first|:
+                peak <- fmax(peak, fabs(raw[(first + i).usize()]))
+            g: f64 = 0.7 / peak if peak > 0.000001 else 0.0
+            out: mutable darray[f64] = []
+            for i in 0..<n |out, raw, first, g, n|:
+                scale: f64 = fmin(1.0, fmin(i.f64() / FADE.f64(), (n - 1 - i).f64() / FADE.f64()))
+                out.push(raw[(first + i).usize()] * g * scale)
+            return out
+
+    # The bundled voices: every hum's shape, worked out once.
+    def hum_corpus() -> Corpus:
+        can Abort.Panic, Memory.Allocate:
+            corpus: mutable Corpus = zeroed
+            unused: mutable darray[f64] = []
+            for index in 0..<HUMS |corpus, unused|:
+                corpus.shapes.push(hum(index / SEEDS, index % SEEDS, false, &unused))
+            return corpus
+
+    # quiz.fixed_pass: would pressing one number throughout pass?
+    def fixed_pass(items: darray[ReadingQuiz::Item]&, need: i64) -> bool:
+        can Abort.Panic:
+            for k in 0..<ReadingQuiz::PORTS |items, need|:
+                right: mutable i64 = 0
+                # By index, reading in place: the items are the round's.
+                for i in 0..<items.count.i64() |right, k, items|:
+                    all: mutable bool = true
+                    for s in 0..<items[i.usize()].steps.count.i64() |all, k, items, i|:
+                        last: i64 = items[i.usize()].steps[s.usize()].options.count.i64() - 1
+                        all <- all and items[i.usize()].steps[s.usize()].answer == (k if k < last else last)
+                    right <- right + 1 if all
+                return true if right >= need
+            return false
+
+    # fixed_pass from each item's answer and last option, kept as plain
+    # numbers while building so deal never borrows the dealt items.
+    def fixed_answers_pass(answers: darray[i64]&, lasts: darray[i64]&, need: i64) -> bool:
+        can Abort.Panic:
+            for k in 0..<ReadingQuiz::PORTS |answers, lasts, need|:
+                right: mutable i64 = 0
+                for i in 0..<answers.count.i64() |right, k, answers, lasts|:
+                    last: i64 = lasts[i.usize()]
+                    right <- right + 1 if answers[i.usize()] == (k if k < last else last)
+                return true if right >= need
+            return false
+
+    def build(level: Grade, draw: mutable MT19937&, corpus: Corpus&) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            return zeroed if corpus.shapes.count.i64() < HUMS
+            allowed: mutable darray[i64] = []
+            for e in 0..<EMOTIONS |allowed, level|:
+                allowed.push(e) if level.plain or e != NEUTRAL
+            order: mutable darray[i64] = []
+            for k in 0..<level.items |order, allowed|:
+                order.push(allowed[(k % allowed.count.i64()).usize()])
+            py_shuffle_i64(draw, &order)
+            items: mutable darray[ReadingQuiz::Item] = []
+            hums: mutable darray[i64] = []
+            answers: mutable darray[i64] = []
+            lasts: mutable darray[i64] = []
+            for e in order |items, hums, answers, lasts, allowed, level, draw, corpus|:
+                hum_index: i64 = e * SEEDS + py_choice_index(draw, SEEDS)
+                others: mutable darray[i64] = []
+                for o in allowed |others, e|:
+                    others.push(o) if o != e
+                picks: darray[i64] = py_sample_range(draw, 0, others.count.i64() - 1, level.choices - 1)
+                shown: mutable darray[i64] = [e]
+                for p in picks |shown, others|:
+                    shown.push(others[p.usize()])
+                # sorted(): a few values, so an insertion sort.
+                for i in 1..<shown.count.i64() |shown|:
+                    j: mutable i64 = i
+                    while j > 0 and shown[(j - 1).usize()] > shown[j.usize()] |j, shown|:
+                        swap: i64 = shown[j.usize()]
+                        shown[j.usize()] <- shown[(j - 1).usize()]
+                        shown[(j - 1).usize()] <- swap
+                        j <- j - 1
+                py_shuffle_i64(draw, &shown)
+                options: mutable darray[dstr] = []
+                answer: mutable i64 = 0
+                for i in 0..<shown.count.i64() |options, answer, shown, e|:
+                    word: mutable dstr = []
+                    dstr_append_cstr(&word, said(shown[i.usize()]))
+                    options.push(word)
+                    answer <- i if shown[i.usize()] == e
+                ask: mutable dstr = []
+                dstr_append_cstr(&ask, "How does the speaker feel?")
+                prompt: mutable dstr = []
+                dstr_append_cstr(&prompt, "(a hum)")
+                truth: mutable dstr = []
+                dstr_append_cstr(&truth, said(e))
+                heard: f64 = LEAD + 2.0 * length(corpus.shapes[hum_index.usize()], level.cut) + GAP
+                steps: mutable darray[ReadingQuiz::Step] = []
+                steps.push(ReadingQuiz::Step{ask: ask, options: options, answer: answer, wide: false, values: []})
+                items.push(ReadingQuiz::Item{prompt: prompt, steps: steps, seconds: heard + level.answer, title: "Listen",
+                    truth: truth, tolerance: 0.0, scored: false})
+                hums.push(hum_index)
+                answers.push(answer)
+                lasts.push(shown.count.i64() - 1)
+            chance_need: i64 = FeelingOdds::need_within(level.items, 1.0 / level.choices.f64(), 0.01 if level.choices == 2 else 0.03)
+            skill_need: i64 = ceil(0.7 * level.items.f64()).i64()
+            need: i64 = chance_need if chance_need > skill_need else skill_need
+            return Round{level: level, quiz: ReadingQuiz::Round{items: items, need: need}, hums: hums,
+                fixed: fixed_answers_pass(&answers, &lasts, need)}
+
+    def deal(level: Grade, draw: mutable MT19937&, corpus: Corpus&) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            # The first round that a fixed-answer player could not pass.
+            chosen: mutable Round = zeroed
+            for _ in 0..<40 |level, draw, corpus, chosen|:
+                next: mutable MT19937 = zeroed
+                mt_seed_int(&next, py_getrandbits(draw, 32))
+                round: Round = build(level, &next, corpus)
+                # The reference player answers every voice at once, so
+                # every built round clears the score and time checks.
+                continue if round.quiz.items.count == 0.usize() or round.fixed
+                chosen <- round
+                break
+            return chosen
+
+    # Nothing is imported yet: the voices are the hums made here.
+    def from_question_cache(owner: mutable Arena&, text: sview) -> Corpus:
+        can Memory.Allocate, Abort.Panic:
+            in owner:
+                return hum_corpus()

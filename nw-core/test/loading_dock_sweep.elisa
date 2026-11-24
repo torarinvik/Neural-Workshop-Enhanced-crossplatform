@@ -1,0 +1,166 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/geometry.elisa"
+include "../src/scene_loading_dock.elisa"
+
+extern printf(format: cstr, ...) -> i32 can[Console.Write]
+
+def emit_dock(dock: LoadingDock::Dock&):
+    can Console.Write, Abort.Panic:
+        _ = printf("dock %lld %.17g\n", dock.seed, dock.seconds)
+        for k in 0..<dock.level.kinds |dock|:
+            _ = printf("kind %lld\n", dock.shelf[k.usize()])
+        for truck in dock.trucks:
+            _ = printf("truck %lld %lld %.17g %.17g\n", truck.city, truck.bay, truck.arrive, truck.leave)
+            _ = printf("order ")
+            for byte in truck.text:
+                _ = printf("%c", byte.i32())
+            _ = printf("\n")
+            for i in 0..<truck.count |truck|:
+                need: LoadingDock::Need = truck.needs[i.usize()]
+                _ = printf("need %lld %lld %lld\n", need.colour, need.tag, need.excluded)
+        for cut in dock.cuts:
+            _ = printf("cut %.17g %lld\n", cut.time, cut.camera)
+
+def wrong_delivery(run: mutable LoadingDock::Run&, mode: i64):
+    can Memory.Allocate, Abort.Panic:
+        truck: LoadingDock::Truck = get run.dock.trucks[0] else zeroed
+        camera: HandView::Lens = LoadingDock::view(run)
+        target: mutable RoomsView::Vec = LoadingDock::lamp(&truck)
+        if mode == 4:
+            bed: RoomsView::Vec = LoadingDock::bed(&truck)
+            run.x <- bed.x
+            run.z <- 5.0
+            run.carried[0] <- ((truck.needs[0].colour + 1) % 4) * 3
+            run.carried_count <- 1
+            target <- bed
+        pick: RoomsView::Vec = LoadingDock::fork(run) if mode == 4 else target
+        origin: RoomsView::Vec = HandView::see(&camera, pick)
+        destination: RoomsView::Vec = HandView::see(&camera, target)
+        HandView::place(&run.hand, origin.x, origin.y)
+        LoadingDock::press(run)
+        HandView::place(&run.hand, destination.x, destination.y)
+        LoadingDock::release(run)
+
+def render_cameras(dock: LoadingDock::Dock):
+    can Memory.Allocate, Abort.Panic, Console.Write:
+        run: mutable LoadingDock::Run = LoadingDock::initialize(dock, false)
+        truck: LoadingDock::Truck = get dock.trucks[0] else zeroed
+        run.cargo[0].met <- (1 << truck.count) - 1
+        run.drag <- LoadingDock::FROM_FORK
+        run.drag_kind <- 1
+        run.hand.down <- true
+        frame: mutable Display::DisplayList = Display::DisplayList()
+        for camera in 0..<5 |frame, run|:
+            run.camera <- camera
+            Display::display_reset(&frame)
+            SceneLoadingDock::warehouse(&frame, &run)
+            assert frame.commands.count > 250.usize()
+            ready_lamp: mutable bool = false
+            pending_lamp: mutable bool = false
+            for cmd in frame.commands |ready_lamp, pending_lamp, frame|:
+                ready_lamp <- true if cmd.color == 0x5ae678ff
+                pending_lamp <- true if cmd.color == 0xf0aa3cff
+                if cmd.kind == Display::CMD_TEXT and cmd.b >= SceneHand::y(30.0).f32():
+                    text: sview = bytes_view_range(frame.pool, cmd.ref.usize(), (cmd.len & 0xffffff.u32()).usize())
+                    _ = printf("text ")
+                    for i in 0..<sview_len(text).i64() |text|:
+                        _ = printf("%c", sview_at(text, i.usize()).i32())
+                    _ = printf("\n")
+            assert ready_lamp and pending_lamp
+            _ = printf("camera %lld\n", camera)
+
+def replay(dock: LoadingDock::Dock, mode: i64):
+    can Memory.Allocate, Abort.Panic, Console.Write:
+        run: mutable LoadingDock::Run = LoadingDock::initialize(dock, true)
+        frame: mutable i64 = 0
+        _ = printf("replay %lld\n", mode)
+        while run.result == LoadingDock::PENDING |run, frame, mode|:
+            port: mutable i64 = LoadingDock::pilot(&run) if mode == 0 else -1
+            if mode == 2:
+                port <- LoadingDock::BACK if frame < 90 else -1
+                port <- LoadingDock::LEFT if frame >= 90 and frame < 160
+                port <- LoadingDock::FWD_RIGHT if frame >= 160 and frame < 250
+            if mode >= 3 and frame == 0:
+                wrong_delivery(&run, mode)
+            LoadingDock::act(&run, port)
+            LoadingDock::tick(&run, 1.0 / 60.0, (1 << (port - LoadingDock::FWD)) if port >= LoadingDock::FWD else 0)
+            if frame % 97 == 0 or run.result != LoadingDock::PENDING:
+                _ = printf("state %lld %lld %lld %lld %lld %lld %lld %.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
+                    frame, port, run.result, run.failed_truck, run.camera, run.drag, run.carried_count,
+                    run.time, run.x, run.z, run.heading, run.speed, run.hand.x, run.hand.y)
+                for i in 0..<run.dock.level.trucks |run|:
+                    c: LoadingDock::Cargo = run.cargo[i.usize()]
+                    _ = printf("cargo %lld %lld %lld\n", c.met, 1 if c.sent else 0, 1 if c.horned else 0)
+                if run.dock.level.busy:
+                    pose: LoadingDock::ForkPose = LoadingDock::other_fork(&run)
+                    _ = printf("forklift %.17g %.17g %.17g\n", pose.x, pose.z, pose.heading)
+            frame <- frame + 1
+        _ = printf("verdict ")
+        message: dstr = LoadingDock::result_text(&run)
+        for byte in message:
+            _ = printf("%c", byte.i32())
+        _ = printf("\n")
+        for cue in run.notes:
+            _ = printf("cue %lld %lld %.17g %.17g %.17g %.17g %.17g\n", cue.voice, cue.seed, cue.time,
+                cue.duration, cue.pitch, cue.gain, cue.pan)
+
+def emit(rung: i64, seed: i64):
+    can Memory.Allocate, Abort.Panic, Console.Write:
+        draw: mutable MT19937 = mt19937_new()
+        mt_seed_int(&draw, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+        dock: LoadingDock::Dock = LoadingDock::deal(rung, &draw)
+        _ = printf("case %lld %lld %lld\n", rung, seed, 1 if dock.valid else 0)
+        if dock.valid:
+            emit_dock(&dock)
+            if rung == 16 and seed == 0:
+                render_cameras(dock)
+            replay(dock, 0)
+            if seed == 0:
+                replay(dock, 1)
+                replay(dock, 2)
+                if rung == 1:
+                    replay(dock, 3)
+                    replay(dock, 4)
+
+def release_trial(owner: mutable Arena&):
+    can Memory.Release, Abort.Panic:
+        arena_free(owner) can Atomics{Exchange,Load,Store}, Unsafe{Alias,PointerCast,RawExtern,UncheckedIndex}, Global{Read,Write}
+
+def check_session() -> bool:
+    can Memory.Allocate, Memory.Release, Abort.Panic:
+        session: mutable LoadingDockGame::Session = LoadingDockGame::initialize(1, 3, true, 17)
+        valid: mutable bool = LoadingDockGame::start(&session, 0.0) can Global{Read,Write}
+        now: mutable f64 = 0.0
+        while session.phase == LoadingDockGame::PLAYING and now < 30.0 |session, now, valid|:
+            port: i64 = LoadingDock::pilot(&session.run)
+            if port >= 0:
+                valid <- (LoadingDockGame::agent_event(&session, now, port) can Global{Read,Write}) and valid
+            now <- now + 1.0 / 60.0
+            _ = LoadingDockGame::agent_event(&session, now, -1) can Global{Read,Write}
+        valid <- valid and session.phase == LoadingDockGame::JUDGED and session.rung == 2 and session.best == 1
+        valid <- valid and LoadingDockGame::result_field(&session, 0, 0) == 1
+        valid <- valid and LoadingDockGame::result_field(&session, 0, 1) == LoadingDock::SUCCESS
+        _ = LoadingDockGame::agent_event(&session, now, -1) can Global{Read,Write}
+        valid <- valid and session.phase == LoadingDockGame::PLAYING and session.trial == 2
+        wrong_delivery(&session.run, 3)
+        _ = LoadingDockGame::agent_event(&session, now + 1.0 / 60.0, -1) can Global{Read,Write}
+        valid <- valid and session.phase == LoadingDockGame::JUDGED and session.rung == 1
+        valid <- valid and LoadingDockGame::result_field(&session, 1, 0) == 2
+        valid <- valid and LoadingDockGame::result_field(&session, 1, 1) == LoadingDock::SHORT_SEND
+        valid <- valid and LoadingDockGame::result_field(&session, 2, 0) == -1
+        LoadingDockGame::close(&session) can Global{Read,Write}
+        return valid and session.phase == LoadingDockGame::READY
+
+def main() -> i32:
+    can Memory.Allocate, Memory.Release, Abort.Panic, Console.Write:
+        return 1.i32() if not (check_session() can Global{Read,Write})
+        rungs: i64[11] = [-1, 1, 4, 7, 10, 13, 16, 19, 20, 25, 30]
+        for rung in rungs:
+            for seed in -1..<3 |rung|:
+                owner: mutable Arena = zeroed
+                in owner:
+                    emit(rung, seed)
+                release_trial(&owner) can Global{Read,Write}
+        return 0.i32()

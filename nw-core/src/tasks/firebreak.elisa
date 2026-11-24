@@ -1,0 +1,428 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module Firebreak:
+    const COLS: i64 = 30
+    const ROWS: i64 = 19
+    const CELLS: i64 = 570
+    const FOREST: i64 = 0
+    const GRASS: i64 = 1
+    const WATER: i64 = 2
+    const ROCK: i64 = 3
+    const TOWN: i64 = 4
+    const BREAK: i64 = 5
+
+    struct Grade:
+        rung: i64
+        fires: i64
+        pace: f64
+        wind: f64
+        shift: bool
+        embers: f64
+        hidden_wind: bool
+        dig: f64
+        spare: i64
+        distance: i64
+
+    struct Land:
+        level: mutable Grade
+        terrain: mutable i64[CELLS]
+        rough: mutable f64[CELLS]
+        ember_draw: mutable f64[CELLS]
+        fires: mutable i64[2]
+        wind_turn: mutable f64
+        initial_wind: mutable f64
+        shifted_wind: mutable f64
+        town: mutable i64[6]
+        shovels: mutable i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: i64 = r - 20 if r > 20 else 0
+        return Grade{rung: r, fires: 1 if r < 7 else 2,
+            pace: 0.8 if r < 4 else (1.0 if r < 20 else fmin(1.5, 1.05 + 0.05 * top.f64())),
+            wind: 0.6 if r < 4 else 0.9, shift: r >= 10, hidden_wind: r >= 16,
+            embers: 0.0 if r < 13 else (0.15 if r < 20 else 0.22),
+            dig: 0.35 if r < 4 else (0.5 if r < 13 else (0.28 if r < 20 else fmin(0.5, 0.3 + 0.02 * top.f64()))),
+            spare: 14 if r < 4 else (8 if r < 13 else (30 if r < 20 else (28 - top if top < 10 else 18))),
+            distance: 18 if r < 4 else (14 if r < 13 else 19)}
+
+    def inside(c: i64, r: i64) -> bool:
+        return c >= 0 and c < COLS and r >= 0 and r < ROWS
+
+    def abs(value: i64) -> i64:
+        return -value if value < 0 else value
+
+    def max(a: i64, b: i64) -> i64:
+        return a if a > b else b
+
+    def town_distance(c: i64, r: i64, tc: i64, tr: i64) -> i64:
+        return max(max(tc - c, c - (tc + 2)), max(tr - r, r - (tr + 1)))
+
+    def flammable(terrain: i64) -> bool:
+        return terrain == FOREST or terrain == GRASS or terrain == TOWN
+
+    def smooth(draw: mutable MT19937&, times: i64) -> f64[CELLS]:
+        can Abort.Panic:
+            values: mutable f64[CELLS] = zeroed
+            for i in 0..<CELLS |values, draw|:
+                values[i.usize()] <- py_random(draw)
+            for _ in 0..<times |values|:
+                out: mutable f64[CELLS] = zeroed
+                for i in 0..<CELLS |values, out|:
+                    total: mutable f64 = 0.0
+                    count: mutable i64 = 0
+                    c: i64 = i % COLS
+                    r: i64 = i / COLS
+                    for dc in [-1, 0, 1] |values, c, r, total, count|:
+                        for dr in [-1, 0, 1] |values, c, r, dc, total, count|:
+                            if inside(c + dc, r + dr):
+                                total <- total + values[((r + dr) * COLS + c + dc).usize()]
+                                count <- count + 1
+                    out[i.usize()] <- total / count.f64()
+                values <- out
+            return values
+
+    def ground(draw: mutable MT19937&) -> i64[CELLS]:
+        can Abort.Panic:
+            height: f64[CELLS] = smooth(draw, 3)
+            damp: f64[CELLS] = smooth(draw, 2)
+            lo: mutable f64 = 1.0
+            hi: mutable f64 = 0.0
+            for i in 0..<CELLS |height, lo, hi|:
+                lo <- fmin(lo, height[i.usize()])
+                hi <- fmax(hi, height[i.usize()])
+            terrain: mutable i64[CELLS] = zeroed
+            for i in 0..<CELLS |terrain, height, damp, lo, hi|:
+                raised: f64 = (height[i.usize()] - lo) / (hi - lo)
+                terrain[i.usize()] <- WATER if raised < 0.13 else (ROCK if raised > 0.93 else
+                    (GRASS if damp[i.usize()] > 0.52 else FOREST))
+            return terrain
+
+    def reaches_town(land: Land&) -> bool:
+        can Abort.Panic:
+            seen: mutable bool[CELLS] = zeroed
+            pending: mutable i64[CELLS] = zeroed
+            count: mutable i64 = land.level.fires
+            for index in 0..<count |land, seen, pending|:
+                fire: i64 = land.fires[index.usize()]
+                pending[index.usize()] <- fire
+                seen[fire.usize()] <- true
+            dc: i64[4] = [0, 0, -1, 1]
+            dr: i64[4] = [1, -1, 0, 0]
+            while count > 0 |land, seen, pending, count, dc, dr|:
+                count <- count - 1
+                i: i64 = pending[count.usize()]
+                return true if land.terrain[i.usize()] == TOWN
+                for direction in 0..<4 |i, land, seen, pending, count, dc, dr|:
+                    c: i64 = i % COLS + dc[direction.usize()]
+                    r: i64 = i / COLS + dr[direction.usize()]
+                    continue if not inside(c, r)
+                    next: i64 = r * COLS + c
+                    if not seen[next.usize()] and flammable(land.terrain[next.usize()]):
+                        seen[next.usize()] <- true
+                        pending[count.usize()] <- next
+                        count <- count + 1
+            return false
+
+    def start_fire(land: Land&, draw: mutable MT19937&, tc: i64, tr: i64, first: i64) -> i64:
+        can Abort.Panic:
+            for _ in 0..<200 |land, draw, tc, tr, first|:
+                c: i64 = py_randint(draw, 1, COLS - 2)
+                r: i64 = py_randint(draw, 1, ROWS - 2)
+                i: i64 = r * COLS + c
+                kind: i64 = land.terrain[i.usize()]
+                if (kind == FOREST or kind == GRASS) and town_distance(c, r, tc, tr) >= land.level.distance:
+                    return i if first < 0 or abs(c - first % COLS) + abs(r - first / COLS) > 5
+            return -1
+
+    def deal_seed(rung: i64, seed: i64) -> Land:
+        can Abort.Panic:
+            draw: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&draw, magnitude)
+            level: Grade = grade(rung)
+            land: mutable Land = zeroed
+            walls: mutable i64 = 0
+            for _ in 0..<40 |draw, level, land, walls|:
+                candidate: mutable Land = zeroed
+                candidate.level <- level
+                candidate.terrain <- ground(&draw)
+                side: i64 = py_randbelow(&draw, 2.u64()).i64()
+                tc: i64 = py_randint(&draw, 3, 6) if side == 0 else py_randint(&draw, COLS - 9, COLS - 6)
+                tr: i64 = py_randint(&draw, 4, ROWS - 7)
+                for k in 0..<6 |candidate, tc, tr|:
+                    i: i64 = (tr + k % 2) * COLS + tc + k / 2
+                    candidate.town[k.usize()] <- i
+                    candidate.terrain[i.usize()] <- TOWN
+                walls <- 0
+                for i in 0..<CELLS |candidate, tc, tr, walls|:
+                    distance: i64 = town_distance(i % COLS, i / COLS, tc, tr)
+                    kind: i64 = candidate.terrain[i.usize()]
+                    candidate.terrain[i.usize()] <- GRASS if distance == 1 and (kind == WATER or kind == ROCK)
+                    walls <- walls + 1 if distance == 2 and (kind == FOREST or kind == GRASS)
+                first: i64 = start_fire(&candidate, &draw, tc, tr, -1)
+                second: i64 = start_fire(&candidate, &draw, tc, tr, first) if level.fires == 2 else -1
+                continue if first < 0 or (level.fires == 2 and second < 0)
+                candidate.fires[0] <- first
+                candidate.fires[1] <- second
+                towards: f64 = atan2((tr - first / COLS).f64(), (tc - first % COLS).f64()) * 57.29577951308232
+                candidate.initial_wind <- towards + py_uniform(&draw, -35.0, 35.0)
+                if level.shift:
+                    candidate.wind_turn <- py_uniform(&draw, 18.0, 30.0)
+                    sign: f64 = -1.0 if py_randbelow(&draw, 2.u64()) == 0.u64() else 1.0
+                    candidate.shifted_wind <- candidate.initial_wind + sign * py_uniform(&draw, 60.0, 110.0)
+                for i in 0..<CELLS |candidate, draw|:
+                    candidate.rough[i.usize()] <- py_uniform(&draw, 0.75, 1.35)
+                for i in 0..<CELLS |candidate, draw|:
+                    candidate.ember_draw[i.usize()] <- py_random(&draw)
+                land <- candidate
+                break if reaches_town(&land)
+            land.shovels <- walls + level.spare
+            return land
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Land:
+        can Abort.Panic:
+            return deal_seed(rung, py_randbelow(rng, 1073741824.u64()).i64())
+
+    const UNBURNT: i64 = 0
+    const BURNING: i64 = 1
+    const ASH: i64 = 2
+    const LIVE: i64 = 0
+    const TOWN_BURNED: i64 = 1
+    const SAVED: i64 = 2
+    const TIMEOUT: i64 = 3
+    const DIG: i64 = 4
+    const JUMP: i64 = 5
+    const PORTS: i64 = 9
+    const SECONDS: f64 = 120.0
+    const UNREACHABLE: f64 = 1e9
+
+    struct Wind:
+        x: f64
+        y: f64
+
+    struct Blaze:
+        land: mutable Land
+        elapsed: mutable f64
+        terrain: mutable i64[CELLS]
+        state: mutable i64[CELLS]
+        lit_at: mutable f64[CELLS]
+        thrown: mutable bool[CELLS]
+        col: mutable i64
+        row: mutable i64
+        shovels: mutable i64
+        ready_at: mutable f64
+        result: mutable i64
+
+    def light(blaze: mutable Blaze&, index: usize):
+        can Abort.Panic:
+            blaze.state[index] <- BURNING
+            blaze.lit_at[index] <- blaze.elapsed
+
+    def initialize(land: Land&) -> Blaze:
+        can Abort.Panic:
+            blaze: mutable Blaze = Blaze{land: land[0], elapsed: 0.0, terrain: land.terrain,
+                state: zeroed, lit_at: zeroed, thrown: zeroed, col: COLS / 2, row: ROWS / 2,
+                shovels: land.shovels, ready_at: 0.0, result: LIVE}
+            for k in 0..<land.level.fires |blaze, land|:
+                light(&blaze, land.fires[k.usize()].usize())
+            return blaze
+
+    def wind_angle(blaze: Blaze&) -> f64:
+        return blaze.land.shifted_wind if blaze.land.level.shift and blaze.elapsed >= blaze.land.wind_turn else blaze.land.initial_wind
+
+    def wind(blaze: Blaze&) -> Wind:
+        angle: f64 = wind_angle(blaze) * 0.017453292519943295
+        strength: f64 = blaze.land.level.wind
+        return Wind{x: cos(angle) * strength, y: sin(angle) * strength}
+
+    def burn_time(kind: i64) -> f64:
+        return 9.0 if kind == FOREST else (4.0 if kind == GRASS else 7.0)
+
+    def cross_time(blaze: Blaze&, dst: usize, dc: i64, dr: i64, flow: Wind) -> f64:
+        can Abort.Panic:
+            length: f64 = 1.4142135623730951 if dc != 0 and dr != 0 else 1.0
+            along: f64 = (dc.f64() * flow.x + dr.f64() * flow.y) / length
+            speed: f64 = exp(0.75 * along) * blaze.land.level.pace
+            kind: i64 = blaze.terrain[dst]
+            delay: f64 = 1.9 if kind == FOREST else (0.9 if kind == GRASS else 2.4)
+            return delay * length * blaze.land.rough[dst] / speed
+
+    def clamp(value: i64, limit: i64) -> i64:
+        return 0 if value < 0 else (limit - 1 if value >= limit else value)
+
+    def put(blaze: mutable Blaze&, col: i64, row: i64):
+        blaze.col <- clamp(col, COLS)
+        blaze.row <- clamp(row, ROWS)
+
+    def can_dig(blaze: Blaze&) -> bool:
+        can Abort.Panic:
+            i: usize = (blaze.row * COLS + blaze.col).usize()
+            kind: i64 = blaze.terrain[i]
+            return blaze.result == LIVE and blaze.shovels > 0 and blaze.elapsed >= blaze.ready_at and
+                (kind == FOREST or kind == GRASS) and blaze.state[i] == UNBURNT
+
+    def dig(blaze: mutable Blaze&) -> bool:
+        can Abort.Panic:
+            return false if not can_dig(blaze)
+            i: usize = (blaze.row * COLS + blaze.col).usize()
+            blaze.terrain[i] <- BREAK
+            blaze.shovels <- blaze.shovels - 1
+            blaze.ready_at <- blaze.elapsed + blaze.land.level.dig
+            return true
+
+    def apply(blaze: mutable Blaze&, port: i64) -> bool:
+        can Abort.Panic:
+            return dig(blaze) if port == DIG
+            return false if port < 0 or port >= PORTS
+            direction: i64 = port - JUMP if port >= JUMP else port
+            distance: i64 = 4 if port >= JUMP else 1
+            dc: i64 = -distance if direction == 2 else (distance if direction == 3 else 0)
+            dr: i64 = distance if direction == 0 else (-distance if direction == 1 else 0)
+            put(blaze, blaze.col + dc, blaze.row + dr)
+            return true
+
+    def unburnt(blaze: Blaze&, index: usize) -> bool:
+        can Abort.Panic:
+            return blaze.state[index] == UNBURNT and flammable(blaze.terrain[index])
+
+    def spread(blaze: Blaze&, i: i64, age: f64, flow: Wind, pending: mutable i64&):
+        can Abort.Panic:
+            col: i64 = i % COLS
+            row: i64 = i / COLS
+            for dc in [-1, 0, 1] |blaze, age, flow, pending, col, row|:
+                for dr in [-1, 0, 1] |blaze, age, flow, pending, col, row, dc|:
+                    if (dc != 0 or dr != 0) and inside(col + dc, row + dr):
+                        dst: usize = ((row + dr) * COLS + col + dc).usize()
+                        pending[dst] <- 1 if unburnt(blaze, dst) and age >= cross_time(blaze, dst, dc, dr, flow)
+
+    def throw_ember(blaze: mutable Blaze&, i: usize, flow: Wind, pending: mutable i64&):
+        can Abort.Panic:
+            blaze.thrown[i] <- true
+            return if blaze.land.ember_draw[i] >= blaze.land.level.embers
+            n: f64 = py_hypot(flow.x, flow.y)
+            scale: f64 = n if n > 0.0 else 1.0
+            col: i64 = py_round_half_even((i.i64() % COLS).f64() + flow.x / scale * 2.0)
+            row: i64 = py_round_half_even((i.i64() / COLS).f64() + flow.y / scale * 2.0)
+            if inside(col, row):
+                dst: usize = (row * COLS + col).usize()
+                pending[dst] <- 1 if unburnt(blaze, dst)
+
+    def step(blaze: mutable Blaze&, elapsed: f64) -> bool:
+        can Abort.Panic:
+            return false if blaze.result != LIVE or not (elapsed >= 0.0 and elapsed <= 9007199254740.0)
+            blaze.elapsed <- blaze.elapsed + elapsed
+            flow: Wind = wind(blaze)
+            pending: mutable i64[CELLS] = zeroed
+            remaining: mutable bool = false
+            for i in 0..<CELLS |blaze, flow, pending, remaining|:
+                at: usize = i.usize()
+                continue if blaze.state[at] != BURNING
+                age: f64 = blaze.elapsed - blaze.lit_at[at]
+                duration: f64 = burn_time(blaze.terrain[at])
+                if age >= duration:
+                    blaze.state[at] <- ASH
+                    continue
+                remaining <- true
+                spread(blaze, i, age, flow, &pending[0])
+                if blaze.land.level.embers > 0.0 and not blaze.thrown[at] and age >= duration * 0.4:
+                    throw_ember(blaze, at, flow, &pending[0])
+            # The tick's newly lit cells begin spreading on the following tick.
+            for i in 0..<CELLS |blaze, pending, remaining|:
+                if pending[i.usize()] != 0:
+                    light(blaze, i.usize())
+                    remaining <- true
+            for k in 0..<6 |blaze|:
+                if blaze.state[blaze.land.town[k.usize()].usize()] != UNBURNT:
+                    blaze.result <- TOWN_BURNED
+                    return true
+            blaze.result <- SAVED if not remaining
+            blaze.result <- TIMEOUT if remaining and blaze.elapsed >= SECONDS
+            return true
+
+    def burned(blaze: Blaze&) -> i64:
+        can Abort.Panic:
+            count: mutable i64 = 0
+            for i in 0..<CELLS |blaze, count|:
+                count <- count + 1 if blaze.state[i.usize()] != UNBURNT
+            return count
+
+    def arrival(blaze: Blaze&) -> f64[CELLS]:
+        can Abort.Panic:
+            best: mutable f64[CELLS] = zeroed
+            settled: mutable bool[CELLS] = zeroed
+            flow: Wind = wind(blaze)
+            for i in 0..<CELLS |blaze, best|:
+                at: usize = i.usize()
+                best[at] <- blaze.lit_at[at] - blaze.elapsed if blaze.state[at] == BURNING else UNREACHABLE
+            # A fixed board permits a bounded scan. Equal times settle in cell order.
+            for _ in 0..<CELLS |blaze, flow, best, settled|:
+                earliest: mutable f64 = UNREACHABLE
+                source: mutable i64 = -1
+                for i in 0..<CELLS |best, settled, earliest, source|:
+                    if not settled[i.usize()] and best[i.usize()] < earliest:
+                        earliest <- best[i.usize()]
+                        source <- i
+                break if source < 0
+                settled[source.usize()] <- true
+                col: i64 = source % COLS
+                row: i64 = source / COLS
+                for dc in [-1, 0, 1] |blaze, flow, best, col, row, earliest|:
+                    for dr in [-1, 0, 1] |blaze, flow, best, col, row, earliest, dc|:
+                        if (dc != 0 or dr != 0) and inside(col + dc, row + dr):
+                            dst: usize = ((row + dr) * COLS + col + dc).usize()
+                            if unburnt(blaze, dst):
+                                next: f64 = earliest + cross_time(blaze, dst, dc, dr, flow)
+                                best[dst] <- next if next < best[dst]
+            return best
+
+    def pilot_target(blaze: Blaze&) -> i64:
+        can Abort.Panic:
+            return -1 if blaze.elapsed < blaze.ready_at or blaze.shovels <= 0
+            times: f64[CELLS] = arrival(blaze)
+            outer: i64 = 3 if blaze.land.level.embers > 0.0 else 2
+            town: i64 = blaze.land.town[0]
+            for rank in 0..<(outer - 1) |blaze, times, outer, town|:
+                distance: i64 = outer - rank
+                earliest: mutable f64 = UNREACHABLE
+                target: mutable i64 = -1
+                for i in 0..<CELLS |blaze, times, town, distance, rank, earliest, target|:
+                    index: usize = i.usize()
+                    kind: i64 = blaze.terrain[index]
+                    continue if (kind != FOREST and kind != GRASS) or blaze.state[index] != UNBURNT
+                    continue if town_distance(i % COLS, i / COLS, town % COLS, town / COLS) != distance
+                    when: f64 = times[index]
+                    continue if when < blaze.land.level.dig * 0.5 or (when == UNREACHABLE and rank == 0)
+                    time: f64 = 999.0 if when == UNREACHABLE else when
+                    if time < earliest:
+                        earliest <- time
+                        target <- i
+                return target if target >= 0
+            return -1
+
+    def route(blaze: Blaze&, target: i64) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            ports: mutable darray[i64] = []
+            return ports if target < 0 or target >= CELLS
+            tc: i64 = target % COLS
+            tr: i64 = target / COLS
+            col: mutable i64 = blaze.col
+            row: mutable i64 = blaze.row
+            while col != tc or row != tr |ports, col, row, tc, tr|:
+                dc: i64 = tc - col
+                dr: i64 = tr - row
+                if abs(dc) >= 4:
+                    ports.push(JUMP + (3 if dc > 0 else 2))
+                    col <- col + (4 if dc > 0 else -4)
+                elif abs(dr) >= 4:
+                    ports.push(JUMP + (0 if dr > 0 else 1))
+                    row <- row + (4 if dr > 0 else -4)
+                elif dc != 0:
+                    ports.push(3 if dc > 0 else 2)
+                    col <- col + (1 if dc > 0 else -1)
+                else:
+                    ports.push(0 if dr > 0 else 1)
+                    row <- row + (1 if dr > 0 else -1)
+            ports.push(DIG)
+            return ports

@@ -1,0 +1,211 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+include "../strings.elisa"
+
+module Balance:
+    const TRACK: f64 = 30.0
+    const GRAVITY: f64 = 9.8
+    const LEFT: i64 = 0
+    const RIGHT: i64 = 1
+    const COAST: i64 = -1
+    const PENDING: i64 = 0
+    const PASSED: i64 = 1
+    const FELL: i64 = 2
+    const BUFFER: i64 = 3
+    const TIMEOUT: i64 = 4
+    const FALLEN: f64 = 0.6108652381980153
+    const UPRIGHT: f64 = 0.20943951023931956
+
+    struct Grade:
+        rung: i64
+        length: f64
+        count: i64
+        spread: f64
+        gusts: f64
+        changes: bool
+        seconds: f64
+
+    struct Course:
+        level: Grade
+        flags: mutable f64[6]
+        change_at: mutable f64
+        changed_length: mutable f64
+        gust_seed: mutable i64
+
+    struct Trial:
+        course: Course
+        time: mutable f64
+        x: mutable f64
+        velocity: mutable f64
+        theta: mutable f64
+        omega: mutable f64
+        flag: mutable i64
+        still: mutable f64
+        result: mutable i64
+        pushing: mutable i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: i64 = r - 20 if r > 20 else 0
+        count: i64 = 2 if r < 4 else (3 if r < 20 else (4 + top / 4 if top < 8 else 6))
+        length: f64 = 3.0 if r < 4 else (2.0 if r < 13 else (1.4 if r < 20 else (1.2 - 0.03 * top.f64() if top < 10 else 0.9)))
+        return Grade{rung: r, length: length, count: count, spread: 6.0 if r < 7 else 14.0,
+            gusts: 0.0 if r < 10 else (0.6 if r < 20 else 0.8 + 0.04 * top.f64()), changes: r >= 16,
+            seconds: 20.0 + 9.0 * count.f64()}
+
+    def uniform(rng: mutable MT19937&, lo: f64, hi: f64) -> f64:
+        return lo + (hi - lo) * py_random(rng)
+
+    def magnitude(value: f64) -> f64:
+        return -value if value < 0.0 else value
+
+    def build(level: Grade, rng: mutable MT19937&) -> Course:
+        can Abort.Panic:
+            course: mutable Course = Course{level: level, flags: zeroed, change_at: 0.0,
+                changed_length: level.length, gust_seed: 0}
+            x: mutable f64 = TRACK / 2.0
+            for flag in 0..<level.count |course, level, rng, x|:
+                found: mutable f64 = TRACK - x
+                for _try in 0..<50 |x, rng, level, found|:
+                    sign: f64 = -1.0 if py_randbelow(rng, 2.u64()) == 0.u64() else 1.0
+                    candidate: f64 = x + sign * uniform(rng, level.spread * 0.6, level.spread)
+                    if candidate >= 3.0 and candidate <= TRACK - 3.0:
+                        found <- candidate
+                        break
+                course.flags[flag.usize()] <- py_round_half_even(found * 100.0).f64() / 100.0
+                x <- found
+            if level.changes:
+                course.change_at <- uniform(rng, 8.0, 14.0)
+                course.changed_length <- level.length * (0.6 if py_randbelow(rng, 2.u64()) == 0.u64() else 1.6)
+            course.gust_seed <- py_randbelow(rng, 1048576.u64()).i64()
+            return course
+
+    def trial(course: Course) -> Trial:
+        return Trial{course: course, time: 0.0, x: TRACK / 2.0, velocity: 0.0, theta: 0.02,
+            omega: 0.0, flag: 0, still: 0.0, result: PENDING, pushing: 0}
+
+    def length(run: Trial&) -> f64:
+        return run.course.changed_length if run.course.level.changes and run.time >= run.course.change_at else run.course.level.length
+
+    def gust(run: Trial&) -> f64:
+        return 0.0 if run.course.level.gusts == 0.0
+        k: f64 = (run.course.gust_seed % 17).f64()
+        return run.course.level.gusts * sin(run.time * 0.8 + k) * sin(run.time * 0.31 + 2.0 * k)
+
+    def accel(run: Trial&, control: i64) -> f64:
+        return -12.0 if control == LEFT
+        return 12.0 if control == RIGHT
+        return 0.0 if magnitude(run.velocity) < 1e-9
+        return -0.6 if run.velocity > 0.0 else 0.6
+
+    def step(run: mutable Trial&, dt: f64, control: i64):
+        can Abort.Panic:
+            return if run.result != PENDING
+            run.time <- run.time + dt
+            a: f64 = accel(run, control)
+            run.pushing <- 1 if control == RIGHT else (-1 if control == LEFT else 0)
+            prior: f64 = run.velocity
+            run.velocity <- run.velocity + a * dt
+            run.velocity <- 0.0 if control == COAST and prior * run.velocity < 0.0
+            run.x <- run.x + run.velocity * dt
+            alpha: f64 = (GRAVITY * sin(run.theta) - a * cos(run.theta) + gust(run)) / length(run) - 0.1 * run.omega
+            run.omega <- run.omega + alpha * dt
+            run.theta <- run.theta + run.omega * dt
+            if magnitude(run.theta) > FALLEN:
+                run.result <- FELL
+                return
+            if run.x < 0.6 or run.x > TRACK - 0.6:
+                run.result <- BUFFER
+                return
+            target: f64 = run.course.flags[run.flag.usize()]
+            if magnitude(run.x - target) < 0.8 and magnitude(run.velocity) < 1.0 and magnitude(run.theta) < UPRIGHT:
+                run.still <- run.still + dt
+                if run.still >= 1.0:
+                    run.still <- 0.0
+                    run.flag <- run.flag + 1
+                    if run.flag == run.course.level.count:
+                        run.result <- PASSED
+                        return
+            else:
+                run.still <- 0.0
+            run.result <- TIMEOUT if run.time >= run.course.level.seconds
+
+    struct Gains:
+        x: f64
+        v: f64
+        theta: f64
+        omega: f64
+
+    def gains(pole: f64) -> Gains:
+        can Abort.Panic:
+            lengths: f64[6] = [0.8, 1.0, 1.4, 2.0, 3.0, 4.0]
+            rows: Gains[6] = [Gains{x: 4.198, v: 7.861, theta: 65.168, omega: 18.202},
+                Gains{x: 4.226, v: 8.13, theta: 69.53, omega: 21.482},
+                Gains{x: 4.26, v: 8.598, theta: 77.785, omega: 28.181},
+                Gains{x: 4.286, v: 9.203, theta: 89.453, omega: 38.594},
+                Gains{x: 4.308, v: 10.066, theta: 107.761, omega: 56.887},
+                Gains{x: 4.32, v: 10.818, theta: 125.173, omega: 76.261}]
+            return rows[0.usize()] if pole <= lengths[0.usize()]
+            for i in 1..<6 |pole, lengths, rows|:
+                if pole <= lengths[i.usize()]:
+                    a: Gains = rows[(i - 1).usize()]
+                    b: Gains = rows[i.usize()]
+                    lo: f64 = lengths[(i - 1).usize()]
+                    f: f64 = (pole - lo) / (lengths[i.usize()] - lo)
+                    return Gains{x: a.x + (b.x - a.x) * f, v: a.v + (b.v - a.v) * f,
+                        theta: a.theta + (b.theta - a.theta) * f, omega: a.omega + (b.omega - a.omega) * f}
+            return rows[5.usize()]
+
+    def pilot(run: Trial&, owed: mutable f64&) -> i64:
+        can Abort.Panic:
+            k: Gains = gains(length(run))
+            distance: f64 = run.x - run.course.flags[run.flag.usize()]
+            offset: mutable f64 = distance
+            offset <- -3.0 if distance < -3.0
+            offset <- 3.0 if distance > 3.0
+            lean: f64 = gust(run) / GRAVITY
+            wanted: f64 = k.x * offset + k.v * run.velocity + k.theta * (run.theta + lean) + k.omega * run.omega
+            desired: f64 = owed[0] * 0.9 + wanted
+            coast: f64 = accel(run, COAST)
+            left_error: f64 = magnitude(-12.0 - desired)
+            coast_error: f64 = magnitude(coast - desired)
+            right_error: f64 = magnitude(12.0 - desired)
+            control: i64 = LEFT if left_error <= coast_error and left_error <= right_error else (COAST if coast_error <= right_error else RIGHT)
+            owed[0] <- desired - accel(run, control)
+            return control
+
+    def play(course: Course) -> Trial:
+        can Abort.Panic:
+            run: mutable Trial = trial(course)
+            owed: mutable f64 = 0.0
+            while run.result == PENDING |run, owed|:
+                control: i64 = pilot(&run, &owed)
+                step(&run, 1.0 / 60.0, control)
+            return run
+
+    def deal(rung: i64, seed: i64) -> Course:
+        can Abort.Panic:
+            level: Grade = grade(rung)
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            first: Course = build(level, &rng)
+            if play(first).result == PASSED:
+                return first
+            for _attempt in 1..<20 |level, rng|:
+                course: Course = build(level, &rng)
+                if play(course).result == PASSED:
+                    return course
+            return first
+
+    def result_text(run: Trial&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if run.result == PASSED:
+                dstr_append_cstr(out, "Every flag, in ")
+                dstr_append_i64(out, py_round_half_even(run.time))
+                dstr_append_cstr(out, " s")
+            elif run.result == FELL:
+                dstr_append_cstr(out, "The pole fell")
+            elif run.result == BUFFER:
+                dstr_append_cstr(out, "The cart hit the buffers")
+            elif run.result == TIMEOUT:
+                dstr_append_cstr(out, "Out of time")

@@ -1,0 +1,350 @@
+include "../scene_video_sequence.elisa"
+
+extern SDL_strdup(value: cstr) -> mutable heap void&? can[Memory.Allocate]
+
+module SDLVideoSequence:
+    const ATTEMPTS: i64 = 6
+    const NO_LIBRARY: i64 = 1
+    const NO_FFMPEG: i64 = 2
+    const BAD_CLIPS: i64 = 3
+
+    struct Session:
+        run: mutable VideoSequence::Run
+        files: mutable usize
+        count: mutable i64
+        shown: mutable usize[ATTEMPTS * Jigsaw::MOST_PUZZLES]
+        shown_count: mutable i64
+        pixels: mutable usize
+        notice: mutable i64
+        options_row: mutable i64
+        options_from_hub: mutable bool
+        draft: mutable i64[4]
+
+    def clip_count(index: i64) -> i64:
+        return 1 if index == 0
+        return 3 if index == 1
+        return 5 if index == 2
+        return 8 if index == 3
+        return 12 if index == 4
+        return 20
+
+    def read_settings(data: heap u8&, size: i64, selected: mutable i64&):
+        can Abort.Panic, Unsafe.PointerCast:
+            cut: i64 = sdl_config_option(data, size, "VIDEO_SEQUENCE_PIECES", 0, -1)
+            rounds: i64 = sdl_config_option(data, size, "VIDEO_SEQUENCE_PUZZLES", 0, -1)
+            adaptive: i64 = sdl_config_option(data, size, "VIDEO_SEQUENCE_ADAPTIVE", 1, -1)
+            placed: i64 = sdl_config_option(data, size, "VIDEO_SEQUENCE_MARK_PLACED", 1, -1)
+            selected[0] <- cut if cut >= VideoSequence::FEWEST and cut <= VideoSequence::MOST
+            selected[1] <- rounds if VideoSequence::allowed_clips(rounds)
+            selected[2] <- adaptive if adaptive == 0 or adaptive == 1
+            selected[3] <- placed if placed == 0 or placed == 1
+
+    def open(seed: i64) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            selected: mutable i64[4] = [4, 5, 1, 0]
+            size: mutable i64 = 0
+            if sdl_media_config(&size) is raw:
+                trusted Unsafe.PointerCast:
+                    read_settings(raw.cast[heap u8&], size, &selected[0])
+                SDL_free(raw)
+            path: mutable u8[4096] = zeroed
+            if sdl_task_profile_sidecar(&path[0], ".video-sequence-options"):
+                if sdl_read_corpus(&path[0], &size) is raw:
+                    trusted Unsafe.PointerCast:
+                        read_settings(raw.cast[heap u8&], size, &selected[0])
+                    SDL_free(raw)
+            if malloc(size_of(Session).usize()) is memory:
+                trusted Unsafe.PointerCast:
+                    session: mutable heap Session& = memory.cast[mutable heap Session&]
+                    session.run <- VideoSequence::initialize(selected[0], selected[1], selected[2] == 1, selected[3] == 1, seed)
+                    session.files <- 0.usize()
+                    session.count <- 0
+                    session.shown_count <- 0
+                    session.pixels <- 0.usize()
+                    session.notice <- 0
+                    session.options_row <- -1
+                    session.options_from_hub <- false
+                    catalog(session)
+                    return memory.uintptr().i64()
+            return 0
+
+    def clear_clip(session: mutable Session&):
+        can Memory.Release, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                free(session.pixels.cast[heap void&]) if session.pixels != 0.usize()
+            session.pixels <- 0.usize()
+
+    def clear_catalog(session: mutable Session&):
+        can Memory.Release, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                SDL_free(session.files.cast[heap void&]) if session.files != 0.usize()
+            session.files <- 0.usize()
+            session.count <- 0
+
+    def clear_shown(session: mutable Session&):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                for index in 0..<session.shown_count |index, session|:
+                    SDL_free(session.shown[index.usize()].cast[heap void&])
+            session.shown_count <- 0
+
+    def close(handle: i64):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                clear_clip(session)
+                clear_catalog(session)
+                clear_shown(session)
+                free(handle.uintptr().cast[heap void&])
+
+    def start(session: mutable Session&) -> bool:
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if not VideoSequence::start(&session.run)
+            clear_shown(session)
+            session.notice <- 0
+            return true
+
+    def catalog(session: mutable Session&):
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            clear_catalog(session)
+            path: mutable u8[4096] = zeroed
+            return if sdl_data_path(&path[0], 4096.usize(), "/datasets/ucf101", 0, true) == 0.i32()
+            count: mutable i32 = 0.i32()
+            trusted Unsafe.PointerCast:
+                if SDL_GlobDirectory((&path[0]).cast[cstr], "*.avi", 0.u32(), (&count).uintptr()) is files:
+                    SDL_qsort(files, count.usize(), size_of(usize).usize(), sdl_compare_media_name)
+                    session.files <- files.uintptr()
+                    session.count <- count.i64()
+                    # The Python pool shuffles a spare list before the task
+                    # chooses from its sorted paths using the same RNG.
+                    for index in 1..<session.count |index, session|:
+                        _ = py_randbelow(&session.run.rng, (session.count - index + 1).u64())
+
+    def choose(session: mutable Session&) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            path: mutable u8[4096] = zeroed
+            size: mutable i64 = 0
+            unseen: mutable darray[i64] = []
+            fresh: mutable darray[i64] = []
+            trusted Unsafe.PointerCast:
+                target: mutable u8& = &path[0]
+                has_path: bool = sdl_data_path(target, 4096.usize(), "/datasets/ucf101/seen.txt", 0, true) != 0.i32()
+                raw: mutable heap void&? = sdl_read_corpus(target, &size) if has_path else null
+                files: heap usize& = session.files.cast[heap usize&]
+                for item in 0..<session.count |item, raw, size, files, session, unseen, fresh|:
+                    name: cstr = files[item.usize()].cast[cstr]
+                    seen: mutable bool = false
+                    if raw != null:
+                        data: heap void& = raw
+                        seen <- sdl_jigsaw_seen(data.cast[heap u8&], size, name)
+                    unseen.push(item) if not seen
+                    shown: mutable bool = false
+                    for prior in 0..<session.shown_count |prior, session, name, shown|:
+                        if SDL_strcmp(session.shown[prior.usize()].cast[cstr], name) == 0.i32():
+                            shown <- true
+                            break
+                    fresh.push(item) if not shown
+                SDL_free(raw) if raw != null
+                reset: bool = unseen.count == 0
+                pick: mutable i64 = 0
+                if not reset:
+                    pick <- unseen[py_randbelow(&session.run.rng, unseen.count.u64()).usize()]
+                elif fresh.count != 0:
+                    pick <- fresh[py_randbelow(&session.run.rng, fresh.count.u64()).usize()]
+                else:
+                    pick <- py_randbelow(&session.run.rng, session.count.u64()).i64()
+                name: cstr = files[pick.usize()].cast[cstr]
+                if has_path:
+                    sdl_jigsaw_note_photo(target, name, reset)
+                if SDL_strdup(name) is remembered:
+                    session.shown[session.shown_count.usize()] <- remembered.uintptr()
+                    session.shown_count <- session.shown_count + 1
+                return pick
+
+    def deal(session: mutable Session&) -> bool:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if session.run.phase != VideoSequence::PHASE_LOADING
+            clear_clip(session)
+            catalog(session)
+            session.notice <- NO_LIBRARY if session.count == 0 else BAD_CLIPS
+            best: mutable i64 = -1
+            best_frames: mutable i64 = 0
+            path: mutable u8[4096] = zeroed
+            trusted Unsafe.PointerCast:
+                target: mutable u8& = &path[0]
+                if session.count > 0:
+                    for attempt in 0..<ATTEMPTS |attempt, session, target, best, best_frames|:
+                        item: i64 = choose(session)
+                        continue if not sdl_catalog_path(target, "/datasets/ucf101/", session.files, item)
+                        if malloc((SDLVideoJigsaw::SEQUENCE_FRAME_BYTES * SDLVideoJigsaw::MAX_FRAMES).usize()) is data:
+                            pixels: mutable heap u8& = data.cast[mutable heap u8&]
+                            frames: i64 = SDLVideoJigsaw::decode(target.cast[cstr], pixels, false, true)
+                            motion: i64 = SDLVideoJigsaw::sequence_motion(pixels, frames, session.run.pieces)
+                            if motion > best:
+                                clear_clip(session)
+                                session.pixels <- data.uintptr()
+                                best <- motion
+                                best_frames <- frames
+                                break if motion >= SDLVideoJigsaw::SEQUENCE_MOTION_FLOOR
+                            else:
+                                free(data)
+                                if frames < 0:
+                                    session.notice <- NO_FFMPEG
+                                    break
+            if best_frames > 0:
+                session.notice <- 0
+                return VideoSequence::load_clip(&session.run, best_frames, SDL_GetTicks().i64())
+            _ = VideoSequence::unavailable(&session.run)
+            return false
+
+    def key(handle: i64, key: i64):
+        can Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return if handle <= 0 or key != 32
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                _ = start(session)
+
+    def pointer(handle: i64, motion: bool, x: f32, y: f32, width: i32, height: i32):
+        can Abort.Panic, Unsafe.PointerCast:
+            return if handle <= 0 or width <= 0.i32() or height <= 0.i32()
+            view: mutable f32[4] = zeroed
+            SDLGeometry::setup(&view[0], width, height)
+            nx: f64 = ((x - view[1]) / (view[0] * 912.0.f32())).f64()
+            ny: f64 = ((height.f32() - y - view[2]) / (view[0] * 684.0.f32())).f64()
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if session.options_row >= 0:
+                    if not motion:
+                        row: i64 = sdl_option_row(x, y, width, height, 4)
+                        if row >= 0:
+                            if row == session.options_row:
+                                change_option(session, 1)
+                            session.options_row <- row
+                    return
+                return if session.run.phase != Jigsaw::PHASE_SOLVING
+                position: i64 = VideoSequence::tile_at(width.f64(), height.f64(), session.run.active_pieces, nx * width.f64(), ny * height.f64())
+                if motion:
+                    session.run.hovered <- position
+                else:
+                    _ = VideoSequence::pick(&session.run, position, SDL_GetTicks().i64())
+
+    def prepare(renderer: mutable void&, handle: i64):
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            properties: u32 = SDL_GetRendererProperties(renderer)
+            now: mutable i64 = SDL_GetTicks().i64()
+            pixels: mutable usize = 0.usize()
+            pieces: mutable i64 = 0
+            trusted Unsafe.PointerCast:
+                if handle > 0:
+                    session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                    if VideoSequence::advance(&session.run, now):
+                        clear_clip(session)
+                    if session.run.phase == VideoSequence::PHASE_LOADING:
+                        _ = deal(session)
+                    pixels <- session.pixels
+                    pieces <- session.run.active_pieces if pixels != 0.usize()
+                    now <- SDL_GetTicks().i64()
+                prior: i64 = SDL_GetNumberProperty(properties, "nw.video.sequence.pieces", 0)
+                return if prior == 0 and pieces == 0
+                for piece in 0..<prior |piece, pieces, properties|:
+                    if piece >= pieces:
+                        key: mutable u8[48] = zeroed
+                        SDLFrame::sequence_texture_name(&key[0], piece)
+                        name: cstr = (&key[0]).cast[cstr]
+                        if SDL_GetPointerProperty(properties, name, null) is old:
+                            _ = SDL_ClearProperty(properties, name)
+                            SDL_DestroyTexture(old)
+                _ = SDL_SetNumberProperty(properties, "nw.video.sequence.pieces", pieces)
+                if pieces > 0:
+                    session: heap Session& = handle.uintptr().cast[heap Session&]
+                    for piece in 0..<pieces |piece, session, properties, renderer, now, pixels|:
+                        key: mutable u8[48] = zeroed
+                        SDLFrame::sequence_texture_name(&key[0], piece)
+                        name: cstr = (&key[0]).cast[cstr]
+                        if SDL_GetPointerProperty(properties, name, null) == null:
+                            if SDL_CreateTexture(renderer, 0x17101803.u32(), 1.i32(), SDLVideoJigsaw::SEQUENCE_WIDTH.i32(), SDLVideoJigsaw::SEQUENCE_HEIGHT.i32()) is texture:
+                                if not SDL_SetPointerProperty(properties, name, texture):
+                                    SDL_DestroyTexture(texture)
+                        if SDL_GetPointerProperty(properties, name, null) is texture:
+                            frame: i64 = VideoSequence::source_frame(&session.run, piece, now)
+                            if frame >= 0:
+                                source: void& = (pixels + (frame * SDLVideoJigsaw::SEQUENCE_FRAME_BYTES).usize()).cast[void&]
+                                _ = SDL_UpdateTexture(texture, null, source, (SDLVideoJigsaw::SEQUENCE_WIDTH * 3).i32())
+
+    def frame_write(dest: i64, capacity: i64, handle: i64, black: i64, width: i64, height: i64) -> i64:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            return 0 if dest <= 0 or capacity <= 0 or handle <= 0 or width <= 0 or height <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                notice: cstr = "No video library yet — see the Readme" if session.notice == NO_LIBRARY else ("Video Sequence needs the ffmpeg program — see the Readme" if session.notice == NO_FFMPEG else ("None of the downloaded clips would decode" if session.notice == BAD_CLIPS else ""))
+                list: mutable Display::DisplayList = Display::DisplayList()
+                if session.options_row >= 0:
+                    sdl_grid_options_frame(&list, black != 0, 46, session.options_row, (&session.draft[0]).cast[i64&])
+                else:
+                    SceneVideoSequence::render(&list, &session.run, black != 0, width.f64(), height.f64(), session.count, sview(notice, 0, -1))
+                encoded: darray[u8] = Display::encode_binary(&list)
+                length: i64 = encoded.count.i64()
+                return 0 if length <= 0 or length > capacity
+                memcpy(dest.uintptr().cast[mutable void&], (&encoded[0]).cast[void&], length.usize())
+                return length
+
+    def info(handle: i64, field: i64) -> i64:
+        can Unsafe.PointerCast:
+            return 0 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: heap Session& = handle.uintptr().cast[heap Session&]
+                return session.run.phase if field == 0
+                return session.run.puzzle if field == 1
+                return session.run.swaps if field == 2
+                return session.notice if field == 3
+                return 0
+
+    def change_option(session: mutable Session&, direction: i64):
+        can Abort.Panic:
+            row: i64 = session.options_row
+            if row == 0:
+                session.draft[0] <- VideoSequence::FEWEST + (session.draft[0] - VideoSequence::FEWEST + 7 + direction) % 7
+            elif row == 1:
+                for index in 0..<6 |index, session, direction|:
+                    if clip_count(index) == session.draft[1]:
+                        session.draft[1] <- clip_count((index + 6 + direction) % 6)
+                        break
+            else:
+                session.draft[row.usize()] <- 1 - session.draft[row.usize()]
+
+    def options_key(handle: i64, key: i64, from_hub: bool = false) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return 0 if handle <= 0
+            trusted Unsafe.PointerCast:
+                session: mutable heap Session& = handle.uintptr().cast[mutable heap Session&]
+                if session.options_row < 0:
+                    return 0 if key != 99 or (session.run.phase != Jigsaw::PHASE_READY and session.run.phase != Jigsaw::PHASE_DONE)
+                    session.draft[0] <- session.run.start_pieces
+                    session.draft[1] <- session.run.puzzles
+                    session.draft[2] <- 1 if session.run.adaptive else 0
+                    session.draft[3] <- 1 if session.run.mark_placed else 0
+                    session.options_row <- 0
+                    session.options_from_hub <- from_hub
+                    return 1
+                if SDLTaskKeys::enter(key):
+                    data: mutable u8[256] = zeroed
+                    length: i32 = SDL_snprintf(&data[0], 256.usize(),
+                        "[DEFAULT]\nVIDEO_SEQUENCE_PIECES = %lld\nVIDEO_SEQUENCE_PUZZLES = %lld\nVIDEO_SEQUENCE_ADAPTIVE = %s\nVIDEO_SEQUENCE_MARK_PLACED = %s\n",
+                        session.draft[0], session.draft[1], "True" if session.draft[2] == 1 else "False", "True" if session.draft[3] == 1 else "False")
+                    if length <= 0.i32() or length >= 256.i32() or not sdl_save_profile_sidecar(".video-sequence-options", &data[0], length.usize()):
+                        SDL_Log("Could not save Video Sequence options")
+                        return 1
+                    session.run.start_pieces <- session.draft[0]
+                    session.run.puzzles <- session.draft[1]
+                    session.run.adaptive <- session.draft[2] == 1
+                    session.run.mark_placed <- session.draft[3] == 1
+                    VideoSequence::reset(&session.run)
+                    session.notice <- 0
+                if key == 27 or SDLTaskKeys::enter(key):
+                    session.options_row <- -1
+                    return 2 if session.options_from_hub else 1
+                session.options_row <- SDLTaskKeys::option_row(key, session.options_row, 4)
+                if key == SDLTaskKeys::LEFT or key == SDLTaskKeys::RIGHT or key == 32:
+                    change_option(session, -1 if key == SDLTaskKeys::LEFT else 1)
+                return 1

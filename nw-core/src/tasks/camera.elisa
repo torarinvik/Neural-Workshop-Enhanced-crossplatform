@@ -1,0 +1,293 @@
+include "../rooms_view.elisa"
+include "../pymath.elisa"
+
+extern acos(x: f64) -> f64
+extern atan2(y: f64, x: f64) -> f64
+
+module Camera:
+    const FOV: f64 = 60.0
+    const ASPECT: f64 = 16.0 / 9.0
+    const EYE: f64 = 1.6
+    const STANDOFF: f64 = 0.6
+    const MOST_OBJECTS: i64 = 260
+    const FORWARD: i64 = 0
+    const BACK: i64 = 1
+    const LEFT: i64 = 2
+    const RIGHT: i64 = 3
+    const TURN_LEFT: i64 = 4
+    const TURN_RIGHT: i64 = 5
+    const LOOK_UP: i64 = 6
+    const LOOK_DOWN: i64 = 7
+    const RISE: i64 = 8
+    const SINK: i64 = 9
+    const MOVES: i64 = 10
+    const STEP_METRES: f64 = 1.0
+    const STEP_DEGREES: f64 = 15.0
+    const STEP_RISE: f64 = 0.5
+
+    struct Grade:
+        rung: i64
+        reach: f64
+        aim: f64
+        objects: i64
+        field: f64
+        kinds: i64
+        lift: f64
+        tilt: f64
+        occluders: i64
+        start: f64
+        turn: f64
+        meter: bool
+        anchors: i64
+
+    struct Pose:
+        x: f64
+        y: f64
+        z: f64
+        yaw: f64
+        pitch: f64
+
+    struct Thing:
+        shape: i64
+        colour: i64
+        x: f64
+        z: f64
+        size: f64
+        spin: f64
+        occluder: bool
+
+    struct Scene:
+        level: Grade
+        things: mutable darray[Thing]
+        target: mutable Pose
+        start: mutable Pose
+        valid: mutable bool
+
+    struct Frustum:
+        eye: RoomsView::Vec
+        forward: RoomsView::Vec
+        right: RoomsView::Vec
+        up: RoomsView::Vec
+
+    def min_value(x: f64, y: f64) -> f64:
+        return x if x < y else y
+
+    def max_value(x: f64, y: f64) -> f64:
+        return x if x > y else y
+
+    def clamp(x: f64, low: f64, high: f64) -> f64:
+        return min_value(high, max_value(low, x))
+
+    def absolute(x: f64) -> f64:
+        return -x if x < 0.0 else x
+
+    def radians(degrees: f64) -> f64:
+        return degrees * 0.017453292519943295
+
+    def degrees(radians: f64) -> f64:
+        return radians * 57.29577951308232
+
+    def wrap(yaw: f64) -> f64:
+        return yaw - floor(yaw / 360.0) * 360.0
+
+    def uniform(rng: mutable MT19937&, low: f64, high: f64) -> f64:
+        can Abort.Panic:
+            return low + (high - low) * py_random(rng)
+
+    def grade(rung: i64) -> Grade:
+        can Abort.Panic:
+            r: i64 = rung if rung > 0 else 1
+            k: f64 = (r - 1).f64()
+            growth: f64 = min_value(256.0, 2.2 * k + 0.06 * k * k)
+            objects: i64 = 4 + py_round_half_even(growth)
+            field: f64 = min_value(120.0, 7.0 + 1.6 * k + 0.04 * k * k)
+            distinct: f64 = (objects.f64() * pow(0.92, max_value(0.0, k - 6.0)))
+            kinds: i64 = min_value(objects.f64(), clamp(py_round_half_even(distinct).f64(), 3.0, 72.0)).i64()
+            return Grade{rung: r, reach: 3.0 * pow(0.72, k), aim: 30.0 * pow(0.76, k),
+                objects: objects, field: field, kinds: kinds,
+                lift: 0.0 if r < 6 else min_value(field * 0.25, 0.5 * (r - 5).f64()),
+                tilt: 6.0 if r < 6 else min_value(70.0, 6.0 + 4.0 * (r - 5).f64()),
+                occluders: 0 if r < 8 else (40 if r >= 27 else (r - 7) * 2),
+                start: min_value(field * 1.4, 1.2 + 1.3 * k),
+                turn: min_value(180.0, 15.0 + 22.0 * k), meter: r <= 3, anchors: 2 if r < 5 else 3}
+
+    def forward(pose: Pose&) -> RoomsView::Vec:
+        yaw: f64 = radians(pose.yaw)
+        pitch: f64 = radians(pose.pitch)
+        return RoomsView::vec(-sin(yaw) * cos(pitch), sin(pitch), -cos(yaw) * cos(pitch))
+
+    def distance(one: Pose&, two: Pose&) -> f64:
+        can Abort.Panic:
+            x: f64 = one.x - two.x
+            y: f64 = one.y - two.y
+            z: f64 = one.z - two.z
+            return sqrt(x * x + y * y + z * z)
+
+    def angle(one: Pose&, two: Pose&) -> f64:
+        can Abort.Panic:
+            return degrees(acos(clamp(RoomsView::dot(forward(one), forward(two)), -1.0, 1.0)))
+
+    def matches(pose: Pose&, target: Pose&, level: Grade&) -> bool:
+        can Abort.Panic:
+            return distance(pose, target) <= level.reach and angle(pose, target) <= level.aim
+
+    def closeness(pose: Pose&, target: Pose&, level: Grade&) -> f64:
+        can Abort.Panic:
+            if level.reach <= 0.0 or level.aim <= 0.0:
+                return 1.0 if matches(pose, target, level) else 0.0
+            worst: f64 = max_value(distance(pose, target) / level.reach, angle(pose, target) / level.aim)
+            return 1.0 / (1.0 + max_value(0.0, worst - 1.0) * 0.35)
+
+    def radius(thing: Thing&) -> f64:
+        return thing.size * (1.2 if thing.occluder else 0.62)
+
+    def clearance(x: f64, z: f64, things: darray[Thing]&, extra: f64, gap: f64 = 0.0) -> bool:
+        can Abort.Panic:
+            for thing in things |x, z, extra, gap|:
+                return false if py_hypot(x - thing.x, z - thing.z) <= radius(&thing) + extra + gap
+            return true
+
+    def place_things(level: Grade&, rng: mutable MT19937&) -> darray[Thing]:
+        can Memory.Allocate, Abort.Panic:
+            kinds: mutable darray[i64] = []
+            for kind in 0..<72 |kinds|:
+                kinds.push(kind)
+            py_shuffle_i64(rng, &kinds)
+            things: mutable darray[Thing] = []
+            _ = things.reserve((level.objects + level.occluders).usize())
+            field: f64 = level.field
+            for index in 0..<(level.objects + level.occluders) |level, rng, kinds, things, field|:
+                occluder: bool = index < level.occluders
+                size: f64 = uniform(rng, 2.2, 3.6) if occluder else uniform(rng, 0.6, 1.6)
+                extra: f64 = size * (1.2 if occluder else 0.62)
+                gap: f64 = 1.0 if occluder else 0.5
+                slot: i64 = (index - level.occluders) % level.kinds if not occluder else 0
+                kind: i64 = get kinds[slot.usize()] else 0
+                for attempt in 0..<(60 if occluder else 80) |rng, things, field, size, extra, gap, kind, occluder|:
+                    x: f64 = uniform(rng, -field, field)
+                    z: f64 = uniform(rng, -field, field)
+                    if clearance(x, z, &things, extra, gap):
+                        spin: f64 = uniform(rng, 0.0, 90.0 if occluder else 360.0)
+                        things.push(Thing{shape: 0 if occluder else kind / 12, colour: 12 if occluder else kind % 12,
+                            x: x, z: z, size: size, spin: spin, occluder: occluder})
+                        break
+            return things
+
+    def frustum(pose: Pose&) -> Frustum:
+        yaw: f64 = radians(pose.yaw)
+        pitch: f64 = radians(pose.pitch)
+        return Frustum{eye: RoomsView::vec(pose.x, pose.y, pose.z), forward: forward(pose),
+            right: RoomsView::vec(cos(yaw), 0.0, -sin(yaw)),
+            up: RoomsView::vec(sin(yaw) * sin(pitch), cos(pitch), cos(yaw) * sin(pitch))}
+
+    # Zero denotes a point outside the requested part of the frame. A visible
+    # point is always at positive depth and beyond the source's near plane.
+    def in_frame(view: Frustum&, point: RoomsView::Vec, margin: f64 = 0.8) -> f64:
+        relative: RoomsView::Vec = RoomsView::sub(point, view.eye)
+        depth: f64 = RoomsView::dot(relative, view.forward)
+        return 0.0 if depth <= 0.3
+        half_v: f64 = 0.5773502691896257
+        half_h: f64 = half_v * ASPECT
+        across: f64 = RoomsView::dot(relative, view.right) / depth
+        lift: f64 = RoomsView::dot(relative, view.up) / depth
+        return 0.0 if absolute(across) > half_h * margin or absolute(lift) > half_v * margin
+        return depth
+
+    def anchors(pose: Pose&, things: darray[Thing]&, field: f64) -> i64:
+        can Abort.Panic:
+            view: Frustum = frustum(pose)
+            far: f64 = 6.0 + field * 0.5
+            near: f64 = max_value(4.0, field * 0.3)
+            seen: mutable i64 = 0
+            close: mutable bool = false
+            for thing in things |view, far, near, seen, close|:
+                if not thing.occluder:
+                    depth: f64 = in_frame(&view, RoomsView::vec(thing.x, thing.size * 0.5, thing.z))
+                    if depth > 0.0 and depth <= far:
+                        seen <- seen + 1
+                        close <- true if depth <= near
+            return seen if close else 0
+
+    def choose_target(scene: mutable Scene&, rng: mutable MT19937&) -> bool:
+        can Abort.Panic:
+            field: f64 = scene.level.field
+            tilt: f64 = scene.level.tilt
+            lift: f64 = scene.level.lift
+            first: mutable i64 = 0
+            for thing in scene.things |first|:
+                break if not thing.occluder
+                first <- first + 1
+            count: i64 = scene.things.count.i64() - first
+            return false if count == 0
+            for attempt in 0..<4000 |scene, field, tilt, lift, rng, first, count|:
+                x: f64 = uniform(rng, -field, field)
+                z: f64 = uniform(rng, -field, field)
+                continue if not clearance(x, z, &scene.things, STANDOFF)
+                y: f64 = max_value(0.3, EYE + uniform(rng, -lift, lift))
+                pick: i64 = py_choice_index(rng, count)
+                subject: Thing = get scene.things[(first + pick).usize()] else zeroed
+                dx: f64 = subject.x - x
+                dz: f64 = subject.z - z
+                yaw: f64 = degrees(atan2(-dx, -dz)) + uniform(rng, -FOV * ASPECT / 6.0, FOV * ASPECT / 6.0)
+                flat: f64 = py_hypot(dx, dz)
+                down: f64 = degrees(atan2(subject.size * 0.5 - y, flat if flat > 0.0 else 1.0))
+                pitch: f64 = clamp(down + uniform(rng, -tilt, tilt) * 0.5, -tilt, tilt)
+                pose: Pose = Pose{x: x, y: y, z: z, yaw: wrap(yaw), pitch: pitch}
+                if anchors(&pose, &scene.things, field) >= scene.level.anchors:
+                    scene.target <- pose
+                    return true
+            return false
+
+    def choose_start(scene: Scene&, rng: mutable MT19937&) -> Pose:
+        can Abort.Panic:
+            level: Grade = scene.level
+            target: Pose = scene.target
+            bound: f64 = level.field + 2.0
+            behind: f64 = radians(target.yaw)
+            away: f64 = max_value(level.start, level.reach * 1.6)
+            for attempt in 0..<400 |scene, level, target, bound, behind, away, rng|:
+                heading: f64 = behind + radians(uniform(rng, -level.turn, level.turn))
+                x: f64 = target.x + sin(heading) * away
+                z: f64 = target.z + cos(heading) * away
+                continue if absolute(x) > bound or absolute(z) > bound or not clearance(x, z, &scene.things, STANDOFF)
+                yaw: f64 = wrap(target.yaw + uniform(rng, -level.turn, level.turn))
+                pose: Pose = Pose{x: x, y: EYE, z: z, yaw: yaw, pitch: 0.0}
+                return pose if not matches(&pose, &target, &level)
+            return Pose{x: target.x, y: EYE, z: target.z, yaw: wrap(target.yaw + 180.0), pitch: 0.0}
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Scene:
+        can Memory.Allocate, Abort.Panic:
+            level: Grade = grade(rung)
+            for attempt in 0..<30 |level, rng|:
+                scene: mutable Scene = Scene{level: level, things: place_things(&level, rng), target: zeroed,
+                    start: zeroed, valid: false}
+                if choose_target(&scene, rng):
+                    scene.start <- choose_start(&scene, rng)
+                    scene.valid <- true
+                    return scene
+            return Scene{level: level, things: [], target: zeroed, start: zeroed, valid: false}
+
+    def moved(pose: Pose&, movement: i64, amount: f64, level: Grade&) -> Pose:
+        rad: f64 = radians(pose.yaw)
+        x: mutable f64 = pose.x
+        y: mutable f64 = pose.y
+        z: mutable f64 = pose.z
+        yaw: mutable f64 = pose.yaw
+        pitch: mutable f64 = pose.pitch
+        if movement == FORWARD or movement == BACK:
+            walk: f64 = STEP_METRES * amount * (1.0 if movement == FORWARD else -1.0)
+            x <- x - sin(rad) * walk
+            z <- z - cos(rad) * walk
+        elif movement == LEFT or movement == RIGHT:
+            walk: f64 = STEP_METRES * amount * (1.0 if movement == RIGHT else -1.0)
+            x <- x + cos(rad) * walk
+            z <- z - sin(rad) * walk
+        elif movement == TURN_LEFT or movement == TURN_RIGHT:
+            yaw <- yaw + STEP_DEGREES * amount * (1.0 if movement == TURN_LEFT else -1.0)
+        elif movement == LOOK_UP or movement == LOOK_DOWN:
+            pitch <- pitch + STEP_DEGREES * amount * (1.0 if movement == LOOK_UP else -1.0)
+        elif level.lift > 0.0 and (movement == RISE or movement == SINK):
+            y <- y + STEP_RISE * amount * (1.0 if movement == RISE else -1.0)
+        bound: f64 = level.field + 2.0
+        return Pose{x: clamp(x, -bound, bound), y: clamp(y, 0.3, EYE + level.lift + 1.0), z: clamp(z, -bound, bound),
+            yaw: wrap(yaw), pitch: clamp(pitch, -89.0, 89.0)}

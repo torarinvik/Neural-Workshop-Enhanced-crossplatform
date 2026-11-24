@@ -1,27 +1,35 @@
 #!/usr/bin/env python3
 """Headless SDL/Python Syllogism settings compatibility and validation."""
+import argparse
 import os
 import ctypes
 import random
 import itertools
+import json
 import re
 import shlex
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('--runtime-object', type=Path)
+parser.add_argument('--compiler', type=Path)
+args = parser.parse_args()
 root=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(root/'shells/python'))
 import app
 flags=shlex.split(subprocess.check_output(['pkg-config','--cflags','--libs','sdl3'],text=True))
 with tempfile.TemporaryDirectory() as temp:
     tmp=Path(temp); path=tmp/'settings'
+    os.environ['NW_SYLLOGISM_SETTINGS_PATH']=str(path)
     object_file=tmp/'syllogism-options.o'
-    compiler=Path(os.environ.get('ELISACORE_BIN',root/'toolchain/elisac-stage0-seed'))
+    compiler = args.compiler or Path(os.environ.get('ELISACORE_BIN', root / 'toolchain/elisac-stage0-seed'))
     subprocess.run([str(compiler),'-emit','obj','-O2','-o',str(object_file),
                     str(root/'src/native/sdl_host.elisa')],check=True)
     shared=tmp/'options.dylib'
-    subprocess.run(['cc','-shared','-o',str(shared),str(object_file),*flags],check=True)
+    runtime = args.runtime_object or root / 'toolchain/elisacore_runtime.o'
+    subprocess.run(['cc','-shared','-o',str(shared),str(object_file),str(runtime),*flags],check=True)
     library=ctypes.CDLL(str(shared))
     input_key=library.nw_syllogism_input_key
     input_key.argtypes=[ctypes.c_int64]*4+[ctypes.POINTER(ctypes.c_int64)]
@@ -44,6 +52,42 @@ with tempfile.TemporaryDirectory() as temp:
     for row in range(5): assert input_pointer(200,474-row*48,1,0)==110+row
     assert input_pointer(200,100,1,0)==100 and input_pointer(600,100,1,0)==104
     assert input_pointer(100,474,1,0)==-1 and input_pointer(0,0,0,2)==0
+    start=library.nw_syllogism_results_start
+    start.argtypes=[ctypes.POINTER(ctypes.c_size_t),ctypes.POINTER(ctypes.c_int64)]
+    judge=library.nw_syllogism_results_judge
+    judge.argtypes=[ctypes.POINTER(ctypes.c_size_t)]+[ctypes.c_int64]*4
+    finish=library.nw_syllogism_results_finish
+    finish.argtypes=[ctypes.POINTER(ctypes.c_size_t)]+[ctypes.c_int64]*3
+    close=library.nw_syllogism_results_close
+    close.argtypes=[ctypes.POINTER(ctypes.c_size_t)]
+    manager=(ctypes.c_size_t*2)()
+    options=(ctypes.c_int64*5)(3,1,1,1,1)
+    prior=os.environ.get('NW_SYLLOGISM_RESULTS_DIR')
+    failed=tmp/'not-a-directory'; failed.write_text('retain me')
+    saved=tmp/'syllogism-results'
+    try:
+        os.environ['NW_SYLLOGISM_RESULTS_DIR']=str(failed)
+        start(manager,options)
+        judge(manager,1,3,1,1250)
+        judge(manager,1,3,1,1250)
+        finish(manager,1,3,1)
+        start(manager,options)
+        assert manager[1]
+        os.environ['NW_SYLLOGISM_RESULTS_DIR']=str(saved)
+        judge(manager,1,3,0,2500)
+        close(manager)
+        assert list(manager)==[0,0]
+        records=[json.loads(path.read_text()) for path in saved.glob('*.json')]
+        assert len(records)==2 and len({record['id'] for record in records})==2
+        completed=next(record for record in records if record['completed'])
+        partial=next(record for record in records if not record['completed'])
+        assert completed['options']==[3,1,1,1,1] and completed['right']==1 and completed['best_level']==3
+        assert completed['results'][0]['elapsed_ms']==1250 and len(completed['results'])==1
+        assert partial['results'][0]['correct'] is False and failed.read_text()=='retain me'
+        assert not list(saved.glob('*.tmp'))
+    finally:
+        if prior is None: os.environ.pop('NW_SYLLOGISM_RESULTS_DIR',None)
+        else: os.environ['NW_SYLLOGISM_RESULTS_DIR']=prior
     allowed=library.nw_syllogism_option_allowed
     allowed.argtypes=[ctypes.c_int64,ctypes.c_int64]; allowed.restype=ctypes.c_int64
     cycle=library.nw_syllogism_option_cycle
@@ -141,7 +185,7 @@ with tempfile.TemporaryDirectory() as temp:
     assert modify(ctypes.byref(o),0,1)==1 and o.level==8
     assert call('--syllogism-level','13')[0]==2
     assert call('--syllogism-level','  +3')[1].level==3
-    assert call('--syllogism-level','3 ')[0]==2
+    status,o=call('--syllogism-level','3 '); assert status==0 and o.level==3
     assert call('--syllogism-level','0'*300+'3')[1].level==3
     path.write_text('7 4 1 0 1\n'); assert call()[1].values()==(3,6,1,1,1)
     path.write_bytes(b'3 6 1 1 1\x00trailing'); assert call()[1].values()==(3,6,1,1,1)

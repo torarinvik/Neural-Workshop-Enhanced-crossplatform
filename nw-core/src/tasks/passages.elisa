@@ -1,0 +1,147 @@
+include "../strings.elisa"
+
+module Passages:
+    # The Python cache writer accepts ASCII letters and at most 13 letters for
+    # a passage word. Keep two packed words so the pair index can verify keys
+    # exactly, including when their table slots collide.
+    struct Word:
+        low: mutable u64
+        high: mutable u64
+        capitals: mutable u64
+        length: mutable i64
+
+    struct Row:
+        start: i64
+        stop: i64
+
+    struct Bank:
+        words: mutable darray[Word]
+        sentences: mutable darray[Row]
+        passages: mutable darray[Row]
+
+    struct Pair:
+        a_low: u64
+        a_high: u64
+        b_low: u64
+        b_high: u64
+
+    struct Index:
+        slots: mutable darray[Pair]
+        size: i64
+
+    def push_letter(word: mutable Word&, byte: i64):
+        upper: bool = byte >= 65 and byte <= 90
+        letter: u64 = (byte + 32 if upper else byte).u64()
+        k: i64 = word.length
+        if k < 8:
+            word.low <- word.low | (letter << (k * 8))
+        else:
+            word.high <- word.high | (letter << ((k - 8) * 8))
+        word.capitals <- word.capitals | (1.u64() << k) if upper
+        word.length <- k + 1
+
+    def letter(word: Word, at: i64) -> i64:
+        lower: u64 = (word.low >> (at * 8)) if at < 8 else (word.high >> ((at - 8) * 8))
+        byte: i64 = (lower & 255.u64()).i64()
+        return byte - 32 if ((word.capitals >> at) & 1.u64()) != 0.u64() else byte
+
+    def append_word(out: mutable dstr&, word: Word):
+        can Memory.Allocate, Abort.Panic:
+            for k in 0..<word.length |out, word|:
+                out.push(letter(word, k).u8())
+
+    # The caches consist of one passage or sentence per nonblank line.
+    # The fetched sentence bank omits punctuation. A passage has full stops.
+    def read(text: sview, paragraphs: bool, vocabulary: bool = false) -> Bank:
+        can Memory.Allocate, Abort.Panic:
+            bank: mutable Bank = Bank{words: [], sentences: [], passages: []}
+            word: mutable Word = zeroed
+            skip_word: mutable bool = false
+            sentence: mutable i64 = 0
+            passage: mutable i64 = 0
+            size: i64 = sview_len(text).i64()
+            for at in 0..<(size + 1) |text, paragraphs, vocabulary, bank, word, skip_word, sentence, passage, size|:
+                byte: i64 = sview_at(text, at.usize()).i64() if at < size else 10
+                alpha: bool = (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+                if alpha:
+                    if word.length == 16:
+                        return Bank{words: [], sentences: [], passages: []} if not vocabulary
+                        skip_word <- true
+                    else:
+                        push_letter(&word, byte)
+                    continue
+                if byte != 9 and byte != 10 and byte != 13 and byte != 32 and (byte != 46 or not paragraphs):
+                    return Bank{words: [], sentences: [], passages: []}
+                if word.length > 0:
+                    bank.words.push(word) if not skip_word
+                    word <- zeroed
+                    skip_word <- false
+                if byte == 10 or byte == 46:
+                    stop: i64 = bank.words.count.i64()
+                    if stop > sentence:
+                        bank.sentences.push(Row{start: sentence, stop: stop})
+                        sentence <- stop
+                if byte == 10:
+                    stop: i64 = bank.sentences.count.i64()
+                    if stop > passage:
+                        bank.passages.push(Row{start: passage, stop: stop})
+                        passage <- stop
+            return bank
+
+    def mix(n: u64) -> u64:
+        masked: u64 = n ^ (n >> 32)
+        return ((masked & 65535.u64()) * 16777619.u64()) ^ (masked >> 16)
+
+    def slot(index: Index&, a: Word, b: Word) -> i64:
+        can Abort.Panic:
+            hash: u64 = mix(a.low ^ mix(a.high)) ^ mix(b.low ^ mix(b.high)) * 65537.u64()
+            where: mutable i64 = (hash % index.size.u64()).i64()
+            while true |index, a, b, where|:
+                pair: Pair = index.slots[where.usize()]
+                return where if pair.a_low == 0.u64() or (pair.a_low == a.low and pair.a_high == a.high and pair.b_low == b.low and pair.b_high == b.high)
+                where <- (where + 1) % index.size
+
+    def contains(index: Index&, a: Word, b: Word) -> bool:
+        can Abort.Panic:
+            return index.slots[slot(index, a, b).usize()].a_low != 0.u64()
+
+    def fill(index: mutable Index&, bank: Bank&, single: bool):
+        can Abort.Panic:
+            blank: Word = zeroed
+            for row in bank.sentences |index, bank, single, blank|:
+                for at in row.start..<(row.stop if single else row.stop - 1) |index, bank, single, blank|:
+                    a: Word = bank.words[at.usize()]
+                    b: Word = blank if single else bank.words[(at + 1).usize()]
+                    where: i64 = slot(index, a, b)
+                    index.slots[where.usize()] <- Pair{a_low: a.low, a_high: a.high, b_low: b.low, b_high: b.high}
+
+    def table(capacity: i64) -> Index:
+        can Memory.Allocate, Abort.Panic:
+            size: i64 = capacity * 2 + 1
+            slots: mutable darray[Pair] = []
+            _ = slots.reserve(size.usize())
+            blank: Pair = zeroed
+            for _ in 0..<size |slots, blank|:
+                slots.push(blank)
+            return Index{slots: slots, size: size}
+
+    def index(sentences: Bank&, passages: Bank&) -> Index:
+        can Memory.Allocate, Abort.Panic:
+            list: mutable Index = table(sentences.words.count.i64() + passages.words.count.i64())
+            fill(&list, sentences, false)
+            fill(&list, passages, false)
+            return list
+
+    def known(words: Bank&) -> Index:
+        can Memory.Allocate, Abort.Panic:
+            list: mutable Index = table(words.words.count.i64())
+            fill(&list, words, true)
+            return list
+
+    def normalized(word: Word, first: bool, flat: bool, known: Index&) -> Word:
+        can Abort.Panic:
+            blank: Word = zeroed
+            result: mutable Word = word
+            if flat or (first and word.capitals <= 1.u64() and contains(known, word, blank)):
+                result.capitals <- 0.u64()
+            return result

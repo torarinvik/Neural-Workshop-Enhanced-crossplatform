@@ -1,0 +1,244 @@
+include "./steadicam.elisa"
+include "./drshape_audio.elisa"
+
+# The Steadicam screen's run of takes, on ClockedTask's clock: every advance
+# steps the take in hundred-and-twentieths of a second with the agent's port
+# for that frame if one came, else the first of the held keys in the
+# reference's order -- Left or A, Right or D, Up or W, Down or S, E, Q. A
+# drag with the primary button pans and tilts by the pixel; the wheel zooms.
+module SteadicamGame:
+    const READY: i64 = 0
+    const PLAYING: i64 = 1
+    const JUDGED: i64 = 2
+    const DONE: i64 = 3
+    const START: i64 = Steadicam::PORTS
+    const FEEDBACK: f64 = 2.5
+
+    struct Session:
+        rng: mutable MT19937
+        start_rung: mutable i64
+        total: mutable i64
+        adaptive: mutable bool
+        rung: mutable i64
+        trial: mutable i64
+        wins: mutable i64
+        best_rung: mutable i64
+        phase: mutable i64
+        time: mutable f64
+        deadline: mutable f64
+        run: mutable Steadicam::Run
+        owner: mutable Arena
+        held_keys: mutable i64
+        pulse: mutable i64
+        dragging: mutable bool
+        drag_x: mutable f64
+        drag_y: mutable f64
+
+    def initialize(rung: i64, trials: i64, adaptive: bool, seed: i64) -> Session:
+        rng: mutable MT19937 = zeroed
+        magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+        mt_seed_int(&rng, magnitude)
+        initial: i64 = Steadicam::grade(rung).rung
+        return Session{rng: rng, start_rung: initial, total: trials, adaptive: adaptive,
+            rung: initial, trial: 0, wins: 0, best_rung: 0, phase: READY, time: 0.0,
+            deadline: 0.0, run: zeroed, owner: zeroed, held_keys: 0, pulse: -1, dragging: false, drag_x: 0.0, drag_y: 0.0}
+
+    def close(session: mutable Session&):
+        can Abort.Panic, Memory.Release:
+            session.run <- zeroed
+            session.phase <- READY
+            session.held_keys <- 0
+            session.pulse <- -1
+            session.dragging <- false
+            arena_free(&session.owner) can Atomics{Exchange,Load,Store}, Unsafe{Alias,PointerCast,RawExtern,UncheckedIndex}, Global{Read,Write}
+
+    def allowed_rung(rung: i64) -> bool:
+        return rung == 1 or rung == 4 or rung == 7 or rung == 10 or rung == 13 or rung == 16 or rung == 20 or rung == 25 or rung == 30
+
+    def allowed_total(trials: i64) -> bool:
+        return trials == 1 or trials == 3 or trials == 5 or trials == 10 or trials == 20
+
+    def reconfigure(session: mutable Session&, rung: i64, trials: i64, adaptive: bool) -> bool:
+        can Abort.Panic, Memory.Release:
+            return false if session.phase != READY and session.phase != DONE
+            return false if not allowed_rung(rung) or not allowed_total(trials)
+            close(session) can Global{Read,Write}
+            session.start_rung <- rung
+            session.rung <- rung
+            session.total <- trials
+            session.adaptive <- adaptive
+            session.trial <- 0
+            session.wins <- 0
+            session.best_rung <- 0
+            return true
+
+    def next_trial(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            session.time <- now
+            session.pulse <- -1
+            if session.trial >= session.total:
+                session.phase <- DONE
+                return true
+            region scratch(1048576):
+                in scratch:
+                    park: Steadicam::Park = Steadicam::deal(session.rung, &session.rng)
+                    if not park.valid:
+                        session.phase <- DONE
+                        return false
+                    keys: i64 = session.held_keys
+                    close(session) can Global{Read,Write}
+                    session.held_keys <- keys
+                    owner: mutable Arena& = &session.owner
+                    in owner:
+                        session.run <- Steadicam::begin(park)
+            session.trial <- session.trial + 1
+            session.phase <- PLAYING
+            return true
+
+    def valid_time(session: Session&, now: f64) -> bool:
+        return now >= session.time and now <= 9007199254740.0
+
+    def start(session: mutable Session&, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if (session.phase != READY and session.phase != DONE) or session.total < 1
+            return false if not valid_time(session, now)
+            session.rung <- session.start_rung
+            session.trial <- 0
+            session.wins <- 0
+            session.best_rung <- 0
+            return next_trial(session, now) can Global{Read,Write}
+
+    def reserve_cues(session: mutable Session&, more: i64):
+        can Abort.Panic, Memory.Allocate:
+            _ = arena_da_reserve[DrShapeDeal::Note](&session.owner, &session.run.notes,
+                session.run.notes.count + more.usize()) can Global{Read,Write}
+
+    # ClockedTask.steer: every Steadicam port is a control for the frame it
+    # is sent in.
+    def input(session: mutable Session&, port: i64) -> bool:
+        return false if session.phase != PLAYING or port < 0 or port >= Steadicam::PORTS
+        session.pulse <- port
+        return true
+
+    # A click starts a take; during one, a drag with the primary button
+    # pans by fov / 900 a pixel across and tilts by as much a pixel up.
+    # Reference framebuffer coordinates with a bottom-left origin; kind 1 is
+    # a press, 0 a move, 2 a release.
+    def pointer(session: mutable Session&, x: f64, y: f64, kind: i64, now: f64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            if kind == 1 and (session.phase == READY or session.phase == DONE):
+                return (start(session, now) can Global{Read,Write})
+            if kind == 2 or session.phase != PLAYING:
+                changed: bool = session.dragging
+                session.dragging <- false
+                return changed
+            if kind == 1:
+                session.dragging <- true
+                session.drag_x <- x
+                session.drag_y <- y
+                return true
+            return false if kind != 0 or not session.dragging
+            k: f64 = session.run.fov / 900.0
+            run: mutable Steadicam::Run& = &session.run
+            run.yaw <- run.yaw + (x - session.drag_x) * k
+            tilt: f64 = run.pitch + (y - session.drag_y) * k
+            capped: f64 = tilt if tilt < 0.6 else 0.6
+            run.pitch <- capped if capped > -0.6 else -0.6
+            session.drag_x <- x
+            session.drag_y <- y
+            return true
+
+    # The wheel, in notches up: the field of view by exp(-0.08) a notch.
+    def wheel(session: mutable Session&, notches: f64) -> bool:
+        return false if session.phase != PLAYING
+        wide: f64 = session.run.fov * exp(-0.08 * notches)
+        narrow: f64 = wide if wide < Steadicam::fov_high() else Steadicam::fov_high()
+        session.run.fov <- narrow if narrow > Steadicam::fov_low() else Steadicam::fov_low()
+        return true
+
+    # Steadicam._held: the first port in the reference's order with a key down.
+    def held(session: Session&) -> i64:
+        keys: i64 = session.held_keys
+        return Steadicam::PAN_L if (keys & 3) != 0
+        return Steadicam::PAN_R if (keys & 12) != 0
+        return Steadicam::TILT_U if (keys & 48) != 0
+        return Steadicam::TILT_D if (keys & 192) != 0
+        return Steadicam::ZOOM_IN if (keys & 256) != 0
+        return Steadicam::ZOOM_OUT if (keys & 512) != 0
+        return -1
+
+    def judge(session: mutable Session&, now: f64):
+        passed: bool = session.run.result == Steadicam::PASSED
+        if passed:
+            session.wins <- session.wins + 1
+            session.best_rung <- session.rung if session.rung > session.best_rung
+        if session.adaptive:
+            session.rung <- session.rung + 1 if passed and session.rung < 9223372036854775807
+            session.rung <- session.rung - 1 if not passed and session.rung > 1
+        session.deadline <- now + FEEDBACK
+        session.phase <- JUDGED
+
+    def advance(session: mutable Session&, now: f64, stepped: bool = false) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not valid_time(session, now)
+            if session.phase == JUDGED:
+                return false if not stepped and now < session.deadline
+                return next_trial(session, now) can Global{Read,Write}
+            return false if session.phase != PLAYING
+            dt: f64 = fmin(0.1, now - session.time)
+            session.time <- now
+            control: i64 = session.pulse if session.pulse >= 0 else held(session)
+            session.pulse <- -1
+            steps: i64 = fmax(1.0, ceil(dt / (1.0 / 120.0))).i64()
+            quantum: f64 = dt / steps.f64()
+            reserve_cues(session, steps) can Global{Read,Write}
+            for _ in 0..<steps |session, quantum, control|:
+                Steadicam::step(&session.run, quantum, control)
+                break if session.run.result != Steadicam::LIVE
+            if session.run.result != Steadicam::LIVE:
+                judge(session, now)
+            return true
+
+    def agent_event(session: mutable Session&, now: f64, port: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return false if not valid_time(session, now)
+            return (start(session, now) can Global{Read,Write}) if port == START
+            return (advance(session, now, true) can Global{Read,Write}) if port == -1
+            return input(session, port)
+
+    # Left 1, A 2, Right 4, D 8, Up 16, W 32, Down 64, S 128, E 256, Q 512.
+    def hold_key(session: mutable Session&, key_bit: i64, down: bool) -> bool:
+        return false if key_bit <= 0 or key_bit > 512 or (key_bit & (key_bit - 1)) != 0
+        return false if down and session.phase != PLAYING
+        before: i64 = session.held_keys
+        session.held_keys <- before | key_bit if down else before & (1023 ^ key_bit)
+        return session.held_keys != before
+
+    def clear_controls(session: mutable Session&) -> bool:
+        changed: bool = session.held_keys != 0 or session.pulse >= 0 or session.dragging
+        session.held_keys <- 0
+        session.pulse <- -1
+        session.dragging <- false
+        return changed
+
+    def info(session: Session&, field: i64) -> i64:
+        can Abort.Panic:
+            return session.phase if field == 0
+            return session.rung if field == 1
+            return session.trial if field == 2
+            return session.total if field == 3
+            return session.wins if field == 4
+            return session.best_rung if field == 5
+            return session.start_rung if field == 6
+            return (1 if session.adaptive else 0) if field == 7
+            return session.run.result if field == 8
+            return py_round_half_even(session.run.t * 1000.0) if field == 9
+            return py_round_half_even(session.run.yaw * 1000.0) if field == 10
+            return py_round_half_even(session.run.pitch * 1000.0) if field == 11
+            return py_round_half_even(session.run.fov * 1000.0) if field == 12
+            return py_round_half_even(100.0 * Steadicam::share(&session.run)) if field == 13
+            return session.held_keys if field == 14
+            return Steadicam::whom(&session.run) if field == 15
+            return (1 if session.phase == PLAYING and Steadicam::in_frame(&session.run) else 0) if field == 16
+            return session.run.park.level.people if field == 17
+            return -1

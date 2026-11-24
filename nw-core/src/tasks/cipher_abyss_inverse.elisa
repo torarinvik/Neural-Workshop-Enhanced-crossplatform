@@ -1,0 +1,141 @@
+include "./cipher_abyss_mind.elisa"
+
+extend CipherLang:
+    struct Inverse:
+        # Both arrays use base-k row indices. order preserves the order
+        # of the outputs encountered while enumerating inputs.
+        inputs: darray[i64]
+        order: darray[i64]
+
+    def population(length: i64, k: i64) -> i64:
+        count: mutable i64 = 1
+        for _ in 0..<length |count, k|:
+            return 0 if count > 9223372036854775807 / k
+            count <- count * k
+        return count
+
+    def row_number(row: darray[i64]&, k: i64) -> i64:
+        value: mutable i64 = 0
+        for symbol in row:
+            return -1 if symbol < 0 or symbol >= k or value > (9223372036854775807 - symbol) / k
+            value <- value * k + symbol
+        return value
+
+    def numbered_row(number: i64, length: i64, k: i64) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            row: mutable darray[i64] = Ints::zeros(length)
+            value: mutable i64 = number
+            for offset in 0..<length |row, length, k, value|:
+                row[(length - 1 - offset).usize()] <- value % k
+                value <- value / k
+            return row
+
+    def encoded_output(program: darray[Node]&, rule: i64, input: i64, length: i64, k: i64) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            region scratch(8192):
+                in scratch:
+                    row: darray[i64] = numbered_row(input, length, k)
+                    initial: State = zeroed
+                    result: darray[i64] = run(program, rule, &row, k, &initial)
+                    return row_number(&result, k) if result.count.i64() == length else -1
+            return -1
+
+    def preimages(program: darray[Node]&, rule: i64, level: CipherAbyss::Grade) -> Inverse:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return zeroed if uses_state(program, rule)
+            length: i64 = level.length
+            k: i64 = level.symbols
+            count: i64 = population(length, k)
+            inputs: mutable darray[i64] = Ints::zeros(count)
+            order: mutable darray[i64] = []
+            for index in 0..<count |program, rule, length, k, inputs, order|:
+                output: i64 = encoded_output(program, rule, index, length, k)
+                return zeroed if output < 0 or inputs[output.usize()] != 0
+                inputs[output.usize()] <- index + 1
+                order.push(output)
+            return Inverse{inputs: inputs, order: order}
+
+    def inverse_lookup(table: Inverse&, output: i64) -> i64:
+        can Abort.Panic:
+            return -1 if output < 0 or output >= table.inputs.count.i64()
+            return table.inputs[output.usize()] - 1
+
+    def uniform_number(value: i64, length: i64, k: i64) -> bool:
+        number: mutable i64 = value
+        symbol: i64 = number % k
+        for _ in 0..<length |number, symbol, k|:
+            return false if number % k != symbol
+            number <- number / k
+        return true
+
+    def contains(entries: darray[i64]&, value: i64) -> bool:
+        for current in entries:
+            return true if current == value
+        return false
+
+    def invert_tests(program: darray[Node]&, rule: i64, survivors: darray[i64]&, earlier: darray[i64]&,
+                     level: CipherAbyss::Grade, draw: mutable MT19937&) -> darray[Probe]:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            count: i64 = population(level.length, level.symbols)
+            return [] if count <= 0 or count > 5000
+            mine: Inverse = preimages(program, rule, level)
+            return [] if mine.order.count == 0.usize()
+            tables: mutable darray[Inverse] = []
+            for entry in survivors:
+                table: Inverse = preimages(program, entry, level)
+                return [] if table.order.count == 0.usize()
+                tables.push(table)
+            opponents: mutable darray[Inverse] = []
+            for entry in earlier:
+                opponents.push(preimages(program, entry, level))
+            asked: mutable darray[i64] = []
+            questions: mutable darray[Probe] = []
+            for _ in 0..<level.tests |mine, tables, opponents, asked, questions, draw, level|:
+                best: mutable i64 = -1
+                score: mutable i64 = -1
+                for _ in 0..<80 |mine, tables, opponents, asked, draw, level, best, score|:
+                    output: i64 = mine.order[py_randbelow(draw, mine.order.count.u64()).usize()]
+                    input: i64 = inverse_lookup(&mine, output)
+                    continue if output == input or contains(&asked, output) or uniform_number(output, level.length, level.symbols)
+                    agrees: mutable bool = true
+                    for table in tables:
+                        agrees <- false if inverse_lookup(&table, output) != input
+                    continue if not agrees
+                    gain: mutable i64 = 0
+                    for table in opponents:
+                        gain <- gain + 1 if inverse_lookup(&table, output) != input
+                    if gain > score:
+                        score <- gain
+                        best <- output
+                return [] if best < 0
+                asked.push(best)
+                questions.push(Probe{values: numbered_row(best, level.length, level.symbols)})
+            return questions
+
+    def invert(program: darray[Node]&, player: mutable Mind&, output: darray[i64]&) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            level: CipherAbyss::Grade = player.level
+            value: i64 = row_number(output, level.symbols)
+            inputs: mutable darray[i64] = []
+            votes: mutable darray[i64] = []
+            for belief in player.testing:
+                input: mutable i64 = -1
+                region scratch(1048576):
+                    in scratch:
+                        inverse: Inverse = preimages(program, belief.entry, level)
+                        input <- inverse_lookup(&inverse, value)
+                if input >= 0:
+                    slot: mutable i64 = 0
+                    while slot < inputs.count.i64() and inputs[slot.usize()] != input |slot, inputs, input|:
+                        slot <- slot + 1
+                    if slot == inputs.count.i64():
+                        inputs.push(input)
+                        votes.push(0)
+                    votes[slot.usize()] <- votes[slot.usize()] + 1
+            player.answered <- player.answered + 1
+            player.split <- player.split + 1 if votes.count > 1.usize()
+            return sliced(output, 0, output.count.i64()) if votes.count == 0.usize()
+            best: mutable usize = 0.usize()
+            for i in 1..<votes.count.i64() |votes, best|:
+                best <- i.usize() if votes[i.usize()] > votes[best]
+            return numbered_row(inputs[best], level.length, level.symbols)

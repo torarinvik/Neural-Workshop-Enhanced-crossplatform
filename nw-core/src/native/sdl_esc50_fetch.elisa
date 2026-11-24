@@ -1,0 +1,166 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_json.elisa"
+include "./tuner_recordings.elisa"
+
+extern SDL_ReadProcess(process: mutable void&, size: mutable usize&?, status: mutable i32&?) -> mutable heap void&? can[Blocking.IO, Memory.Allocate]
+
+module SDLEsc50Fetch:
+    const ROWS: i64 = 2000
+    const PAGE_SIZE: i64 = 100
+    const PAGES: i64 = ROWS / PAGE_SIZE
+
+    def valid_http(url: sview) -> bool:
+        can Abort.Panic:
+            return (sview_starts_with(url, "https://") or sview_starts_with(url, "http://")) and not sview_contains_byte(url, 0.u8())
+
+    def curl_request(url: cstr, output: cstr, pipe: bool) -> mutable void&?:
+        can Blocking.IO, Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                args: mutable usize[22] = [
+                    "curl".cast[usize], "--disable".cast[usize], "--fail".cast[usize],
+                    "--globoff".cast[usize], "--silent".cast[usize], "--show-error".cast[usize], "--location".cast[usize],
+                    "--max-time".cast[usize], "30".cast[usize], "--max-filesize".cast[usize], "4194304".cast[usize],
+                    "--proto".cast[usize], "=http,https".cast[usize],
+                    "--proto-redir".cast[usize], "=http,https".cast[usize],
+                    "--user-agent".cast[usize], "neural-workshop".cast[usize],
+                    "--output".cast[usize], output.cast[usize], "--".cast[usize], url.cast[usize], 0.usize()]
+                return SDL_CreateProcess(&args[0], pipe)
+
+    def inspect_wave(arena: mutable Arena&, path: cstr) -> bool:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic:
+            bad: darray[u8] = []
+            bytes: darray[u8] = try read_entire_file(arena, path) else bad
+            info: TunerRecordings::Pcm = TunerRecordings::inspect(&bytes)
+            return info.frames > 0
+
+    def download_clip(directory: cstr, row: i64, source: sview) -> bool:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if not valid_http(source) or sview_len(source) >= 4096.usize()
+            path: mutable u8[4096] = zeroed
+            return false if not TunerRecordingFiles::clip_path(directory, row, &path[0])
+            trusted Unsafe.PointerCast:
+                target: cstr = (&path[0]).cast[cstr]
+                return false if file_exists(target)
+                url: mutable u8[4096] = zeroed
+                for i in 0..<sview_len(source) |url, source|:
+                    url[i] <- sview_at(source, i)
+                temporary: mutable u8[4160] = zeroed
+                length: i32 = SDL_snprintf(&temporary[0], 4160.usize(), "%s.%llu-%u.part", target, SDL_GetTicksNS(), SDL_rand_bits())
+                return false if length <= 0.i32() or length >= 4160.i32()
+                partial: cstr = (&temporary[0]).cast[cstr]
+                saved: mutable bool = false
+                if curl_request((&url[0]).cast[cstr], partial, false) is process:
+                    status: mutable i32 = -1.i32()
+                    done: bool = SDL_WaitProcess(process, true, &status)
+                    SDL_DestroyProcess(process)
+                    if done and status == 0.i32():
+                        region clip_memory(8388608):
+                            in clip_memory:
+                                arena: mutable Arena& = (&clip_memory).cast[mutable Arena&]
+                                if inspect_wave(arena, partial):
+                                    saved <- SDL_RenamePath(partial, target)
+                if not saved:
+                    _ = SDL_RemovePath(partial)
+                return saved
+
+    def row_url[@r](sound: JsonValueHandle[r]) -> sview @r:
+        can Abort.Panic:
+            if json_handle_is_object(sound):
+                item: JsonValueHandle[r] = try json_handle_get(sound, "src") else json_handle_null(sound)
+                return try json_handle_as_string(item) else ""
+            if json_handle_is_array(sound):
+                for i in 0..<json_handle_array_len(sound) |sound|:
+                    item: JsonValueHandle[r] = try json_handle_at(sound, i) else json_handle_null(sound)
+                    if json_handle_is_object(item):
+                        src: JsonValueHandle[r] = try json_handle_get(item, "src") else json_handle_null(sound)
+                        url: sview @r = try json_handle_as_string(src) else ""
+                        return url if sview_len(url) != 0.usize()
+            return ""
+
+    def take_rows[@r](arena: mutable Arena& @r, payload: sview, directory: cstr, offset: i64, remaining: i64) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            parsed: JsonParseResult[r] = json_parse_checked(arena, payload) can Global{Read,Write}
+            return -1 if parsed.code != JsonErrorCode.OK
+            root: JsonValueHandle[r] = json_handle_from_result(parsed)
+            rows: JsonValueHandle[r] = try json_handle_get(root, "rows") else json_handle_null(root)
+            return -1 if not json_handle_is_array(rows)
+            saved: mutable i64 = 0
+            for i in 0..<json_handle_array_len(rows) |rows, saved, directory, offset, remaining|:
+                entry: JsonValueHandle[r] = try json_handle_at(rows, i) else json_handle_null(rows)
+                index: JsonValueHandle[r] = try json_handle_get(entry, "row_idx") else json_handle_null(rows)
+                number: f64 = try json_handle_as_number(index) else -1.0
+                continue if number < offset.f64() or number >= (offset + PAGE_SIZE).f64()
+                row: i64 = number.i64()
+                continue if row.f64() != number
+                data: JsonValueHandle[r] = try json_handle_get(entry, "row") else json_handle_null(rows)
+                sound: JsonValueHandle[r] = try json_handle_get(data, "audio") else json_handle_null(rows)
+                if download_clip(directory, row, row_url(sound)):
+                    saved <- saved + 1
+                    break if saved >= remaining
+            return saved
+
+    def request_page(endpoint: cstr, directory: cstr, offset: i64, remaining: i64) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            url: mutable u8[4096] = zeroed
+            length: i32 = SDL_snprintf(&url[0], 4096.usize(),
+                "%s?dataset=renumics/esc50&config=default&split=train&offset=%lld&length=100", endpoint, offset)
+            return -1 if length <= 0.i32() or length >= 4096.i32()
+            trusted Unsafe.PointerCast:
+                if curl_request((&url[0]).cast[cstr], "-", true) is process:
+                    size: mutable usize = 0.usize()
+                    status: mutable i32 = -1.i32()
+                    buffer: mutable heap void&? = SDL_ReadProcess(process, &size, &status)
+                    SDL_DestroyProcess(process)
+                    if buffer is content:
+                        added: mutable i64 = -1
+                        if status == 0.i32() and size > 0.usize() and size <= 4194304.usize():
+                            region page_memory(16777216):
+                                in page_memory:
+                                    arena: mutable Arena& = (&page_memory).cast[mutable Arena&]
+                                    payload: sview = sview(content.cast[cstr], 0, size.i64())
+                                    added <- take_rows(arena, payload, directory, offset, remaining) can Global{Read,Write}
+                        SDL_free(content)
+                        return added
+            return -1
+
+    def installed(directory: cstr) -> i64:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            count: mutable i32 = 0.i32()
+            if SDL_GlobDirectory(directory, "???????.wav", 0.u32(), (&count).uintptr()) is files:
+                SDL_free(files)
+            return count.i64()
+
+    def run(wanted: i64) -> i32:
+        can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            path: mutable u8[4096] = zeroed
+            if sdl_data_path(&path[0], 4096.usize(), "/datasets/esc50", 0, true) == 0.i32():
+                SDL_Log("Could not locate the ESC-50 data directory")
+                return 1.i32()
+            trusted Unsafe.PointerCast:
+                directory: cstr = (&path[0]).cast[cstr]
+                if not SDL_CreateDirectory(directory):
+                    SDL_Log("Could not create %s", directory)
+                    return 1.i32()
+                endpoint: mutable cstr = "https://datasets-server.huggingface.co/rows"
+                if SDL_getenv("NW_ESC50_ROWS_URL") is override:
+                    endpoint <- override.cast[cstr]
+                if not valid_http(sview(endpoint, 0, -1)):
+                    SDL_Log("Invalid ESC-50 rows endpoint")
+                    return 2.i32()
+                count: mutable i64 = installed(directory)
+                failures: mutable i64 = 0
+                first: i64 = (SDL_rand_bits().u64() % PAGES.u64()).i64()
+                _ = printf("ESC-50: have %lld, want %lld in %s\n", count, wanted, directory)
+                for page in 0..<PAGES |count, failures, first, wanted, directory, endpoint|:
+                    break if count >= wanted or failures >= 5
+                    offset: i64 = ((first + page * 7) % PAGES) * PAGE_SIZE
+                    added: i64 = request_page(endpoint, directory, offset, wanted - count) can Global{Read,Write}
+                    if added < 0:
+                        failures <- failures + 1
+                    else:
+                        failures <- 0
+                        count <- installed(directory)
+                        _ = printf("ESC-50: %lld / %lld\n", count, wanted)
+                if count < wanted:
+                    SDL_Log("ESC-50 download incomplete (%lld / %lld). Check the connection and that curl is installed, then retry.", count, wanted)
+                    return 1.i32()
+                return 0.i32()

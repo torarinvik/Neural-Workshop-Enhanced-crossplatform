@@ -1,0 +1,126 @@
+include "./reading_quiz.elisa"
+include "./feeling_odds.elisa"
+
+module ReadingPeople:
+    # readingpeople.py: EmoBench stories. What the subject feels, then why,
+    # or the most helpful thing to do; past rung 9 all three mixed.
+    const ITEMS: i64 = 6
+    const FEEL: i64 = 0
+    const WHY: i64 = 1
+    const ACT: i64 = 2
+    # Story kinds: EmoBench's understanding and application sets, and
+    # anything else a file names, which is never asked about.
+    const UNDERSTAND: i64 = 0
+    const APPLY: i64 = 1
+    const OTHER: i64 = 2
+
+    struct Grade:
+        rung: i64
+        # One kind (FEEL, WHY or ACT), or -1 for all three.
+        kind: i64
+        seconds: f64
+
+    struct Story:
+        kind: i64
+        scenario: dstr
+        subject: dstr
+        choices: darray[dstr]
+        answer: i64
+        causes: darray[dstr]
+        cause: i64
+
+    struct Corpus:
+        stories: mutable darray[Story]
+
+    struct Round:
+        level: Grade
+        quiz: ReadingQuiz::Round
+
+    def grade(requested: i64) -> Grade:
+        r: i64 = requested if requested > 0 else 1
+        kind: i64 = FEEL if r < 4 else (WHY if r < 7 else (ACT if r < 10 else -1))
+        raw: f64 = 45.0 - 2.0 * (r - 1).f64()
+        return Grade{rung: r, kind: kind, seconds: raw if raw > 15.0 else 15.0}
+
+    def kind_name(kind: i64) -> cstr:
+        return "feel" if kind == FEEL
+        return "why" if kind == WHY
+        return "act"
+
+    def copy_of(text: dstr&) -> dstr:
+        can Abort.Panic, Memory.Allocate:
+            result: mutable dstr = []
+            for byte in text |result|:
+                result.push(byte)
+            return result
+
+    def item_of(level: Grade, story: Story&, kind: i64) -> ReadingQuiz::Item:
+        can Abort.Panic, Memory.Allocate:
+            ask: mutable dstr = []
+            truth: mutable dstr = copy_of(&story.choices[story.answer.usize()])
+            if kind == ACT:
+                dstr_append_cstr(&ask, "What would be most helpful for ")
+                dstr_append_dstr(&ask, story.subject)
+                dstr_append_cstr(&ask, " to do?")
+            else:
+                dstr_append_cstr(&ask, "How does ")
+                dstr_append_dstr(&ask, story.subject)
+                dstr_append_cstr(&ask, " feel?")
+            steps: mutable darray[ReadingQuiz::Step] = [ReadingQuiz::Step{ask: ask, options: story.choices,
+                answer: story.answer, wide: false, values: []}]
+            if kind == WHY:
+                why: mutable dstr = []
+                dstr_append_cstr(&why, "Why?")
+                steps.push(ReadingQuiz::Step{ask: why, options: story.causes, answer: story.cause, wide: false, values: []})
+                dstr_append_cstr(&truth, ": ")
+                dstr_append_dstr(&truth, story.causes[story.cause.usize()])
+            return ReadingQuiz::Item{prompt: story.scenario, steps: steps, seconds: level.seconds * steps.count.i64().f64(),
+                title: "A story", truth: truth, tolerance: 0.0, scored: false}
+
+    def build(level: Grade, draw: mutable MT19937&, corpus: Corpus&) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            count: i64 = corpus.stories.count.i64()
+            return zeroed if count == 0
+            # stories * max(1, ceil(60 / len(stories)))
+            copies: i64 = (60 + count - 1) / count
+            pool: mutable darray[i64] = []
+            for copy in 0..<(copies if copies > 1 else 1) |pool, count|:
+                for i in 0..<count |pool|:
+                    pool.push(i)
+            py_shuffle_i64(draw, &pool)
+            items: mutable darray[ReadingQuiz::Item] = []
+            worst: mutable f64 = 0.0
+            for index in pool |items, worst, level, draw, corpus|:
+                break if items.count.i64() >= ITEMS
+                # draw.choice(level.kinds), drawn for every story looked at;
+                # a choice of one still draws a bit.
+                pick: i64 = py_choice_index(draw, 1 if level.kind >= 0 else 3)
+                kind: i64 = level.kind if level.kind >= 0 else pick
+                story: Story = corpus.stories[index.usize()]
+                continue if kind != ACT and story.kind != UNDERSTAND
+                continue if kind == ACT and story.kind != APPLY
+                # Stories the reference could not ask (see decode_story).
+                continue if story.answer < 0 or story.choices.count.i64() > ReadingQuiz::PORTS
+                continue if kind == WHY and (story.cause < 0 or story.causes.count.i64() > ReadingQuiz::PORTS)
+                item: ReadingQuiz::Item = item_of(level, &story, kind)
+                chance: mutable f64 = 1.0
+                for step in item.steps |chance|:
+                    chance <- chance / step.options.count.i64().f64()
+                worst <- chance if chance > worst
+                items.push(item)
+            return zeroed if items.count.i64() < ITEMS
+            chance_need: i64 = FeelingOdds::need_for(ITEMS, worst)
+            # ceil(0.67 * 6)
+            need: i64 = chance_need if chance_need > 5 else 5
+            return Round{level: level, quiz: ReadingQuiz::Round{items: items, need: need}}
+
+    def deal(level: Grade, draw: mutable MT19937&, corpus: Corpus&) -> Round:
+        can Memory.Allocate, Abort.Panic:
+            for _ in 0..<40 |level, draw, corpus|:
+                next: mutable MT19937 = zeroed
+                mt_seed_int(&next, py_getrandbits(draw, 32))
+                round: Round = build(level, &next, corpus)
+                # The reference player answers every story right away, so
+                # every built round clears the score and time checks.
+                return round if round.quiz.items.count > 0.usize()
+            return zeroed

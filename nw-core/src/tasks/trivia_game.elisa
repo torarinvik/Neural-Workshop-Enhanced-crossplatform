@@ -65,6 +65,13 @@ module TriviaGame:
         right: mutable i64
         phase: mutable i64
         deal_seed: mutable i64
+        index_address: mutable usize
+        index_size: mutable i64
+        index_active: mutable bool
+        pool_size: mutable i64
+        index_question: mutable u8[180]
+        index_answers: mutable u8[320]
+        index_lengths: mutable i64[9]
 
     def clamp_rung(value: i64) -> i64:
         can Abort.Panic:
@@ -154,32 +161,81 @@ module TriviaGame:
                 else:
                     dstr_append_cstr(out, "No — it was \"")
                     answer_text: mutable dstr = []
-                    append_seed_field(&answer_text, run.option_id[run.answer.usize()], true)
+                    if not run.index_active:
+                        append_seed_field(&answer_text, run.option_id[run.answer.usize()], true)
+                    else:
+                        append_index_text(&answer_text, run, run.answer)
                     dstr_append_dstr(out, answer_text)
                     dstr_append_cstr(out, "\"")
             else:
                 append_done_message(out, run)
 
-    def deal_round(run: mutable TriviaRun&) -> bool:
+    def append_index_text(out: mutable dstr&, run: TriviaRun&, slot: i64):
         can Memory.Allocate, Abort.Panic:
+            length: i64 = run.index_lengths[(slot + 1).usize()]
+            for at in 0..<length |out, run, slot|:
+                if slot < 0:
+                    out.push(run.index_question[at.usize()])
+                else:
+                    out.push(run.index_answers[(slot * Trivia::ANSWER_LONGEST + at).usize()])
+
+    def store_index_text(run: mutable TriviaRun&, bank: mutable Trivia::TriviaBank&):
+        can Abort.Panic:
+            asked_at: i64 = Ints::at_ref(&bank.asked_at, run.question_id)
+            asked_n: i64 = Ints::at_ref(&bank.asked_n, run.question_id)
+            run.index_lengths[0] <- asked_n
+            for at in 0..<asked_n |run, bank, asked_at|:
+                run.index_question[at.usize()] <- Ints::at_ref(&bank.text, asked_at + at).u8()
+            for slot in 0..<run.option_count |run, bank|:
+                row: i64 = run.option_id[slot.usize()]
+                answer_at: i64 = Ints::at_ref(&bank.answer_at, row)
+                answer_n: i64 = Ints::at_ref(&bank.answer_n, row)
+                run.index_lengths[(slot + 1).usize()] <- answer_n
+                for at in 0..<answer_n |run, bank, slot, answer_at|:
+                    run.index_answers[(slot * Trivia::ANSWER_LONGEST + at).usize()] <- Ints::at_ref(&bank.text, answer_at + at).u8()
+
+    def deal_from_bank(run: mutable TriviaRun&, bank: mutable Trivia::TriviaBank&) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            run.pool_size <- bank.rows
+            work: mutable Trivia::TriviaWork = Trivia::new_work(bank.rows)
+            deal_rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&deal_rng, run.deal_seed.u64())
+            round: Trivia::TriviaRound = Trivia::generate(bank, &work, run.rung, &deal_rng)
+            return false if not round.given
+            run.question_id <- round.question
+            run.option_count <- round.options
+            run.answer <- round.answer
+            run.choice <- 0
+            run.answered <- -1
+            for at in 0..<Trivia::MOST_OPTIONS |at, run, work|:
+                run.option_id[at.usize()] <- Ints::at_ref(&work.options, at) if at < round.options else -1
+            store_index_text(run, bank) if run.index_active
+            return true
+
+    def deal_from_index(run: mutable TriviaRun&) -> bool:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
             made: mutable bool = false
+            region trivia_index_deal(1073741824):
+                in trivia_index_deal:
+                    trusted Unsafe.PointerCast:
+                        corpus: heap u8& = run.index_address.uintptr().cast[heap u8&]
+                        bank: mutable Trivia::TriviaBank = index_bank(corpus, run.index_size)
+                        if bank.rows >= 2:
+                            run.index_active <- true
+                            made <- deal_from_bank(run, &bank)
+                    destroy trivia_index_deal
+            return made
+
+    def deal_round(run: mutable TriviaRun&) -> bool:
+        can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
             run.deal_seed <- py_randbelow(&run.rng, 1073741824.u64()).i64()
+            return true if run.index_address != 0.usize() and deal_from_index(run)
+            run.index_active <- false
+            made: mutable bool = false
             region trivia_deal(67108864):
                 in trivia_deal:
                     bank: mutable Trivia::TriviaBank = seed_bank()
-                    work: mutable Trivia::TriviaWork = Trivia::new_work()
-                    deal_rng: mutable MT19937 = mt19937_new()
-                    mt_seed_int(&deal_rng, run.deal_seed.u64())
-                    round: Trivia::TriviaRound = Trivia::generate(&bank, &work, run.rung, &deal_rng)
-                    if round.given:
-                        run.question_id <- round.question
-                        run.option_count <- round.options
-                        run.answer <- round.answer
-                        run.choice <- 0
-                        run.answered <- -1
-                        for at in 0..<Trivia::MOST_OPTIONS |at, run, work|:
-                            run.option_id[at.usize()] <- Ints::at_ref(&work.options, at) if at < round.options else -1
-                        made <- true
+                    made <- deal_from_bank(run, &bank)
                     destroy trivia_deal
             return made
 
@@ -230,6 +286,10 @@ module TriviaGame:
             run.right <- 0
             run.phase <- PHASE_READY
             run.deal_seed <- 0
+            run.index_address <- 0.usize()
+            run.index_size <- 0
+            run.index_active <- false
+            run.pool_size <- 120
             for at in 0..<Trivia::MOST_OPTIONS |at, run|:
                 run.option_id[at.usize()] <- -1
 
@@ -288,7 +348,7 @@ module TriviaGame:
             if field == INFO_LAST_RIGHT: return run.last_right
             if field == INFO_RIGHT: return run.right
             if field == INFO_ASKED: return run.question_id
-            if field == INFO_POOL: return 120
+            if field == INFO_POOL: return run.pool_size
             if field == INFO_ADAPTIVE: return 1 if run.adaptive else 0
             if field == INFO_SHOW_ANSWER: return 1 if run.show_answer else 0
             if field == INFO_DEAL_QUESTION: return run.question_id
@@ -306,33 +366,43 @@ module TriviaGame:
     def render(run: TriviaRun&, black_background: bool, width: f64, height: f64,
                list: mutable Display::DisplayList&):
         can Memory.Allocate, Abort.Panic:
-            asked: mutable dstr = []
-            options_text: mutable dstr = []
-            starts: mutable i64[8] = zeroed
-            lengths: mutable i64[8] = zeroed
-            if run.phase == PHASE_ASKING or run.phase == PHASE_JUDGED:
-                append_seed_field(&asked, run.question_id, false)
-                for at in 0..<run.option_count |at, run, options_text, starts, lengths|:
-                    starts[at.usize()] <- options_text.count.i64()
-                    option: i64 = run.option_id[at.usize()]
-                    before: i64 = options_text.count.i64()
-                    append_seed_field(&options_text, option, true)
-                    lengths[at.usize()] <- options_text.count.i64() - before
-            options: mutable darray[sview] = []
-            for at in 0..<run.option_count |at, options, options_text, starts, lengths|:
-                options.push(string_view_slice(bytes_view(options_text), starts[at.usize()], starts[at.usize()] + lengths[at.usize()]))
-            message: mutable dstr = []
-            append_message(&message, run)
-            verdict_text: mutable dstr = []
-            if run.phase == PHASE_JUDGED:
-                dstr_append_cstr(&verdict_text, "Right" if run.last_right == 1 else "No")
-            scene_phase: i64 = SceneTrivia::PHASE_DONE if run.phase == PHASE_DONE else run.phase
-            paint: SceneTrivia::TriviaPaint = SceneTrivia::paint_of(black_background, width, height,
-                width / Display::REFERENCE_WIDTH, height / Display::REFERENCE_HEIGHT)
-            SceneTrivia::render(list, &paint, scene_phase,
-                run.phase == PHASE_ASKING or run.phase == PHASE_JUDGED,
-                bytes_view(asked), options, run.choice, run.answered, run.answer,
-                run.show_answer, false, sview("Trivia is on its seed questions -- for the whole bank run python -m neural_workshop.trivia", 0, -1),
-                120, run.trial, run.total_trials, bytes_view(message),
-                run.last_right if run.phase == PHASE_JUDGED else -1,
-                bytes_view(verdict_text))
+            region frame(67108864):
+                in frame:
+                    asked: mutable dstr = []
+                    options_text: mutable dstr = []
+                    starts: mutable i64[8] = zeroed
+                    lengths: mutable i64[8] = zeroed
+                    if run.phase == PHASE_ASKING or run.phase == PHASE_JUDGED:
+                        if not run.index_active:
+                            append_seed_field(&asked, run.question_id, false)
+                        else:
+                            append_index_text(&asked, run, -1)
+                        for at in 0..<run.option_count |at, run, options_text, starts, lengths|:
+                            starts[at.usize()] <- options_text.count.i64()
+                            option: i64 = run.option_id[at.usize()]
+                            before: i64 = options_text.count.i64()
+                            if not run.index_active:
+                                append_seed_field(&options_text, option, true)
+                            else:
+                                append_index_text(&options_text, run, at)
+                            lengths[at.usize()] <- options_text.count.i64() - before
+                    options: mutable darray[sview] = []
+                    for at in 0..<run.option_count |at, options, options_text, starts, lengths|:
+                        options.push(string_view_slice(bytes_view(options_text), starts[at.usize()], starts[at.usize()] + lengths[at.usize()]))
+                    message: mutable dstr = []
+                    append_message(&message, run)
+                    verdict_text: mutable dstr = []
+                    if run.phase == PHASE_JUDGED:
+                        dstr_append_cstr(&verdict_text, "Right" if run.last_right == 1 else "No")
+                    scene_phase: i64 = SceneTrivia::PHASE_DONE if run.phase == PHASE_DONE else run.phase
+                    paint: SceneTrivia::TriviaPaint = SceneTrivia::paint_of(black_background, width, height,
+                        width / Display::REFERENCE_WIDTH, height / Display::REFERENCE_HEIGHT)
+                    SceneTrivia::render(list, &paint, scene_phase,
+                        run.phase == PHASE_ASKING or run.phase == PHASE_JUDGED,
+                        bytes_view(asked), options, run.choice, run.answered, run.answer,
+                        run.show_answer, run.index_active, sview("Trivia is on its built-in questions", 0, -1),
+                        run.pool_size, run.trial, run.total_trials, bytes_view(message),
+                        run.last_right if run.phase == PHASE_JUDGED else -1,
+                        bytes_view(verdict_text))
+
+include "./trivia_index.elisa"

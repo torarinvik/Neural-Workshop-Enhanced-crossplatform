@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory() as temp:
     assert core.actions[-2:]==[(0,0),(6,2)]
     session.pointer(456,300,912,684); assert core.actions[-1]==(0,0)
     session.close(); assert core.destroyed[-1]==2
-    hub=app.TaskHubSession(core,args()); hub.category=4; hub.selected=11
+    hub=app.TaskHubSession(core,args()); hub.category=4; hub.selected=12
     hub.key(key.C,key); assert isinstance(hub.child,app.SyllogismSession) and hub.child.options_draft is not None
     hub.key(key.ESCAPE,key); assert hub.child is None
 print('Syllogism Python host: settings, cancellation, apply, keyboard and menu routing pass')

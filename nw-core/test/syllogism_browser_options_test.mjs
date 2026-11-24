@@ -10,8 +10,8 @@ const storage=new Map();
 const context=vm.createContext({SYLLOGISM_OPTIONS_STORAGE:'options',SYLLOGISM_LEVEL_OPTIONS:[1,2,3,4,5,6,7,8,9,10,11,12],
   SYLLOGISM_TRIAL_OPTIONS:[1,2,3,5,6,8,10,15], localStorage:{getItem:k=>storage.get(k)??null,setItem:(k,v)=>storage.set(k,v)},
   referencePointFromEvent:event=>event,setScreen:value=>{screen=value;},draw:()=>{},
-  isTaskId:()=>true, API_TASK:{syllogism:1n}, apiCreateRun:(...args)=>{created=args;return 44n;}, apiDestroyRun:()=>destroyed++,BigInt});
-vm.runInContext(`let syllogismOptionsDraft=null,syllogismOptionsReturnScreen=null,syllogismOptionsSelection=0,syllogismRunHandle=0n;\n${read}\n${options}\n${controller}`,context);
+  isTaskId:()=>true, API_TASK:{syllogism:1n}, apiCreateRun:(...args)=>{created=args;return 44n;}, apiDestroyRun:()=>destroyed++,upsertResultRecord:()=>({ok:true}),BigInt});
+vm.runInContext(`let syllogismOptionsDraft=null,syllogismOptionsReturnScreen=null,syllogismOptionsSelection=0,syllogismRunHandle=0n,syllogismRunStats=null,syllogismFailedResults=[],syllogismSessionSerial=0,resultStoreMessage="";\n${read}\n${options}\n${controller}`,context);
 assert.deepEqual(JSON.parse(JSON.stringify(vm.runInContext('syllogismOptions',context))),
   {level:3,trials:6,showWorking:true,adaptive:true,realWords:true});
 context.openSyllogismOptions('task');

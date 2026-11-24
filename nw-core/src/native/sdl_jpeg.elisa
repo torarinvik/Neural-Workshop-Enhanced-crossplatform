@@ -1,0 +1,88 @@
+# Decode the original dataset JPEGs with the stable TurboJPEG C API.
+extern SDL_LoadObject(path: cstr) -> mutable void&? can[Blocking.IO]
+extern SDL_LoadFunction(library: mutable void&, name: cstr) -> usize can[Blocking.IO]
+extern SDL_UnloadObject(library: mutable void&) can[Blocking.IO]
+extern SDL_CreateSurfaceFrom(width: i32, height: i32, format: u32, pixels: mutable void&, pitch: i32) -> mutable void&? can[Memory.Allocate]
+
+def sdl_jpeg_library_name() -> cstr:
+    can Abort.Panic, Unsafe.PointerCast:
+        platform: i64 = SDL_GetPlatform().uintptr().i64()
+        return "libturbojpeg.0.dylib" if syllogism_argument_is(platform, "macOS") else ("turbojpeg.dll" if syllogism_argument_is(platform, "Windows") else "libturbojpeg.so.0")
+
+def sdl_packaged_library(name: cstr) -> mutable void&?:
+    can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+        trusted Unsafe.PointerCast:
+            if SDL_GetBasePath() is base:
+                path: mutable u8[4096] = zeroed
+                windows: bool = syllogism_argument_is(SDL_GetPlatform().uintptr().i64(), "Windows")
+                folder: cstr = "" if windows else "lib/"
+                length: i32 = SDL_snprintf(&path[0], 4096.usize(), "%s%s%s", base.cast[cstr], folder, name)
+                if length > 0.i32() and length < 4096.i32():
+                    return SDL_LoadObject((&path[0]).uintptr().cast[cstr])
+            return null
+
+def sdl_jpeg_library() -> mutable void&?:
+    can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+        trusted Unsafe.PointerCast:
+            if SDL_getenv("NW_JPEG_LIBRARY") is path:
+                return SDL_LoadObject(path.cast[cstr]) if path != 0.u8()
+            name: cstr = sdl_jpeg_library_name()
+            if sdl_packaged_library(name) is library:
+                return library
+            return SDL_LoadObject(name)
+
+def sdl_jpeg_package_selftest() -> i32:
+    can Blocking.IO, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        if sdl_packaged_library(sdl_jpeg_library_name()) is library:
+            valid: bool = SDL_LoadFunction(library, "tjInitDecompress") != 0.usize() and SDL_LoadFunction(library, "tjDestroy") != 0.usize() and SDL_LoadFunction(library, "tjDecompressHeader3") != 0.usize() and SDL_LoadFunction(library, "tjDecompress2") != 0.usize()
+            SDL_UnloadObject(library)
+            if valid:
+                _ = printf("Packaged TurboJPEG selftest: PASS\n")
+                return 0.i32()
+        SDL_Log("Could not load TurboJPEG decoder from the application package")
+        return 1.i32()
+
+def sdl_jpeg_decode(renderer: mutable void&, library: mutable void&, data: heap void&, length: usize) -> mutable void&?:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        trusted Unsafe.PointerCast:
+            init: usize = SDL_LoadFunction(library, "tjInitDecompress")
+            close: usize = SDL_LoadFunction(library, "tjDestroy")
+            read: usize = SDL_LoadFunction(library, "tjDecompressHeader3")
+            decode: usize = SDL_LoadFunction(library, "tjDecompress2")
+            return null if init == 0.usize() or close == 0.usize() or read == 0.usize() or decode == 0.usize()
+            initialize: fn() -> mutable void&? = init.cast[fn() -> mutable void&?]
+            destroy: fn(mutable void&) -> i32 = close.cast[fn(mutable void&) -> i32]
+            header: fn(usize, usize, usize, usize, usize, usize, usize) -> i32 = read.cast[fn(usize, usize, usize, usize, usize, usize, usize) -> i32]
+            decompress: fn(usize, usize, usize, usize, i32, i32, i32, i32, i32) -> i32 = decode.cast[fn(usize, usize, usize, usize, i32, i32, i32, i32, i32) -> i32]
+            instance: mutable void&? = initialize()
+            return null if instance == null
+            handle: mutable void& = instance
+            width: mutable i32 = 0.i32()
+            height: mutable i32 = 0.i32()
+            subsampling: mutable i32 = 0.i32()
+            colorspace: mutable i32 = 0.i32()
+            status: i32 = header(handle.uintptr(), data.uintptr(), length, (&width).uintptr(), (&height).uintptr(), (&subsampling).uintptr(), (&colorspace).uintptr())
+            texture: mutable void&? = null
+            if status == 0.i32() and width > 0.i32() and height > 0.i32() and width.i64() * height.i64() <= 16777216:
+                pitch: i32 = width * 3.i32()
+                if SDL_malloc((pitch.i64() * height.i64()).usize()) is pixels:
+                    # TJPF_RGB is zero, with bytes in the same order as SDL RGB24.
+                    if decompress(handle.uintptr(), data.uintptr(), length, pixels.uintptr(), width, pitch, height, 0.i32(), 0.i32()) == 0.i32():
+                        if SDL_CreateSurfaceFrom(width, height, 0x17101803.u32(), pixels.cast[mutable void&], pitch) is surface:
+                            texture <- SDL_CreateTextureFromSurface(renderer, surface)
+                            SDL_DestroySurface(surface)
+                    SDL_free(pixels)
+            _ = destroy(handle)
+            return texture
+
+def sdl_jpeg_texture(renderer: mutable void&, path: cstr) -> mutable void&?:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        if sdl_jpeg_library() is library:
+            length: mutable usize = 0.usize()
+            texture: mutable void&? = null
+            if SDL_LoadFile(path, &length) is data:
+                texture <- sdl_jpeg_decode(renderer, library, data, length) if length <= 33554432.usize()
+                SDL_free(data)
+            SDL_UnloadObject(library)
+            return texture
+        return null

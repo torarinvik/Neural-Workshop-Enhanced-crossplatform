@@ -4,6 +4,258 @@ Document version: 3.85
 Prepared: 2026-09-13; updated: 2026-11-09
 Status: implementation backlog; no completion claim is implied by this document.
 
+**SDL input migration checkpoint (2026-11-14):** key-to-action mapping for 33
+tasks now lives in `nw-core/src/native/sdl_task_keys.elisa`, called through the
+native FFI. Headless mapping tests passed with the available Stage0 and Stage1
+products; a temporary optimized application linked and passed the task options,
+3D N-Back, Tetris, Count, Mr. Time, Sokoban, Monkey Ladder, Jigsaw, Sudoku,
+Go, N-Cup Monte, Lookout, Pursuit, Out of Sight, Buzz Wire, Donkey, Two Hands,
+Overrun, Scrabble, Crossword, Crossed Wires, and Marble Maze self-tests. The selected Stage1 product
+is currently older than its source, so this diagnostic does not qualify as a
+fresh-compiler artifact promotion. Further C shell migration remains open.
+Shared option-menu key translation for Algebra, Numberology, Scramble,
+Scrabble, and Crossword also now runs in Elisa. Headless mapping checks and
+temporary native task self-tests passed; these do not exercise full SDL event
+delivery or establish fresh-compiler artifact acceptance.
+Their option-row selection and repeat-click value changes now run in Elisa as
+well, with headless checks against both available compiler stages.
+Numberology, Algebra, and Scramble pointer handling now delegates option
+clicks, controller starts, and Numberology paging and result transitions to
+Elisa. The headless native checks cover those paths and the dummy-video event
+loop still passes with the available (stale) Stage1 compiler.
+SDL text-event routing for Numberology, Algebra, and Scramble now runs in
+Elisa, including phase and option gating and Scramble space suppression.
+A temporary native build passed controller comparisons and the dummy-video
+event-loop replay; the routing check is included in the SDL build gate.
+Numberology option text editing now processes complete text events in Elisa;
+headless checks cover mixed UTF-8, embedded terminators, and numeric overflow.
+The shared SDL pointer normalization for controller routes has also moved to
+Elisa; headless edge-coordinate checks and temporary native task self-tests
+passed. Syllogism keyboard dispatch now shares Elisa controller and option-state
+handling with pointer input. Headless key/apply and pointer checks passed,
+as did the dummy-video task-hub replay and the available Stage1 semantic gate.
+Syllogism pointer handling now runs in Elisa, including option selection and
+application, settings persistence, trial starts, and hub cleanup. Headless
+checks passed using isolated settings and results directories.
+Non-hub key routing and its task-priority decisions now run in Elisa.
+Headless controller comparisons cover the grouped routes, Go, Marble Maze,
+Algebra options, and Tetris frame equivalence; the event replay also passed.
+Mouse-event routing for controller, option, and word-task pointers now runs in
+Elisa. Headless comparisons cover the seven pixel routes, five option overlays,
+and Scramble text-input start; the dummy-video event replay also passed.
+Key-down orchestration (option cancellation, exit, hub navigation and launch)
+and key-up/focus-loss routing now run in Elisa. The dummy-video replay passed
+all 37 direct and hub routes and five option cancellations; controller checks
+covered key releases and focus loss. This remains diagnostic with the available
+older Stage1 compiler product.
+The 37 controller handle/mode rows are now bound in Elisa from contiguous
+state, and the text-event and frame-option tables are derived from shared
+overlay rows there. Headless address, text, frame snapshot, and dummy-video
+route checks passed with the available compiler product.
+Elisa also initializes and binds all six option overlays, including draft
+defaults, controller state, editing flags, and result managers. The headless
+binding checks and dummy-video replay passed with the available Stage1 product.
+Hub launches now reuse the shared Elisa handle/mode rows, removing the
+duplicated C launch tables. All 37 direct and hub launches/exits and five
+option cancellations passed the dummy-video replay.
+SDL text events now dispatch across Scramble, Numberology, and Algebra in
+Elisa, preserving task order, option editing, and space suppression. Headless
+controller checks and the direct/hub event replay passed.
+SDL diagnostic command dispatch now runs in Elisa, and obsolete C helpers
+and declarations were removed. A temporary diagnostic build passed all 44
+self-test commands, word-corpus and settings suites, and the headless replay.
+The SDL multi-frame title decoder self-test now runs in Elisa, retaining
+its text-pool bounds checks and first/last-frame diagnostics. The 180-frame
+binary check, long-text rendering, and direct/hub headless replay passed.
+The SDL long-text software-renderer self-test now runs through Elisa FFI,
+including offscreen surface creation, pixel reads, and cleanup. Its binary
+check, 180-frame decoder check, and direct/hub headless replay passed.
+The SDL task-options self-test now runs in Elisa, retaining default and
+configured argument checks plus Numberology editing and overflow checks.
+The binary self-test and direct/hub headless replay passed.
+The SDL Algebra options self-test now runs in Elisa, preserving parser,
+option-change, controller, and edited-response checks. Its binary check and
+headless direct/hub replay passed.
+The SDL Scramble self-test now runs in Elisa, retaining seeded text, corpus
+replacement, answer, and options checks. Its binary check, corpus suite,
+and headless direct/hub replay passed.
+The SDL Crossword self-test now runs in Elisa, retaining options, reserved
+keys, lexicon, controller, and pointer checks. Its binary check, corpus suite,
+and headless direct/hub replay passed.
+The SDL Scrabble self-test now runs in Elisa, retaining option parsing, the
+seeded deal, controller and pointer assertions, and decoded frame checks.
+Its binary self-test, corpus suite, and headless event replay passed.
+The SDL Algebra controller self-test now runs in Elisa, retaining complete
+source-derived fractional and large-CRT feedback comparisons. Its binary
+check and the headless direct/hub replay passed.
+The SDL Numberology controller self-test now runs in Elisa, including its
+large exact-answer and decoded-frame checks. Its binary test, results suite,
+and the headless direct/hub replay passed.
+The SDL task-hub and Marble Maze self-tests now run in Elisa, preserving
+frame text-pool and serialized board checks. Both binary checks and the
+direct/hub headless replay passed.
+SDL self-tests for 3D Maze, Sokoban, Monkey Ladder, and 3D N-Back now run
+in Elisa, including their frame decoding and state-transition checks. All
+four binary checks and the direct/hub headless replay passed.
+SDL self-tests for Jigsaw, Sudoku, Go, Crossed Wires, In the Dark,
+Removals, and Chain of Custody now run in Elisa. Their binary checks and
+direct/hub headless replay passed.
+Eight more SDL self-tests now run in Elisa: Mr. Time, Graph Mapping, Matrix
+Reasoning, Fog of War, Concentration, Seen It Before, Trivia, and Reflex.
+Their binary checks and the direct/hub headless replay passed.
+Nine SDL self-tests for N-Cup Monte, Moving Targets, Lookout, Pursuit, Out
+of Sight, Buzz Wire, Donkey, Two Hands, and Overrun now run in Elisa and
+decode their frames. All nine binary checks and the headless replay passed.
+The SDL Tetris and Count controller/frame self-tests now run in Elisa, with
+frame buffers released on both normal and allocation-failure paths. Their
+headless binary checks and the direct/hub event replay passed.
+The Numberology result-lifecycle self-test now runs entirely in Elisa. Its
+headless binary check verified the completed persisted record, and the
+Numberology results suite and task-hub replay passed.
+Crossword, Scrabble, and Scramble settings self-test commands now execute
+in Elisa. Temporary-binary checks passed shared Python persistence, CLI
+precedence, invalid-file fallback, and the headless task-hub replay.
+The SDL word-corpus binary self-test now runs in Elisa through the same FFI
+constructors and cleanup paths. The headless binary corpus suite passed,
+including missing, invalid, explicit, default, and boundary cases.
+Final SDL shutdown now collects all owned controller handles in Elisa, even
+when their modes are inactive, and closes both results managers. Headless
+checks covered all 37 handles, repeated shutdown, and both managers.
+The dummy-video event replay now also starts and exits each of the 37 direct
+screens through the real SDL loop. It passed alongside all hub launches and
+five option-screen cancellations without focusing a desktop window.
+Direct SDL screen startup now creates and selects controllers in Elisa using
+shared active-task state. Headless checks cover all 37 direct routes, failed
+creation, text-input requests, hub replay, and window-failure cleanup.
+Screen-constructor option assembly now runs in Elisa for startup and hub
+launches. Headless field-mapping checks and the launch/exit replay passed.
+SDL startup now coordinates all six native task configuration parsers and
+Scramble corpus paths in Elisa. Headless comparisons matched the individual
+parsers, rejected invalid input, and passed the full task-hub event replay.
+The six SDL frame-option snapshots now run in Elisa, including the distinct
+Numberology and Syllogism layouts. Headless value comparisons and the full
+dummy-video launch/exit replay passed with the Stage1 semantic gate.
+The SDL key and pixel-pointer routing lists now derive from the shared
+Elisa active-controller state. Headless slot checks and the task-hub event
+replay passed with the available Stage1 semantic gate.
+Per-frame active-controller snapshots for all 37 frame routes and 22 timed
+routes now come from Elisa. Headless slot checks and the full dummy-video
+launch/exit replay passed with the available Stage1 semantic gate.
+The SDL fallback playback toggle and frame-step timing now run in Elisa.
+The dummy-video replay now checks that every one of 37 task launches returns
+to the hub on Escape, along with five option-screen cancellations.
+Task-hub active-task detection, category navigation, and launch-key routing
+now run in Elisa. The headless event replay passed all 37 task launches and
+five options routes with the available Stage1 semantic gate.
+Task-hub controller launch and option-overlay initialization now run in
+Elisa. Headless checks cover all launch routes, configurable overlays,
+failed lexicon creation, and text-input requests.
+Task-hub exit routing for all 37 controllers now runs in Elisa, preserving
+controller destruction order and text-input stop requests without closing
+results managers. Headless per-controller checks and the event replay passed.
+Escape handling for all six task option overlays now runs in Elisa, including
+hub-owned controller destruction and text-input cleanup requests. Headless
+checks covered hub and non-hub cancellation for each task.
+Numberology keyboard dispatch now runs in Elisa, including option editing,
+settings and controller replacement, result transitions, and hub cleanup.
+Headless checks and the available Stage1 semantic gate and event replay passed.
+Algebra keyboard dispatch, settings application, controller replacement, and
+hub cleanup now run in Elisa. Headless settings, start, and editing checks
+passed with the available Stage1 semantic gate and dummy-video replay.
+Scramble keyboard dispatch and option application now run in Elisa, with
+SDL text-input start/stop requests returned to the shell. Isolated settings,
+start, submit, suppression, and hub-cleanup checks passed headlessly.
+Scrabble and Crossword keyboard dispatch and option application now run in
+Elisa. Isolated settings, controller starts, and Scrabble hub cleanup passed
+headless tests, along with the dummy-video replay and Stage1 semantic gate.
+Scrabble and Crossword pointer routing, including option-menu gating,
+button selection, and Scrabble motion, now also runs in Elisa. Headless
+controller comparisons and the dummy-video event replay passed.
+Seven pixel-coordinate pointer routes now share an Elisa dispatcher, which
+filters button and motion events before forwarding to the active controllers.
+Headless comparisons covered each route and its ignored event type.
+Ten pointer-event routes, including Scrabble's click-to-start path,
+now dispatch to controllers in Elisa; fixed-clock native comparisons matched
+the prior direct calls. Real platform pointer delivery remains to be verified.
+Crossword and Scrabble lexicon loading, validation, and buffer ownership now
+run in Elisa. A temporary native library passed missing-default, missing-explicit,
+empty, invalid, and valid-file checks against both real controllers; both native
+task self-tests passed. The selected Stage1 product was stale for these checks.
+Scramble controller creation and corpus ownership now also run in Elisa; a
+temporary native library passed missing-explicit, default fallback, and
+index-only, sentence-only, and combined corpus checks, plus its task self-test.
+Scramble corpus CLI argument parsing now runs in Elisa; missing-path errors are
+checked by the regular headless SDL corpus test.
+Crossword and Scrabble creation now also includes lexicon loading and cleanup
+in Elisa. Native tests passed creation with valid and missing explicit files and
+Scramble's 4,096/4,097-byte default-sentence boundary.
+The SDL build gate now runs these word-corpus creation and fallback checks
+against its own headless executable; a temporary diagnostic build passed them.
+Algebra, Numberology, and Scramble text-task keyboard decisions now also use
+the shared Elisa mapper; phase, modifier, paging, submit, and delete cases
+passed headless mapping checks and temporary native task self-tests.
+Key-to-controller action dispatch for 31 SDL task routes now also runs in
+Elisa. A fixed-clock native comparison exercised start, directional, digit,
+letter, and submit keys against the prior direct-controller call paths.
+Marble Maze and Buzz Wire key releases also dispatch through Elisa and matched
+the direct paths in the same headless test.
+The SDL shell now delegates its four groups of simple task-key branches to
+Elisa; headless tests cover every group, branch priority, and ignored keys.
+Task-hub launch routing and configurable controller creation now also use the
+Elisa screen dispatcher.
+Their SDL clipboard allocation, routing, and release now run in Elisa. A
+process-local clipboard stub verified null and text input against all three
+real native controllers without touching the system clipboard.
+Task-hub navigation and reserved global exit keys are mapped in Elisa too;
+headless mapping checks and temporary task-hub/word-task self-tests passed.
+Fixed task-hub construction defaults for 27 controllers have moved to Elisa.
+A headless native comparison created each through both the hub and the direct
+ABI, checked initial information where available, and destroyed both; all
+passed with the temporary diagnostic build.
+Those same defaults now serve direct SDL screen launches, and all 38 accepted
+screen names are resolved by Elisa; both compiler stages passed routing checks.
+All 37 direct-screen controller creations now route through Elisa, including
+configured task settings and corpus paths. A temporary native comparison
+matched the previous constructors, including non-default settings and missing
+explicit-corpus errors.
+Startup failure selection and diagnostics also run in Elisa, with one SDL
+cleanup path. The frame buffer is released on startup failure and normal exit;
+dummy-video Crossword and Scrabble failed launches passed headlessly.
+SDL video initialization, window/renderer creation, frame-buffer ownership,
+and window/renderer cleanup now run through Elisa FFI. Dummy-driver tests
+passed open, repeat close, unavailable-driver failure, and the complete
+task-hub event replay without focusing a desktop window.
+The regular SDL build gate also injects initialization, window, renderer, and
+buffer-allocation failures and verifies resource-release order. Frame-buffer
+allocation now rejects nonpositive sizes before calling the allocator.
+SDL frame clearing, display decoding, rendering, presentation, and pacing now
+run through Elisa FFI. Stage0 and the available Stage1 passed a headless
+software-renderer comparison with the previous direct rendering path, and
+a temporary Stage1 application passed the dummy-video event-loop replay.
+The Stage1 product remains stale, so this is diagnostic rather than fresh
+compiler acceptance. The remaining SDL C shell is not yet fully migrated.
+Normal SDL shutdown now destroys all 37 controller types and closes both
+result managers in Elisa. A headless native test exercised each controller,
+repeat shutdown, and both managers with persisted records.
+Task-hub cleanup for those 27 controllers also routes through Elisa. The same
+headless comparison now exercises the migrated cleanup path for every case.
+Per-frame timing for 22 active-controller routes now runs in Elisa through one
+SDL FFI call. A fixed-clock native comparison matched direct calls for all 22,
+including Marble's elapsed-time state and inactive-controller behavior.
+The SDL build gate now runs an Elisa lifecycle self-test covering all 27 fixed
+routes and rejecting unsupported hub positions; the temporary diagnostic build
+passed it without opening a window. The same gate now also invokes the frame
+advance dispatcher for each of its 22 timed controller routes, key and frame
+dispatch for all 27 fixed routes, and pointer dispatch for the five applicable
+routes. The gate also creates and shuts down all 34 non-corpus direct screens;
+the isolated corpus test covers the other three. A dummy-video event-loop replay
+drives all 37 task-hub launches and five options routes with scripted key
+events. Real platform focus and physical input remain unverified.
+The SDL shell's main task-frame choices, options screens, and hub/title fallback
+now use an Elisa dispatcher. Headless native tests compared encoded frames
+byte for byte with direct writers, including all six options screens and their
+priority order.
+
 **Current application-artifact/compiler boundary (2026-11-09):** the selected
 external Elisa Stage1 source-fresh product is
 `main@d3b2e657d57c159c77b9523542f21fd67a93b916`, source fingerprint
@@ -4033,6 +4285,12 @@ fallbacks for optional allocation-profiler hooks emitted by newer compiler
 runtimes when profiling is disabled. These are host-startup and scope checks,
 not evidence that Python or SDL already implement the catalog.
 
+Subsequent migration note: the current Python build uses the selected full
+runtime object instead of that legacy shim. The old C fallback has been
+replaced by `nw-core/src/native/pymodule_runtime_shim.elisa`; its optional
+profiler and callback ABI is tested with both available compiler stages. This
+fallback is not claimed as a substitute for the required full runtime.
+
 **Focused Marble correction recorded for the current refresh (2026-09-17):**
 the fallback adapter's public `step(dt)` now has the same boundary as the
 native `Simulation.step(dt)`: positive finite direct steps advance elapsed time
@@ -6648,15 +6906,45 @@ direct number-key answers; its headless host tests pass. The Python shell now
 has the corresponding session, menu route and options in source, with headless
 host tests; SDL settings code shares its validated on-disk format. The native
 exports and full desktop routes still need a fresh build and verification. SDL
-controller routing is wired in source, including keyboard and pointer options;
-it still needs a fresh native build and end-to-end verification. Result
-persistence and other task-specific gates remain open.
+controller routing is wired in source, including keyboard and pointer options.
+A temporary diagnostic SDL build using the stale Stage1 product passed the
+Syllogism lifecycle self-test and the Numberology, task-options, and long-text
+checks. A temporary native ABI library from that same stale compiler also
+matched 12 source-oracle sessions (24 questions), per-question timing and result
+records, and five options frames; the
+fresh native build and end-to-end verification remain outstanding. A separate
+temporary SDL ABI replay also matches all five Numberology source-derived
+sessions, including feedback, scores, adaptive progression, hidden answers, and
+reconstructed long-sequence and answer pages. A temporary stale-Stage1 WASM
+diagnostic passed those session and paging replays as well as Syllogism source
+sessions and its real-controller browser-results retry test. This exposed and
+fixed protocol rejection of Numberology page actions. A wider headless artifact
+run passed through the generated Marble session matrix, including both
+Syllogism result tests; its 55-second diagnostic limit stopped the remaining
+Marble checks. The subsequent generated held-input play test also exceeded an
+individual 45-second limit while executing MuJoCo simulation; it produced no
+assertion failure before termination and is not a completed test. The run was
+therefore not a complete artifact-gate pass. The original Syllogism UI keeps
+per-question results in memory; its `score()` exposes elapsed seconds. The web shell now persists judged Syllogism results in the shared ledger,
+with headless tests for retries, restarts and duplicate prevention. The Python
+shell also writes and retries per-session Syllogism results, with headless
+lifecycle tests. The SDL source now records Syllogism transitions using an
+Elisa atomic result manager; standalone Stage0/Stage1 ABI retry tests pass.
+A temporary stale-compiler native replay also verified the real controller’s
+transition adapter writes one completed session and its measured duration.
+The Python host also wrote a source-derived completed result against that
+temporary native ABI; its Python-extension replay awaits a fresh build.
+Fresh full-artifact and cross-platform result verification remain open.
 The Syllogism SDL settings helper has now been ported from C to Elisa, using
 SDL3 FFI for environment and file operations; the Stage0-compiled ABI is
 covered by direct headless tests. The rest of the SDL C shell and other C files
 remain to be migrated, and the complete Stage1 artifact remains unverified.
-The Numberology SDL results manager, serialization, and atomic file writes now
-run in Elisa through SDL FFI. Headless tests cover path selection, collisions,
+SDL text routing for Numberology, Algebra and Scramble also runs in Elisa;
+a temporary stale-Stage1 native executable passed the corresponding headless
+Numberology lifecycle, Algebra options and Scramble self-tests.
+The Numberology SDL transition adapter, results manager, serialization, and
+atomic file writes now run in Elisa through SDL FFI. A temporary native
+executable passed the real lifecycle and result-file check. Headless tests cover path selection, collisions,
 atomic replacement, duplicate notifications, and failed-save retry.
 
 **Reference discovery:** Read premise generation, askable relations, ordering, labels, and entailment rules. Read the environment wrapper's action mapping and compare it with the actual UI handlers; record any difference in the replay specification.
@@ -6667,7 +6955,7 @@ atomic replacement, duplicate notifications, and failed-save retry.
 
 **Delivery checklist:**
 
-- [ ] Record source-derived phases, options, action vocabulary, generation, and grading.
+- [x] Record source-derived phases, options, action vocabulary, generation, and grading: `nw-core/docs/replays/syllogism.md`.
 - [ ] Connect the kernel/controller to exports and all three shells using the shared protocol.
 - [x] Drive at least one complete run from the real menu with ordinary input. Headed Playwright evidence covers Games → Reasoning → Syllogisms → Space, generated answer selection through ordinary arrow keys and Enter submission across all five questions, and terminal `done · question 5/5 · right 5`; capture: `nw-core/output/playwright/syllogisms-headed-complete.png`. No browser console errors occurred.
 - [ ] Compare generated state, action outcomes, feedback, and score against the original.

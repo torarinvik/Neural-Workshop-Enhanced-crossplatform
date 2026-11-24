@@ -40,7 +40,12 @@ class PrepareRuntimeSourcesTest(unittest.TestCase):
                 Path(temporary),
                 "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa",
             )
+            wasm = project / "src" / "wasm"
+            wasm.mkdir()
+            transient = wasm / "wasm_exports_stage1.abcdef.elisa"
+            transient.write_text(f'include "{compiler}/elisacore_std/elisacore_runtime.elisa"\n', encoding="utf-8")
             count = prepare(project, output, compiler)
+            self.assertFalse((output / "src" / "wasm" / transient.name).exists())
 
             self.assertEqual(1, count)
             source = (output / "test" / "case.elisa").read_text(encoding="utf-8")

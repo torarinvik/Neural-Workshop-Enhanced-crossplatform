@@ -1,0 +1,288 @@
+include "../rooms_view.elisa"
+include "../pymath.elisa"
+
+module Mirror:
+    const SAME: i64 = 0
+    const MIRROR: i64 = 1
+    const RADIANS: f64 = 0.017453292519943295
+
+    struct Grade:
+        rung: i64
+        cubes: i64
+        most: f64
+        options: i64
+        nudged: i64
+        any_axis: bool
+        lit: bool
+
+    struct Cube:
+        x: i64
+        y: i64
+        z: i64
+
+    struct Shape:
+        cubes: mutable Cube[11]
+        count: mutable i64
+
+    struct Turns:
+        rows: mutable Cube[24]
+        count: mutable i64
+
+    struct Matrix:
+        x: RoomsView::Vec
+        y: RoomsView::Vec
+        z: RoomsView::Vec
+
+    struct Figure:
+        shape: Shape
+        turn: Matrix
+
+    struct Puzzle:
+        seed: i64
+        level: Grade
+        reference: Figure
+        others: Figure[5]
+        angles: f64[5]
+        count: i64
+        answer: i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        extra: i64 = (r - 6) / 5 if r > 6 else 0
+        most: f64 = 40.0 + 28.0 * (r - 1).f64() if r < 7 else (60.0 + 40.0 * (r - 7).f64() if r < 10 else 180.0)
+        return Grade{rung: r, cubes: 7 + extra if extra < 4 else 11,
+            most: most, options: 0 if r < 13 else (3 if r < 16 else (4 if r < 21 else 5)),
+            nudged: 0 if r < 16 else (1 if r < 21 else 4), any_axis: r >= 7, lit: r < 25}
+
+    def cube(x: i64, y: i64, z: i64) -> Cube:
+        return Cube{x: x, y: y, z: z}
+
+    def step(c: Cube, axis: i64, sign: i64) -> Cube:
+        return cube(c.x + sign if axis == 0 else c.x, c.y + sign if axis == 1 else c.y, c.z + sign if axis == 2 else c.z)
+
+    def has(shape: Shape&, item: Cube, except_index: i64 = -1) -> bool:
+        can Abort.Panic:
+            for i in 0..<shape.count |shape, item, except_index|:
+                c: Cube = shape.cubes[i.usize()]
+                return true if i != except_index and c.x == item.x and c.y == item.y and c.z == item.z
+            return false
+
+    def reflected(shape: Shape&) -> Shape:
+        can Abort.Panic:
+            out: mutable Shape = Shape{cubes: zeroed, count: shape.count}
+            for i in 0..<shape.count |shape, out|:
+                c: Cube = shape.cubes[i.usize()]
+                out.cubes[i.usize()] <- cube(-c.x, c.y, c.z)
+            return out
+
+    def grid_turns() -> Turns:
+        can Abort.Panic:
+            out: mutable Turns = zeroed
+            permutations: Cube[6] = [cube(1, 2, 3), cube(1, 3, 2), cube(2, 1, 3),
+                cube(2, 3, 1), cube(3, 1, 2), cube(3, 2, 1)]
+            for row in 0..<6 |out, permutations|:
+                perm: Cube = permutations[row.usize()]
+                parity: i64 = 1 if row == 0 or row == 3 or row == 4 else -1
+                for sign in 0..<8 |out, perm, parity|:
+                    x: i64 = 1 if (sign & 4) == 0 else -1
+                    y: i64 = 1 if (sign & 2) == 0 else -1
+                    z: i64 = 1 if (sign & 1) == 0 else -1
+                    if x * y * z == parity:
+                        out.rows[out.count.usize()] <- cube(x * perm.x, y * perm.y, z * perm.z)
+                        out.count <- out.count + 1
+            return out
+
+    def coordinate(c: Cube, axis: i64) -> i64:
+        n: i64 = axis if axis > 0 else -axis
+        value: i64 = c.x if n == 1 else (c.y if n == 2 else c.z)
+        return value if axis > 0 else -value
+
+    def normalize(shape: Shape&, turn: Cube) -> Shape:
+        can Abort.Panic:
+            out: mutable Shape = Shape{cubes: zeroed, count: shape.count}
+            x: mutable i64 = 9223372036854775807
+            y: mutable i64 = x
+            z: mutable i64 = x
+            for i in 0..<shape.count |out, shape, turn, x, y, z|:
+                c: Cube = shape.cubes[i.usize()]
+                v: Cube = cube(coordinate(c, turn.x), coordinate(c, turn.y), coordinate(c, turn.z))
+                out.cubes[i.usize()] <- v
+                x <- v.x if v.x < x
+                y <- v.y if v.y < y
+                z <- v.z if v.z < z
+            for i in 0..<shape.count |out, x, y, z|:
+                v: Cube = out.cubes[i.usize()]
+                out.cubes[i.usize()] <- cube(v.x - x, v.y - y, v.z - z)
+            return out
+
+    def same_shape(a: Shape&, b: Shape&, turns: Turns&) -> bool:
+        can Abort.Panic:
+            return false if a.count != b.count
+            target: Shape = normalize(b, cube(1, 2, 3))
+            for t in 0..<turns.count |a, target, turns|:
+                turned: Shape = normalize(a, turns.rows[t.usize()])
+                equal: mutable bool = true
+                for i in 0..<turned.count |turned, target, equal|:
+                    if not has(&target, turned.cubes[i.usize()]):
+                        equal <- false
+                        break
+                return true if equal
+            return false
+
+    def chiral(shape: Shape&, turns: Turns&) -> bool:
+        can Abort.Panic:
+            mirror: Shape = reflected(shape)
+            return not same_shape(shape, &mirror, turns)
+
+    def arms(rng: mutable MT19937&, count: i64, turns: Turns&) -> Shape:
+        can Abort.Panic:
+            max_run: mutable i64 = (count - 1) / 3
+            max_run <- 2 if max_run < 2
+            for _attempt in 0..<500 |rng, count, turns, max_run|:
+                out: mutable Shape = Shape{cubes: zeroed, count: 1}
+                last: mutable i64 = -1
+                ok: mutable bool = true
+                while out.count < count and ok |rng, count, out, last, ok, max_run|:
+                    pick: i64 = py_randbelow(rng, 3.u64() if last < 0 else 2.u64()).i64()
+                    axis: i64 = pick + 1 if last >= 0 and pick >= last else pick
+                    sign: i64 = 1 if py_randbelow(rng, 2.u64()) == 0.u64() else -1
+                    length: i64 = 2 + py_randbelow(rng, (max_run - 1).u64()).i64()
+                    for _k in 0..<length |out, count, axis, sign, ok|:
+                        break if out.count == count
+                        candidate: Cube = step(out.cubes[(out.count - 1).usize()], axis, sign)
+                        if has(&out, candidate):
+                            ok <- false
+                            break
+                        out.cubes[out.count.usize()] <- candidate
+                        out.count <- out.count + 1
+                    last <- axis
+                # A planar shape is always congruent to its reflection in 3D.
+                return out if ok and out.count == count and chiral(&out, turns)
+            return zeroed
+
+    def allowed_nudge(shape: Shape&, source: Shape&, reflection: Shape&, avoid: Shape[5]&, count: i64, turns: Turns&) -> bool:
+        can Abort.Panic:
+            return false if not chiral(shape, turns) or same_shape(shape, source, turns) or same_shape(shape, reflection, turns)
+            for i in 0..<count |shape, avoid, turns|:
+                return false if same_shape(shape, &avoid[i.usize()], turns)
+            return true
+
+    def nudge(rng: mutable MT19937&, shape: Shape&, avoid: Shape[5]&, count: i64, turns: Turns&) -> Shape:
+        can Memory.Allocate, Abort.Panic:
+            reflection: Shape = reflected(shape)
+            swap: bool = py_randbelow(rng, 2.u64()) == 0.u64()
+            for choice in 0..<2 |rng, shape, avoid, count, turns, reflection, swap|:
+                first: bool = (choice == 0) != swap
+                at: i64 = 0 if first else shape.count - 1
+                anchor: Cube = shape.cubes[(1 if first else shape.count - 2).usize()]
+                options: mutable darray[i64] = [0, 1, 2, 3, 4, 5]
+                py_shuffle_i64(rng, &options)
+                for i in 0..<6 |options, shape, anchor, at, avoid, count, turns, reflection|:
+                    option: i64 = options[i.usize()]
+                    spot: Cube = step(anchor, option / 2, 1 if option % 2 == 0 else -1)
+                    if not has(shape, spot):
+                        # The remaining path is still connected, and spot
+                        # touches its endpoint. Keep Python's cube order.
+                        changed: mutable Shape = shape[0]
+                        changed.cubes[at.usize()] <- spot
+                        return changed if allowed_nudge(&changed, shape, &reflection, avoid, count, turns)
+            return shape[0]
+
+    def vec(x: f64, y: f64, z: f64) -> RoomsView::Vec:
+        return RoomsView::vec(x, y, z)
+
+    def axis_row(axis: i64) -> RoomsView::Vec:
+        return vec((1.0 if axis == 1 else (-1.0 if axis == -1 else 0.0)),
+            (1.0 if axis == 2 else (-1.0 if axis == -2 else 0.0)),
+            (1.0 if axis == 3 else (-1.0 if axis == -3 else 0.0)))
+
+    def apply(turn: Matrix, p: RoomsView::Vec) -> RoomsView::Vec:
+        return vec(RoomsView::dot(turn.x, p), RoomsView::dot(turn.y, p), RoomsView::dot(turn.z, p))
+
+    def multiply_row(left: RoomsView::Vec, right: Matrix) -> RoomsView::Vec:
+        return vec(RoomsView::dot(left, vec(right.x.x, right.y.x, right.z.x)),
+            RoomsView::dot(left, vec(right.x.y, right.y.y, right.z.y)),
+            RoomsView::dot(left, vec(right.x.z, right.y.z, right.z.z)))
+
+    def compose(left: Matrix, right: Matrix) -> Matrix:
+        return Matrix{x: multiply_row(left.x, right), y: multiply_row(left.y, right), z: multiply_row(left.z, right)}
+
+    def rotate(axis: RoomsView::Vec, angle: f64) -> Matrix:
+        can Abort.Panic:
+            u: RoomsView::Vec = RoomsView::unit(axis)
+            s: f64 = sin(angle)
+            c: f64 = cos(angle)
+            t: f64 = 1.0 - c
+            return Matrix{x: vec(t * u.x * u.x + c, t * u.x * u.y - s * u.z, t * u.x * u.z + s * u.y),
+                y: vec(t * u.x * u.y + s * u.z, t * u.y * u.y + c, t * u.y * u.z - s * u.x),
+                z: vec(t * u.x * u.z - s * u.y, t * u.y * u.z + s * u.x, t * u.z * u.z + c)}
+
+    def angle_between(base: Matrix, turn: Matrix) -> f64:
+        can Abort.Panic:
+            trace: f64 = (RoomsView::dot(vec(base.x.x, base.y.x, base.z.x), vec(turn.x.x, turn.y.x, turn.z.x)) +
+                (RoomsView::dot(vec(base.x.y, base.y.y, base.z.y), vec(turn.x.y, turn.y.y, turn.z.y)) +
+                RoomsView::dot(vec(base.x.z, base.y.z, base.z.z), vec(turn.x.z, turn.y.z, turn.z.z))))
+            c: f64 = (trace - 1.0) / 2.0
+            return acos(-1.0 if c < -1.0 else (1.0 if c > 1.0 else c)) * 57.29577951308232
+
+    def base_turn(rng: mutable MT19937&, turns: Turns&) -> Matrix:
+        can Abort.Panic:
+            grid: Cube = turns.rows[py_randbelow(rng, turns.count.u64()).usize()]
+            angle: f64 = -0.4 + 0.8 * py_random(rng)
+            return compose(rotate(vec(0.0, 1.0, 0.0), angle), Matrix{x: axis_row(grid.x), y: axis_row(grid.y), z: axis_row(grid.z)})
+
+    def random_axis(rng: mutable MT19937&, cache: mutable GaussCache&) -> RoomsView::Vec:
+        can Abort.Panic:
+            while true |rng, cache|:
+                x: f64 = py_gauss(rng, cache, 0.0, 1.0)
+                y: f64 = py_gauss(rng, cache, 0.0, 1.0)
+                z: f64 = py_gauss(rng, cache, 0.0, 1.0)
+                axis: RoomsView::Vec = vec(x, y, z)
+                return RoomsView::unit(axis) if sqrt(RoomsView::dot(axis, axis)) > 0.000001
+            return vec(0.0, 1.0, 0.0)
+
+    def turned(rng: mutable MT19937&, cache: mutable GaussCache&, base: Matrix, level: Grade) -> Matrix:
+        can Abort.Panic:
+            most: f64 = level.most * RADIANS
+            low: f64 = 15.0 * RADIANS if most / 3.0 < 15.0 * RADIANS else most / 3.0
+            angle: f64 = low + (most - low) * py_random(rng)
+            axis: RoomsView::Vec = random_axis(rng, cache) if level.any_axis else vec(0.0, 1.0, 0.0)
+            sign: f64 = -1.0 if py_random(rng) < 0.5 else 1.0
+            return compose(rotate(axis, angle * sign), base)
+
+    def deal(rung: i64, seed: i64) -> Puzzle:
+        can Memory.Allocate, Abort.Panic:
+            level: Grade = grade(rung)
+            turns: Turns = grid_turns()
+            rng: mutable MT19937 = mt19937_new()
+            cache: mutable GaussCache = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&rng, magnitude)
+            shape: Shape = arms(&rng, level.cubes, &turns)
+            return Puzzle{seed: seed, level: level, reference: zeroed, others: zeroed, angles: zeroed, count: 0, answer: -1} if shape.count == 0
+            reflected_shape: Shape = reflected(&shape)
+            base: Matrix = base_turn(&rng, &turns)
+            reference: Figure = Figure{shape: shape, turn: base}
+            others: mutable Figure[5] = zeroed
+            angles: mutable f64[5] = zeroed
+            if level.options == 0:
+                answer: i64 = py_randbelow(&rng, 2.u64()).i64()
+                view: Matrix = turned(&rng, &cache, base, level)
+                angles[0] <- angle_between(base, view)
+                others[0] <- Figure{shape: shape if answer == SAME else reflected_shape, turn: view}
+                return Puzzle{seed: seed, level: level, reference: reference, others: others, angles: angles, count: 1, answer: answer}
+            wrong: mutable Shape[5] = zeroed
+            for i in 0..<(level.options - 1) |rng, turns, shape, reflected_shape, level, wrong|:
+                source: Shape = shape if i % 2 == 0 else reflected_shape
+                wrong[i.usize()] <- nudge(&rng, &source, &wrong, i, &turns) if i < level.nudged else reflected_shape
+            answer: i64 = py_randbelow(&rng, level.options.u64()).i64()
+            for i in 0..<level.options |rng, cache, base, level, answer, shape, wrong, others, angles|:
+                view: Matrix = turned(&rng, &cache, base, level)
+                candidate: Shape = shape if i == answer else wrong[(i if i < answer else i - 1).usize()]
+                others[i.usize()] <- Figure{shape: candidate, turn: view}
+                angles[i.usize()] <- angle_between(base, view)
+            return Puzzle{seed: seed, level: level, reference: reference, others: others, angles: angles,
+                count: level.options, answer: answer}
+
+    def choices(puzzle: Puzzle&) -> i64:
+        return 2 if puzzle.count == 1 else puzzle.count

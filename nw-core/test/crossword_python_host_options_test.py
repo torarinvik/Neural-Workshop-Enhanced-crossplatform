@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory() as directory:
     session.close()
     session.close()
     hub = app.TaskHubSession(core, args)
-    hub.category, hub.selected = 4, 6
+    hub.category, hub.selected = 4, 7
     hub.key(key.RETURN, key)
     child = hub.child
     hub.key(key.O, key)

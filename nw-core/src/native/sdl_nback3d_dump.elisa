@@ -1,0 +1,152 @@
+# Emit primitive pickle opcodes only. There are no global references or
+# executable objects in a session record.
+def nback_pickle_text(out: mutable dstr&, value: sview):
+    can Memory.Allocate, Abort.Panic:
+        out.push(140.u8()) # SHORT_BINUNICODE
+        out.push(sview_len(value).u8())
+        dstr_append_sview(out, value)
+
+def nback_pickle_key(out: mutable dstr&, value: cstr):
+    can Memory.Allocate, Abort.Panic:
+        nback_pickle_text(out, sview(value, 0, -1))
+
+def nback_pickle_number(out: mutable dstr&, value: i64):
+    can Memory.Allocate, Abort.Panic:
+        out.push(73.u8()) # INT
+        dstr_append_i64(out, value)
+        out.push(10.u8())
+
+def nback_pickle_seconds(out: mutable dstr&, milliseconds: i64):
+    can Memory.Allocate, Abort.Panic:
+        out.push(70.u8()) # FLOAT
+        dstr_append_fixed(out, milliseconds.f64() / 1000.0, 3)
+        out.push(10.u8())
+
+def nback_pickle_summary(out: mutable dstr&, summary: sview):
+    can Memory.Allocate, Abort.Panic:
+        out.push(40.u8()) # MARK
+        length: i64 = sview_len(summary).i64()
+        start: mutable i64 = 0
+        for at in 0..<length |at, out, summary, start|:
+            if sview_at(summary, at.usize()) == 44.u8():
+                nback_pickle_text(out, string_view_slice(summary, start, at))
+                start <- at + 1
+        nback_pickle_text(out, string_view_slice(summary, start, length))
+        out.push(108.u8()) # LIST
+
+def nback_pickle_trials(out: mutable dstr&, run: NBack3DGame::NBack3DRun&, stream: i64):
+    can Memory.Allocate, Abort.Panic:
+        out.push(40.u8())
+        for at in 0..<run.total_trials |at, out, run, stream|:
+            if stream == 0:
+                nback_pickle_number(out, run.position[at.usize()])
+            elif stream == 1:
+                pressed_opcode: u8 = 136.u8() if run.pressed[at.usize()] else 137.u8()
+                out.push(pressed_opcode)
+            elif stream == 2:
+                nback_pickle_seconds(out, run.response_ms[at.usize()])
+            else:
+                nback_pickle_number(out, run.color[at.usize()])
+        out.push(108.u8())
+
+def nback_pickle_session(run: NBack3DGame::NBack3DRun&, summary: sview) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        out.push(128.u8()) # PROTO
+        out.push(4.u8())
+        out.push(40.u8())
+        nback_pickle_key(&out, "summary")
+        nback_pickle_summary(&out, summary)
+        nback_pickle_key(&out, "cfg")
+        out.push(40.u8())
+        nback_pickle_key(&out, "GRID_3D")
+        out.push(136.u8())
+        nback_pickle_key(&out, "GRID_3D_CUBES")
+        nback_pickle_number(&out, run.cubes)
+        nback_pickle_key(&out, "TICK_DURATION_MS")
+        nback_pickle_number(&out, run.tick_ms)
+        out.push(100.u8()) # DICT
+        nback_pickle_key(&out, "timestamp")
+        nback_pickle_text(&out, string_view_slice(summary, 0, 19))
+        nback_pickle_key(&out, "mode")
+        nback_pickle_number(&out, NBack3DGame::MODE_POSITION)
+        nback_pickle_key(&out, "n")
+        nback_pickle_number(&out, run.nback)
+        nback_pickle_key(&out, "manual")
+        out.push(137.u8() if run.progression.enabled else 136.u8())
+        nback_pickle_key(&out, "trial_duration")
+        nback_pickle_seconds(&out, run.interval_ms)
+        nback_pickle_key(&out, "trials")
+        nback_pickle_number(&out, run.total_trials)
+        nback_pickle_key(&out, "session")
+        out.push(40.u8())
+        nback_pickle_key(&out, "position1")
+        nback_pickle_trials(&out, run, 0)
+        nback_pickle_key(&out, "position1_input")
+        nback_pickle_trials(&out, run, 1)
+        nback_pickle_key(&out, "position1_rt")
+        nback_pickle_trials(&out, run, 2)
+        nback_pickle_key(&out, "color")
+        nback_pickle_trials(&out, run, 3)
+        out.push(100.u8())
+        out.push(100.u8())
+        out.push(46.u8()) # STOP
+        return out
+
+def nback_pickle_clinical(summary: sview) -> dstr:
+    can Memory.Allocate, Abort.Panic:
+        out: mutable dstr = []
+        out.push(128.u8()) # PROTO
+        out.push(2.u8())
+        out.push(40.u8()) # MARK
+        length: i64 = sview_len(summary).i64()
+        start: mutable i64 = 0
+        column: mutable i64 = 0
+        for at in 0..<length |at, out, summary, start, column|:
+            if sview_at(summary, at.usize()) == 44.u8():
+                break if column >= 25
+                value: sview = string_view_slice(summary, start, at)
+                if column < 2:
+                    out.push(88.u8()) # BINUNICODE
+                    out.push(sview_len(value).u8())
+                    out.push(0.u8())
+                    out.push(0.u8())
+                    out.push(0.u8())
+                    dstr_append_sview(&out, value)
+                else:
+                    number: ParsedInt = py_parse_int(value)
+                    nback_pickle_number(&out, number.value)
+                column <- column + 1
+                start <- at + 1
+        out.push(108.u8()) # LIST
+        out.push(46.u8()) # STOP
+        return out
+
+def sdl_nback3d_append_pickle(record: mutable dstr&, clinical: bool) -> bool:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        path: mutable u8[4096] = zeroed
+        suffix: mutable u8[270] = zeroed
+        expanded: mutable u8[4096] = zeroed
+        trusted Unsafe.PointerCast:
+            target: mutable u8& = (&path[0]).uintptr().cast[mutable u8&]
+            name: mutable u8& = (&suffix[0]).uintptr().cast[mutable u8&]
+            length: i64 = sdl_profile_suffix(target, name)
+            selected: mutable cstr = "/logfile.dat" if clinical else "/default-sessions.dat"
+            if length > 0:
+                return false if SyllogismOptionsHost::append(name.uintptr().i64(), 270, length - 11, "-logfile.dat" if clinical else "-sessions.dat") < 0
+                selected <- name.cast[cstr]
+            return false if sdl_data_path(target, 4096.usize(), selected, 0, true) == 0.i32()
+            destination: i64 = (&expanded[0]).uintptr().i64()
+            return false if SyllogismOptionsHost::settings_override(destination, 4096, target.cast[cstr], true) < 0
+            return sdl_append_file(destination.uintptr().cast[cstr], &record[0], record.count.usize())
+
+
+def sdl_nback3d_append_session(run: NBack3DGame::NBack3DRun&, summary: sview) -> bool:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        session: mutable dstr = nback_pickle_session(run, summary)
+        saved: bool = sdl_nback3d_append_pickle(&session, false)
+        if run.clinical_log:
+            clinical: mutable dstr = nback_pickle_clinical(summary)
+            logged: bool = sdl_nback3d_append_pickle(&clinical, true)
+            return saved and logged
+        return saved

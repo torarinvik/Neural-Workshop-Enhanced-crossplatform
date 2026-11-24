@@ -1,0 +1,313 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+extern strtod(text: u8&, end: u8&?) -> f64
+
+# byear.py: hear a tune, then play it back. A tune plays on a keyboard of
+# one octave and the keys do not light while it plays; then play it back on
+# the same keys, note for note. A wrong key ends the try, and so does waiting
+# too long. From rung 10 the tune is heard in one key and played back from
+# another, the first key lit; from rung 13 some steps are two keys at once.
+# Ports 0-12 press the keys from C to the C above, at once.
+module ByEar:
+    const KEYS: i64 = 13
+    const PORTS: i64 = 13
+    const BASE: f64 = 261.63
+    const LEAD: f64 = 0.8
+    const CHORD: f64 = 0.45
+    const MOST: i64 = 64
+
+    const LIVE: i64 = 0
+    const PLAYED: i64 = 1
+    const WRONG: i64 = 2
+    const APART: i64 = 3
+    const SLOW: i64 = 4
+
+    struct Grade:
+        rung: mutable i64
+        keys: mutable i64[13]
+        count: mutable i64
+        length: mutable i64
+        note: mutable f64
+        shift: mutable bool
+        pairs: mutable f64
+        patch: mutable i64
+
+    # A step of the tune: one key or two, in the order CPython's frozenset
+    # of them iterates.
+    struct Step:
+        count: mutable i64
+        keys: mutable i64[2]
+
+    struct Tune:
+        level: mutable Grade
+        heard: mutable Step[64]
+        want: mutable Step[64]
+        lit: mutable i64
+        valid: mutable bool
+
+    struct Press:
+        t: f64
+        key: i64
+        right: bool
+
+    struct Run:
+        tune: mutable Tune
+        t: mutable f64
+        seed: mutable i64
+        done: mutable i64
+        held: mutable i64
+        first_at: mutable f64
+        listen_end: mutable f64
+        end: mutable f64
+        result: mutable i64
+        pressed: mutable darray[Press]
+        notes: mutable darray[DrShapeDeal::Note]
+
+    def py_min(a: f64, b: f64) -> f64:
+        return b if b < a else a
+
+    def py_max(a: f64, b: f64) -> f64:
+        return b if b > a else a
+
+    # BASE * 2 ** (key / 12.0), by the C library's pow as CPython takes it.
+    # With a base the optimizer can see is 2 it calls exp2 instead, which is
+    # an ulp off pow for key 11, and it sees through any arithmetic on the
+    # key; so the base is read from the text "2", which it cannot.
+    def freq(key: i64) -> f64:
+        can Abort.Panic:
+            digits: u8[2] = [50.u8(), 0.u8()]
+            two: f64 = strtod(&digits[0], null)
+            return BASE * pow(two, key.f64() / 12.0)
+
+    def scale(name: i64, level: mutable Grade&):
+        can Abort.Panic:
+            three: i64[3] = [0, 4, 7]
+            five: i64[5] = [0, 2, 4, 7, 9]
+            white: i64[8] = [0, 2, 4, 5, 7, 9, 11, 12]
+            level.count <- 3 if name == 0 else (5 if name == 1 else (8 if name == 2 else 13))
+            for i in 0..<level.count |level, name, three, five, white|:
+                level.keys[i.usize()] <- three[i.usize()] if name == 0 else (five[i.usize()] if name == 1 else
+                    (white[i.usize()] if name == 2 else i))
+
+    def grade(rung: i64) -> Grade:
+        can Abort.Panic:
+            r: i64 = rung if rung > 1 else 1
+            level: mutable Grade = zeroed
+            level.rung <- r
+            if r == 1:
+                scale(0, &level)
+                level.length <- 2
+                level.note <- 0.9
+            elif r < 4:
+                scale(1, &level)
+                level.length <- 3
+                level.note <- 0.75
+            elif r < 7:
+                scale(2, &level)
+                level.length <- 4 + (1 if r >= 5 else 0)
+                level.note <- 0.6
+            elif r < 10:
+                scale(3, &level)
+                level.length <- 5 + (1 if r >= 8 else 0)
+                level.note <- 0.5
+            else:
+                scale(3, &level)
+                level.length <- 6 + (r - 10) / 2
+                level.note <- py_max(0.16, 0.5 - 0.025 * (r - 10).f64())
+            level.shift <- r >= 10
+            level.pairs <- 0.0 if r < 13 else py_min(0.5, 0.2 + 0.03 * (r - 13).f64())
+            level.patch <- 0 if r < 7 else (1 if r < 16 else 2)
+            return level
+
+    # CPython's iteration order of a small set of ints, built by adding
+    # *keys* in turn: each goes to slot hash & 7 of an eight-slot table, and
+    # on a collision to (i * 5 + 1 + (perturb >>= 5)) & 7. hash(-1) is -2.
+    # perturb is a size_t, so its shifts bring in zeros: masking each to 59
+    # bits does that here, and once perturb is 0 the probe visits every
+    # slot.
+    def ordered(keys: i64[2], count: i64) -> Step:
+        can Abort.Panic:
+            table: mutable i64[8] = zeroed
+            used: mutable bool[8] = zeroed
+            for n in 0..<count |keys, table, used|:
+                k: i64 = keys[n.usize()]
+                seen: mutable bool = false
+                for s in 0..<8 |table, used, k, seen|:
+                    seen <- true if used[s.usize()] and table[s.usize()] == k
+                if not seen:
+                    h: i64 = -2 if k == -1 else k
+                    i: mutable i64 = h & 7
+                    perturb: mutable i64 = h
+                    while used[i.usize()] |used, i, perturb|:
+                        perturb <- (perturb >> 5) & 576460752303423487
+                        i <- (i * 5 + 1 + perturb) & 7
+                    table[i.usize()] <- k
+                    used[i.usize()] <- true
+            out: mutable Step = zeroed
+            for s in 0..<8 |table, used, out|:
+                if used[s.usize()]:
+                    out.keys[out.count.usize()] <- table[s.usize()]
+                    out.count <- out.count + 1
+            return out
+
+    def abs_i(v: i64) -> i64:
+        return -v if v < 0 else v
+
+    # _walk: a key to start on, then each step a key of the scale within a
+    # fifth of the last (any other if none is), and now and then a second
+    # key three to nine keys from it.
+    def walk(level: Grade&, draw: mutable MT19937&, out: mutable Step[64]&):
+        can Abort.Panic:
+            at: mutable i64 = level.keys[py_choice_index(draw, level.count).usize()]
+            for n in 0..<level.length |level, draw, out, at|:
+                near: mutable i64[13] = zeroed
+                count: mutable i64 = 0
+                for i in 0..<level.count |level, near, count, at|:
+                    k: i64 = level.keys[i.usize()]
+                    if k != at and abs_i(k - at) <= 7:
+                        near[count.usize()] <- k
+                        count <- count + 1
+                if count == 0:
+                    for i in 0..<level.count |level, near, count, at|:
+                        k: i64 = level.keys[i.usize()]
+                        if k != at:
+                            near[count.usize()] <- k
+                            count <- count + 1
+                if n > 0:
+                    at <- near[py_choice_index(draw, count).usize()]
+                pair: mutable i64[2] = [at, 0]
+                size: mutable i64 = 1
+                if py_random(draw) < level.pairs:
+                    other: mutable i64[13] = zeroed
+                    found: mutable i64 = 0
+                    for i in 0..<level.count |level, other, found, at|:
+                        k: i64 = level.keys[i.usize()]
+                        if abs_i(k - at) >= 3 and abs_i(k - at) <= 9:
+                            other[found.usize()] <- k
+                            found <- found + 1
+                    if found > 0:
+                        pair[1] <- other[py_choice_index(draw, found).usize()]
+                        size <- 2
+                out[n.usize()] <- ordered(pair, size)
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Tune:
+        can Abort.Panic:
+            tune: mutable Tune = zeroed
+            tune.level <- grade(rung)
+            tune.lit <- -1
+            return tune if tune.level.length > MOST
+            walk(&tune.level, draw, &tune.want)
+            tune.valid <- true
+            if not tune.level.shift:
+                tune.heard <- tune.want
+                return tune
+            lo: mutable i64 = 9223372036854775807
+            hi: mutable i64 = -9223372036854775807
+            for n in 0..<tune.level.length |tune, lo, hi|:
+                s: Step = tune.want[n.usize()]
+                for j in 0..<s.count |s, lo, hi|:
+                    lo <- s.keys[j.usize()] if s.keys[j.usize()] < lo
+                    hi <- s.keys[j.usize()] if s.keys[j.usize()] > hi
+            # heard somewhere else, but still on the keyboard's octave and a
+            # half: d from -lo - 5 up to KEYS + 4 - hi, but not 0
+            start: i64 = -lo - 5
+            choices: i64 = KEYS + 5 - hi - start - (1 if start <= 0 and 0 < KEYS + 5 - hi else 0)
+            index: i64 = py_choice_index(draw, choices)
+            d: i64 = start + index + (1 if start <= 0 and start + index >= 0 else 0)
+            for n in 0..<tune.level.length |tune, d|:
+                s: Step = tune.want[n.usize()]
+                moved: i64[2] = [s.keys[0] + d, s.keys[1] + d]
+                tune.heard[n.usize()] <- ordered(moved, s.count)
+            first: Step = tune.want[0]
+            tune.lit <- first.keys[0] if first.count == 1 or first.keys[0] < first.keys[1] else first.keys[1]
+            return tune
+
+    # Run._note: a note, kept in order of its start, after any that start
+    # at the same moment.
+    def note(run: mutable Run&, t: f64, dur: f64, f: f64, voice: i64, gain: f64):
+        can Abort.Panic, Memory.Allocate:
+            run.seed <- run.seed + 1
+            made: DrShapeDeal::Note = DrShapeDeal::Note{t: t, dur: dur, freq: f, pan: 0.0, pan2: 0.0, gain: gain, gain2: gain,
+                bright: 0.8, voice: voice, seed: run.seed, who: -1, room: 0.0}
+            run.notes.push(made)
+            k: mutable i64 = run.notes.count.i64() - 1
+            while k > 0 and run.notes[(k - 1).usize()].t > t |run, k|:
+                run.notes[k.usize()] <- run.notes[(k - 1).usize()]
+                k <- k - 1
+            run.notes[k.usize()] <- made
+
+    def begin(tune: Tune) -> Run:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = Run{tune: tune, t: 0.0, seed: 0, done: 0, held: 0, first_at: 0.0, listen_end: 0.0, end: 0.0,
+                result: LIVE, pressed: [], notes: []}
+            level: Grade = tune.level
+            t: mutable f64 = LEAD
+            for n in 0..<level.length |run, level, t|:
+                s: Step = run.tune.heard[n.usize()]
+                for j in 0..<s.count |run, level, t, s|:
+                    note(&run, t, level.note * 0.92, freq(s.keys[j.usize()]), level.patch, 0.45)
+                t <- t + level.note
+            run.listen_end <- t + 0.3
+            run.end <- run.listen_end + 4.0 + 3.0 * level.length.f64()
+            return run
+
+    def listening(run: Run&) -> bool:
+        return run.t < run.listen_end
+
+    def mask(s: Step) -> i64:
+        can Abort.Panic:
+            m: mutable i64 = 0
+            for j in 0..<s.count |s, m|:
+                m <- m | (1 << s.keys[j.usize()])
+            return m
+
+    def press(run: mutable Run&, key: i64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE or listening(run) or key < 0 or key >= KEYS
+            note(run, run.t, 0.35, freq(key), run.tune.level.patch, 0.4)
+            want: i64 = mask(run.tune.want[run.done.usize()])
+            bit: i64 = 1 << key
+            right: bool = (want & bit) != 0 and (run.held & bit) == 0
+            run.pressed.push(Press{t: run.t, key: key, right: right})
+            if not right:
+                run.result <- WRONG
+                note(run, run.t + 0.3, 0.4, 110.0, 2, 0.4)
+                return
+            run.first_at <- run.t if run.held == 0
+            run.held <- run.held | bit
+            if run.held == want:
+                run.held <- 0
+                run.done <- run.done + 1
+                if run.done == run.tune.level.length:
+                    run.result <- PLAYED
+                    note(run, run.t + 0.3, 0.3, 1320.0, 2, 0.3)
+
+    def step(run: mutable Run&, dt: f64):
+        return if run.result != LIVE
+        run.t <- run.t + dt
+        if run.held != 0 and run.t - run.first_at > CHORD:
+            run.result <- APART
+        elif run.t > run.end:
+            run.result <- SLOW
+
+    # The reference autopilot: plays back what it heard, one key a call, a
+    # little after the tune ends. -1 is no key.
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if listening(run) or run.result != LIVE or run.t < run.listen_end + 0.3
+            left: i64 = mask(run.tune.want[run.done.usize()]) & (8191 ^ run.held)
+            for k in 0..<KEYS |left|:
+                return k if (left & (1 << k)) != 0
+            return -1
+
+    # play(): one try at 1/30 s a step, the autopilot asked every step.
+    def play(tune: Tune) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            run: mutable Run = begin(tune)
+            while run.result == LIVE |run|:
+                key: i64 = pilot(&run)
+                press(&run, key) if key >= 0
+                step(&run, 1.0 / 30.0)
+            return run.result

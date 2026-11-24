@@ -1,0 +1,160 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module Bandit:
+    const ARMS: i64 = 8
+    const PULLS: i64 = 80
+    const PAYOUTS: i64 = ARMS * PULLS
+
+    struct Grade:
+        rung: i64
+        arms: i64
+        pulls: i64
+        gap: f64
+        drift: f64
+        jumps: i64
+        batch: i64
+        noise: f64
+
+    struct Deal:
+        level: Grade
+        means: mutable f64[PAYOUTS]
+        pays: mutable i64[PAYOUTS]
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        arms: i64 = 2 if r < 4 else (3 if r < 5 else (4 if r < 13 else (6 if r < 20 else ARMS)))
+        pulls: i64 = 30 if r < 4 else (40 if r < 7 else (60 if r < 20 else PULLS))
+        return Grade{rung: r, arms: arms, pulls: pulls, gap: 3.0 if r < 4 else 1.5,
+            drift: 0.0 if r < 7 else (0.3 if r < 13 else 0.5),
+            jumps: 0 if r < 10 else 18, batch: 1 if r < 16 else 5,
+            noise: 2.0 if r < 20 else 2.6}
+
+    def fresh(level: Grade, draw: mutable MT19937&, means: mutable f64&):
+        can Abort.Panic:
+            while true |level, draw, means|:
+                high: mutable f64 = 0.0
+                second: mutable f64 = 0.0
+                for arm in 0..<level.arms |draw, means, high, second|:
+                    mean: f64 = py_uniform(draw, 1.5, 8.5)
+                    means[arm.usize()] <- mean
+                    if mean > high:
+                        second <- high
+                        high <- mean
+                    elif mean > second:
+                        second <- mean
+                return if high - second >= level.gap * 0.6
+
+    def deal_seed(rung: i64, seed: i64) -> Deal:
+        can Abort.Panic:
+            draw: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&draw, magnitude)
+            gauss: mutable GaussCache = zeroed
+            level: Grade = grade(rung)
+            means: mutable f64[ARMS] = zeroed
+            deal: mutable Deal = Deal{level: level, means: zeroed, pays: zeroed}
+            fresh(level, &draw, &means[0])
+            for turn in 0..<level.pulls |draw, gauss, level, means, deal|:
+                if level.jumps != 0 and turn > 0 and turn % level.jumps == 0:
+                    fresh(level, &draw, &means[0])
+                for arm in 0..<level.arms |draw, gauss, level, means, deal, turn|:
+                    index: usize = (turn * ARMS + arm).usize()
+                    mean: f64 = means[arm.usize()]
+                    pay: i64 = py_round_half_even(py_gauss(&draw, &gauss, mean, level.noise))
+                    deal.means[index] <- mean
+                    deal.pays[index] <- 0 if pay < 0 else (10 if pay > 10 else pay)
+                if level.drift > 0.0:
+                    for arm in 0..<level.arms |draw, gauss, level, means|:
+                        mean: f64 = means[arm.usize()] + py_gauss(&draw, &gauss, 0.0, level.drift)
+                        means[arm.usize()] <- fmax(0.5, fmin(9.5, mean))
+            return deal
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Deal:
+        can Abort.Panic:
+            return deal_seed(rung, py_randbelow(rng, 1073741824.u64()).i64())
+
+    def seen_after(level: Grade, played: i64) -> i64:
+        return played - played % level.batch
+
+    def payout(deal: Deal&, turn: i64, arm: i64) -> i64:
+        can Abort.Panic:
+            return deal.pays[(turn * ARMS + arm).usize()]
+
+    def reference_move(deal: Deal&, chosen: i64&, turn: i64) -> i64:
+        can Abort.Panic:
+            level: Grade = deal.level
+            fade: f64 = 0.92 if level.jumps != 0 else (0.97 if level.drift > 0.0 else 1.0)
+            doubt: f64 = 1.5 if fade == 1.0 else 1.0
+            shown: i64 = seen_after(level, turn)
+            weights: mutable f64[ARMS] = zeroed
+            rewards: mutable f64[ARMS] = zeroed
+            pending: mutable bool[ARMS] = zeroed
+            for pull in 0..<shown |chosen, fade, turn, deal, weights, rewards|:
+                arm: i64 = chosen[pull.usize()]
+                weight: f64 = pow(fade, (turn - pull).f64())
+                weights[arm.usize()] <- weights[arm.usize()] + weight
+                rewards[arm.usize()] <- rewards[arm.usize()] + weight * payout(deal, pull, arm).f64()
+            for pull in shown..<turn |chosen, pending|:
+                pending[chosen[pull.usize()].usize()] <- true
+            total: mutable f64 = 0.0
+            for arm in 0..<level.arms |weights, total|:
+                total <- total + weights[arm.usize()]
+            best: mutable f64 = -1e9
+            pick: mutable i64 = 0
+            for arm in 0..<level.arms |weights, rewards, pending, total, doubt, best, pick|:
+                weight: f64 = weights[arm.usize()]
+                return arm if weight < 1e-6 and not pending[arm.usize()]
+                score: f64 = 5.0 if weight < 1e-6 else rewards[arm.usize()] / weight + doubt * sqrt(log(1.0 + total) / weight)
+                if score > best:
+                    best <- score
+                    pick <- arm
+            return pick
+
+    def reference(deal: Deal&) -> i64:
+        can Abort.Panic:
+            chosen: mutable i64[PULLS] = zeroed
+            coins: mutable i64 = 0
+            for turn in 0..<deal.level.pulls |deal, chosen, coins|:
+                arm: i64 = reference_move(deal, &chosen[0], turn)
+                chosen[turn.usize()] <- arm
+                coins <- coins + payout(deal, turn, arm)
+            return coins
+
+    def floor(deal: Deal&) -> f64:
+        can Abort.Panic:
+            total: mutable f64 = 0.0
+            correction: mutable f64 = 0.0
+            for turn in 0..<deal.level.pulls |deal, total, correction|:
+                coins: mutable i64 = 0
+                for arm in 0..<deal.level.arms |deal, turn, coins|:
+                    coins <- coins + payout(deal, turn, arm)
+                mean: f64 = coins.f64() / deal.level.arms.f64()
+                next: f64 = total + mean
+                correction <- correction + ((total - next) + mean if total >= mean else (mean - next) + total)
+                total <- next
+            return total + correction
+
+    def best(deal: Deal&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for turn in 0..<deal.level.pulls |deal, total|:
+                pick: mutable i64 = 0
+                largest: mutable f64 = 0.0
+                for arm in 0..<deal.level.arms |deal, turn, pick, largest|:
+                    mean: f64 = deal.means[(turn * ARMS + arm).usize()]
+                    if mean > largest:
+                        largest <- mean
+                        pick <- arm
+                total <- total + payout(deal, turn, pick)
+            return total
+
+    def par(deal: Deal&) -> f64:
+        can Abort.Panic:
+            target: f64 = reference(deal).f64()
+            rung: i64 = deal.level.rung
+            if rung <= 20:
+                give: f64 = 0.5 * (20 - rung).f64() / 19.0
+                return target - give * fmax(0.0, target - floor(deal))
+            take: f64 = fmin(0.8, 0.08 * (rung - 20).f64())
+            return target + take * fmax(0.0, best(deal).f64() - target)

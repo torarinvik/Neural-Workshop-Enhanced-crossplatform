@@ -1,0 +1,109 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/geometry.elisa"
+include "../src/scene_field_manual.elisa"
+
+extern printf(format: cstr, ...) -> i32 can[Console.Write]
+
+def emit_job(job: FieldManual::Job&, rung: i64, seed: i64):
+    can Abort.Panic, Console.Write:
+        _ = printf("%lld %lld %lld %lld %lld %.17g\n", rung, seed, 1 if job.valid else 0, job.count, job.seed, job.seconds)
+        for i in 0..<6 |job|:
+            _ = printf("%lld%s", job.numbers[i.usize()], "\n" if i == 5 else " ")
+        for i in 0..<job.count |job|:
+            p: FieldManual::Part = job.parts[i.usize()]
+            _ = printf("%lld %lld %lld %lld %lld %lld %.17g\n", p.kind, p.colour, p.face, p.col, p.row,
+                job.secrets[i.usize()], job.start[i.usize()])
+        for i in 0..<job.orders.count.i64() |job|:
+            order: FieldManual::Order = get job.orders[i.usize()] else zeroed
+            _ = printf("%lld %lld %.17g %lld %lld %lld %lld", order.kind, order.targets, order.value, order.digits,
+                1 if order.shift else 0, order.wait, order.tone)
+            for j in 0..<order.beeps.count.i64() |order|:
+                _ = printf(" %lld", get order.beeps[j.usize()] else -1)
+            _ = printf("\n")
+            text: sview = bytes_view(order.text)
+            for j in 0..<sview_len(text).i64() |text|:
+                _ = printf("%c", sview_at(text, j.usize()).i32())
+            _ = printf("\n")
+
+def replay(job: FieldManual::Job):
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        run: mutable FieldManualRun::Run = FieldManualRun::initialize(job)
+        frame: mutable i64 = 0
+        while run.result == FieldManualRun::PENDING |run, frame, job|:
+            port: i64 = FieldManualRun::pilot(&run)
+            FieldManualRun::act(&run, port)
+            FieldManualRun::tick(&run, 1.0 / 60.0, port == FieldManual::SHIFT)
+            if frame % 59 == 0 or run.result != FieldManualRun::PENDING:
+                _ = printf("%lld %lld %lld %lld %lld %lld %lld %lld %.17g %.17g %.17g %.17g %.17g %lld\n",
+                    frame, port, run.step_no, run.result, run.typed, run.grab, run.beeped, run.done,
+                    run.time, run.hand.x, run.hand.y, run.yaw, run.pitch, 1 if run.hand.down else 0)
+                for i in 0..<job.count |run|:
+                    _ = printf(" %.17g", run.state[i.usize()])
+                _ = printf("\n")
+            frame <- frame + 1
+        _ = printf("audio %lld\n", run.notes.count.i64())
+        for i in 0..<run.notes.count.i64() |run|:
+            cue: FieldManualRun::Cue = get run.notes[i.usize()] else zeroed
+            _ = printf("%.17g %.17g %.17g %lld %.17g %.17g %lld\n", cue.time, cue.duration, cue.pitch, cue.voice, cue.gain, cue.pan, cue.seed)
+
+def scene_check() -> bool:
+    can Memory.Allocate, Abort.Panic:
+        job: FieldManual::Job = FieldManual::build(FieldManual::grade(20), 17)
+        run: mutable FieldManualRun::Run = FieldManualRun::initialize(job)
+        list: mutable Display::DisplayList = Display::DisplayList()
+        SceneFieldManual::stage(&list, &run)
+        return false if list.commands.count < 40 or sview_len(FieldManualRun::reading(&run)) == 0.usize()
+        Display::display_reset(&list)
+        run.time <- job.level.show + 0.01
+        run.yaw <- -90.0
+        SceneFieldManual::stage(&list, &run)
+        return list.commands.count >= 40 and sview_len(FieldManualRun::reading(&run)) == 0.usize()
+
+def session_check() -> bool:
+    can Memory.Allocate, Memory.Release, Abort.Panic:
+        session: mutable FieldManualGame::Session = FieldManualGame::initialize(16, 2, true, 17)
+        accepted: mutable bool = false
+        region request(4096):
+            in request:
+                accepted <- FieldManualGame::start(&session, 0.0) can Global{Read,Write}
+        valid: mutable bool = accepted and sview_len(FieldManualRun::reading(&session.run)) > 0.usize()
+        now: mutable f64 = 0.0
+        for _index in 0..<50 |session, now|:
+            now <- now + 0.05
+            _ = FieldManualGame::advance(&session, now) can Global{Read,Write}
+        valid <- valid and session.run.notes.count > 0.usize()
+        list: mutable Display::DisplayList = Display::DisplayList()
+        SceneFieldManual::render(&list, &session, true)
+        valid <- valid and list.commands.count > 40.usize()
+        pcm: mutable u8[8820] = zeroed
+        valid <- valid and FieldManualGame::audio_window(&session, &pcm[0], 8820) == 8820
+        # Pressing a digit on a click/drag order consumes that trial and opens the next.
+        order: FieldManual::Order = get session.run.job.orders[0] else zeroed
+        wrong: i64 = (FieldManualRun::digit(order.digits, 0) + 1) % 10 if order.kind == FieldManual::TYPE else 0
+        _ = FieldManualGame::input(&session, FieldManual::DIGIT + wrong, now) can Global{Read,Write}
+        _ = FieldManualGame::advance(&session, now + 0.05) can Global{Read,Write}
+        valid <- valid and session.phase == FieldManualGame::JUDGED and session.run.result == FieldManualRun::WRONG_KEY
+        _ = FieldManualGame::advance(&session, session.deadline) can Global{Read,Write}
+        valid <- valid and session.phase == FieldManualGame::PLAYING and session.rung == 15 and session.trial == 2
+        FieldManualGame::close(&session) can Global{Read,Write}
+        return valid and session.phase == FieldManualGame::READY
+
+def main() -> i32:
+    can Abort.Panic, Console.Write, Memory.Allocate, Memory.Release:
+        return 1.i32() if not scene_check() or not (session_check() can Global{Read,Write})
+        rungs: i64[15] = [-1, 1, 3, 4, 6, 7, 10, 12, 13, 16, 19, 20, 25, 30, 100]
+        for i in 0..<15 |rungs|:
+            rung: i64 = rungs[i.usize()]
+            level: FieldManual::Grade = FieldManual::grade(rung)
+            for seed in -1..<7 |level, rung|:
+                job: FieldManual::Job = FieldManual::build(level, seed)
+                emit_job(&job, rung, seed)
+                if seed < 2 and job.valid:
+                    replay(job)
+            draw: mutable MT19937 = mt19937_new()
+            mt_seed_int(&draw, 17.u64())
+            dealt: FieldManual::Job = FieldManualRun::deal(rung, &draw)
+            _ = printf("dealt %lld %lld\n", rung, dealt.seed if dealt.valid else -1)
+        return 0.i32()

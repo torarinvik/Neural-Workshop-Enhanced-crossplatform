@@ -1,0 +1,397 @@
+include "../hand_view.elisa"
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+# semaphore.py: read the far signaller's two flags, put your own two flags
+# in the same pose, and type the letter before the signal comes down.
+module Semaphore:
+    const LETTERS: i64 = 26
+    const PORTS: i64 = HandView::KEYS + LETTERS
+    const PIVOT_X: f64 = 500.0
+    const PIVOT_Y: f64 = 150.0
+    const ARM: f64 = 115.0
+    const FAR_X: f64 = 500.0
+    const FAR_Y: f64 = 455.0
+    const FAR_ARM: f64 = 62.0
+    const GRAB: f64 = 34.0
+    const BELL: i64 = 0
+    const RIGHT: i64 = 1
+    const WRONG: i64 = 2
+    const CLICK: i64 = 3
+    const SEA: i64 = 4
+    const NAMED: i64 = 0
+    const CHART: i64 = 1
+    const PEEK: i64 = 2
+    const NONE: i64 = 3
+    const LIVE: i64 = 0
+    const PASSED: i64 = 1
+    const FAILED: i64 = 2
+    const SAID_NOTHING: i64 = 0
+    const SAID_MISMATCH: i64 = 1
+    const SAID_WRONG: i64 = 2
+    const SAID_PASSED: i64 = 3
+    const MOST: i64 = 14
+    const NO_FLAG: i64 = -1
+
+    struct Grade:
+        rung: i64
+        letters: i64
+        hold: f64
+        near: f64
+        help: i64
+        roll: f64
+        turns: bool
+        words: bool
+        fog: bool
+        strikes: i64
+        seconds: f64
+
+    struct Message:
+        level: Grade
+        text: i64[14]
+        count: i64
+        turned: bool[14]
+        seed: i64
+        valid: bool
+
+    struct Run:
+        message: Message
+        code: i64[26]
+        hand: mutable HandView::Pointer
+        flags: mutable f64[2]
+        held: mutable i64
+        read: mutable i64[14]
+        strikes: mutable i64
+        said: mutable i64
+        said_letter: mutable i64
+        rung_at: mutable i64
+        matched: mutable bool
+        time: mutable f64
+        result: mutable i64
+        audible: bool
+        notes: mutable darray[DrShapeDeal::Note]
+
+    # Python's float %, which takes the divisor's sign.
+    def pymod(x: f64, y: f64) -> f64:
+        mod: mutable f64 = fmod(x, y)
+        if mod != 0.0:
+            mod <- mod + y if (y < 0.0) != (mod < 0.0)
+        else:
+            mod <- -0.0 if y < 0.0 else 0.0
+        return mod
+
+    # Python's float //.
+    def floordiv(x: f64, y: f64) -> f64:
+        mod: mutable f64 = fmod(x, y)
+        div: mutable f64 = (x - mod) / y
+        if mod != 0.0 and (y < 0.0) != (mod < 0.0):
+            div <- div - 1.0
+        return (-0.0 if x / y < 0.0 else 0.0) if div == 0.0
+        whole: mutable f64 = floor(div)
+        whole <- whole + 1.0 if div - whole > 0.5
+        return whole
+
+    # math.radians and math.degrees, as CPython multiplies.
+    def radians(degrees: f64) -> f64:
+        return degrees * (3.141592653589793 / 180.0)
+
+    def degrees(radians: f64) -> f64:
+        return radians * (180.0 / 3.141592653589793)
+
+    # Keep libm sine and cosine as separate calls, as Python makes them; a
+    # fused sincos can differ by an ulp on Darwin.
+    @inline(never)
+    def sine(angle: f64) -> f64:
+        return sin(angle)
+
+    @inline(never)
+    def cosine(angle: f64) -> f64:
+        return cos(angle)
+
+    # CODE: the 28 pairs of eight positions, shuffled by Random(1851), and
+    # the first 26 given to A-Z in order. A pair is a * 8 + b with a < b.
+    def code() -> i64[26]:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            pairs: mutable darray[i64] = []
+            for a in 0..<8 |pairs|:
+                for b in (a + 1)..<8 |pairs, a|:
+                    pairs.push(a * 8 + b)
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, 1851.u64())
+            py_shuffle_i64(&draw, &pairs)
+            out: mutable i64[26] = zeroed
+            for i in 0..<26 |out, pairs|:
+                out[i.usize()] <- pairs[i.usize()]
+            return out
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: i64 = r - 20 if r > 20 else 0
+        letters: i64 = 4 if r < 7 else (5 if r < 10 else (6 if r < 16 else (7 + top / 5 if 7 + top / 5 < 14 else 14)))
+        hold: f64 = 10.0 if r < 4 else (9.0 if r < 7 else (8.0 if r < 10 else (7.0 if r < 13 else
+            (6.5 if r < 16 else (5.5 if r < 20 else fmax(2.0, 5.0 - 0.07 * top.f64()))))))
+        return Grade{rung: r, letters: letters, hold: hold,
+            near: 18.0 if r < 10 else (14.0 if r < 20 else 11.0),
+            help: NAMED if r < 4 else (CHART if r < 10 else (PEEK if r < 16 else NONE)),
+            roll: 0.0 if r < 7 else (10.0 if r < 20 else fmin(22.0, 12.0 + 0.3 * top.f64())),
+            turns: r >= 13, words: r < 16, fog: r >= 20,
+            strikes: 3 if r < 10 else 2,
+            seconds: 2.0 + letters.f64() * (hold + 0.8) + 0.5}
+
+    def word_count(letters: i64) -> i64:
+        return 16 if letters == 4 else (10 if letters == 5 else (8 if letters == 6 else (6 if letters == 7 else (5 if letters == 8 else 0))))
+
+    # WORDS, in the reference's order; 'OVERBOARD'[:8] is OVERBOAR.
+    def word(letters: i64, index: i64) -> cstr:
+        if letters == 4:
+            return "SHIP" if index == 0 else ("MAST" if index == 1 else ("KNOT" if index == 2 else ("WIND" if index == 3 else
+                ("PORT" if index == 4 else ("DECK" if index == 5 else ("TIDE" if index == 6 else ("HELM" if index == 7 else
+                ("CREW" if index == 8 else ("FLAG" if index == 9 else ("BUOY" if index == 10 else ("JUMP" if index == 11 else
+                ("QUAY" if index == 12 else ("WAVE" if index == 13 else ("ZINC" if index == 14 else "FOXY"))))))))))))))
+        if letters == 5:
+            return "STORM" if index == 0 else ("CABIN" if index == 1 else ("WHARF" if index == 2 else ("PILOT" if index == 3 else
+                ("NORTH" if index == 4 else ("QUICK" if index == 5 else ("JETTY" if index == 6 else ("EXTRA" if index == 7 else
+                ("ZEBRA" if index == 8 else "GLOVE"))))))))
+        if letters == 6:
+            return "ANCHOR" if index == 0 else ("VOYAGE" if index == 1 else ("HARBOR" if index == 2 else ("SIGNAL" if index == 3 else
+                ("RUDDER" if index == 4 else ("KEELED" if index == 5 else ("JIGSAW" if index == 6 else "OXYGEN"))))))
+        if letters == 7:
+            return "CAPTAIN" if index == 0 else ("COMPASS" if index == 1 else ("LANTERN" if index == 2 else ("WHISTLE" if index == 3 else
+                ("JOURNEY" if index == 4 else "QUARTER"))))
+        return "STARLING" if index == 0 else ("MIDNIGHT" if index == 1 else ("FLAGSHIP" if index == 2 else ("OVERBOAR" if index == 3 else "WINDWARD")))
+
+    def build(level: Grade, draw: mutable MT19937&) -> Message:
+        can Abort.Panic:
+            text: mutable i64[14] = zeroed
+            if level.words and word_count(level.letters) > 0:
+                chosen: sview = sview(word(level.letters, py_choice_index(draw, word_count(level.letters))), 0, -1)
+                for i in 0..<level.letters |text, chosen|:
+                    text[i.usize()] <- sview_at(chosen, i.usize()).i64() - 65
+            else:
+                for i in 0..<level.letters |text, draw|:
+                    text[i.usize()] <- py_choice_index(draw, LETTERS)
+            turned: mutable bool[14] = zeroed
+            for i in 0..<level.letters |turned, draw, level|:
+                turned[i.usize()] <- level.turns and py_random(draw) < 0.45
+            return Message{level: level, text: text, count: level.letters, turned: turned,
+                seed: py_randbelow(draw, 1073741824.u64()).i64(), valid: true}
+
+    def begin(message: Message, audible: bool = true) -> Run:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            hand: mutable HandView::Pointer = HandView::initialize()
+            HandView::place(&hand, 500.0, 300.0)
+            read: mutable i64[14] = zeroed
+            for i in 0..<MOST |read|:
+                read[i.usize()] <- -1
+            return Run{message: message, code: code(), hand: hand, flags: [20.0, 340.0], held: NO_FLAG, read: read,
+                strikes: 0, said: SAID_NOTHING, said_letter: 0, rung_at: -1, matched: false, time: 0.0,
+                result: LIVE, audible: audible, notes: []}
+
+    def note(run: mutable Run&, duration: f64, frequency: f64, voice: i64, gain: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if not run.audible
+            run.notes.push(DrShapeDeal::Note{t: run.time, dur: duration, freq: frequency, voice: voice,
+                gain: gain, gain2: gain, pan: 0.0, pan2: 0.0, bright: 0.8, seed: 1 + run.notes.count.i64(), who: -1, room: 0.0})
+
+    # --- the clock
+    def span(run: Run&) -> f64:
+        return run.message.level.hold + 0.8
+
+    # Which signal is up now, or -1.
+    def index(run: Run&) -> i64:
+        t: f64 = run.time - 2.0
+        return -1 if t < 0.0
+        k: i64 = floordiv(t, span(run)).i64()
+        return -1 if k >= run.message.count or t - k.f64() * span(run) >= run.message.level.hold
+        return k
+
+    def since(run: Run&) -> f64:
+        return pymod(run.time - 2.0, span(run))
+
+    # --- the picture
+    def roll(run: Run&) -> f64:
+        return run.message.level.roll * sine(run.time * 0.9)
+
+    def fogged(run: Run&) -> bool:
+        return run.message.level.fog and sine(run.time * 1.3) > 0.45
+
+    def flip(pair: i64) -> i64:
+        a: i64 = (8 - pair / 8) % 8
+        b: i64 = (8 - pair % 8) % 8
+        return a * 8 + b if a <= b else b * 8 + a
+
+    # Their two flags as you see them, in degrees, roll and all.
+    def theirs(run: Run&) -> RoomsView::Point:
+        can Abort.Panic:
+            k: i64 = index(run)
+            return RoomsView::Point{x: 8.0 + roll(run), y: 352.0 + roll(run)} if k < 0
+            pair: mutable i64 = run.code[run.message.text[k.usize()].usize()]
+            pair <- flip(pair) if run.message.turned[k.usize()]
+            return RoomsView::Point{x: (pair / 8).f64() * 45.0 + roll(run), y: (pair % 8).f64() * 45.0 + roll(run)}
+
+    def back(run: Run&) -> bool:
+        can Abort.Panic:
+            k: i64 = index(run)
+            return k >= 0 and run.message.turned[k.usize()]
+
+    def helped(run: Run&) -> i64:
+        if run.message.level.help == PEEK:
+            return CHART if index(run) >= 0 and since(run) < 0.3 * run.message.level.hold else NONE
+        return run.message.level.help
+
+    def way(angle: f64) -> RoomsView::Point:
+        a: f64 = radians(angle)
+        return RoomsView::Point{x: -sine(a), y: -cosine(a)}
+
+    def tip(run: Run&, which: i64) -> RoomsView::Point:
+        can Abort.Panic:
+            d: RoomsView::Point = way(run.flags[which.usize()])
+            return RoomsView::Point{x: PIVOT_X + ARM * d.x, y: PIVOT_Y + ARM * d.y}
+
+    # Your flags as a pair of positions, or -1 unless both are on one.
+    def pose(run: Run&) -> i64:
+        can Abort.Panic:
+            out: mutable i64[2] = zeroed
+            for i in 0..<2 |run, out|:
+                a: f64 = run.flags[i.usize()]
+                k: i64 = ((py_round_half_even(a / 45.0) % 8) + 8) % 8
+                return -1 if fabs(pymod(a - k.f64() * 45.0 + 180.0, 360.0) - 180.0) > run.message.level.near
+                out[i.usize()] <- k
+            return out[0] * 8 + out[1] if out[0] <= out[1] else out[1] * 8 + out[0]
+
+    def wanted(run: Run&, k: i64) -> i64:
+        can Abort.Panic:
+            return run.code[run.message.text[k.usize()].usize()]
+
+    # --- the hands
+    def press(run: mutable Run&):
+        can Abort.Panic:
+            run.hand.down <- true
+            best: mutable i64 = NO_FLAG
+            nearest: mutable f64 = 0.0
+            for k in 0..<2 |run, best, nearest|:
+                at: RoomsView::Point = tip(run, k)
+                d: f64 = py_hypot(run.hand.x - at.x, run.hand.y - at.y)
+                if d <= GRAB and (best == NO_FLAG or d < nearest):
+                    best <- k
+                    nearest <- d
+            run.held <- best
+
+    def release(run: mutable Run&):
+        run.hand.down <- false
+        run.held <- NO_FLAG
+
+    def strike(run: mutable Run&, k: i64, why: i64, letter: i64):
+        can Abort.Panic, Memory.Allocate:
+            run.read[k.usize()] <- 0
+            run.strikes <- run.strikes + 1
+            run.said <- why
+            run.said_letter <- letter
+            note(run, 0.3, 120.0, WRONG, 0.5)
+            run.result <- FAILED if run.strikes >= run.message.level.strikes
+
+    def key(run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate:
+            letter: i64 = port - HandView::KEYS
+            k: i64 = index(run)
+            return if k < 0 or run.read[k.usize()] != -1
+            truth: i64 = run.message.text[k.usize()]
+            if pose(run) != wanted(run, k):
+                strike(run, k, SAID_MISMATCH, truth)
+                return
+            if letter != truth:
+                strike(run, k, SAID_WRONG, truth)
+                return
+            run.read[k.usize()] <- 1
+            note(run, 0.2, 990.0, RIGHT, 0.5)
+
+    def act(run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate:
+            if port >= 0 and port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                press(run)
+            elif port == HandView::RELEASE:
+                release(run)
+            elif port >= HandView::KEYS and port < PORTS:
+                key(run, port)
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            before: i64 = index(run)
+            run.time <- run.time + dt
+            if run.held != NO_FLAG and run.hand.down:
+                dx: f64 = run.hand.x - PIVOT_X
+                dy: f64 = run.hand.y - PIVOT_Y
+                if py_hypot(dx, dy) > 12.0:
+                    run.flags[run.held.usize()] <- pymod(degrees(atan2(-dx, -dy)), 360.0)
+            now: i64 = index(run)
+            if now >= 0 and now != run.rung_at:
+                run.rung_at <- now
+                note(run, 0.5, 660.0, BELL, 0.5)
+            if before >= 0 and now != before and run.read[before.usize()] == -1:
+                strike(run, before, SAID_PASSED, run.message.text[before.usize()])
+                return if run.result != LIVE
+            matching: bool = now >= 0 and pose(run) == wanted(run, now)
+            if matching and not run.matched and run.message.level.rung < 7:
+                note(run, 0.05, 520.0, CLICK, 0.35)
+            run.matched <- matching
+            run.result <- PASSED if run.time >= run.message.level.seconds
+
+    def read_count(run: Run&) -> i64:
+        can Abort.Panic:
+            done: mutable i64 = 0
+            for i in 0..<run.message.count |run, done|:
+                done <- done + 1 if run.read[i.usize()] == 1
+            return done
+
+    def off(a: f64, b: f64) -> f64:
+        return fabs(pymod(a - b + 180.0, 360.0) - 180.0)
+
+    # The reference player: put each flag on the letter's pose, then type it.
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            k: i64 = index(run)
+            if run.result != LIVE or k < 0 or run.read[k.usize()] != -1:
+                return HandView::RELEASE if run.hand.down else -1
+            pair: i64 = wanted(run, k)
+            want: mutable f64[2] = [(pair / 8).f64() * 45.0, (pair % 8).f64() * 45.0]
+            straight: f64 = off(run.flags[0], want[0]) + off(run.flags[1], want[1])
+            crossed: f64 = off(run.flags[0], want[1]) + off(run.flags[1], want[0])
+            if crossed < straight:
+                first: f64 = want[0]
+                want[0] <- want[1]
+                want[1] <- first
+            fine: f64 = 0.4 * run.message.level.near
+            for which in 0..<2 |run, want, fine|:
+                continue if off(run.flags[which.usize()], want[which.usize()]) <= fine
+                if run.held != which:
+                    return HandView::RELEASE if run.hand.down
+                    at: RoomsView::Point = tip(run, which)
+                    going: i64 = HandView::toward(&run.hand, at.x, at.y, 6.0)
+                    return going if going >= 0 else HandView::PRESS
+                d: RoomsView::Point = way(want[which.usize()])
+                going: i64 = HandView::toward(&run.hand, PIVOT_X + ARM * d.x, PIVOT_Y + ARM * d.y, 4.0)
+                return going if going >= 0 else HandView::RELEASE
+            return HandView::RELEASE if run.hand.down
+            return HandView::KEYS + run.message.text[k.usize()]
+
+    def reference_passes(message: Message) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            run: mutable Run = begin(message, false)
+            while run.result == LIVE |run|:
+                act(&run, pilot(&run))
+                step(&run, 1.0 / 60.0)
+            return run.result == PASSED
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Message:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            level: Grade = grade(rung)
+            for _ in 0..<80 |level, draw|:
+                rng: mutable MT19937 = zeroed
+                mt_seed_int(&rng, py_getrandbits(draw, 32))
+                message: Message = build(level, &rng)
+                return message if reference_passes(message)
+            return zeroed

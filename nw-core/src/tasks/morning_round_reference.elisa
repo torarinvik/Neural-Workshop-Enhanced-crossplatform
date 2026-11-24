@@ -1,0 +1,169 @@
+include "./morning_round_ride.elisa"
+
+module MorningRoundReference:
+    const NEUTRAL: i64 = -1
+    const REFERENCE: i64 = 0
+    const EVERY_HOUSE: i64 = 1
+    const FIRST_RULE: i64 = 2
+    const STEP: f64 = 1.0 / 60.0
+
+    struct Weights:
+        values: mutable f64[6]
+
+    struct Pilot:
+        aimed: mutable bool[96]
+        weights: mutable Weights[8]
+        computed: mutable i64
+        known_count: mutable i64
+
+    struct Sum:
+        value: mutable f64
+        correction: mutable f64
+
+    def add(sum: mutable Sum&, term: f64):
+        next: f64 = sum.value + term
+        sum.correction <- sum.correction + ((sum.value - next) + term if sum.value >= term else ((term - next) + sum.value))
+        sum.value <- next
+
+    def compatible(run: MorningRoundRide::Run&, block: i64, votes: MorningRoundRules::Votes) -> bool:
+        can Abort.Panic:
+            size: i64 = run.street.layout.level.houses * 2
+            begin: i64 = block * size
+            for i in begin..<(begin + size) |run, votes|:
+                if run.known[i.usize()] and MorningRoundRules::pick(votes, i) != MorningRoundRules::pick(run.street.want, i):
+                    return false
+            return true
+
+    def known_rule(rule: i64) -> Weights:
+        can Abort.Panic:
+            out: mutable Weights = zeroed
+            out.values[rule.usize()] <- 1.0
+            return out
+
+    def believed(run: MorningRoundRide::Run&, pilot: mutable Pilot&, block: i64) -> Weights:
+        can Abort.Panic:
+            level: MorningRound::Grade = run.street.layout.level
+            if level.mode != MorningRound::HIDDEN or block == 0:
+                return known_rule(run.street.active[block.usize()])
+            if pilot.known_count != run.known_count:
+                pilot.computed <- 0
+                pilot.known_count <- run.known_count
+            if pilot.computed == 0:
+                pilot.weights[0] <- known_rule(run.street.active[0])
+                pilot.computed <- 1
+            while pilot.computed <= block |run, level, pilot, block|:
+                b: i64 = pilot.computed
+                prev: Weights = pilot.weights[(b - 1).usize()]
+                out: mutable Weights = zeroed
+                total: mutable Sum = zeroed
+                for k in 0..<level.deck |run, level, b, prev, out, total|:
+                    continue if not compatible(run, b, run.street.book.votes[k.usize()])
+                    value: mutable Sum = zeroed
+                    for j in 0..<level.deck |prev, level, k, value|:
+                        weight: f64 = prev.values[j.usize()]
+                        if weight > 0.0:
+                            add(&value, weight * (0.5 if j == k else 0.5 / (level.deck - 1).f64()))
+                    p: f64 = value.value + value.correction
+                    out.values[k.usize()] <- p
+                    add(&total, p) if p > 0.0
+                mass: f64 = total.value + total.correction
+                if mass > 0.0:
+                    for k in 0..<level.deck |out, mass|:
+                        out.values[k.usize()] <- out.values[k.usize()] / mass
+                pilot.weights[b.usize()] <- out
+                pilot.computed <- b + 1
+            return pilot.weights[block.usize()]
+
+    def decide(run: MorningRoundRide::Run&, pilot: mutable Pilot&, h: MorningRound::House, policy: i64) -> bool:
+        can Abort.Panic:
+            return true if policy == EVERY_HOUSE
+            if policy == FIRST_RULE:
+                return MorningRoundRules::pick(run.street.book.votes[run.street.active[0].usize()], h.i)
+            weights: Weights = believed(run, pilot, h.block)
+            total: mutable Sum = zeroed
+            for k in 0..<run.street.book.count |run, h, weights, total|:
+                if MorningRoundRules::pick(run.street.book.votes[k.usize()], h.i):
+                    add(&total, weights.values[k.usize()])
+            return total.value + total.correction > 0.5
+
+    def danger(run: MorningRoundRide::Run&, x: f64) -> f64:
+        can Abort.Panic:
+            worst: mutable f64 = 0.0
+            for k in 0..<run.street.traffic.count |run, x, worst|:
+                continue if run.hit[k.usize()]
+                thing: MorningRound::Thing = run.street.traffic.things[k.usize()]
+                gap: f64 = MorningRoundRide::thing_d(run, thing) - run.s
+                reach: f64 = thing.radius + MorningRoundRide::RIDER_RADIUS
+                continue if gap < -reach or gap > 2.2 * run.speed + thing.speed * 2.2
+                ahead: f64 = fmax(0.0, gap) / fmax(1.0, run.speed + thing.speed)
+                continue if ahead > 2.2
+                clear: f64 = fabs(thing.x - x) - thing.radius - MorningRoundRide::RIDER_RADIUS
+                worst <- fmax(worst, (14.0 - clear) * (3.0 - ahead)) if clear < 14.0
+            return worst
+
+    def lane(run: MorningRoundRide::Run&) -> i64:
+        can Abort.Panic:
+            return NEUTRAL if danger(run, run.x) <= 0.0
+            visited: mutable i64 = 0
+            best: mutable f64 = 1.0e300
+            best_x: mutable f64 = run.x
+            for _ in 0..<9 |run, best, best_x, visited|:
+                minimum: mutable f64 = 1.0e300
+                closest: mutable i64 = 0
+                for i in 0..<9 |run, visited, minimum, closest|:
+                    continue if ((visited >> i) & 1) != 0
+                    distance: f64 = fabs((516.0 + 21.0 * i.f64()) - run.x)
+                    if distance < minimum:
+                        minimum <- distance
+                        closest <- i
+                visited <- visited | (1 << closest)
+                x: f64 = 516.0 + 21.0 * closest.f64()
+                score: f64 = danger(run, x)
+                if score < best - 0.000001:
+                    best <- score
+                    best_x <- x
+            return NEUTRAL if fabs(best_x - run.x) < 3.0
+            return MorningRound::LEFT if best_x < run.x else MorningRound::RIGHT
+
+    def choose(run: MorningRoundRide::Run&, pilot: mutable Pilot&, policy: i64 = REFERENCE) -> i64:
+        can Abort.Panic:
+            return NEUTRAL if run.result != MorningRoundRide::LIVE or not MorningRoundRide::riding(run)
+            if run.t >= run.down_until:
+                end: i64 = MorningRound::cap(run.passed + 6, run.street.layout.count)
+                for i in run.passed..<end |run, pilot, policy|:
+                    continue if run.got[i.usize()] != MorningRoundRide::UNDELIVERED or pilot.aimed[i.usize()]
+                    h: MorningRound::House = run.street.layout.houses[i.usize()]
+                    flight: f64 = fabs(MorningRoundRide::front(h.side) - run.x) / MorningRoundRide::PAPER_SPEED
+                    land: f64 = run.s + run.speed * flight
+                    continue if land < h.d - 14.0 or land > h.d + MorningRoundRide::HOUSE_LENGTH / 2.0 - 12.0
+                    continue if not decide(run, pilot, h, policy)
+                    break if run.t - run.last_throw < MorningRoundRide::COOLDOWN
+                    pilot.aimed[i.usize()] <- true
+                    return MorningRound::THROW_L if h.side < 0 else MorningRound::THROW_R
+            return lane(run)
+
+    def tick(run: mutable MorningRoundRide::Run&, port: i64, dt: f64):
+        can Abort.Panic:
+            if port == MorningRound::THROW_L or port == MorningRound::THROW_R:
+                _ = MorningRoundRide::throw(run, -1 if port == MorningRound::THROW_L else 1)
+            MorningRoundRide::step(run, dt, port)
+
+    def play(street: MorningRoundRules::Street, policy: i64 = REFERENCE) -> i64:
+        can Abort.Panic:
+            run: mutable MorningRoundRide::Run = MorningRoundRide::start(street)
+            pilot: mutable Pilot = zeroed
+            while run.result == MorningRoundRide::LIVE |run, pilot, policy|:
+                port: i64 = choose(&run, &pilot, policy)
+                tick(&run, port, STEP)
+            return run.result
+
+    def deal(rung: i64, draw: mutable MT19937&) -> MorningRoundRules::Candidate:
+        can Abort.Panic:
+            level: MorningRound::Grade = MorningRound::grade(rung)
+            for _ in 0..<300 |level, draw|:
+                child: mutable MT19937 = zeroed
+                mt_seed_int(&child, py_getrandbits(draw, 32))
+                candidate: MorningRoundRules::Candidate = MorningRoundRules::build(level, &child)
+                if candidate.valid and play(candidate.street) == MorningRoundRide::CLEAR:
+                    return candidate
+            return MorningRoundRules::Candidate{valid: false, street: zeroed}

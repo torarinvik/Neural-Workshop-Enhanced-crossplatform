@@ -1,0 +1,292 @@
+include "./tasks/rover_game.elisa"
+include "./scene_live_view.elisa"
+include "./scene_polish.elisa"
+include "./scene_verdict.elisa"
+
+module SceneRover:
+    const CELL: f64 = 2.5
+    const LEFT: f64 = (LiveView::WIDTH - LiveView::VIEW_WIDTH) / 2.0
+    const GRID_SIDE: i64 = 25
+    const ROCK: i64 = 0
+    const FLAG: i64 = 1
+    const VEHICLE: i64 = 2
+
+    struct Item:
+        distance: f64
+        kind: i64
+        index: i64
+
+    def farther(a: Item, b: Item) -> bool:
+        return a.distance > b.distance if a.distance != b.distance
+        return a.kind < b.kind if a.kind != b.kind
+        return a.index < b.index
+
+    def sort_far_first(order: mutable darray[Item]&):
+        can Abort.Panic:
+            size: i64 = order.count.i64()
+            gap: mutable i64 = size / 2
+            while gap > 0 |order, size, gap|:
+                for i in gap..<size |order, gap|:
+                    item: Item = order[i]
+                    j: mutable i64 = i
+                    while j >= gap and farther(item, order[j - gap]) |j, gap, order, item|:
+                        order[j] <- order[j - gap]
+                        j <- j - gap
+                    order[j] <- item
+                gap <- gap / 2
+
+    def shade(ink: u32, scale: f64) -> u32:
+        r: u32 = fmin(255.0, ((ink >> 24) & 255.u32()).f64() * scale).u32()
+        g: u32 = fmin(255.0, ((ink >> 16) & 255.u32()).f64() * scale).u32()
+        b: u32 = fmin(255.0, ((ink >> 8) & 255.u32()).f64() * scale).u32()
+        return (r << 24) | (g << 16) | (b << 8) | 255.u32()
+
+    def card(list: mutable Display::DisplayList&, view: LiveView::View&):
+        can Memory.Allocate, Abort.Panic:
+            box: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: LEFT - 4.0, y: view.bottom - 4.0,
+                w: LiveView::VIEW_WIDTH + 8.0, h: view.height + 8.0}
+            alpha: u32[3] = [30.u32(), 18.u32(), 12.u32()]
+            for i in 0..<3 |list, box, alpha|:
+                spread: f64 = i.f64() * 2.0
+                halo: SceneHiddenRule::Rect = ScenePolish::spread_box(&box, spread, 4.0)
+                ScenePolish::rounded(list, &halo, 14.0 + spread, alpha[i.usize()])
+            ScenePolish::rounded(list, &box, 14.0, 0xb07860ff)
+
+    def earth(g: Rover::Ground&, x: f64, z: f64) -> RoomsView::Vec:
+        can Abort.Panic:
+            return RoomsView::vec(x, Rover::height(g, x, z), z)
+
+    def quad(list: mutable Display::DisplayList&, view: LiveView::View&, a: RoomsView::Vec, b: RoomsView::Vec,
+             c: RoomsView::Vec, d: RoomsView::Vec, count: i64, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            points: mutable RoomsView::Vec[46] = zeroed
+            points[0] <- a
+            points[1] <- b
+            points[2] <- c
+            points[3] <- d
+            LiveView::face(list, view, &points, count, ink)
+
+    def terrain(list: mutable Display::DisplayList&, view: LiveView::View&, g: Rover::Ground&, center: Rover::Point,
+                fx: f64, fz: f64):
+        can Memory.Allocate, Abort.Panic:
+            eye: RoomsView::Vec = view.camera.eye
+            h: RoomsView::Vec = LiveView::camera_point(view, RoomsView::vec(eye.x + 900.0 * fx, eye.y, eye.z + 900.0 * fz))
+            top: f64 = view.bottom + view.height
+            if h.z >= 0.05:
+                y: f64 = fmax(view.bottom, LiveView::project(view, h).y)
+                Display::draw_rect(list, LEFT, y, LiveView::VIEW_WIDTH, top - y, 0xd6a884ff) if y < top
+
+            order: mutable darray[Item] = []
+            _ = order.reserve((GRID_SIDE * GRID_SIDE).usize())
+            for index in 0..<(GRID_SIDE * GRID_SIDE) |center, eye, fx, fz, order|:
+                i: i64 = index / GRID_SIDE - 12
+                j: i64 = index % GRID_SIDE - 12
+                x: f64 = center.x + i.f64() * CELL - eye.x
+                z: f64 = center.z + j.f64() * CELL - eye.z
+                if x * fx + z * fz >= -2.0:
+                    order.push(Item{distance: py_hypot(x, z), kind: 0, index: index})
+            sort_far_first(&order)
+            for item in order |list, view, g, center|:
+                i: i64 = item.index / GRID_SIDE - 12
+                j: i64 = item.index % GRID_SIDE - 12
+                x: f64 = center.x + i.f64() * CELL
+                z: f64 = center.z + j.f64() * CELL
+                a: RoomsView::Vec = earth(g, x, z)
+                b: RoomsView::Vec = earth(g, x + CELL, z)
+                c: RoomsView::Vec = earth(g, x + CELL, z + CELL)
+                d: RoomsView::Vec = earth(g, x, z + CELL)
+                rise: f64 = (b.y - a.y) - (d.y - a.y)
+                scale: f64 = fmax(0.55, fmin(1.15, 0.9 + 0.5 * rise / CELL))
+                ink: u32 = shade(0xc48462ff if (i + j) % 2 != 0 else 0xbc7e5eff, scale)
+                quad(list, view, a, b, c, d, 4, ink)
+
+    def disc(list: mutable Display::DisplayList&, view: LiveView::View&, x: f64, y: f64, radius: f64, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            dx: f64 = fmin(x - LEFT, LEFT + LiveView::VIEW_WIDTH - x)
+            dy: f64 = fmin(y - view.bottom, view.bottom + view.height - y)
+            return if dx < 0.0 or dy < 0.0
+            clipped: f64 = fmin(radius, fmin(dx, dy)) if radius > 4.0 else radius
+            Display::draw_circle(list, x, y, fmax(0.5, clipped), ink)
+
+    def ball(list: mutable Display::DisplayList&, view: LiveView::View&, world: RoomsView::Vec, radius: f64, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            p: RoomsView::Vec = LiveView::camera_point(view, world)
+            return if p.z < 0.05
+            center: RoomsView::Point = LiveView::project(view, p)
+            r: f64 = radius * view.focal / p.z
+            disc(list, view, center.x, center.y, r, shade(ink, 0.75))
+            disc(list, view, center.x - 0.15 * r, center.y + 0.15 * r, r * 0.8, ink)
+
+    def banner(list: mutable Display::DisplayList&, view: LiveView::View&, run: Rover::Run&, index: i64):
+        can Memory.Allocate, Abort.Panic:
+            p: Rover::Point = run.ground.flags[index.usize()]
+            base: RoomsView::Vec = earth(&run.ground, p.x, p.z)
+            top: RoomsView::Vec = RoomsView::vec(p.x, base.y + 3.2, p.z)
+            LiveView::seg(list, view, base, top, 3.0, 0xf0f0f5ff)
+            quad(list, view, top, RoomsView::vec(p.x + 1.2, base.y + 2.85, p.z),
+                RoomsView::vec(p.x, base.y + 2.5, p.z), base, 3,
+                0xfaf05aff if index == run.reached else 0xc8c8d2ff)
+            ring: mutable RoomsView::Vec[46] = zeroed
+            for i in 0..<16 |ring, p, base|:
+                a: f64 = i.f64() * RoverReference::PI / 8.0
+                ring[i.usize()] <- RoomsView::vec(p.x + cos(a) * Rover::FLAG, base.y + 0.05, p.z + sin(a) * Rover::FLAG)
+            LiveView::face(list, view, &ring, 16, 0xd2966eff)
+
+    def vehicle_point(base: RoomsView::Vec, fx: f64, fz: f64, a: f64, b: f64, up: f64) -> RoomsView::Vec:
+        return RoomsView::vec(base.x + fx * a + fz * b, base.y + up, base.z + fz * a - fx * b)
+
+    def vehicle(list: mutable Display::DisplayList&, view: LiveView::View&, base: RoomsView::Vec, fx: f64, fz: f64):
+        can Memory.Allocate, Abort.Panic:
+            for wheel in 0..<4 |list, view, base, fx, fz|:
+                a: f64 = 0.8 if wheel < 2 else -0.8
+                b: f64 = 0.75 if wheel % 2 == 0 else -0.75
+                ball(list, view, vehicle_point(base, fx, fz, a, b, 0.0), 0.35, 0x323238ff)
+            top: mutable RoomsView::Vec[4] = zeroed
+            low: mutable RoomsView::Vec[4] = zeroed
+            for i in 0..<4 |top, low, base, fx, fz|:
+                a: f64 = 1.1 if i < 2 else -1.1
+                b: f64 = 0.6 if i == 0 or i == 3 else -0.6
+                top[i.usize()] <- vehicle_point(base, fx, fz, a, b, 0.5)
+                low[i.usize()] <- vehicle_point(base, fx, fz, a, b, 0.15)
+            quad(list, view, low[2], low[3], top[3], top[2], 4, 0xbebec8ff)
+            quad(list, view, low[3], low[0], top[0], top[3], 4, 0xaaaab6ff)
+            quad(list, view, low[1], low[2], top[2], top[1], 4, 0xaaaab6ff)
+            quad(list, view, top[0], top[1], top[2], top[3], 4, 0xe8e8f0ff)
+            LiveView::seg(list, view, vehicle_point(base, fx, fz, -0.6, 0.0, 0.5),
+                vehicle_point(base, fx, fz, -0.6, 0.0, 1.4), 2.0, 0x5a5a64ff)
+            ball(list, view, vehicle_point(base, fx, fz, -0.6, 0.0, 1.45), 0.12, 0xf0f0faff)
+
+    def objects(list: mutable Display::DisplayList&, view: LiveView::View&, run: Rover::Run&, s: Rover::State,
+                center: Rover::Point, fx: f64, fz: f64):
+        can Memory.Allocate, Abort.Panic:
+            eye: Rover::Point = Rover::Point{x: view.camera.eye.x, z: view.camera.eye.z}
+            order: mutable darray[Item] = []
+            for i in 0..<run.ground.level.rocks |run, eye, center, order|:
+                p: Rover::Point = run.ground.rocks[i.usize()].at
+                if fabs(p.x - center.x) <= 28.0 and fabs(p.z - center.z) <= 28.0:
+                    order.push(Item{distance: Rover::flag_distance(p, eye), kind: ROCK, index: i})
+            for i in run.reached..<run.ground.level.flags |run, eye, order|:
+                p: Rover::Point = run.ground.flags[i.usize()]
+                order.push(Item{distance: Rover::flag_distance(p, eye), kind: FLAG, index: i})
+            order.push(Item{distance: py_hypot(s.x - eye.x, s.z - eye.z), kind: VEHICLE, index: 0})
+            sort_far_first(&order)
+            for item in order |list, view, run, s, fx, fz|:
+                if item.kind == ROCK:
+                    rock: Rover::Rock = run.ground.rocks[item.index.usize()]
+                    y: f64 = Rover::height(&run.ground, rock.at.x, rock.at.z)
+                    ball(list, view, RoomsView::vec(rock.at.x, y + rock.radius * 0.6, rock.at.z), rock.radius, 0x6e5246ff)
+                elif item.kind == FLAG:
+                    banner(list, view, run, item.index)
+                else:
+                    y: f64 = Rover::height(&run.ground, s.x, s.z) + 0.35
+                    vehicle(list, view, RoomsView::vec(s.x, y, s.z), fx, fz)
+
+    def tray(list: mutable Display::DisplayList&, view: LiveView::View&, run: Rover::Run&):
+        can Memory.Allocate, Abort.Panic:
+            delay: f64 = Rover::delay_at(&run.ground, run.t)
+            span: f64 = fmax(0.2, delay / 2.0)
+            x: f64 = LEFT + 110.0
+            y: f64 = view.bottom + 14.0
+            width: f64 = LiveView::VIEW_WIDTH - 220.0
+            Display::draw_rect(list, x, y, width, 14.0, 0x1e1614c8)
+            colors: u32[4] = [0x6edc8cff, 0xe66e5aff, 0x78aafaff, 0xf0c85aff]
+            for i in 0..<run.queued |list, run, span, x, y, width, colors|:
+                cmd: Rover::Command = run.queue[i]
+                u: f64 = fmax(0.0, fmin(1.0, 1.0 - (cmd.at - run.t) / span))
+                Display::draw_rect(list, x + width * u - 2.0, y + 1.0, 4.0, 12.0, colors[cmd.port.usize()])
+            words: mutable dstr = []
+            dstr_append_cstr(&words, "delay ")
+            dstr_append_fixed(&words, py_round_decimal(delay, 10.0), 1)
+            dstr_append_cstr(&words, " s")
+            Display::draw_text(list, bytes_view(words), x - 54.0, y + 7.0, 12.0, 0xfaecdcff, Display::ANCHOR_CENTER_CENTER)
+            Display::draw_text(list, "rover", x + width + 30.0, y + 7.0, 12.0, 0xfaecdcff, Display::ANCHOR_CENTER_CENTER)
+
+    def drive(list: mutable Display::DisplayList&, run: Rover::Run&):
+        can Memory.Allocate, Abort.Panic:
+            s: Rover::State = Rover::seen(run)
+            fx: f64 = sin(s.heading)
+            fz: f64 = cos(s.heading)
+            eye: RoomsView::Vec = RoomsView::vec(s.x - 9.0 * fx, Rover::height(&run.ground, s.x, s.z) + 3.4, s.z - 9.0 * fz)
+            view: LiveView::View = LiveView::lens(eye, RoomsView::vec(12.0 * fx, -1.6, 12.0 * fz),
+                RoomsView::vec(0.0, 1.0, 0.0), 0.5585053606381855)
+            center: Rover::Point = Rover::Point{x: py_round_half_even(s.x / CELL).f64() * CELL,
+                z: py_round_half_even(s.z / CELL).f64() * CELL}
+            card(list, &view)
+            terrain(list, &view, &run.ground, center, fx, fz)
+            objects(list, &view, run, s, center, fx, fz)
+            tray(list, &view, run)
+
+    def label(list: mutable Display::DisplayList&, words: sview, y: f64, size: f64, ink: u32, bold: bool = false):
+        can Memory.Allocate, Abort.Panic:
+            Display::draw_text_weight(list, words, LiveView::CX, y, size, ink, Display::ANCHOR_CENTER_CENTER, bold)
+
+    def verdict_text(run: Rover::Run&, words: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if run.result == Rover::CLEAR:
+                dstr_append_cstr(words, "Every flag in ")
+                dstr_append_i64(words, py_round_half_even(run.t))
+                dstr_append_cstr(words, " s")
+            elif run.result == Rover::HIT_ROCK:
+                dstr_append_cstr(words, "Hit a rock")
+            elif run.result == Rover::TIPPED:
+                dstr_append_cstr(words, "Tipped over on a slope")
+            elif run.result == Rover::TIMEOUT:
+                dstr_append_i64(words, run.reached)
+                dstr_append_cstr(words, " of ")
+                dstr_append_i64(words, run.ground.level.flags)
+                dstr_append_cstr(words, " flags")
+
+    def render(list: mutable Display::DisplayList&, session: RoverGame::Session&, dark: bool):
+        can Memory.Allocate, Abort.Panic:
+            ink: u32 = 0xffffffff if dark else 0x000000ff
+            label(list, "Rover", 648.0, 22.0, ink, true)
+            label(list, "W: drive   S: brake / back   A / D: steer   Esc: menu", 26.0, 12.0, ink)
+            caption: mutable dstr = []
+            verdict_text(&session.run, &caption)
+            status: mutable dstr = []
+            if session.phase == RoverGame::READY:
+                dstr_append_cstr(&status, "Press Space or click to start")
+            elif session.phase == RoverGame::DONE:
+                dstr_append_i64(&status, session.wins)
+                dstr_append_cstr(&status, " of ")
+                dstr_append_i64(&status, session.trial)
+                dstr_append_cstr(&status, " passed   highest rung passed ")
+                dstr_append_i64(&status, session.best_rung)
+            elif session.phase == RoverGame::JUDGED:
+                status <- caption
+            else:
+                dstr_append_cstr(&status, "Drive to each flag. Everything you see and send is late")
+            label(list, bytes_view(status), 614.0, 14.0, ink)
+            if session.phase == RoverGame::PLAYING or session.phase == RoverGame::JUDGED:
+                facts: mutable dstr = []
+                dstr_append_cstr(&facts, "rung ")
+                dstr_append_i64(&facts, session.rung)
+                dstr_append_cstr(&facts, "  ")
+                dstr_append_i64(&facts, session.trial)
+                dstr_append_cstr(&facts, "/")
+                dstr_append_i64(&facts, session.total)
+                dstr_append_cstr(&facts, "   flags ")
+                dstr_append_i64(&facts, session.run.reached)
+                dstr_append_cstr(&facts, "/")
+                dstr_append_i64(&facts, session.run.ground.level.flags)
+                label(list, bytes_view(facts), 588.0, 12.0, ink)
+                drive(list, &session.run)
+            if session.phase == RoverGame::JUDGED or session.phase == RoverGame::DONE:
+                SceneVerdict::put(list, LiveView::WIDTH, LiveView::HEIGHT, 1.0, 1.0, session.run.result == Rover::CLEAR,
+                    bytes_view(caption), 60.0, 16.0)
+
+    def option_note(rung: i64, words: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            level: Rover::Grade = Rover::grade(rung)
+            dstr_append_cstr(words, "Rung ")
+            dstr_append_i64(words, level.rung)
+            dstr_append_cstr(words, ": ")
+            dstr_append_fixed(words, py_round_decimal(level.delay, 10.0), 1)
+            dstr_append_cstr(words, " s delay, ")
+            dstr_append_i64(words, level.flags)
+            dstr_append_cstr(words, " flag(s).")
+            if level.rocks > 0:
+                dstr_append_cstr(words, "  ")
+                dstr_append_i64(words, level.rocks)
+                dstr_append_cstr(words, " rocks.")
+            dstr_append_cstr(words, "  Slopes that tip.") if level.tip != 0.0

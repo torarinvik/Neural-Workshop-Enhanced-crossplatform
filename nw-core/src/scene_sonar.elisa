@@ -1,0 +1,228 @@
+include "./tasks/sonar_game.elisa"
+include "./scene_polish.elisa"
+include "./scene_verdict.elisa"
+include "./verdict.elisa"
+include "./geometry.elisa"
+
+module SceneSonar:
+    const WIDTH: f64 = 912.0
+    const HEIGHT: f64 = 684.0
+    const CENTER: u32 = Display::ANCHOR_CENTER_CENTER
+    const FOUND: u32 = 0xeec440ff
+    const MISSED: u32 = 0x969696ff
+    const CURSOR: u32 = 0x285adcff
+
+    struct Marks:
+        missed: mutable i64[Sonar::MAX_CELLS]
+        latest: mutable i64[Sonar::MAX_CELLS]
+
+    def maximum(a: f64, b: f64) -> f64:
+        return a if a > b else b
+
+    def board() -> SceneHiddenRule::Rect:
+        can Abort.Panic:
+            top: f64 = Geometry::from_top_edge(HEIGHT, 116.0).f64() - 16.0
+            bottom: f64 = Verdict::above_the_band(HEIGHT, Geometry::from_bottom_edge(HEIGHT, 58.0).f64()).f64() + 16.0
+            size: f64 = top - bottom
+            return SceneHiddenRule::Rect{x: (WIDTH - size) / 2.0, y: bottom, w: size, h: size}
+
+    def cell_box(grid: SceneHiddenRule::Rect&, cell: i64, side: i64) -> SceneHiddenRule::Rect:
+        can Abort.Panic:
+            span: f64 = grid.w / side.f64()
+            return SceneHiddenRule::Rect{x: grid.x + (cell % side).f64() * span,
+                y: grid.y + grid.h - (cell / side + 1).f64() * span, w: span, h: span}
+
+    def hit(session: SonarGame::Session&, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            return -1 if session.phase != SonarGame::SEARCHING
+            grid: SceneHiddenRule::Rect = board()
+            # The bottom edge has no cell below it.
+            return -1 if not (x >= grid.x and x < grid.x + grid.w and y > grid.y and y < grid.y + grid.h)
+            side: i64 = session.board.dealt.level.side
+            span: f64 = grid.w / side.f64()
+            row: i64 = ((grid.y + grid.h - y) / span).i64()
+            column: i64 = ((x - grid.x) / span).i64()
+            return -1 if row >= side or column >= side
+            return row * side + column
+
+    def reading_color(reading: i64, bands: i64, age: i64, dark: bool) -> u32:
+        can Abort.Panic:
+            near: f64 = 1.0 - reading.f64() / (bands - 1).f64()
+            red: f64 = (200.0 - 150.0 * near).i64().f64()
+            green: f64 = (222.0 - 132.0 * near).i64().f64()
+            blue: f64 = (250.0 - 40.0 * near).i64().f64()
+            fade: f64 = SceneHiddenRule::minimum(0.75, age.f64() * 0.07)
+            return Display::rgba(
+                (red + ((46.0 if dark else 226.0) - red) * fade).i64(),
+                (green + ((50.0 if dark else 230.0) - green) * fade).i64(),
+                (blue + ((58.0 if dark else 236.0) - blue) * fade).i64(), 255)
+
+    def bezel(list: mutable Display::DisplayList&, grid: SceneHiddenRule::Rect&, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            rim: f64 = grid.w * 0.03
+            outer: SceneHiddenRule::Rect = ScenePolish::spread_box(grid, rim)
+            ScenePolish::shadow(list, &outer, rim * 1.4, 4.0, dark)
+            slate: u32 = 0x3c4458ff if dark else 0x343c4eff
+            ScenePolish::rounded(list, &outer, rim * 1.4, slate)
+            rim_box: SceneHiddenRule::Rect = ScenePolish::spread_box(grid, rim * 0.35)
+            ScenePolish::rounded(list, &rim_box, rim * 0.8, ScenePolish::mix_rgb(slate, 0xffffffff, 0.12))
+            ScenePolish::rounded(list, grid, rim * 0.5,
+                ScenePolish::mix_rgb(slate, 0x000000ff, 0.6 if dark else 0.25))
+
+    def draw_cell(list: mutable Display::DisplayList&, session: SonarGame::Session&, marks: Marks&,
+                  grid: SceneHiddenRule::Rect&, cell: i64, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            side: i64 = session.board.dealt.level.side
+            box: SceneHiddenRule::Rect = cell_box(grid, cell, side)
+            span: f64 = box.w
+            gap: f64 = 1.0 if span < 14.0 else maximum(1.5, span * 0.045)
+            corner: f64 = 0.0 if span < 14.0 else span * 0.16
+            cx: f64 = box.x + span / 2.0
+            cy: f64 = box.y + span / 2.0
+            color: mutable u32 = 0x2e323aff if dark else 0xe2e6ecff
+            text: mutable dstr = []
+            found: bool = session.phase == SonarGame::JUDGED and session.board.found and cell == Sonar::target(&session.board)
+            latest: i64 = marks.latest[cell.usize()]
+            if found:
+                color <- FOUND
+                dstr_append_cstr(&text, "★")
+            elif marks.missed[cell.usize()] != 0:
+                color <- MISSED
+                dstr_append_cstr(&text, "×")
+            elif latest > 0:
+                reading: i64 = session.board.observations[(latest - 1).usize()].reading
+                color <- reading_color(reading, session.board.dealt.level.bands, session.board.actions - latest + 1, dark)
+                dstr_append_i64(&text, reading)
+            tile: SceneHiddenRule::Rect = ScenePolish::spread_box(&box, -gap)
+            ScenePolish::rounded(list, &tile, corner, color)
+            if span >= 14.0 and text.count > 0.usize():
+                total: u32 = (color >> 24) + ((color >> 16) & 255.u32()) + ((color >> 8) & 255.u32())
+                ink: u32 = 0xffffffff if total < 380.u32() else 0x141414ff
+                Display::draw_text(list, bytes_view(text), cx, cy, maximum(6.0, span * 0.32), ink, CENTER)
+
+    def draw_board(list: mutable Display::DisplayList&, session: SonarGame::Session&, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            grid: SceneHiddenRule::Rect = board()
+            side: i64 = session.board.dealt.level.side
+            marks: mutable Marks = zeroed
+            for at in 0..<session.board.actions |session, marks|:
+                observation: Sonar::Observation = session.board.observations[at.usize()]
+                cell: usize = observation.cell.usize()
+                marks.missed[cell] <- 1 if observation.reading == Sonar::WRONG_DIG
+                marks.latest[cell] <- at + 1 if observation.reading >= 0
+            bezel(list, &grid, dark)
+            if session.phase == SonarGame::JUDGED and session.board.found:
+                target: SceneHiddenRule::Rect = cell_box(&grid, Sonar::target(&session.board), side)
+                ScenePolish::glow(list, target.x + target.w / 2.0, target.y + target.h / 2.0, target.w * 1.4, FOUND, 160)
+            for cell in 0..<(side * side) |list, session, marks, grid, dark|:
+                draw_cell(list, session, &marks, &grid, cell, dark)
+            if session.phase == SonarGame::SEARCHING or session.phase == SonarGame::FLAGGED:
+                cursor: SceneHiddenRule::Rect = cell_box(&grid, session.cursor, side)
+                ring: f64 = maximum(2.5, cursor.w * 0.08)
+                box: SceneHiddenRule::Rect = ScenePolish::spread_box(&cursor, ring * 0.3)
+                Display::draw_box(list, box.x, box.y, box.w, box.h, CURSOR, ring)
+
+    def points(out: mutable dstr&, value: f64):
+        can Abort.Panic, Memory.Allocate:
+            dstr_append_fixed(out, value, 0 if value == floor(value) else 1)
+
+    def message(out: mutable dstr&, session: SonarGame::Session&):
+        can Abort.Panic, Memory.Allocate:
+            if session.phase == SonarGame::READY:
+                dstr_append_cstr(out, "Press Space to start")
+            elif session.phase == SonarGame::DONE:
+                dstr_append_i64(out, session.wins)
+                dstr_append_cstr(out, " of ")
+                dstr_append_i64(out, session.scored)
+                dstr_append_cstr(out, " under par   highest rung passed ")
+                dstr_append_i64(out, session.best_rung)
+            elif session.phase == SonarGame::SEARCHING or session.phase == SonarGame::FLAGGED:
+                dstr_append_cstr(out, "Find it for ")
+                points(out, session.par)
+                dstr_append_cstr(out, " or less")
+            else:
+                verdict_message(out, session)
+
+    def verdict_message(out: mutable dstr&, session: SonarGame::Session&):
+        can Abort.Panic, Memory.Allocate:
+            if session.board.found:
+                dstr_append_cstr(out, "Found for ")
+                dstr_append_i64(out, session.board.cost)
+                dstr_append_cstr(out, "; par was ")
+                points(out, session.par)
+            else:
+                dstr_append_cstr(out, "Out of moves after spending ")
+                dstr_append_i64(out, session.board.cost)
+
+    def percent(out: mutable dstr&, prefix: cstr, rate: f64):
+        can Abort.Panic, Memory.Allocate:
+            dstr_append_cstr(out, prefix)
+            dstr_append_i64(out, round_half_even(rate * 100.0))
+            dstr_append_cstr(out, "%")
+
+    def facts(out: mutable dstr&, session: SonarGame::Session&):
+        can Abort.Panic, Memory.Allocate:
+            level: Sonar::Grade = session.board.dealt.level
+            dstr_append_cstr(out, "rung ")
+            dstr_append_i64(out, level.rung)
+            dstr_append_cstr(out, "  ")
+            dstr_append_i64(out, session.trial)
+            dstr_append_cstr(out, "/")
+            dstr_append_i64(out, session.total)
+            dstr_append_cstr(out, "   spent ")
+            dstr_append_i64(out, session.board.cost)
+            dstr_append_cstr(out, "   wrong dig ")
+            dstr_append_i64(out, level.penalty)
+            dstr_append_cstr(out, "   reading = cells away")
+            if level.width != 1:
+                dstr_append_cstr(out, " ÷ ")
+                dstr_append_i64(out, level.width)
+            if level.noise > 0.0:
+                percent(out, "   noise ", level.noise)
+            if level.drift > 0.0:
+                percent(out, "   drift ", level.drift)
+
+    def render(list: mutable Display::DisplayList&, session: SonarGame::Session&, dark: bool):
+        can Abort.Panic, Memory.Allocate:
+            ink: u32 = 0xffffffff if dark else 0x000000ff
+            Display::draw_text_weight(list, "Sonar", 456.0, 648.0, 22.0, ink, CENTER, true)
+            Display::draw_text(list, "click: ping    Shift-click or right-click: dig    arrows + P / D    Esc: menu    C: options",
+                456.0, 26.0, 12.0, ink, CENTER)
+            status: mutable dstr = []
+            message(&status, session)
+            Display::draw_text(list, bytes_view(status), 456.0, 614.0, 14.0, ink, CENTER)
+            if session.phase == SonarGame::DONE:
+                if session.has_verdict:
+                    result: mutable dstr = []
+                    verdict_message(&result, session)
+                    SceneVerdict::put(list, WIDTH, HEIGHT, 1.0, 1.0, session.passed, bytes_view(result), 60.0, 16.0)
+                return
+            return if session.phase == SonarGame::READY
+            prices: mutable dstr = []
+            facts(&prices, session)
+            Display::draw_text(list, bytes_view(prices), 456.0, 588.0, 12.0, ink, CENTER)
+            draw_board(list, session, dark)
+            if session.phase == SonarGame::JUDGED:
+                SceneVerdict::put(list, WIDTH, HEIGHT, 1.0, 1.0, session.passed, bytes_view(status), 60.0, 16.0)
+            elif session.phase == SonarGame::FLAGGED:
+                SceneVerdict::put(list, WIDTH, HEIGHT, 1.0, 1.0, false, "Out of time", 60.0, 16.0)
+
+    def option_note(rung: i64, out: mutable dstr&):
+        can Abort.Panic, Memory.Allocate:
+            level: Sonar::Grade = Sonar::grade(rung)
+            dstr_append_cstr(out, "Rung ")
+            dstr_append_i64(out, level.rung)
+            dstr_append_cstr(out, ": a ")
+            dstr_append_i64(out, level.side)
+            dstr_append_cstr(out, "x")
+            dstr_append_i64(out, level.side)
+            dstr_append_cstr(out, " grid, a wrong dig costs ")
+            dstr_append_i64(out, level.penalty)
+            dstr_append_cstr(out, " pings.")
+            if level.noise > 0.0:
+                percent(out, "  ", level.noise)
+                dstr_append_cstr(out, " of readings are off by one band.")
+            if level.drift > 0.0:
+                dstr_append_cstr(out, "  The target drifts.")
+            if level.slack < 0.0:
+                dstr_append_cstr(out, "  You must beat the reference player.")

@@ -1,0 +1,70 @@
+include "./docking.elisa"
+
+module DockingReference:
+    struct Request:
+        need: f64
+        port: i64
+
+    struct Deal:
+        valid: bool
+        approach: Docking::Approach
+
+    def request(miss: f64, epsilon: f64, negative: i64, positive: i64) -> Request:
+        return Request{need: fabs(miss) / epsilon, port: positive if miss > 0.0 else negative}
+
+    def axis(offset: f64, rate: f64, gain: f64, limit: f64, epsilon: f64, negative: i64, positive: i64) -> Request:
+        want: f64 = fmax(-limit, fmin(limit, -gain * offset))
+        return request(want - rate, epsilon, negative, positive)
+
+    def prefer(first: Request, next: Request) -> Request:
+        return next if next.need > first.need else first
+
+    def choose(run: Docking::Run&) -> i64:
+        can Abort.Panic:
+            return Docking::NEUTRAL if run.result != Docking::LIVE
+            lv: Docking::Grade = run.approach.level
+            att: Docking::Vec = run.att
+            local: Docking::Vec = Docking::world_to_body(run.pos, att)
+            motion: Docking::Vec = Docking::world_to_body(run.vel, att)
+            best: mutable Request = axis(att.x, run.spin.x, 0.5, 0.06, 0.004, Docking::YAW_L, Docking::YAW_R)
+            best <- prefer(best, axis(att.y, run.spin.y, 0.5, 0.06, 0.004, Docking::PITCH_D, Docking::PITCH_U))
+            if lv.station != 0.0:
+                roll: f64 = lv.station - 0.5 * Docking::roll_error(run) - run.spin.z
+                best <- prefer(best, request(roll, 0.004, Docking::ROLL_R, Docking::ROLL_L))
+            best <- prefer(best, axis(local.x, motion.x, 0.25, 0.25, 0.012, Docking::LEFT, Docking::RIGHT))
+            best <- prefer(best, axis(local.y, motion.y, 0.25, 0.25, 0.012, Docking::DOWN, Docking::UP))
+            centred: bool = py_hypot(local.x, local.y) < lv.tol * 0.4 and fmax(fabs(att.x), fabs(att.y)) < lv.angle * 0.5
+            closing: f64 = fmin(0.8, lv.vmax * 0.6 + 0.05 * fmax(0.0, fabs(local.z) - 1.0)) if centred or fabs(local.z) > 6.0 else 0.0
+            best <- prefer(best, request(closing - motion.z, 0.012, Docking::AFT, Docking::FORE))
+            return best.port if best.need >= 1.0 else Docking::NEUTRAL
+
+    def mask(port: i64) -> i64:
+        return 1 << port if port >= 0 else 0
+
+    def play(approach: Docking::Approach) -> Docking::Run:
+        can Abort.Panic:
+            run: mutable Docking::Run = Docking::start(approach)
+            while run.result == Docking::LIVE |run|:
+                port: i64 = choose(&run)
+                Docking::step(&run, 1.0 / 30.0, mask(port))
+            return run
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Deal:
+        can Abort.Panic:
+            lv: Docking::Grade = Docking::grade(rung)
+            for _ in 0..<100 |lv, rng|:
+                candidate: mutable Docking::Approach = Docking::build(lv, rng)
+                test: Docking::Run = play(candidate)
+                if test.result == Docking::CLEAR:
+                    used: f64 = Docking::UNLIMITED_FUEL - test.fuel
+                    candidate.fuel <- used * lv.slack + 3.0
+                    if play(candidate).result == Docking::CLEAR:
+                        return Deal{valid: true, approach: candidate}
+            return Deal{valid: false, approach: zeroed}
+
+    def deal_seed(rung: i64, seed: i64) -> Deal:
+        can Abort.Panic:
+            rng: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&rng, magnitude)
+            return deal(rung, &rng)

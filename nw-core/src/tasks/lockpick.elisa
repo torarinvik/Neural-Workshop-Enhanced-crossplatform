@@ -1,0 +1,235 @@
+include "../hand_view.elisa"
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+include "./drshape_deal.elisa"
+
+module LockPick:
+    const TENSION: i64 = HandView::KEYS
+    const PORTS: i64 = TENSION + 1
+    const LEFT: f64 = 250.0
+    const GAP: f64 = 70.0
+    const FLOOR: f64 = 230.0
+    const LIFT: f64 = 170.0
+    const UNDER: f64 = 20.0
+    const DWELL: f64 = 0.12
+
+    const CLICK: i64 = 0
+    const TICK: i64 = 1
+    const TONE: i64 = 2
+    const SLIP: i64 = 3
+    const JAM: i64 = 4
+    const OPEN: i64 = 5
+
+    const LIVE: i64 = 0
+    const TURNED: i64 = 1
+    const SLIPPED: i64 = 2
+    const TIMEOUT: i64 = 3
+
+    struct Grade:
+        rung: i64
+        pins: i64
+        fine: f64
+        low: f64
+        high: f64
+        ordered: bool
+        glow: bool
+        tone: bool
+        false_click: bool
+        hidden: bool
+        seconds: f64
+
+    struct Lock:
+        level: Grade
+        heights: f64[10]
+        order: i64[10]
+        seed: i64
+        valid: bool
+
+    struct Run:
+        lock: Lock
+        hand: mutable HandView::Pointer
+        lifts: mutable f64[10]
+        set_count: mutable i64
+        tension: mutable f64
+        tension_until: mutable f64
+        at_height: mutable f64
+        drop_at: mutable f64
+        under: mutable i64
+        tone_at: mutable f64
+        fooled: mutable bool[10]
+        slips: mutable i64
+        time: mutable f64
+        result: mutable i64
+        audible: bool
+        notes: mutable darray[DrShapeDeal::Note]
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: i64 = r - 20 if r > 20 else 0
+        pins: i64 = 3 if r < 4 else (4 if r < 7 else (5 if r < 13 else (6 if r < 20 else (7 + top / 4 if top < 12 else 10))))
+        half: f64 = 0.25 if r < 7 else (0.2 if r < 20 else fmax(0.16, 0.2 - 0.002 * top.f64()))
+        fine: f64 = 0.07 if r < 7 else (0.055 if r < 20 else fmax(0.04, 0.055 - 0.0005 * top.f64()))
+        time_per_pin: f64 = 9.0 if r < 7 else (7.5 if r < 20 else fmax(4.5, 7.0 - 0.06 * top.f64()))
+        return Grade{rung: r, pins: pins, fine: fine, low: 0.55 - half, high: 0.55 + half,
+            ordered: r < 4, glow: r < 4, tone: r < 7, false_click: r >= 10, hidden: r >= 13,
+            seconds: pins.f64() * time_per_pin + 6.0}
+
+    def build(level: Grade, draw: mutable MT19937&) -> Lock:
+        can Abort.Panic:
+            heights: mutable f64[10] = zeroed
+            order: mutable i64[10] = zeroed
+            for i in 0..<level.pins |draw, heights, order|:
+                heights[i.usize()] <- py_round_decimal(0.25 + (0.85 - 0.25) * mt_random_res53(draw), 100.0)
+                order[i.usize()] <- i
+            if not level.ordered:
+                i: mutable i64 = level.pins - 1
+                while i > 0 |i, draw, order|:
+                    j: usize = py_randbelow(draw, (i + 1).u64()).usize()
+                    backup: i64 = order[i.usize()]
+                    order[i.usize()] <- order[j]
+                    order[j] <- backup
+                    i <- i - 1
+            return Lock{level: level, heights: heights, order: order,
+                seed: py_randbelow(draw, 1073741824.u64()).i64(), valid: true}
+
+    def begin(lock: Lock, audible: bool = true) -> Run:
+        return Run{lock: lock, hand: HandView::initialize(), lifts: zeroed, set_count: 0,
+            tension: 0.0, tension_until: -1.0, at_height: 0.0, drop_at: 0.0, under: -1,
+            tone_at: 0.0, fooled: zeroed, slips: 0, time: 0.0, result: LIVE, audible: audible, notes: []}
+
+    def pin_x(k: i64) -> f64:
+        return LEFT + GAP * k.f64()
+
+    def binding(run: Run&) -> i64:
+        can Abort.Panic:
+            return run.lock.order[run.set_count.usize()] if run.set_count < run.lock.level.pins else -1
+
+    def is_set(run: Run&, pin: i64) -> bool:
+        can Abort.Panic:
+            for i in 0..<run.set_count |run,pin|:
+                return true if run.lock.order[i.usize()] == pin
+            return false
+
+    def in_band(run: Run&) -> bool:
+        return run.lock.level.low <= run.tension and run.tension <= run.lock.level.high
+
+    def over(run: Run&) -> i64:
+        k: i64 = py_round_half_even((run.hand.x - LEFT) / GAP)
+        return k if k >= 0 and k < run.lock.level.pins and fabs(run.hand.x - pin_x(k)) <= UNDER else -1
+
+    def note(run: mutable Run&, duration: f64, frequency: f64, voice: i64, gain: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if not run.audible
+            run.notes.push(DrShapeDeal::Note{t: run.time, dur: duration, freq: frequency, voice: voice,
+                gain: gain, gain2: gain, pan: 0.0, pan2: 0.0, bright: 0.8, seed: 1 + run.notes.count.i64(), who: -1, room: 0.0})
+
+    def act(run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate:
+            if port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                return if run.result != LIVE or run.hand.down
+                run.hand.down <- true
+                k: i64 = over(run)
+                if k >= 0 and not is_set(run, k):
+                    note(run, 0.05, 300.0 if k == binding(run) else 520.0, TICK, 0.4)
+            elif port == HandView::RELEASE:
+                run.hand.down <- false
+            elif port == TENSION:
+                run.tension_until <- run.time + HandView::LATCH
+
+    def work_binding(run: mutable Run&, k: usize, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            fine: f64 = run.lock.level.fine
+            off: f64 = run.lifts[k] - run.lock.heights[k]
+            if run.lock.level.tone and run.time >= run.tone_at:
+                run.tone_at <- run.time + 0.1
+                note(run, 0.1, 300.0 + 500.0 * fmax(0.0, 1.0 - fabs(off) * 3.0), TONE, 0.3)
+            if off > 2.2 * fine:
+                run.set_count <- 0
+                run.at_height <- 0.0
+                note(run, 0.4, 150.0, JAM, 0.6)
+            elif fabs(off) <= fine:
+                run.at_height <- run.at_height + dt
+                if run.at_height >= DWELL:
+                    run.at_height <- 0.0
+                    run.set_count <- run.set_count + 1
+                    note(run, 0.08, 240.0, CLICK, 0.7)
+                    if run.set_count >= run.lock.level.pins:
+                        note(run, 0.5, 660.0, OPEN, 0.5)
+                        run.result <- TURNED
+            else:
+                run.at_height <- 0.0
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            run.time <- run.time + dt
+            run.tension <- HandView::clamp(run.tension + dt * (0.9 if run.tension_until >= run.time else -0.5), 0.0, 1.0)
+            if run.tension >= 0.97:
+                run.tension <- 0.5
+                run.slips <- run.slips + 1
+                note(run, 0.3, 120.0, SLIP, 0.6)
+                if run.slips >= 3:
+                    run.result <- SLIPPED
+                    return
+            if run.tension < run.lock.level.low and run.set_count > 0 and run.time >= run.drop_at:
+                run.drop_at <- run.time + 0.5
+                run.set_count <- run.set_count - 1
+                note(run, 0.1, 200.0, CLICK, 0.35)
+            k: i64 = over(run) if run.hand.down else -1
+            run.under <- k
+            for j in 0..<run.lock.level.pins |run,k,dt|:
+                i: usize = j.usize()
+                if is_set(run, j):
+                    run.lifts[i] <- run.lock.heights[i]
+                elif j == k:
+                    run.lifts[i] <- HandView::clamp((run.hand.y - FLOOR) / LIFT, 0.0, 1.0)
+                else:
+                    run.lifts[i] <- fmax(0.0, run.lifts[i] - 4.0 * dt)
+            b: i64 = binding(run)
+            if k >= 0 and k == b and in_band(run):
+                work_binding(run, k.usize(), dt)
+            elif k >= 0 and run.lock.level.false_click and k != b and not is_set(run, k):
+                i: usize = k.usize()
+                if fabs(run.lifts[i] - (1.0 - run.lock.heights[i])) < 0.04:
+                    if not run.fooled[i]:
+                        run.fooled[i] <- true
+                        note(run, 0.06, 420.0, CLICK, 0.5)
+                else:
+                    run.fooled[i] <- false
+            if run.result == LIVE and run.time >= run.lock.level.seconds:
+                run.result <- TIMEOUT
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            level: Grade = run.lock.level
+            if run.tension < (level.low + level.high) / 2.0 - 0.06 and run.tension_until < run.time:
+                return TENSION
+            b: i64 = binding(run)
+            return HandView::RELEASE if run.hand.down and run.under != b
+            if not run.hand.down:
+                port: i64 = HandView::toward(&run.hand, pin_x(b), FLOOR, 3.0)
+                return port if port >= 0 else HandView::PRESS
+            return -1 if not in_band(run)
+            off: f64 = run.lock.heights[b.usize()] - run.lifts[b.usize()]
+            return (1 if off > 0.2 else 2) if off > 0.6 * level.fine else -1
+
+    def reference_wins(lock: Lock) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = begin(lock, false)
+            while run.result == LIVE |run|:
+                act(&run, pilot(&run))
+                step(&run, 1.0 / 60.0)
+            return run.result == TURNED
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Lock:
+        can Abort.Panic, Memory.Allocate:
+            level: Grade = grade(rung)
+            for _ in 0..<80 |level, draw|:
+                rng: mutable MT19937 = zeroed
+                mt_seed_int(&rng, py_getrandbits(draw, 32))
+                lock: Lock = build(level, &rng)
+                return lock if reference_wins(lock)
+            return zeroed

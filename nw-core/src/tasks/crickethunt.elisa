@@ -1,0 +1,378 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+# crickethunt.py: find the cricket in the dark by its chirping. A dark room
+# seen from inside, and somewhere in it crickets too small and dark to see.
+# Each chirps: louder nearer, in the ear on its side, duller behind, louder
+# and brighter the more directly it is looked at. Look straight at one from
+# within two metres and grab it. Three grabs at nothing end the try. Ports
+# 0-5 walk forward and back, turn left and right and look up and down for
+# the step they are sent in; port 6 grabs, at once.
+module CricketHunt:
+    const FORWARD: i64 = 0
+    const BACK: i64 = 1
+    const LEFT: i64 = 2
+    const RIGHT: i64 = 3
+    const UP: i64 = 4
+    const DOWN: i64 = 5
+    const GRAB: i64 = 6
+    const PORTS: i64 = 7
+    const EYE: f64 = 1.6
+    const WALK: f64 = 1.3
+    const REACH: f64 = 2.0
+    const MISSES: i64 = 3
+    const PI: f64 = 3.141592653589793
+    # math.radians multiplies by pi / 180.
+    const DEGREE: f64 = 0.017453292519943295
+    const MOST: i64 = 6
+    # livesound tracks: one a cricket, then the hum.
+    const TRACKS: i64 = 7
+    const HUM: i64 = 6
+    # Note voices, livesound.make_patches(('wood', 'bell', 'growl')).
+    const WOOD: i64 = 0
+    const BELL: i64 = 1
+    const GROWL: i64 = 2
+    # Results; LIVE while the try goes on.
+    const LIVE: i64 = 0
+    const ALL_CAUGHT: i64 = 1
+    const OUT_OF_TIME: i64 = 2
+    const GRABS_AT_NOTHING: i64 = 3
+
+    struct Grade:
+        rung: mutable i64
+        room: mutable f64
+        crickets: mutable i64
+        low: mutable f64
+        high: mutable f64
+        every: mutable f64
+        hum: mutable f64
+        hop: mutable bool
+        radius: mutable f64
+
+    struct Cricket:
+        at: mutable f64[3]
+        hop: mutable f64[3]
+        pitch: mutable f64
+        phase: mutable f64
+
+    struct Room:
+        level: mutable Grade
+        crickets: mutable Cricket[6]
+        # x, z, heading
+        start: mutable f64[3]
+        # x, z, width, depth, height of each of three pieces
+        furniture: mutable f64[15]
+        seconds: mutable f64
+
+    struct Heard:
+        r: f64
+        side: f64
+        ahead: f64
+        facing: f64
+
+    struct Run:
+        room: mutable Room
+        t: mutable f64
+        x: mutable f64
+        z: mutable f64
+        yaw: mutable f64
+        pitch: mutable f64
+        where: mutable f64[18]
+        hopped: mutable bool[6]
+        caught: mutable bool[6]
+        misses: mutable i64
+        result: mutable i64
+        notes: mutable darray[DrShapeDeal::Note]
+        end: mutable f64
+        # Whether the track log is kept: play() runs without sound.
+        sounding: mutable bool
+        # livesound's tracks, all set together: when, and for each track
+        # (TRACKS a setting) its loudness in each ear, its brightness and
+        # the phase it has reached there. Each track's pitch never changes.
+        times: mutable darray[f64]
+        left: mutable darray[f64]
+        right: mutable darray[f64]
+        bright: mutable darray[f64]
+        phases: mutable darray[f64]
+
+    @inline(never)
+    def sine(angle: f64) -> f64:
+        return sin(angle)
+
+    @inline(never)
+    def cosine(angle: f64) -> f64:
+        return cos(angle)
+
+    @inline(never)
+    def arc_tangent(y: f64, x: f64) -> f64:
+        return atan2(y, x)
+
+    def py_min(a: f64, b: f64) -> f64:
+        return b if b < a else a
+
+    def py_max(a: f64, b: f64) -> f64:
+        return b if b > a else a
+
+    # CPython 3.12's sum() of floats: 0, then a Neumaier-compensated sum,
+    # the compensation added only if it is non-zero and finite.
+    def psum3(a: f64, b: f64, c: f64) -> f64:
+        terms: f64[3] = [a, b, c]
+        total: mutable f64 = 0.0
+        low: mutable f64 = 0.0
+        for k in 0..<3 |terms, total, low|:
+            x: f64 = terms[k.usize()]
+            t: f64 = total + x
+            if fabs(total) >= fabs(x):
+                low <- low + ((total - t) + x)
+            else:
+                low <- low + ((x - t) + total)
+            total <- t
+        return total + low if low != 0.0 and low - low == 0.0 else total
+
+    # Python's float %: the remainder takes the divisor's sign.
+    def py_mod(x: f64, m: f64) -> f64:
+        r: f64 = fmod(x, m)
+        return 0.0 if r == 0.0 else (r + m if (r < 0.0) != (m < 0.0) else r)
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 1 else 1
+        return Grade{rung: r, room: 6.0, crickets: 1, low: 0.75, high: 0.75, every: 0.6, hum: 0.0, hop: false,
+            radius: 0.55} if r == 1
+        return Grade{rung: r, room: 7.0, crickets: 1, low: 0.4, high: 1.4, every: 0.7, hum: 0.0, hop: false,
+            radius: 0.5} if r < 4
+        return Grade{rung: r, room: 8.0, crickets: 2, low: 0.0, high: 2.2, every: 0.8, hum: 0.0, hop: false,
+            radius: 0.45} if r < 7
+        return Grade{rung: r, room: 9.0, crickets: 2 + (1 if r >= 8 else 0), low: 0.0, high: 2.2, every: 1.4,
+            hum: 0.04, hop: false, radius: 0.4} if r < 10
+        crickets: i64 = 3 + (r - 10) / 3
+        return Grade{rung: r, room: py_min(16.0, 10.0 + 0.4 * (r - 10).f64()), crickets: 6 if crickets > 6 else crickets,
+            low: 0.0, high: 2.4, every: py_min(4.0, 1.5 + 0.12 * (r - 10).f64()),
+            hum: py_min(0.2, 0.05 + 0.01 * (r - 10).f64()), hop: true, radius: 0.4}
+
+    def spot(level: Grade&, draw: mutable MT19937&) -> f64[3]:
+        s: f64 = level.room
+        x: f64 = py_uniform(draw, 0.6, s - 0.6)
+        y: f64 = py_uniform(draw, level.low, level.high)
+        z: f64 = py_uniform(draw, 0.6, s - 0.6)
+        return [x, y, z]
+
+    def look(yaw: f64, pitch: f64) -> f64[3]:
+        return [sine(yaw) * cosine(pitch), sine(pitch), cosine(yaw) * cosine(pitch)]
+
+    def begin(room: Room, sounding: bool) -> Run:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = Run{room: room, t: 0.0, x: room.start[0], z: room.start[1], yaw: room.start[2],
+                pitch: 0.0, where: zeroed, hopped: zeroed, caught: zeroed, misses: 0, result: LIVE, notes: [],
+                end: room.seconds, sounding: sounding, times: [], left: [], right: [], bright: [], phases: []}
+            for k in 0..<room.level.crickets |run, room|:
+                for a in 0..<3 |run, room, k|:
+                    run.where[(3 * k + a).usize()] <- room.crickets[k.usize()].at[a.usize()]
+            sound(&run)
+            return run
+
+    # Distance, side (-1 left, 1 right), how far ahead (-1 behind, 1 in
+    # front) and how directly looked at (cosine) cricket k is.
+    def heard(run: Run&, k: i64) -> Heard:
+        can Abort.Panic:
+            v0: f64 = run.where[(3 * k).usize()] - run.x
+            v1: f64 = run.where[(3 * k + 1).usize()] - EYE
+            v2: f64 = run.where[(3 * k + 2).usize()] - run.z
+            length: f64 = sqrt(psum3(v0 * v0, v1 * v1, v2 * v2))
+            r: f64 = length if length != 0.0 else 1e-6
+            flat: f64 = py_hypot(v0, v2)
+            h: f64 = flat if flat != 0.0 else 1e-6
+            az: f64 = arc_tangent(v0, v2) - run.yaw
+            lk: f64[3] = look(run.yaw, run.pitch)
+            facing: f64 = psum3(lk[0] * v0, lk[1] * v1, lk[2] * v2) / r
+            return Heard{r: r, side: sine(az) * h / r, ahead: cosine(az) * h / r, facing: facing}
+
+    def pitch_of(run: Run&, track: i64) -> f64:
+        can Abort.Panic:
+            return 60.0 if track == HUM else run.room.crickets[track.usize()].pitch
+
+    # Run._sound: Track.set on every track at once; the same moment set
+    # again keeps the last word, a new one carries each phase on.
+    def sound(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            return if not run.sounding
+            levels: mutable f64[21] = zeroed
+            count: i64 = run.room.level.crickets
+            for k in 0..<count |run, levels|:
+                if run.caught[k.usize()] or run.result != LIVE:
+                    levels[(3 * k + 2).usize()] <- 1.0
+                    continue
+                ear: Heard = heard(run, k)
+                g: f64 = 0.5 / (1.0 + ear.r / 1.2) * (0.45 + 0.55 * pow(py_max(0.0, ear.facing), 2.0))
+                bright: f64 = 0.25 + 0.75 * (ear.ahead + 1.0) / 2.0
+                # livesound.pan: the total power kept.
+                a: f64 = (py_max(-1.0, py_min(1.0, ear.side)) + 1.0) * PI / 4.0
+                levels[(3 * k).usize()] <- g * cosine(a)
+                levels[(3 * k + 1).usize()] <- g * sine(a)
+                levels[(3 * k + 2).usize()] <- bright
+            h: f64 = run.room.level.hum if run.result == LIVE else 0.0
+            levels[(3 * HUM).usize()] <- h
+            levels[(3 * HUM + 1).usize()] <- h
+            levels[(3 * HUM + 2).usize()] <- 1.0
+            n: i64 = run.times.count.i64()
+            if n > 0 and run.t <= run.times[(n - 1).usize()] + 1e-9:
+                for track in 0..<TRACKS |run, levels, n|:
+                    at: usize = ((n - 1) * TRACKS + track).usize()
+                    run.left[at] <- levels[(3 * track).usize()]
+                    run.right[at] <- levels[(3 * track + 1).usize()]
+                    run.bright[at] <- levels[(3 * track + 2).usize()]
+                return
+            span: f64 = run.t - (run.times[(n - 1).usize()] if n > 0 else 0.0)
+            run.times.push(run.t)
+            for track in 0..<TRACKS |run, levels, n, span|:
+                f: f64 = pitch_of(run, track) if track == HUM or track < run.room.level.crickets else 0.0
+                ph: mutable f64 = 0.0
+                if n > 0:
+                    ph <- run.phases[((n - 1) * TRACKS + track).usize()] + 0.5 * (f + f) * span
+                run.left.push(levels[(3 * track).usize()])
+                run.right.push(levels[(3 * track + 1).usize()])
+                run.bright.push(levels[(3 * track + 2).usize()])
+                run.phases.push(ph)
+
+    def note(run: mutable Run&, dur: f64, f: f64, voice: i64, gain: f64):
+        can Abort.Panic, Memory.Allocate:
+            run.notes.push(DrShapeDeal::Note{t: run.t, dur: dur, freq: f, pan: 0.0, pan2: 0.0, gain: gain, gain2: gain,
+                bright: 0.8, voice: voice, seed: run.notes.count.i64() + 1, who: -1, room: 0.0})
+
+    def caught_count(run: Run&) -> i64:
+        can Abort.Panic:
+            total: mutable i64 = 0
+            for k in 0..<run.room.level.crickets |run, total|:
+                total <- total + 1 if run.caught[k.usize()]
+            return total
+
+    def step(run: mutable Run&, dt: f64, control: i64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            run.t <- run.t + dt
+            s: f64 = run.room.level.room
+            forward: f64 = 1.0 if control == FORWARD else 0.0
+            back: f64 = 1.0 if control == BACK else 0.0
+            walk: f64 = WALK * dt * (forward - 0.7 * back)
+            run.x <- py_min(s - 0.3, py_max(0.3, run.x + sine(run.yaw) * walk))
+            run.z <- py_min(s - 0.3, py_max(0.3, run.z + cosine(run.yaw) * walk))
+            turn: f64 = (1.0 if control == RIGHT else 0.0) - (1.0 if control == LEFT else 0.0)
+            run.yaw <- run.yaw + 90.0 * DEGREE * dt * turn
+            tilt: f64 = (1.0 if control == UP else 0.0) - (1.0 if control == DOWN else 0.0)
+            run.pitch <- py_max(-1.35, py_min(1.35, run.pitch + 60.0 * DEGREE * dt * tilt))
+            if run.room.level.hop:
+                for k in 0..<run.room.level.crickets |run|:
+                    u: usize = k.usize()
+                    if not run.hopped[u] and not run.caught[u] and
+                            py_hypot(run.where[(3 * k).usize()] - run.x, run.where[(3 * k + 2).usize()] - run.z) < 2.0:
+                        run.hopped[u] <- true
+                        for a in 0..<3 |run, k, u|:
+                            run.where[(3 * k + a).usize()] <- run.room.crickets[u].hop[a.usize()]
+                        note(run, 0.05, 1800.0, WOOD, 0.15)
+            if run.t > run.room.seconds:
+                run.result <- OUT_OF_TIME
+            sound(run)
+
+    # Is cricket k within reach and right under the look?
+    def aimed(run: Run&, k: i64) -> bool:
+        can Abort.Panic:
+            ear: Heard = heard(run, k)
+            square: f64 = pow(py_min(1.0, ear.facing), 2.0)
+            off: f64 = ear.r * sqrt(py_max(0.0, 1.0 - square))
+            return ear.r <= REACH and ear.facing > 0.0 and off <= run.room.level.radius
+
+    def grab(run: mutable Run&):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            count: i64 = run.room.level.crickets
+            for k in 0..<count |run, count|:
+                if not run.caught[k.usize()] and aimed(run, k):
+                    run.caught[k.usize()] <- true
+                    note(run, 0.3, 1320.0, BELL, 0.3)
+                    run.result <- ALL_CAUGHT if caught_count(run) == count
+                    sound(run)
+                    return
+            run.misses <- run.misses + 1
+            note(run, 0.25, 140.0, GROWL, 0.35)
+            if run.misses >= MISSES:
+                run.result <- GRABS_AT_NOTHING
+                sound(run)
+
+    def act(run: mutable Run&, port: i64):
+        can Abort.Panic, Memory.Allocate:
+            grab(run) if port == GRAB
+
+    def wrap(a: f64) -> f64:
+        return py_mod(a + PI, 2.0 * PI) - PI
+
+    # Knows where they are: turns to the nearest, walks up to it, looks at
+    # it, grabs. -1 is no port.
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            count: i64 = run.room.level.crickets
+            nearest: mutable i64 = -1
+            best: mutable f64 = 0.0
+            for k in 0..<count |run, nearest, best|:
+                continue if run.caught[k.usize()]
+                return GRAB if aimed(run, k)
+            for k in 0..<count |run, nearest, best|:
+                continue if run.caught[k.usize()]
+                d: f64 = py_hypot(run.where[(3 * k).usize()] - run.x, run.where[(3 * k + 2).usize()] - run.z)
+                if nearest < 0 or d < best:
+                    nearest <- k
+                    best <- d
+            return -1 if nearest < 0
+            u: usize = (3 * nearest).usize()
+            dx: f64 = run.where[u] - run.x
+            dz: f64 = run.where[u + 2] - run.z
+            want: f64 = arc_tangent(dx, dz)
+            d: f64 = wrap(want - run.yaw)
+            return (RIGHT if d > 0.0 else LEFT) if fabs(d) > 0.06
+            h: f64 = py_hypot(dx, dz)
+            return FORWARD if h > 1.0
+            return BACK if h < 0.35
+            tilt: f64 = arc_tangent(run.where[u + 1] - EYE, h) - run.pitch
+            return (UP if tilt > 0.0 else DOWN) if fabs(tilt) > 0.05
+            return FORWARD if h > 0.6 else BACK
+
+    # crickethunt.play at 1/30 s a step, without sound: whether the
+    # autopilot catches them all.
+    def play(room: Room) -> bool:
+        can Abort.Panic, Memory.Allocate:
+            run: mutable Run = begin(room, false)
+            while run.result == LIVE |run|:
+                port: i64 = pilot(&run)
+                act(&run, port) if port == GRAB
+                step(&run, 1.0 / 30.0, -1 if port == GRAB else port)
+            return run.result == ALL_CAUGHT
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Room:
+        can Abort.Panic, Memory.Allocate:
+            room: mutable Room = zeroed
+            room.level <- grade(rung)
+            s: f64 = room.level.room
+            room.furniture <- [0.3, 0.3, 1.6, 0.9, 0.75, s - 2.0, 0.2, 1.8, 0.4, 2.2, 0.2, s - 1.2, 0.4, 1.0, 1.8]
+            room.seconds <- 60.0 + 45.0 * room.level.crickets.f64()
+            for _ in 0..<100 |room, draw, s|:
+                room.start <- [s / 2.0, s / 2.0, py_uniform(draw, 0.0, 2.0 * PI)]
+                count: i64 = room.level.crickets
+                for c in 0..<count |room, draw|:
+                    at: f64[3] = spot(&room.level, draw)
+                    hop: f64[3] = spot(&room.level, draw)
+                    pitch: f64 = py_uniform(draw, 2600.0, 3400.0)
+                    phase: f64 = py_uniform(draw, 0.0, 1.0)
+                    room.crickets[c.usize()] <- Cricket{at: at, hop: hop, pitch: pitch, phase: phase}
+                near: mutable bool = false
+                for c in 0..<count |room, near|:
+                    a: Cricket& = &room.crickets[c.usize()]
+                    near <- true if py_hypot(a.at[0] - room.start[0], a.at[2] - room.start[1]) < 2.0
+                continue if near
+                for i in 0..<count |room, near, count|:
+                    for j in (i + 1)..<count |room, near, i|:
+                        a: Cricket& = &room.crickets[i.usize()]
+                        b: Cricket& = &room.crickets[j.usize()]
+                        near <- true if py_hypot(a.at[0] - b.at[0], a.at[2] - b.at[2]) < 1.5
+                continue if near
+                return room if play(room)
+            return room

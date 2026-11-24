@@ -1,0 +1,158 @@
+include "./signals.elisa"
+
+module SignalsReference:
+    struct Learner:
+        belief: mutable f64[64]
+        options: i64
+        drift: f64
+
+    def initialize(level: Signals::Grade&) -> Learner:
+        options: i64 = Signals::GLYPHS if level.shapes else 5
+        learner: mutable Learner = Learner{belief: zeroed, options: options, drift: 0.15 if level.swaps > 0 else 0.0}
+        for at in 0..<64 |learner, options, at|:
+            learner.belief[at.usize()] <- 1.0 / options.f64()
+        return learner
+
+    def meaning(learner: Learner&, option: i64) -> i64:
+        return Signals::UNKNOWN if learner.options == 5 and option == 4 else option
+
+    def chance(exchange: Signals::Exchange&, count: i64, picked: i64, value: i64) -> f64:
+        can Abort.Panic:
+            return 1.0 / count.f64() if value == Signals::UNKNOWN
+            matching: i64 = Signals::count_value(exchange, count, value)
+            return 1.0 / count.f64() if matching == 0
+            return 1.0 / matching.f64() if Signals::has(exchange.objects[picked.usize()], value) else 0.02
+
+    # Python's float sum adds a Neumaier correction before selecting the
+    # best glyph or object. Keeping that rounding preserves tie-breaking.
+    struct Sum:
+        value: mutable f64
+        correction: mutable f64
+
+    def add(sum: mutable Sum&, term: f64):
+        next: f64 = sum.value + term
+        sum.correction <- sum.correction + ((sum.value - next) + term if sum.value >= term else ((term - next) + sum.value))
+        sum.value <- next
+
+    def saw(learner: mutable Learner&, level: Signals::Grade&, exchange: Signals::Exchange&, result: Signals::Result&):
+        can Abort.Panic:
+            for place in 0..<result.signal.length |place, learner, level, exchange, result|:
+                g: i64 = result.signal.first if place == 0 else result.signal.second
+                offset: i64 = g * 8
+                sum: mutable Sum = zeroed
+                for i in 0..<learner.options |i, learner, offset, sum, level, exchange, result, place|:
+                    value: i64 = meaning(learner, i)
+                    likelihood: mutable f64 = 0.0
+                    if exchange.role == Signals::LISTEN:
+                        target: i64 = exchange.objects[exchange.target.usize()]
+                        fits: bool = value != Signals::UNKNOWN and Signals::has(target, value)
+                        fits_position: bool = level.length == 1 or (value / 4 == place)
+                        likelihood <- 1.0 if fits and fits_position else 0.02
+                    else:
+                        likelihood <- chance(exchange, level.objects, result.picked, value)
+                    at: usize = (offset + i).usize()
+                    updated: f64 = learner.belief[at] * likelihood
+                    learner.belief[at] <- updated
+                    add(&sum, updated)
+                total: f64 = sum.value + sum.correction
+                denominator: f64 = total if total != 0.0 else 1.0
+                for i in 0..<learner.options |i, learner, offset, denominator|:
+                    at: usize = (offset + i).usize()
+                    probability: f64 = learner.belief[at] / denominator
+                    learner.belief[at] <- (1.0 - learner.drift) * probability + learner.drift / learner.options.f64() if learner.drift > 0.0 else probability
+
+    def reads(learner: Learner&, glyph: i64, thing: i64) -> f64:
+        sum: mutable Sum = zeroed
+        for i in 0..<learner.options |sum, learner, glyph, thing, i|:
+            value: i64 = meaning(learner, i)
+            if value == Signals::UNKNOWN or Signals::has(thing, value):
+                add(&sum, learner.belief[(glyph * 8 + i).usize()])
+        return sum.value + sum.correction
+
+    def listen(learner: Learner&, exchange: Signals::Exchange&, count: i64, signal: Signals::Message) -> i64:
+        best: mutable i64 = 0
+        best_score: mutable f64 = -1.0
+        for i in 0..<count |learner, exchange, signal, best, best_score, i|:
+            thing: i64 = exchange.objects[i.usize()]
+            first: f64 = reads(learner, signal.first, thing)
+            score: f64 = first * reads(learner, signal.second, thing) if signal.length == 2 else first
+            if score > best_score:
+                best <- i
+                best_score <- score
+        return best
+
+    def lands(learner: Learner&, glyph: i64, exchange: Signals::Exchange&, count: i64) -> f64:
+        can Abort.Panic:
+            sum: mutable Sum = zeroed
+            for i in 0..<learner.options |sum, learner, glyph, exchange, count, i|:
+                probability: f64 = chance(exchange, count, exchange.target, meaning(learner, i))
+                add(&sum, learner.belief[(glyph * 8 + i).usize()] * probability)
+            return sum.value + sum.correction
+
+    def best_glyph(learner: Learner&, value: i64, exclude: i64) -> i64:
+        best: mutable i64 = -1
+        score: mutable f64 = -1.0
+        for g in 0..<Signals::GLYPHS |learner, value, exclude, score, best, g|:
+            probability: f64 = learner.belief[(g * 8 + value).usize()]
+            if g != exclude and probability > score:
+                score <- probability
+                best <- g
+        return best
+
+    def speak(learner: Learner&, level: Signals::Grade&, exchange: Signals::Exchange&) -> Signals::Message:
+        can Abort.Panic:
+            if level.length == 2:
+                thing: i64 = exchange.objects[exchange.target.usize()]
+                first: i64 = best_glyph(learner, thing / 4, -1)
+                return Signals::Message{first: first, second: best_glyph(learner, 4 + thing % 4, first), length: 2}
+            best: mutable i64 = 0
+            score: mutable f64 = -1.0
+            for g in 0..<Signals::GLYPHS |learner, exchange, level, best, score, g|:
+                probability: f64 = lands(learner, g, exchange, level.objects)
+                if probability > score:
+                    score <- probability
+                    best <- g
+            return Signals::Message{first: best, second: -1, length: 1}
+
+    def reference_game(dealt: Signals::Deal&) -> Signals::Game:
+        can Abort.Panic:
+            game: mutable Signals::Game = Signals::initialize(dealt[0])
+            learner: mutable Learner = initialize(&dealt.level)
+            for at in 0..<dealt.level.exchanges |at, dealt, learner, game|:
+                exchange: Signals::Exchange& = &dealt.exchanges[at.usize()]
+                if exchange.role == Signals::LISTEN:
+                    signal: Signals::Message = Signals::partner_says(dealt, at)
+                    _ = Signals::pick(&game, listen(&learner, exchange, dealt.level.objects, signal))
+                else:
+                    signal: Signals::Message = speak(&learner, &dealt.level, exchange)
+                    _ = Signals::say(&game, signal.first)
+                    if signal.length == 2:
+                        _ = Signals::say(&game, signal.second)
+                saw(&learner, &dealt.level, exchange, &game.history[at.usize()])
+            return game
+
+    def guessing(dealt: Signals::Deal&) -> f64:
+        can Abort.Panic:
+            points: mutable i64 = 0
+            for seed in 0..<4 |seed, points, dealt|:
+                rng: mutable MT19937 = zeroed
+                mt_seed_int(&rng, seed.u64())
+                game: mutable Signals::Game = Signals::initialize(dealt[0])
+                while game.at < dealt.level.exchanges |game, rng, dealt|:
+                    if dealt.exchanges[game.at.usize()].role == Signals::LISTEN:
+                        _ = Signals::pick(&game, py_choice_index(&rng, dealt.level.objects))
+                    else:
+                        _ = Signals::say(&game, py_choice_index(&rng, Signals::GLYPHS))
+                points <- points + game.score
+            return points.f64() / 4.0
+
+    def par(dealt: Signals::Deal&) -> f64:
+        can Abort.Panic:
+            reference: Signals::Game = reference_game(dealt)
+            ref: f64 = reference.score.f64()
+            rung: i64 = dealt.level.rung
+            if rung <= 20:
+                floor: f64 = guessing(dealt)
+                return ref - (0.5 * (20 - rung).f64() / 19.0) * (ref - floor if ref > floor else 0.0)
+            fraction: f64 = 0.08 * (rung - 20).f64() if rung < 30 else 0.8
+            return ref + fraction * ((ref + dealt.level.exchanges.f64()) / 2.0 - ref)

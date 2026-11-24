@@ -1,0 +1,178 @@
+include "../tasks/camera_render.elisa"
+
+module CameraGL:
+    struct Renderer:
+        colour_program: mutable u32
+        shadow_program: mutable u32
+        shadow: mutable MarbleGLShadow::Target
+        target: mutable MarbleGLColour::Target
+        meshes: mutable MarbleGLMesh::Mesh[8]
+        field: mutable f64
+
+    def close(renderer: mutable Renderer&):
+        can Memory.Release, Abort.Panic:
+            for kind in 0..<8 |renderer|:
+                MarbleGLMesh::close(&renderer.meshes[kind.usize()])
+            MarbleGLColour::close(&renderer.target)
+            MarbleGLShadow::close(&renderer.shadow)
+            MarbleGLProgram::destroy(renderer.colour_program)
+            MarbleGLProgram::destroy(renderer.shadow_program)
+            renderer[0] <- zeroed
+
+    def compile(name: cstr, kind: u32) -> u32:
+        can Blocking.IO, Console.Write, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            base: u8&? = SDL_GetBasePath()
+            return 0.u32() if base == null
+            trusted Unsafe.PointerCast:
+                prefix: u8& = base
+                path: mutable u8[4096] = zeroed
+                count: i32 = SDL_snprintf(&path[0], 4096.usize(), "%sres/camera/%s", prefix.cast[cstr], name)
+                return 0.u32() if count <= 0.i32() or count >= 4096.i32()
+                length: mutable usize = 0.usize()
+                loaded: mutable heap void&? = SDL_LoadFile((&path[0]).uintptr().cast[cstr], &length)
+                if loaded == null:
+                    SDL_Log("Could not load Camera shader %s: %s", name, SDL_GetError())
+                    return 0.u32()
+                source: mutable heap void& = loaded
+                shader: u32 = glCreateShader(kind)
+                if shader != 0.u32() and length <= 2147483647.usize():
+                    version: cstr = "#version 330 core\n"
+                    addresses: usize[2] = [version.uintptr(), source.uintptr()]
+                    lengths: i32[2] = [18.i32(), length.i32()]
+                    glShaderSource(shader, 2.i32(), &addresses[0], &lengths[0])
+                    glCompileShader(shader)
+                SDL_free(source.cast[heap void&])
+                return 0.u32() if shader == 0.u32()
+                status: mutable i32 = 0.i32()
+                glGetShaderiv(shader, 35713.u32(), &status) # GL_COMPILE_STATUS
+                if status == 0.i32():
+                    message: mutable u8[2048] = zeroed
+                    glGetShaderInfoLog(shader, 2048.i32(), 0.usize(), &message[0])
+                    SDL_Log("Could not compile Camera shader %s: %s", name, (&message[0]).uintptr().cast[cstr])
+                    glDeleteShader(shader)
+                    return 0.u32()
+                return shader
+
+    def program(vertex_name: cstr, fragment_name: cstr) -> u32:
+        can Blocking.IO, Console.Write, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            vertex: u32 = compile(vertex_name, 35633.u32())
+            return 0.u32() if vertex == 0.u32()
+            fragment: u32 = compile(fragment_name, 35632.u32())
+            if fragment == 0.u32():
+                glDeleteShader(vertex)
+                return 0.u32()
+            return MarbleGLProgram::link(vertex, fragment, vertex_name)
+
+    def open(renderer: mutable Renderer&) -> bool:
+        can Blocking.IO, Console.Write, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            if renderer.colour_program != 0.u32():
+                return true
+            renderer.colour_program <- program("colour.vert", "colour.frag")
+            renderer.shadow_program <- program("shadow.vert", "shadow.frag") if renderer.colour_program != 0.u32()
+            if renderer.shadow_program == 0.u32() or not MarbleGLShadow::open(&renderer.shadow):
+                close(renderer)
+                return false
+            return true
+
+    def upload(owner: mutable Arena&, target: mutable MarbleGLMesh::Mesh&, kind: i64, field: f64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            in owner:
+                source: CameraMesh::Mesh = CameraMesh::build(kind, field)
+                mesh: mutable MarbleGeometry::Mesh = MarbleGeometry::empty()
+                for v in source.vertices |mesh|:
+                    MarbleGeometry::vertex(&mesh, v.position.x, v.position.y, v.position.z, v.normal.x, v.normal.y, v.normal.z)
+                for index in source.indices |mesh|:
+                    mesh.indices.push(index.i64())
+                return MarbleGLMesh::upload(target, &mesh)
+
+    def prepare_meshes(renderer: mutable Renderer&, field: f64) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            if field != renderer.field:
+                MarbleGLMesh::close(&renderer.meshes[CameraMesh::FIELD.usize()])
+                MarbleGLMesh::close(&renderer.meshes[CameraMesh::OUTSIDE.usize()])
+                renderer.field <- field
+            owner: mutable Arena = zeroed
+            ok: mutable bool = true
+            for kind in 0..<8 |renderer, field, owner, ok|:
+                if renderer.meshes[kind.usize()].count == 0.i32():
+                    ok <- upload(&owner, &renderer.meshes[kind.usize()], kind, field)
+                    if not ok:
+                        break
+            CameraGame::release_scene(&owner) can Global{Read,Write}
+            return ok
+
+    def matrix(program_id: u32, name: cstr, value: CameraView::Matrix&):
+        can Abort.Panic:
+            MarbleGLShadow::matrix(program_id, name, &value.column[0], 0)
+
+    def vector(program_id: u32, name: cstr, value: RoomsView::Vec):
+        glUniform3f(glGetUniformLocation(program_id, name), value.x.f32(), value.y.f32(), value.z.f32())
+
+    def shadows(renderer: Renderer&, frame: CameraRender::Frame&):
+        can Abort.Panic:
+            program_id: u32 = renderer.shadow_program
+            size: i32 = MarbleGLShadow::SIZE
+            glBindFramebuffer(MarbleGLShadow::FRAMEBUFFER, renderer.shadow.framebuffer)
+            glViewport(0.i32(), 0.i32(), size, size)
+            glEnable(2929.u32()) # GL_DEPTH_TEST
+            glDepthMask(1.u8())
+            glDepthFunc(513.u32()) # GL_LESS
+            glDisable(3042.u32()) # GL_BLEND
+            glDisable(2884.u32()) # GL_CULL_FACE
+            glDisable(3089.u32()) # GL_SCISSOR_TEST
+            glDisable(32926.u32()) # GL_SAMPLE_ALPHA_TO_COVERAGE
+            glClearDepth(1.0)
+            glClear(256.u32()) # GL_DEPTH_BUFFER_BIT
+            glUseProgram(program_id)
+            matrix(program_id, "light_clip", &frame.light.clip)
+            for item in frame.draws |renderer, program_id|:
+                if item.casts:
+                    matrix(program_id, "model", &item.model)
+                    MarbleGLMesh::draw(&renderer.meshes[item.mesh.usize()], program_id)
+
+    def colour_pass(renderer: Renderer&, frame: CameraRender::Frame&, viewport: CameraRender::Pass&):
+        can Abort.Panic:
+            program_id: u32 = renderer.colour_program
+            glViewport(viewport.x.i32(), viewport.y.i32(), viewport.width.i32(), viewport.height.i32())
+            glScissor(viewport.x.i32(), viewport.y.i32(), viewport.width.i32(), viewport.height.i32())
+            glClear(16640.u32()) # GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT
+            matrix(program_id, "view_proj", &viewport.projection)
+            vector(program_id, "eye", viewport.eye)
+            for item in frame.draws |renderer, program_id|:
+                matrix(program_id, "model", &item.model)
+                vector(program_id, "normal_scale", item.normal_scale)
+                vector(program_id, "tint", item.colour)
+                MarbleGLMesh::draw(&renderer.meshes[item.mesh.usize()], program_id)
+
+    def render(renderer: mutable Renderer&, frame: CameraRender::Frame&) -> bool:
+        can Blocking.IO, Console.Write, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return false if frame.passes == 0
+            return false if not open(renderer) or not (prepare_meshes(renderer, frame.field) can Global{Read,Write})
+            return false if not MarbleGLColour::resize(&renderer.target, frame.width.i32(), frame.height.i32())
+            shadows(renderer, frame)
+            glBindFramebuffer(MarbleGLColour::FRAMEBUFFER, renderer.target.multisample)
+            glEnable(32925.u32()) # GL_MULTISAMPLE
+            glClearColor(0.0.f32(), 0.0.f32(), 0.0.f32(), 0.0.f32())
+            glClear(16640.u32())
+            glEnable(3089.u32()) # GL_SCISSOR_TEST
+            program_id: u32 = renderer.colour_program
+            glUseProgram(program_id)
+            glActiveTexture(33984.u32()) # GL_TEXTURE0
+            glBindTexture(MarbleGLShadow::TEXTURE_2D, renderer.shadow.texture)
+            glUniform1i(glGetUniformLocation(program_id, "shadow_map"), 0.i32())
+            glUniform1f(glGetUniformLocation(program_id, "shadow_texel"), 1.0.f32() / MarbleGLShadow::SIZE.f32())
+            matrix(program_id, "light_matrix", &frame.light.shadow)
+            vector(program_id, "light_dir", frame.light.direction)
+            vector(program_id, "light_colour", frame.light.colour)
+            vector(program_id, "sky_colour", frame.light.sky)
+            vector(program_id, "ground_colour", frame.light.ground)
+            background: RoomsView::Vec = frame.light.background
+            glClearColor(background.x.f32(), background.y.f32(), background.z.f32(), 1.0.f32())
+            colour_pass(renderer, frame, &frame.live)
+            if frame.passes == 2:
+                colour_pass(renderer, frame, &frame.photo)
+            glDisable(3089.u32())
+            glBindTexture(MarbleGLShadow::TEXTURE_2D, 0.u32())
+            glUseProgram(0.u32())
+            MarbleGLColour::resolve(&renderer.target)
+            return glGetError() == 0.u32()

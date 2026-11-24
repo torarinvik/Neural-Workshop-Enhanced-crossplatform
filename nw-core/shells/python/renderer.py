@@ -33,6 +33,13 @@ if str(_TEST_DIR) not in sys.path:
 
 from display_decode import ANCHOR_NAMES, decode, rgba  # noqa: E402,F401  (re-exported)
 
+_TEXT_FACES = (
+    "Arial", "Times New Roman", "Courier New", "Georgia", "Impact", "Comic Sans MS",
+    "Futura", "Marker Felt", "Papyrus", "Didot", "American Typewriter", "Rockwell",
+    "Chalkduster", "Bradley Hand", "Copperplate", "Verdana",
+)
+_TEXT_FACE_FALLBACK = ("Arial", "Helvetica", "DejaVu Sans", "Liberation Sans")
+
 # The historic reference space every command is expressed in. Shells own the
 # mapping to physical pixels; see docs/display-list.md.
 REFERENCE_WIDTH = 912.0
@@ -326,6 +333,7 @@ def plan(commands: Sequence[Mapping[str, Any]], viewport: Viewport,
             anchor_x, _, anchor_y = anchor.partition("_")
             lines = cmd["text"].split("\n")
             font_size = viewport.font_size(cmd["size"])
+            face_fields = {"face": cmd["face"], "rotation": cmd["rotation"]} if "face" in cmd else {}
             for index, line in enumerate(lines):
                 ops.append(DrawOp("text", {
                     "text": line, "x": x,
@@ -335,6 +343,7 @@ def plan(commands: Sequence[Mapping[str, Any]], viewport: Viewport,
                     "anchor_x": _ANCHOR_X.get(anchor_x, "left"),
                     "anchor_y": _ANCHOR_Y.get(anchor_y, "baseline"),
                     "bold": bool(cmd.get("bold", False)),
+                    **face_fields,
                 }))
 
         elif kind == "verdict":
@@ -406,9 +415,8 @@ class PygletFactory:
 
     def _build_bordered_rect(self, batch, x, y, width, height, border, color, border_color):
         # pyglet refuses a bordered rectangle whose fill and border alphas
-        # differ (the blend would be ambiguous). When they do differ, the
-        # border goes in as RGB, which pyglet reads as opaque -- the fill's
-        # alpha is the one the display list is actually using for the shape.
+        # differ. Pass the border as RGB so Pyglet uses the fill opacity
+        # for the entire shape.
         if color[3] != border_color[3]:
             border_color = border_color[:3]
         return self.shapes.BorderedRectangle(
@@ -474,11 +482,17 @@ class PygletFactory:
         return self._build_sprite(batch, asset, x, y, scale, rotation, color)
 
     def _build_text(self, batch, text, x, y, font_size, color, anchor_x, anchor_y,
-                    bold=False):
-        return self.text.Label(text, x=x, y=y, font_size=font_size, color=color,
-                               anchor_x=anchor_x, anchor_y=anchor_y,
-                               weight='bold' if bold else 'normal',
-                               font_name=self.font_name, batch=batch)
+                    bold=False, face=None, rotation=0.0):
+        fonts = self.font_name
+        if face is not None and 0 <= face < len(_TEXT_FACES):
+            fonts = (_TEXT_FACES[face], *_TEXT_FACE_FALLBACK)
+        label = self.text.Label(text, x=x, y=y, font_size=font_size, color=color,
+                                anchor_x=anchor_x, anchor_y=anchor_y,
+                                weight='bold' if bold else 'normal',
+                                font_name=fonts, batch=batch)
+        if rotation:
+            label.rotation = rotation
+        return label
 
 
 class Renderer:

@@ -1,0 +1,176 @@
+include "./ints.elisa"
+include "../pyrandom.elisa"
+
+module HiddenWiring:
+    const COPY: i64 = 0
+    const AND: i64 = 1
+    const OR: i64 = 2
+    const XOR: i64 = 3
+    const MAJORITY: i64 = 4
+    const MAX_LAMPS: i64 = 6
+    const MAX_LOOKS: i64 = 40
+    const MAX_QUESTIONS: i64 = 5
+
+    struct Grade:
+        rung: i64
+        switches: i64
+        lamps: i64
+        noise: f64
+        questions: i64
+        penalty: i64
+        factor: f64
+        slack: f64
+
+    struct Gate:
+        kind: i64
+        a: i64
+        b: i64
+        c: i64
+        rank: i64
+        flipped: i64
+
+    struct Deal:
+        gates: mutable Gate[MAX_LAMPS]
+        indices: mutable i64[MAX_LAMPS]
+        lies: mutable i64[MAX_LOOKS]
+        exam: mutable i64[MAX_QUESTIONS]
+        questions: mutable i64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung >= 1 else 1
+        return Grade{rung: r, switches: 8 if r >= 17 else 2 + (r + 1) / 3,
+            lamps: 6 if r >= 21 else 1 + (r - 1) / 4,
+            noise: 0.0 if r < 16 else (0.12 if r >= 24 else 0.04 + 0.01 * (r - 16).f64()),
+            questions: 5 if r >= 18 else 2 + r / 6, penalty: 6 + r,
+            factor: 2.0 - (r - 1).f64() / 11.0 if r < 12 else (1.0 if r <= 20 else 1.0 / (1.0 + 0.04 * (r - 20).f64())),
+            slack: 2.0 if r < 12 else 1.0}
+
+    def evaluate(gate: Gate, setting: i64) -> bool:
+        a: i64 = ((setting >> gate.a.u64()) ^ gate.flipped) & 1
+        return a != 0 if gate.kind == COPY
+        b: i64 = ((setting >> gate.b.u64()) ^ (gate.flipped >> 1)) & 1
+        c: i64 = (setting >> gate.c.u64()) & 1 if gate.rank == 3 else 0
+        lit: i64 = a + b + c
+        return lit == gate.rank if gate.kind == AND
+        return lit > 0 if gate.kind == OR
+        return lit % 2 == 1 if gate.kind == XOR
+        return lit >= 2
+
+    # Each generated family has a distinct truth table. COPY depends on one
+    # input, pair gates on two, and triple gates on three. Within each arity
+    # the choices of inputs, inversions and Boolean operation are distinct.
+    def space(level: Grade&) -> darray[Gate]:
+        can Memory.Allocate, Abort.Panic:
+            gates: mutable darray[Gate] = []
+            for a in 0..<level.switches |a, gates|:
+                gates.push(Gate{kind: COPY, a: a, b: 0, c: 0, rank: 1, flipped: 0})
+                gates.push(Gate{kind: COPY, a: a, b: 0, c: 0, rank: 1, flipped: 1})
+            if level.rung >= 3:
+                inversions: i64 = 4 if level.rung >= 5 else 1
+                for a in 0..<level.switches |a, level, gates, inversions|:
+                    for b in (a + 1)..<level.switches |b, a, level, gates, inversions|:
+                        for flags in 0..<inversions |flags, a, b, gates|:
+                            flipped: i64 = ((flags & 1) << 1) | (flags >> 1)
+                            gates.push(Gate{kind: AND, a: a, b: b, c: 0, rank: 2, flipped: flipped})
+                            gates.push(Gate{kind: OR, a: a, b: b, c: 0, rank: 2, flipped: flipped})
+                        if level.rung >= 7:
+                            gates.push(Gate{kind: XOR, a: a, b: b, c: 0, rank: 2, flipped: 0})
+                            gates.push(Gate{kind: XOR, a: a, b: b, c: 0, rank: 2, flipped: 2})
+            if level.rung >= 12:
+                for a in 0..<level.switches |a, level, gates|:
+                    for b in (a + 1)..<level.switches |b, a, level, gates|:
+                        for c in (b + 1)..<level.switches |c, b, a, gates|:
+                            gates.push(Gate{kind: AND, a: a, b: b, c: c, rank: 3, flipped: 0})
+                            gates.push(Gate{kind: OR, a: a, b: b, c: c, rank: 3, flipped: 0})
+                            gates.push(Gate{kind: MAJORITY, a: a, b: b, c: c, rank: 3, flipped: 0})
+                            gates.push(Gate{kind: XOR, a: a, b: b, c: c, rank: 3, flipped: 0})
+            return gates
+
+    def budget(level: Grade&) -> i64:
+        return 3 * level.lamps + 2 * level.switches + 6
+
+    def lamps(level: Grade&, result: Deal&, setting: i64) -> i64:
+        can Abort.Panic:
+            pattern: mutable i64 = 0
+            for lamp in 0..<level.lamps |lamp, result, setting, pattern|:
+                pattern <- pattern | (1 << lamp.u64()) if evaluate(result.gates[lamp.usize()], setting)
+            return pattern
+
+    def deal(level: Grade&, gates: darray[Gate]&, rng: mutable MT19937&, result: mutable Deal&):
+        can Memory.Allocate, Abort.Panic:
+            widest: i64 = 3 if level.rung >= 12 else (2 if level.rung >= 3 else 1)
+            pool: mutable darray[i64] = Ints::zeros(gates.count.i64())
+            for lamp in 0..<level.lamps |lamp, gates, rng, result, widest, pool|:
+                rank: i64 = widest if py_random(rng) < 0.7 else py_randint(rng, 1, widest)
+                size: mutable i64 = 0
+                for index in 0..<gates.count.i64() |index, gates, result, lamp, rank, pool, size|:
+                    continue if gates[index.usize()].rank != rank
+                    used: mutable bool = false
+                    for prior in 0..<lamp |prior, result, index, used|:
+                        used <- true if result.indices[prior.usize()] == index
+                    if not used:
+                        Ints::put(&pool, size, index)
+                        size <- size + 1
+                chosen: i64 = Ints::at_ref(&pool, py_randbelow(rng, size.u64()).i64())
+                result.indices[lamp.usize()] <- chosen
+                result.gates[lamp.usize()] <- gates[chosen.usize()]
+            for look in 0..<budget(level) |look, level, rng, result|:
+                result.lies[look.usize()] <- py_randbelow(rng, level.lamps.u64()).i64() if py_random(rng) < level.noise else -1
+
+            # Before any observations, both polarities of COPY remain possible
+            # for each lamp. Therefore no setting guarantees any pattern, and
+            # every distinct reachable pattern is a hard question.
+            settings: i64 = 1 << level.switches.u64()
+            order: mutable darray[i64] = Ints::zeros(settings)
+            for setting in 0..<settings |setting, order|:
+                Ints::put(&order, setting, setting)
+            py_shuffle_i64_prefix(rng, &order, settings)
+            seen: mutable u64 = 0.u64()
+            result.questions <- 0
+            for index in 0..<settings |index, level, result, order, seen|:
+                pattern: i64 = lamps(level, result, Ints::at_ref(&order, index))
+                bit: u64 = 1.u64() << pattern.u64()
+                continue if (seen & bit) != 0.u64()
+                seen <- seen | bit
+                result.exam[result.questions.usize()] <- pattern
+                result.questions <- result.questions + 1
+                break if result.questions >= level.questions
+
+    struct Round:
+        settings: mutable i64[MAX_LOOKS]
+        readings: mutable i64[MAX_LOOKS]
+        looks: mutable i64
+        examining: mutable bool
+        answers: mutable i64[MAX_QUESTIONS]
+        answered: mutable i64
+        wrong: mutable i64
+
+    def look(round: mutable Round&, level: Grade&, dealt: Deal&, setting: i64) -> i64:
+        can Abort.Panic:
+            return -1 if round.examining or round.looks >= budget(level)
+            return -1 if setting < 0 or setting >= (1 << level.switches.u64())
+            index: usize = round.looks.usize()
+            pattern: i64 = lamps(level, dealt, setting)
+            liar: i64 = dealt.lies[index]
+            shown: i64 = pattern ^ (1 << liar.u64()) if liar >= 0 else pattern
+            round.settings[index] <- setting
+            round.readings[index] <- shown
+            round.looks <- round.looks + 1
+            return shown
+
+    def question(round: Round&, dealt: Deal&) -> i64:
+        can Abort.Panic:
+            return -1 if not round.examining or round.answered >= dealt.questions
+            return dealt.exam[round.answered.usize()]
+
+    def answer(round: mutable Round&, level: Grade&, dealt: Deal&, setting: i64) -> bool:
+        can Abort.Panic:
+            want: i64 = question(round, dealt)
+            return false if want < 0 or setting < 0 or setting >= (1 << level.switches.u64())
+            round.answers[round.answered.usize()] <- setting
+            round.answered <- round.answered + 1
+            round.wrong <- round.wrong + 1 if lamps(level, dealt, setting) != want
+            return true
+
+    def cost(round: Round&, level: Grade&) -> i64:
+        return round.looks + level.penalty * round.wrong

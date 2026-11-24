@@ -1,0 +1,366 @@
+include "./tasks/drone_hoops_game.elisa"
+include "./scene_polish.elisa"
+include "./scene_verdict.elisa"
+
+module SceneDroneHoops:
+    const WIDTH: f64 = 857.28
+    const LEFT: f64 = (912.0 - WIDTH) / 2.0
+    const RIGHT: f64 = LEFT + WIDTH
+    const BOTTOM: f64 = 179.0
+    const HEIGHT: f64 = 389.0
+    const TOP: f64 = BOTTOM + HEIGHT
+    const CX: f64 = DroneHoopsGame::CX
+    const CY: f64 = DroneHoopsGame::CY
+    const GOLD: u32 = 0xffc83cff
+    const STEEL: u32 = 0xbec6d6ff
+    const DONE: u32 = 0x78dc8cff
+    const HOOP: i64 = 0
+    const DRONE: i64 = 1
+    const BIRD: i64 = 2
+
+    struct View:
+        camera: RoomsView::Camera
+        focal: f64
+
+    struct Item:
+        depth: f64
+        kind: i64
+        index: i64
+        half: i64
+
+    def maximum(a: f64, b: f64) -> f64:
+        return a if a >= b else b
+
+    def see(view: View&, point: RoomsView::Vec) -> RoomsView::Vec:
+        d: RoomsView::Vec = RoomsView::sub(point, view.camera.eye)
+        depth: f64 = RoomsView::dot(d, view.camera.forward)
+        return RoomsView::vec(0.0, 0.0, depth) if depth < 0.05
+        k: f64 = view.focal / depth
+        return RoomsView::vec(CX + k * RoomsView::dot(d, view.camera.right), CY + k * RoomsView::dot(d, view.camera.up), depth)
+
+    def inside(point: RoomsView::Vec) -> bool:
+        return point.z >= 0.05 and point.x >= LEFT and point.x <= RIGHT and point.y >= BOTTOM and point.y <= TOP
+
+    def boundary(p: RoomsView::Vec, edge: i64) -> f64:
+        return p.x - LEFT if edge == 0
+        return RIGHT - p.x if edge == 1
+        return p.y - BOTTOM if edge == 2
+        return TOP - p.y
+
+    def polygon(list: mutable Display::DisplayList&, view: View&, vertices: RoomsView::Vec[12]&, entries: i64, colour: u32):
+        can Memory.Allocate, Abort.Panic:
+            points: mutable RoomsView::Vec[16] = zeroed
+            count: mutable i64 = entries
+            for i in 0..<entries |points, vertices, view|:
+                p: RoomsView::Vec = see(view, vertices[i.usize()])
+                return if p.z < 0.05
+                points[i.usize()] <- p
+            for edge in 0..<4 |points, count|:
+                return if count < 3
+                clipped: mutable RoomsView::Vec[16] = zeroed
+                kept: mutable i64 = 0
+                prior: mutable RoomsView::Vec = points[(count - 1).usize()]
+                for i in 0..<count |points, count, edge, prior, kept, clipped|:
+                    p: RoomsView::Vec = points[i.usize()]
+                    before: f64 = boundary(prior, edge)
+                    after: f64 = boundary(p, edge)
+                    if (before >= 0.0) != (after >= 0.0):
+                        t: f64 = before / (before - after)
+                        clipped[kept.usize()] <- RoomsView::add(prior, RoomsView::mul(RoomsView::sub(p, prior), t))
+                        kept <- kept + 1
+                    if after >= 0.0:
+                        clipped[kept.usize()] <- p
+                        kept <- kept + 1
+                    prior <- p
+                points <- clipped
+                count <- kept
+            return if count < 3
+            first: RoomsView::Vec = points[0]
+            Display::begin_polygon(list, count, first.x, first.y, colour)
+            for i in 0..<count |list, points|:
+                p: RoomsView::Vec = points[i.usize()]
+                Display::polygon_point(list, p.x, p.y)
+
+    def quad(list: mutable Display::DisplayList&, view: View&, a: RoomsView::Vec, b: RoomsView::Vec,
+             c: RoomsView::Vec, d: RoomsView::Vec, colour: u32):
+        can Memory.Allocate, Abort.Panic:
+            vertices: RoomsView::Vec[12] = [a, b, c, d, zeroed, zeroed, zeroed, zeroed, zeroed, zeroed, zeroed, zeroed]
+            polygon(list, view, &vertices, 4, colour)
+
+    def line(list: mutable Display::DisplayList&, view: View&, start: RoomsView::Vec, stop: RoomsView::Vec, width: f64, colour: u32):
+        can Memory.Allocate, Abort.Panic:
+            a: RoomsView::Vec = see(view, start)
+            b: RoomsView::Vec = see(view, stop)
+            return if a.z < 0.05 or b.z < 0.05
+            low: mutable f64 = 0.0
+            high: mutable f64 = 1.0
+            for edge in 0..<4 |a, b, low, high|:
+                before: f64 = boundary(a, edge)
+                after: f64 = boundary(b, edge)
+                return if before < 0.0 and after < 0.0
+                if before < 0.0 or after < 0.0:
+                    t: f64 = before / (before - after)
+                    if before < 0.0:
+                        low <- t if t > low
+                    else:
+                        high <- t if t < high
+            return if low > high
+            dx: f64 = b.x - a.x
+            dy: f64 = b.y - a.y
+            Display::draw_line(list, a.x + low * dx, a.y + low * dy, a.x + high * dx, a.y + high * dy, width, colour)
+
+    def lighten(colour: u32, flash: f64) -> u32:
+        return ScenePolish::mix_rgb(colour, 0xffffffff, 0.6 * flash)
+
+    def ground(list: mutable Display::DisplayList&, view: View&, run: DroneHoops::Run&, flash: f64):
+        can Memory.Allocate, Abort.Panic:
+            card: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: LEFT - 4.0, y: BOTTOM - 4.0, w: WIDTH + 8.0, h: HEIGHT + 8.0}
+            shade: u32[3] = [30.u32(), 18.u32(), 12.u32()]
+            for i in 0..<3 |list, card, shade|:
+                spread: f64 = i.f64() * 2.0
+                box: SceneHiddenRule::Rect = ScenePolish::spread_box(&card, spread, 4.0)
+                ScenePolish::rounded(list, &box, 14.0 + spread, shade[i.usize()])
+            ScenePolish::rounded(list, &card, 14.0, 0x1e1e32ff)
+            base: u32 = lighten(0xeea078ff, flash)
+            high: u32 = lighten(0x2e3468ff, flash)
+            for i in 0..<18 |list, base, high|:
+                colour: u32 = ScenePolish::mix_rgb(base, high, (i.f64() + 0.5) / 18.0)
+                Display::draw_rect(list, LEFT, BOTTOM + HEIGHT * i.f64() / 18.0, WIDTH, HEIGHT / 18.0 + 1.0, colour)
+            frame: DroneHoops::Frame = DroneHoops::controls(run)
+            horizon: RoomsView::Vec = see(view, RoomsView::add(run.eye, RoomsView::mul(frame.forward, 10000.0)))
+            if horizon.z >= 0.05 and horizon.y > BOTTOM:
+                Display::draw_rect(list, LEFT, BOTTOM, WIDTH, DroneHoops::minimum(TOP, horizon.y) - BOTTOM, lighten(0x706676ff, flash))
+            h: f64 = DroneHoops::HALF
+            step: f64 = 2.0 * h / 12.0
+            for i in 0..<12 |list, view, h, step, flash|:
+                x: f64 = -h + i.f64() * step
+                for j in 0..<12 |list, view, h, step, flash, x, i|:
+                    z: f64 = -h + j.f64() * step
+                    colour: u32 = lighten(0x768468ff if (i + j) % 2 != 0 else 0x62705aff, flash)
+                    quad(list, view, RoomsView::vec(x, 0.0, z), RoomsView::vec(x + step, 0.0, z),
+                        RoomsView::vec(x + step, 0.0, z + step), RoomsView::vec(x, 0.0, z + step), colour)
+            corners: RoomsView::Vec[4] = [RoomsView::vec(-h, 0.0, -h), RoomsView::vec(h, 0.0, -h),
+                RoomsView::vec(h, 0.0, h), RoomsView::vec(-h, 0.0, h)]
+            wall: u32 = (lighten(0x967860ff, flash) & 0xffffff00.u32()) | 200.u32()
+            for i in 0..<4 |list, view, corners, wall|:
+                a: RoomsView::Vec = corners[i.usize()]
+                b: RoomsView::Vec = corners[((i + 1) % 4).usize()]
+                up: RoomsView::Vec = RoomsView::vec(0.0, 1.0, 0.0)
+                quad(list, view, a, b, RoomsView::add(b, up), RoomsView::add(a, up), wall)
+                top_a: RoomsView::Vec = RoomsView::vec(a.x, DroneHoops::CEILING, a.z)
+                top_b: RoomsView::Vec = RoomsView::vec(b.x, DroneHoops::CEILING, b.z)
+                line(list, view, a, top_a, 3.0, 0x463c46c8)
+                line(list, view, top_a, top_b, 1.0, 0xffffff32)
+            shadow: mutable RoomsView::Vec[12] = zeroed
+            for i in 0..<12 |run, shadow|:
+                a: f64 = DroneHoops::TAU * i.f64() / 12.0
+                shadow[i.usize()] <- RoomsView::vec(run.p.x + 0.55 * cos(a), 0.02, run.p.z + 0.55 * sin(a))
+            polygon(list, view, &shadow, 12, 0x14141e78)
+            line(list, view, RoomsView::vec(run.p.x, 0.02, run.p.z), run.p, 1.0, 0xffffff6e)
+            if run.aimed:
+                p: RoomsView::Vec = run.aim
+                y: f64 = p.y if run.aimed_y else run.p.y
+                line(list, view, RoomsView::vec(p.x - 0.4, y, p.z), RoomsView::vec(p.x + 0.4, y, p.z), 2.0, 0xffffff96)
+                line(list, view, RoomsView::vec(p.x, y, p.z - 0.4), RoomsView::vec(p.x, y, p.z + 0.4), 2.0, 0xffffff96)
+
+    def hoop_point(shape: DroneHoops::Hooped, radius: f64, index: i64) -> RoomsView::Vec:
+        angle: f64 = DroneHoops::TAU * index.f64() / 32.0
+        along: f64 = radius * cos(angle)
+        return RoomsView::add(shape.centre, RoomsView::vec(along * shape.normal.z,
+            radius * sin(angle), -along * shape.normal.x))
+
+    def hoop(list: mutable Display::DisplayList&, view: View&, run: DroneHoops::Run&, index: i64, half: i64):
+        can Memory.Allocate, Abort.Panic:
+            h: DroneHoops::Hoop = run.course.hoops[index.usize()]
+            shape: DroneHoops::Hooped = DroneHoops::hoop_at(h, run.time)
+            c: RoomsView::Vec = shape.centre
+            q: RoomsView::Vec = see(view, c)
+            target: bool = run.course.level.lit and index == run.next_hoop
+            colour: u32 = 0x78dc8c96 if index < run.next_hoop else (GOLD if target else STEEL)
+            tone: u32 = ((ScenePolish::mix_rgb(colour, 0xffffffff, 0.25) & 0xffffff00.u32()) | (colour & 255.u32())) if half == 1 else colour
+            for j in 0..<32 |list, view, shape, h, q, half, tone, index, run|:
+                a: RoomsView::Vec = hoop_point(shape, h.radius, j)
+                b: RoomsView::Vec = hoop_point(shape, h.radius, j + 1)
+                mid: RoomsView::Vec = see(view, RoomsView::mul(RoomsView::add(a, b), 0.5))
+                continue if mid.z < 0.05 or (mid.z < q.z) != (half == 1)
+                thickness: f64 = maximum(2.0, view.focal * 2.0 * DroneHoops::RIM / mid.z)
+                line(list, view, a, b, thickness, tone)
+                joint: RoomsView::Vec = see(view, b)
+                if index >= run.next_hoop and thickness > 3.0 and inside(joint):
+                    Display::draw_circle(list, joint.x, joint.y, thickness / 2.0, tone)
+            if half == 0:
+                line(list, view, RoomsView::vec(c.x, c.y - h.radius, c.z), RoomsView::vec(c.x, 0.0, c.z),
+                    maximum(1.5, view.focal * 0.14 / q.z), 0x5a505aff)
+                if target:
+                    ScenePolish::glow(list, q.x, q.y, view.focal * h.radius * 1.3 / q.z, GOLD, 35)
+
+    def drone(list: mutable Display::DisplayList&, view: View&, run: DroneHoops::Run&):
+        can Memory.Allocate, Abort.Panic:
+            p: RoomsView::Vec = run.p
+            q: RoomsView::Vec = see(view, p)
+            fwd: RoomsView::Vec = RoomsView::vec(sin(run.heading), 0.0, cos(run.heading))
+            side: RoomsView::Vec = RoomsView::vec(fwd.z, 0.0, -fwd.x)
+            rotors: mutable RoomsView::Vec[4] = zeroed
+            for k in 0..<4 |list, view, run, p, q, fwd, side, rotors|:
+                off: RoomsView::Vec = RoomsView::add(RoomsView::mul(fwd, 0.42 if k < 2 else -0.42),
+                    RoomsView::mul(side, 0.42 if k == 0 or k == 3 else -0.42))
+                tilt: f64 = -0.18 * RoomsView::dot(off, run.thrust) / (0.42 * DroneHoops::ACC)
+                r: RoomsView::Vec = RoomsView::add(p, RoomsView::vec(off.x, tilt, off.z))
+                rotors[k.usize()] <- r
+                line(list, view, p, r, maximum(2.0, view.focal * 0.08 / q.z), 0x3c3c46ff)
+            for k in 0..<4 |list, view, run, rotors|:
+                r: RoomsView::Vec = see(view, rotors[k.usize()])
+                continue if not inside(r)
+                radius: f64 = maximum(3.0, view.focal * 0.24 / r.z)
+                dx: f64 = cos(run.time * 40.0 + k.f64()) * radius
+                dy: f64 = sin(run.time * 40.0 + k.f64()) * radius
+                Display::draw_circle(list, r.x, r.y, radius, 0xdce6f05a)
+                Display::draw_line(list, r.x - dx, r.y - dy, r.x + dx, r.y + dy, 2.0, 0x282832ff)
+            if inside(q):
+                Display::draw_circle(list, q.x, q.y, maximum(3.0, view.focal * 0.2 / q.z), 0xf08228ff)
+            for k in 0..<2 |list, view, p, fwd|:
+                lamp: RoomsView::Vec = see(view, RoomsView::add(p, RoomsView::mul(fwd, 0.3 if k == 0 else -0.3)))
+                if inside(lamp):
+                    Display::draw_circle(list, lamp.x, lamp.y, maximum(2.0, view.focal * 0.08 / lamp.z),
+                        0x50ff78ff if k == 0 else 0xff463cff)
+
+    def wind(list: mutable Display::DisplayList&, view: View&, run: DroneHoops::Run&):
+        can Memory.Allocate, Abort.Panic:
+            gust: RoomsView::Vec = DroneHoops::gust_vector(&run.course, run.time)
+            return if DroneHoops::norm(gust) == 0.0
+            w: RoomsView::Vec = DroneHoops::unit(gust)
+            p: RoomsView::Vec = run.p
+            for k in 0..<22 |list, view, run, w, p|:
+                a: f64 = k.f64() * 7.31
+                b: f64 = k.f64() * 3.77
+                c: f64 = k.f64() * 5.13
+                travel: f64 = run.time * 14.0 + k.f64() * 3.1
+                along: f64 = travel - floor(travel / 14.0) * 14.0 - 7.0
+                base: RoomsView::Vec = RoomsView::vec(p.x + (a - floor(a) - 0.5) * 10.0 + w.x * along,
+                    maximum(0.2, p.y + (b - floor(b) - 0.5) * 5.0), p.z + (c - floor(c) - 0.5) * 10.0 + w.z * along)
+                line(list, view, base, RoomsView::add(base, RoomsView::mul(w, 1.3)), 1.5, 0xffffff78)
+
+    def objects(list: mutable Display::DisplayList&, view: View&, run: DroneHoops::Run&):
+        can Memory.Allocate, Abort.Panic:
+            items: mutable Item[51] = zeroed
+            count: mutable i64 = 0
+            for k in 0..<run.course.level.hoops |run, view, items, count|:
+                q: RoomsView::Vec = see(view, DroneHoops::hoop_at(run.course.hoops[k.usize()], run.time).centre)
+                continue if q.z < 0.05
+                items[count.usize()] <- Item{depth: q.z + 0.3, kind: HOOP, index: k, half: 0}
+                items[(count + 1).usize()] <- Item{depth: q.z - 0.3, kind: HOOP, index: k, half: 1}
+                count <- count + 2
+            q: RoomsView::Vec = see(view, run.p)
+            if q.z >= 0.05:
+                items[count.usize()] <- Item{depth: q.z, kind: DRONE, index: 0, half: 0}
+                count <- count + 1
+            for k in 0..<(run.course.level.birds * 4) |run, view, items, count|:
+                bird: DroneHoops::Bird = run.course.birds[k.usize()]
+                continue if not DroneHoops::bird_visible(bird, run.time)
+                depth: f64 = see(view, DroneHoops::bird_at(bird, run.time)).z
+                continue if depth < 0.05
+                items[count.usize()] <- Item{depth: depth, kind: BIRD, index: k, half: 0}
+                count <- count + 1
+            for i in 1..<count |items|:
+                item: Item = items[i.usize()]
+                at: mutable i64 = i
+                while at > 0:
+                    prior: Item = items[(at - 1).usize()]
+                    break if prior.depth >= item.depth
+                    items[at.usize()] <- prior
+                    at <- at - 1
+                items[at.usize()] <- item
+            for i in 0..<count |list, view, run, items|:
+                item: Item = items[i.usize()]
+                if item.kind == HOOP:
+                    hoop(list, view, run, item.index, item.half)
+                elif item.kind == DRONE:
+                    drone(list, view, run)
+                else:
+                    b: RoomsView::Vec = DroneHoops::bird_at(run.course.birds[item.index.usize()], run.time)
+                    flap: f64 = 0.3 * sin(run.time * 12.0 + b.x)
+                    line(list, view, b, RoomsView::vec(b.x - 0.5, b.y + flap, b.z + 0.2), 2.0, 0x1e1a24ff)
+                    line(list, view, b, RoomsView::vec(b.x + 0.5, b.y + flap, b.z + 0.2), 2.0, 0x1e1a24ff)
+
+    def stage(list: mutable Display::DisplayList&, run: DroneHoops::Run&):
+        can Memory.Allocate, Abort.Panic:
+            view: View = View{camera: DroneHoopsGame::view(run), focal: DroneHoopsGame::focal(run)}
+            flash: f64 = DroneHoops::flash(&run.course, run.time)
+            ground(list, &view, run, flash)
+            objects(list, &view, run)
+            wind(list, &view, run)
+            if flash > 0.01:
+                Display::draw_rect(list, LEFT, BOTTOM, WIDTH, HEIGHT, 0xffffff00.u32() | (200.0 * flash).u32())
+            if run.camera >= 0:
+                label: mutable dstr = []
+                dstr_append_cstr(&label, "CAM ")
+                dstr_append_i64(&label, run.camera + 1)
+                Display::draw_text_weight(list, bytes_view(label), LEFT + 52.0, TOP - 24.0, 13.0, 0xffffffe6, Display::ANCHOR_CENTER_CENTER, true)
+                if (run.time * 2.0).i64() % 2 == 0:
+                    Display::draw_circle(list, LEFT + 16.0, TOP - 24.0, 6.0, 0xe62828ff)
+            elif run.camera == -1:
+                Display::draw_text_weight(list, "ORBIT", LEFT + 40.0, TOP - 24.0, 13.0, 0xffffffe6, Display::ANCHOR_CENTER_CENTER, true)
+            total: i64 = run.course.level.hoops
+            for k in 0..<total |list, run, total|:
+                Display::draw_circle(list, RIGHT - 20.0 - (total - 1 - k).f64() * 20.0, TOP - 22.0, 6.0,
+                    DONE if k < run.next_hoop else 0xffffff5a)
+            share: f64 = 1.0 - run.time / (run.course.level.seconds * run.course.level.hoops.f64())
+            if share > 0.005:
+                Display::draw_rect(list, LEFT + 10.0, BOTTOM + 8.0, (WIDTH - 20.0) * share, 6.0,
+                    ScenePolish::mix_rgb(0xec5040ff, 0x6edc8cff, DroneHoops::minimum(1.0, share * 1.6)))
+
+    def result_text(result: i64) -> sview:
+        return "Through every hoop" if result == DroneHoops::PASSED
+        return "Through the wrong hoop" if result == DroneHoops::WRONG
+        return "Out of time"
+
+    def render(list: mutable Display::DisplayList&, session: DroneHoopsGame::Session&, dark: bool):
+        can Memory.Allocate, Abort.Panic:
+            ink: u32 = 0xffffffff if dark else 0x000000ff
+            Display::draw_text_weight(list, "Drone Hoops", CX, 648.0, 22.0, ink, Display::ANCHOR_CENTER_CENTER, true)
+            Display::draw_text(list, "Hold mouse: fly to pointer, wheel: height   Arrows / WASD: move   Space: up   Shift: down   Esc: menu",
+                CX, 26.0, 12.0, ink, Display::ANCHOR_CENTER_CENTER)
+            msg: mutable dstr = []
+            if session.phase == DroneHoopsGame::READY:
+                dstr_append_cstr(&msg, "Press Space or click to start")
+            elif session.phase == DroneHoopsGame::DONE:
+                dstr_append_i64(&msg, session.passed_count)
+                dstr_append_cstr(&msg, " of ")
+                dstr_append_i64(&msg, session.trial)
+                dstr_append_cstr(&msg, " passed   highest rung passed ")
+                dstr_append_i64(&msg, session.best_rung)
+            elif session.phase == DroneHoopsGame::JUDGED:
+                Display::draw_text(list, result_text(session.run.result), CX, 614.0, 14.0, ink, Display::ANCHOR_CENTER_CENTER)
+            else:
+                dstr_append_cstr(&msg, "Fly through the gold hoop, then the next" if session.run.course.level.lit else "Follow the bell: fly through the hoop that rings")
+            if session.phase != DroneHoopsGame::JUDGED:
+                Display::draw_text(list, bytes_view(msg), CX, 614.0, 14.0, ink, Display::ANCHOR_CENTER_CENTER)
+            if session.phase >= DroneHoopsGame::JUDGED and session.run.result != DroneHoops::PENDING:
+                SceneVerdict::put(list, 912.0, 684.0, 1.0, 1.0, session.run.result == DroneHoops::PASSED, result_text(session.run.result), 60.0, 16.0)
+            return if session.phase == DroneHoopsGame::READY or session.phase == DroneHoopsGame::DONE
+            facts: mutable dstr = []
+            dstr_append_cstr(&facts, "rung ")
+            dstr_append_i64(&facts, session.rung)
+            dstr_append_cstr(&facts, "  ")
+            dstr_append_i64(&facts, session.trial)
+            dstr_append_cstr(&facts, "/")
+            dstr_append_i64(&facts, session.total)
+            dstr_append_cstr(&facts, "   hoop ")
+            total: i64 = session.run.course.level.hoops
+            dstr_append_i64(&facts, session.run.next_hoop + 1 if session.run.next_hoop < total else total)
+            dstr_append_cstr(&facts, " of ")
+            dstr_append_i64(&facts, total)
+            dstr_append_cstr(&facts, "   bumps ")
+            dstr_append_i64(&facts, session.run.bumps)
+            Display::draw_text(list, bytes_view(facts), CX, 588.0, 12.0, ink, Display::ANCHOR_CENTER_CENTER)
+            stage(list, &session.run)
+
+    def option_note(rung: i64, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            level: DroneHoops::Grade = DroneHoops::grade(rung)
+            dstr_append_cstr(out, "Rung ")
+            dstr_append_i64(out, level.rung)
+            dstr_append_cstr(out, " has ")
+            dstr_append_i64(out, level.hoops)
+            dstr_append_cstr(out, " hoops. ")
+            dstr_append_cstr(out, "Follow the gold hoop." if level.lit else "Follow the bell.")

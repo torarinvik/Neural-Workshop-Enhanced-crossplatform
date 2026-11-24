@@ -1,0 +1,285 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+
+module Unicycle:
+    const PEDAL: i64 = 0
+    const BACK: i64 = 1
+    const LEAN_B: i64 = 2
+    const LEAN_F: i64 = 3
+    const PEDAL_B: i64 = 4
+    const PEDAL_F: i64 = 5
+    const BACK_B: i64 = 6
+    const BACK_F: i64 = 7
+    const PORTS: i64 = 8
+    const NEUTRAL: i64 = -1
+
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const HEAD_OVER_HEELS: i64 = 2
+    const FELL: i64 = 3
+    const TIMEOUT: i64 = 4
+
+    const RADIUS: f64 = 0.35
+    const WHEEL_MASS: f64 = 6.0
+    const RIDER_MASS: f64 = 50.0
+    const INERTIA: f64 = 0.5 * WHEEL_MASS * RADIUS * RADIUS
+    const POST: f64 = 1.0
+    const HEAD: f64 = 1.5
+    const SPRING: f64 = 7000.0
+    const DAMPING: f64 = 500.0
+    const TORQUE: f64 = 100.0
+    const MAX_SPIN: f64 = 13.0
+    const LEAN_FORCE: f64 = 450.0
+    const GRAVITY: f64 = 9.81
+    const GRIP: f64 = 1.2
+    const SUBSTEPS: i64 = 4
+    const DX: f64 = 0.25
+    const START_X: f64 = -4.0
+
+    struct Grade:
+        rung: i64
+        length: f64
+        hills: f64
+        bumps: f64
+        steps: f64
+        pits: i64
+        slack: f64
+
+    struct Track:
+        level: Grade
+        heights: f64[601]
+        count: i64
+        finish: f64
+        seconds: mutable f64
+        best: mutable f64
+
+    struct Wave:
+        amplitude: f64
+        frequency: f64
+        phase: f64
+
+    struct Point:
+        x: f64
+        y: f64
+
+    struct Body:
+        px: mutable f64
+        py: mutable f64
+        vx: mutable f64
+        vy: mutable f64
+        a: mutable f64
+        w: mutable f64
+        qx: mutable f64
+        qy: mutable f64
+        ux: mutable f64
+        uy: mutable f64
+
+    struct Run:
+        track: Track
+        body: mutable Body
+        t: mutable f64
+        result: mutable i64
+        last: mutable i64
+
+    def grade(requested: i64) -> Grade:
+        rung: i64 = requested if requested > 1 else 1
+        if rung == 1:
+            return Grade{rung: rung, length: 22.0, hills: 0.0, bumps: 0.0, steps: 0.0, pits: 0, slack: 3.0}
+        if rung < 4:
+            return Grade{rung: rung, length: 30.0, hills: 0.5 + 0.3 * (rung - 2).f64(), bumps: 0.0, steps: 0.0, pits: 0, slack: 2.5}
+        if rung < 7:
+            return Grade{rung: rung, length: 40.0, hills: 1.2 + 0.2 * (rung - 4).f64(),
+                bumps: 0.06 + 0.02 * (rung - 4).f64(), steps: 0.0, pits: 0, slack: 2.2}
+        if rung < 10:
+            return Grade{rung: rung, length: 45.0, hills: 1.4, bumps: 0.08,
+                steps: 0.15 + 0.05 * (rung - 7).f64(), pits: 0, slack: 2.0}
+        if rung < 13:
+            return Grade{rung: rung, length: 50.0, hills: 1.4, bumps: 0.08,
+                steps: 0.2, pits: 1 + (rung - 10) / 2, slack: 1.8}
+        extra: i64 = rung - 13
+        return Grade{rung: rung, length: fmin(140.0, 55.0 + 3.0 * extra.f64()), hills: fmin(3.0, 1.5 + 0.05 * extra.f64()),
+            bumps: fmin(0.16, 0.09 + 0.004 * extra.f64()), steps: fmin(0.3, 0.2 + 0.005 * extra.f64()),
+            pits: 2 + extra / 6, slack: fmax(1.08, 1.1 + 0.6 * pow(0.9, extra.f64()))}
+
+    def x_at(index: i64) -> f64:
+        return START_X + index.f64() * DX
+
+    def ground(track: Track&, x: f64) -> f64:
+        can Abort.Panic:
+            raw: i64 = ((x - START_X) / DX).i64()
+            index: i64 = 0 if raw < 0 else (track.count - 2 if raw > track.count - 2 else raw)
+            y: f64 = track.heights[index.usize()]
+            next: f64 = track.heights[(index + 1).usize()]
+            return y + (next - y) * ((x - x_at(index)) / DX)
+
+    def wave(rng: mutable MT19937&, hills: f64) -> Wave:
+        can Abort.Panic:
+            amplitude: f64 = hills * py_uniform(rng, 0.3, 0.6)
+            frequency: f64 = py_uniform(rng, 0.12, 0.3)
+            return Wave{amplitude: amplitude, frequency: frequency, phase: py_uniform(rng, 0.0, 6.3)}
+
+    def swell(w: Wave, t: f64) -> f64:
+        return w.amplitude * (sin(w.frequency * t + w.phase) - sin(w.phase))
+
+    def shift(ys: mutable f64[601]&, count: i64, x: f64, h: f64, width: f64):
+        can Abort.Panic:
+            for i in 0..<count |ys, x, h, width|:
+                p: f64 = x_at(i)
+                if p >= x:
+                    ys[i.usize()] <- ys[i.usize()] + h * fmin(1.0, (p - x) / width)
+
+    def build(level: Grade, rng: mutable MT19937&) -> Track:
+        can Abort.Panic:
+            count: i64 = ((level.length + 6.0 - START_X) / DX).i64() + 1
+            ys: mutable f64[601] = zeroed
+            if level.hills != 0.0:
+                first: Wave = wave(rng, level.hills)
+                second: Wave = wave(rng, level.hills)
+                for i in 0..<count |ys, first, second|:
+                    t: f64 = fmax(0.0, x_at(i) - 3.0)
+                    ys[i.usize()] <- fmin(1.0, t / 4.0) * (swell(first, t) + swell(second, t))
+            if level.bumps != 0.0:
+                x: mutable f64 = 6.0
+                while x < level.length |x, ys, level, rng, count|:
+                    x <- x + py_uniform(rng, 2.0, 5.0)
+                    height: f64 = level.bumps * py_uniform(rng, 0.6, 1.0)
+                    for i in 0..<count |x, ys, height|:
+                        d: f64 = fabs(x_at(i) - x)
+                        ys[i.usize()] <- ys[i.usize()] + height * (1.0 - d / 0.4) if d < 0.4
+            if level.steps != 0.0:
+                x: mutable f64 = 8.0
+                while x < level.length - 4.0 |x, ys, level, rng, count|:
+                    x <- x + py_uniform(rng, 5.0, 9.0)
+                    height: f64 = level.steps * py_uniform(rng, 0.6, 1.0)
+                    sign: f64 = -1.0 if py_randbelow(rng, 2.u64()) == 0.u64() else 1.0
+                    shift(&ys, count, x, height * sign, 0.75)
+            if level.pits > 0:
+                span: f64 = (level.length - 14.0) / level.pits.f64()
+                for i in 0..<level.pits |span, level, rng, ys, count|:
+                    x: f64 = 10.0 + span * (i.f64() + py_uniform(rng, 0.35, 0.65))
+                    h: f64 = fmin(1.4, py_uniform(rng, 0.5, 0.8) + 0.03 * fmax(0.0, (level.rung - 13).f64()))
+                    shift(&ys, count, x, -h, 0.25)
+            return Track{level: level, heights: ys, count: count, finish: level.length, seconds: 600.0, best: 0.0}
+
+    def begin(track: Track&) -> Body:
+        can Abort.Panic:
+            y: f64 = ground(track, 0.0) + RADIUS
+            return Body{px: 0.0, py: y, vx: 0.0, vy: 0.0, a: 0.0, w: 0.0,
+                qx: POST * sin(0.03), qy: y + POST * cos(0.03), ux: 0.0, uy: 0.0}
+
+    def contact(track: Track&, b: mutable Body&, dt: f64):
+        can Abort.Panic:
+            lo: i64 = ((b.px - RADIUS - 0.3 - START_X) / DX).i64()
+            hi: i64 = lo + ((2.0 * RADIUS + 0.6) / DX).i64() + 2
+            first: i64 = lo if lo > 0 else 0
+            end: i64 = hi if hi < track.count - 1 else track.count - 1
+            nearest: mutable f64 = RADIUS
+            cx: mutable f64 = 0.0
+            cy: mutable f64 = 0.0
+            for i in first..<end |track, b, nearest, cx, cy|:
+                ax: f64 = x_at(i)
+                ay: f64 = track.heights[i.usize()]
+                rise: f64 = track.heights[(i + 1).usize()] - ay
+                u: f64 = fmax(0.0, fmin(1.0, ((b.px - ax) * DX + (b.py - ay) * rise) / (DX * DX + rise * rise)))
+                x: f64 = ax + DX * u
+                y: f64 = ay + rise * u
+                d: f64 = py_hypot(b.px - x, b.py - y)
+                if d < nearest:
+                    nearest <- d
+                    cx <- x
+                    cy <- y
+            return if nearest == RADIUS
+            nx: f64 = (b.px - cx) / nearest if nearest > 0.000000001 else 0.0
+            ny: f64 = (b.py - cy) / nearest if nearest > 0.000000001 else 1.0
+            b.px <- cx + nx * RADIUS
+            b.py <- cy + ny * RADIUS
+            vn: f64 = b.vx * nx + b.vy * ny
+            jn: mutable f64 = 0.0
+            if vn < 0.0:
+                b.vx <- b.vx - 1.05 * vn * nx
+                b.vy <- b.vy - 1.05 * vn * ny
+                jn <- -1.05 * vn * WHEEL_MASS
+            tx: f64 = ny
+            ty: f64 = -nx
+            slip: f64 = b.vx * tx + b.vy * ty + b.w * RADIUS
+            effective_mass: f64 = 1.0 / (1.0 / WHEEL_MASS + RADIUS * RADIUS / INERTIA)
+            cap: f64 = GRIP * (jn + WHEEL_MASS * GRAVITY * dt)
+            jt: f64 = fmax(-cap, fmin(cap, -slip * effective_mass))
+            b.vx <- b.vx + jt / WHEEL_MASS * tx
+            b.vy <- b.vy + jt / WHEEL_MASS * ty
+            b.w <- b.w + jt * RADIUS / INERTIA
+
+    def command(drive: i64, lean: i64) -> i64:
+        if drive > 0:
+            return PEDAL_B if lean < 0 else (PEDAL_F if lean > 0 else PEDAL)
+        if drive < 0:
+            return BACK_B if lean < 0 else (BACK_F if lean > 0 else BACK)
+        return LEAN_B if lean < 0 else (LEAN_F if lean > 0 else NEUTRAL)
+
+    def advance(track: Track&, b: mutable Body&, port: i64, dt: f64):
+        can Abort.Panic:
+            drive: f64 = 1.0 if port == PEDAL or port == PEDAL_B or port == PEDAL_F else (
+                -1.0 if port == BACK or port == BACK_B or port == BACK_F else 0.0)
+            lean: f64 = 1.0 if port == LEAN_F or port == PEDAL_F or port == BACK_F else (
+                -1.0 if port == LEAN_B or port == PEDAL_B or port == BACK_B else 0.0)
+            h: f64 = dt / SUBSTEPS.f64()
+            for _ in 0..<SUBSTEPS |track, b, drive, lean, h|:
+                dx: f64 = b.qx - b.px
+                dy: f64 = b.qy - b.py
+                length: f64 = py_hypot(dx, dy)
+                ln: f64 = length if length != 0.0 else 0.000000001
+                nx: f64 = dx / ln
+                ny: f64 = dy / ln
+                rel: f64 = (b.ux - b.vx) * nx + (b.uy - b.vy) * ny
+                force: f64 = -SPRING * (ln - POST) - DAMPING * rel
+                tx: f64 = ny
+                ty: f64 = -nx
+                rider_x: f64 = force * nx + LEAN_FORCE * lean * tx
+                rider_y: f64 = force * ny + LEAN_FORCE * lean * ty
+                supplied: f64 = -TORQUE * drive
+                tau: f64 = 0.0 if drive != 0.0 and fabs(b.w) > MAX_SPIN and (b.w < 0.0) == (supplied < 0.0) else supplied
+                b.w <- b.w + tau / INERTIA * h
+                torque_force: f64 = -tau / ln
+                push_x: f64 = torque_force * tx
+                push_y: f64 = torque_force * ty
+                b.ux <- b.ux + (rider_x + push_x) / RIDER_MASS * h
+                b.uy <- b.uy + ((rider_y + push_y) / RIDER_MASS - GRAVITY) * h
+                b.vx <- b.vx + (-rider_x - push_x) / WHEEL_MASS * h
+                b.vy <- b.vy + ((-rider_y - push_y) / WHEEL_MASS - GRAVITY) * h
+                b.w <- b.w * (1.0 - 0.3 * h)
+                b.px <- b.px + b.vx * h
+                b.py <- b.py + b.vy * h
+                b.qx <- b.qx + b.ux * h
+                b.qy <- b.qy + b.uy * h
+                b.a <- b.a + b.w * h
+                contact(track, b, h)
+
+    def head(b: Body&) -> Point:
+        return Point{x: b.px + (b.qx - b.px) * HEAD, y: b.py + (b.qy - b.py) * HEAD}
+
+    def tilt(b: Body&) -> f64:
+        return atan2(b.qx - b.px, b.qy - b.py)
+
+    def crashed(track: Track&, b: Body&) -> i64:
+        can Abort.Panic:
+            p: Point = head(b)
+            return HEAD_OVER_HEELS if p.y - ground(track, p.x) < 0.15
+            return FELL if b.qy - ground(track, b.qx) < 0.1
+            return LIVE
+
+    def start(track: Track) -> Run:
+        can Abort.Panic:
+            return Run{track: track, body: begin(&track), t: 0.0, result: LIVE, last: NEUTRAL}
+
+    def step(run: mutable Run&, dt: f64, port: i64):
+        can Abort.Panic:
+            return if run.result != LIVE
+            run.t <- run.t + dt
+            run.last <- port
+            advance(&run.track, &run.body, port, dt)
+            run.result <- crashed(&run.track, &run.body)
+            return if run.result != LIVE
+            if run.body.px >= run.track.finish:
+                run.result <- CLEAR
+            elif run.t > run.track.seconds:
+                run.result <- TIMEOUT

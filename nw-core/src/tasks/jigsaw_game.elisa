@@ -2,7 +2,7 @@
 # region on every call; the ABI run itself owns only fixed storage.
 module JigsawGame:
     const TASK_ID: i64 = 714977126
-    const MAX_TILES: i64 = 100
+    const MAX_TILES: i64 = JigsawPhotoAssets::MAX_VIDEO_TILES
     const MAX_PUZZLES: i64 = 64
     const PHASE_READY: i64 = Jigsaw::PHASE_READY
     const PHASE_SOLVING: i64 = Jigsaw::PHASE_SOLVING
@@ -11,6 +11,10 @@ module JigsawGame:
     const ACTION_START: i64 = 0
     const ACTION_PICK: i64 = 1
     const ACTION_TICK: i64 = 2
+    const ACTION_MOVE_CURSOR: i64 = 3
+    const ACTION_PICK_CURSOR: i64 = 4
+    const ACTION_FIT_PHOTO: i64 = 5
+    const ACTION_VIDEO_UNAVAILABLE: i64 = 6
     const INFO_PHASE: i64 = 0
     const INFO_SIDE: i64 = 1
     const INFO_TRIAL_SIDE: i64 = 2
@@ -26,14 +30,38 @@ module JigsawGame:
     const INFO_PREVIEW: i64 = 12
     const INFO_START_SIDE: i64 = 13
     const INFO_MARK_PLACED: i64 = 14
+    const INFO_TRIAL_ROWS: i64 = 15
+    const INFO_HOVERED: i64 = 16
+    const INFO_PHOTO_COUNT: i64 = 17
+    const INFO_CURSOR: i64 = 18
+    const INFO_VIDEO: i64 = 19
     const VALUE_ORDER: i64 = 0
     const VALUE_RESULT_SIDE: i64 = 1
     const VALUE_RESULT_EFFICIENCY_PPM: i64 = 2
     const VALUE_RESULT_TIME_MS: i64 = 3
+    const VALUE_RESULT_PIECES: i64 = 4
 
     struct JigsawRun:
+        video: mutable bool
         rng: mutable MT19937
+        before_deal: mutable MT19937
+        photo_rng: mutable MT19937
+        photo_item: mutable i64
+        photo_puzzle: mutable i64
+        photo_timed: mutable bool
+        photo_visible: mutable bool
+        photo_shown: mutable i64[MAX_PUZZLES]
+        photo_catalog_loaded: mutable bool
+        photo_files: mutable usize
+        photo_count: mutable i64
+        video_pixels: mutable usize
+        video_frames: mutable i64
+        video_index: mutable i64
+        video_error: mutable i64
         start_side: mutable i64
+        start_pieces: mutable i64
+        pieces: mutable i64
+        trial_rows: mutable i64
         total_puzzles: mutable i64
         adaptive: mutable bool
         preview: mutable bool
@@ -44,6 +72,12 @@ module JigsawGame:
         par: mutable i64
         swaps: mutable i64
         picked: mutable i64
+        hovered: mutable i64
+        cursor: mutable i64
+        cursor_shown: mutable bool
+        options_row: mutable i64
+        options_from_hub: mutable bool
+        options_draft: mutable i64[5]
         started_at_ms: mutable i64
         feedback_until_ms: mutable i64
         phase: mutable i64
@@ -52,6 +86,7 @@ module JigsawGame:
         order: mutable i64[MAX_TILES]
         seen: mutable i64[MAX_TILES]
         result_side: mutable i64[MAX_PUZZLES]
+        result_pieces: mutable i64[MAX_PUZZLES]
         result_efficiency: mutable f64[MAX_PUZZLES]
         result_took: mutable f64[MAX_PUZZLES]
 
@@ -64,7 +99,11 @@ module JigsawGame:
 
     def to_source(run: JigsawRun&, source: mutable Jigsaw::JigsawKernelRun&):
         can Abort.Panic:
+            source.video <- run.video
             source.start_side <- run.start_side
+            source.start_pieces <- run.start_pieces
+            source.pieces <- run.pieces
+            source.trial_rows <- run.trial_rows
             source.total_puzzles <- run.total_puzzles
             source.adaptive <- run.adaptive
             source.preview <- run.preview
@@ -79,17 +118,20 @@ module JigsawGame:
             source.phase <- run.phase
             source.verdict <- run.verdict
             source.result_count <- run.result_count
-            for at in 0..<MAX_TILES |at, run, source|:
+            for at in 0..<(run.trial_side * run.trial_rows) |at, run, source|:
                 Ints::put(&source.order, at, run.order[at.usize()])
                 Ints::put(&source.seen, at, run.seen[at.usize()])
             for at in 0..<MAX_PUZZLES |at, run, source|:
                 Ints::put(&source.result_side, at, run.result_side[at.usize()])
+                Ints::put(&source.result_pieces, at, run.result_pieces[at.usize()])
                 Floats::put(&source.result_efficiency, at, run.result_efficiency[at.usize()])
                 Floats::put(&source.result_took, at, run.result_took[at.usize()])
 
     def from_source(run: mutable JigsawRun&, source: Jigsaw::JigsawKernelRun&):
         can Abort.Panic:
             run.start_side <- source.start_side
+            run.pieces <- source.pieces
+            run.trial_rows <- source.trial_rows
             run.total_puzzles <- source.total_puzzles
             run.adaptive <- source.adaptive
             run.preview <- source.preview
@@ -104,63 +146,171 @@ module JigsawGame:
             run.phase <- source.phase
             run.verdict <- source.verdict
             run.result_count <- source.result_count
-            for at in 0..<MAX_TILES |at, run, source|:
+            for at in 0..<(run.trial_side * run.trial_rows) |at, run, source|:
                 run.order[at.usize()] <- Ints::at(source.order, at)
                 run.seen[at.usize()] <- Ints::at(source.seen, at)
             for at in 0..<MAX_PUZZLES |at, run, source|:
                 run.result_side[at.usize()] <- Ints::at(source.result_side, at)
+                run.result_pieces[at.usize()] <- Ints::at(source.result_pieces, at)
                 run.result_efficiency[at.usize()] <- Floats::at(source.result_efficiency, at)
                 run.result_took[at.usize()] <- Floats::at(source.result_took, at)
 
     def initialize(run: mutable JigsawRun&, start_side: i64, total_puzzles: i64,
-                   adaptive: bool, preview: bool, mark_placed: bool, seed: i64):
+                   adaptive: bool, preview: bool, mark_placed: bool, seed: i64, start_pieces: i64 = 0, video: bool = false):
         can Abort.Panic:
+            run.photo_rng <- mt19937_new()
+            mt_seed_int(&run.photo_rng, seed.u64())
+            run.photo_item <- -1
+            run.photo_puzzle <- 0
+            run.photo_catalog_loaded <- false
+            run.photo_files <- 0.usize()
+            run.photo_count <- 0
+            run.video_pixels <- 0.usize()
+            run.video_frames <- 0
+            run.video_index <- -1
+            run.video_error <- 0
             run.rng <- mt19937_new()
             mt_seed_int(&run.rng, seed.u64())
-            run.start_side <- Jigsaw::clamped(start_side)
+            run.before_deal <- run.rng
+            run.video <- video
+            run.start_pieces <- Jigsaw::bounded_pieces(start_pieces, video)
+            run.pieces <- run.start_pieces
+            run.start_side <- Jigsaw::piece_columns(start_pieces, video) if start_pieces > 0 else Jigsaw::clamped(start_side)
             run.total_puzzles <- total_puzzles
             run.adaptive <- adaptive
             run.preview <- preview
             run.mark_placed <- mark_placed
             run.side <- run.start_side
             run.trial_side <- run.start_side
+            run.trial_rows <- Jigsaw::piece_rows(run.start_pieces, run.trial_side, video) if start_pieces > 0 else run.trial_side
             run.puzzle <- 0
             run.par <- 0
             run.swaps <- 0
             run.picked <- -1
+            run.hovered <- -1
+            run.cursor <- 0
+            run.cursor_shown <- false
+            run.options_row <- -1
+            run.options_from_hub <- false
+            run.photo_timed <- false
+            run.photo_visible <- false
             run.started_at_ms <- 0
             run.feedback_until_ms <- 0
             run.phase <- PHASE_READY
             run.verdict <- -1
             run.result_count <- 0
-            for at in 0..<MAX_TILES |at, run|:
+            for at in 0..<(run.trial_side * run.trial_rows) |at, run|:
                 run.order[at.usize()] <- 0
                 run.seen[at.usize()] <- 0
             for at in 0..<MAX_PUZZLES |at, run|:
+                run.photo_shown[at.usize()] <- -1
                 run.result_side[at.usize()] <- 0
+                run.result_pieces[at.usize()] <- 0
                 run.result_efficiency[at.usize()] <- 0.0
                 run.result_took[at.usize()] <- 0.0
 
+    def action_capacity(run: JigsawRun&) -> i64:
+        tiles: mutable i64 = run.trial_side * run.trial_rows
+        if run.start_pieces > 0:
+            start: i64 = Jigsaw::piece_count(run.start_pieces, run.video)
+            next: i64 = Jigsaw::piece_count(run.pieces, run.video)
+            tiles <- start if start > tiles
+            tiles <- next if next > tiles
+        else:
+            tiles <- Jigsaw::LARGEST_SIDE * Jigsaw::LARGEST_SIDE
+        return tiles
+
+    def move_cursor(run: mutable JigsawRun&, direction: i64) -> i64:
+        return 2 if run.phase != PHASE_SOLVING
+        return -6 if direction < 0 or direction > 3
+        column: i64 = run.cursor % run.trial_side
+        row: i64 = run.cursor / run.trial_side
+        if direction == 0 and row > 0:
+            run.cursor <- run.cursor - run.trial_side
+        elif direction == 1 and row + 1 < run.trial_rows:
+            run.cursor <- run.cursor + run.trial_side
+        elif direction == 2 and column > 0:
+            run.cursor <- run.cursor - 1
+        elif direction == 3 and column + 1 < run.trial_side:
+            run.cursor <- run.cursor + 1
+        run.cursor_shown <- true
+        return 1
+
     def apply(run: mutable JigsawRun&, action: i64, value: i64, now_ms: i64) -> i64:
         can Memory.Allocate, Abort.Panic:
+            return move_cursor(run, value) if action == ACTION_MOVE_CURSOR
+            if action == ACTION_VIDEO_UNAVAILABLE:
+                return -6 if not run.video
+                return 2 if run.phase != PHASE_SOLVING or run.photo_timed or run.swaps != 0 or run.picked >= 0
+                run.phase <- PHASE_READY
+                run.puzzle <- run.puzzle - 1
+                run.rng <- run.before_deal
+                return 1
+            if action == ACTION_FIT_PHOTO:
+                return 2 if run.phase != PHASE_SOLVING or run.photo_timed or run.swaps != 0 or run.picked >= 0
+                # Zero means the host settled on colored tiles after a load failure.
+                return 2 if value != 0 and not fit_photo(run, value)
+                run.started_at_ms <- now_ms
+                run.photo_timed <- true
+                run.photo_visible <- value > 0
+                return 1
             region scratch(134217728):
                 in scratch:
-                    source: mutable Jigsaw::JigsawKernelRun = Jigsaw::new_run()
+                    source: mutable Jigsaw::JigsawKernelRun = Jigsaw::new_run(action_capacity(run))
                     to_source(run, &source)
                     now: f64 = now_ms.f64() / 1000.0
                     if action == ACTION_START:
                         return 2 if source.phase != PHASE_READY and source.phase != PHASE_DONE
+                        run.before_deal <- run.rng
                         Jigsaw::start_run(&source, now, &run.rng)
-                    elif action == ACTION_PICK:
+                        run.photo_item <- -1
+                        run.photo_puzzle <- 0
+                        for at in 0..<MAX_PUZZLES |at, run|:
+                            run.photo_shown[at.usize()] <- -1
+                    elif action == ACTION_PICK or action == ACTION_PICK_CURSOR:
                         return 2 if source.phase != PHASE_SOLVING
-                        Jigsaw::pick(&source, value, now)
+                        run.cursor_shown <- true if action == ACTION_PICK_CURSOR
+                        Jigsaw::pick(&source, run.cursor if action == ACTION_PICK_CURSOR else value, now)
                     elif action == ACTION_TICK:
+                        if source.phase == PHASE_SOLVED and now >= source.feedback_until and source.puzzle < source.total_puzzles:
+                            run.before_deal <- run.rng
                         Jigsaw::update(&source, now, &run.rng)
                     else:
                         return -6
+                    if source.phase != PHASE_SOLVING or source.puzzle != run.puzzle or action == ACTION_START:
+                        run.hovered <- -1
+                    if source.puzzle != run.puzzle or action == ACTION_START:
+                        run.cursor <- 0
+                        run.photo_timed <- false
+                        run.photo_visible <- false
                     from_source(run, &source)
                 destroy scratch
             return 1
+
+    def fit_photo(run: mutable JigsawRun&, size: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            return false if size <= 0
+            height: i64 = JigsawPhotoAssets::VIDEO_HEIGHT if run.video and size > JigsawPhotoAssets::VIDEO_HEIGHT else size
+            width: i64 = height * JigsawPhotoAssets::VIDEO_WIDTH / JigsawPhotoAssets::VIDEO_HEIGHT if run.video else height
+            columns: i64 = width if width < run.trial_side else run.trial_side
+            rows: i64 = height if height < run.trial_rows else run.trial_rows
+            return false if columns * rows < 2
+            return true if columns == run.trial_side and rows == run.trial_rows
+            return false if run.phase != PHASE_SOLVING or run.swaps != 0 or run.picked >= 0
+            region scratch(134217728):
+                in scratch:
+                    source: mutable Jigsaw::JigsawKernelRun = Jigsaw::new_run(run.trial_side * run.trial_rows)
+                    to_source(run, &source)
+                    source.trial_side <- columns
+                    source.trial_rows <- rows
+                    started: f64 = source.started_at
+                    run.rng <- run.before_deal
+                    Jigsaw::deal(&source, started, &run.rng)
+                    from_source(run, &source)
+                    run.hovered <- -1
+                    run.cursor <- 0
+                destroy scratch
+            return true
 
     def advance(run: mutable JigsawRun&, now_ms: i64) -> i64:
         return apply(run, ACTION_TICK, 0, now_ms)
@@ -181,28 +331,74 @@ module JigsawGame:
         if field == INFO_PREVIEW: return 1 if run.preview else 0
         if field == INFO_START_SIDE: return run.start_side
         if field == INFO_MARK_PLACED: return 1 if run.mark_placed else 0
+        if field == INFO_TRIAL_ROWS: return run.trial_rows
+        if field == INFO_HOVERED: return run.hovered
+        if field == INFO_PHOTO_COUNT: return run.photo_count
+        if field == INFO_VIDEO: return 1 if run.video else 0
+        if field == INFO_CURSOR: return run.cursor if run.cursor_shown and run.phase == PHASE_SOLVING else -1
         return -1
 
     def value(run: JigsawRun&, field: i64, at: i64) -> i64:
         return -1 if at < 0
-        if field == VALUE_ORDER: return run.order[at.usize()] if at < run.trial_side * run.trial_side else -1
+        if field == VALUE_ORDER: return run.order[at.usize()] if at < run.trial_side * run.trial_rows else -1
         if field == VALUE_RESULT_SIDE: return run.result_side[at.usize()] if at < run.result_count else -1
         if field == VALUE_RESULT_EFFICIENCY_PPM: return (run.result_efficiency[at.usize()] * 1000000.0).i64() if at < run.result_count else -1
         if field == VALUE_RESULT_TIME_MS: return (run.result_took[at.usize()] * 1000.0).i64() if at < run.result_count else -1
+        if field == VALUE_RESULT_PIECES: return run.result_pieces[at.usize()] if at < run.result_count else -1
         return -1
 
-    def render(run: JigsawRun&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
+    def render(run: JigsawRun&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&, photo: bool = false, photo_count: i64 = -1):
         can Memory.Allocate, Abort.Panic:
             region scratch(134217728):
                 in scratch:
-                    source: mutable Jigsaw::JigsawKernelRun = Jigsaw::new_run()
+                    source: mutable Jigsaw::JigsawKernelRun = Jigsaw::new_run(run.trial_side * run.trial_rows)
                     to_source(run, &source)
                     paint: mutable SceneJigsaw::JigsawPaint = SceneJigsaw::paint_of(black, width, height, width / 912.0, height / 684.0)
                     message: mutable dstr = []
                     if run.phase == PHASE_READY: dstr_append_cstr(&message, "Press Space to start")
-                    elif run.phase == PHASE_SOLVING: dstr_append_cstr(&message, "Swap two tiles to rebuild the picture")
-                    elif run.phase == PHASE_SOLVED: dstr_append_cstr(&message, "Solved")
-                    else: dstr_append_cstr(&message, "Session complete")
+                    elif run.phase == PHASE_SOLVING and photo_count == -1:
+                        dstr_append_cstr(&message, "Swap two tiles to rebuild the picture")
+                    elif run.phase == PHASE_DONE:
+                        tally: Jigsaw::JigsawScore = Jigsaw::score(&source)
+                        dstr_append_i64(&message, tally.puzzles)
+                        dstr_append_cstr(&message, " puzzles, ")
+                        dstr_append_i64(&message, tally.efficiency)
+                        dstr_append_cstr(&message, "% swap efficiency, ")
+                        dstr_append_fixed(&message, tally.mean_seconds, 0)
+                        dstr_append_cstr(&message, "s each, largest puzzle ")
+                        dstr_append_i64(&message, tally.most_pieces)
+                        dstr_append_cstr(&message, " pieces")
+                    verdict: mutable dstr = []
+                    if run.phase == PHASE_SOLVED:
+                        dstr_append_cstr(&verdict, "Solved in ")
+                        dstr_append_i64(&verdict, run.swaps)
+                        dstr_append_cstr(&verdict, " swaps — the minimum was ")
+                        dstr_append_i64(&verdict, run.par)
+                        dstr_append_cstr(&verdict, " — in ")
+                        dstr_append_fixed(&verdict, run.result_took[(run.result_count - 1).usize()], 0)
+                        dstr_append_cstr(&verdict, "s")
+                    note: mutable dstr = []
+                    if run.video:
+                        if run.video_error == 1:
+                            dstr_append_cstr(&note, "No video library yet — add UCF-101 clips")
+                        elif run.video_error == 2:
+                            dstr_append_cstr(&note, "Video Jigsaw needs the ffmpeg program")
+                        elif run.video_error == 3:
+                            dstr_append_cstr(&note, "None of the downloaded clips would decode")
+                        elif photo and photo_count > 0 and photo_count < run.total_puzzles:
+                            dstr_append_cstr(&note, "Only ")
+                            dstr_append_i64(&note, photo_count)
+                            dstr_append_cstr(&note, " clips downloaded — clips will repeat")
+                    elif photo_count == -2:
+                        dstr_append_cstr(&note, "Photograph loading requires SDL 3.4. Using colored tiles.")
+                    elif photo_count == 0:
+                        dstr_append_cstr(&note, "No photographs in the DIV2K library. Using colored tiles.")
+                    elif photo_count > 0 and not photo:
+                        dstr_append_cstr(&note, "Could not load the photograph. Using colored tiles.")
+                    elif photo and photo_count > 0 and photo_count < run.total_puzzles:
+                        dstr_append_cstr(&note, "Only ")
+                        dstr_append_i64(&note, photo_count)
+                        dstr_append_cstr(&note, " photographs downloaded — pictures will repeat")
                     empty: mutable darray[i64] = []
-                    SceneJigsaw::render(list, &paint, source.phase, source.trial_side, &source.order, 1, source.preview, false, 0, 0, empty, 0, source.picked, -1, run.mark_placed, source.puzzle, source.total_puzzles, source.swaps, source.par, sview("", 0, -1), bytes_view(message), source.verdict, sview("", 0, -1))
+                    SceneJigsaw::render(list, &paint, source.phase, source.trial_side, &source.order, 1, source.preview, false, 0, 0, empty, 0, source.picked, run.hovered, run.mark_placed, source.puzzle, source.total_puzzles, source.swaps, source.par, bytes_view(note), bytes_view(message), source.verdict if run.phase == PHASE_SOLVED else -1, bytes_view(verdict), source.trial_rows, photo, info(run, INFO_CURSOR), run.video)
                 destroy scratch

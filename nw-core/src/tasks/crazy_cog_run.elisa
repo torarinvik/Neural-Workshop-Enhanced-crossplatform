@@ -1,0 +1,178 @@
+include "./crazy_cog.elisa"
+
+extend CrazyCog:
+    const LIVE: i64 = 0
+    const BUCKET_UP: i64 = 1
+    const FAN_WRONG: i64 = 2
+    const TIMEOUT: i64 = 3
+
+    const TICK: i64 = 0
+    const CLUNK: i64 = 1
+    const HUM: i64 = 2
+    const GRIND: i64 = 3
+    const DONE: i64 = 4
+    const MISS: i64 = 5
+
+    struct Wheel:
+        cog: Cog
+        angle: mutable f64
+        ratio: mutable f64
+        driven: mutable bool
+
+    struct Cue:
+        time: f64
+        duration: f64
+        frequency: f64
+        voice: i64
+        gain: f64
+        pan: f64
+
+    struct Run:
+        machine: Machine
+        wheels: mutable darray[Wheel]
+        belts: mutable darray[Link]
+        cues: mutable darray[Cue]
+        tray: mutable darray[i64]
+        previous: mutable darray[Wheel]
+        hand: mutable HandView::Pointer
+        stock: mutable i64
+        carry: mutable i64
+        layer: mutable i64
+        chain_from: mutable Cog
+        powered: mutable bool
+        jammed: mutable bool
+        height: mutable f64
+        out: mutable f64
+        hum_at: mutable f64
+        tick_at: mutable i64
+        time: mutable f64
+        result: mutable i64
+        record: bool
+
+    def begin(machine: Machine, record: bool = true) -> Run:
+        can Memory.Allocate, Abort.Panic:
+            tray: mutable darray[i64] = []
+            for radius in machine.tray:
+                tray.push(radius)
+            return Run{machine: machine, wheels: [], belts: [], cues: [], previous: [], tray: tray,
+                hand: HandView::initialize(), stock: machine.chains, carry: 0, layer: 0, chain_from: zeroed,
+                powered: false, jammed: false, height: 0.0, out: 0.0, hum_at: 0.0, tick_at: 0, time: 0.0, result: LIVE, record: record}
+
+    def note(run: mutable Run&, duration: f64, frequency: f64, voice: i64, gain: f64, pan: f64 = 0.0):
+        can Memory.Allocate, Abort.Panic:
+            return if not run.record
+            run.cues.push(Cue{time: run.time, duration: duration, frequency: frequency, voice: voice,
+                gain: gain, pan: HandView::clamp(pan, -1.0, 1.0)})
+
+    def belt_between(a: Cog, b: Cog, belts: darray[Link]&) -> bool:
+        for link in belts:
+            if (cog_equals(a, link.first) and cog_equals(b, link.second)) or (cog_equals(b, link.first) and cog_equals(a, link.second)):
+                return true
+        return false
+
+    def rewire(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            run.powered <- false
+            run.jammed <- false
+            todo: mutable darray[i64] = []
+            count: i64 = run.wheels.count.i64()
+            for i in 0..<count |run, todo|:
+                wheel: mutable Wheel& = &run.wheels[i.usize()]
+                driven: bool = wheel.cog.z == 0 and distance(wheel.cog, run.machine.motor) < 1.0
+                wheel.driven <- driven
+                wheel.ratio <- -1.0 if driven else 0.0
+                if driven:
+                    todo.push(i)
+                    run.powered <- true
+            while todo.count > 0.usize() |run, todo, count|:
+                index: i64 = todo[todo.count - 1.usize()]
+                _ = todo.pop()
+                first: Wheel = run.wheels[index.usize()]
+                for j in 0..<count |run, todo, index, first|:
+                    continue if j == index
+                    second: Wheel = run.wheels[j.usize()]
+                    w: mutable f64 = first.ratio
+                    if meshed(first.cog, second.cog):
+                        w <- -w * first.cog.r / second.cog.r
+                    elif not shared_axle(first.cog, second.cog):
+                        continue if not belt_between(first.cog, second.cog, &run.belts)
+                        w <- w * first.cog.r / second.cog.r
+                    if second.driven:
+                        run.jammed <- true if HandView::absolute(second.ratio - w) > 0.000001
+                    else:
+                        run.wheels[j.usize()] <- Wheel{cog: second.cog, angle: second.angle, driven: true, ratio: w}
+                        todo.push(j)
+            if run.jammed:
+                note(run, 0.4, 60.0, GRIND, 0.5)
+
+    def at_peg(run: Run&, peg: Cog) -> i64:
+        can Abort.Panic:
+            return -1 if peg.r == 0.0
+            for i in 0..<run.wheels.count.i64() |run, peg|:
+                c: Cog = run.wheels[i.usize()].cog
+                return i if c.z == peg.z and distance(c, peg) < 1.0
+            return -1
+
+    def winch_ratio(run: Run&) -> f64:
+        can Abort.Panic:
+            return 0.0 if run.jammed
+            index: i64 = at_peg(run, run.machine.winch)
+            return run.wheels[index.usize()].ratio if index >= 0 else 0.0
+
+    def motor_speed(run: Run&) -> f64:
+        can Abort.Panic:
+            return 0.0 if not run.powered or run.jammed
+            ratio: f64 = winch_ratio(run)
+            return FREE if ratio <= 0.0
+            return 0.0 if run.height >= run.machine.lift
+            return run.out / ratio
+
+    def fan_speed(run: Run&) -> f64:
+        can Abort.Panic:
+            index: i64 = at_peg(run, run.machine.fan)
+            return run.wheels[index.usize()].ratio * motor_speed(run) if index >= 0 else 0.0
+
+    def fan_ok(run: Run&) -> bool:
+        can Abort.Panic:
+            return true if run.machine.fan.r == 0.0
+            speed: f64 = fan_speed(run) * run.machine.fan_way.f64()
+            return false if speed <= 0.05
+            return run.machine.level.fan < 2 or (run.machine.fan_low <= speed and speed <= run.machine.fan_high)
+
+    def tick_train(run: mutable Run&, dt: f64):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != LIVE
+            run.time <- run.time + dt
+            g: f64 = winch_ratio(run)
+            want: f64 = lift_speed(1.0 / g, run.machine.level.load) if g > 0.0 else FREE * g
+            run.out <- run.out + (want - run.out) * fmin(1.0, dt / SETTLE)
+            was_ok: bool = fan_ok(run)
+            run.height <- HandView::clamp(run.height + run.out * DRUM * dt, 0.0, run.machine.lift)
+            speed: f64 = motor_speed(run)
+            for i in 0..<run.wheels.count.i64() |run, speed, dt|:
+                wheel: mutable Wheel& = &run.wheels[i.usize()]
+                wheel.angle <- wheel.angle + wheel.ratio * speed * dt
+            if run.time >= run.hum_at and run.powered:
+                run.hum_at <- run.time + 0.5
+                if run.jammed:
+                    note(run, 0.3, 55.0, GRIND, 0.45, -0.6)
+                elif g > 0.0 and want <= 0.0:
+                    note(run, 0.45, 70.0, HUM, 0.4, -0.6)
+                else:
+                    note(run, 0.45, 80.0 + 30.0 * speed, HUM, 0.3, -0.6)
+                fan: f64 = HandView::absolute(fan_speed(run))
+                if run.machine.fan.r > 0.0 and fan > 0.05:
+                    note(run, 0.45, 200.0 + 40.0 * fan, MISS, 0.2, (run.machine.fan.x - 500.0) / 500.0)
+            tick: i64 = (run.height / 20.0).i64()
+            if run.out > 0.05 and tick != run.tick_at:
+                run.tick_at <- tick
+                note(run, 0.04, 1200.0, TICK, 0.3, 0.6)
+            if run.height >= run.machine.lift:
+                if was_ok:
+                    note(run, 0.6, 880.0, DONE, 0.5)
+                    run.result <- BUCKET_UP
+                else:
+                    note(run, 0.6, 110.0, CLUNK, 0.5)
+                    run.result <- FAN_WRONG
+            elif run.time >= run.machine.seconds:
+                run.result <- TIMEOUT

@@ -1,3 +1,6 @@
+include "./jigsaw_photo_assets.elisa"
+include "./jigsaw_layout.elisa"
+
 # The Jigsaw Puzzle screen: game state in, display list out.
 #
 # Port of neural_workshop/ui/jigsaw.py -- the drawing, not the thinking.
@@ -29,9 +32,6 @@ module SceneJigsaw:
     const PHASE_SOLVING: i64 = 1
     const PHASE_SOLVED: i64 = 2
     const PHASE_DONE: i64 = 3
-
-    # The gap between two tiles, in pixels and not scaled with the board.
-    const SEAM: f64 = 2.0
 
     def color_accent() -> u32:
         return Display::rgba(64, 96, 255, 255)
@@ -79,16 +79,19 @@ module SceneJigsaw:
         left: mutable f64
         bottom: mutable f64
         size: mutable f64
+        height: mutable f64
 
     # With the preview on, the board leaves a quarter of the width to its
     # right for the finished picture -- the lid of the box.
-    def board_of(out: mutable JigsawBoard&, canvas: JigsawCanvas&, preview: bool):
+    def board_of(out: mutable JigsawBoard&, canvas: JigsawCanvas&, preview: bool, aspect: f64):
         can Abort.Panic:
             room: f64 = canvas.width * (0.72 if preview else 1.0)
-            size: f64 = room if room < canvas.height else canvas.height
+            size: f64 = room if room < canvas.height * aspect else canvas.height * aspect
+            height: f64 = size / aspect
             out.left <- canvas.left + (room - size) / 2.0
-            out.bottom <- canvas.bottom + (canvas.height - size) / 2.0
+            out.bottom <- canvas.bottom + (canvas.height - height) / 2.0
             out.size <- size
+            out.height <- height
 
     def render(list: mutable Display::DisplayList&, paint: JigsawPaint&, phase: i64,
                side: i64, order: darray[i64]&, tile_pixels: i64,
@@ -97,12 +100,14 @@ module SceneJigsaw:
                preview_asset: i64, picked: i64, hovered: i64,
                mark_placed: bool, puzzle: i64, total_puzzles: i64,
                swaps: i64, par: i64, small_library: sview, message: sview,
-               verdict: i64, verdict_text: sview):
+               verdict: i64, verdict_text: sview, rows: i64 = 0, cropped_photo: bool = false, cursor: i64 = -1, video: bool = false):
         can Memory.Allocate, Abort.Panic:
+            height_count: i64 = rows if rows > 0 else side
             middle: f64 = Geometry::width_center(paint.width).f64()
             playing: bool = (phase == PHASE_SOLVING or phase == PHASE_SOLVED) and order.count.i64() > 0
 
-            put_text(list, paint, sview("Jigsaw Puzzle", 0, -1), middle,
+            title: sview = "Video Jigsaw" if video else "Jigsaw Puzzle"
+            put_text(list, paint, title, middle,
                      Geometry::from_top_edge(paint.height, 36.0).f64(),
                      Geometry::calc_fontsize(paint.height, 22.0), paint.ink,
                      Display::ANCHOR_CENTER_CENTER, true)
@@ -121,17 +126,17 @@ module SceneJigsaw:
                 dstr_append_cstr(&status, "   tiles ")
                 dstr_append_i64(&status, side)
                 dstr_append_cstr(&status, "x")
-                dstr_append_i64(&status, side)
-                if sview_len(small_library).i64() > 0:
-                    dstr_append_cstr(&status, "     ")
-                    dstr_append_sview(&status, small_library)
+                dstr_append_i64(&status, height_count)
+            if sview_len(small_library).i64() > 0:
+                dstr_append_cstr(&status, "     ")
+                dstr_append_sview(&status, small_library)
             put_text(list, paint, bytes_view(status), middle,
                      Geometry::from_top_edge(paint.height, 70.0).f64(),
                      Geometry::calc_fontsize(paint.height, 14.0), paint.ink,
                      Display::ANCHOR_CENTER_CENTER, false)
 
             put_text(list, paint,
-                     sview("Esc: task menu     Space: start     click two tiles to swap     C: options", 0, -1),
+                     sview("Esc: task menu     Space: start     Arrows: move     Enter or click: pick     C: options", 0, -1),
                      middle, Geometry::from_bottom_edge(paint.height, 26.0).f64(),
                      Geometry::calc_fontsize(paint.height, 12.0), paint.ink,
                      Display::ANCHOR_CENTER_CENTER, false)
@@ -145,18 +150,27 @@ module SceneJigsaw:
 
             canvas: mutable JigsawCanvas = JigsawCanvas{left: 0.0, bottom: 0.0, width: 0.0, height: 0.0}
             canvas_of(&canvas, paint.width, paint.height)
-            board: mutable JigsawBoard = JigsawBoard{left: 0.0, bottom: 0.0, size: 0.0}
-            board_of(&board, &canvas, preview)
-            span: f64 = (board.size - SEAM * (side - 1).f64()) / side.f64()
-            places: i64 = side * side
+            aspect: f64 = 4.0 / 3.0 if video else 1.0
+            board: mutable JigsawBoard = JigsawBoard{left: 0.0, bottom: 0.0, size: 0.0, height: 0.0}
+            board_of(&board, &canvas, preview, aspect)
+            spans: JigsawLayout::TileSpans = JigsawLayout::spans_for(board.size, board.height, side, height_count)
+            span: f64 = spans.width
+            tile_height: f64 = spans.height
+            seam: f64 = spans.seam
+            places: i64 = side * height_count
 
             # The tiles first, then the preview, and only then the marks --
             # which is what the two groups make pyglet do.
-            for position in 0..<places |list, paint, board, order, tile_asset, side, span, tile_pixels, places|:
-                if tile_asset.count.i64() > 0:
+            for position in 0..<places |list, paint, board, order, tile_asset, side, span, tile_height, seam, tile_pixels, places, cropped_photo|:
+                if cropped_photo:
+                    Display::draw_sprite_fitted(list, JigsawPhotoAssets::tile_ref(step_at(order, position)).u32(),
+                        (tile_x(&board, side, span, seam, position) + span / 2.0) / paint.sx,
+                        (tile_y(&board, side, tile_height, seam, position) + tile_height / 2.0) / paint.sy,
+                        span / paint.sx, tile_height / paint.sy, 0.0, Display::rgba(255, 255, 255, 255))
+                elif tile_asset.count.i64() > 0:
                     Display::draw_sprite(list, tile_at(tile_asset, step_at(order, position)).u32(),
-                                         tile_x(&board, side, span, position) / paint.sx,
-                                         tile_y(&board, side, span, position) / paint.sy,
+                                         tile_x(&board, side, span, seam, position) / paint.sx,
+                                         tile_y(&board, side, tile_height, seam, position) / paint.sy,
                                          span / tile_pixels.f64() / paint.sx, 0.0,
                                          tile_pixels, tile_pixels,
                                          Display::rgba(255, 255, 255, 255))
@@ -166,12 +180,21 @@ module SceneJigsaw:
                     green: i64 = 64 + ((tile * 113) % 160)
                     blue: i64 = 64 + ((tile * 157) % 160)
                     Display::draw_rect(list,
-                        tile_x(&board, side, span, position) / paint.sx,
-                        tile_y(&board, side, span, position) / paint.sy,
-                        span / paint.sx, span / paint.sy,
+                        tile_x(&board, side, span, seam, position) / paint.sx,
+                        tile_y(&board, side, tile_height, seam, position) / paint.sy,
+                        span / paint.sx, tile_height / paint.sy,
                         Display::rgba(red, green, blue, 255))
 
-            if preview and has_image:
+            if preview and cropped_photo:
+                maximum_width: f64 = canvas.width * 0.24
+                maximum_height_width: f64 = canvas.height * 0.5 * aspect
+                size: f64 = maximum_width if maximum_width < maximum_height_width else maximum_height_width
+                preview_height: f64 = size / aspect
+                Display::draw_sprite_fitted(list, JigsawPhotoAssets::PREVIEW.u32(),
+                    (canvas.left + canvas.width - size / 2.0) / paint.sx,
+                    (canvas.bottom + canvas.height - preview_height / 2.0) / paint.sy,
+                    size / paint.sx, preview_height / paint.sy, 0.0, Display::rgba(255, 255, 255, 255))
+            elif preview and has_image:
                 # `min(image.width, image.height)` -- the largest square the
                 # picture holds, taken from its middle.
                 square: i64 = image_width if image_width < image_height else image_height
@@ -183,7 +206,7 @@ module SceneJigsaw:
                                      square, square,
                                      Display::rgba(255, 255, 255, 255))
 
-            for position in 0..<places |list, paint, board, order, side, span, picked, hovered, mark_placed, phase, places|:
+            for position in 0..<places |list, paint, board, order, side, span, tile_height, seam, picked, hovered, cursor, mark_placed, phase, places|:
                 shade: mutable u32 = 0.u32()
                 thickness: mutable f64 = 2.0
                 drawn: mutable bool = false
@@ -194,6 +217,10 @@ module SceneJigsaw:
                 elif phase == PHASE_SOLVED:
                     shade <- color_right()
                     drawn <- true
+                elif position == cursor:
+                    shade <- Display::rgba(240, 150, 30, 255)
+                    thickness <- 3.0
+                    drawn <- true
                 elif position == hovered:
                     shade <- color_accent()
                     drawn <- true
@@ -201,9 +228,9 @@ module SceneJigsaw:
                     shade <- color_right()
                     drawn <- true
                 if drawn:
-                    Display::draw_box(list, tile_x(&board, side, span, position) / paint.sx,
-                                      tile_y(&board, side, span, position) / paint.sy,
-                                      span / paint.sx, span / paint.sy, shade,
+                    Display::draw_box(list, tile_x(&board, side, span, seam, position) / paint.sx,
+                                      tile_y(&board, side, tile_height, seam, position) / paint.sy,
+                                      span / paint.sx, tile_height / paint.sy, shade,
                                       thickness / paint.sx)
 
     def preview_size(canvas: JigsawCanvas&) -> f64:
@@ -219,12 +246,12 @@ module SceneJigsaw:
         can Abort.Panic:
             return get values[index.usize()] else 0
 
-    def tile_x(board: JigsawBoard&, side: i64, span: f64, position: i64) -> f64:
+    def tile_x(board: JigsawBoard&, side: i64, span: f64, seam: f64, position: i64) -> f64:
         column: i64 = position % side
-        return board.left + column.f64() * (span + SEAM)
+        return board.left + column.f64() * (span + seam)
 
     # `top - span`, where `top` counts DOWN from the board's top edge.
-    def tile_y(board: JigsawBoard&, side: i64, span: f64, position: i64) -> f64:
+    def tile_y(board: JigsawBoard&, side: i64, span: f64, seam: f64, position: i64) -> f64:
         row: i64 = position / side
-        top: f64 = board.bottom + board.size - row.f64() * (span + SEAM)
+        top: f64 = board.bottom + board.height - row.f64() * (span + seam)
         return top - span

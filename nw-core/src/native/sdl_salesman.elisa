@@ -1,0 +1,192 @@
+include "../tasks/salesman.elisa"
+include "../scene_salesman.elisa"
+include "../tasks/salesman_game.elisa"
+
+def sdl_salesman_option_allowed(row: i64, value: i64) -> bool:
+    return SalesmanGame::allowed_start_cities(value) if row == 0
+    return SalesmanGame::allowed_rounds(value) if row == 1
+    return SalesmanGame::allowed_flag(value)
+
+def sdl_read_salesman_options(output: mutable i64&):
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        path: mutable u8[4096] = zeroed
+        data: mutable u8[128] = zeroed
+        trusted Unsafe.PointerCast:
+            target: mutable u8& = (&path[0]).uintptr().cast[mutable u8&]
+            return if not sdl_task_profile_sidecar(target, ".salesman-options")
+            if SDL_IOFromFile(target.cast[cstr], "rb") is stream:
+                raw: heap u8& = (&data[0]).uintptr().cast[heap u8&]
+                length: usize = SDL_ReadIO(stream, (&data[0]).cast[mutable void&], 128.usize())
+                status: i32 = SDL_GetIOStatus(stream)
+                closed: bool = SDL_CloseIO(stream)
+                return if not closed or status != 2.i32() or length == 0.usize() or length >= 128.usize()
+                values: mutable i64[4] = zeroed
+                at: mutable i64 = 0
+                for row in 0..<4 |row, values, at, raw, length|:
+                    value: i64 = SyllogismOptions::saved_integer(raw, length.i64(), &at)
+                    valid: bool = sdl_salesman_option_allowed(row, value)
+                    return if not valid
+                    values[row.usize()] <- value
+                while at < length.i64() and SyllogismOptions::whitespace(raw[at.usize()].i64()) |at, length, raw|:
+                    at <- at + 1
+                return if at != length.i64()
+                for row in 0..<4 |row, output, values|:
+                    output[row.usize()] <- values[row.usize()]
+
+def sdl_salesman_option_change(row: i64, current: i64, direction: i64) -> i64:
+    return 1 - current if row >= 2
+    low: i64 = Salesman::FEWEST_CITIES if row == 0 else 1
+    high: i64 = Salesman::MOST_CITIES if row == 0 else 20
+    count: i64 = high - low + 1
+    next: mutable i64 = current
+    while true |next, count, low, row, direction|:
+        next <- (next - low + direction + count) % count + low
+        return next if sdl_salesman_option_allowed(row, next)
+    return current
+
+def sdl_salesman_options_key(handle: i64, key: i64, from_hub: bool = false) -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return 0 if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: mutable heap SalesmanGame::Run& = handle.uintptr().cast[mutable heap SalesmanGame::Run&]
+            draft: mutable i64& = (&run.options_draft[0]).uintptr().cast[mutable i64&]
+            if run.options_row < 0:
+                return 0 if key != 99 or (run.phase != SalesmanGame::PHASE_READY and run.phase != SalesmanGame::PHASE_DONE)
+                draft[0] <- run.start_cities
+                draft[1] <- run.total_rounds
+                draft[2] <- 1 if run.adaptive else 0
+                draft[3] <- 1 if run.show_best else 0
+                run.options_from_hub <- from_hub
+                run.options_row <- 0
+                return 1
+            if SDLTaskKeys::enter(key) or key == 27:
+                close: i64 = 2 if run.options_from_hub else 1
+                if SDLTaskKeys::enter(key):
+                    data: mutable u8[128] = zeroed
+                    length: i32 = SDL_snprintf(&data[0], 128.usize(), "%lld %lld %lld %lld\n", draft[0], draft[1], draft[2], draft[3])
+                    if length <= 0.i32() or length >= 128.i32() or not sdl_save_profile_sidecar(".salesman-options", &data[0], length.usize()):
+                        SDL_Log("Could not save Traveling Salesman options")
+                        return 1
+                    SalesmanGame::configure(run, draft[0], draft[1], draft[2] != 0, draft[3] != 0)
+                run.options_row <- -1
+                return close
+            run.options_row <- SDLTaskKeys::option_row(key, run.options_row, 4)
+            if key == SDLTaskKeys::LEFT or key == SDLTaskKeys::RIGHT or key == 32:
+                row: i64 = run.options_row
+                draft[row.usize()] <- sdl_salesman_option_change(row, draft[row.usize()], -1 if key == SDLTaskKeys::LEFT else 1)
+            return 1
+
+def sdl_salesman_options_click(handle: i64, x: f32, y: f32, width: i32, height: i32) -> bool:
+    can Abort.Panic, Unsafe.PointerCast:
+        return false if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: mutable heap SalesmanGame::Run& = handle.uintptr().cast[mutable heap SalesmanGame::Run&]
+            return false if run.options_row < 0
+            row: i64 = sdl_option_row(x, y, width, height, 4)
+            if row >= 0:
+                if row == run.options_row:
+                    run.options_draft[row.usize()] <- sdl_salesman_option_change(row, run.options_draft[row.usize()], 1)
+                run.options_row <- row
+            return true
+
+def sdl_salesman_options_note(list: mutable Display::DisplayList&, ink: u32, cities: i64, adaptive: bool):
+    can Memory.Allocate, Abort.Panic:
+        note: mutable dstr = []
+        dstr_append_i64(&note, cities)
+        dstr_append_cstr(&note, " cities. Your score compares your route with the exact shortest route.")
+        Display::draw_text(list, bytes_view(note), 456.0, 282.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        if cities >= 16:
+            Display::draw_text(list, "Calculating the shortest route may take a moment at the start of each round.",
+                456.0, 252.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        if adaptive:
+            Display::draw_text(list, "Come within a few percent of the shortest route to add a city next round.",
+                456.0, 222.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+
+def sdl_salesman_profile_create(seed: i64) -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        selected: mutable i64[4] = [7, 5, 1, 1]
+        size: mutable i64 = 0
+        if sdl_media_config(&size) is raw:
+            trusted Unsafe.PointerCast:
+                data: heap u8& = raw.cast[heap u8&]
+                start: i64 = sdl_config_option(data, size, "TSP_CITIES", 0, 7)
+                count: i64 = sdl_config_option(data, size, "TSP_ROUNDS", 0, 5)
+                selected[0] <- start if SalesmanGame::allowed_start_cities(start)
+                selected[1] <- count if SalesmanGame::allowed_rounds(count)
+                selected[2] <- sdl_config_option(data, size, "TSP_ADAPTIVE", 1, 1)
+                selected[3] <- sdl_config_option(data, size, "TSP_SHOW_BEST", 1, 1)
+            SDL_free(raw)
+        sdl_read_salesman_options(&selected[0])
+        if malloc(size_of(SalesmanGame::Run).usize()) is memory:
+            trusted Unsafe.PointerCast:
+                run: mutable heap SalesmanGame::Run& = memory.cast[mutable heap SalesmanGame::Run&]
+                SalesmanGame::initialize(run, selected[0], selected[1], selected[2] != 0, selected[3] != 0, seed)
+                return memory.uintptr().i64()
+        return 0
+
+def sdl_salesman_destroy(handle: i64):
+    can Memory.Release, Unsafe.PointerCast:
+        if handle > 0:
+            trusted Unsafe.PointerCast:
+                free(handle.uintptr().cast[heap void&])
+
+def sdl_salesman_info(handle: i64, field: i64) -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        return -1 if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: heap SalesmanGame::Run& = handle.uintptr().cast[heap SalesmanGame::Run&]
+            return SalesmanGame::info(run, field)
+
+def sdl_salesman_key(handle: i64, key: i64, now: i64) -> i64:
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        return 2 if handle <= 0 or key != 32
+        trusted Unsafe.PointerCast:
+            run: mutable heap SalesmanGame::Run& = handle.uintptr().cast[mutable heap SalesmanGame::Run&]
+            return SalesmanGame::apply(run, SalesmanGame::ACTION_START, 0, now)
+
+def sdl_salesman_pointer(handle: i64, x: f32, y: f32, width: i32, height: i32, now: i64):
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        return if handle <= 0 or width <= 0.i32() or height <= 0.i32()
+        view: mutable f32[4] = zeroed
+        SDLGeometry::setup(&view[0], width, height)
+        px: f64 = ((x - view[1]) / view[0]).f64() * width.f64() / Display::REFERENCE_WIDTH
+        py: f64 = ((view[3] - view[2] - y) / view[0]).f64() * height.f64() / Display::REFERENCE_HEIGHT
+        trusted Unsafe.PointerCast:
+            run: mutable heap SalesmanGame::Run& = handle.uintptr().cast[mutable heap SalesmanGame::Run&]
+            city: i64 = SalesmanGame::pointer_city_at(run, px, py, width.f64(), height.f64())
+            if city >= 0:
+                _ = SalesmanGame::apply(run, SalesmanGame::ACTION_PICK, city, now)
+
+def sdl_salesman_advance(handle: i64, now: i64):
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        return if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: mutable heap SalesmanGame::Run& = handle.uintptr().cast[mutable heap SalesmanGame::Run&]
+            _ = SalesmanGame::advance(run, now)
+
+def sdl_salesman_frame_write(dest: i64, capacity: i64, handle: i64, black: i64, width: i64, height: i64) -> i64:
+    can Memory.Allocate, Abort.Panic, Unsafe.PointerCast:
+        return 0 if dest <= 0 or capacity <= 0 or handle <= 0 or width <= 0 or height <= 0
+        trusted Unsafe.PointerCast:
+            run: heap SalesmanGame::Run& = handle.uintptr().cast[heap SalesmanGame::Run&]
+            list: mutable Display::DisplayList = Display::DisplayList()
+            if run.options_row >= 0:
+                sdl_grid_options_frame(&list, black != 0, 40, run.options_row, &run.options_draft[0])
+            else:
+                SalesmanGame::render(run, black != 0, width.f64(), height.f64(), &list)
+            encoded: darray[u8] = Display::encode_binary(&list)
+            length: i64 = encoded.count.i64()
+            return 0 if length <= 0 or length > capacity
+            memcpy(dest.uintptr().cast[mutable void&], (&encoded[0]).cast[void&], length.usize())
+            return length
+
+export fn nw_salesman_info(handle: i64, field: i64) -> i64 = sdl_salesman_info
+
+def sdl_salesman_city_coordinate(handle: i64, axis: i64, city: i64) -> i64:
+    can Abort.Panic, Unsafe.PointerCast:
+        return -1 if handle <= 0 or (axis != SalesmanGame::VALUE_X and axis != SalesmanGame::VALUE_Y)
+        trusted Unsafe.PointerCast:
+            run: heap SalesmanGame::Run& = handle.uintptr().cast[heap SalesmanGame::Run&]
+            return SalesmanGame::value(run, axis, city)
+
+export fn nw_salesman_city_coordinate(handle: i64, axis: i64, city: i64) -> i64 = sdl_salesman_city_coordinate

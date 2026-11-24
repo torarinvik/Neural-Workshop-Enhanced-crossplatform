@@ -1,0 +1,306 @@
+include "./missing_word_offers.elisa"
+include "../hand_view.elisa"
+
+extend MissingWord:
+    const LIVE: i64 = 0
+    const MENDED: i64 = 1
+    const WRONG: i64 = 2
+    const TIMEOUT: i64 = 3
+    const DONE: i64 = HandView::KEYS
+    const RESET: i64 = DONE + 1
+    const PORTS: i64 = RESET + 1
+    const NO_CHOICE: i64 = 0
+    const WORD: i64 = 1
+    const GAP_CHOICE: i64 = 2
+    const TILE_H: f64 = 34.0
+    const GAP: f64 = 8.0
+    const TEXT_LEFT: f64 = 96.0
+    const TEXT_WIDTH: f64 = 884.0
+    const CARET_DY: f64 = 30.0
+    const CARET_RADIUS: f64 = 12.0
+    const OPT_Y: f64 = 112.0
+    const OPT_WIDTH: f64 = 150.0
+    const BUTTON_Y: f64 = 44.0
+    const DONE_X: f64 = 900.0
+    const RESET_X: f64 = 760.0
+
+    struct Choice:
+        kind: i64
+        row: i64
+        index: i64
+
+    struct Cue:
+        t: f64
+        duration: f64
+        frequency: f64
+        voice: i64
+        gain: f64
+
+    struct Run:
+        machine: Machine
+        rows: mutable darray[Token][6]
+        hand: mutable HandView::Pointer
+        choice: mutable Choice
+        options: mutable Offer
+        made: mutable i64
+        t: mutable f64
+        result: mutable i64
+        cues: mutable darray[Cue]
+        record: bool
+
+    def row_y(row: i64, count: i64) -> f64:
+        step: f64 = fmin(78.0, 400.0 / (count - 1).f64()) if count > 1 else 0.0
+        return 540.0 - row.f64() * step
+
+    def tile_width(row: darray[Token]&, index: i64) -> f64:
+        can Abort.Panic:
+            extra: i64 = 1 if index + 1 == row.count.i64() else 0
+            return (row[index.usize()].text.length + extra).f64() * 12.0 + 14.0
+
+    def row_scale(row: darray[Token]&) -> f64:
+        can Abort.Panic:
+            width: mutable f64 = GAP * (row.count.i64() - 1).f64()
+            for i in 0..<row.count.i64() |row, width|:
+                width <- width + tile_width(row, i)
+            return fmin(1.0, TEXT_WIDTH / width) if width > 0.0 else 1.0
+
+    def left_of(row: darray[Token]&, i: i64, scale: f64) -> f64:
+        can Abort.Panic:
+            x: mutable f64 = TEXT_LEFT
+            for k in 0..<i |row, x, scale|:
+                x <- x + (tile_width(row, k) * scale + GAP * scale)
+            return x
+
+    def option_x(index: i64, count: i64) -> f64:
+        return 500.0 + (index.f64() - (count - 1).f64() / 2.0) * (OPT_WIDTH + 14.0)
+
+    def copy_row(original: Line&) -> darray[Token]:
+        can Memory.Allocate, Abort.Panic:
+            row: mutable darray[Token] = []
+            _ = row.reserve((original.count + 16).usize())
+            for j in 0..<original.count |row, original|:
+                token: Token = original.words[j.usize()]
+                row.push(token)
+            return row
+
+    def restore_rows(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            run.choice <- zeroed
+            run.options <- zeroed
+            for i in 0..<run.machine.level.sentences |run|:
+                row: mutable darray[Token] = run.rows[i.usize()]
+                original: Line = run.machine.rows[i.usize()]
+                if row.capacity == 0.usize():
+                    row <- copy_row(&original)
+                else:
+                    row.clear()
+                    for j in 0..<original.count |row, original|:
+                        token: Token = original.words[j.usize()]
+                        row.push(token)
+                run.rows[i.usize()] <- row
+
+    def start(machine: Machine, record: bool = true) -> Run:
+        can Memory.Allocate, Abort.Panic:
+            run: mutable Run = Run{machine: machine, rows: zeroed, hand: HandView::initialize(), choice: zeroed,
+                options: zeroed, made: 20000, t: 0.0, result: LIVE, cues: [], record: record}
+            if record:
+                _ = run.cues.reserve(64.usize())
+            restore_rows(&run)
+            return run
+
+    # Exported input calls have an arena that ends with the call. Explicitly
+    # reserve any growing row or cue buffer in the arena owned by the trial.
+    def reserve_input(run: mutable Run&, owner: mutable Arena&, port: i64):
+        can Abort.Panic:
+            return if run.result != LIVE or (port != HandView::PRESS and port != DONE and port != RESET)
+            if run.record and run.cues.count == run.cues.capacity:
+                count: i64 = run.cues.count.i64() + 1
+                _ = arena_da_reserve[Cue](owner, &run.cues, count.usize()) can Global{Read,Write}
+            if port == HandView::PRESS and not run.hand.down and run.choice.kind == GAP_CHOICE:
+                at: usize = run.choice.row.usize()
+                count: i64 = run.rows[at].count.i64() + 1
+                _ = arena_da_reserve[Token](owner, &run.rows[at], count.usize()) can Global{Read,Write}
+
+    # Keep the growing buffers in the live trial arena. A fresh allocation
+    # preserves the old contents without reallocating a returned array header.
+    def extend_edit_buffer[T](buffer: darray[T]) -> darray[T]:
+        can Memory.Allocate, Abort.Panic:
+            return buffer if buffer.count < buffer.capacity
+            grown: mutable darray[T] = []
+            capacity: i64 = 2 * buffer.capacity.i64() + 1
+            _ = grown.reserve(capacity.usize())
+            for item in buffer:
+                grown.push(item)
+            return grown
+
+    def note(run: mutable Run&, duration: f64, pitch: f64, voice: i64, gain: f64):
+        can Memory.Allocate, Abort.Panic:
+            if run.record:
+                cues: mutable darray[Cue] = extend_edit_buffer(run.cues)
+                cues.push(Cue{t: run.t, duration: duration, frequency: pitch, voice: voice, gain: gain})
+                run.cues <- cues
+
+    def reset(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            restore_rows(run)
+            note(run, 0.1, 200.0, 2, 0.3)
+
+    def is_mended(run: Run&) -> bool:
+        can Abort.Panic:
+            for r in 0..<run.machine.level.sentences |run|:
+                row: darray[Token]& = &run.rows[r.usize()]
+                truth: Line& = &run.machine.original[r.usize()]
+                return false if row.count.i64() != truth.count
+                for i in 0..<row.count.i64() |row, truth|:
+                    return false if not same_word(row[i.usize()].text, truth.words[i.usize()].text)
+            return true
+
+    def submit(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            if is_mended(run):
+                note(run, 0.6, 880.0, 3, 0.5)
+                run.result <- MENDED
+            else:
+                note(run, 0.5, 90.0, 4, 0.5)
+                run.result <- WRONG
+
+    def pick(run: mutable Run&, index: i64):
+        can Memory.Allocate, Abort.Panic:
+            choice: Choice = run.choice
+            word: Passages::Word = run.options.words[index.usize()]
+            run.choice <- zeroed
+            run.options <- zeroed
+            row: mutable darray[Token] = run.rows[choice.row.usize()]
+            if choice.kind == WORD:
+                if row.count > 1.usize():
+                    _ = row.remove_at(choice.index.usize())
+                note(run, 0.08, 300.0, 2, 0.3)
+            else:
+                position: i64 = choice.index + 1
+                added: Token = Token{id: run.made, text: word}
+                row <- extend_edit_buffer(row)
+                row.push(added)
+                for i in 0..<(row.count.i64() - position - 1) |row|:
+                    at: usize = (row.count.i64() - i - 1).usize()
+                    row[at] <- row[at - 1.usize()]
+                row[position.usize()] <- added
+                run.made <- run.made + 1
+                note(run, 0.08, 660.0, 1, 0.3)
+            run.rows[choice.row.usize()] <- row
+
+    def press(run: mutable Run&, sources: Sources&, vocab: Vocabulary&):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != LIVE or run.hand.down
+            run.hand.down <- true
+            x: f64 = run.hand.x
+            y: f64 = run.hand.y
+            if fabs(y - BUTTON_Y) <= 20.0:
+                if fabs(x - DONE_X) <= 60.0:
+                    submit(run)
+                    return
+                if fabs(x - RESET_X) <= 60.0:
+                    reset(run)
+                    return
+            if fabs(y - OPT_Y) <= TILE_H / 2.0 + 4.0:
+                for i in 0..<run.options.count |run, x|:
+                    if fabs(x - option_x(i, run.options.count)) <= OPT_WIDTH / 2.0:
+                        pick(run, i)
+                        return
+            run.choice <- zeroed
+            run.options <- zeroed
+            for i in 0..<run.machine.level.sentences |run, sources, vocab, x, y|:
+                row: darray[Token]& = &run.rows[i.usize()]
+                ry: f64 = row_y(i, run.machine.level.sentences)
+                scale: f64 = row_scale(row)
+                if fabs(y - (ry - CARET_DY)) <= CARET_RADIUS:
+                    at: mutable f64 = TEXT_LEFT
+                    for j in 0..<(row.count.i64() - 1) |row, run, at, scale, x, i, sources, vocab|:
+                        at <- at + tile_width(row, j) * scale
+                        if fabs(x - (at + GAP * scale / 2.0)) <= CARET_RADIUS:
+                            run.choice <- Choice{kind: GAP_CHOICE, row: i, index: j}
+                            run.options <- offer(&run.machine, row[j.usize()], row[(j + 1).usize()], sources, vocab)
+                            note(run, 0.05, 520.0, 0, 0.2)
+                            return
+                        at <- at + GAP * scale
+                if fabs(y - ry) <= TILE_H / 2.0:
+                    at: mutable f64 = TEXT_LEFT
+                    for j in 0..<row.count.i64() |run, row, scale, at, x, i|:
+                        width: f64 = tile_width(row, j) * scale
+                        if x >= at and x <= at + width:
+                            run.choice <- Choice{kind: WORD, row: i, index: j}
+                            run.options.count <- 1
+                            note(run, 0.05, 700.0, 0, 0.2)
+                            return
+                        at <- at + width + GAP * scale
+
+    def act(run: mutable Run&, sources: Sources&, vocab: Vocabulary&, port: i64):
+        can Memory.Allocate, Abort.Panic:
+            return if port < 0 or port >= PORTS
+            if port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                press(run, sources, vocab)
+            elif port == HandView::RELEASE:
+                run.hand.down <- false
+            elif run.result == LIVE:
+                if port == DONE:
+                    submit(run)
+                else:
+                    reset(run)
+
+    def step(run: mutable Run&, dt: f64):
+        return if run.result != LIVE
+        run.t <- run.t + dt
+        run.result <- TIMEOUT if run.t >= run.machine.level.seconds
+
+    def click_port(run: Run&, x: f64, y: f64) -> i64:
+        port: i64 = HandView::toward(&run.hand, x, y)
+        return port if port >= 0 else HandView::PRESS
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            return HandView::RELEASE if run.hand.down
+            for r in 0..<run.machine.level.sentences |run|:
+                row: darray[Token]& = &run.rows[r.usize()]
+                truth: Line& = &run.machine.original[r.usize()]
+                k: mutable i64 = 0
+                while k < row.count.i64() and k < truth.count |k, row, truth|:
+                    break if not same_word(row[k.usize()].text, truth.words[k.usize()].text)
+                    k <- k + 1
+                continue if k == row.count.i64() and k == truth.count
+                scale: f64 = row_scale(row)
+                y: f64 = row_y(r, run.machine.level.sentences)
+                if k < row.count.i64() and row[k.usize()].id >= FIRST_EXTRA:
+                    if run.choice.kind == WORD and run.choice.row == r and run.choice.index == k:
+                        return click_port(run, option_x(0, 1), OPT_Y)
+                    return click_port(run, left_of(row, k, scale) + tile_width(row, k) * scale / 2.0, y)
+                if run.choice.kind == GAP_CHOICE and run.choice.row == r and run.choice.index == k - 1:
+                    wanted: Passages::Word = truth.words[k.usize()].text
+                    for i in 0..<run.options.count |run, wanted|:
+                        return click_port(run, option_x(i, run.options.count), OPT_Y) if same_word(wanted, run.options.words[i.usize()])
+                    return -1
+                return click_port(run, left_of(row, k, scale) - GAP * scale / 2.0, y - CARET_DY)
+            return click_port(run, DONE_X, BUTTON_Y)
+
+    def deal(level: Grade, rng: mutable MT19937&, sources: Sources&, vocab: Vocabulary&, sentences: Passages::Bank&,
+            passages: Passages::Bank&, pairs: Passages::Index&, known: Passages::Index&) -> Candidate:
+        can Memory.Allocate, Memory.Release, Abort.Panic:
+            for _ in 0..<200 |level, rng, sources, vocab, sentences, passages, pairs, known|:
+                seed: u64 = py_getrandbits(rng, 32)
+                draw: mutable MT19937 = zeroed
+                mt_seed_int(&draw, seed)
+                candidate: Candidate = build(level, &draw, sources, sentences, passages, pairs, known)
+                continue if not candidate.valid
+                passed: mutable bool = false
+                region attempt(1048576):
+                    in attempt:
+                        run: mutable Run = start(candidate.machine, false)
+                        while run.result == LIVE |run, sources, vocab|:
+                            port: i64 = pilot(&run)
+                            break if port < 0
+                            act(&run, sources, vocab, port)
+                            step(&run, 1.0 / 60.0)
+                        passed <- run.result == MENDED
+                return candidate if passed
+            return zeroed

@@ -1,8 +1,28 @@
+include "../jigsaw_photo_assets.elisa"
+include "../jigsaw_layout.elisa"
+include "../video_sequence_assets.elisa"
+include "../what_next_assets.elisa"
+
 # SDL display-list command dispatch. Struct layouts match the native ABI.
 extern SDL_RenderFillRect(renderer: mutable void&, rect: f32&) -> bool
-extern SDL_RenderRect(renderer: mutable void&, rect: f32&) -> bool
+
+extern SDL_GetRendererProperties(renderer: mutable void&) -> u32
+extern SDL_GetPointerProperty(properties: u32, name: cstr, default_value: void&?) -> mutable void&?
+extern SDL_GetTextureSize(texture: mutable void&, width: mutable f32&, height: mutable f32&) -> bool
+extern SDL_SetTextureColorMod(texture: mutable void&, red: u8, green: u8, blue: u8) -> bool
+extern SDL_SetTextureAlphaMod(texture: mutable void&, alpha: u8) -> bool
+extern SDL_RenderTextureRotated(renderer: mutable void&, texture: mutable void&, source: f32&?, destination: f32&, angle: f64, center: f32&?, flip: i32) -> bool
+
+extern SDL_GetRendererName(renderer: mutable void&) -> cstr
+extern SDL_roundf(value: f32) -> f32
 
 module SDLFrame:
+    def sequence_texture_name(key: mutable u8&, piece: i64):
+        _ = SDL_snprintf(key, 48.usize(), "nw.video.sequence.%lld", piece)
+
+    def what_next_texture_name(key: mutable u8&, stream: i64):
+        _ = SDL_snprintf(key, 48.usize(), "nw.video.what_next.%lld", stream)
+
     struct Command:
         kind: mutable u8
         color: mutable u32
@@ -20,6 +40,107 @@ module SDLFrame:
         sounds: mutable i32
         marker: mutable u8[64]
 
+    def fill_box(renderer: mutable void&, x: f32, y: f32, width: f32, height: f32):
+        can Unsafe.PointerCast:
+            return if width <= 0.0.f32() or height <= 0.0.f32()
+            rect: f32[4] = [x, y, width, height]
+            trusted Unsafe.PointerCast:
+                _ = SDL_RenderFillRect(renderer, (&rect[0]).cast[f32&])
+
+    def stroke_box(renderer: mutable void&, x: f32, y: f32, width: f32, height: f32, thickness: f32):
+        can Abort.Panic, Unsafe.PointerCast:
+            return if thickness <= 0.0.f32() or width <= 0.0.f32() or height <= 0.0.f32()
+            if thickness * 2.0.f32() >= width or thickness * 2.0.f32() >= height:
+                fill_box(renderer, x, y, width, height)
+                return
+            inner_height: f32 = height - thickness * 2.0.f32()
+            fill_box(renderer, x, y, width, thickness)
+            fill_box(renderer, x, y + height - thickness, width, thickness)
+            fill_box(renderer, x, y + thickness, thickness, inner_height)
+            fill_box(renderer, x + width - thickness, y + thickness, thickness, inner_height)
+
+    def draw_jigsaw_crop(renderer: mutable void&, properties: u32, view: f32&, cmd: heap Command&, viewport_scale: f32):
+        can Abort.Panic, Unsafe.PointerCast:
+            texture: mutable void&? = SDL_GetPointerProperty(properties, "nw.jigsaw.texture", null)
+            return if texture == null
+            photo: mutable void& = texture
+            width: mutable f32 = 0.0.f32()
+            height: mutable f32 = 0.0.f32()
+            return if not SDL_GetTextureSize(photo, &width, &height)
+            columns: i64 = SDL_GetNumberProperty(properties, "nw.jigsaw.columns", 0)
+            rows: i64 = SDL_GetNumberProperty(properties, "nw.jigsaw.rows", 0)
+            tile: i64 = JigsawPhotoAssets::tile_index(cmd.ref.i64())
+            return if tile >= 0 and (columns <= 0 or rows <= 0 or tile >= columns * rows)
+            video: bool = SDL_GetNumberProperty(properties, "nw.jigsaw.video", 0) != 0
+            crop: JigsawLayout::PhotoCrop = JigsawLayout::image_crop(width.i64(), height.i64(), columns, rows, tile) if video else JigsawLayout::photo_crop(width.i64(), height.i64(), columns, rows, tile)
+            return if crop.width <= 0 or crop.height <= 0
+            source: mutable f32[4] = [crop.left.f32(), crop.top.f32(), crop.width.f32(), crop.height.f32()]
+            w: f32 = cmd.c * viewport_scale
+            h: f32 = cmd.d * viewport_scale
+            x: f32 = SDLGeometry::x(view, cmd.a) - w * 0.5.f32()
+            y: f32 = SDLGeometry::y(view, cmd.b) - h * 0.5.f32()
+            destination: mutable f32[4] = [x, y, w, h]
+            trusted Unsafe.PointerCast:
+                _ = SDL_RenderTextureRotated(renderer, photo, (&source[0]).uintptr().cast[f32&], (&destination[0]).uintptr().cast[f32&], 0.0, null, 0.i32())
+
+    def draw_sprite(renderer: mutable void&, view: f32&, cmd: heap Command&, viewport_scale: f32):
+        can Abort.Panic, Unsafe.PointerCast:
+            properties: u32 = SDL_GetRendererProperties(renderer)
+            if cmd.kind == 15.u8() and cmd.ref >= JigsawPhotoAssets::FIRST_TILE.u32() and cmd.ref <= JigsawPhotoAssets::LAST_TILE.u32():
+                draw_jigsaw_crop(renderer, properties, view, cmd, viewport_scale)
+                return
+            texture: mutable void&? = null
+            if cmd.ref == 1.u32() or cmd.ref == 2.u32():
+                name: cstr = "nw.sprite.1" if cmd.ref == 1.u32() else "nw.sprite.2"
+                texture <- SDL_GetPointerProperty(properties, name, null)
+            elif cmd.ref.i64() == SDL_GetNumberProperty(properties, "nw.recognition.asset", 0):
+                texture <- SDL_GetPointerProperty(properties, "nw.recognition.texture", null)
+            elif cmd.ref.i64() >= VideoSequenceAssets::FIRST_SPRITE and cmd.ref.i64() < VideoSequenceAssets::FIRST_SPRITE + VideoSequenceAssets::SEGMENT_LIMIT:
+                key: mutable u8[48] = zeroed
+                sequence_texture_name(&key[0], cmd.ref.i64() - VideoSequenceAssets::FIRST_SPRITE)
+                trusted Unsafe.PointerCast:
+                    texture <- SDL_GetPointerProperty(properties, (&key[0]).cast[cstr], null)
+            elif cmd.ref.i64() >= WhatNextAssets::FIRST_SPRITE and cmd.ref.i64() < WhatNextAssets::FIRST_SPRITE + WhatNextAssets::STREAM_LIMIT:
+                key: mutable u8[48] = zeroed
+                what_next_texture_name(&key[0], cmd.ref.i64() - WhatNextAssets::FIRST_SPRITE)
+                trusted Unsafe.PointerCast:
+                    texture <- SDL_GetPointerProperty(properties, (&key[0]).cast[cstr], null)
+            elif cmd.ref >= 1000.u32() and cmd.ref < 1064.u32():
+                key: mutable u8[48] = zeroed
+                _ = SDL_snprintf(&key[0], 48.usize(), "nw.concentration.texture.%lld", cmd.ref.i64() - 1000)
+                trusted Unsafe.PointerCast:
+                    texture <- SDL_GetPointerProperty(properties, (&key[0]).uintptr().cast[cstr], null)
+            return if texture == null
+            sprite: mutable void& = texture
+            width: mutable f32 = 0.0.f32()
+            height: mutable f32 = 0.0.f32()
+            trusted Unsafe.PointerCast:
+                return if not SDL_GetTextureSize(sprite, (&width).uintptr().cast[mutable f32&], (&height).uintptr().cast[mutable f32&])
+                return if width <= 0.0.f32() or height <= 0.0.f32()
+                scale: mutable f32 = cmd.c
+                if cmd.kind == 15.u8():
+                    height_scale: f32 = cmd.d / height
+                    scale <- cmd.c / width
+                    scale <- height_scale if height_scale < scale
+                scale <- scale * viewport_scale
+                return if scale <= 0.0.f32()
+                w: f32 = width * scale
+                h: f32 = height * scale
+                x: f32 = SDLGeometry::x(view, cmd.a) - w * 0.5.f32()
+                y: f32 = SDLGeometry::y(view, cmd.b) - h * 0.5.f32()
+                box: mutable f32[4] = [x, y, w, h]
+                # SDL's software blit uses integer destination bounds.
+                # Round both edges to preserve the fitted sprite's center.
+                if cmd.e == 0.0.f32() and syllogism_argument_is(SDL_GetRendererName(renderer).uintptr().i64(), "software"):
+                    box[0] <- SDL_roundf(x)
+                    box[1] <- SDL_roundf(y)
+                    box[2] <- SDL_roundf(x + w) - box[0]
+                    box[3] <- SDL_roundf(y + h) - box[1]
+                color: u32 = cmd.color
+                _ = SDL_SetTextureColorMod(sprite, (color >> 24).u8(), ((color >> 16) & 255.u32()).u8(), ((color >> 8) & 255.u32()).u8())
+                _ = SDL_SetTextureAlphaMod(sprite, (color & 255.u32()).u8())
+                _ = SDL_RenderTextureRotated(renderer, sprite, null, (&box[0]).uintptr().cast[f32&], -cmd.e.f64(), null, 0.i32())
+
     def render(renderer: mutable void&?, view: f32&?, frame: NativeDisplayDecode::Frame&?, event: mutable Events&?):
         can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
             return if renderer == null or view == null or frame == null or event == null
@@ -35,13 +156,17 @@ module SDLFrame:
                 remaining: mutable i64 = 0
                 seen: mutable i64 = 0
                 open: mutable bool = false
+                poly_width: mutable f32 = 0.0.f32()
                 poly_color: mutable u32 = 0.u32()
                 first_x: mutable f32 = 0.0.f32()
                 first_y: mutable f32 = 0.0.f32()
                 prev_x: mutable f32 = 0.0.f32()
                 prev_y: mutable f32 = 0.0.f32()
+                has_join: mutable bool = false
+                join_x: mutable f32 = 0.0.f32()
+                join_y: mutable f32 = 0.0.f32()
                 index: mutable i64 = 0
-                while index < current.count.i64() |index, current, target, view, frame, events, scales, remaining, seen, open, poly_color, first_x, first_y, prev_x, prev_y|:
+                while index < current.count.i64() |index, current, target, view, view_ptr, frame, events, scales, remaining, seen, open, poly_width, poly_color, first_x, first_y, prev_x, prev_y, has_join, join_x, join_y|:
                     cmd: heap Command& = (current.commands.i64() + index * 40).uintptr().cast[heap Command&]
                     kind: u8 = cmd.kind
                     if kind == 1.u8() or kind == 2.u8() or kind == 3.u8():
@@ -56,32 +181,76 @@ module SDLFrame:
                             box[2] <- cmd.c * scales[0]
                             box[3] <- cmd.d * scales[0]
                             sdl_set_color(target, cmd.color)
-                            if kind != 3.u8():
-                                _ = SDL_RenderFillRect(target, &box[0])
-                            if kind == 2.u8():
-                                sdl_set_color(target, cmd.ref)
-                            if kind != 1.u8():
-                                _ = SDL_RenderRect(target, &box[0])
+                            if kind == 1.u8():
+                                _ = SDL_RenderFillRect(target, (&box[0]).uintptr().cast[f32&])
+                            else:
+                                thickness: f32 = cmd.e * scales[0]
+                                if kind == 2.u8():
+                                    # Draw the fill inside the border so translucent edges
+                                    # blend with the backing surface only once.
+                                    inset: f32 = thickness if thickness > 0.0.f32() else 0.0.f32()
+                                    fill_box(target, box[0] + inset, box[1] + inset,
+                                             box[2] - inset * 2.0.f32(), box[3] - inset * 2.0.f32())
+                                    # Pyglet applies the fill opacity to both parts of the shape.
+                                    border: u32 = (cmd.ref & 0xffffff00.u32()) | (cmd.color & 255.u32())
+                                    sdl_set_color(target, border)
+                                stroke_box(target, box[0], box[1], box[2], box[3], thickness)
                     elif kind == 4.u8():
                         sdl_fill_circle(target, view, cmd.a, cmd.b, cmd.c, cmd.color)
                     elif kind == 5.u8():
-                        sdl_set_color(target, cmd.color)
-                        sdl_stroke_arc(target, view, cmd.a, cmd.b, cmd.c, cmd.e, cmd.f)
+                        sdl_stroke_arc(target, view, cmd.a, cmd.b, cmd.c, cmd.e, cmd.f, cmd.color)
                     elif kind == 6.u8():
-                        sdl_set_color(target, cmd.color)
-                        _ = SDL_RenderLine(target, SDLGeometry::x(view, cmd.a), SDLGeometry::y(view, cmd.b), SDLGeometry::x(view, cmd.c), SDLGeometry::y(view, cmd.d))
+                        sdl_stroke_segment(target, view, cmd.a, cmd.b, cmd.c, cmd.d, cmd.e, cmd.color)
                     elif kind == 7.u8():
                         sdl_fill_triangle(target, view, cmd.a, cmd.b, cmd.c, cmd.d, cmd.e, cmd.f, cmd.color)
                     elif kind == 8.u8() or kind == 16.u8():
                         remaining <- cmd.len.i32().i64()
                         poly_color <- cmd.color
+                        poly_width <- cmd.c
                         seen <- 0
+                        has_join <- false
                         open <- kind == 16.u8()
                     elif kind == 9.u8() and remaining > 0:
                         if open:
                             if seen > 0:
-                                sdl_set_color(target, poly_color)
-                                _ = SDL_RenderLine(target, SDLGeometry::x(view, prev_x), SDLGeometry::y(view, prev_y), SDLGeometry::x(view, cmd.a), SDLGeometry::y(view, cmd.b))
+                                dx: f32 = cmd.a - prev_x
+                                dy: f32 = cmd.b - prev_y
+                                length: f32 = SDL_sqrtf(dx * dx + dy * dy)
+                                if length > 0.0.f32() and poly_width > 0.0.f32():
+                                    nx: f32 = -dy / length
+                                    ny: f32 = dx / length
+                                    half: f32 = poly_width * 0.5.f32()
+                                    end_x: mutable f32 = nx * half
+                                    end_y: mutable f32 = ny * half
+                                    if remaining > 1 and index + 1 < current.count.i64():
+                                        look: mutable i64 = index + 1
+                                        while look < index + remaining and look < current.count.i64() |look, index, remaining, current, cmd|:
+                                            point: heap Command& = (current.commands.i64() + look * 40).uintptr().cast[heap Command&]
+                                            if point.kind != 9.u8() or point.a != cmd.a or point.b != cmd.b:
+                                                break
+                                            look <- look + 1
+                                        if look < index + remaining and look < current.count.i64():
+                                            next: heap Command& = (current.commands.i64() + look * 40).uintptr().cast[heap Command&]
+                                            ax: f32 = next.a - cmd.a
+                                            ay: f32 = next.b - cmd.b
+                                            next_length: f32 = SDL_sqrtf(ax * ax + ay * ay)
+                                            if next.kind == 9.u8() and next_length > 0.0.f32():
+                                                mx: f32 = nx - ay / next_length
+                                                my: f32 = ny + ax / next_length
+                                                mlen: f32 = SDL_sqrtf(mx * mx + my * my)
+                                                projection: f32 = (mx * nx + my * ny)
+                                                if mlen > 0.0.f32() and projection > 0.0.f32():
+                                                    extension: f32 = half * mlen / projection
+                                                    limited: f32 = poly_width * 2.0.f32() if extension > poly_width * 2.0.f32() else extension
+                                                    end_x <- mx / mlen * limited
+                                                    end_y <- my / mlen * limited
+                                    if not has_join:
+                                        join_x <- nx * half
+                                        join_y <- ny * half
+                                    sdl_stroke_quad(target, view_ptr, prev_x, prev_y, cmd.a, cmd.b, join_x, join_y, end_x, end_y, poly_color)
+                                    join_x <- end_x
+                                    join_y <- end_y
+                                    has_join <- true
                         elif seen == 0:
                             first_x <- cmd.a
                             first_y <- cmd.b
@@ -91,8 +260,12 @@ module SDLFrame:
                         prev_y <- cmd.b
                         seen <- seen + 1
                         remaining <- remaining - 1
+                    elif kind == 10.u8() or kind == 15.u8():
+                        draw_sprite(target, view_ptr, cmd, scales[0])
+                    elif kind == 11.u8() and cmd.f > 0.0.f32():
+                        sdl_draw_faced_text(target, view_ptr, current, cmd)
                     elif kind == 11.u8():
-                        sdl_draw_multiline(target, view, frame, cmd.cast[u8&], cmd.a, cmd.b, cmd.c, cmd.color, (cmd.len >> 24).u8())
+                        sdl_draw_multiline_weighted(target, view, frame, cmd.cast[u8&], cmd.a, cmd.b, cmd.c, cmd.color, (cmd.len >> 24).u8(), cmd.d != 0.0.f32())
                     elif kind == 12.u8():
                         events.verdict <- cmd.ref.i32()
                     elif kind == 13.u8():
@@ -112,3 +285,117 @@ module SDLFrame:
                     index <- index + 1
 
 export fn nw_sdl_render_frame(renderer: mutable void&?, view: f32&?, frame: NativeDisplayDecode::Frame&?, event: mutable SDLFrame::Events&?) = SDLFrame::render
+
+extern SDL_GetError() -> cstr
+extern SDL_RenderClear(renderer: mutable void&) -> bool
+extern SDL_RenderPresent(renderer: mutable void&) -> bool
+extern SDL_Delay(milliseconds: u32)
+
+# Decode, render and present a complete frame. The scratch buffer is local to
+# this call, so decoded command pointers never outlive their source frame.
+def sdl_draw_frame_theme(renderer: mutable void&?, data: u8&?, length: i64, width: i32, height: i32, trial: i64, black: i64) -> i32:
+    can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return 0.i32() if renderer == null
+        target: mutable void& = renderer
+        shade: u8 = 0.u8() if black != 0 else 255.u8()
+        if not SDL_SetRenderDrawColor(target, shade, shade, shade, 255.u8()) or not SDL_RenderClear(target):
+            SDL_Log("Could not clear frame %lld: %s", trial, SDL_GetError())
+            return 0.i32()
+        return sdl_draw_frame_layer(target, data, length, width, height, trial, false)
+
+def sdl_draw_frame_layer(target: mutable void&, data: u8&?, length: i64, width: i32, height: i32, trial: i64, physical: bool) -> i32:
+    can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        view: mutable f32[4] = zeroed
+        scratch: mutable u8[NativeDisplayDecode::DESKTOP_SCRATCH_BYTES] = zeroed
+        frame: mutable NativeDisplayDecode::Frame = zeroed
+        events: mutable SDLFrame::Events = zeroed
+        decoded: mutable i32 = 0.i32()
+        trusted Unsafe.PointerCast:
+            if physical:
+                view[0] <- 1.0.f32()
+                view[3] <- height.f32()
+            else:
+                SDLGeometry::setup((&view[0]).uintptr().cast[mutable f32&], width, height)
+            if length > 0:
+                output: mutable NativeDisplayDecode::Frame& = (&frame).uintptr().cast[mutable NativeDisplayDecode::Frame&]
+                decoded <- NativeDisplayDecode::decode_view(data, length.usize(), output)
+                if decoded == 0.i32():
+                    decoded <- NativeDisplayDecode::decode(data, length.usize(), (&scratch[0]).uintptr().cast[mutable u8&], NativeDisplayDecode::DESKTOP_COMMANDS.usize(), output)
+            if decoded != 0.i32():
+                SDLFrame::render(target, (&view[0]).uintptr().cast[f32&], (&frame).uintptr().cast[NativeDisplayDecode::Frame&], (&events).uintptr().cast[mutable SDLFrame::Events&])
+            else:
+                SDL_Log("frame %lld: decode failed (%lld bytes)", trial, length)
+        return decoded
+
+export fn nw_sdl_draw_frame_theme(renderer: mutable void&?, data: u8&?, length: i64, width: i32, height: i32, trial: i64, black: i64) -> i32 = sdl_draw_frame_theme
+
+extern SDL_GetRenderWindow(renderer: mutable void&) -> mutable void&?
+extern SDL_GetWindowPixelDensity(window: mutable void&) -> f32
+
+extern SDL_GetNumberProperty(properties: u32, name: cstr, fallback: i64) -> i64
+extern SDL_GetStringProperty(properties: u32, name: cstr, fallback: cstr) -> cstr
+
+extern SDL_GetFloatProperty(properties: u32, name: cstr, fallback: f32) -> f32
+
+def sdl_debug_hud_enabled() -> bool:
+    can Abort.Panic:
+        setting: u8&? = SDL_getenv("NW_NATIVE_DEBUG_HUD")
+        return false if setting == null
+        enabled: u8& = setting
+        return enabled[0] == 49.u8() and enabled[1] == 0.u8()
+
+# Draw diagnostics after the scene, using physical pixels like the desktop HUD.
+def sdl_draw_debug_hud(renderer: mutable void&, data: u8&?, length: i64, width: i32, height: i32):
+    can Abort.Panic, Unsafe.PointerCast:
+        return if data == null or length < 16 or height < 16.i32() or not sdl_debug_hud_enabled()
+        window: mutable void&? = SDL_GetRenderWindow(renderer)
+        properties: u32 = SDL_GetRendererProperties(renderer)
+        density: mutable f32 = SDL_GetFloatProperty(properties, "nw.capture.density", 1.0.f32())
+        if window != null:
+            target: mutable void& = window
+            density <- SDL_GetWindowPixelDensity(target)
+        view: mutable f32[4] = zeroed
+        label: mutable u8[256] = zeroed
+        trusted Unsafe.PointerCast:
+            SDLGeometry::setup((&view[0]).uintptr().cast[mutable f32&], width, height)
+            source: u8& = data
+            count: u32 = NativeDisplayDecode::word(source.cast[heap u8&], 8.usize())
+            summary: cstr = SDL_GetStringProperty(properties, "nw.debug.summary", "")
+            size: i32 = SDL_snprintf(&label[0], 256.usize(), "%s%u ops - %lld bytes - scale %.3f - dpr %.3g",
+                summary, count, length, view[0].f64(), density.f64())
+            if size > 0.i32() and size < 256.i32():
+                _ = SDL_SetRenderDrawColor(renderer, 154.u8(), 164.u8(), 178.u8(), 255.u8())
+                scale: f32 = density if density > 0.0.f32() else 1.0.f32()
+                if SDL_SetRenderScale(renderer, scale, scale):
+                    _ = SDL_RenderDebugText(renderer, 8.0.f32(), height.f32() / scale - 16.0.f32(),
+                        (&label[0]).uintptr().cast[cstr])
+                    _ = SDL_SetRenderScale(renderer, 1.0.f32(), 1.0.f32())
+
+def sdl_present_frame_theme(renderer: mutable void&?, data: u8&?, length: i64, width: i32, height: i32, trial: i64, black: i64, capture: uintptr = 0.uintptr()) -> i32:
+    can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return 0.i32() if renderer == null
+        target: mutable void& = renderer
+        decoded: i32 = sdl_draw_frame_theme(renderer, data, length, width, height, trial, black)
+        if decoded != 0.i32():
+            sdl_draw_debug_hud(target, data, length, width, height)
+            if capture != 0.uintptr():
+                trusted Unsafe.PointerCast:
+                    publish: fn(mutable void&) -> void can[Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast] = capture.cast[fn(mutable void&) -> void can[Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast]]
+                    publish(target)
+        presented: bool = SDL_RenderPresent(target)
+        if not presented:
+            SDL_Log("Could not present frame %lld: %s", trial, SDL_GetError())
+        SDL_Delay(16.u32())
+        return decoded if presented else 0.i32()
+
+def sdl_present_frame_theme_legacy(renderer: mutable void&?, data: u8&?, length: i64, width: i32, height: i32, trial: i64, black: i64) -> i32:
+    can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return sdl_present_frame_theme(renderer, data, length, width, height, trial, black)
+
+export fn nw_sdl_present_frame_theme(renderer: mutable void&?, data: u8&?, length: i64, width: i32, height: i32, trial: i64, black: i64) -> i32 = sdl_present_frame_theme_legacy
+
+def sdl_present_frame(renderer: mutable void&?, data: u8&?, length: i64, width: i32, height: i32, trial: i64) -> i32:
+    can Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return sdl_present_frame_theme(renderer, data, length, width, height, trial, 0)
+
+export fn nw_sdl_present_frame(renderer: mutable void&?, data: u8&?, length: i64, width: i32, height: i32, trial: i64) -> i32 = sdl_present_frame

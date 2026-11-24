@@ -1,0 +1,323 @@
+include "./tasks/catch_game.elisa"
+include "./scene_polish.elisa"
+include "./scene_verdict.elisa"
+include "./rooms_view.elisa"
+
+module SceneCatch:
+    const CX: f64 = 456.0
+    const WIDTH: f64 = 857.28
+    const LEFT: f64 = (912.0 - WIDTH) / 2.0
+    const BOTTOM: f64 = 179.0
+    const HEIGHT: f64 = 389.0
+    const FOG_COLOUR: u32 = 0x96a0beff
+    const THROWER: i64 = 0
+    const BALL: i64 = 1
+    const LANDED: i64 = 2
+    const BASKET: i64 = 3
+    const FOG: i64 = 4
+
+    struct Lens:
+        camera: RoomsView::Camera
+        focal: f64
+        cx: f64
+        cy: f64
+
+    struct Thing:
+        depth: f64
+        kind: i64
+        index: i64
+
+    def camera(swing: f64) -> RoomsView::Camera:
+        can Abort.Panic:
+            eye: RoomsView::Vec = RoomsView::vec(-sin(swing) * 26.0, 12.0, 14.0 - cos(swing) * 26.0)
+            forward: RoomsView::Vec = RoomsView::unit(RoomsView::sub(RoomsView::vec(0.0, 0.0, 19.0), eye))
+            right: RoomsView::Vec = RoomsView::unit(RoomsView::cross(forward, RoomsView::vec(0.0, 1.0, 0.0)))
+            return RoomsView::Camera{eye: eye, forward: forward, right: right, up: RoomsView::cross(right, forward)}
+
+    def lens(run: Catch::Run&) -> Lens:
+        can Abort.Panic:
+            wide: f64 = run.court.level.swing * 0.017453292519943295
+            view: RoomsView::Camera = camera(wide * sin(0.3 * run.time))
+            points: RoomsView::Vec[6] = [RoomsView::vec(-Catch::HALF, 0.0, 0.0),
+                RoomsView::vec(Catch::HALF, 0.0, 0.0), RoomsView::vec(-Catch::HALF, 0.0, Catch::LONG),
+                RoomsView::vec(Catch::HALF, 0.0, Catch::LONG), RoomsView::vec(0.0, 10.5, Catch::LONG * 0.55),
+                RoomsView::vec(0.0, 3.0, Catch::LONG + 1.0)]
+            first: RoomsView::Point = RoomsView::project(&view, points[0])
+            bounds: mutable RoomsView::Bounds = RoomsView::Bounds{left: first.x, right: first.x, bottom: first.y, top: first.y}
+            for i in 1..<6 |view, points, bounds|:
+                p: RoomsView::Point = RoomsView::project(&view, points[i.usize()])
+                bounds.left <- p.x if p.x < bounds.left
+                bounds.right <- p.x if p.x > bounds.right
+                bounds.bottom <- p.y if p.y < bounds.bottom
+                bounds.top <- p.y if p.y > bounds.top
+            focal: f64 = SceneHiddenRule::minimum(WIDTH * 0.92 / (bounds.right - bounds.left),
+                HEIGHT * 0.92 / (bounds.top - bounds.bottom))
+            return Lens{camera: view, focal: focal,
+                cx: CX - focal * (bounds.right + bounds.left) / 2.0,
+                cy: BOTTOM + HEIGHT / 2.0 - focal * (bounds.top + bounds.bottom) / 2.0}
+
+    def see(view: Lens&, x: f64, y: f64, z: f64) -> RoomsView::Vec:
+        difference: RoomsView::Vec = RoomsView::sub(RoomsView::vec(x, y, z), view.camera.eye)
+        depth: f64 = RoomsView::dot(difference, view.camera.forward)
+        return RoomsView::vec(0.0, 0.0, depth) if depth < 0.05
+        scale: f64 = view.focal / depth
+        return RoomsView::vec(view.cx + RoomsView::dot(difference, view.camera.right) * scale,
+            view.cy + RoomsView::dot(difference, view.camera.up) * scale, depth)
+
+    def pointer(session: mutable CatchGame::Session&, x: f64, y: f64) -> bool:
+        can Abort.Panic:
+            return false if session.phase != CatchGame::PLAYING
+            view: Lens = lens(&session.run)
+            a: f64 = (x - view.cx) / view.focal
+            b: f64 = (y - view.cy) / view.focal
+            f: RoomsView::Vec = view.camera.forward
+            r: RoomsView::Vec = view.camera.right
+            u: RoomsView::Vec = view.camera.up
+            ray: RoomsView::Vec = RoomsView::unit(RoomsView::vec(f.x + a * r.x + b * u.x,
+                f.y + a * r.y + b * u.y, f.z + a * r.z + b * u.z))
+            return false if ray.y > -0.000001
+            reach: f64 = -view.camera.eye.y / ray.y
+            return CatchGame::aim(session, view.camera.eye.x + ray.x * reach, view.camera.eye.z + ray.z * reach)
+
+    def line(list: mutable Display::DisplayList&, a: RoomsView::Vec, b: RoomsView::Vec, width: f64, colour: u32):
+        can Memory.Allocate, Abort.Panic:
+            if a.z >= 0.05 and b.z >= 0.05:
+                Display::draw_line(list, a.x, a.y, b.x, b.y, width, colour)
+
+    def quad(list: mutable Display::DisplayList&, a: RoomsView::Vec, b: RoomsView::Vec, c: RoomsView::Vec, d: RoomsView::Vec, colour: u32):
+        can Memory.Allocate, Abort.Panic:
+            return if a.z < 0.05 or b.z < 0.05 or c.z < 0.05 or d.z < 0.05
+            Display::begin_polygon(list, 4, a.x, a.y, colour)
+            Display::polygon_point(list, a.x, a.y)
+            Display::polygon_point(list, b.x, b.y)
+            Display::polygon_point(list, c.x, c.y)
+            Display::polygon_point(list, d.x, d.y)
+
+    def court(list: mutable Display::DisplayList&, view: Lens&, level: Catch::Grade):
+        can Memory.Allocate, Abort.Panic:
+            box: SceneHiddenRule::Rect = SceneHiddenRule::Rect{x: LEFT - 4.0, y: BOTTOM - 4.0, w: WIDTH + 8.0, h: HEIGHT + 8.0}
+            alphas: u32[3] = [30.u32(), 18.u32(), 12.u32()]
+            for i in 0..<3 |list, box, alphas|:
+                spread: f64 = i.f64() * 2.0
+                shadow: SceneHiddenRule::Rect = ScenePolish::spread_box(&box, spread, 4.0)
+                ScenePolish::rounded(list, &shadow, 14.0 + spread, alphas[i.usize()])
+            ScenePolish::rounded(list, &box, 14.0, 0x282846ff)
+            for i in 0..<22 |list|:
+                colour: u32 = ScenePolish::mix_rgb(0xfabe8cff, 0x465096ff, (i.f64() + 0.5) / 22.0)
+                Display::draw_rect(list, LEFT, BOTTOM + HEIGHT * i.f64() / 22.0, WIDTH, HEIGHT / 22.0 + 1.0, colour)
+            for i in 0..<12 |list, view, level|:
+                z0: f64 = Catch::LONG * i.f64() / 12.0
+                z1: f64 = Catch::LONG * (i + 1).f64() / 12.0
+                base: u32 = ScenePolish::mix_rgb(0x609660ff, 0x467050ff, i.f64() / 12.0)
+                colour: u32 = ScenePolish::mix_rgb(base, FOG_COLOUR, SceneHiddenRule::minimum(1.0, (z1 - Catch::FOG) / 6.0)) if level.fog and z1 > Catch::FOG else base
+                quad(list, see(view, -Catch::HALF, 0.0, z0), see(view, Catch::HALF, 0.0, z0),
+                    see(view, Catch::HALF, 0.0, z1), see(view, -Catch::HALF, 0.0, z1), colour)
+            for i in 0..<2 |list, view, level|:
+                z: f64 = 15.0 if i == 0 else Catch::LONG / 2.0
+                line(list, see(view, -Catch::HALF, 0.0, z), see(view, Catch::HALF, 0.0, z), 2.0, 0xebf0e1a0)
+                x: f64 = -Catch::HALF if i == 0 else Catch::HALF
+                start: RoomsView::Vec = see(view, x, 0.0, 0.0)
+                end: RoomsView::Vec = see(view, x, 0.0, Catch::LONG)
+                line(list, start, end, 3.0, 0xebf0e1ff)
+                if level.walls:
+                    quad(list, start, end, see(view, x, 1.6, Catch::LONG), see(view, x, 1.6, 0.0), 0x967864ff)
+            near_left: RoomsView::Vec = see(view, -8.5, 0.0, 2.0)
+            near_right: RoomsView::Vec = see(view, 8.5, 0.0, 2.0)
+            far_left: RoomsView::Vec = see(view, -8.5, 0.0, 15.0)
+            far_right: RoomsView::Vec = see(view, 8.5, 0.0, 15.0)
+            line(list, near_left, near_right, 1.0, 0xffffff5a)
+            line(list, near_right, far_right, 1.0, 0xffffff5a)
+            line(list, far_right, far_left, 1.0, 0xffffff5a)
+            line(list, far_left, near_left, 1.0, 0xffffff5a)
+
+    def ring_point(view: Lens&, centre: Catch::Position, radius: f64, index: i64, count: i64) -> RoomsView::Vec:
+        angle: f64 = Catch::TAU * index.f64() / count.f64()
+        return see(view, centre.x + radius * cos(angle), centre.y, centre.z + radius * sin(angle))
+
+    def ring(list: mutable Display::DisplayList&, view: Lens&, centre: Catch::Position, radius: f64, count: i64, width: f64, colour: u32):
+        can Memory.Allocate, Abort.Panic:
+            points: mutable RoomsView::Vec[28] = zeroed
+            for i in 0..<count |view, centre, radius, count, points|:
+                p: RoomsView::Vec = ring_point(view, centre, radius, i, count)
+                return if p.z < 0.05
+                points[i.usize()] <- p
+            if width == 0.0:
+                start: RoomsView::Vec = points[0.usize()]
+                Display::begin_polygon(list, count, start.x, start.y, colour)
+                for i in 0..<count |list, points|:
+                    p: RoomsView::Vec = points[i.usize()]
+                    Display::polygon_point(list, p.x, p.y)
+            else:
+                for i in 0..<count |list, points, count, width, colour|:
+                    line(list, points[i.usize()], points[((i + 1) % count).usize()], width, colour)
+
+    def basket_colour(level: Catch::Grade, b: i64) -> u32:
+        return 0xeea834ff if not level.two else (0xe24840ff if b == 0 else 0x4084ecff)
+
+    def basket(list: mutable Display::DisplayList&, view: Lens&, run: Catch::Run&, index: i64):
+        can Memory.Allocate, Abort.Panic:
+            p: Catch::Point = run.baskets[index.usize()]
+            radius: f64 = run.court.level.radius
+            floor: Catch::Position = Catch::Position{x: p.x, y: 0.0, z: p.z}
+            rim: Catch::Position = Catch::Position{x: p.x, y: Catch::RIM, z: p.z}
+            colour: u32 = basket_colour(run.court.level, index)
+            shade: u32 = ScenePolish::mix_rgb(colour, 0x000000ff, 0.5) & 0xffffff00.u32()
+            stripe: u32 = ScenePolish::mix_rgb(colour, 0xffffffff, 0.3)
+            ring(list, view, floor, radius, 28, 0.0, shade | 150.u32())
+            ring(list, view, rim, radius, 28, 4.0, colour)
+            for i in 0..<7 |list, view, floor, rim, radius, stripe|:
+                line(list, ring_point(view, floor, radius, 4 * i, 28), ring_point(view, rim, radius, 4 * i, 28), 2.0, stripe)
+            if run.aimed[index.usize()]:
+                target: Catch::Point = run.aim[index.usize()]
+                spot: RoomsView::Vec = see(view, target.x, 0.0, target.z)
+                if spot.z >= 0.05:
+                    ScenePolish::ring(list, spot.x, spot.y, 6.0, 2.0, (colour & 0xffffff00.u32()) | 160.u32(), 24)
+
+    def airborne(list: mutable Display::DisplayList&, view: Lens&, run: Catch::Run&, index: i64):
+        can Memory.Allocate, Abort.Panic:
+            ball: Catch::Ball = run.court.balls[index.usize()]
+            level: Catch::Grade = run.court.level
+            point: Catch::Position = Catch::where(ball, run.time, level.walls)
+            return if level.fog and point.z > Catch::FOG
+            if level.shadow:
+                shadow: Catch::Position = Catch::Position{x: point.x, y: 0.0, z: point.z}
+                ring(list, view, shadow, 0.4, 14, 0.0, 0x14281478)
+            p: RoomsView::Vec = see(view, point.x, point.y + 0.35, point.z)
+            return if p.z < 0.05
+            size: f64 = 0.35 * view.focal / p.z
+            r: f64 = 2.0 if size < 2.0 else size
+            colour: u32 = basket_colour(level, ball.colour) if level.two else 0xfafaf5ff
+            Display::draw_circle(list, p.x, p.y, r, ScenePolish::mix_rgb(colour, 0x000000ff, 0.25))
+            Display::draw_circle(list, p.x - r * 0.15, p.y + r * 0.15, r * 0.8, colour)
+            Display::draw_circle(list, p.x - r * 0.35, p.y + r * 0.35, r * 0.25, 0xffffffc8)
+
+    def landed(list: mutable Display::DisplayList&, view: Lens&, run: Catch::Run&, index: i64):
+        can Memory.Allocate, Abort.Panic:
+            ball: Catch::Ball = run.court.balls[index.usize()]
+            time: f64 = ball.t0 + ball.flight
+            point: Catch::Position = Catch::where(ball, time, run.court.level.walls)
+            age: f64 = run.time - ball.t0 - ball.flight
+            centre: Catch::Position = Catch::Position{x: point.x, y: 0.0, z: ball.land.z}
+            colour: u32 = 0x6ef08c00 if run.fate[index.usize()] == Catch::CAUGHT else 0xff504600
+            ring(list, view, centre, 0.4 + age * 2.0, 20, 3.0, colour | (255.0 * (1.0 - age / 0.7)).u32())
+
+    def thrower(list: mutable Display::DisplayList&, view: Lens&, time: f64):
+        can Memory.Allocate, Abort.Panic:
+            base: RoomsView::Vec = see(view, 0.0, 0.0, Catch::LONG + 1.0)
+            head: RoomsView::Vec = see(view, 0.0, 2.6, Catch::LONG + 1.0)
+            w: f64 = 0.5 * view.focal / base.z
+            Display::draw_line(list, base.x, base.y, head.x, head.y, 2.0 if w < 2.0 else w, 0x3c3c5aff)
+            Display::draw_circle(list, head.x, head.y, 2.0 if w * 0.8 < 2.0 else w * 0.8, 0xf0c8aaff)
+            Display::draw_line(list, head.x, head.y - w, head.x + 2.0 * w, head.y + sin(time * 3.0) * w * 2.0,
+                1.5 if w * 0.5 < 1.5 else w * 0.5, 0x3c3c5aff)
+
+    def fog(list: mutable Display::DisplayList&, view: Lens&):
+        can Memory.Allocate, Abort.Panic:
+            for k in 0..<4 |list, view|:
+                low: f64 = 2.5 * k.f64()
+                high: f64 = 2.5 * (k + 1).f64()
+                quad(list, see(view, -Catch::HALF, low, Catch::FOG), see(view, Catch::HALF, low, Catch::FOG),
+                    see(view, Catch::HALF, high, Catch::FOG), see(view, -Catch::HALF, high, Catch::FOG),
+                    (FOG_COLOUR & 0xffffff00.u32()) | (250 - 40 * k).u32())
+
+    def objects(list: mutable Display::DisplayList&, view: Lens&, run: Catch::Run&):
+        can Memory.Allocate, Abort.Panic:
+            things: mutable darray[Thing] = []
+            level: Catch::Grade = run.court.level
+            if not level.fog:
+                things.push(Thing{depth: Catch::LONG + 1.0, kind: THROWER, index: 0})
+            for i in 0..<level.count |run, level, things|:
+                b: Catch::Ball = run.court.balls[i.usize()]
+                if run.fate[i.usize()] == Catch::PENDING:
+                    if run.time >= b.t0:
+                        p: Catch::Position = Catch::where(b, run.time, level.walls)
+                        things.push(Thing{depth: p.z, kind: BALL, index: i})
+                elif run.time - (b.t0 + b.flight) < 0.7:
+                    things.push(Thing{depth: b.land.z, kind: LANDED, index: i})
+            for i in 0..<(2 if level.two else 1) |things, run|:
+                things.push(Thing{depth: run.baskets[i.usize()].z, kind: BASKET, index: i})
+            if level.fog:
+                things.push(Thing{depth: Catch::FOG, kind: FOG, index: 0})
+            for i in 1..<things.count.i64() |things|:
+                item: Thing = things[i.usize()]
+                at: mutable i64 = i
+                while at > 0 |at, things, item|:
+                    previous: Thing = things[(at - 1).usize()]
+                    break if previous.depth >= item.depth
+                    things[at.usize()] <- previous
+                    at <- at - 1
+                things[at.usize()] <- item
+            for i in 0..<things.count.i64() |things, list, view, run|:
+                item: Thing = things[i.usize()]
+                if item.kind == THROWER:
+                    thrower(list, view, run.time)
+                elif item.kind == BALL:
+                    airborne(list, view, run, item.index)
+                elif item.kind == LANDED:
+                    landed(list, view, run, item.index)
+                elif item.kind == BASKET:
+                    basket(list, view, run, item.index)
+                else:
+                    fog(list, view)
+            for i in 0..<level.count |run, list|:
+                result: i64 = run.fate[i.usize()]
+                colour: u32 = 0x5ad278ff if result == Catch::CAUGHT else (0xe6463cff if result == Catch::DROPPED else 0xffffff5a)
+                Display::draw_circle(list, LEFT + 20.0 + 22.0 * i.f64(), BOTTOM + HEIGHT - 22.0, 7.0, colour)
+
+    def render(list: mutable Display::DisplayList&, session: CatchGame::Session&, dark: bool):
+        can Memory.Allocate, Abort.Panic:
+            ink: u32 = 0xffffffff if dark else 0x000000ff
+            Display::draw_text_weight(list, "Catch", CX, 648.0, 22.0, ink, Display::ANCHOR_CENTER_CENTER, true)
+            Display::draw_text(list, "Mouse or arrows / WASD: move the basket   Esc: menu",
+                CX, 26.0, 12.0, ink, Display::ANCHOR_CENTER_CENTER)
+            msg: mutable dstr = []
+            if session.phase == CatchGame::READY:
+                dstr_append_cstr(&msg, "Press Space or click to start")
+            elif session.phase == CatchGame::DONE:
+                dstr_append_i64(&msg, session.passed_count)
+                dstr_append_cstr(&msg, " of ")
+                dstr_append_i64(&msg, session.trial)
+                dstr_append_cstr(&msg, " passed   highest rung passed ")
+                dstr_append_i64(&msg, session.best_rung)
+            elif session.phase == CatchGame::JUDGED:
+                Catch::result_text(&session.run, &msg)
+            elif session.run.court.level.two:
+                dstr_append_cstr(&msg, "Red basket on the keys, blue on the mouse -- catch your own colour")
+            else:
+                dstr_append_cstr(&msg, "Be under each ball when it comes down")
+            Display::draw_text(list, bytes_view(msg), CX, 614.0, 14.0, ink, Display::ANCHOR_CENTER_CENTER)
+            if session.phase >= CatchGame::JUDGED and session.run.result != Catch::PENDING:
+                verdict: mutable dstr = []
+                Catch::result_text(&session.run, &verdict)
+                SceneVerdict::put(list, 912.0, 684.0, 1.0, 1.0, session.run.result == Catch::CAUGHT, bytes_view(verdict), 60.0, 16.0)
+            return if session.phase == CatchGame::READY or session.phase == CatchGame::DONE
+            facts: mutable dstr = []
+            dstr_append_cstr(&facts, "rung ")
+            dstr_append_i64(&facts, session.rung)
+            dstr_append_cstr(&facts, "  ")
+            dstr_append_i64(&facts, session.trial)
+            dstr_append_cstr(&facts, "/")
+            dstr_append_i64(&facts, session.total)
+            dstr_append_cstr(&facts, "   ")
+            dstr_append_cstr(&facts, "caught ")
+            dstr_append_i64(&facts, session.run.caught)
+            dstr_append_cstr(&facts, ", dropped ")
+            dstr_append_i64(&facts, session.run.missed)
+            dstr_append_cstr(&facts, " of 1 allowed")
+            Display::draw_text(list, bytes_view(facts), CX, 588.0, 12.0, ink, Display::ANCHOR_CENTER_CENTER)
+            view: Lens = lens(&session.run)
+            court(list, &view, session.run.court.level)
+            objects(list, &view, &session.run)
+
+    def option_note(rung: i64, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            level: Catch::Grade = Catch::grade(rung)
+            dstr_append_cstr(out, "Rung ")
+            dstr_append_i64(out, level.rung)
+            dstr_append_cstr(out, ": ")
+            dstr_append_i64(out, level.count)
+            dstr_append_cstr(out, " balls, one drop allowed")
+            dstr_append_cstr(out, ", two baskets" if level.two else "")
+            dstr_append_cstr(out, ", fog" if level.fog else "")
+            dstr_append_cstr(out, ", swinging camera" if level.swing != 0.0 else "")
+            dstr_append_cstr(out, ".")

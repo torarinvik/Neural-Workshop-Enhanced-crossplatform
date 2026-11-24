@@ -1,0 +1,217 @@
+include "./cipher_abyss_questions.elisa"
+
+extend CipherLang:
+    struct SipState:
+        a: mutable u64
+        b: mutable u64
+        c: mutable u64
+        d: mutable u64
+
+    def rotate_word(word: u64, places: u64) -> u64:
+        return (word << places) | (word >> (64.u64() - places))
+
+    def sip_round(state: mutable SipState&):
+        state.a <- state.a + state.b
+        state.b <- rotate_word(state.b, 13.u64()) ^ state.a
+        state.a <- rotate_word(state.a, 32.u64())
+        state.c <- state.c + state.d
+        state.d <- rotate_word(state.d, 16.u64()) ^ state.c
+        state.a <- state.a + state.d
+        state.d <- rotate_word(state.d, 21.u64()) ^ state.a
+        state.c <- state.c + state.b
+        state.b <- rotate_word(state.b, 17.u64()) ^ state.c
+        state.c <- rotate_word(state.c, 32.u64())
+
+    def fold_word(state: mutable SipState&, word: u64):
+        state.d <- state.d ^ word
+        sip_round(state)
+        state.a <- state.a ^ word
+
+    def twin_seed(code: dstr&) -> u64:
+        can Abort.Panic:
+            # CPython's hash of ASCII rule notation with PYTHONHASHSEED=0.
+            # Python otherwise changes the rival pool across processes.
+            return 0.u64() if code.count == 0.usize()
+            state: mutable SipState = SipState{a: 0x736f6d6570736575.u64(), b: 0x646f72616e646f6d.u64(),
+                c: 0x6c7967656e657261.u64(), d: 0x7465646279746573.u64()}
+            word: mutable u64 = 0.u64()
+            for i in 0..<code.count.i64() |code, state, word|:
+                offset: i64 = i % 8
+                word <- word | (code[i.usize()].u64() << (8 * offset).u64())
+                if offset == 7:
+                    fold_word(&state, word)
+                    word <- 0.u64()
+            fold_word(&state, word | ((code.count.u64() & 255.u64()) << 56.u64()))
+            state.c <- state.c ^ 255.u64()
+            sip_round(&state)
+            sip_round(&state)
+            sip_round(&state)
+            hashed: u64 = state.a ^ state.b ^ state.c ^ state.d
+            return 65534.u64() if hashed == 18446744073709551615.u64()
+            return hashed & 65535.u64()
+
+    def same_machine(program: darray[Node]&, a: i64, b: i64, level: CipherAbyss::Grade) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            base: darray[Probe] = probes(level.length, level.symbols, 160, 97)
+            return false if not equivalent(program, a, b, &base, level.symbols)
+            return true if fixed_length(program, a) or fixed_length(program, b)
+            long: darray[Probe] = probes(level.length + 2, level.symbols, 160, 97)
+            return equivalent(program, a, b, &long, level.symbols)
+
+    struct NearRule:
+        entry: i64
+        same: i64
+        size: i64
+
+    def closeness(program: darray[Node]&, entry: i64, inputs: darray[Probe]&, outputs: darray[Probe]&, k: i64, early: bool) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            region scratch(32768):
+                in scratch:
+                    initial: State = zeroed
+                    same: mutable i64 = 0
+                    for i in 0..<inputs.count.i64() |program, entry, inputs, outputs, initial, k, same, early|:
+                        actual: darray[i64] = run(program, entry, &inputs[i.usize()].values, k, &initial)
+                        if same_row(&actual, &outputs[i.usize()].values):
+                            same <- same + 1
+                        elif early and same == 0 and i == 2:
+                            break
+                    return same
+            return 0
+
+    def twins(program: darray[Node]&, rules: darray[i64]&, rule: i64, level: CipherAbyss::Grade) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            code: mutable dstr = []
+            write_code(&code, program, rule)
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, twin_seed(&code))
+            inputs: mutable darray[Probe] = []
+            outputs: mutable darray[Probe] = []
+            initial: State = zeroed
+            k: i64 = level.symbols
+            for _ in 0..<24 |program, level, k, draw, inputs, outputs, initial, rule|:
+                row: darray[i64] = random_row(&draw, level.length, k)
+                inputs.push(Probe{values: row})
+                outputs.push(Probe{values: run(program, rule, &row, k, &initial)})
+            near: mutable darray[NearRule] = []
+            for entry in rules:
+                continue if entry == rule
+                matches: i64 = closeness(program, entry, &inputs, &outputs, k, true)
+                continue if matches < 3
+                length: i64 = size(program, entry)
+                slot: mutable i64 = near.count.i64()
+                while slot > 0 |near, slot, matches, length|:
+                    prior: NearRule = near[(slot - 1).usize()]
+                    break if prior.same > matches or (prior.same == matches and prior.size <= length)
+                    slot <- slot - 1
+                continue if slot >= 40
+                item: NearRule = NearRule{entry: entry, same: matches, size: length}
+                if near.count.i64() < 40:
+                    near.push(item)
+                at: mutable i64 = near.count.i64() - 1
+                while at > slot |at, near, slot|:
+                    near[at.usize()] <- near[(at - 1).usize()]
+                    at <- at - 1
+                near[slot.usize()] <- item
+            result: mutable darray[i64] = []
+            for item in near:
+                result.push(item.entry)
+            return result
+
+    def splits(program: mutable darray[Node]&, entry: i64, level: CipherAbyss::Grade) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            p: Node = program[entry.usize()]
+            op: i64 = p.op
+            out: mutable darray[i64] = []
+            k: i64 = level.symbols
+            if op == ROT or op == SHIFT:
+                modulus: i64 = level.length if op == ROT else k
+                for b in 1..<modulus |program, p, op, modulus, out|:
+                    c: i64 = modulo(p.args[0] - b, modulus)
+                    if c != 0:
+                        left: i64 = atomic(program, op, b)
+                        right: i64 = atomic(program, op, c)
+                        out.push(pair(program, SEQ, left, right))
+            elif op == MUL:
+                for b in 2..<k |program, p, k, out|:
+                    for c in 2..<k |program, p, k, out, b|:
+                        if (b * c) % k == p.args[0] % k:
+                            left: i64 = atomic(program, MUL, b)
+                            right: i64 = atomic(program, MUL, c)
+                            out.push(pair(program, SEQ, left, right))
+            elif op == REV and level.length % 2 == 0:
+                left: i64 = atomic(program, MIRROR)
+                right: i64 = atomic(program, ROT, level.length / 2)
+                out.push(pair(program, SEQ, left, right))
+            return out
+
+    def rewrites(program: mutable darray[Node]&, entry: i64, level: CipherAbyss::Grade) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            node: Node = program[entry.usize()]
+            op: i64 = node.op
+            return splits(program, entry, level) if op < FIRST
+            out: mutable darray[i64] = []
+            return out if op != SEQ and op != IF and op != ALT and op != EXCEPT
+            start: i64 = 1 if op == IF else 0
+            count: i64 = 1 if op == EXCEPT else node.children.count.i64()
+            for i in start..<count |program, node, op, level, out, count|:
+                piece: i64 = node.children[i.usize()]
+                expand: bool = op == SEQ and program[piece.usize()].op < FIRST
+                alternatives: darray[i64] = rewrites(program, piece, level)
+                for replacement in alternatives:
+                    parts: mutable darray[i64] = sliced(&node.children, 0, i)
+                    if expand:
+                        new_piece: Node = program[replacement.usize()]
+                        append_list(&parts, &new_piece.children)
+                    else:
+                        parts.push(replacement)
+                    for at in (i + 1)..<node.children.count.i64() |parts, node|:
+                        parts.push(node.children[at.usize()])
+                    out.push(add_node(program, op, [], parts))
+                if op == SEQ and i + 1 < count:
+                    parts: mutable darray[i64] = sliced(&node.children, 0, count)
+                    parts[i.usize()] <- node.children[(i + 1).usize()]
+                    parts[(i + 1).usize()] <- piece
+                    out.push(add_node(program, op, [], parts))
+            return out
+
+    def disguise(program: mutable darray[Node]&, rule: i64, level: CipherAbyss::Grade, draw: mutable MT19937&) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            original: Rank = rank(program, rule, false)
+            candidates: darray[i64] = rewrites(program, rule, level)
+            ways: mutable darray[i64] = []
+            for entry in candidates:
+                changed: Rank = rank(program, entry, false)
+                if code_less(&original.code, &changed.code) or code_less(&changed.code, &original.code):
+                    ways.push(entry)
+            py_shuffle_i64(draw, &ways)
+            for i in 0..<CipherAbyss::min(12, ways.count.i64()) |program, rule, level, ways|:
+                entry: i64 = ways[i.usize()]
+                return entry if same_machine(program, entry, rule, level)
+            return -1
+
+    struct Twin:
+        entry: i64
+        same: bool
+
+    def twin_for(program: mutable darray[Node]&, rule: i64, near: darray[i64]&, level: CipherAbyss::Grade, draw: mutable MT19937&) -> Twin:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            if py_random(draw) < 0.5:
+                retold: i64 = disguise(program, rule, level, draw)
+                return Twin{entry: retold, same: true} if retold >= 0
+            k: i64 = level.symbols
+            inputs: darray[Probe] = probes(level.length, k, 64, 31)
+            outputs: mutable darray[Probe] = []
+            initial: State = zeroed
+            for row in inputs:
+                outputs.push(Probe{values: run(program, rule, &row.values, k, &initial)})
+            candidates: mutable darray[Rank] = []
+            stateful: bool = uses_state(program, rule)
+            for entry in near:
+                continue if uses_state(program, entry) != stateful
+                apart: i64 = inputs.count.i64() - closeness(program, entry, &inputs, &outputs, k, false)
+                if apart > 0 and apart <= inputs.count.i64() / 4:
+                    candidates.push(rank(program, entry, false))
+            return Twin{entry: -1, same: false} if candidates.count == 0.usize()
+            sort_ranks(&candidates)
+            chosen: usize = py_randbelow(draw, candidates.count.u64()).usize()
+            return Twin{entry: candidates[chosen].entry, same: false}

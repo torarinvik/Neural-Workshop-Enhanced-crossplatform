@@ -1,0 +1,180 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/scene_emotionfaces.elisa"
+
+extern getchar() -> i32 can[Blocking.IO]
+extern dprintf(fd: i32, format: cstr, ...) -> i32 can[Console.Write]
+extern exit(code: i32) can[Console.Write]
+
+# Built -O2, `assert` is dropped together with everything inside it; this
+# check stays, and a failure ends the sweep with a nonzero exit.
+def require(ok: bool, what: cstr):
+    can Console.Write:
+        if not ok:
+            _ = dprintf(2.i32(), "FAILED: %s\n", what)
+            exit(3.i32())
+
+def text_bytes(text: sview):
+    can Console.Write, Abort.Panic:
+        for i in 0..<sview_len(text).i64() |text|:
+            _ = dprintf(1.i32(), "%02x", sview_at(text, i.usize()).i32())
+        _ = dprintf(1.i32(), "\n")
+
+def flag(value: bool) -> i64:
+    return 1 if value else 0
+
+def emit(quiz: ReadingQuiz::Round&, draw: mutable MT19937&):
+    can Abort.Panic, Console.Write:
+        _ = dprintf(1.i32(), "deal %lld %.17g\n", quiz.need, py_random(draw))
+        for item in quiz.items:
+            text_bytes(bytes_view(item.prompt))
+            text_bytes(sview(item.title, 0, -1))
+            _ = dprintf(1.i32(), "item %.17g\n", item.seconds)
+            for step in item.steps:
+                text_bytes(bytes_view(step.ask))
+                _ = dprintf(1.i32(), "step %lld %lld %lld\n", step.options.count.i64(), step.answer, flag(step.wide))
+                for option in step.options:
+                    text_bytes(bytes_view(option))
+
+def emit_run(quiz: ReadingQuiz::Round, policy: i64):
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        return if quiz.need == 0
+        run: mutable ReadingQuiz::Run = ReadingQuiz::begin(quiz)
+        while run.result == ReadingQuiz::LIVE |run, policy|:
+            answer: i64 = ReadingQuiz::pilot(&run)
+            accepted: mutable bool = false
+            if answer >= 0 and policy != 2:
+                st: ReadingQuiz::Step = ReadingQuiz::active_step(&run)
+                # Policy 3 misses only an item's first step.
+                right: bool = policy == 0 or (policy == 3 and run.progress > 0)
+                port: i64 = answer if right else (answer + 1) % st.options.count.i64()
+                box: ReadingQuiz::Box = ReadingQuiz::option_box(port, st.options.count.i64(), st.wide)
+                y: f64 = box.y + box.height / 2.0
+                if y >= 0.0:
+                    accepted <- ReadingQuiz::click(&run, box.x + box.width / 2.0, y)
+                else:
+                    accepted <- ReadingQuiz::choose(&run, port)
+            ReadingQuiz::advance_quiz(&run, 1.0 / 30.0)
+            _ = dprintf(1.i32(), "tick %lld %lld %lld %lld %lld %lld %.17g %.17g %lld\n",
+                flag(accepted), run.index, run.progress, run.right, run.wrong, flag(run.showing), run.time, run.since, run.result)
+        for cue in run.cues:
+            _ = dprintf(1.i32(), "cue %.17g %.17g %.17g %lld %.17g\n", cue.time, cue.duration, cue.frequency, cue.voice, cue.gain)
+
+# Each item's face and crop.
+def emit_faces(round: EmotionFaces::Round&):
+    can Abort.Panic, Console.Write:
+        for k in 0..<round.faces.count.i64() |round|:
+            _ = dprintf(1.i32(), "face %lld %lld\n", round.faces[k.usize()], round.crops[k.usize()])
+
+# The page as the reference draws it: as dealt, with a wrong answer
+# shown, timed out, and once the face is covered (or a second on).
+def emit_pages(round: EmotionFaces::Round&, corpus: EmotionFaces::Corpus&):
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        for policy in 0..<4 |round, corpus|:
+            run: mutable ReadingQuiz::Run = ReadingQuiz::begin(round.quiz)
+            step: ReadingQuiz::Step = ReadingQuiz::active_step(&run)
+            if policy == 1:
+                _ = ReadingQuiz::choose(&run, (step.answer + 1) % step.options.count.i64())
+            elif policy == 2:
+                ReadingQuiz::advance_quiz(&run, round.quiz.items[0].seconds)
+            elif policy == 3:
+                ReadingQuiz::advance_quiz(&run, round.level.flash + 0.05 if round.level.flash > 0.0 else 1.0)
+            page: mutable Display::DisplayList = Display::DisplayList()
+            SceneEmotionFaces::page(&page, &run, corpus, round.level.flash, &round.faces, &round.crops)
+            for command in page.commands |page|:
+                if command.kind == Display::CMD_TEXT:
+                    _ = dprintf(1.i32(), "label %u %.9g %.9g %.9g %d ", command.color, command.a.f64(), command.b.f64(),
+                        command.c.f64(), command.d.i32())
+                    offset: i64 = command.ref.i64()
+                    length: i64 = (command.len & 0xffffff.u32()).i64()
+                    text_bytes(bytes_view_range(page.pool, offset.usize(), length.usize()))
+                else:
+                    _ = dprintf(1.i32(), "shape %d %u %.9g %.9g %.9g %.9g\n", command.kind.i32(), command.color,
+                        command.a.f64(), command.b.f64(), command.c.f64(), command.d.f64())
+            _ = dprintf(1.i32(), "end\n")
+
+def check_session(corpus: EmotionFaces::Corpus&):
+    can Abort.Panic, Memory.Release, Memory.Allocate:
+        session: mutable EmotionFacesGame::Session = EmotionFacesGame::initialize(11, 2, true, -17)
+        require((EmotionFacesGame::start(&session, corpus, 0.0) can Global{Read,Write}), "emotionfaces_sweep line 91")
+        first: ReadingQuiz::Step = ReadingQuiz::active_step(&session.run)
+        box: ReadingQuiz::Box = ReadingQuiz::option_box(first.answer, first.options.count.i64(), first.wide)
+        require(EmotionFacesGame::pointer(&session, HandView::VIEW_LEFT + (box.x + box.width / 2.0) * HandView::VIEW_SCALE,
+            HandView::VIEW_BOTTOM + (box.y + box.height / 2.0) * HandView::VIEW_SCALE, 1), "emotionfaces_sweep line 94")
+        require(session.run.right == 1 and session.run.showing, "emotionfaces_sweep line 96")
+        require(session.faces.count == session.run.round.items.count and session.crops.count == session.faces.count, "emotionfaces_sweep line 97")
+        require(session.level.flash == EmotionFaces::grade(11).flash, "emotionfaces_sweep line 98")
+        clock: mutable f64 = 0.0
+        while session.phase == EmotionFacesGame::PLAYING |session, corpus, clock|:
+            port: i64 = ReadingQuiz::pilot(&session.run)
+            if port >= 0:
+                require(EmotionFacesGame::choose(&session, port), "emotionfaces_sweep line 103")
+                require(not EmotionFacesGame::choose(&session, port), "emotionfaces_sweep line 104")
+            clock <- clock + 0.05
+            require((EmotionFacesGame::advance(&session, corpus, clock) can Global{Read,Write}), "emotionfaces_sweep line 106")
+        require(session.phase == EmotionFacesGame::JUDGED and session.rung == 12, "emotionfaces_sweep line 107")
+        require(session.best_rung == 11 and session.wins == 1 and session.trial == 1, "emotionfaces_sweep line 108")
+        require(not (EmotionFacesGame::advance(&session, corpus, session.deadline - 0.001) can Global{Read,Write}), "emotionfaces_sweep line 109")
+        clock <- session.deadline
+        require((EmotionFacesGame::advance(&session, corpus, clock) can Global{Read,Write}), "emotionfaces_sweep line 111")
+        while session.phase == EmotionFacesGame::PLAYING |session, corpus, clock|:
+            step: ReadingQuiz::Step = ReadingQuiz::active_step(&session.run)
+            if step.answer >= 0 and step.options.count > 0.usize():
+                bad: i64 = (step.answer + 1) % step.options.count.i64()
+                require(EmotionFacesGame::choose(&session, bad), "emotionfaces_sweep line 116")
+            clock <- clock + 0.05
+            require((EmotionFacesGame::advance(&session, corpus, clock) can Global{Read,Write}), "emotionfaces_sweep line 118")
+        require(session.phase == EmotionFacesGame::JUDGED and session.rung == 11 and session.trial == 2, "emotionfaces_sweep line 119")
+        require((EmotionFacesGame::advance(&session, corpus, session.deadline) can Global{Read,Write}), "emotionfaces_sweep line 120")
+        require(session.phase == EmotionFacesGame::DONE and session.wins == 1, "emotionfaces_sweep line 121")
+        require((EmotionFacesGame::start(&session, corpus, session.time) can Global{Read,Write}), "emotionfaces_sweep line 122")
+        require(session.phase == EmotionFacesGame::PLAYING and session.rung == 11 and session.trial == 1 and session.wins == 0, "emotionfaces_sweep line 123")
+        EmotionFacesGame::close(&session) can Global{Read,Write}
+        require(session.phase == EmotionFacesGame::READY, "emotionfaces_sweep line 125")
+
+def test_level(corpus: EmotionFaces::Corpus&, rung: i64):
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        g: EmotionFaces::Grade = EmotionFaces::grade(rung)
+        _ = dprintf(1.i32(), "level %lld %lld %.17g %.17g %.17g %.17g %lld %.17g %.17g\n", g.rung, g.options, g.low, g.high,
+            g.flash, g.crop, flag(g.two), g.seconds, g.skill)
+        for seed in 0..<16 |g, corpus|:
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, seed.u64())
+            candidate: EmotionFaces::Round = EmotionFaces::build(g, &draw, corpus)
+            emit(&candidate.quiz, &draw)
+            emit_faces(&candidate)
+        rng: mutable MT19937 = zeroed
+        mt_seed_int(&rng, 17.u64())
+        dealt: EmotionFaces::Round = EmotionFaces::deal(g, &rng, corpus)
+        emit(&dealt.quiz, &rng)
+        emit_faces(&dealt)
+        # No round at this rung from these faces (Python raises).
+        return if dealt.quiz.items.count == 0.usize()
+        emit_pages(&dealt, corpus)
+        emit_run(dealt.quiz, 0)
+        if rung == 10:
+            emit_run(dealt.quiz, 1)
+            emit_run(dealt.quiz, 2)
+        emit_run(dealt.quiz, 3)
+
+def main() -> i32:
+    can Abort.Panic, Blocking.IO, Console.Write, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+        for rung in [1, 4, 7, 10, 13, 16, 20, 25, 30]:
+            note: mutable dstr = []
+            SceneEmotionFaces::option_note(rung, &note)
+            text_bytes(bytes_view(note))
+        corpus: EmotionFaces::Corpus = EmotionFaces::drawn_faces()
+        for face in corpus.faces |corpus|:
+            _ = dprintf(1.i32(), "drawn")
+            for k in 0..<8 |face|:
+                _ = dprintf(1.i32(), " %lld", face.votes[k.usize()])
+            for k in 0..<6 |face|:
+                _ = dprintf(1.i32(), " %.17g", face.params[k.usize()])
+            _ = dprintf(1.i32(), "\n")
+        for rung in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 20, 25, 30, 99] |corpus|:
+            region trial(4194304):
+                in trial:
+                    test_level(&corpus, rung)
+        check_session(&corpus) can Global{Read,Write}
+        return 0.i32()

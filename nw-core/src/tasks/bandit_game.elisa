@@ -1,0 +1,186 @@
+include "./bandit.elisa"
+
+module BanditGame:
+    const READY: i64 = 0
+    const PLAYING: i64 = 1
+    const JUDGED: i64 = 2
+    const DONE: i64 = 3
+    const FLAGGED: i64 = 4
+    const START: i64 = Bandit::ARMS
+    const FEEDBACK_MS: i64 = 3000
+
+    struct Session:
+        rng: mutable MT19937
+        start_rung: i64
+        total: i64
+        adaptive: bool
+        rung: mutable i64
+        trial: mutable i64
+        phase: mutable i64
+        run: mutable Bandit::Deal
+        chosen: mutable i64[Bandit::PULLS]
+        pulls: mutable i64
+        coins: mutable i64
+        revealed_coins: mutable i64
+        par: mutable f64
+        passed: mutable bool
+        verdict_coins: mutable i64
+        wins: mutable i64
+        best_rung: mutable i64
+        deadline_ms: mutable i64
+        last_ms: mutable i64
+        forfeits: mutable i64
+        agent_seconds: mutable f64
+        think_capacity: mutable f64
+        think_refill: mutable f64
+        think_left: mutable f64
+        agent_mode: mutable bool
+        verdict_published: mutable bool
+        has_verdict: mutable bool
+
+    def allowed_rung(rung: i64) -> bool:
+        return rung == 1 or rung == 4 or rung == 7 or rung == 10 or rung == 13 or rung == 16 or rung == 20 or rung == 25 or rung == 30
+
+    def allowed_total(total: i64) -> bool:
+        return total == 1 or total == 3 or total == 5 or total == 10
+
+    def initialize(rung: i64, total: i64, adaptive: bool, seed: i64) -> Session:
+        can Abort.Panic:
+            rng: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&rng, magnitude)
+            initial: i64 = rung if rung > 0 else 1
+            return Session{rng: rng, start_rung: initial, total: total, adaptive: adaptive,
+                rung: initial, trial: 0, phase: READY, run: zeroed, chosen: zeroed,
+                pulls: 0, coins: 0, revealed_coins: 0, par: 0.0, passed: false, verdict_coins: 0, wins: 0,
+                best_rung: 0, deadline_ms: 0, last_ms: 0,
+                forfeits: 0, agent_seconds: 0.0, think_capacity: 0.0, think_refill: 0.0,
+                think_left: 0.0, agent_mode: false, verdict_published: false, has_verdict: false}
+
+    def next_trial(session: mutable Session&, now_ms: i64):
+        can Abort.Panic:
+            session.last_ms <- now_ms
+            session.pulls <- 0
+            session.coins <- 0
+            session.revealed_coins <- 0
+            if session.trial >= session.total:
+                session.phase <- DONE
+                return
+            session.run <- Bandit::deal(session.rung, &session.rng)
+            session.par <- Bandit::par(&session.run)
+            session.trial <- session.trial + 1
+            session.verdict_published <- false
+            session.has_verdict <- false
+            session.phase <- PLAYING
+
+    def reconfigure(session: mutable Session&, rung: i64, total: i64, adaptive: bool) -> bool:
+        can Abort.Panic:
+            return false if session.agent_mode or (session.phase != READY and session.phase != DONE)
+            return false if not allowed_rung(rung) or not allowed_total(total)
+            rng: MT19937 = session.rng
+            session[0] <- initialize(rung, total, adaptive, 0)
+            session.rng <- rng
+            return true
+
+    def start(session: mutable Session&, now_ms: i64) -> bool:
+        can Abort.Panic:
+            return false if session.total <= 0 or (session.phase != READY and session.phase != DONE)
+            session.rung <- session.start_rung
+            session.trial <- 0
+            session.wins <- 0
+            session.best_rung <- 0
+            session.forfeits <- 0
+            session.think_left <- session.think_capacity
+            next_trial(session, now_ms)
+            return true
+
+    def judge(session: mutable Session&, now_ms: i64):
+        passed: bool = session.coins.f64() >= session.par - 1e-9
+        session.passed <- passed
+        session.has_verdict <- true
+        session.verdict_coins <- session.coins
+        if passed:
+            session.wins <- session.wins + 1
+            session.best_rung <- session.rung if session.rung > session.best_rung
+        if session.adaptive:
+            session.rung <- session.rung + 1 if passed and session.rung < 9223372036854775807
+            session.rung <- session.rung - 1 if not passed and session.rung > 1
+        session.deadline_ms <- now_ms + FEEDBACK_MS
+        session.phase <- JUDGED
+
+    def input(session: mutable Session&, port: i64, now_ms: i64) -> bool:
+        can Abort.Panic:
+            return false if now_ms < session.last_ms or now_ms > 9007199254740991
+            return start(session, now_ms) if port == START
+            return false if session.phase != PLAYING or port < 0 or port >= session.run.level.arms
+            turn: i64 = session.pulls
+            session.chosen[turn.usize()] <- port
+            session.coins <- session.coins + Bandit::payout(&session.run, turn, port)
+            session.pulls <- turn + 1
+            session.last_ms <- now_ms
+            if session.pulls == session.run.level.pulls:
+                session.revealed_coins <- session.coins
+                judge(session, now_ms)
+            elif session.pulls % session.run.level.batch == 0:
+                session.revealed_coins <- session.coins
+            return true
+
+    def advance(session: mutable Session&, now_ms: i64) -> bool:
+        can Abort.Panic:
+            return false if now_ms < session.last_ms or now_ms > 9007199254740991
+            return false if session.agent_mode or session.phase != JUDGED or now_ms < session.deadline_ms
+            next_trial(session, now_ms)
+            return true
+
+    def configure_think(session: mutable Session&, capacity: f64, refill: f64) -> bool:
+        return false if session.phase != READY or not (capacity >= 0.0 and capacity <= 1.7976931348623157e308)
+        return false if not (refill >= 0.0 and refill <= 1.7976931348623157e308)
+        session.agent_mode <- true
+        session.think_capacity <- capacity
+        session.think_refill <- refill if refill < capacity else capacity
+        session.think_left <- capacity
+        return true
+
+    def agent_action(session: mutable Session&, port: i64) -> bool:
+        can Abort.Panic:
+            return false if not session.agent_mode
+            return input(session, port, (session.agent_seconds * 1000.0).i64())
+
+    def step(session: mutable Session&, elapsed_seconds: f64) -> bool:
+        can Abort.Panic:
+            next: f64 = session.agent_seconds + elapsed_seconds
+            return false if not session.agent_mode or not (elapsed_seconds > 0.0 and next <= 9007199254740.0)
+            return false if session.phase == READY or session.phase == DONE
+            session.agent_seconds <- next
+            if session.phase == PLAYING:
+                if session.think_capacity > 0.0:
+                    session.think_left <- session.think_left - elapsed_seconds
+                    if session.think_left <= 0.000000001:
+                        session.think_left <- 0.0
+                        session.forfeits <- session.forfeits + 1
+                        session.has_verdict <- false
+                        session.phase <- FLAGGED
+                return true
+            if session.phase == JUDGED and not session.verdict_published:
+                session.verdict_published <- true
+                return true
+            next_trial(session, (next * 1000.0).i64())
+            if session.phase == PLAYING:
+                room: f64 = session.think_capacity - session.think_left
+                session.think_left <- session.think_left + (session.think_refill if session.think_refill < room else room)
+            return true
+
+    def info(session: Session&, field: i64) -> i64:
+        return session.phase if field == 0
+        return session.rung if field == 1
+        return session.trial if field == 2
+        return session.total if field == 3
+        return session.pulls if field == 4
+        return session.revealed_coins if field == 5
+        return session.wins if field == 6
+        return session.best_rung if field == 7
+        return session.start_rung if field == 8
+        return 1 if field == 9 and session.adaptive
+        return 0 if field == 9
+        return session.forfeits if field == 10
+        return -1

@@ -1,0 +1,113 @@
+def sdl_go_option_change(row: i64, current: i64, direction: i64) -> i64:
+    limit: i64 = 10 if row == 0 else 50
+    next: mutable i64 = current
+    while true |next, limit, row, direction|:
+        next <- (next + direction + limit - 1) % limit + 1
+        return next if SDLTaskCLI::allowed(9 + row, next)
+    return current
+
+def sdl_go_options_key(handle: i64, key: i64, tasks: usize, from_hub: bool = false) -> i64:
+    can Blocking.IO, Memory.Allocate, Memory.Release, Console.Write, Abort.Panic, Unsafe.PointerCast:
+        return 0 if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: mutable heap GoGame::GoRun& = handle.uintptr().cast[mutable heap GoGame::GoRun&]
+            draft: mutable i64& = (&run.options_draft[0]).uintptr().cast[mutable i64&]
+            if run.options_row < 0:
+                return 0 if key != 99
+                draft[0] <- run.start_difficulty
+                draft[1] <- run.total_trials
+                if tasks != 0.usize():
+                    configured: i64& = tasks.cast[i64&]
+                    draft[0] <- configured[9]
+                    draft[1] <- configured[10]
+                run.options_from_hub <- from_hub
+                run.options_row <- 0
+                return 1
+            if SDLTaskKeys::enter(key) or key == 27:
+                if SDLTaskKeys::enter(key):
+                    run.start_difficulty <- draft[0]
+                    run.total_trials <- draft[1]
+                    GoGame::reset_run(run)
+                    if tasks != 0.usize():
+                        selected: mutable i64& = tasks.cast[mutable i64&]
+                        selected[9] <- draft[0]
+                        selected[10] <- draft[1]
+                        data: mutable u8[128] = zeroed
+                        length: i32 = SDL_snprintf(&data[0], 128.usize(), "%lld %lld\n", draft[0], draft[1])
+                        if length <= 0.i32() or length >= 128.i32() or not sdl_save_profile_sidecar(".go-options", &data[0], length.usize()):
+                            SDL_Log("Could not save Go options")
+                run.options_row <- -1
+                return 2 if run.options_from_hub else 1
+            run.options_row <- SDLTaskKeys::option_row(key, run.options_row, 2)
+            if key == SDLTaskKeys::LEFT or key == SDLTaskKeys::RIGHT or key == 32:
+                row: i64 = run.options_row
+                draft[row.usize()] <- sdl_go_option_change(row, draft[row.usize()], -1 if key == SDLTaskKeys::LEFT else 1)
+            return 1
+
+def sdl_go_options_click(handle: i64, x: f32, y: f32, width: i32, height: i32) -> bool:
+    can Abort.Panic, Unsafe.PointerCast:
+        return false if handle <= 0
+        trusted Unsafe.PointerCast:
+            run: mutable heap GoGame::GoRun& = handle.uintptr().cast[mutable heap GoGame::GoRun&]
+            return false if run.options_row < 0
+            row: i64 = sdl_option_row(x, y, width, height, 2)
+            if row >= 0:
+                if row == run.options_row:
+                    run.options_draft[row.usize()] <- sdl_go_option_change(row, run.options_draft[row.usize()], 1)
+                run.options_row <- row
+            return true
+
+def sdl_read_go_options(output: mutable i64&):
+    can Blocking.IO, Memory.Allocate, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+        path: mutable u8[4096] = zeroed
+        data: mutable u8[128] = zeroed
+        trusted Unsafe.PointerCast:
+            target: mutable u8& = (&path[0]).uintptr().cast[mutable u8&]
+            return if not sdl_task_profile_sidecar(target, ".go-options")
+            if SDL_IOFromFile(target.cast[cstr], "rb") is stream:
+                raw: heap u8& = (&data[0]).uintptr().cast[heap u8&]
+                length: usize = SDL_ReadIO(stream, (&data[0]).cast[mutable void&], 128.usize())
+                status: i32 = SDL_GetIOStatus(stream)
+                closed: bool = SDL_CloseIO(stream)
+                return if not closed or status != 2.i32() or length == 0.usize() or length >= 128.usize()
+                values: mutable i64[2] = zeroed
+                at: mutable i64 = 0
+                for row in 0..<2 |row, values, at, raw, length|:
+                    value: i64 = SyllogismOptions::saved_integer(raw, length.i64(), &at)
+                    valid: bool = SDLTaskCLI::allowed(9 + row, value)
+                    return if not valid
+                    values[row.usize()] <- value
+                while at < length.i64() and SyllogismOptions::whitespace(raw[at.usize()].i64()) |at, length, raw|:
+                    at <- at + 1
+                return if at != length.i64()
+                for row in 0..<2 |row, output, values|:
+                    output[(9 + row).usize()] <- values[row.usize()]
+
+def sdl_go_options_note(list: mutable Display::DisplayList&, ink: u32, level: i64, trials: i64):
+    can Memory.Allocate, Abort.Panic:
+        profile: Go::Difficulty = Go::difficulty_of(level)
+        board: mutable dstr = []
+        dstr_append_i64(&board, profile.size)
+        dstr_append_cstr(&board, " × ")
+        dstr_append_i64(&board, profile.size)
+        dstr_append_cstr(&board, " board   |   White group of ")
+        dstr_append_i64(&board, profile.target_size)
+        dstr_append_cstr(&board, "   |   ")
+        dstr_append_i64(&board, trials)
+        dstr_append_cstr(&board, " position per run" if trials == 1 else " positions per run")
+        Display::draw_text(list, bytes_view(board), 456.0, 362.0, 17.0, ink, Display::ANCHOR_CENTER_CENTER)
+        Display::draw_text(list, "Black to play. One point takes the White group's last liberty.",
+            456.0, 330.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        hints: sview = "The target group and winning move are both marked." if profile.show_move else (
+            "The target group is marked." if profile.show_target else "Find the target group on the board.")
+        Display::draw_text(list, hints, 456.0, 300.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        if profile.decoy_count > 0:
+            decoys: mutable dstr = []
+            dstr_append_cstr(&decoys, "Smaller captures are decoys. Decoy sizes in stones: ")
+            for index in 0..<profile.decoy_count |index, profile, decoys|:
+                if index > 0:
+                    dstr_append_cstr(&decoys, ", ")
+                dstr_append_i64(&decoys, profile.decoys[index.usize()])
+            Display::draw_text(list, bytes_view(decoys), 456.0, 270.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)
+        Display::draw_text(list, "The level stays fixed for the run.",
+            456.0, 236.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER)

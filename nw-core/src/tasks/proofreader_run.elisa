@@ -1,0 +1,303 @@
+include "./proofreader.elisa"
+
+extend Proofreader:
+    const LIVE: i64 = 0
+    const MENDED: i64 = 1
+    const WRONG: i64 = 2
+    const TIMEOUT: i64 = 3
+    const DONE: i64 = HandView::KEYS
+    const RESET: i64 = DONE + 1
+    const PORTS: i64 = RESET + 1
+    const TICK: i64 = 0
+    const LIFT: i64 = 1
+    const DROP: i64 = 2
+    const PICK: i64 = 3
+    const MEND: i64 = 4
+    const MISS: i64 = 5
+
+    const HANDLE_X: f64 = 54.0
+    const NO_CARRY: i64 = 0
+    const CARRY_ROW: i64 = 1
+    const CARRY_WORD: i64 = 2
+
+    struct Carry:
+        kind: i64
+        row: i64
+        index: i64
+
+    struct Cue:
+        t: f64
+        duration: f64
+        frequency: f64
+        voice: i64
+        gain: f64
+        pan: f64
+
+    struct Run:
+        machine: Machine
+        rows: mutable MissingWord::Line[6]
+        hand: mutable HandView::Pointer
+        carry: mutable Carry
+        selected: mutable i64
+        start_x: mutable f64
+        start_y: mutable f64
+        goal_x: mutable f64
+        goal_y: mutable f64
+        moves: mutable i64
+        t: mutable f64
+        result: mutable i64
+        cues: mutable darray[Cue]
+        record: bool
+
+    struct Layout:
+        widths: mutable f64[28]
+        centres: mutable f64[28]
+        scale: mutable f64
+
+    def layout(row: MissingWord::Line&) -> Layout:
+        can Abort.Panic:
+            result: mutable Layout = zeroed
+            total: mutable f64 = 0.0
+            for i in 0..<row.count |row, result, total|:
+                length: i64 = row.words[i.usize()].text.length + (1 if i + 1 == row.count else 0)
+                result.widths[i.usize()] <- length.f64() * 12.0 + 14.0
+                total <- total + result.widths[i.usize()]
+            total <- total + MissingWord::GAP * (row.count - 1).f64() if row.count > 0
+            scale: f64 = fmin(1.0, MissingWord::TEXT_WIDTH / total) if total > 0.0 else 1.0
+            result.scale <- scale
+            x: mutable f64 = MissingWord::TEXT_LEFT
+            for i in 0..<row.count |result, scale, x|:
+                width: f64 = result.widths[i.usize()] * scale
+                result.widths[i.usize()] <- width
+                result.centres[i.usize()] <- x + width / 2.0
+                x <- x + (width + MissingWord::GAP * scale)
+            return result
+
+    def start(machine: Machine, record: bool = true) -> Run:
+        return Run{machine: machine, rows: machine.rows, hand: HandView::initialize(), carry: zeroed,
+            selected: -1, start_x: 0.0, start_y: 0.0, goal_x: 0.0, goal_y: 0.0, moves: 0,
+            t: 0.0, result: LIVE, cues: [], record: record}
+
+    def note(run: mutable Run&, duration: f64, frequency: f64, voice: i64, gain: f64, pan: f64 = 0.0):
+        can Memory.Allocate, Abort.Panic:
+            if run.record:
+                run.cues.push(Cue{t: run.t, duration: duration, frequency: frequency, voice: voice, gain: gain, pan: pan})
+
+    def row_at(y: f64, n: i64) -> i64:
+        for r in 0..<n |y, n|:
+            return r if HandView::absolute(y - MissingWord::row_y(r, n)) <= MissingWord::TILE_H / 2.0 + 6.0
+        return -1
+
+    def options(run: Run&) -> MissingWord::Offer:
+        can Abort.Panic:
+            return zeroed if run.selected < 0
+            return run.machine.options[option_index(run.selected)]
+
+    def done(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != LIVE
+            if equal_rows(&run.machine.original, &run.rows, run.machine.level.sentences):
+                note(run, 0.6, 880.0, MEND, 0.5)
+                run.result <- MENDED
+            else:
+                note(run, 0.5, 90.0, MISS, 0.5)
+                run.result <- WRONG
+
+    def reset(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            run.rows <- run.machine.rows
+            run.selected <- -1
+            note(run, 0.1, 200.0, DROP, 0.3)
+
+    def replace_selected(run: mutable Run&, word: Passages::Word):
+        can Abort.Panic:
+            for r in 0..<run.machine.level.sentences |run, word|:
+                for i in 0..<run.rows[r.usize()].count |run, r, word|:
+                    if run.rows[r.usize()].words[i.usize()].id == run.selected:
+                        run.rows[r.usize()].words[i.usize()] <- MissingWord::Token{id: run.selected, text: word}
+                        run.moves <- run.moves + 1
+                        return
+
+    def press(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            return if run.result != LIVE or run.hand.down
+            run.hand.down <- true
+            x: f64 = run.hand.x
+            y: f64 = run.hand.y
+            run.start_x <- x
+            run.start_y <- y
+            if HandView::absolute(y - MissingWord::BUTTON_Y) <= 20.0:
+                if HandView::absolute(x - MissingWord::DONE_X) <= 60.0:
+                    done(run)
+                    return
+                if HandView::absolute(x - MissingWord::RESET_X) <= 60.0:
+                    reset(run)
+                    return
+            opts: MissingWord::Offer = options(run)
+            if HandView::absolute(y - MissingWord::OPT_Y) <= MissingWord::TILE_H / 2.0 + 4.0:
+                for k in 0..<opts.count |opts, x, run|:
+                    if HandView::absolute(x - MissingWord::option_x(k, opts.count)) <= MissingWord::OPT_WIDTH / 2.0:
+                        replace_selected(run, opts.words[k.usize()])
+                        run.selected <- -1
+                        note(run, 0.08, 660.0, PICK, 0.3)
+                        return
+            run.selected <- -1
+            r: i64 = row_at(y, run.machine.level.sentences)
+            return if r < 0
+            if HandView::absolute(x - HANDLE_X) <= 30.0:
+                run.carry <- Carry{kind: CARRY_ROW, row: r, index: 0}
+                note(run, 0.05, 300.0, LIFT, 0.3)
+                return
+            tiles: Layout = layout(&run.rows[r.usize()])
+            for i in 0..<run.rows[r.usize()].count |tiles, run, x, r|:
+                if HandView::absolute(x - tiles.centres[i.usize()]) <= tiles.widths[i.usize()] / 2.0 + MissingWord::GAP / 2.0:
+                    run.carry <- Carry{kind: CARRY_WORD, row: r, index: i}
+                    note(run, 0.05, 500.0, LIFT, 0.25)
+                    return
+
+    def drop_row(run: mutable Run&, source: i64, y: f64):
+        can Memory.Allocate, Abort.Panic:
+            n: i64 = run.machine.level.sentences
+            target: mutable i64 = 0
+            distance: mutable f64 = HandView::absolute(y - MissingWord::row_y(0, n))
+            for k in 1..<n |target, distance, y, n|:
+                next: f64 = HandView::absolute(y - MissingWord::row_y(k, n))
+                if next < distance:
+                    target <- k
+                    distance <- next
+            if source != target:
+                held: MissingWord::Line = run.rows[source.usize()]
+                stride: i64 = 1 if source < target else -1
+                i: mutable i64 = source
+                while i != target |run, i, target, stride|:
+                    run.rows[i.usize()] <- run.rows[(i + stride).usize()]
+                    i <- i + stride
+                run.rows[target.usize()] <- held
+                run.moves <- run.moves + 1
+            note(run, 0.06, 260.0, DROP, 0.35)
+
+    def release(run: mutable Run&):
+        can Memory.Allocate, Abort.Panic:
+            return if not run.hand.down
+            run.hand.down <- false
+            carry: Carry = run.carry
+            run.carry <- zeroed
+            return if carry.kind == NO_CARRY or run.result != LIVE
+            x: f64 = run.hand.x
+            y: f64 = run.hand.y
+            moved: f64 = HandView::absolute(x - run.start_x) + HandView::absolute(y - run.start_y)
+            if carry.kind == CARRY_ROW:
+                if moved >= 8.0:
+                    drop_row(run, carry.row, y)
+                return
+            r: usize = carry.row.usize()
+            if moved < 8.0:
+                id: i64 = run.rows[r].words[carry.index.usize()].id
+                if run.machine.options[option_index(id)].count > 0:
+                    run.selected <- id
+                note(run, 0.05, 700.0, TICK, 0.2)
+                return
+            return if row_at(y, run.machine.level.sentences) != carry.row
+            tiles: Layout = layout(&run.rows[r])
+            target: mutable i64 = 0
+            for i in 0..<run.rows[r].count |target, carry, tiles, x|:
+                target <- target + 1 if i != carry.index and tiles.centres[i.usize()] < x
+            shift(&run.rows[r], carry.index, target)
+            run.moves <- run.moves + 1
+            note(run, 0.06, 420.0, DROP, 0.3, (x - 500.0) / 500.0)
+
+    def act(run: mutable Run&, port: i64):
+        can Memory.Allocate, Abort.Panic:
+            if port < HandView::PRESS:
+                HandView::move(&run.hand, port)
+            elif port == HandView::PRESS:
+                press(run)
+            elif port == HandView::RELEASE:
+                release(run)
+            elif run.result == LIVE:
+                if port == DONE:
+                    done(run)
+                elif port == RESET:
+                    reset(run)
+
+    def step(run: mutable Run&, dt: f64):
+        return if run.result != LIVE
+        run.t <- run.t + dt
+        run.result <- TIMEOUT if run.t >= run.machine.level.seconds
+
+    def aim(run: mutable Run&, x: f64, y: f64, goal_x: f64, goal_y: f64) -> i64:
+        port: i64 = HandView::toward(&run.hand, x, y)
+        return port if port >= 0
+        return HandView::RELEASE if run.hand.down
+        run.goal_x <- goal_x
+        run.goal_y <- goal_y
+        return HandView::PRESS
+
+    def row_origin(row: MissingWord::Line&, fallback: i64) -> i64:
+        can Abort.Panic:
+            return row.words[0].id / 100 if row.count > 0 else fallback
+
+    def word_destination(row: MissingWord::Line&, tiles: Layout&, source: i64, target: i64) -> f64:
+        can Abort.Panic:
+            # Map an index in the row without the dragged tile to its centre.
+            if target == 0:
+                return tiles.centres[(1 if source == 0 else 0).usize()] - 20.0
+            if target == row.count - 1:
+                return tiles.centres[(row.count - (2 if source == row.count - 1 else 1)).usize()] + 20.0
+            left: i64 = target - 1 if target - 1 < source else target
+            right: i64 = target if target < source else target + 1
+            return (tiles.centres[left.usize()] + tiles.centres[right.usize()]) / 2.0
+
+    def pilot(run: mutable Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            return HandView::RELEASE if run.hand.down and run.carry.kind == NO_CARRY
+            if run.carry.kind != NO_CARRY:
+                port: i64 = HandView::toward(&run.hand, run.goal_x, run.goal_y)
+                return port if port >= 0 else HandView::RELEASE
+            n: i64 = run.machine.level.sentences
+            for r in 0..<n |run, n|:
+                if row_origin(&run.rows[r.usize()], r) != r:
+                    for j in 0..<n |run, r, n|:
+                        if row_origin(&run.rows[j.usize()], j) == r:
+                            return aim(run, HANDLE_X, MissingWord::row_y(j, n), HANDLE_X, MissingWord::row_y(r, n))
+            for r in 0..<n |run, n|:
+                for i in 0..<run.rows[r.usize()].count |run, r, n|:
+                    token: MissingWord::Token = run.rows[r.usize()].words[i.usize()]
+                    truth: Passages::Word = run.machine.original[(token.id / 100).usize()].words[(token.id % 100).usize()].text
+                    continue if MissingWord::same_word(token.text, truth)
+                    if run.selected == token.id:
+                        opts: MissingWord::Offer = options(run)
+                        for k in 0..<opts.count |opts, run, truth|:
+                            if MissingWord::same_word(opts.words[k.usize()], truth):
+                                x: f64 = MissingWord::option_x(k, opts.count)
+                                return aim(run, x, MissingWord::OPT_Y, x, MissingWord::OPT_Y)
+                    tiles: Layout = layout(&run.rows[r.usize()])
+                    x: f64 = tiles.centres[i.usize()]
+                    y: f64 = MissingWord::row_y(r, n)
+                    return aim(run, x, y, x, y)
+            for r in 0..<n |run, n|:
+                for i in 0..<run.rows[r.usize()].count |run, r, n|:
+                    continue if run.rows[r.usize()].words[i.usize()].id % 100 == i
+                    for j in 0..<run.rows[r.usize()].count |run, r, i, n|:
+                        if run.rows[r.usize()].words[j.usize()].id % 100 == i:
+                            row: MissingWord::Line = run.rows[r.usize()]
+                            tiles: Layout = layout(&row)
+                            y: f64 = MissingWord::row_y(r, n)
+                            return aim(run, tiles.centres[j.usize()], y, word_destination(&row, &tiles, j, i), y)
+            return aim(run, MissingWord::DONE_X, MissingWord::BUTTON_Y, MissingWord::DONE_X, MissingWord::BUTTON_Y)
+
+    def deal(level: Grade, draw: mutable MT19937&, corpus: MissingWordGame::Corpus&) -> Candidate:
+        can Memory.Allocate, Abort.Panic:
+            for _ in 0..<200 |level, draw, corpus|:
+                next: mutable MT19937 = zeroed
+                mt_seed_int(&next, py_getrandbits(draw, 32))
+                candidate: Candidate = build(level, &next, corpus)
+                continue if not candidate.valid
+                run: mutable Run = start(candidate.machine, false)
+                while run.result == LIVE |run|:
+                    port: i64 = pilot(&run)
+                    act(&run, port)
+                    step(&run, 1.0 / 60.0)
+                return candidate if run.result == MENDED
+            return zeroed

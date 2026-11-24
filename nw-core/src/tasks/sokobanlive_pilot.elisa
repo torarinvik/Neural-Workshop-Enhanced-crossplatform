@@ -1,0 +1,224 @@
+include "./sokobanlive_search.elisa"
+
+module SokobanLivePilot:
+    const CELLS: i64 = SokobanLive::MOST_CELLS
+    const LOOKAHEAD: i64 = 6
+    const CLOCK_STEP: f64 = 1.0 / 30.0
+
+    struct Spot:
+        player: mutable i64
+        boxes: bool[CELLS]
+        time: mutable f64
+
+    struct Timeline:
+        spots: Spot[LOOKAHEAD]
+        count: mutable i64
+
+    struct Pilot:
+        search: mutable SokobanLiveSearch::Search
+        dist: i64[CELLS]
+        boxes: mutable PySet::Table
+        frozen: mutable PySet::Table
+        pushes: mutable i64
+        plan: mutable darray[i64]
+        cursor: mutable i64
+        expected_crates: mutable u64
+        expected_player: mutable i64
+        since: mutable f64
+        draw: mutable MT19937
+
+    def create(floor: SokobanLive::Warehouse&) -> Pilot:
+        can Abort.Panic, Memory.Allocate:
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, 7.u64())
+            boxes: mutable PySet::Table = PySet::new(8)
+            for i in 0..<SokobanLiveSearch::SET_SLOTS |floor, boxes|:
+                c: i64 = SokobanLiveSearch::crate(floor.crate_slots, i)
+                if c >= 0:
+                    Ints::put(&boxes.slots, i, c)
+                    boxes.fill <- boxes.fill + 1
+                    boxes.used <- boxes.used + 1
+            return Pilot{search: SokobanLiveSearch::create(), dist: SokobanLiveSearch::distances(floor),
+                boxes: boxes, frozen: PySet::new(8), pushes: 0, plan: [], cursor: 0,
+                expected_crates: 0.u64(), expected_player: -1, since: 0.0, draw: draw}
+
+    def capture_crate_slots(pilot: mutable Pilot&) -> u64:
+        can Abort.Panic:
+            PySet::copy_from(&pilot.boxes, &pilot.frozen)
+            slots: mutable u64 = 0.u64()
+            for i in 0..<SokobanLiveSearch::SET_SLOTS |pilot, slots|:
+                c: i64 = Ints::at(pilot.frozen.slots, i)
+                slots <- slots | ((c + 1).u64() << (i * 8).u64()) if c >= 0
+            return slots
+
+    def timeline(run: SokobanLive::Run&, plan: darray[i64]&, offset: i64) -> Timeline:
+        can Abort.Panic:
+            result: mutable Timeline = zeroed
+            position: mutable Spot = Spot{player: run.player, boxes: run.boxes, time: 0.0}
+            remaining: i64 = plan.count.i64() - offset
+            count: i64 = LOOKAHEAD if remaining > LOOKAHEAD else remaining
+            width: i64 = run.warehouse.level.width
+            for i in 0..<count |run, result, position, plan, offset, width|:
+                stride: i64 = Sokoban::step_of(width, plan[(offset + i).usize()])
+                destination: i64 = position.player + stride
+                if run.warehouse.walls[destination.usize()]:
+                    result.count <- 0
+                    return result
+                if position.boxes[destination.usize()]:
+                    position.boxes[destination.usize()] <- false
+                    position.boxes[(destination + stride).usize()] <- true
+                position.player <- destination
+                result.spots[i.usize()] <- position
+                result.count <- result.count + 1
+                position.time <- position.time + (SokobanLive::STEP + CLOCK_STEP)
+            return result
+
+    def spot_at(route: Timeline&, elapsed: f64) -> i64:
+        can Abort.Panic:
+            at: mutable i64 = 0
+            for i in 1..<route.count |route, elapsed, at|:
+                break if route.spots[i.usize()].time > elapsed
+                at <- i
+            return at
+
+    def safe(run: SokobanLive::Run&, route: Timeline&, horizon: f64) -> bool:
+        can Abort.Panic:
+            guards: mutable SokobanLive::Guard[SokobanLive::MOST_GUARDS] = run.guards
+            times: mutable f64[SokobanLive::MOST_GUARDS] = zeroed
+            count: i64 = run.warehouse.level.guards
+            for i in 0..<count |guards, times, run, route|:
+                g: SokobanLive::Guard = guards[i.usize()]
+                return false if SokobanLive::guard_cell(g) == route.spots[0].player
+                times[i.usize()] <- g.next_beat - run.elapsed
+            while true |run, route, horizon, guards, times, count|:
+                next: mutable i64 = -1
+                earliest: mutable f64 = horizon
+                for i in 0..<count |times, next, earliest|:
+                    t: f64 = times[i.usize()]
+                    if t < earliest or (t == earliest and next < 0):
+                        earliest <- t
+                        next <- i
+                break if next < 0
+                ix: usize = next.usize()
+                spot: Spot& = &route.spots[spot_at(route, earliest).usize()]
+                guard: SokobanLive::Guard = SokobanLive::move_guard(run, guards[ix], &spot.boxes)
+                guards[ix] <- guard
+                for i in 0..<count |guards, spot|:
+                    return false if SokobanLive::guard_cell(guards[i.usize()]) == spot.player
+                before: i64 = route.spots[spot_at(route, earliest - 0.08).usize()].player
+                return false if SokobanLive::guard_cell(guard) == before
+                times[ix] <- earliest + run.warehouse.level.beat
+            return true
+
+    def shut_soon(run: SokobanLive::Run&, first: Spot&) -> bool:
+        can Abort.Panic:
+            for i in 0..<run.warehouse.level.shutters |run, first|:
+                shutter: SokobanLive::Shutter = run.warehouse.shutters[i.usize()]
+                if shutter.cell == first.player or first.boxes[shutter.cell.usize()]:
+                    return true if not SokobanLive::shutter_open(shutter, run.elapsed + 0.05)
+            return false
+
+    def parked(run: SokobanLive::Run&, player: i64) -> Timeline:
+        can Abort.Panic:
+            route: mutable Timeline = zeroed
+            route.spots[0] <- Spot{player: player, boxes: run.boxes, time: 0.0}
+            route.count <- 1
+            return route
+
+    def shuffle(draw: mutable MT19937&) -> i64[4]:
+        can Abort.Panic:
+            ways: mutable i64[4] = [0, 1, 2, 3]
+            for i in 0..<3 |draw, ways|:
+                n: usize = (3 - i).usize()
+                k: usize = py_randbelow(draw, n.u64() + 1.u64()).usize()
+                value: i64 = ways[n]
+                ways[n] <- ways[k]
+                ways[k] <- value
+            return ways
+
+    # The reference calls this once per tick. Synchronize its crate set
+    # before the cooldown check so even moves followed by a wait retain
+    # the source set's insertion and deletion history.
+    def order(pilot: mutable Pilot&, run: SokobanLive::Run&) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            if run.pushes != pilot.pushes:
+                PySet::discard(&pilot.boxes, run.push_from)
+                PySet::add(&pilot.boxes, run.push_into)
+                pilot.pushes <- run.pushes
+            return -1 if run.result != SokobanLive::LIVE or run.elapsed < run.ready_at or run.queued >= 0
+            slots: u64 = capture_crate_slots(pilot)
+            crates: u64 = SokobanLiveSearch::key(slots)
+            if run.player != pilot.expected_player or crates != pilot.expected_crates or pilot.cursor >= pilot.plan.count.i64():
+                _ = SokobanLiveSearch::solve(&run.warehouse, &pilot.search, &pilot.dist, slots, run.player, &pilot.plan)
+                pilot.cursor <- 0
+            return -1 if pilot.plan.count == 0.usize()
+            direction: i64 = pilot.plan[pilot.cursor.usize()]
+            route: Timeline = timeline(run, &pilot.plan, pilot.cursor)
+            width: i64 = run.warehouse.level.width
+            if route.count != 0 and safe(run, &route, 1.2):
+                wall: i64 = run.player + Sokoban::step_of(width, direction)
+                return -1 if SokobanLive::solid(run, wall) or shut_soon(run, &route.spots[0])
+                pilot.cursor <- pilot.cursor + 1
+                pilot.expected_player <- route.spots[0].player
+                pilot.expected_crates <- crates
+                if run.boxes[wall.usize()]:
+                    beyond: i64 = wall + Sokoban::step_of(width, direction)
+                    pilot.expected_crates <- SokobanLiveSearch::key(SokobanLiveSearch::moved(slots, wall, beyond))
+                pilot.since <- run.elapsed
+                return direction
+            if run.elapsed - pilot.since < 2.0:
+                stay: Timeline = parked(run, run.player)
+                if safe(run, &stay, 0.9):
+                    pilot.expected_player <- run.player
+                    pilot.expected_crates <- crates
+                    return -1
+            ways: i64[4] = shuffle(&pilot.draw)
+            for i in 0..<4 |pilot, run, ways, width|:
+                way: i64 = ways[i.usize()]
+                at: i64 = run.player + Sokoban::step_of(width, way)
+                continue if SokobanLive::solid(run, at) or run.boxes[at.usize()] or SokobanLive::guards_at(run, at)
+                away: Timeline = parked(run, at)
+                if safe(run, &away, 0.9):
+                    pilot.plan.clear()
+                    pilot.cursor <- 0
+                    pilot.expected_player <- -1
+                    pilot.since <- run.elapsed
+                    return way
+            return -1
+
+    def play(floor: SokobanLive::Warehouse&) -> i64:
+        can Abort.Panic, Memory.Allocate:
+            pilot: mutable Pilot = create(floor)
+            run: mutable SokobanLive::Run = SokobanLive::initialize(floor)
+            while run.result == SokobanLive::LIVE |run, pilot|:
+                _ = SokobanLive::press(&run, order(&pilot, &run))
+                SokobanLive::step(&run, CLOCK_STEP)
+            return run.result
+
+    def deal_seed(rung: i64, seed: i64) -> SokobanLive::Warehouse:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, magnitude)
+            level: SokobanLive::Grade = SokobanLive::grade(rung)
+            best: mutable SokobanLive::Warehouse = zeroed
+            region workspace(67108864):
+                in workspace:
+                    work: mutable Sokoban::SokobanWork = Sokoban::work_new()
+                    search: mutable Sokoban::Search = Sokoban::Search(80000)
+                    for _ in 0..<30 |draw, level, best, work, search|:
+                        region attempt(4194304):
+                            in attempt:
+                                candidate: SokobanLive::Warehouse = SokobanLive::build(&work, &search, level, &draw)
+                                if candidate.valid:
+                                    best <- candidate if not best.valid
+                                    if play(&candidate) == SokobanLive::CLEAR:
+                                        return candidate
+                    return best if best.valid
+                    mt_seed_int(&draw, magnitude)
+                    return SokobanLive::build(&work, &search, SokobanLive::grade(1), &draw)
+            return best
+
+    def deal(rung: i64, rng: mutable MT19937&) -> SokobanLive::Warehouse:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            return deal_seed(rung, py_randbelow(rng, 1073741824.u64()).i64())

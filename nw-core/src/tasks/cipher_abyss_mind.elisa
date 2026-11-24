@@ -1,0 +1,233 @@
+include "./cipher_abyss_looks.elisa"
+
+extend CipherLang:
+    const SAMPLE: i64 = 150
+
+    struct Belief:
+        entry: i64
+        meta: i64
+
+    struct Snapshot:
+        entries: darray[i64]
+
+    struct Mind:
+        level: CipherAbyss::Grade
+        draw: mutable MT19937
+        alive: mutable darray[Belief]
+        testing: mutable darray[Belief]
+        # Surviving rules share the last input, output, and run count.
+        # Each belief keeps its own meta counter.
+        experiment_state: mutable State
+        testing_state: mutable State
+        history: mutable darray[i64]
+        snapshots: mutable darray[Snapshot]
+        seen: mutable i64
+        answered: mutable i64
+        split: mutable i64
+        tested: mutable i64
+
+    def mind(level: CipherAbyss::Grade, rules: darray[i64]&, seed: i64) -> Mind:
+        can Abort.Panic, Memory.Allocate:
+            draw: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&draw, magnitude)
+            beliefs: mutable darray[Belief] = []
+            for rule in rules:
+                beliefs.push(Belief{entry: rule, meta: 0})
+            return Mind{level: level, draw: draw, alive: beliefs, testing: [], history: [rules.count.i64()],
+                snapshots: [snapshot(&beliefs)], experiment_state: zeroed, testing_state: zeroed, seen: 0, answered: 0, split: 0, tested: 0}
+
+    def snapshot(beliefs: darray[Belief]&) -> Snapshot:
+        can Abort.Panic, Memory.Allocate:
+            entries: mutable darray[i64] = []
+            for belief in beliefs:
+                entries.push(belief.entry)
+            return Snapshot{entries: entries}
+
+    def agrees(program: darray[Node]&, entry: i64, state: State&, given: darray[i64]&, correct: darray[i64]&, k: i64) -> bool:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            fits: mutable bool = false
+            region scratch(4096):
+                in scratch:
+                    output: darray[i64] = run(program, entry, given, k, state)
+                    fits <- same_row(&output, correct)
+            return fits
+
+    def observe(program: darray[Node]&, beliefs: mutable darray[Belief]&, shared: State,
+                given: darray[i64]&, correct: darray[i64]&, k: i64) -> State:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            next_state: State = State{runs: shared.runs + 1, last_in: sliced(given, 0, given.count.i64()),
+                last_out: sliced(correct, 0, correct.count.i64()), meta: 0}
+            count: i64 = beliefs.count.i64()
+            keep: mutable i64 = 0
+            for i in 0..<count |program, beliefs, shared, given, correct, k, keep|:
+                rule: Belief = beliefs[i.usize()]
+                prior: mutable State = shared
+                prior.meta <- rule.meta
+                continue if not agrees(program, rule.entry, &prior, given, correct, k)
+                next_meta: i64 = rule.meta + meta_bump(program, rule.entry, given, &prior)
+                beliefs[keep.usize()] <- Belief{entry: rule.entry, meta: next_meta}
+                keep <- keep + 1
+            while beliefs.count.i64() > keep |beliefs, keep|:
+                _ = beliefs.pop()
+            return next_state
+
+    def update(program: darray[Node]&, player: mutable Mind&, log: darray[Sample]&):
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            while player.seen < log.count.i64() |player, log, program|:
+                entry: Sample& = &log[player.seen.usize()]
+                shared: State = player.experiment_state
+                player.experiment_state <- observe(program, &player.alive, shared, &entry.given, &entry.result, player.level.symbols)
+                player.seen <- player.seen + 1
+                player.history.push(player.alive.count.i64())
+                player.snapshots.push(snapshot(&player.alive))
+
+    def begin_test(player: mutable Mind&):
+        can Abort.Panic, Memory.Allocate:
+            player.testing.clear()
+            player.testing_state <- zeroed
+            for rule in player.alive:
+                player.testing.push(Belief{entry: rule.entry, meta: 0})
+
+    def tested_on(program: darray[Node]&, player: mutable Mind&, given: darray[i64]&, correct: darray[i64]&):
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            shared: State = player.testing_state
+            player.testing_state <- observe(program, &player.testing, shared, given, correct, player.level.symbols)
+            player.tested <- player.tested + 1
+
+    def random_row(draw: mutable MT19937&, n: i64, k: i64) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            row: mutable darray[i64] = []
+            for _ in 0..<n |draw, row, k|:
+                row.push(py_randbelow(draw, k.u64()).i64())
+            return row
+
+    def candidates(player: mutable Mind&) -> darray[Probe]:
+        can Abort.Panic, Memory.Allocate:
+            k: i64 = player.level.symbols
+            n: i64 = player.level.length
+            result: mutable darray[Probe] = []
+            for _ in 0..<36 |player, result, k, n|:
+                result.push(Probe{values: random_row(&player.draw, n, k)})
+            for symbol in 0..<k |result, n|:
+                values: mutable darray[i64] = []
+                for _ in 0..<n |values, symbol|:
+                    values.push(symbol)
+                result.push(Probe{values: values})
+            pattern: mutable darray[i64] = []
+            first: mutable darray[i64] = []
+            descending: mutable darray[i64] = []
+            for i in 0..<n |pattern, first, descending, k, n|:
+                pattern.push(i % k)
+                first.push(1 if i == 0 else 0)
+                descending.push((n - 1 - i) % k)
+            result.push(Probe{values: pattern})
+            result.push(Probe{values: first})
+            ordered: mutable darray[i64] = random_row(&player.draw, n, k)
+            Ints::sort_prefix(&ordered, n)
+            result.push(Probe{values: ordered})
+            half: i64 = n / 2
+            palindrome: mutable darray[i64] = random_row(&player.draw, half, k)
+            palindrome.push(py_randbelow(&player.draw, k.u64()).i64()) if n % 2 != 0
+            for i in 0..<half |palindrome, half|:
+                palindrome.push(palindrome[(half - 1 - i).usize()])
+            result.push(Probe{values: palindrome})
+            result.push(Probe{values: descending})
+            return result
+
+    def sampled(player: mutable Mind&) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            count: i64 = player.alive.count.i64()
+            return py_sample_range(&player.draw, 0, count - 1, SAMPLE) if count > SAMPLE
+            all: mutable darray[i64] = []
+            for i in 0..<count |all|:
+                all.push(i)
+            return all
+
+    def bucket_size(program: darray[Node]&, player: Mind&, sample: darray[i64]&, input: darray[i64]&, limit: i64) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            region scratch(32768):
+                in scratch:
+                    slots: mutable darray[i64] = Ints::zeros(512)
+                    outputs: mutable darray[FirstRule] = []
+                    counts: mutable darray[i64] = []
+                    biggest: mutable i64 = 0
+                    for i in sample:
+                        belief: Belief& = &player.alive[i.usize()]
+                        prior: mutable State = player.experiment_state
+                        prior.meta <- belief.meta
+                        value: darray[i64] = run(program, belief.entry, input, player.level.symbols, &prior)
+                        slot: usize = find_output(&slots, &outputs, &value, 511.usize())
+                        if slots[slot] == 0:
+                            slots[slot] <- outputs.count.i64() + 1
+                            outputs.push(FirstRule{output: value, entry: belief.entry})
+                            counts.push(0)
+                        bucket: usize = (slots[slot] - 1).usize()
+                        count: i64 = counts[bucket] + 1
+                        counts[bucket] <- count
+                        biggest <- count if count > biggest
+                        break if biggest >= limit
+                    return biggest
+            return 0
+
+    def experiment(program: darray[Node]&, player: mutable Mind&) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            sample: darray[i64] = sampled(player)
+            count: i64 = sample.count.i64()
+            return [] if count <= 1
+            best: mutable darray[i64] = []
+            worst: mutable i64 = count + 1
+            choices: darray[Probe] = candidates(player)
+            for input in choices:
+                score: i64 = bucket_size(program, player, &sample, &input.values, worst)
+                if score < worst:
+                    worst <- score
+                    best <- input.values
+            return best if worst < count
+            stateful: mutable bool = false
+            for i in 0..<CipherAbyss::min(20, count) |stateful, program, player, sample|:
+                stateful <- true if uses_state(program, player.alive[sample[i.usize()].usize()].entry)
+            return [] if not stateful
+            best <- []
+            most: mutable i64 = 0
+            alternatives: darray[Probe] = candidates(player)
+            for input in alternatives:
+                moved: mutable i64 = 0
+                for i in sample:
+                    belief: Belief& = &player.alive[i.usize()]
+                    # Only the meta triggers can change this counter.
+                    prior: mutable State = player.experiment_state
+                    prior.meta <- belief.meta
+                    if meta_bump(program, belief.entry, &input.values, &prior) != 0:
+                        moved <- moved + 1
+                if moved > most:
+                    most <- moved
+                    best <- input.values
+            return best
+
+    def answer(program: darray[Node]&, player: mutable Mind&, input: darray[i64]&) -> darray[i64]:
+        can Abort.Panic, Memory.Allocate:
+            capacity: mutable i64 = 1
+            while capacity <= 2 * player.testing.count.i64() |capacity, player|:
+                capacity <- capacity * 2
+            slots: mutable darray[i64] = Ints::zeros(capacity)
+            outputs: mutable darray[FirstRule] = []
+            votes: mutable darray[i64] = []
+            for belief in player.testing:
+                prior: mutable State = player.testing_state
+                prior.meta <- belief.meta
+                value: darray[i64] = run(program, belief.entry, input, player.level.symbols, &prior)
+                slot: usize = find_output(&slots, &outputs, &value, (capacity - 1).usize())
+                if slots[slot] == 0:
+                    slots[slot] <- outputs.count.i64() + 1
+                    outputs.push(FirstRule{output: value, entry: belief.entry})
+                    votes.push(0)
+                bucket: usize = (slots[slot] - 1).usize()
+                votes[bucket] <- votes[bucket] + 1
+            player.answered <- player.answered + 1
+            player.split <- player.split + 1 if votes.count > 1.usize()
+            return sliced(input, 0, input.count.i64()) if votes.count == 0.usize()
+            best: mutable usize = 0.usize()
+            for i in 1..<votes.count.i64() |votes, best|:
+                best <- i.usize() if votes[i.usize()] > votes[best]
+            return outputs[best].output

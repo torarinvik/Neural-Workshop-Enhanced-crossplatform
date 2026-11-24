@@ -1,0 +1,329 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+include "../strings.elisa"
+
+module EchoCave:
+    const CLICK: i64 = 8
+    const PENDING: i64 = 0
+    const ESCAPED: i64 = 1
+    const ROCK: i64 = 2
+    const TOO_FEW: i64 = 3
+    const TAU: f64 = 6.283185307179586
+    const BODY: f64 = 0.6
+    const CLICK_SOUND: i64 = 0
+    const ECHO_SOUND: i64 = 1
+    const FAR_SOUND: i64 = 2
+    const MOTH_SOUND: i64 = 3
+
+    struct Grade:
+        rung: i64
+        radius: f64
+        bend: f64
+        both: bool
+        speed: f64
+        length: f64
+        moths: i64
+        need: i64
+        see: f64
+        flash: f64
+        moths_seen: bool
+
+    struct Point:
+        x: f64
+        y: f64
+
+    struct Wave:
+        amplitude: f64
+        wavelength: f64
+        phase: f64
+
+    struct Moth:
+        z: f64
+        dx: f64
+        dy: f64
+
+    struct Cave:
+        level: Grade
+        horizontal_one: Wave
+        horizontal_two: Wave
+        vertical_one: Wave
+        vertical_two: Wave
+        width: Wave
+        moths: mutable Moth[4]
+        flutter: mutable i64
+
+    struct Cue:
+        time: f64
+        duration: f64
+        pitch: f64
+        pan: f64
+        gain: f64
+        bright: f64
+        voice: i64
+
+    struct Run:
+        cave: Cave
+        time: mutable f64
+        z: mutable f64
+        x: mutable f64
+        y: mutable f64
+        vx: mutable f64
+        vy: mutable f64
+        aim: mutable Point
+        aimed: mutable bool
+        caught: mutable i64
+        caught_mask: mutable i64
+        clicked_at: mutable f64
+        next_buzz: mutable f64
+        cues: mutable Cue[2304]
+        cue_count: mutable i64
+        audible: bool
+        result: mutable i64
+
+    def clamp(value: f64, low: f64, high: f64) -> f64:
+        return low if value < low else (high if value > high else value)
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 0 else 1
+        top: f64 = (r - 20).f64() if r >= 20 else 0.0
+        return Grade{rung: r,
+            radius: 7.0 if r < 4 else (6.0 if r < 13 else (5.2 if r < 20 else clamp(5.0 - 0.04 * top, 4.4, 5.0))),
+            bend: 4.0 if r < 4 else (6.0 if r < 13 else 7.5), both: r >= 13,
+            speed: 11.0 if r < 4 else (13.0 if r < 13 else (15.0 if r < 20 else clamp(15.5 + 0.25 * top, 15.5, 19.0))),
+            length: 240.0 if r < 13 else 300.0, moths: 3 if r < 4 else 4,
+            need: 1 if r < 4 else 2, see: 60.0 if r < 4 else (22.0 if r < 7 else 0.0),
+            flash: 40.0 if r >= 7 and r < 16 else 0.0, moths_seen: r < 10}
+
+    def wave_at(wave: Wave, z: f64) -> f64:
+        return wave.amplitude * sin(z / wave.wavelength + wave.phase)
+
+    def axis(cave: Cave&, z: f64) -> Point:
+        ramp: f64 = z / 30.0 if z < 30.0 else 1.0
+        return Point{x: (wave_at(cave.horizontal_one, z) + wave_at(cave.horizontal_two, z)) * ramp,
+            y: (wave_at(cave.vertical_one, z) + wave_at(cave.vertical_two, z)) * ramp}
+
+    def radius(cave: Cave&, z: f64) -> f64:
+        return cave.level.radius * (1.0 + wave_at(cave.width, z))
+
+    def moth(run: Run&, index: i64, time: f64) -> Point:
+        can Abort.Panic:
+            entry: Moth = run.cave.moths[index.usize()]
+            centre: Point = axis(&run.cave, entry.z)
+            phase: f64 = (run.cave.flutter + index * 7).f64()
+            return Point{x: centre.x + entry.dx + 0.6 * sin(2.1 * time + phase),
+                y: centre.y + entry.dy + 0.5 * sin(2.7 * time + phase * 1.3)}
+
+    def trial(cave: Cave, audible: bool = true) -> Run:
+        return Run{cave: cave, time: 0.0, z: 0.0, x: 0.0, y: 0.0, vx: 0.0, vy: 0.0,
+            aim: zeroed, aimed: false, caught: 0, caught_mask: 0, clicked_at: -1.0,
+            next_buzz: 0.0, cues: zeroed, cue_count: 0, audible: audible, result: PENDING}
+
+    def lit(run: Run&) -> f64:
+        flash: f64 = run.cave.level.flash
+        age: f64 = run.time - run.clicked_at
+        see: f64 = run.cave.level.see
+        return clamp(flash * (1.0 - age / 0.4), see, 60.0) if flash > 0.0 and run.clicked_at >= 0.0 and age < 0.4 else see
+
+    def cue(run: mutable Run&, time: f64, duration: f64, pitch: f64, pan: f64, gain: f64, bright: f64, voice: i64):
+        can Abort.Panic:
+            # A flight lasts under 22 seconds. The 150 ms click cooldown and
+            # 120 ms buzz period bound the number of notes even at four moths.
+            return if not run.audible or run.cue_count >= 2304
+            run.cues[run.cue_count.usize()] <- Cue{time: time, duration: duration, pitch: pitch,
+                pan: pan, gain: gain, bright: bright, voice: voice}
+            run.cue_count <- run.cue_count + 1
+
+    def distance(run: Run&, ux: f64, uy: f64, z: f64) -> f64:
+        centre: Point = axis(&run.cave, z)
+        r: f64 = radius(&run.cave, z)
+        px: f64 = run.x - centre.x
+        py: f64 = run.y - centre.y
+        b: f64 = px * ux + py * uy
+        c: f64 = px * px + py * py - r * r
+        disc: f64 = b * b - c
+        root: f64 = sqrt(disc if disc > 0.0 else 0.0) - b
+        return root if root > 0.0 else 0.0
+
+    def click(run: mutable Run&) -> bool:
+        can Abort.Panic:
+            return false if run.result != PENDING or (run.clicked_at >= 0.0 and run.time - run.clicked_at < 0.15)
+            run.clicked_at <- run.time
+            return true if not run.audible
+            cue(run, run.time, 0.03, 2400.0, 0.0, 0.5, 1.0, CLICK_SOUND)
+            start: i64 = run.cue_count
+            for k in 0..<8 |run|:
+                angle: f64 = TAU * k.f64() / 8.0
+                ux: f64 = cos(angle)
+                uy: f64 = sin(angle)
+                d: f64 = distance(run, ux, uy, run.z + 5.0)
+                cue(run, run.time + 0.02 + 2.0 * d * 0.012, 0.05, 1200.0 * pow(2.0, 0.6 * uy), ux,
+                    0.55 / (1.0 + 0.35 * d), 0.9, ECHO_SOUND)
+            f: Point = axis(&run.cave, run.z + 22.0)
+            scale: f64 = 2.0 * run.cave.level.radius
+            dx: f64 = clamp((f.x - run.x) / scale, -1.0, 1.0)
+            dy: f64 = clamp((f.y - run.y) / scale, -1.0, 1.0)
+            cue(run, run.time + 2.0 * 22.0 * 0.012, 0.25, 260.0 * pow(2.0, 0.7 * dy), dx, 0.3, 0.5, FAR_SOUND)
+            for i in (start + 1)..<run.cue_count |run, start|:
+                item: Cue = run.cues[i.usize()]
+                at: mutable i64 = i
+                while at > start |at, run, start, item|:
+                    prior: Cue = run.cues[(at - 1).usize()]
+                    break if prior.time <= item.time
+                    run.cues[at.usize()] <- prior
+                    at <- at - 1
+                run.cues[at.usize()] <- item
+            return true
+
+    def push(port: i64) -> Point:
+        x: f64 = -1.0 if port == 2 else (1.0 if port == 3 else (0.0 if port < 4 else (-0.71 if port % 2 == 0 else 0.71)))
+        y: f64 = 1.0 if port == 0 else (-1.0 if port == 1 else (0.0 if port < 4 else (0.71 if port < 6 else -0.71)))
+        return Point{x: x, y: y}
+
+    def active(mask: i64, port: i64) -> i64:
+        return 1 if (mask & (1 << port.u64())) != 0 else 0
+
+    def steering(run: Run&, mask: i64) -> Point:
+        x: mutable f64 = 0.0
+        y: mutable f64 = 0.0
+        for port in 0..<8 |mask, x, y|:
+            if (mask & (1 << port.u64())) != 0:
+                p: Point = push(port)
+                x <- x + p.x
+                y <- y + p.y
+        length: f64 = py_hypot(x, y)
+        if length > 1.0:
+            return Point{x: x / length, y: y / length}
+        if length == 0.0 and run.aimed:
+            d: f64 = py_hypot(run.aim.x, run.aim.y)
+            if d > 0.2:
+                k: f64 = clamp(d / 3.0, 0.0, 1.0) / d
+                return Point{x: run.aim.x * k, y: run.aim.y * k}
+        return Point{x: x, y: y}
+
+    def buzz(run: mutable Run&):
+        can Abort.Panic:
+            return if not run.audible
+            while run.next_buzz <= run.time |run|:
+                t: f64 = run.next_buzz
+                run.next_buzz <- t + 0.12
+                for k in 0..<run.cave.level.moths |run, t|:
+                    entry: Moth = run.cave.moths[k.usize()]
+                    dz: f64 = entry.z - run.z
+                    continue if (run.caught_mask & (1 << k.u64())) != 0 or dz <= -3.0 or dz >= 40.0
+                    p: Point = moth(run, k, t)
+                    pan: f64 = clamp((p.x - run.x) / 5.0, -1.0, 1.0)
+                    gain: f64 = 0.3 / (1.0 + (dz if dz > 0.0 else 0.0) / 8.0)
+                    pitch: f64 = 520.0 * pow(2.0, clamp((p.y - run.y) / 5.0, -1.0, 1.0) * 0.7)
+                    cue(run, t, 0.1, pitch, pan, gain, 0.7, MOTH_SOUND)
+
+    def step(run: mutable Run&, dt: f64, mask: i64):
+        can Abort.Panic:
+            return if run.result != PENDING
+            run.time <- run.time + dt
+            acceleration: Point = steering(run, mask)
+            run.vx <- run.vx + (34.0 * acceleration.x - 2.6 * run.vx) * dt
+            run.vy <- run.vy + (34.0 * acceleration.y - 2.6 * run.vy) * dt
+            run.x <- run.x + run.vx * dt
+            run.y <- run.y + run.vy * dt
+            past: f64 = run.z
+            run.z <- run.z + run.cave.level.speed * dt
+            for k in 0..<run.cave.level.moths |run, past|:
+                bit: i64 = 1 << k.u64()
+                entry: Moth = run.cave.moths[k.usize()]
+                if (run.caught_mask & bit) == 0 and past < entry.z and entry.z <= run.z:
+                    p: Point = moth(run, k, run.time)
+                    if py_hypot(p.x - run.x, p.y - run.y) < 1.6:
+                        run.caught_mask <- run.caught_mask | bit
+                        run.caught <- run.caught + 1
+                        cue(run, run.time, 0.12, 1500.0, 0.0, 0.4, 1.0, ECHO_SOUND)
+            buzz(run)
+            centre: Point = axis(&run.cave, run.z)
+            if py_hypot(run.x - centre.x, run.y - centre.y) > radius(&run.cave, run.z) - BODY:
+                run.result <- ROCK
+            elif run.z >= run.cave.level.length:
+                run.result <- ESCAPED if run.caught >= run.cave.level.need else TOO_FEW
+
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            level: Grade = run.cave.level
+            target: mutable Point = axis(&run.cave, run.z + level.speed * 0.35)
+            if run.caught < level.need:
+                for k in 0..<level.moths |run, level, target|:
+                    z: f64 = run.cave.moths[k.usize()].z
+                    if (run.caught_mask & (1 << k.u64())) == 0 and z > run.z and z - run.z < level.speed * 1.4:
+                        p: Point = moth(run, k, run.time + 0.35)
+                        centre: Point = axis(&run.cave, z)
+                        target <- p if py_hypot(p.x - centre.x, p.y - centre.y) < radius(&run.cave, z) - BODY - 1.0
+                        break
+            wx: f64 = (target.x - run.x) * 3.0 - run.vx
+            wy: f64 = (target.y - run.y) * 3.0 - run.vy
+            return 0 if py_hypot(wx, wy) <= 0.5
+            angle: f64 = atan2(wy, wx)
+            best: mutable i64 = 0
+            strength: mutable f64 = -2.0
+            for port in 0..<8 |best, strength, angle|:
+                p: Point = push(port)
+                alignment: f64 = cos(angle - atan2(p.y, p.x))
+                if alignment > strength:
+                    strength <- alignment
+                    best <- port
+            return 1 << best.u64()
+
+    def uniform(rng: mutable MT19937&, low: f64, high: f64) -> f64:
+        return low + (high - low) * py_random(rng)
+
+    def make_wave(rng: mutable MT19937&, amp: f64, low: f64, high: f64) -> Wave:
+        return Wave{amplitude: amp, wavelength: uniform(rng, low, high), phase: uniform(rng, 0.0, 6.3)}
+
+    def build(level: Grade, rng: mutable MT19937&) -> Cave:
+        can Abort.Panic:
+            up: f64 = level.bend if level.both else level.bend * 0.45
+            cave: mutable Cave = Cave{level: level,
+                horizontal_one: make_wave(rng, level.bend * 0.7, 9.0, 13.0),
+                horizontal_two: make_wave(rng, level.bend * 0.3, 4.5, 6.5),
+                vertical_one: make_wave(rng, up * 0.7, 10.0, 15.0),
+                vertical_two: make_wave(rng, up * 0.3, 5.0, 7.0),
+                width: make_wave(rng, 0.18, 7.0, 11.0), moths: zeroed, flutter: 0}
+            gap: f64 = (level.length - 60.0) / level.moths.f64()
+            for k in 0..<level.moths |cave, gap, rng, level|:
+                z: f64 = 45.0 + gap * (k.f64() + uniform(rng, 0.2, 0.8))
+                angle: f64 = uniform(rng, 0.0, TAU)
+                d: f64 = uniform(rng, 0.15, 0.5) * level.radius
+                cave.moths[k.usize()] <- Moth{z: z, dx: d * cos(angle), dy: d * sin(angle)}
+            cave.flutter <- py_randbelow(rng, 1000.u64()).i64()
+            return cave
+
+    def play(cave: Cave, guided: bool) -> bool:
+        can Abort.Panic:
+            run: mutable Run = trial(cave, false)
+            while run.result == PENDING |run, guided|:
+                mask: i64 = pilot(&run) if guided else 0
+                step(&run, 1.0 / 60.0, mask)
+            return run.result == ESCAPED
+
+    def deal(rung: i64, seed: i64) -> Cave:
+        can Abort.Panic:
+            level: Grade = grade(rung)
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64())
+            first: mutable Cave = zeroed
+            for attempt in 0..<30 |rng, level, first|:
+                cave: Cave = build(level, &rng)
+                first <- cave if attempt == 0
+                return cave if play(cave, true) and not play(cave, false)
+            return first
+
+    def result_text(run: Run&, out: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            if run.result == ROCK:
+                dstr_append_cstr(out, "Hit the rock")
+            elif run.result == ESCAPED:
+                dstr_append_cstr(out, "Out of the cave, ")
+                dstr_append_i64(out, run.caught)
+                dstr_append_cstr(out, " moths caught")
+            elif run.result == TOO_FEW:
+                dstr_append_cstr(out, "Out of the cave, but only ")
+                dstr_append_i64(out, run.caught)
+                dstr_append_cstr(out, " of ")
+                dstr_append_i64(out, run.cave.level.need)
+                dstr_append_cstr(out, " moths caught")

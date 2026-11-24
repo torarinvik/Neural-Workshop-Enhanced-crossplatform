@@ -1,0 +1,212 @@
+# SDL Syllogism session records, persisted atomically through SDL FFI.
+module SyllogismResults:
+    struct Row:
+        trial: mutable i64
+        level: mutable i64
+        correct: mutable i64
+        elapsed_ms: mutable i64
+        judged_at: mutable f64
+
+    struct Record:
+        id: mutable u8[96]
+        started_at: mutable f64
+        options: mutable i64[5]
+        rows: mutable Row[15]
+        count: mutable i64
+        completed: mutable i64
+        right: mutable i64
+        best_level: mutable i64
+        seconds: mutable i64
+        dirty: mutable i64
+        next: mutable usize
+
+    def directory(out: mutable u8&) -> i32:
+        can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+            trusted Unsafe.PointerCast:
+                address: i64 = out.uintptr().i64()
+                if getenv("NW_SYLLOGISM_RESULTS_DIR") is override:
+                    if override != 0.u8():
+                        return 1 if SyllogismOptionsHost::append_user_path(address, 4096, override.cast[cstr]) >= 0 else 0
+                settings: mutable u8[4096] = zeroed
+                source_address: i64 = (&settings[0]).uintptr().i64()
+                return 0 if SyllogismOptionsHost::path(source_address, 4096, false) < 0
+                platform: heap u8& = SDL_GetPlatform().cast[heap u8&]
+                windows: bool = platform[0] == 87.u8() and platform[1] == 105.u8() and platform[2] == 110.u8()
+                index: mutable i64 = 0
+                last: mutable i64 = -1
+                while settings[index.usize()] != 0.u8() |index, last, settings, windows|:
+                    last <- index if settings[index.usize()] == 47.u8() or (windows and settings[index.usize()] == 92.u8())
+                    index <- index + 1
+                if last < 0:
+                    return 1 if SyllogismOptionsHost::append(address, 4096, 0, "./results/syllogism") >= 0 else 0
+                dest: mutable heap u8& = out.cast[mutable heap u8&]
+                for at in 0..<last |at, dest, settings|:
+                    dest[at.usize()] <- settings[at.usize()]
+                dest[last.usize()] <- 0.u8()
+                return 1 if SyllogismOptionsHost::append(address, 4096, last, "/results/syllogism") >= 0 else 0
+
+    def persist(address: i64) -> i32:
+        can Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+            return 1 if address == 0
+            directory_buffer: mutable u8[4096] = zeroed
+            path_buffer: mutable u8[4300] = zeroed
+            temporary: mutable u8[4400] = zeroed
+            data: mutable u8[8192] = zeroed
+            trusted Unsafe.PointerCast:
+                record: mutable heap Record& = address.uintptr().cast[mutable heap Record&]
+                return 1 if record.dirty == 0 or record.count == 0
+                return 0 if directory(&directory_buffer[0]) == 0.i32()
+                return 0 if not SDL_CreateDirectory((&directory_buffer[0]).uintptr().cast[cstr])
+                path_length: i32 = SDL_snprintf(&path_buffer[0], 4300.usize(), "%s/%s.json", (&directory_buffer[0]).uintptr().cast[cstr], (&record.id[0]).uintptr().cast[cstr])
+                return 0 if path_length < 0.i32() or path_length >= 4300.i32()
+                temp_length: i32 = SDL_snprintf(&temporary[0], 4400.usize(), "%s.%llu.tmp", (&path_buffer[0]).uintptr().cast[cstr], SDL_GetTicksNS())
+                return 0 if temp_length < 0.i32() or temp_length >= 4400.i32()
+                count: mutable i32 = SDL_snprintf(&data[0], 8192.usize(), "{\"id\":\"%s\",\"task\":\"syllogism\",\"started_at\":%.9f,\"options\":[%lld,%lld,%lld,%lld,%lld],\"results\":[", (&record.id[0]).uintptr().cast[cstr], record.started_at, record.options[0], record.options[1], record.options[2], record.options[3], record.options[4])
+                return 0 if count < 0.i32() or count >= 8192.i32()
+                used: mutable i64 = count.i64()
+                index: mutable i64 = 0
+                while index < record.count |index, record, data, used|:
+                    cursor: mutable u8& = &data[used.usize()]
+                    row: i32 = SDL_snprintf(cursor, (8192 - used).usize(), "%s{\"trial\":%lld,\"level\":%lld,\"correct\":%s,\"elapsed_ms\":%lld,\"judged_at\":%.9f}", "," if index > 0 else "", record.rows[index.usize()].trial, record.rows[index.usize()].level, "true" if record.rows[index.usize()].correct != 0 else "false", record.rows[index.usize()].elapsed_ms, record.rows[index.usize()].judged_at)
+                    return 0 if row < 0.i32() or row.i64() >= 8192 - used
+                    used <- used + row.i64()
+                    index <- index + 1
+                cursor: mutable u8& = &data[used.usize()]
+                ending: mutable i32 = 0
+                if record.completed != 0:
+                    ending <- SDL_snprintf(cursor, (8192 - used).usize(), "],\"completed\":true,\"right\":%lld,\"best_level\":%lld,\"seconds\":%lld}\n", record.right, record.best_level, record.seconds)
+                else:
+                    ending <- SDL_snprintf(cursor, (8192 - used).usize(), "],\"completed\":false}\n")
+                return 0 if ending < 0.i32() or ending.i64() >= 8192 - used
+                used <- used + ending.i64()
+                ok: i32 = numberology_results_write(&temporary[0], &path_buffer[0], &data[0], used.usize())
+                record.dirty <- 0 if ok != 0.i32()
+                return ok
+
+    def create(options: i64&?) -> i64:
+        can Memory.Allocate, Blocking.IO, Abort.Panic, Unsafe.PointerCast:
+            return 0 if options == null
+            memory: mutable heap void&? = SDL_calloc(1.usize(), size_of(Record).usize())
+            return 0 if memory == null
+            trusted Unsafe.PointerCast:
+                block: mutable heap void& = memory
+                record: mutable heap Record& = block.cast[mutable heap Record&]
+                source: i64& = options
+                values: heap i64& = source.cast[heap i64&]
+                for index in 0..<5 |index, values, record|:
+                    record.options[index.usize()] <- values[index.usize()]
+                now: mutable i64 = 0
+                _ = SDL_GetCurrentTime(&now)
+                record.started_at <- now.f64() / 1000000000.0
+                _ = SDL_snprintf(&record.id[0], 96.usize(), "syllogism-%llu-%llu-%llu", now.u64(), SDL_rand_bits().u64(), SDL_GetTicksNS())
+                return block.uintptr().i64()
+
+    def destroy(address: i64):
+        can Memory.Release, Unsafe.PointerCast:
+            return if address == 0
+            trusted Unsafe.PointerCast:
+                SDL_free(address.uintptr().cast[heap void&])
+
+    def retry(manager: mutable usize&?):
+        can Blocking.IO, Console.Write, Memory.Release, Abort.Panic, Unsafe.PointerCast:
+            return if manager == null
+            trusted Unsafe.PointerCast:
+                pointer: mutable usize& = manager
+                slots: mutable heap usize& = pointer.cast[mutable heap usize&]
+                previous: mutable i64 = 0
+                current: mutable i64 = slots[1].i64()
+                while current != 0 |current, previous, slots|:
+                    record: mutable heap Record& = current.uintptr().cast[mutable heap Record&]
+                    next: i64 = record.next.i64()
+                    if persist(current) != 0.i32():
+                        if previous == 0:
+                            slots[1] <- next.usize()
+                        else:
+                            prior: mutable heap Record& = previous.uintptr().cast[mutable heap Record&]
+                            prior.next <- next.usize()
+                        destroy(current)
+                    else:
+                        SDL_Log("Could not save Syllogism results")
+                        previous <- current
+                    current <- next
+                if slots[0] != 0.usize() and persist(slots[0].i64()) == 0.i32():
+                    SDL_Log("Could not save Syllogism results")
+
+    def start(manager: mutable usize&?, options: i64&?):
+        can Memory.Allocate, Memory.Release, Blocking.IO, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return if manager == null or options == null
+            trusted Unsafe.PointerCast:
+                pointer: mutable usize& = manager
+                slots: mutable heap usize& = pointer.cast[mutable heap usize&]
+                if slots[0] != 0.usize():
+                    old: mutable heap Record& = slots[0].cast[mutable heap Record&]
+                    if old.dirty != 0:
+                        old.next <- slots[1]
+                        slots[1] <- slots[0]
+                    else:
+                        destroy(slots[0].i64())
+                slots[0] <- 0.usize()
+                created: i64 = create(options)
+                if created == 0:
+                    SDL_Log("Could not allocate Syllogism result")
+                    return
+                slots[0] <- created.usize()
+                retry(manager)
+
+    def judge(manager: mutable usize&?, trial: i64, level: i64, correct: i64, elapsed_ms: i64):
+        can Memory.Release, Blocking.IO, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return if manager == null
+            trusted Unsafe.PointerCast:
+                pointer: mutable usize& = manager
+                slots: mutable heap usize& = pointer.cast[mutable heap usize&]
+                return if slots[0] == 0.usize()
+                record: mutable heap Record& = slots[0].cast[mutable heap Record&]
+                previous: mutable i64 = 0
+                previous <- record.rows[(record.count - 1).usize()].trial if record.count > 0 and record.count <= 15
+                return if numberology_results_accept(record.count.i32(), previous, trial) == 0.i32()
+                row: usize = record.count.usize()
+                record.rows[row].trial <- trial
+                record.rows[row].level <- level
+                record.rows[row].correct <- correct
+                record.rows[row].elapsed_ms <- elapsed_ms
+                now: mutable i64 = 0
+                _ = SDL_GetCurrentTime(&now)
+                record.rows[row].judged_at <- now.f64() / 1000000000.0
+                record.count <- record.count + 1
+                record.dirty <- 1
+                retry(manager)
+
+    def finish(manager: mutable usize&?, right: i64, best: i64, seconds: i64):
+        can Memory.Release, Blocking.IO, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return if manager == null
+            trusted Unsafe.PointerCast:
+                pointer: mutable usize& = manager
+                slots: mutable heap usize& = pointer.cast[mutable heap usize&]
+                return if slots[0] == 0.usize()
+                record: mutable heap Record& = slots[0].cast[mutable heap Record&]
+                record.completed <- 1
+                record.right <- right
+                record.best_level <- best
+                record.seconds <- seconds
+                record.dirty <- 1
+                retry(manager)
+
+    def close(manager: mutable usize&?):
+        can Memory.Release, Blocking.IO, Console.Write, Abort.Panic, Unsafe.PointerCast:
+            return if manager == null
+            retry(manager)
+            trusted Unsafe.PointerCast:
+                pointer: mutable usize& = manager
+                slots: mutable heap usize& = pointer.cast[mutable heap usize&]
+                destroy(slots[0].i64())
+                slots[0] <- 0.usize()
+                while slots[1] != 0.usize() |slots|:
+                    address: i64 = slots[1].i64()
+                    record: mutable heap Record& = address.uintptr().cast[mutable heap Record&]
+                    slots[1] <- record.next
+                    destroy(address)
+
+export fn nw_syllogism_results_start(manager: mutable usize&?, options: i64&?) = SyllogismResults::start
+export fn nw_syllogism_results_judge(manager: mutable usize&?, trial: i64, level: i64, correct: i64, elapsed_ms: i64) = SyllogismResults::judge
+export fn nw_syllogism_results_finish(manager: mutable usize&?, right: i64, best: i64, seconds: i64) = SyllogismResults::finish
+export fn nw_syllogism_results_close(manager: mutable usize&?) = SyllogismResults::close

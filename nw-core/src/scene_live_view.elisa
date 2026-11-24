@@ -1,0 +1,103 @@
+include "./rooms_view.elisa"
+include "./display.elisa"
+include "./geometry.elisa"
+include "./verdict.elisa"
+
+module LiveView:
+    const WIDTH: f64 = 912.0
+    const HEIGHT: f64 = 684.0
+    const VIEW_WIDTH: f64 = WIDTH * 0.94
+    const CX: f64 = WIDTH / 2.0
+    const NEAR: f64 = 0.08
+
+    struct View:
+        camera: RoomsView::Camera
+        bottom: f64
+        height: f64
+        focal: f64
+
+    def lens(eye: RoomsView::Vec, look: RoomsView::Vec, up: RoomsView::Vec, half_fov: f64) -> View:
+        can Abort.Panic:
+            bottom: f64 = Verdict::above_the_band(HEIGHT, Geometry::from_bottom_edge(HEIGHT, 58.0).f64()).f64()
+            height: f64 = fmax(40.0, Geometry::from_top_edge(HEIGHT, 116.0).f64() - bottom)
+            target: RoomsView::Vec = RoomsView::add(eye, look)
+            forward: RoomsView::Vec = RoomsView::unit(RoomsView::sub(target, eye))
+            right: RoomsView::Vec = RoomsView::unit(RoomsView::cross(forward, up))
+            camera: RoomsView::Camera = RoomsView::Camera{eye: eye, forward: forward,
+                right: right, up: RoomsView::cross(right, forward)}
+            return View{camera: camera, bottom: bottom, height: height, focal: VIEW_WIDTH / (2.0 * tan(half_fov))}
+
+    def camera_point(view: View&, world: RoomsView::Vec) -> RoomsView::Vec:
+        d: RoomsView::Vec = RoomsView::sub(world, view.camera.eye)
+        return RoomsView::vec(RoomsView::dot(d, view.camera.right), RoomsView::dot(d, view.camera.up),
+            RoomsView::dot(d, view.camera.forward))
+
+    def project(view: View&, p: RoomsView::Vec) -> RoomsView::Point:
+        scale: f64 = view.focal / p.z
+        return RoomsView::Point{x: CX + p.x * scale, y: view.bottom + view.height / 2.0 + p.y * scale}
+
+    # Evaluate each side of the viewing frustum before the perspective divide.
+    def boundary(view: View&, p: RoomsView::Vec, edge: i64) -> f64:
+        return p.z - NEAR if edge == 0
+        extent_x: f64 = p.z * (VIEW_WIDTH / (2.0 * view.focal))
+        extent_y: f64 = p.z * (view.height / (2.0 * view.focal))
+        return extent_x + p.x if edge == 1
+        return extent_x - p.x if edge == 2
+        return extent_y + p.y if edge == 3
+        return extent_y - p.y
+
+    def interpolate(a: RoomsView::Vec, b: RoomsView::Vec, t: f64) -> RoomsView::Vec:
+        return RoomsView::add(a, RoomsView::mul(RoomsView::sub(b, a), t))
+
+    def seg(list: mutable Display::DisplayList&, view: View&, start: RoomsView::Vec, stop: RoomsView::Vec, thick: f64, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            a: RoomsView::Vec = camera_point(view, start)
+            b: RoomsView::Vec = camera_point(view, stop)
+            low: mutable f64 = 0.0
+            high: mutable f64 = 1.0
+            for edge in 0..<5 |view, a, b, low, high|:
+                before: f64 = boundary(view, a, edge)
+                after: f64 = boundary(view, b, edge)
+                return if before < 0.0 and after < 0.0
+                if (before < 0.0) != (after < 0.0):
+                    t: f64 = before / (before - after)
+                    if before < 0.0:
+                        low <- fmax(low, t)
+                    else:
+                        high <- fmin(high, t)
+            return if low > high
+            p: RoomsView::Point = project(view, interpolate(a, b, low))
+            q: RoomsView::Point = project(view, interpolate(a, b, high))
+            Display::draw_line(list, p.x, p.y, q.x, q.y, thick, ink)
+
+    # Clipping a convex face with up to 40 vertices adds at most one vertex per plane.
+    def face(list: mutable Display::DisplayList&, view: View&, vertices: RoomsView::Vec[46]&, count: i64, ink: u32):
+        can Memory.Allocate, Abort.Panic:
+            points: mutable RoomsView::Vec[46] = zeroed
+            for k in 0..<count |view, vertices, points|:
+                points[k.usize()] <- camera_point(view, vertices[k.usize()])
+            kept_count: mutable i64 = count
+            for edge in 0..<5 |view, points, kept_count|:
+                return if kept_count < 3
+                clipped: mutable RoomsView::Vec[46] = zeroed
+                kept: mutable i64 = 0
+                prior: mutable RoomsView::Vec = points[(kept_count - 1).usize()]
+                for k in 0..<kept_count |view, edge, points, prior, clipped, kept|:
+                    p: RoomsView::Vec = points[k.usize()]
+                    before: f64 = boundary(view, prior, edge)
+                    after: f64 = boundary(view, p, edge)
+                    if (before >= 0.0) != (after >= 0.0):
+                        clipped[kept.usize()] <- interpolate(prior, p, before / (before - after))
+                        kept <- kept + 1
+                    if after >= 0.0:
+                        clipped[kept.usize()] <- p
+                        kept <- kept + 1
+                    prior <- p
+                points <- clipped
+                kept_count <- kept
+            return if kept_count < 3
+            first: RoomsView::Point = project(view, points[0])
+            Display::begin_polygon(list, kept_count, first.x, first.y, ink)
+            for i in 0..<kept_count |list, view, points|:
+                p: RoomsView::Point = project(view, points[i.usize()])
+                Display::polygon_point(list, p.x, p.y)

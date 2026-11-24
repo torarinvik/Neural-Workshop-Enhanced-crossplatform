@@ -1,0 +1,155 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_runtime.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_rng.elisa"
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_math.elisa"
+include "../src/scene_howstrongly.elisa"
+
+extern getchar() -> i32 can[Blocking.IO]
+extern dprintf(fd: i32, format: cstr, ...) -> i32 can[Console.Write]
+
+def text_bytes(text: sview):
+    can Console.Write, Abort.Panic:
+        for i in 0..<sview_len(text).i64() |text|:
+            _ = dprintf(1.i32(), "%02x", sview_at(text, i.usize()).i32())
+        _ = dprintf(1.i32(), "\n")
+
+def flag(value: bool) -> i64:
+    return 1 if value else 0
+
+def emit(quiz: ReadingQuiz::Round&, draw: mutable MT19937&):
+    can Abort.Panic, Console.Write:
+        _ = dprintf(1.i32(), "deal %lld %.17g\n", quiz.need, py_random(draw))
+        for item in quiz.items:
+            text_bytes(bytes_view(item.prompt))
+            text_bytes(sview(item.title, 0, -1))
+            _ = dprintf(1.i32(), "item %.17g\n", item.seconds)
+            for step in item.steps:
+                text_bytes(bytes_view(step.ask))
+                _ = dprintf(1.i32(), "step %lld %lld %lld\n", step.options.count.i64(), step.answer, flag(step.wide))
+                for option in step.options:
+                    text_bytes(bytes_view(option))
+
+def emit_run(quiz: ReadingQuiz::Round, policy: i64):
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        return if quiz.need == 0
+        run: mutable ReadingQuiz::Run = ReadingQuiz::begin(quiz)
+        while run.result == ReadingQuiz::LIVE |run, policy|:
+            answer: i64 = ReadingQuiz::pilot(&run)
+            accepted: mutable bool = false
+            if answer >= 0 and policy != 2:
+                st: ReadingQuiz::Step = ReadingQuiz::active_step(&run)
+                # Policy 3 misses only an item's first step: within tolerance on easier rungs.
+                right: bool = policy == 0 or (policy == 3 and run.progress > 0)
+                port: i64 = answer if right else (answer + 1) % st.options.count.i64()
+                box: ReadingQuiz::Box = ReadingQuiz::option_box(port, st.options.count.i64(), st.wide)
+                y: f64 = box.y + box.height / 2.0
+                if y >= 0.0:
+                    accepted <- ReadingQuiz::click(&run, box.x + box.width / 2.0, y)
+                else:
+                    accepted <- ReadingQuiz::choose(&run, port)
+            ReadingQuiz::advance_quiz(&run, 1.0 / 30.0)
+            _ = dprintf(1.i32(), "tick %lld %lld %lld %lld %lld %lld %.17g %.17g %lld\n",
+                flag(accepted), run.index, run.progress, run.right, run.wrong, flag(run.showing), run.time, run.since, run.result)
+        for cue in run.cues:
+            _ = dprintf(1.i32(), "cue %.17g %.17g %.17g %lld %.17g\n", cue.time, cue.duration, cue.frequency, cue.voice, cue.gain)
+
+def emit_pages(quiz: ReadingQuiz::Round):
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        for policy in 0..<3 |quiz|:
+            run: mutable ReadingQuiz::Run = ReadingQuiz::begin(quiz)
+            step: ReadingQuiz::Step = ReadingQuiz::active_step(&run)
+            if policy == 1:
+                _ = ReadingQuiz::choose(&run, (step.answer + 1) % step.options.count.i64())
+            elif policy == 2:
+                ReadingQuiz::advance_quiz(&run, quiz.items[0].seconds)
+            page: mutable Display::DisplayList = Display::DisplayList()
+            SceneReadingQuiz::page(&page, &run)
+            for command in page.commands |page|:
+                if command.kind == Display::CMD_TEXT:
+                    _ = dprintf(1.i32(), "label %u %.9g %.9g %.9g %d ", command.color, command.a.f64(), command.b.f64(),
+                        command.c.f64(), command.d.i32())
+                    offset: i64 = command.ref.i64()
+                    length: i64 = (command.len & 0xffffff.u32()).i64()
+                    text_bytes(bytes_view_range(page.pool, offset.usize(), length.usize()))
+                else:
+                    _ = dprintf(1.i32(), "shape %d %u %.9g %.9g %.9g %.9g\n", command.kind.i32(), command.color,
+                        command.a.f64(), command.b.f64(), command.c.f64(), command.d.f64())
+            _ = dprintf(1.i32(), "end\n")
+
+def test_level(corpus: HowStrongly::Corpus&, rung: i64):
+    can Abort.Panic, Console.Write, Memory.Allocate:
+        g: HowStrongly::Grade = HowStrongly::grade(rung)
+        _ = dprintf(1.i32(), "level %lld %lld %.17g %.17g %lld\n", g.rung, flag(g.strongest), g.tolerance, g.seconds, g.items)
+        for seed in 0..<16 |g, corpus|:
+            draw: mutable MT19937 = zeroed
+            mt_seed_int(&draw, seed.u64())
+            candidate: HowStrongly::Round = HowStrongly::build(g, &draw, corpus)
+            emit(&candidate.quiz, &draw)
+        rng: mutable MT19937 = zeroed
+        mt_seed_int(&rng, 17.u64())
+        dealt: HowStrongly::Round = HowStrongly::deal(g, &rng, corpus)
+        emit(&dealt.quiz, &rng)
+        # No round at this rung from these questions (Python raises).
+        return if dealt.quiz.items.count == 0.usize()
+        emit_pages(dealt.quiz)
+        emit_run(dealt.quiz, 0)
+        if rung == 10:
+            emit_run(dealt.quiz, 1)
+            emit_run(dealt.quiz, 2)
+        emit_run(dealt.quiz, 3)
+
+def check_session(corpus: HowStrongly::Corpus&):
+    can Abort.Panic, Memory.Release, Memory.Allocate:
+        session: mutable HowStronglyGame::Session = HowStronglyGame::initialize(11, 2, true, -17)
+        assert (HowStronglyGame::start(&session, corpus, 0.0) can Global{Read,Write})
+        first: ReadingQuiz::Step = ReadingQuiz::active_step(&session.run)
+        box: ReadingQuiz::Box = ReadingQuiz::option_box(first.answer, first.options.count.i64(), first.wide)
+        assert HowStronglyGame::pointer(&session, HandView::VIEW_LEFT + (box.x + box.width / 2.0) * HandView::VIEW_SCALE,
+            HandView::VIEW_BOTTOM + (box.y + box.height / 2.0) * HandView::VIEW_SCALE, 1)
+        assert session.run.right == 1 and session.run.showing
+        clock: mutable f64 = 0.0
+        while session.phase == HowStronglyGame::PLAYING |session, corpus, clock|:
+            port: i64 = ReadingQuiz::pilot(&session.run)
+            if port >= 0:
+                assert HowStronglyGame::choose(&session, port)
+                assert not HowStronglyGame::choose(&session, port)
+            clock <- clock + 0.05
+            assert (HowStronglyGame::advance(&session, corpus, clock) can Global{Read,Write})
+        assert session.phase == HowStronglyGame::JUDGED and session.rung == 12
+        assert session.best_rung == 11 and session.wins == 1 and session.trial == 1
+        assert not (HowStronglyGame::advance(&session, corpus, session.deadline - 0.001) can Global{Read,Write})
+        clock <- session.deadline
+        assert (HowStronglyGame::advance(&session, corpus, clock) can Global{Read,Write})
+        while session.phase == HowStronglyGame::PLAYING |session, corpus, clock|:
+            step: ReadingQuiz::Step = ReadingQuiz::active_step(&session.run)
+            if step.answer >= 0 and step.options.count > 0.usize():
+                bad: i64 = (step.answer + 1) % step.options.count.i64()
+                assert HowStronglyGame::choose(&session, bad)
+            clock <- clock + 0.05
+            assert (HowStronglyGame::advance(&session, corpus, clock) can Global{Read,Write})
+        assert session.phase == HowStronglyGame::JUDGED and session.rung == 11 and session.trial == 2
+        assert (HowStronglyGame::advance(&session, corpus, session.deadline) can Global{Read,Write})
+        assert session.phase == HowStronglyGame::DONE and session.wins == 1
+        assert (HowStronglyGame::start(&session, corpus, session.time) can Global{Read,Write})
+        assert session.phase == HowStronglyGame::PLAYING and session.rung == 11 and session.trial == 1 and session.wins == 0
+        HowStronglyGame::close(&session) can Global{Read,Write}
+        assert session.phase == HowStronglyGame::READY
+
+def main() -> i32:
+    can Abort.Panic, Blocking.IO, Console.Write, Memory.Allocate, Memory.Release, Unsafe.PointerCast:
+        for rung in [1, 4, 7, 10, 13, 16, 20, 25, 30]:
+            note: mutable dstr = []
+            SceneHowStrongly::option_note(rung, &note)
+            text_bytes(bytes_view(note))
+        raw: mutable dstr = []
+        while true |raw|:
+            next: i32 = getchar()
+            break if next < 0.i32()
+            raw.push(next.u8())
+        region resources(1048576):
+            corpus: HowStrongly::Corpus = HowStrongly::from_dialogue_cache(&resources, bytes_view(raw)) can Global{Read,Write}
+            for rung in [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 16, 20, 21, 25, 30, 99] |corpus|:
+                region trial(1048576):
+                    in trial:
+                        test_level(&corpus, rung)
+            check_session(&corpus) can Global{Read,Write}
+        return 0.i32()

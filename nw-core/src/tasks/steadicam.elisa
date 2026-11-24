@@ -1,0 +1,421 @@
+include "../pymath.elisa"
+include "../pyrandom.elisa"
+include "./drshape_deal.elisa"
+
+# steadicam.py: a camera on a tripod in a park, and someone walking a winding
+# path among the trees. Pan, tilt and zoom to keep them inside the framing box
+# drawn on the viewfinder. The take passes when they were framed for enough
+# of the time, and fails at once if they are lost for three seconds.
+module Steadicam:
+    const PAN_L: i64 = 0
+    const PAN_R: i64 = 1
+    const TILT_U: i64 = 2
+    const TILT_D: i64 = 3
+    const ZOOM_IN: i64 = 4
+    const ZOOM_OUT: i64 = 5
+    const PORTS: i64 = 6
+    const EYE: f64 = 1.5
+    const ASPECT: f64 = 0.62
+    const PI: f64 = 3.141592653589793
+    # math.radians multiplies by pi / 180.
+    const DEGREE: f64 = 0.017453292519943295
+    const ZOOM: f64 = 0.9
+    const LOST: f64 = 3.0
+    const PERSON: f64 = 1.75
+    const STEPS: i64 = 860
+    const MOST: i64 = 4
+    const TREES: i64 = 30
+    const CUES: i64 = 40
+    const LIVE: i64 = 0
+    const PASSED: i64 = 1
+    const SHORT: i64 = 2
+    const LOST_THEM: i64 = 3
+    const WOOD: i64 = 0
+    const BELL: i64 = 1
+
+    struct Grade:
+        rung: i64
+        speed: f64
+        wind: f64
+        near: f64
+        box: f64
+        low: f64
+        high: f64
+        heavy: bool
+        moods: bool
+        lead: bool
+        people: i64
+        cue: f64
+        seconds: f64
+        need: f64
+
+    struct Walker:
+        xs: mutable f64[860]
+        zs: mutable f64[860]
+        pace: mutable f64[860]
+        count: mutable i64
+
+    struct Park:
+        level: mutable Grade
+        walkers: mutable Walker[4]
+        tree_x: mutable f64[30]
+        tree_z: mutable f64[30]
+        tree_r: mutable f64[30]
+        cue_at: mutable f64[40]
+        cue_who: mutable i64[40]
+        cues: mutable i64
+        yaw: mutable f64
+        pitch: mutable f64
+        fov: mutable f64
+        seed: mutable i64
+        valid: mutable bool
+
+    struct Spot:
+        x: f64
+        z: f64
+
+    struct Angles:
+        a: f64
+        e: f64
+        r: f64
+
+    struct Place:
+        ux: f64
+        uy: f64
+        tall: f64
+
+    struct Run:
+        park: Park
+        t: mutable f64
+        yaw: mutable f64
+        pitch: mutable f64
+        fov: mutable f64
+        vyaw: mutable f64
+        vpitch: mutable f64
+        framed: mutable f64
+        counted: mutable f64
+        lost: mutable bool
+        lost_since: mutable f64
+        result: mutable i64
+        cue_heard: mutable i64
+        notes: mutable darray[DrShapeDeal::Note]
+
+    @inline(never)
+    def sine(angle: f64) -> f64:
+        return sin(angle)
+
+    @inline(never)
+    def cosine(angle: f64) -> f64:
+        return cos(angle)
+
+    # Python's float %, which takes the divisor's sign.
+    def pymod(x: f64, y: f64) -> f64:
+        mod: mutable f64 = fmod(x, y)
+        if mod != 0.0:
+            mod <- mod + y if (y < 0.0) != (mod < 0.0)
+        else:
+            mod <- -0.0 if y < 0.0 else 0.0
+        return mod
+
+    def fov_low() -> f64:
+        return 14.0 * DEGREE
+
+    def fov_high() -> f64:
+        return 70.0 * DEGREE
+
+    def pan_speed() -> f64:
+        return 55.0 * DEGREE
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung > 1 else 1
+        low: f64 = 0.0 if r < 4 else (0.22 if r < 10 else 0.28)
+        high: f64 = 0.0 if r < 4 else (0.65 if r < 10 else 0.6)
+        if r == 1:
+            return Grade{rung: r, speed: 1.0, wind: 0.2, near: 14.0, box: 0.6, low: low, high: high, heavy: false,
+                moods: false, lead: false, people: 1, cue: 0.0, seconds: 25.0, need: 0.8}
+        if r < 4:
+            return Grade{rung: r, speed: 1.4 + 0.3 * (r - 2).f64(), wind: 0.6, near: 6.0, box: 0.5, low: low, high: high,
+                heavy: false, moods: false, lead: false, people: 1, cue: 0.0, seconds: 30.0, need: 0.82}
+        if r < 7:
+            return Grade{rung: r, speed: 1.6, wind: 0.7, near: 6.0, box: 0.5, low: low, high: high, heavy: false,
+                moods: false, lead: false, people: 1, cue: 0.0, seconds: 30.0, need: 0.82}
+        if r < 10:
+            return Grade{rung: r, speed: 1.8, wind: 0.8, near: 5.0, box: 0.45, low: low, high: high, heavy: true,
+                moods: true, lead: false, people: 1, cue: 0.0, seconds: 35.0, need: 0.82}
+        if r < 13:
+            return Grade{rung: r, speed: 1.8, wind: 0.8, near: 5.0, box: 0.42, low: low, high: high, heavy: true,
+                moods: true, lead: true, people: 1, cue: 0.0, seconds: 35.0, need: 0.8}
+        speed: f64 = 2.0 + 0.1 * (r - 13).f64()
+        box: f64 = 0.4 * pow(0.95, (r - 13).f64())
+        people: i64 = 2 + (r - 13) / 4
+        cue: f64 = 9.0 - 0.4 * (r - 13).f64()
+        need: f64 = 0.78 + 0.002 * (r - 13).f64()
+        return Grade{rung: r, speed: speed if speed < 4.5 else 4.5, wind: 0.9, near: 5.0, box: box if box > 0.2 else 0.2,
+            low: low, high: high, heavy: true, moods: true, lead: true, people: people if people < 4 else 4,
+            cue: cue if cue > 3.0 else 3.0, seconds: 40.0, need: need if need < 0.85 else 0.85}
+
+    # _path: a walk at a steady pace, sampled every 0.05 s.
+    def path(level: Grade, draw: mutable MT19937&, out: mutable Walker&):
+        can Abort.Panic:
+            a: f64 = py_uniform(draw, -0.9, 0.9)
+            d: f64 = py_uniform(draw, level.near + 6.0, level.near + 14.0)
+            x: mutable f64 = d * sine(a)
+            z: mutable f64 = d * cosine(a)
+            heading: mutable f64 = py_uniform(draw, 0.0, 2.0 * PI)
+            turn: mutable f64 = 0.0
+            p: mutable f64 = 1.0
+            t: mutable f64 = 0.0
+            count: mutable i64 = 0
+            paces: f64[4] = [0.0, 0.0, 1.0, 1.8]
+            while t < level.seconds + 2.0 |level, draw, out, x, z, heading, turn, p, t, count, paces|:
+                turn <- py_uniform(draw, -1.0, 1.0) * level.wind if py_random(draw) < 0.02
+                if level.moods and py_random(draw) < 0.006:
+                    p <- paces[py_choice_index(draw, 4).usize()]
+                elif py_random(draw) < 0.004:
+                    p <- 1.0
+                heading <- heading + turn * 0.05
+                r: f64 = py_hypot(x, z)
+                if r > 32.0 or z < 2.0 or r < level.near:
+                    want: f64 = atan2(-x, 18.0 - z) if r > 32.0 or z < 2.0 else atan2(x, z)
+                    diff: f64 = pymod(want - heading + PI, 2.0 * PI) - PI
+                    bend: f64 = diff if diff < 0.15 else 0.15
+                    heading <- heading + (bend if bend > -0.15 else -0.15)
+                x <- x + sine(heading) * level.speed * p * 0.05
+                z <- z + cosine(heading) * level.speed * p * 0.05
+                out.xs[count.usize()] <- x
+                out.zs[count.usize()] <- z
+                out.pace[count.usize()] <- p
+                count <- count + 1
+                t <- t + 0.05
+            out.count <- count
+
+    def where(w: Walker&, t: f64) -> Spot:
+        can Abort.Panic:
+            step: f64 = t / 0.05
+            i: f64 = step if step > 0.0 else 0.0
+            whole: i64 = i.i64()
+            k: i64 = whole if whole < w.count - 2 else w.count - 2
+            part: f64 = i - k.f64()
+            f: f64 = part if part < 1.0 else 1.0
+            ax: f64 = w.xs[k.usize()]
+            az: f64 = w.zs[k.usize()]
+            return Spot{x: ax + (w.xs[(k + 1).usize()] - ax) * f, z: az + (w.zs[(k + 1).usize()] - az) * f}
+
+    # Pan and tilt that point at (x, y, z), and how far it is.
+    def angles(x: f64, z: f64, y: f64 = 0.875) -> Angles:
+        can Abort.Panic:
+            h: f64 = py_hypot(x, z)
+            return Angles{a: atan2(x, z), e: atan2(y - EYE, h), r: py_hypot(h, y - EYE)}
+
+    def bearing(w: Walker&, t: f64) -> f64:
+        can Abort.Panic:
+            at: Spot = where(w, t)
+            return atan2(at.x, at.z)
+
+    def deal(rung: i64, draw: mutable MT19937&) -> Park:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            park: mutable Park = zeroed
+            park.level <- grade(rung)
+            people: i64 = park.level.people
+            every: f64 = park.level.cue
+            seconds: f64 = park.level.seconds
+            for _ in 0..<60 |rung, draw, park, people, every, seconds|:
+                for k in 0..<people |rung, draw, park|:
+                    walker: mutable Walker = zeroed
+                    path(grade(rung), draw, &walker)
+                    park.walkers[k.usize()] <- walker
+                for k in 0..<TREES |draw, park|:
+                    park.tree_x[k.usize()] <- py_uniform(draw, -25.0, 25.0)
+                    park.tree_z[k.usize()] <- py_uniform(draw, 4.0, 35.0)
+                    park.tree_r[k.usize()] <- py_uniform(draw, 0.3, 0.7)
+                park.cue_at[0] <- 0.0
+                park.cue_who[0] <- 0
+                park.cues <- 1
+                if people > 1:
+                    t: mutable f64 = every
+                    while t < seconds |people, every, draw, park, t|:
+                        now: i64 = park.cue_who[(park.cues - 1).usize()]
+                        a0: f64 = bearing(&park.walkers[now.usize()], t)
+                        next: mutable i64 = -1
+                        nearest: mutable f64 = 0.0
+                        for k in 0..<people |park, now, a0, t, next, nearest|:
+                            continue if k == now
+                            off: f64 = fabs(bearing(&park.walkers[k.usize()], t) - a0)
+                            if next < 0 or off < nearest:
+                                next <- k
+                                nearest <- off
+                        park.cue_at[park.cues.usize()] <- t
+                        park.cue_who[park.cues.usize()] <- next
+                        park.cues <- park.cues + 1
+                        t <- t + every * py_uniform(draw, 0.8, 1.2)
+                at: Spot = where(&park.walkers[park.cue_who[0].usize()], 0.0)
+                aim: Angles = angles(at.x, at.z)
+                park.yaw <- aim.a
+                park.pitch <- aim.e
+                park.fov <- 50.0 * DEGREE
+                park.valid <- true
+                if play(park, -1) == PASSED:
+                    fails: mutable bool = true
+                    for held in -1..<PORTS |park, fails|:
+                        if play(park, held + 100) == PASSED:
+                            fails <- false
+                            break
+                    return park if fails
+            return zeroed
+
+    def begin(park: Park) -> Run:
+        can Abort.Panic, Memory.Allocate:
+            return Run{park: park, t: 0.0, yaw: park.yaw, pitch: park.pitch, fov: park.fov, vyaw: 0.0, vpitch: 0.0,
+                framed: 0.0, counted: 0.0, lost: false, lost_since: 0.0, result: LIVE, cue_heard: 0, notes: []}
+
+    def whom(run: Run&) -> i64:
+        can Abort.Panic:
+            k: mutable i64 = 0
+            for c in 0..<run.park.cues |run, k|:
+                k <- run.park.cue_who[c.usize()] if run.t >= run.park.cue_at[c.usize()]
+            return k
+
+    def subject(run: Run&) -> Spot:
+        can Abort.Panic:
+            return where(&run.park.walkers[whom(run).usize()], run.t)
+
+    # Which way the subject moves across the frame over the last second:
+    # -1 left, 1 right, 0 hardly at all (under 2 degrees a second).
+    def motion(run: Run&) -> f64:
+        can Abort.Panic:
+            w: Walker& = &run.park.walkers[whom(run).usize()]
+            back: f64 = run.t - 1.0
+            d: f64 = bearing(w, run.t) - bearing(w, back if back > 0.0 else 0.0)
+            return 0.0 if fabs(d) < 2.0 * DEGREE else (1.0 if d > 0.0 else -1.0)
+
+    # Where in the frame the subject should sit, across.
+    def aim_x(run: Run&) -> f64:
+        can Abort.Panic:
+            return -0.4 * motion(run) if run.park.level.lead else 0.0
+
+    def half_high(half_wide: f64) -> f64:
+        return atan(tan(half_wide) * ASPECT)
+
+    def place(run: Run&) -> Place:
+        can Abort.Panic:
+            at: Spot = subject(run)
+            seen: Angles = angles(at.x, at.z)
+            da: f64 = pymod(seen.a - run.yaw + PI, 2.0 * PI) - PI
+            half_w: f64 = run.fov / 2.0
+            half_h: f64 = half_high(half_w)
+            return Place{ux: tan(da) / tan(half_w), uy: tan(seen.e - run.pitch) / tan(half_h),
+                tall: 2.0 * atan(PERSON / 2.0 / seen.r) / (2.0 * half_h)}
+
+    def in_frame(run: Run&) -> bool:
+        can Abort.Panic:
+            at: Place = place(run)
+            box: f64 = run.park.level.box
+            return false if fabs(at.ux - aim_x(run)) > box or fabs(at.uy - 0.0) > box / ASPECT * 0.7
+            return run.park.level.high == 0.0 or (run.park.level.low <= at.tall and at.tall <= run.park.level.high)
+
+    def step(run: mutable Run&, dt: f64, control: i64):
+        can Abort.Panic, Memory.Allocate:
+            return if run.result != LIVE
+            run.t <- run.t + dt
+            px: i64 = (1 if control == PAN_R else 0) - (1 if control == PAN_L else 0)
+            py: i64 = (1 if control == TILT_U else 0) - (1 if control == TILT_D else 0)
+            ratio: f64 = run.fov / fov_high()
+            slow: f64 = ratio if ratio > 0.35 else 0.35
+            if run.park.level.heavy:
+                run.vyaw <- run.vyaw + (px.f64() * 3.0 * pan_speed() * slow - 1.2 * run.vyaw) * dt
+                run.vpitch <- run.vpitch + (py.f64() * 3.0 * pan_speed() * slow - 1.2 * run.vpitch) * dt
+            else:
+                run.vyaw <- px.f64() * pan_speed() * slow
+                run.vpitch <- py.f64() * pan_speed() * slow
+            run.yaw <- run.yaw + run.vyaw * dt
+            tilt: f64 = run.pitch + run.vpitch * dt
+            capped: f64 = tilt if tilt < 0.6 else 0.6
+            run.pitch <- capped if capped > -0.6 else -0.6
+            zoom: i64 = (1 if control == ZOOM_OUT else 0) - (1 if control == ZOOM_IN else 0)
+            wide: f64 = run.fov * exp(zoom.f64() * ZOOM * dt)
+            narrow: f64 = wide if wide < fov_high() else fov_high()
+            run.fov <- narrow if narrow > fov_low() else fov_low()
+            cue: mutable i64 = 0
+            for c in 0..<run.park.cues |run, cue|:
+                cue <- cue + 1 if run.t >= run.park.cue_at[c.usize()]
+            if cue != run.cue_heard:
+                run.cue_heard <- cue
+                if cue > 1:
+                    run.notes.push(DrShapeDeal::Note{t: run.t, dur: 0.2, freq: 880.0, pan: 0.0, pan2: 0.0, gain: 0.3,
+                        gain2: 0.3, bright: 0.8, voice: BELL, seed: cue, who: -1, room: 0.0})
+            return if run.t < 1.0
+            switched: mutable bool = false
+            for c in 1..<run.park.cues |run, switched|:
+                since: f64 = run.t - run.park.cue_at[c.usize()]
+                switched <- true if 0.0 < since and since < 1.5
+            run.counted <- run.counted + dt if not switched
+            if in_frame(run):
+                run.framed <- run.framed + dt
+                run.lost <- false
+            elif switched:
+                pass
+            elif not run.lost:
+                run.lost <- true
+                run.lost_since <- run.t
+            elif run.t - run.lost_since > LOST:
+                run.result <- LOST_THEM
+                return
+            if run.t >= run.park.level.seconds:
+                run.result <- PASSED if share(run) >= run.park.level.need else SHORT
+
+    def share(run: Run&) -> f64:
+        return run.framed / (run.counted if run.counted > 1e-6 else 1e-6)
+
+    # The reference autopilot: points where the subject will be a moment from
+    # now, and zooms to the middle of the size allowed. -1 is no port.
+    def pilot(run: Run&) -> i64:
+        can Abort.Panic:
+            return -1 if run.result != LIVE
+            w: Walker& = &run.park.walkers[whom(run).usize()]
+            heavy: bool = run.park.level.heavy
+            lead: f64 = 0.25 if heavy else 0.12
+            at: Spot = where(w, run.t + lead)
+            seen: Angles = angles(at.x, at.z)
+            ax: f64 = aim_x(run)
+            half_w: f64 = run.fov / 2.0
+            half_h: f64 = half_high(half_w)
+            want_yaw: f64 = seen.a - atan(ax * tan(half_w))
+            want_pitch: f64 = seen.e - atan(0.0 * tan(half_h))
+            dy: mutable f64 = pymod(want_yaw - run.yaw + PI, 2.0 * PI) - PI
+            dp: mutable f64 = want_pitch - run.pitch
+            if heavy:
+                ahead: Spot = where(w, run.t + lead + 0.2)
+                later: Angles = angles(ahead.x, ahead.z)
+                rate_a: f64 = (pymod(later.a - seen.a + PI, 2.0 * PI) - PI) / 0.2
+                rate_e: f64 = (later.e - seen.e) / 0.2
+                dy <- dy - (run.vyaw - rate_a) * 0.6
+                dp <- dp - (run.vpitch - rate_e) * 0.6
+            box: f64 = run.park.level.box
+            ex: f64 = fabs(dy) / half_w / box
+            ey: f64 = fabs(dp) / half_h / (box / ASPECT * 0.7)
+            ez: mutable f64 = 0.0
+            zoom: mutable i64 = -1
+            lo: f64 = run.park.level.low
+            hi: f64 = run.park.level.high
+            if hi != 0.0:
+                tall: f64 = place(run).tall
+                mid: f64 = (lo + hi) / 2.0
+                ez <- fabs(tall - mid) / ((hi - lo) / 2.0)
+                zoom <- ZOOM_IN if tall < mid else ZOOM_OUT
+            worst: mutable f64 = ex
+            worst <- ey if ey > worst
+            worst <- ez if ez > worst
+            return -1 if worst < 0.15
+            return zoom if ez == worst
+            return (PAN_R if dy > 0.0 else PAN_L) if ex == worst
+            return TILT_U if dp > 0.0 else TILT_D
+
+    # play(): one take at 1/30 s a step, the autopilot asked every step
+    # (held < 0), or one port held throughout (held - 100, -1 for none).
+    def play(park: Park, held: i64) -> i64:
+        can Abort.Panic, Memory.Allocate, Memory.Release:
+            run: mutable Run = begin(park)
+            while run.result == LIVE |run, held|:
+                port: i64 = pilot(&run) if held < 0 else held - 100
+                step(&run, 1.0 / 30.0, port)
+            return run.result

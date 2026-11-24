@@ -17,13 +17,9 @@ module NBack3DGame:
 
     const MODE_POSITION: i64 = 10
     const MAX_TRIALS: i64 = 100
-    # The original human-facing scheduler wakes every 100 ms. Millisecond
-    # options are retained at the API boundary, but phase edges are snapped
-    # to this same clock.
     const TICK_MS: i64 = 100
-    # session.new_session() starts mode.tick at -9 for one stimulus channel;
-    # the first visible trial is emitted on the tenth scheduler wake-up.
-    const STARTUP_DELAY_MS: i64 = 1000
+    # The first visible trial is emitted on the tenth scheduler wake-up.
+    const STARTUP_TICKS: i64 = 10
 
     const PHASE_READY: i64 = 0
     const PHASE_STIMULUS: i64 = 1
@@ -39,6 +35,9 @@ module NBack3DGame:
     const ACTION_TICK: i64 = 2
     const ACTION_PAUSE: i64 = 3
     const ACTION_RESTART: i64 = 4
+    const ACTION_ADJUST_LEVEL: i64 = 5
+    const ACTION_ADJUST_TRIALS: i64 = 6
+    const ACTION_ADJUST_INTERVAL: i64 = 7
 
     const VERDICT_NONE: i64 = -1
     const VERDICT_HIT: i64 = 1
@@ -66,12 +65,54 @@ module NBack3DGame:
     const INFO_SEED: i64 = 17
     const INFO_PAUSED: i64 = 18
     const INFO_ERROR: i64 = 19
+    const INFO_SCORE_PERCENT: i64 = 20
+    const INFO_JAEGGI_PERCENT: i64 = 21
+    const INFO_NEXT_NBACK: i64 = 22
+    const INFO_FALLBACK_PROGRESS: i64 = 23
+    const INFO_MUSIC_TIER: i64 = 24
+
+    struct Progression:
+        enabled: mutable bool
+        jaeggi: mutable bool
+        immediate_fallback: mutable bool
+        advance_threshold: mutable i64
+        fallback_threshold: mutable i64
+        fallback_sessions: mutable i64
+        base_trials: mutable i64
+        trials_factor: mutable i64
+        trials_exponent: mutable i64
+        fallback_progress: mutable i64
+        next_nback: mutable i64
 
     struct NBack3DRun:
+        history_chart: mutable usize
+        history_style: mutable i64
+        history_mode: mutable i64
+        history_rollover: mutable i64
+        stats_path: mutable usize
+        stats_pending: mutable bool
+        clinical_log: mutable bool
+        save_progress: mutable bool
+        progress_dirty: mutable bool
+        reward_fade_at: mutable u64
+        music_gain: mutable f32
+        music_live_gain: mutable f64
+        music_pending: mutable bool
+        music_library: mutable usize
+        music_mixer: mutable usize
+        music_tier: mutable i64
+        applause_gain: mutable f32
+        applause_live_gain: mutable f64
+        applause_pending: mutable bool
+        applause_voice: mutable usize
+        progression: mutable Progression
         seed: mutable i64
         nback: mutable i64
         cubes: mutable i64
+        match_key: mutable i64
         total_trials: mutable i64
+        next_interval_ms: mutable i64
+        tick_ms: mutable i64
         interval_ms: mutable i64
         stimulus_ms: mutable i64
         feedback_ms: mutable i64
@@ -83,6 +124,8 @@ module NBack3DGame:
         resume_phase: mutable i64
         position: mutable i64[100]
         color: mutable i64[100]
+        pressed: mutable bool[100]
+        response_ms: mutable i64[100]
         phase: mutable i64
         verdict: mutable i64
         answered: mutable bool
@@ -91,6 +134,7 @@ module NBack3DGame:
         hits: mutable i64
         misses: mutable i64
         false_alarms: mutable i64
+        warmup_false_alarms: mutable i64
         correct_rejections: mutable i64
 
     def clamp_nback(value: i64) -> i64:
@@ -110,6 +154,8 @@ module NBack3DGame:
             for at in 0..<MAX_TRIALS |at, run|:
                 run.position[at.usize()] <- 0
                 run.color[at.usize()] <- 0
+                run.pressed[at.usize()] <- false
+                run.response_ms[at.usize()] <- 0
 
     # The original config normally supplies positive feedback (200 ms). The
     # controller also exposes feedback=0 for deterministic/headless callers,
@@ -119,18 +165,18 @@ module NBack3DGame:
         can Abort.Panic:
             if run.feedback_ms > 0:
                 return plan_trial_phases(run.interval_ms, run.stimulus_ms,
-                                         run.feedback_ms, TICK_MS)
-            total: mutable i64 = ms_to_ticks(run.interval_ms.f64(), TICK_MS)
+                                         run.feedback_ms, run.tick_ms)
+            total: mutable i64 = ms_to_ticks(run.interval_ms.f64(), run.tick_ms)
             total <- 3 if total < 3
-            stimulus: mutable i64 = ms_to_ticks(run.stimulus_ms.f64(), TICK_MS)
+            stimulus: mutable i64 = ms_to_ticks(run.stimulus_ms.f64(), run.tick_ms)
             stimulus <- total if stimulus > total
             return TrialPhases{
                 total_ticks: total,
                 stimulus_ticks: stimulus,
                 blank_ticks: total - stimulus,
                 feedback_ticks: 0,
-                stimulus_ms: stimulus * TICK_MS,
-                blank_ms: (total - stimulus) * TICK_MS,
+                stimulus_ms: stimulus * run.tick_ms,
+                blank_ms: (total - stimulus) * run.tick_ms,
                 feedback_ms: 0,
             }
 
@@ -138,13 +184,43 @@ module NBack3DGame:
                    total_trials: i64, interval_ms: i64, stimulus_ms: i64,
                    feedback_ms: i64, seed: i64):
         can Abort.Panic:
+            run.history_chart <- 0.usize()
+            run.history_style <- 0
+            run.history_mode <- MODE_POSITION
+            run.history_rollover <- 4
+            run.stats_path <- 0.usize()
+            run.stats_pending <- false
+            run.clinical_log <- false
+            run.save_progress <- false
+            run.progress_dirty <- false
+            run.reward_fade_at <- 0.u64()
+            run.music_live_gain <- 0.0
+            run.applause_live_gain <- 0.0
+            run.music_gain <- 0.0.f32()
+            run.music_pending <- false
+            run.music_library <- 0.usize()
+            run.music_mixer <- 0.usize()
+            run.music_tier <- 0
+            run.progression.jaeggi <- false
+            run.applause_gain <- 0.0.f32()
+            run.applause_pending <- false
+            run.applause_voice <- 0.usize()
             run.seed <- seed
             run.nback <- clamp_nback(nback)
+            run.progression.enabled <- false
+            run.progression.next_nback <- run.nback
+            run.progression.fallback_progress <- 0
+            run.progression.base_trials <- clamp_trials(total_trials)
+            run.progression.trials_factor <- 0
+            run.progression.trials_exponent <- 0
             run.cubes <- clamp_cubes(cubes)
+            run.match_key <- 97
             run.total_trials <- clamp_trials(total_trials)
+            run.tick_ms <- TICK_MS
             wanted_interval: i64 = interval_ms if interval_ms > 0 else 3000
             run.interval_ms <- clamp_trial_interval_ms(
                 wanted_interval, TICK_MS, 3, 60000)
+            run.next_interval_ms <- run.interval_ms
             run.stimulus_ms <- stimulus_ms if stimulus_ms > 0 else 500
             run.feedback_ms <- 0 if feedback_ms < 0 else feedback_ms
             run.trial <- 0
@@ -161,6 +237,7 @@ module NBack3DGame:
             run.hits <- 0
             run.misses <- 0
             run.false_alarms <- 0
+            run.warmup_false_alarms <- 0
             run.correct_rejections <- 0
             clear_history(run)
 
@@ -191,11 +268,40 @@ module NBack3DGame:
             run.position[index.usize()] <- generated.position
             run.color[index.usize()] <- generated.color
 
+    def adaptive_trial_count(progression: Progression&, nback: i64) -> i64:
+        can Abort.Panic:
+            extra: mutable i64 = progression.trials_factor
+            exponent: mutable i64 = progression.trials_exponent
+            while exponent > 0 and extra > 0 and extra < MAX_TRIALS and nback > 1 |extra, exponent, nback|:
+                extra <- extra * nback
+                exponent <- exponent - 1
+            return clamp_trials(progression.base_trials + extra)
+
+    def finish_progression(progression: mutable Progression&, nback: i64, percent: i64):
+        can Abort.Panic:
+            return if not progression.enabled
+            progression.next_nback <- nback
+            if percent >= progression.advance_threshold:
+                progression.next_nback <- clamp_nback(nback + 1)
+                progression.fallback_progress <- 0
+            elif nback > 1 and percent < progression.fallback_threshold:
+                progression.fallback_progress <- progression.fallback_progress + 1
+                if progression.immediate_fallback or progression.fallback_progress >= progression.fallback_sessions:
+                    progression.next_nback <- nback - 1
+                    progression.fallback_progress <- 0
+
     def start_trial(run: mutable NBack3DRun&, now_ms: i64):
         can Memory.Allocate, Abort.Panic:
             if run.trial >= run.total_trials:
                 run.phase <- PHASE_DONE
                 run.deadline_ms <- 0
+                run.stats_pending <- run.stats_path != 0.usize()
+                run.music_pending <- run.music_gain > 0.0.f32()
+                if run.progression.enabled:
+                    percent: i64 = score_percent(run, run.progression.jaeggi)
+                    finish_progression(&run.progression, run.nback, percent)
+                    run.progress_dirty <- true
+                    run.applause_pending <- run.progression.next_nback > run.nback and run.applause_gain > 0.0.f32()
                 return
             run.trial <- run.trial + 1
             run.verdict <- VERDICT_NONE
@@ -204,16 +310,22 @@ module NBack3DGame:
             return if run.failed
             phases: TrialPhases = phase_plan(run)
             run.trial_started_ms <- now_ms
-            run.trial_deadline_ms <- now_ms + phases.total_ticks * TICK_MS
+            run.trial_deadline_ms <- now_ms + phases.total_ticks * run.tick_ms
             run.deadline_ms <- now_ms + phases.stimulus_ms
             run.phase <- PHASE_STIMULUS
 
     def reset_and_start(run: mutable NBack3DRun&, now_ms: i64):
         can Memory.Allocate, Abort.Panic:
+            run.nback <- run.progression.next_nback
+            run.total_trials <- adaptive_trial_count(&run.progression, run.nback)
+            run.interval_ms <- run.next_interval_ms
+            run.music_pending <- false
+            run.applause_pending <- false
             run.trial <- 0
             run.hits <- 0
             run.misses <- 0
             run.false_alarms <- 0
+            run.warmup_false_alarms <- 0
             run.correct_rejections <- 0
             run.verdict <- VERDICT_NONE
             run.answered <- false
@@ -223,7 +335,7 @@ module NBack3DGame:
             run.paused_remaining_ms <- 0
             clear_history(run)
             run.phase <- PHASE_STARTUP
-            run.deadline_ms <- now_ms + STARTUP_DELAY_MS
+            run.deadline_ms <- now_ms + STARTUP_TICKS * run.tick_ms
 
     def settle_trial(run: mutable NBack3DRun&, now_ms: i64):
         can Memory.Allocate, Abort.Panic:
@@ -265,13 +377,16 @@ module NBack3DGame:
 
     def answer_match(run: mutable NBack3DRun&, now_ms: i64) -> i64:
         can Memory.Allocate, Abort.Panic:
-            # The original input path accepts the match key throughout the
-            # active trial, including the short feedback phase.
-            return 2 if run.phase != PHASE_STIMULUS and run.phase != PHASE_RESPONSE and run.phase != PHASE_FEEDBACK
-            return 2 if run.answered
+            phase: i64 = run.resume_phase if run.phase == PHASE_PAUSED else run.phase
+            return 2 if phase != PHASE_STIMULUS and phase != PHASE_RESPONSE and phase != PHASE_FEEDBACK
+            index: usize = current_index(run).usize()
+            # Python records the latest keypress against the original trial onset.
+            run.response_ms[index] <- now_ms - run.trial_started_ms if now_ms >= run.trial_started_ms else 0
+            return 1 if run.answered
             run.answered <- true
+            run.pressed[index] <- true
             if current_matches(run):
-                if run.phase == PHASE_FEEDBACK:
+                if phase == PHASE_FEEDBACK:
                     if run.verdict == VERDICT_MISS:
                         run.misses <- run.misses - 1
                     elif run.verdict == VERDICT_CORRECT_REJECTION:
@@ -279,13 +394,14 @@ module NBack3DGame:
                 run.verdict <- VERDICT_HIT
                 run.hits <- run.hits + 1
             else:
-                if run.phase == PHASE_FEEDBACK:
+                if phase == PHASE_FEEDBACK:
                     if run.verdict == VERDICT_MISS:
                         run.misses <- run.misses - 1
                     elif run.verdict == VERDICT_CORRECT_REJECTION:
                         run.correct_rejections <- run.correct_rejections - 1
                 run.verdict <- VERDICT_FALSE_ALARM
                 run.false_alarms <- run.false_alarms + 1
+                run.warmup_false_alarms <- run.warmup_false_alarms + 1 if current_index(run) < run.nback
             return 1
 
     def toggle_pause(run: mutable NBack3DRun&, now_ms: i64) -> i64:
@@ -294,6 +410,14 @@ module NBack3DGame:
                 run.paused <- false
                 run.phase <- run.resume_phase
                 run.deadline_ms <- now_ms + run.paused_remaining_ms
+                if run.phase != PHASE_STARTUP:
+                    phases: TrialPhases = phase_plan(run)
+                    # Rebuild the trial end from the resumed phase's remaining
+                    # time and the duration of the phases that follow it.
+                    after_phase: mutable i64 = 0
+                    after_phase <- phases.blank_ms + phases.feedback_ms if run.phase == PHASE_STIMULUS
+                    after_phase <- phases.feedback_ms if run.phase == PHASE_RESPONSE
+                    run.trial_deadline_ms <- run.deadline_ms + after_phase
                 return 1
             if run.phase != PHASE_STARTUP and run.phase != PHASE_STIMULUS and run.phase != PHASE_RESPONSE and run.phase != PHASE_FEEDBACK:
                 return 2
@@ -302,6 +426,25 @@ module NBack3DGame:
             run.deadline_ms <- 0
             run.paused <- true
             run.phase <- PHASE_PAUSED
+            return 1
+
+    def adjust_manual(run: mutable NBack3DRun&, action: i64, delta: i64) -> i64:
+        can Abort.Panic:
+            return 2 if run.progression.enabled or (run.phase != PHASE_READY and run.phase != PHASE_DONE)
+            return -6 if delta != -1 and delta != 1
+            progress: mutable Progression& = &run.progression
+            if action == ACTION_ADJUST_LEVEL:
+                progress.next_nback <- clamp_nback(progress.next_nback + delta)
+            elif action == ACTION_ADJUST_TRIALS:
+                if delta > 0 or progress.base_trials > 5:
+                    base: i64 = progress.base_trials + 5 * delta
+                    progress.base_trials <- MAX_TRIALS if base > MAX_TRIALS else base
+            else:
+                run.next_interval_ms <- adjust_speed_ms(run.next_interval_ms, delta < 0, run.tick_ms, 3, 60000)
+            if run.phase == PHASE_READY:
+                run.nback <- progress.next_nback
+                run.total_trials <- adaptive_trial_count(progress, run.nback)
+                run.interval_ms <- run.next_interval_ms
             return 1
 
     def apply(run: mutable NBack3DRun&, action: i64, value: i64, now_ms: i64) -> i64:
@@ -319,7 +462,20 @@ module NBack3DGame:
             elif action == ACTION_RESTART:
                 reset_and_start(run, now_ms)
                 return 1
+            elif action >= ACTION_ADJUST_LEVEL and action <= ACTION_ADJUST_INTERVAL:
+                return adjust_manual(run, action, value)
             return -6
+
+    # The original score ignores trials without an N-back comparison.
+    # Jaeggi scoring also counts correctly withheld comparison trials.
+    def score_percent(run: NBack3DRun&, jaeggi: bool) -> i64:
+        return -1 if run.phase != PHASE_DONE
+        warmup: i64 = run.nback if run.nback < run.total_trials else run.total_trials
+        wrong: i64 = run.misses + run.false_alarms - run.warmup_false_alarms
+        right: mutable i64 = run.hits
+        right <- right + run.correct_rejections - (warmup - run.warmup_false_alarms) if jaeggi
+        total: i64 = right + wrong
+        return right * 100 / total if total > 0 else 0
 
     def info(run: NBack3DRun&, field: i64) -> i64:
         can Abort.Panic:
@@ -345,14 +501,20 @@ module NBack3DGame:
             if field == INFO_SEED: return run.seed
             if field == INFO_PAUSED: return 1 if run.paused else 0
             if field == INFO_ERROR: return 1 if run.failed else 0
+            if field == INFO_SCORE_PERCENT: return score_percent(run, false)
+            if field == INFO_JAEGGI_PERCENT: return score_percent(run, true)
+            if field == INFO_NEXT_NBACK: return run.progression.next_nback
+            if field == INFO_FALLBACK_PROGRESS: return run.progression.fallback_progress
+            if field == INFO_MUSIC_TIER: return run.music_tier
             return -1
 
-    def append_message(out: mutable dstr&, run: NBack3DRun&):
+    def append_message(out: mutable dstr&, run: NBack3DRun&, match_label: sview):
         can Memory.Allocate, Abort.Panic:
             if run.phase == PHASE_READY:
                 dstr_append_cstr(out, "Press SPACE to begin")
             elif run.phase == PHASE_STIMULUS:
-                dstr_append_cstr(out, "Match: press A")
+                dstr_append_cstr(out, "Match: press ")
+                dstr_append_sview(out, match_label)
             elif run.phase == PHASE_RESPONSE:
                 dstr_append_cstr(out, "Respond if it matches N trials back")
             elif run.phase == PHASE_FEEDBACK:
@@ -365,7 +527,13 @@ module NBack3DGame:
                 else:
                     dstr_append_cstr(out, "Correct rejection")
             elif run.phase == PHASE_DONE:
-                dstr_append_cstr(out, "Session complete")
+                dstr_append_cstr(out, "Session complete · Score: ")
+                dstr_append_i64(out, score_percent(run, run.progression.enabled and run.progression.jaeggi))
+                dstr_append_cstr(out, "%")
+                if run.progression.next_nback != run.nback:
+                    dstr_append_cstr(out, " · Next: ")
+                    dstr_append_i64(out, run.progression.next_nback)
+                    dstr_append_cstr(out, "-back")
             elif run.phase == PHASE_PAUSED:
                 dstr_append_cstr(out, "Paused")
             elif run.phase == PHASE_STARTUP:
@@ -374,12 +542,12 @@ module NBack3DGame:
                 dstr_append_cstr(out, "3D N-Back could not generate this trial")
 
     def render(run: NBack3DRun&, black_background: bool, width: f64, height: f64,
-               list: mutable Display::DisplayList&):
+               list: mutable Display::DisplayList&, match_label: sview = "A"):
         can Memory.Allocate, Abort.Panic:
             message: mutable dstr = []
-            append_message(&message, run)
+            append_message(&message, run, match_label)
             SceneNBack3D::render(list, black_background, width, height,
                 run.phase, run.trial, run.total_trials, run.nback, run.cubes,
                 info(run, INFO_POSITION), info(run, INFO_COLOR), run.verdict,
                 run.hits, run.misses, run.false_alarms,
-                run.correct_rejections, bytes_view(message))
+                run.correct_rejections, bytes_view(message), match_label)

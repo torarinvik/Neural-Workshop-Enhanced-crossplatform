@@ -1,0 +1,167 @@
+include "./gamble.elisa"
+
+module GambleReference:
+    struct Evidence:
+        wins: mutable f64
+        losses: mutable f64
+        bites: mutable f64
+        calm: mutable f64
+        bite_size: mutable i64
+        pulls: mutable i64
+        won: mutable i64
+        spent: mutable i64
+
+    struct Belief:
+        keep: f64
+        arms: mutable Evidence[Gamble::ARMS]
+        coins: mutable i64
+
+    struct Sum:
+        total: mutable f64
+        correction: mutable f64
+
+    def add(sum: mutable Sum&, value: f64):
+        next: f64 = sum.total + value
+        lost: f64 = ((sum.total - next) + value) if fabs(sum.total) >= fabs(value) else ((value - next) + sum.total)
+        sum.total <- next
+        sum.correction <- sum.correction + lost
+
+    # CPython random.gammavariate with unit scale. Keep the rejection tests
+    # and uniform draw order because each accepted sample affects later arms.
+    def gamma(rng: mutable MT19937&, alpha: f64) -> f64:
+        can Abort.Panic:
+            return -log(1.0 - py_random(rng)) if alpha == 1.0
+            if alpha > 1.0:
+                ainv: f64 = sqrt(2.0 * alpha - 1.0)
+                b: f64 = alpha - 1.3862943611198906
+                c: f64 = alpha + ainv
+                while true |rng, alpha, ainv, b, c|:
+                    u: f64 = py_random(rng)
+                    if u > 0.0000001 and u < 0.9999999:
+                        u2: f64 = 1.0 - py_random(rng)
+                        v: f64 = log(u / (1.0 - u)) / ainv
+                        x: f64 = alpha * exp(v)
+                        z: f64 = u * u * u2
+                        r: f64 = b + c * v - x
+                        return x if r + 2.504077396776274 - 4.5 * z >= 0.0 or r >= log(z)
+            b: f64 = (2.718281828459045 + alpha) / 2.718281828459045
+            while true |rng, alpha, b|:
+                p: f64 = b * py_random(rng)
+                x: f64 = pow(p, 1.0 / alpha) if p <= 1.0 else -log((b - p) / alpha)
+                u: f64 = py_random(rng)
+                boundary: f64 = pow(x, alpha - 1.0) if p > 1.0 else exp(-x)
+                return x if u <= boundary
+            return 0.0
+
+    def beta(rng: mutable MT19937&, alpha: f64, shape: f64) -> f64:
+        can Abort.Panic:
+            y: f64 = gamma(rng, alpha)
+            return y / (y + gamma(rng, shape)) if y != 0.0 else 0.0
+
+    def initialize(level: Gamble::Grade) -> Belief:
+        can Abort.Panic:
+            keep: f64 = 0.9 if level.jumps > 0 else (0.95 if level.drift > 0.0 else 1.0)
+            belief: mutable Belief = Belief{keep: keep, arms: zeroed, coins: 0}
+            for arm in 0..<level.arms |belief|:
+                belief.arms[arm.usize()] <- Evidence{wins: 1.0, losses: 1.0, bites: 0.2, calm: 5.0,
+                    bite_size: 0, pulls: 0, won: 0, spent: 0}
+            return belief
+
+    def saw(belief: mutable Belief&, level: Gamble::Grade, arm: i64, won: i64):
+        can Abort.Panic:
+            for i in 0..<level.arms |belief|:
+                at: usize = i.usize()
+                belief.arms[at].wins <- 1.0 + (belief.arms[at].wins - 1.0) * belief.keep
+                belief.arms[at].losses <- 1.0 + (belief.arms[at].losses - 1.0) * belief.keep
+            at: usize = arm.usize()
+            gross: i64 = won + level.price
+            belief.coins <- belief.coins + won
+            belief.arms[at].pulls <- belief.arms[at].pulls + 1
+            belief.arms[at].spent <- belief.arms[at].spent + level.price + (-gross if gross < 0 else 0)
+            if gross > 0:
+                belief.arms[at].won <- belief.arms[at].won + gross
+                belief.arms[at].wins <- belief.arms[at].wins + 1.0
+            else:
+                belief.arms[at].losses <- belief.arms[at].losses + 1.0
+            if gross < 0:
+                belief.arms[at].bites <- belief.arms[at].bites + 1.0
+                belief.arms[at].bite_size <- -gross if -gross > belief.arms[at].bite_size
+            else:
+                belief.arms[at].calm <- belief.arms[at].calm + 1.0
+
+    def choose_arm(dealt: Gamble::Deal&, belief: Belief&, rng: mutable MT19937&) -> i64:
+        can Abort.Panic:
+            level: Gamble::Grade = dealt.level
+            if level.price > 0:
+                return -1 if level.bankroll + belief.coins <= 3 * level.price
+                losing: mutable bool = true
+                for arm in 0..<level.arms |belief, losing|:
+                    evidence: Evidence = belief.arms[arm.usize()]
+                    if evidence.pulls < 2 or evidence.won >= evidence.spent:
+                        losing <- false
+                        break
+                return -1 if losing
+            best: mutable i64 = -1
+            best_worth: mutable f64 = 0.0
+            for arm in 0..<level.arms |dealt, belief, rng, level, best, best_worth|:
+                evidence: Evidence = belief.arms[arm.usize()]
+                win: f64 = beta(rng, evidence.wins, evidence.losses)
+                bite: f64 = beta(rng, evidence.bites, evidence.calm)
+                worth: f64 = win * dealt.machines[arm.usize()].pays.f64() - bite * evidence.bite_size.f64() - level.price.f64()
+                if best < 0 or worth > best_worth:
+                    best <- arm
+                    best_worth <- worth
+            return best
+
+    def reference(dealt: Gamble::Deal&) -> Gamble::Round:
+        can Abort.Panic, Memory.Allocate:
+            rng: mutable MT19937 = zeroed
+            mt_seed_int(&rng, dealt.seed.u64())
+            round: mutable Gamble::Round = Gamble::initialize()
+            belief: mutable Belief = initialize(dealt.level)
+            while not Gamble::over(&round, dealt.level) |dealt, rng, round, belief|:
+                arm: i64 = choose_arm(dealt, &belief, &rng)
+                if arm < 0:
+                    _ = Gamble::stop(&round, dealt.level)
+                    break
+                won: i64 = Gamble::payout(dealt, round.history.count.i64(), arm)
+                _ = Gamble::pull(&round, dealt, arm)
+                saw(&belief, dealt.level, arm, won)
+            return round
+
+    def guessing(dealt: Gamble::Deal&) -> f64:
+        can Abort.Panic:
+            total: mutable Sum = zeroed
+            level: Gamble::Grade = dealt.level
+            for t in 0..<level.pulls |dealt, level, total|:
+                slot: mutable Sum = zeroed
+                for arm in 0..<level.arms |dealt, slot, t|:
+                    add(&slot, Gamble::worth(dealt, t, arm))
+                add(&total, (slot.total + slot.correction) / level.arms.f64())
+            return total.total + total.correction
+
+    def knowing(dealt: Gamble::Deal&) -> f64:
+        can Abort.Panic:
+            level: Gamble::Grade = dealt.level
+            total: mutable Sum = zeroed
+            running: mutable f64 = 0.0
+            peak: mutable f64 = 0.0
+            for t in 0..<level.pulls |dealt, level, total, running, peak|:
+                best: mutable f64 = Gamble::worth(dealt, t, 0)
+                for arm in 1..<level.arms |dealt, t, best|:
+                    worth: f64 = Gamble::worth(dealt, t, arm)
+                    best <- worth if worth > best
+                if level.price == 0:
+                    add(&total, best)
+                else:
+                    running <- running + best
+                    peak <- running if running > peak
+            return total.total + total.correction if level.price == 0 else peak
+
+    def par(dealt: Gamble::Deal&) -> f64:
+        can Abort.Panic, Memory.Allocate:
+            play: Gamble::Round = reference(dealt)
+            ref: f64 = Gamble::value(&play)
+            allow: f64 = dealt.level.allow
+            gap: f64 = ref - guessing(dealt) if allow >= 0.0 else knowing(dealt) - ref
+            return ref - allow * (gap if gap > 0.0 else 0.0)

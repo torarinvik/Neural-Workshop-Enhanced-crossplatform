@@ -23,6 +23,13 @@ const ANCHORS = [
     ["left", "top"], ["center", "top"], ["right", "top"],
 ];
 
+const TEXT_FACES = [
+    "Arial", "Times New Roman", "Courier New", "Georgia", "Impact", "Comic Sans MS",
+    "Futura", "Marker Felt", "Papyrus", "Didot", "American Typewriter", "Rockwell",
+    "Chalkduster", "Bradley Hand", "Copperplate", "Verdana",
+];
+const TEXT_FACE_FALLBACK = "Arial, Helvetica, 'DejaVu Sans', 'Liberation Sans', sans-serif";
+
 export function decode(bytes) {
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     if (bytes.byteLength < 16) throw new Error("display list: truncated header");
@@ -105,11 +112,12 @@ export function fillTextRoundedAdvances(ctx, text, x, y, {
 export function render(ctx, commands, {
     width, height, assets = {}, fontFamily = "system-ui, sans-serif",
     fontScale = 1, textOffsetY = 0, roundGlyphAdvances = false,
-    glyphStrokeRatio = 0, replaceRect = null, afterCommands = null,
+    glyphStrokeRatio = 0, replaceRect = null, afterCommands = null, replaceFittedSprite = null,
+    referenceWidth = REFERENCE_WIDTH, referenceHeight = REFERENCE_HEIGHT, sceneImage = null,
 } = {}) {
-    const scale = Math.min(width / REFERENCE_WIDTH, height / REFERENCE_HEIGHT);
-    const offsetX = (width - REFERENCE_WIDTH * scale) / 2;
-    const offsetY = (height - REFERENCE_HEIGHT * scale) / 2;
+    const scale = Math.min(width / referenceWidth, height / referenceHeight);
+    const offsetX = (width - referenceWidth * scale) / 2;
+    const offsetY = (height - referenceHeight * scale) / 2;
 
     ctx.save();
     // Host game layers can leave a scaled/flipped transform behind. Clearing
@@ -117,6 +125,7 @@ export function render(ctx, commands, {
     // and geometry accumulate on every animation frame.
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, width, height);
+    if (sceneImage) ctx.drawImage(sceneImage, 0, 0, width, height);
     ctx.setTransform(scale, 0, 0, -scale, offsetX, height - offsetY);
 
     let polygon = null;
@@ -261,6 +270,7 @@ export function render(ctx, commands, {
                 break;
             }
             case Kind.SPRITE_FIT: {
+                if (typeof replaceFittedSprite === "function" && replaceFittedSprite(ctx, cmd)) break;
                 // The core names a room; the shell owns the fit, because only
                 // the shell has decoded the image and knows its size. Same rule
                 // as bootstrap._place_splash: keep the aspect, land inside.
@@ -279,16 +289,18 @@ export function render(ctx, commands, {
             case Kind.TEXT: {
                 // Text must not be mirrored by the y-flip, so it draws in a
                 // temporarily un-flipped frame.
-        ctx.save();
-        ctx.fillStyle = css(cmd.color);
-        const commandTextOffsetY = typeof textOffsetY === "function"
-            ? textOffsetY(cmd) : textOffsetY;
+                ctx.save();
+                ctx.fillStyle = css(cmd.color);
+                const commandTextOffsetY = typeof textOffsetY === "function"
+                    ? textOffsetY(cmd) : textOffsetY;
+                const face = TEXT_FACES[cmd.f - 1];
+                const family = face ? `"${face}", ${TEXT_FACE_FALLBACK}` : fontFamily;
                 // `d` is the weight: every task screen's title asks for bold,
                 // and a title back at normal weight is a different frame.
-                if (roundGlyphAdvances) {
+                if (roundGlyphAdvances && !face && !cmd.e) {
                     const align = cmd.anchor ? cmd.anchor[0] : "left";
                     ctx.setTransform(1, 0, 0, 1, 0, 0);
-                    ctx.font = `${cmd.d ? "bold " : ""}${cmd.c * fontScale * scale}px ${fontFamily}`;
+                    ctx.font = `${cmd.d ? "bold " : ""}${cmd.c * fontScale * scale}px ${family}`;
                     ctx.textAlign = "left";
                     ctx.textBaseline = cmd.anchor
                         ? { bottom: "alphabetic", middle: "middle", top: "top" }[cmd.anchor[1]]
@@ -304,7 +316,8 @@ export function render(ctx, commands, {
                 } else {
                     ctx.translate(cmd.a, cmd.b + commandTextOffsetY);
                     ctx.scale(1, -1);
-                    ctx.font = `${cmd.d ? "bold " : ""}${cmd.c * fontScale}px ${fontFamily}`;
+                    if (cmd.e) ctx.rotate(cmd.e * Math.PI / 180);
+                    ctx.font = `${cmd.d ? "bold " : ""}${cmd.c * fontScale}px ${family}`;
                     ctx.textAlign = cmd.anchor ? cmd.anchor[0] : "left";
                     ctx.textBaseline = cmd.anchor
                         ? { bottom: "alphabetic", middle: "middle", top: "top" }[cmd.anchor[1]]

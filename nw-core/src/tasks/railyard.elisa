@@ -1,0 +1,503 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module RailYard:
+    const WORLD_W: f64 = 160.0
+    const WORLD_H: f64 = 100.0
+    const MOST_SWITCHES: i64 = 15
+    const MOST_STATIONS: i64 = 16
+    const MOST_PORTALS: i64 = 2
+    const PORTS: i64 = MOST_SWITCHES + MOST_PORTALS
+    const MOST_NODES: i64 = 34
+    const MOST_SEGMENTS: i64 = 33
+    const MOST_TRAINS: i64 = 18
+    const MOST_ROUTE_SEGMENTS: i64 = 6
+    const SWITCH: i64 = 0
+    const STATION: i64 = 1
+    const PORTAL: i64 = 2
+    const MERGE: i64 = 3
+
+    struct Grade:
+        rung: i64
+        depth: i64
+        portals: i64
+        trains: i64
+        headway: f64
+        speed: f64
+        throw_seconds: f64
+        express: f64
+        forgive: i64
+
+    struct Point:
+        x: f64
+        y: f64
+
+    struct Node:
+        kind: i64
+        point: Point
+        index: i64
+        out: i64[2]
+        out_count: i64
+
+    struct Segment:
+        start: i64
+        end: i64
+        points: Point[4]
+        point_count: i64
+        length: f64
+
+    struct Layout:
+        nodes: Node[MOST_NODES]
+        segments: Segment[MOST_SEGMENTS]
+        starts: i64[MOST_PORTALS]
+        node_count: mutable i64
+        segment_count: mutable i64
+
+    struct Route:
+        segments: i64[MOST_ROUTE_SEGMENTS]
+        ways: i64[MOST_ROUTE_SEGMENTS]
+        count: mutable i64
+
+    struct TrainPlan:
+        portal: i64
+        station: i64
+        due: f64
+        speed: f64
+        express: bool
+
+    struct Yard:
+        level: Grade
+        layout: Layout
+        plans: TrainPlan[MOST_TRAINS]
+        seconds: mutable f64
+
+    def grade(rung: i64) -> Grade:
+        can Abort.Panic:
+            r: i64 = rung if rung > 0 else 1
+            top: i64 = r - 20 if r > 20 else 0
+            return Grade{rung: r, depth: 1 if r < 4 else (2 if r < 10 else (3 if r < 20 else 4)),
+                portals: 1 if r < 13 else 2, trains: 5 if r < 4 else (7 if r < 10 else (10 if r < 20 else (12 + top if top < 6 else 18))),
+                headway: 9.0 if r < 4 else (7.0 if r < 7 else (6.0 if r < 10 else (5.0 if r < 20 else fmax(2.6, 4.2 - 0.15 * top.f64())))),
+                speed: 14.0 if r < 4 else (16.0 if r < 10 else (18.0 if r < 20 else fmin(26.0, 20.0 + 0.6 * top.f64()))),
+                throw_seconds: 0.0 if r < 7 else (1.0 if r < 20 else fmin(1.6, 1.1 + 0.05 * top.f64())),
+                express: 0.0 if r < 16 else 0.3, forgive: 1 if r < 10 else 0}
+
+    def leaf_y(stations: i64, station: i64) -> f64:
+        return WORLD_H - 8.0 - (WORLD_H - 16.0) * (station.f64() + 0.5) / stations.f64()
+
+    def add_node(layout: mutable Layout&, kind: i64, index: i64, x: f64, y: f64) -> i64:
+        can Abort.Panic:
+            id: i64 = layout.node_count
+            layout.nodes[id.usize()] <- Node{kind: kind, point: Point{x: x, y: y}, index: index, out: zeroed, out_count: 0}
+            layout.node_count <- id + 1
+            return id
+
+    def distance(a: Point, b: Point) -> f64:
+        return py_hypot(b.x - a.x, b.y - a.y)
+
+    def connect(layout: mutable Layout&, from_node: i64, to_node: i64) -> i64:
+        can Abort.Panic:
+            id: i64 = layout.segment_count
+            a: Point = layout.nodes[from_node.usize()].point
+            b: Point = layout.nodes[to_node.usize()].point
+            dx: f64 = b.x - a.x
+            first: Point = Point{x: a.x + dx * 0.25, y: a.y}
+            last: Point = Point{x: a.x + dx * 0.75, y: b.y}
+            slant: bool = fabs(a.y - b.y) >= 0.000001
+            layout.segments[id.usize()] <- Segment{start: from_node, end: to_node,
+                points: [a, first if slant else b, last, b], point_count: 4 if slant else 2,
+                length: distance(a, first) + distance(first, last) + distance(last, b) if slant else distance(a, b)}
+            branch: i64 = layout.nodes[from_node.usize()].out_count
+            layout.nodes[from_node.usize()].out[branch.usize()] <- id
+            layout.nodes[from_node.usize()].out_count <- branch + 1
+            layout.segment_count <- id + 1
+            return id
+
+    def layout(level: Grade) -> Layout:
+        can Abort.Panic:
+            result: mutable Layout = zeroed
+            stations: i64 = 1 << level.depth
+            separation: f64 = 112.0 / level.depth.f64()
+            for depth in 0..<level.depth |result, stations, separation|:
+                count: i64 = 1 << depth
+                span: i64 = stations / count
+                for branch in 0..<count |result, stations, separation, depth, count, span|:
+                    lo: i64 = branch * span
+                    y: f64 = (leaf_y(stations, lo) + leaf_y(stations, lo + span - 1)) / 2.0
+                    _ = add_node(&result, SWITCH, count + branch - 1, 36.0 + depth.f64() * separation, y)
+            for station in 0..<stations |result, stations|:
+                _ = add_node(&result, STATION, station, WORLD_W - 12.0, leaf_y(stations, station))
+            for k in 1..<stations |result|:
+                _ = connect(&result, k - 1, 2 * k - 1)
+                _ = connect(&result, k - 1, 2 * k)
+            root_y: f64 = result.nodes[0].point.y
+            if level.portals == 1:
+                portal: i64 = add_node(&result, PORTAL, 0, 6.0, root_y)
+                result.starts[0] <- connect(&result, portal, 0)
+            else:
+                merge: i64 = add_node(&result, MERGE, 0, 22.0, root_y)
+                _ = connect(&result, merge, 0)
+                for j in 0..<level.portals |result, merge, root_y|:
+                    portal: i64 = add_node(&result, PORTAL, j, 4.0, root_y + (16.0 if j == 0 else -16.0))
+                    result.starts[j.usize()] <- connect(&result, portal, merge)
+            return result
+
+    def route(layout: Layout&, depth: i64, portal: i64, station: i64) -> Route:
+        can Abort.Panic:
+            result: mutable Route = zeroed
+            segment: mutable i64 = layout.starts[portal.usize()]
+            bit: mutable i64 = depth - 1
+            for i in 0..<MOST_ROUTE_SEGMENTS |layout, station, result, segment, bit|:
+                node: Node = layout.nodes[layout.segments[segment.usize()].end.usize()]
+                way: i64 = ((station >> bit) & 1) if node.kind == SWITCH else -1
+                result.segments[i.usize()] <- segment
+                result.ways[i.usize()] <- way
+                result.count <- i + 1
+                break if node.kind == STATION
+                segment <- node.out[(way if way >= 0 else 0).usize()]
+                bit <- bit - 1 if way >= 0
+            return result
+
+    def route_length(layout: Layout&, depth: i64, plan: TrainPlan) -> f64:
+        can Abort.Panic:
+            path: Route = route(layout, depth, plan.portal, plan.station)
+            length: mutable f64 = 0.0
+            for i in 0..<path.count |layout, path, length|:
+                length <- length + layout.segments[path.segments[i.usize()].usize()].length
+            return length
+
+    def round_decimal(value: f64, scale: f64) -> f64:
+        can Abort.Panic:
+            # Recover which side of a decimal midpoint the binary input is on.
+            scaled: f64 = value * scale
+            lower: i64 = floor(scaled).i64()
+            fraction: f64 = scaled - lower.f64()
+            return (lower + (1 if fraction > 0.5 else 0)).f64() / scale if fraction != 0.5
+            split: f64 = value * 134217729.0
+            high: f64 = split - (split - value)
+            rounding_error: f64 = (high * scale - scaled) + (value - high) * scale
+            return (lower + (1 if rounding_error > 0.0 or (rounding_error == 0.0 and lower % 2 != 0) else 0)).f64() / scale
+
+    def deal_seed(rung: i64, seed: i64) -> Yard:
+        can Abort.Panic:
+            draw: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&draw, magnitude)
+            level: Grade = grade(rung)
+            yard: mutable Yard = Yard{level: level, layout: layout(level), plans: zeroed, seconds: 0.0}
+            stations: u64 = 1.u64() << level.depth
+            count: mutable i64 = 0
+            for portal in 0..<level.portals |draw, level, yard, stations, count|:
+                due: mutable f64 = py_uniform(&draw, 1.0, 3.0) + portal.f64() * level.headway / 2.0
+                trains: i64 = level.trains / level.portals + (1 if portal < level.trains % level.portals else 0)
+                for _ in 0..<trains |draw, level, yard, stations, count, due, portal|:
+                    express: bool = py_random(&draw) < level.express
+                    station: i64 = py_randbelow(&draw, stations).i64()
+                    plan: TrainPlan = TrainPlan{portal: portal, station: station, due: round_decimal(due, 100.0),
+                        speed: level.speed * (1.5 if express else 1.0), express: express}
+                    idx: mutable i64 = count
+                    while idx > 0 and yard.plans[(idx - 1).usize()].due > plan.due |idx, yard, plan|:
+                        yard.plans[idx.usize()] <- yard.plans[(idx - 1).usize()]
+                        idx <- idx - 1
+                    yard.plans[idx.usize()] <- plan
+                    count <- count + 1
+                    due <- due + level.headway * py_uniform(&draw, 0.8, 1.25) * level.portals.f64()
+            longest: mutable f64 = 0.0
+            for i in 0..<level.trains |yard, level, longest|:
+                longest <- fmax(longest, route_length(&yard.layout, level.depth, yard.plans[i.usize()]))
+            yard.seconds <- round_decimal(yard.plans[(level.trains - 1).usize()].due + 2.2 * longest / level.speed + 12.0, 10.0)
+            return yard
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Yard:
+        can Abort.Panic:
+            return deal_seed(rung, py_randbelow(rng, 1073741824.u64()).i64())
+
+    const DUE: i64 = 0
+    const WAITING: i64 = 1
+    const RUNNING: i64 = 2
+    const RIGHT: i64 = 3
+    const WRONG: i64 = 4
+    const LOST: i64 = 5
+    const LIVE: i64 = 0
+    const CLEAR: i64 = 1
+    const MISROUTED: i64 = 2
+    const TIMEOUT: i64 = 3
+    const DERAILMENT: i64 = 4
+    const COLLISION: i64 = 5
+    const CLEAR_AT_TIMEOUT: i64 = 6
+    const GAP: f64 = 7.0
+    const TRAIN_LENGTH: f64 = 5.0
+
+    struct Position:
+        point: Point
+        heading: f64
+
+    struct Train:
+        state: mutable i64
+        segment: mutable i64
+        distance: mutable f64
+        left_at: mutable f64
+
+    struct Points:
+        way: mutable i64
+        target: mutable i64
+        moving: mutable f64
+
+    struct Run:
+        yard: Yard
+        elapsed: mutable f64
+        trains: Train[MOST_TRAINS]
+        points: Points[MOST_SWITCHES]
+        signals: bool[MOST_PORTALS]
+        result: mutable i64
+        crash: mutable Point
+        first_train: mutable i64
+        second_train: mutable i64
+        right: mutable i64
+        delivered: mutable i64
+
+    def initialize(yard: Yard&) -> Run:
+        can Abort.Panic:
+            run: mutable Run = Run{yard: yard[0], elapsed: 0.0, trains: zeroed, points: zeroed, signals: [true, true],
+                result: LIVE, crash: zeroed, first_train: -1, second_train: -1, right: 0, delivered: 0}
+            for i in 0..<yard.level.trains |run|:
+                run.trains[i.usize()].segment <- -1
+            return run
+
+    def steer(run: mutable Run&, port: i64) -> bool:
+        can Abort.Panic:
+            return false if run.result != LIVE or port < 0
+            if port >= MOST_SWITCHES:
+                index: i64 = port - MOST_SWITCHES
+                return false if index >= run.yard.level.portals
+                run.signals[index.usize()] <- not run.signals[index.usize()]
+                return true
+            switches: i64 = (1 << run.yard.level.depth) - 1
+            return false if port >= switches
+            idx: usize = port.usize()
+            target: i64 = 1 - run.points[idx].target
+            run.points[idx].target <- target
+            throw_seconds: f64 = run.yard.level.throw_seconds
+            if throw_seconds <= 0.0:
+                run.points[idx].way <- target
+            run.points[idx].moving <- throw_seconds if target != run.points[idx].way else 0.0
+            return true
+
+    def position(segment: Segment&, at: f64) -> Position:
+        can Abort.Panic:
+            left: mutable f64 = at
+            for i in 1..<segment.point_count |segment, left|:
+                a: Point = segment.points[(i - 1).usize()]
+                b: Point = segment.points[i.usize()]
+                length: f64 = distance(a, b)
+                if left <= length or i == segment.point_count - 1:
+                    share: f64 = 0.0 if length == 0.0 else fmax(0.0, fmin(1.0, left / length))
+                    return Position{point: Point{x: a.x + (b.x - a.x) * share, y: a.y + (b.y - a.y) * share},
+                        heading: atan2(b.y - a.y, b.x - a.x)}
+                left <- left - length
+            return zeroed
+
+    def release_portal(run: mutable Run&, portal: i64):
+        can Abort.Panic:
+            return if not run.signals[portal.usize()]
+            start: i64 = run.yard.layout.starts[portal.usize()]
+            next: mutable i64 = -1
+            for i in 0..<run.yard.level.trains |run, portal, start, next|:
+                train: Train = run.trains[i.usize()]
+                return if train.state == RUNNING and train.segment == start and train.distance < GAP + 1.0
+                if next < 0 and train.state == WAITING and run.yard.plans[i.usize()].portal == portal:
+                    next <- i
+            if next >= 0:
+                run.trains[next.usize()] <- Train{state: RUNNING, segment: start, distance: 0.0, left_at: run.elapsed}
+
+    def advance_train(run: mutable Run&, index: i64, dt: f64):
+        can Abort.Panic:
+            i: usize = index.usize()
+            run.trains[i].distance <- run.trains[i].distance + run.yard.plans[i].speed * dt
+            while run.trains[i].state == RUNNING |run, i, index|:
+                seg: Segment = run.yard.layout.segments[run.trains[i].segment.usize()]
+                return if run.trains[i].distance < seg.length
+                run.trains[i].distance <- run.trains[i].distance - seg.length
+                node: Node = run.yard.layout.nodes[seg.end.usize()]
+                if node.kind == STATION:
+                    arrived: bool = node.index == run.yard.plans[i].station
+                    run.trains[i].state <- RIGHT if arrived else WRONG
+                    run.delivered <- run.delivered + 1
+                    run.right <- run.right + (1 if arrived else 0)
+                    return
+                way: mutable i64 = 0
+                if node.kind == SWITCH:
+                    switches: Points = run.points[node.index.usize()]
+                    if switches.moving > 0.0:
+                        run.trains[i].state <- LOST
+                        run.crash <- node.point
+                        run.first_train <- index
+                        run.result <- DERAILMENT
+                        return
+                    way <- switches.way
+                run.trains[i].segment <- node.out[way.usize()]
+
+    def collisions(run: mutable Run&):
+        can Abort.Panic:
+            for i in 0..<run.yard.level.trains |run|:
+                a: Train = run.trains[i.usize()]
+                continue if a.state != RUNNING
+                for j in (i + 1)..<run.yard.level.trains |run, i, a|:
+                    b: Train = run.trains[j.usize()]
+                    continue if b.state != RUNNING or a.segment != b.segment or fabs(a.distance - b.distance) >= GAP
+                    run.trains[i.usize()].state <- LOST
+                    run.trains[j.usize()].state <- LOST
+                    run.crash <- position(&run.yard.layout.segments[a.segment.usize()], fmax(a.distance, b.distance)).point
+                    run.first_train <- i
+                    run.second_train <- j
+                    run.result <- COLLISION
+                    return
+
+    def step(run: mutable Run&, dt: f64):
+        can Abort.Panic:
+            return if run.result != LIVE
+            run.elapsed <- run.elapsed + dt
+            switches: i64 = (1 << run.yard.level.depth) - 1
+            for i in 0..<switches |run, dt|:
+                idx: usize = i.usize()
+                if run.points[idx].moving > 0.0:
+                    run.points[idx].moving <- fmax(0.0, run.points[idx].moving - dt)
+                    if run.points[idx].moving == 0.0:
+                        run.points[idx].way <- run.points[idx].target
+            for i in 0..<run.yard.level.trains |run|:
+                idx: usize = i.usize()
+                if run.trains[idx].state == DUE and run.elapsed >= run.yard.plans[idx].due:
+                    run.trains[idx].state <- WAITING
+            for portal in 0..<run.yard.level.portals |run|:
+                release_portal(run, portal)
+            for i in 0..<run.yard.level.trains |run, dt|:
+                if run.trains[i.usize()].state == RUNNING:
+                    advance_train(run, i, dt)
+                    return if run.result != LIVE
+            collisions(run)
+            return if run.result != LIVE
+            total: i64 = run.yard.level.trains
+            complete: bool = run.delivered == total
+            if complete or run.elapsed >= run.yard.seconds:
+                passed: bool = run.right >= total - run.yard.level.forgive
+                run.result <- (CLEAR if passed else MISROUTED) if complete else (CLEAR_AT_TIMEOUT if passed else TIMEOUT)
+
+    struct Arrival:
+        node: i64
+        time: f64
+        way: i64
+
+    struct Arrivals:
+        entries: Arrival[MOST_ROUTE_SEGMENTS]
+        count: mutable i64
+
+    def arrivals(run: Run&, train_index: i64, departure: f64) -> Arrivals:
+        can Abort.Panic:
+            train: Train = run.trains[train_index.usize()]
+            plan: TrainPlan = run.yard.plans[train_index.usize()]
+            path: Route = route(&run.yard.layout, run.yard.level.depth, plan.portal, plan.station)
+            underway: bool = train.state == RUNNING
+            start: mutable i64 = 0
+            if underway:
+                while start < path.count and path.segments[start.usize()] != train.segment |start, path, train|:
+                    start <- start + 1
+            start_time: f64 = run.elapsed if underway else departure
+            travelled: mutable f64 = -train.distance if underway else 0.0
+            result: mutable Arrivals = zeroed
+            for i in start..<path.count |run, path, start_time, travelled, result, plan|:
+                piece: Segment = run.yard.layout.segments[path.segments[i.usize()].usize()]
+                travelled <- travelled + piece.length
+                result.entries[result.count.usize()] <- Arrival{node: piece.end,
+                    time: start_time + travelled / plan.speed, way: path.ways[i.usize()]}
+                result.count <- result.count + 1
+            return result
+
+    def earlier(current: Arrival, times: Arrivals&, node: i64, minimum: f64) -> Arrival:
+        can Abort.Panic:
+            for i in 0..<times.count |times, node, minimum, current|:
+                next: Arrival = times.entries[i.usize()]
+                if next.node == node and next.time >= minimum and (current.way < 0 or next.time < current.time):
+                    return next
+            return current
+
+    def can_share_route(mine: Arrivals&, theirs: Arrivals&, spacing: f64, throw_seconds: f64) -> bool:
+        can Abort.Panic:
+            order: mutable i64 = 0
+            for i in 0..<mine.count |mine, theirs, spacing, throw_seconds, order|:
+                candidate: Arrival = mine.entries[i.usize()]
+                for j in 0..<theirs.count |theirs, candidate, spacing, throw_seconds, order|:
+                    other: Arrival = theirs.entries[j.usize()]
+                    continue if other.node != candidate.node
+                    gap: f64 = candidate.time - other.time
+                    different: bool = candidate.way >= 0 and other.way >= 0 and candidate.way != other.way
+                    need: f64 = fmax(spacing, throw_seconds) if different else spacing
+                    sign: i64 = 1 if gap > 0.0 else -1
+                    return false if fabs(gap) < need or (order != 0 and sign != order)
+                    order <- sign
+                    break
+            return true
+
+    def autopilot(run: Run&) -> i64:
+        can Abort.Panic:
+            level: Grade = run.yard.level
+            committed: mutable Arrivals[MOST_TRAINS] = zeroed
+            count: mutable i64 = 0
+            waiting: mutable i64[MOST_PORTALS] = [-1, -1]
+            blocked: mutable bool[MOST_PORTALS] = zeroed
+            slowest: mutable f64 = run.yard.plans[0].speed
+            for j in 0..<level.trains |run, committed, count, waiting, blocked, slowest|:
+                i: usize = j.usize()
+                plan: TrainPlan = run.yard.plans[i]
+                train: Train = run.trains[i]
+                portal: usize = plan.portal.usize()
+                slowest <- fmin(slowest, plan.speed)
+                if train.state == RUNNING:
+                    committed[count.usize()] <- arrivals(run, j, run.elapsed)
+                    count <- count + 1
+                    for k in 0..<run.yard.level.portals |run, train, blocked|:
+                        if train.segment == run.yard.layout.starts[k.usize()] and train.distance < GAP + 1.0:
+                            blocked[k.usize()] <- true
+                elif train.state == WAITING and waiting[portal] < 0:
+                    waiting[portal] <- j
+            queued: mutable Arrivals[MOST_PORTALS] = zeroed
+            for i in 0..<level.portals |run, waiting, queued|:
+                if waiting[i.usize()] >= 0:
+                    queued[i.usize()] <- arrivals(run, waiting[i.usize()], run.elapsed)
+            mask: mutable i64 = 0
+            switches: i64 = (1 << level.depth) - 1
+            for k in 0..<switches |run, level, committed, count, queued, mask|:
+                point: Points = run.points[k.usize()]
+                next: mutable Arrival = Arrival{node: -1, time: 0.0, way: -1}
+                for j in 0..<count |run, committed, next, k|:
+                    next <- earlier(next, &committed[j.usize()], k, run.elapsed - 0.000001)
+                if next.way < 0:
+                    for j in 0..<level.portals |queued, next, k|:
+                        next <- earlier(next, &queued[j.usize()], k, run.elapsed)
+                    if next.way >= 0 and point.target != next.way and point.moving <= 0.0:
+                        mask <- mask | (1 << k)
+                elif point.target != next.way and next.time - run.elapsed > level.throw_seconds + 0.05:
+                    mask <- mask | (1 << k)
+            spacing: f64 = (GAP + 3.0) / slowest
+            for j in 0..<level.portals |run, level, waiting, blocked, committed, count, mask, spacing|:
+                i: usize = j.usize()
+                want: mutable bool = waiting[i] >= 0 and not blocked[i]
+                if want:
+                    mine: Arrivals = arrivals(run, waiting[i], run.elapsed + 0.05)
+                    for k in 0..<mine.count |run, level, mine, want|:
+                        arrival: Arrival = mine.entries[k.usize()]
+                        node: Node = run.yard.layout.nodes[arrival.node.usize()]
+                        continue if node.kind != SWITCH
+                        point: Points = run.points[node.index.usize()]
+                        until: f64 = arrival.time - run.elapsed
+                        if (point.target != arrival.way and until < level.throw_seconds + 0.4) or until < point.moving + 0.4:
+                            want <- false
+                            break
+                    for k in 0..<count |level, want, mine, committed, spacing|:
+                        break if not want
+                        want <- can_share_route(&mine, &committed[k.usize()], spacing, level.throw_seconds + 0.35)
+                    if want:
+                        committed[count.usize()] <- mine
+                        count <- count + 1
+                if want != run.signals[i]:
+                    mask <- mask | (1 << (MOST_SWITCHES + j))
+            return mask

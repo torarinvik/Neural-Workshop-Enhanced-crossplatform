@@ -1,0 +1,408 @@
+# The session clock and score for the Cookie Thief kernel. All state that
+# survives an input event lives inline so the host can own a single handle.
+module CookieThiefGame:
+    const PHASE_READY: i64 = 0
+    const PHASE_SETTING: i64 = 1
+    const PHASE_RUNNING: i64 = 2
+    const PHASE_SCORED: i64 = 3
+    const PHASE_DONE: i64 = 4
+    const ACTION_START: i64 = 0
+    const ACTION_GRAB: i64 = 1
+    const ACTION_LEAVE: i64 = 2
+    const ACTION_LUNGE: i64 = 3
+    const ACTION_WAIT: i64 = 4
+    const VERDICT_MS: i64 = 1000
+    const REHEARSAL_DEALS: i64 = 400
+
+    struct Run:
+        start_rung: mutable i64
+        total_trials: mutable i64
+        adaptive: mutable bool
+        coach: mutable bool
+        coach_verdict: mutable i64
+        beat_ms: mutable i64
+        set_ms: mutable i64
+        rng: mutable MT19937
+        setup: mutable CookieThief::Setup
+        thief: mutable CookieThief::Thief
+        phase: mutable i64
+        rung: mutable i64
+        trial_rung: mutable i64
+        trial: mutable i64
+        deadline: mutable i64
+        grabbing: mutable bool
+        shown_grab: mutable bool
+        verdict: mutable i64
+        clean: mutable i64
+        cookies: mutable i64
+        points: mutable i64
+        best_rung: mutable i64
+        recent: mutable i64
+        rung_counts: mutable i64[10]
+        floor_percent: mutable i64
+
+    def clamp_rung(rung: i64) -> i64:
+        return 1 if rung < 1 else (CookieThief::GRADE_COUNT if rung > CookieThief::GRADE_COUNT else rung)
+
+    def reset(run: mutable Run&):
+        can Abort.Panic:
+            run.rung <- run.start_rung
+            run.trial_rung <- run.start_rung
+            run.trial <- 0
+            run.phase <- PHASE_READY
+            run.deadline <- 0
+            run.verdict <- -1
+            run.coach_verdict <- -1
+            run.clean <- 0
+            run.cookies <- 0
+            run.points <- 0
+            run.best_rung <- 0
+            run.recent <- 0
+            run.floor_percent <- 0
+            run.grabbing <- false
+            run.shown_grab <- false
+            CookieThief::reset_thief(&run.thief)
+            for index in 0..<CookieThief::GRADE_COUNT |index, run|:
+                run.rung_counts[index.usize()] <- 0
+
+    def initialize(run: mutable Run&, level: i64, trials: i64, beat_ms: i64,
+                   set_ms: i64, adaptive: bool, seed: i64, coach: bool = false):
+        can Abort.Panic:
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, seed.u64())
+            run.rng <- rng
+            run.coach <- coach
+            configure(run, level, trials, beat_ms, set_ms, adaptive)
+
+    def configure(run: mutable Run&, level: i64, trials: i64, beat_ms: i64,
+                  set_ms: i64, adaptive: bool):
+        can Abort.Panic:
+            run.start_rung <- clamp_rung(level)
+            run.total_trials <- 1 if trials < 1 else trials
+            run.beat_ms <- 1 if beat_ms < 1 else beat_ms
+            run.set_ms <- 0 if set_ms < 0 else set_ms
+            run.adaptive <- adaptive
+            reset(run)
+
+    def rehearsal_wins(rung: i64) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            wins: mutable i64 = 0
+            grade: mutable CookieThief::Grade = CookieThief::grade_at(rung)
+            rng: mutable MT19937 = mt19937_new()
+            mt_seed_int(&rng, 0.u64())
+            # Generation's temporary decoy lists must never outlive the rehearsal.
+            region rehearsal(4194304):
+                in rehearsal:
+                    for deal in 0..<REHEARSAL_DEALS |grade, rng, rung, wins|:
+                        setup: mutable CookieThief::Setup = CookieThief::generate(rung, py_randbelow(&rng, 1073741824.u64()).i64())
+                        thief: mutable CookieThief::Thief = CookieThief::Thief()
+                        while not CookieThief::over(&thief, &grade) |thief, setup, grade, rng|:
+                            _ = CookieThief::press(&thief, py_choice_index(&rng, 4), &setup, &grade)
+                            _ = CookieThief::beat(&thief, &setup, &grade)
+                        wins <- wins + 1 if CookieThief::cleared(&thief, &grade)
+                destroy rehearsal
+            return wins
+
+    def next_trial(run: mutable Run&, now: i64):
+        can Memory.Allocate, Abort.Panic:
+            if run.trial >= run.total_trials:
+                wins: mutable i64 = 0
+                for index in 0..<CookieThief::GRADE_COUNT |index, run, wins|:
+                    count: i64 = run.rung_counts[index.usize()]
+                    if count > 0:
+                        wins <- wins + count * rehearsal_wins(index + 1)
+                run.floor_percent <- py_round_half_even(100.0 * wins.f64() / (REHEARSAL_DEALS.f64() * run.trial.f64()))
+                run.phase <- PHASE_DONE
+                return
+            run.trial <- run.trial + 1
+            run.trial_rung <- run.rung
+            seed: i64 = py_randbelow(&run.rng, 1073741824.u64()).i64()
+            region deal(65536):
+                in deal:
+                    setup: CookieThief::Setup = CookieThief::generate(run.rung, seed)
+                    run.setup.trigger <- setup.trigger
+                    run.setup.deadline <- setup.deadline
+                    run.setup.decoy_n <- setup.decoy_n
+                    for index in 0..<setup.decoy_n |index, setup, run|:
+                        run.setup.decoy_at[index.usize()] <- setup.decoy_at[index.usize()]
+                        run.setup.decoy_who[index.usize()] <- setup.decoy_who[index.usize()]
+                destroy deal
+            CookieThief::reset_thief(&run.thief)
+            run.grabbing <- false
+            run.shown_grab <- false
+            run.verdict <- -1
+            run.coach_verdict <- -1
+            run.phase <- PHASE_SETTING
+            run.deadline <- now + run.set_ms
+
+    def start_or_next(run: mutable Run&, now: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            if run.phase == PHASE_READY or run.phase == PHASE_DONE:
+                reset(run)
+            elif run.phase != PHASE_SCORED or now < run.deadline:
+                return false
+            next_trial(run, now)
+            return true
+
+    def press(run: mutable Run&, port: i64) -> bool:
+        can Abort.Panic:
+            return false if run.phase != PHASE_RUNNING
+            grade: mutable CookieThief::Grade = CookieThief::grade_at(run.trial_rung)
+            did: bool = CookieThief::press(&run.thief, port, &run.setup, &grade)
+            run.grabbing <- true if did and port == CookieThief::GRAB
+            run.shown_grab <- run.grabbing
+            return did
+
+    def advance(run: mutable Run&, now: i64) -> bool:
+        can Abort.Panic:
+            return false if now < run.deadline
+            if run.phase == PHASE_SETTING:
+                run.phase <- PHASE_RUNNING
+                return true
+            return false if run.phase != PHASE_RUNNING
+            run.deadline <- now + run.beat_ms
+            grade: mutable CookieThief::Grade = CookieThief::grade_at(run.trial_rung)
+            # Python measures cookies added by this beat. An ordinary grab
+            # already added its cookie when the key was pressed.
+            eaten_before: i64 = run.thief.eaten
+            _ = CookieThief::beat(&run.thief, &run.setup, &grade)
+            if run.coach:
+                run.coach_verdict <- 0 if run.thief.seen else (1 if run.thief.eaten > eaten_before else -1)
+            run.shown_grab <- run.grabbing
+            run.grabbing <- false
+            if CookieThief::over(&run.thief, &grade):
+                settle(run, &grade, now)
+            return true
+
+    def settle(run: mutable Run&, grade: CookieThief::Grade&, now: i64):
+        can Abort.Panic:
+            right: bool = CookieThief::cleared(&run.thief, grade)
+            run.verdict <- 1 if right else 0
+            run.clean <- run.clean + 1 if right
+            run.cookies <- run.cookies + run.thief.eaten
+            run.points <- run.points + CookieThief::haul(&run.thief)
+            run.best_rung <- run.trial_rung if run.trial_rung > run.best_rung
+            index: usize = (run.trial_rung - 1).usize()
+            run.rung_counts[index] <- run.rung_counts[index] + 1
+            run.recent <- ((run.recent << 1) | run.verdict) & 15
+            if run.adaptive:
+                rounds: i64 = 4 if run.trial > 4 else run.trial
+                wins: i64 = (run.recent & 1) + ((run.recent >> 1) & 1) + ((run.recent >> 2) & 1) + ((run.recent >> 3) & 1)
+                if wins * 4 >= rounds * 3:
+                    run.rung <- clamp_rung(run.rung + 1)
+                elif wins * 5 < rounds * 2:
+                    run.rung <- clamp_rung(run.rung - 1)
+            run.phase <- PHASE_SCORED
+            run.deadline <- now + VERDICT_MS
+
+    def visible_verdict(run: Run&) -> i64:
+        return run.verdict if run.verdict >= 0 or run.phase != PHASE_RUNNING
+        return run.coach_verdict
+
+    def info(run: Run&, field: i64) -> i64:
+        can Abort.Panic:
+            return run.phase if field == 0
+            return run.rung if field == 1
+            return run.trial if field == 2
+            return run.total_trials if field == 3
+            return run.beat_ms if field == 4
+            return run.set_ms if field == 5
+            return (1 if run.adaptive else 0) if field == 6
+            return run.thief.beat if field == 7
+            return run.thief.eaten if field == 8
+            return run.thief.caught if field == 9
+            return run.verdict if field == 10
+            return run.clean if field == 11
+            return run.points if field == 12
+            return run.floor_percent if field == 13
+            return (1 if run.coach else 0) if field == 14
+            return visible_verdict(run) if field == 15
+            return -1
+
+    def grade_name(rung: i64) -> cstr:
+        return "one cookie" if rung == 1
+        return "a handful" if rung == 2
+        return "quick hands" if rung == 3
+        return "she is listening" if rung == 4
+        return "quieter feet" if rung == 5
+        return "no warning at all" if rung == 6
+        return "she is quick" if rung == 7
+        return "the golden one" if rung == 8
+        return "someone at the door" if rung == 9
+        return "the kitchen at night"
+
+    def append_verdict(run: Run&, grade: CookieThief::Grade&, text: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            return if run.verdict < 0
+            if run.thief.caught > 0:
+                dstr_append_cstr(text, "Seen ")
+                dstr_append_i64(text, run.thief.caught)
+                dstr_append_cstr(text, " times, ")
+                dstr_append_i64(text, run.thief.eaten)
+                dstr_append_cstr(text, " taken")
+            elif run.thief.eaten < grade.quota:
+                dstr_append_cstr(text, "Only ")
+                dstr_append_i64(text, run.thief.eaten)
+                dstr_append_cstr(text, " of ")
+                dstr_append_i64(text, grade.quota)
+            else:
+                dstr_append_cstr(text, "Away with ")
+                dstr_append_i64(text, run.thief.eaten)
+            dstr_append_cstr(text, " — ")
+            haul: i64 = CookieThief::haul(&run.thief)
+            dstr_append_cstr(text, "+" if haul >= 0 else "")
+            dstr_append_i64(text, haul)
+            dstr_append_cstr(text, " points")
+
+    def append_summary(run: Run&, text: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_i64(text, run.clean)
+            dstr_append_cstr(text, " of ")
+            dstr_append_i64(text, run.trial)
+            dstr_append_cstr(text, " clean, ")
+            dstr_append_i64(text, run.points)
+            dstr_append_cstr(text, " points off ")
+            dstr_append_i64(text, run.cookies)
+            dstr_append_cstr(text, " cookies, highest rung ")
+            dstr_append_i64(text, run.best_rung)
+            dstr_append_cstr(text, " — guessing gets away clean about ")
+            dstr_append_i64(text, run.floor_percent)
+            dstr_append_cstr(text, "% of the time")
+
+    def append_asked(run: Run&, grade: CookieThief::Grade&, text: mutable dstr&):
+        can Memory.Allocate, Abort.Panic:
+            dstr_append_cstr(text, "Rung ")
+            dstr_append_i64(text, run.trial_rung)
+            dstr_append_cstr(text, ", ")
+            dstr_append_cstr(text, grade_name(run.trial_rung))
+            dstr_append_cstr(text, ". Take ")
+            dstr_append_i64(text, grade.quota)
+            dstr_append_cstr(text, " and get out. ")
+            if CookieThief::reactive(grade):
+                dstr_append_cstr(text, "She stands in the door for ")
+                dstr_append_i64(text, grade.warn)
+                dstr_append_cstr(text, " beats first.")
+            else:
+                dstr_append_cstr(text, "No warning at all: the press that opens the door far enough is the one she sees.")
+            if grade.gold != 0:
+                dstr_append_cstr(text, " The golden one is worth ")
+                dstr_append_i64(text, grade.gold)
+                dstr_append_cstr(text, ".")
+            dstr_append_cstr(text, " Not everyone at the door is her." if grade.decoys > 0 else "")
+
+    def render(run: Run&, black: bool, width: f64, height: f64, list: mutable Display::DisplayList&):
+        can Memory.Allocate, Abort.Panic:
+            grade: mutable CookieThief::Grade = CookieThief::grade_at(run.trial_rung)
+            paint: mutable SceneCookieThief::Paint = SceneCookieThief::paint_of(
+                black, width, height, width / Display::REFERENCE_WIDTH, height / Display::REFERENCE_HEIGHT)
+            message: mutable dstr = []
+            verdict: mutable dstr = []
+            asked: mutable dstr = []
+            has_setup: bool = run.phase != PHASE_READY and run.phase != PHASE_DONE
+            shown: i64 = visible_verdict(run)
+            if run.verdict >= 0:
+                append_verdict(run, &grade, &verdict)
+            elif shown >= 0:
+                dstr_append_cstr(&verdict, "Got one" if shown == 1 else "She saw that")
+            if has_setup:
+                append_asked(run, &grade, &asked)
+            if run.phase == PHASE_READY:
+                dstr_append_cstr(&message, "Press Space to start")
+            elif run.phase == PHASE_SETTING:
+                dstr_append_cstr(&message, "The jar is full")
+            elif run.phase == PHASE_RUNNING:
+                dstr_append_cstr(&message, "Go on, then")
+            elif run.phase == PHASE_SCORED:
+                dstr_append_sview(&message, bytes_view(verdict))
+            else:
+                append_summary(run, &message)
+            doorway: i64 = 0 if run.thief.phase == CookieThief::GONE else run.thief.phase
+            SceneCookieThief::render(list, &paint, run.phase, has_setup,
+                CookieThief::room(&grade), grade.quota, grade.notice, grade.opening, CookieThief::limit(&grade),
+                run.thief.jar, run.thief.eaten, run.thief.pace, run.thief.beat, run.shown_grab, run.thief.reaching,
+                run.thief.gold_from, run.thief.gold_taken, doorway, run.thief.who - 1, bytes_view(asked),
+                run.trial, run.total_trials, bytes_view(message), shown, bytes_view(verdict))
+
+    def option_count(row: i64) -> i64:
+        return CookieThief::GRADE_COUNT if row == 0
+        return 8 if row == 1
+        return 6 if row == 2
+        return 5 if row == 3
+        return 2
+
+    def option_value(row: i64, index: usize) -> i64:
+        can Abort.Panic:
+            trials: i64[8] = [1, 2, 3, 5, 8, 10, 15, 20]
+            beats: i64[6] = [80, 120, 160, 250, 400, 600]
+            setup: i64[5] = [0, 400, 800, 1500, 2500]
+            return index.i64() + 1 if row == 0
+            return trials[index] if row == 1
+            return beats[index] if row == 2
+            return setup[index] if row == 3
+            return index.i64()
+
+    def option_allowed(row: i64, value: i64) -> bool:
+        can Abort.Panic:
+            for at in 0..<option_count(row) |at, row, value|:
+                return true if option_value(row, at.usize()) == value
+            return false
+
+    def render_options(list: mutable Display::DisplayList&, black: bool, selection: i64, draft: i64&):
+        can Memory.Allocate, Abort.Panic:
+            ink: u32 = Display::rgba(255, 255, 255, 255) if black else Display::rgba(20, 24, 32, 255)
+            Display::draw_text_weight(list, "Cookie Thief options", 456.0, 566.0, 26.0, ink, Display::ANCHOR_CENTER_CENTER, true)
+            for row in 0..<5 |row, list, selection, draft, ink|:
+                y: f64 = 474.0 - row.f64() * 48.0
+                selected: bool = row == selection
+                if selected:
+                    Display::draw_rect(list, 102.0, y - 18.0, 708.0, 36.0, Display::rgba(70, 120, 180, 96))
+                label: mutable sview = "Level"
+                label <- "Rounds per run" if row == 1
+                label <- "Beat duration" if row == 2
+                label <- "Time before the first beat" if row == 3
+                label <- "Adaptive difficulty" if row == 4
+                Display::draw_text_weight(list, label, 120.0, y, 18.0, ink, Display::ANCHOR_LEFT_CENTER, selected)
+                value: mutable dstr = []
+                if row < 2:
+                    dstr_append_i64(&value, draft[row.usize()])
+                elif row < 4:
+                    dstr_append_fixed(&value, draft[row.usize()].f64() / 1000.0, 3)
+                    dstr_append_cstr(&value, " s")
+                else:
+                    dstr_append_cstr(&value, "On" if draft[row.usize()] != 0 else "Off")
+                Display::draw_text_weight(list, bytes_view(value), 760.0, y, 18.0, ink, Display::ANCHOR_CENTER_CENTER, selected)
+            options_note(list, ink, draft[0], draft[5])
+            Display::draw_text_weight(list, "Arrows or click: change options    Enter: apply    Esc: cancel",
+                456.0, 108.0, 16.0, ink, Display::ANCHOR_CENTER_CENTER, false)
+
+    def options_note(list: mutable Display::DisplayList&, ink: u32, rung: i64, guessing: i64):
+        can Memory.Allocate, Abort.Panic:
+            grade: mutable CookieThief::Grade = CookieThief::grade_at(rung)
+            note: mutable dstr = []
+            dstr_append_cstr(&note, "Take ")
+            dstr_append_i64(&note, grade.quota)
+            dstr_append_cstr(&note, " and leave. At a walking pace you can take up to ")
+            dstr_append_i64(&note, CookieThief::room(&grade))
+            dstr_append_cstr(&note, " before the door is certainly too far open.")
+            Display::draw_text(list, bytes_view(note), 456.0, 238.0, 14.0, ink, Display::ANCHOR_CENTER_CENTER)
+            warning: mutable dstr = []
+            if grade.warn > 0:
+                dstr_append_cstr(&warning, "You have ")
+                dstr_append_i64(&warning, grade.warn)
+                dstr_append_cstr(&warning, " beats to leave after she reaches the door.")
+            else:
+                dstr_append_cstr(&warning, "She looks in without warning.")
+            if grade.decoys > 0:
+                dstr_append_cstr(&warning, " Other figures can appear in the doorway.")
+            Display::draw_text(list, bytes_view(warning), 456.0, 210.0, 14.0, ink, Display::ANCHOR_CENTER_CENTER)
+            if grade.gold > 0:
+                gold: mutable dstr = []
+                dstr_append_cstr(&gold, "A golden cookie is worth ")
+                dstr_append_i64(&gold, grade.gold)
+                dstr_append_cstr(&gold, ". Reaching takes two beats.")
+                Display::draw_text(list, bytes_view(gold), 456.0, 182.0, 14.0, ink, Display::ANCHOR_CENTER_CENTER)
+            score: mutable dstr = []
+            dstr_append_cstr(&score, "+1 per cookie, −2 each time you’re seen. Guessing gets away clean about ")
+            dstr_append_i64(&score, guessing)
+            dstr_append_cstr(&score, "% of the time.")
+            Display::draw_text(list, bytes_view(score), 456.0, 154.0, 14.0, ink, Display::ANCHOR_CENTER_CENTER)

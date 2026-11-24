@@ -1,0 +1,144 @@
+include "./kitchen.elisa"
+
+module KitchenReference:
+    def count_part(dish: Kitchen::Dish&, part: i64) -> i64:
+        can Abort.Panic:
+            count: mutable i64 = 0
+            for i in 0..<dish.count |dish, part, count|:
+                count <- count + 1 if dish.parts[i.usize()] == part
+            return count
+
+    def fits(plate: Kitchen::Dish&, dish: Kitchen::Dish&) -> bool:
+        can Abort.Panic:
+            for i in 0..<plate.count |plate, dish|:
+                part: i64 = plate.parts[i.usize()]
+                return false if count_part(plate, part) > count_part(dish, part)
+            return true
+
+    def plan(run: Kitchen::Run&) -> i64[2]:
+        can Abort.Panic:
+            assigned: mutable i64[2] = [-1, -1]
+            for p in 0..<run.shift.level.plates |run, assigned|:
+                plate: Kitchen::Dish = run.plates[p.usize()]
+                best: mutable i64 = -1
+                for k in 0..<run.arrived |run, assigned, p, plate, best|:
+                    status: i64 = get run.status[k.usize()] else Kitchen::WAITING
+                    if status == Kitchen::OPEN and (p == 0 or assigned[0] != k):
+                        ticket: Kitchen::Ticket = get run.shift.tickets[k.usize()] else zeroed
+                        if fits(&plate, &ticket.dish) and (best < 0 or Kitchen::ticket_left(run, k) < Kitchen::ticket_left(run, best)):
+                            best <- k
+                assigned[p.usize()] <- best
+            return assigned
+
+    def pan_urgent(run: Kitchen::Run&) -> bool:
+        can Abort.Panic:
+            for i in 0..<run.shift.level.stoves |run|:
+                pan: Kitchen::WorkItem = run.stoves[i.usize()]
+                if pan.part != 0:
+                    stove: Kitchen::Station = run.shift.stations[(Kitchen::STOVE + i).usize()]
+                    left: f64 = pan.time + Kitchen::COOK + run.shift.level.hold - run.t
+                    walk: f64 = py_hypot(stove.x - run.x, stove.y - run.y) / Kitchen::WALK
+                    return true if left < walk + 1.2
+            return false
+
+    def holding_part(run: Kitchen::Run&, assigned: i64[2]&) -> i64:
+        can Abort.Panic:
+            stage: i64 = Kitchen::part_stage(run.held_part)
+            if stage == Kitchen::RAW:
+                for i in 0..<run.shift.level.boards |run|:
+                    return Kitchen::BOARD + i if run.boards[i.usize()].part == 0
+                return Kitchen::NO_PORT
+            return Kitchen::BIN if stage == Kitchen::BURNT
+            for p in 0..<run.shift.level.plates |run, assigned|:
+                k: i64 = assigned[p.usize()]
+                if k >= 0:
+                    ticket: Kitchen::Ticket = get run.shift.tickets[k.usize()] else zeroed
+                    plate: Kitchen::Dish = run.plates[p.usize()]
+                    return Kitchen::PLATE + p if count_part(&ticket.dish, run.held_part) > count_part(&plate, run.held_part)
+            if stage == Kitchen::CHOPPED:
+                for i in 0..<run.shift.level.stoves |run|:
+                    return Kitchen::STOVE + i if run.stoves[i.usize()].part == 0
+                return Kitchen::NO_PORT
+            return Kitchen::BIN
+
+    def choose_ingredient(run: Kitchen::Run&, assigned: i64[2]&) -> i64:
+        can Abort.Panic:
+            underway: mutable i64[4] = zeroed
+            for i in 0..<run.shift.level.stoves |run, underway|:
+                pan: Kitchen::WorkItem = run.stoves[i.usize()]
+                if pan.part != 0 and Kitchen::pan_stage(run, pan, run.t) != Kitchen::BURNT:
+                    food: usize = Kitchen::part_food(pan.part).usize()
+                    underway[food] <- underway[food] + 1
+            first: i64 = 1 if assigned[0] < 0 or (assigned[1] >= 0 and Kitchen::ticket_left(run, assigned[1]) < Kitchen::ticket_left(run, assigned[0])) else 0
+            for at in 0..<2 |run, assigned, first, underway|:
+                p: usize = ((first + at) % 2).usize()
+                k: i64 = assigned[p]
+                if k >= 0:
+                    ticket: Kitchen::Ticket = get run.shift.tickets[k.usize()] else zeroed
+                    plate: Kitchen::Dish = run.plates[p]
+                    previous: mutable i64 = 0
+                    used: mutable i64 = 0
+                    for i in 0..<ticket.dish.count |run, ticket, plate, previous, used, underway|:
+                        part: i64 = ticket.dish.parts[i.usize()]
+                        used <- 0 if part != previous
+                        previous <- part
+                        used <- used + 1
+                        if used > count_part(&plate, part):
+                            food: usize = Kitchen::part_food(part).usize()
+                            if underway[food] > 0:
+                                underway[food] <- underway[food] - 1
+                            else:
+                                for crate in 0..<run.shift.level.foods |run, food|:
+                                    return Kitchen::CRATE + crate if run.shift.stations[crate.usize()].food == food.i64()
+            for p in 0..<run.shift.level.plates |run, assigned|:
+                return Kitchen::PLATE + p if run.plates[p.usize()].count > 0 and assigned[p.usize()] < 0
+            return Kitchen::NO_PORT
+
+    def choose(run: Kitchen::Run&) -> i64:
+        can Abort.Panic:
+            return Kitchen::NO_PORT if run.result != Kitchen::LIVE or run.target != Kitchen::NO_PORT
+            if run.chopping != Kitchen::NO_PORT:
+                board: Kitchen::WorkItem = run.boards[run.chopping.usize()]
+                return Kitchen::NO_PORT if board.part != 0 and board.time < Kitchen::CHOP and not pan_urgent(run)
+            if run.held_dish.count > 0:
+                dish: Kitchen::Dish = Kitchen::sorted_dish(&run.held_dish)
+                return Kitchen::PASS if Kitchen::matching_ticket(run, &dish) >= 0 else Kitchen::BIN
+            assigned: i64[2] = plan(run)
+            return holding_part(run, &assigned) if run.held_part > 0
+            for i in 0..<run.shift.level.stoves |run|:
+                pan: Kitchen::WorkItem = run.stoves[i.usize()]
+                return Kitchen::STOVE + i if pan.part != 0 and Kitchen::pan_stage(run, pan, run.t) != Kitchen::CHOPPED
+            for p in 0..<run.shift.level.plates |run, assigned|:
+                k: i64 = assigned[p.usize()]
+                if k >= 0:
+                    ticket: Kitchen::Ticket = get run.shift.tickets[k.usize()] else zeroed
+                    return Kitchen::PLATE + p if run.plates[p.usize()].count == ticket.dish.count
+            for i in 0..<run.shift.level.boards |run|:
+                return Kitchen::BOARD + i if run.boards[i.usize()].part != 0
+            return choose_ingredient(run, &assigned)
+
+    def play(shift: Kitchen::Shift) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            run: mutable Kitchen::Run = Kitchen::start(shift)
+            while run.result == Kitchen::LIVE and run.t <= 600.0 |run|:
+                port: i64 = choose(&run)
+                _ = Kitchen::send(&run, port)
+                Kitchen::step(&run, 1.0 / 30.0)
+            return run.t <= 600.0 and run.result == Kitchen::CLEAR
+
+    def deal_seed(rung: i64, seed: i64) -> Kitchen::Shift:
+        can Memory.Allocate, Abort.Panic:
+            rng: mutable MT19937 = zeroed
+            magnitude: u64 = (-(seed + 1)).u64() + 1.u64() if seed < 0 else seed.u64()
+            mt_seed_int(&rng, magnitude)
+            level: Kitchen::Grade = Kitchen::grade(rung)
+            first: Kitchen::Shift = Kitchen::build(level, &rng)
+            return first if play(first)
+            for _ in 1..<25 |rng, level|:
+                shift: Kitchen::Shift = Kitchen::build(level, &rng)
+                return shift if play(shift)
+            return first
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Kitchen::Shift:
+        can Memory.Allocate, Abort.Panic:
+            return deal_seed(rung, py_randbelow(rng, 1073741824.u64()).i64())

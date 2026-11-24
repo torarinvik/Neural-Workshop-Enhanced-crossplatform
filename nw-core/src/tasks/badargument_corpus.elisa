@@ -1,0 +1,103 @@
+include "@ELISA_STAGE1_ROOT@/elisacore_std/elisacore_json.elisa"
+include "./badargument.elisa"
+
+extend BadArgument:
+    def data_name(kind: i64) -> cstr:
+        return "fallacy" if kind == 0
+        return "formal" if kind == 1
+        return ""
+
+    def kind_index(name: sview) -> i64:
+        can Abort.Panic:
+            for i in 0..<2 |name|:
+                if sview_eq(name, sview(data_name(i), 0, -1)):
+                    return i
+            return -1
+
+    def copy_question_text(text: sview) -> dstr:
+        can Abort.Panic, Memory.Allocate:
+            result: mutable dstr = []
+            dstr_append_sview(&result, text)
+            return result
+
+    struct Decoded:
+        kind: i64
+        question: Question
+        valid: bool
+
+    def decode_question[@r](arena: mutable Arena& @r, line: sview) -> Decoded:
+        can Memory.Allocate, Abort.Panic:
+            parsed: JsonParseResult[r] = json_parse_checked(arena, line) can Global{Read,Write}
+            return zeroed if parsed.code != JsonErrorCode.OK
+            root: JsonValueHandle[r] = json_handle_from_result(parsed)
+            kind_node: JsonValueHandle[r] = try json_handle_get(root, "kind") else json_handle_null(root)
+            name: sview @r = try json_handle_as_string(kind_node) else ""
+            kind: i64 = kind_index(name)
+            return zeroed if kind < 0
+            prompt_node: JsonValueHandle[r] = try json_handle_get(root, "prompt") else json_handle_null(root)
+            ask_node: JsonValueHandle[r] = try json_handle_get(root, "ask") else json_handle_null(root)
+            options_node: JsonValueHandle[r] = try json_handle_get(root, "options") else json_handle_null(root)
+            answer_node: JsonValueHandle[r] = try json_handle_get(root, "answer") else json_handle_null(root)
+            answer: f64 = try json_handle_as_number(answer_node) else -1.0
+            count: i64 = json_handle_array_len(options_node)
+            return zeroed if answer < 0.0 or answer >= count.f64() or answer != answer.i64().f64()
+            return zeroed if count < 2 or count > ReadingQuiz::PORTS
+            return zeroed if not json_handle_is_string(prompt_node) or not json_handle_is_string(ask_node)
+            prompt: sview @r = try json_handle_as_string(prompt_node) else ""
+            ask: sview @r = try json_handle_as_string(ask_node) else ""
+            options: mutable darray[dstr] = []
+            for i in 0..<count |root, options_node, options|:
+                node: JsonValueHandle[r] = try json_handle_at(options_node, i) else json_handle_null(root)
+                return zeroed if not json_handle_is_string(node)
+                text: sview @r = try json_handle_as_string(node) else ""
+                label: dstr = copy_question_text(text)
+                options.push(label)
+            return Decoded{kind: kind, question: Question{prompt: copy_question_text(prompt), ask: copy_question_text(ask), options: options, answer: answer.i64()}, valid: true}
+
+    def take_line(corpus: mutable Corpus&, owner: mutable Arena&, line: sview):
+        can Memory.Allocate, Abort.Panic:
+            in owner:
+                decoded: Decoded = decode_question(owner, line) can Global{Read,Write}
+                if decoded.valid:
+                    question: Question = decoded.question
+                    corpus.questions[decoded.kind.usize()].push(question)
+
+    def words_of(words: cstr) -> dstr:
+        can Abort.Panic, Memory.Allocate:
+            result: mutable dstr = []
+            dstr_append_cstr(&result, words)
+            return result
+
+    def put(corpus: mutable Corpus&, kind: i64, prompt: cstr, ask: cstr, first: cstr, second: cstr, answer: i64):
+        can Abort.Panic, Memory.Allocate:
+            options: mutable darray[dstr] = []
+            options.push(words_of(first))
+            options.push(words_of(second))
+            corpus.questions[kind.usize()].push(Question{prompt: words_of(prompt), ask: words_of(ask), options: options, answer: answer})
+
+    # socialdata.SEED: the questions written there, standing in for any
+    # kind not fetched.
+    def seed_questions(owner: mutable Arena&) -> Corpus:
+        can Memory.Allocate, Abort.Panic:
+            corpus: mutable Corpus = zeroed
+            in owner:
+                put(&corpus, 0, "All dogs are animals. Rex is a dog. Therefore Rex is an animal.", "Does the conclusion follow?", "valid", "invalid", 0)
+                put(&corpus, 0, "All dogs are animals. Tom is an animal. Therefore Tom is a dog.", "Does the conclusion follow?", "valid", "invalid", 1)
+            return corpus
+
+    # The original questions.jsonl replaces its bundled deck per question kind.
+    def from_question_cache(owner: mutable Arena&, text: sview) -> Corpus:
+        can Memory.Allocate, Abort.Panic:
+            corpus: mutable Corpus = zeroed
+            size: i64 = sview_len(text).i64()
+            start: mutable i64 = 0
+            for i in 0..<(size + 1) |start, size, text, corpus, owner|:
+                if i == size or sview_at(text, i.usize()) == 10.u8():
+                    if i > start:
+                        take_line(&corpus, owner, string_view_slice(text, start, i)) can Global{Read,Write}
+                    start <- i + 1
+            seed: Corpus = seed_questions(owner) can Global{Read,Write}
+            for k in 0..<2 |seed, corpus|:
+                if corpus.questions[k.usize()].count == 0.usize():
+                    corpus.questions[k.usize()] <- seed.questions[k.usize()]
+            return corpus

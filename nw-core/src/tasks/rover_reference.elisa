@@ -1,0 +1,291 @@
+include "./rover.elisa"
+
+module RoverReference:
+    const DIRECTIONS: i64 = 8
+    const STATES_PER_CELL: i64 = 9
+    const INF: f64 = 1.0e18
+    const PI: f64 = 3.141592653589793
+    const STEP: f64 = 1.0 / 30.0
+
+    struct Move:
+        x: i64
+        z: i64
+        heading: f64
+        cost: f64
+
+    struct Grid:
+        x: f64
+        z: f64
+        width: i64
+        length: i64
+        blocked: mutable darray[bool]
+        checked: mutable darray[i64]
+        safe: mutable darray[i64]
+        best: mutable darray[f64]
+        previous: mutable darray[i64]
+
+    struct Entry:
+        estimate: f64
+        cost: f64
+        node: i64
+
+    struct Queue:
+        entries: mutable darray[Entry]
+        count: mutable i64
+
+    struct Target:
+        tile: i64
+        x: i64
+        z: i64
+
+    def moves() -> Move[8]:
+        return [
+            Move{x: -1, z: -1, heading: -2.356194490192345, cost: 1.4142135623730951},
+            Move{x: -1, z: 0, heading: -1.5707963267948966, cost: 1.0},
+            Move{x: -1, z: 1, heading: -0.7853981633974483, cost: 1.4142135623730951},
+            Move{x: 0, z: -1, heading: PI, cost: 1.0},
+            Move{x: 0, z: 1, heading: 0.0, cost: 1.0},
+            Move{x: 1, z: -1, heading: 2.356194490192345, cost: 1.4142135623730951},
+            Move{x: 1, z: 0, heading: 1.5707963267948966, cost: 1.0},
+            Move{x: 1, z: 1, heading: 0.7853981633974483, cost: 1.4142135623730951}]
+
+    # Node indices have the same order as Python's (i, j, direction) tuple.
+    def earlier(a: Entry, b: Entry) -> bool:
+        return a.estimate < b.estimate if a.estimate != b.estimate
+        return a.cost < b.cost if a.cost != b.cost
+        return a.node < b.node
+
+    def push(queue: mutable Queue&, entry: Entry):
+        can Memory.Allocate, Abort.Panic:
+            index: mutable i64 = queue.count
+            if index == queue.entries.count.i64():
+                queue.entries.push(entry)
+            queue.count <- queue.count + 1
+            while index > 0 |queue, entry, index|:
+                parent: i64 = (index - 1) / 2
+                prior: Entry = queue.entries[parent]
+                break if not earlier(entry, prior)
+                queue.entries[index] <- prior
+                index <- parent
+            queue.entries[index] <- entry
+
+    def pop(queue: mutable Queue&) -> Entry:
+        can Abort.Panic:
+            first: Entry = queue.entries[0]
+            queue.count <- queue.count - 1
+            last_entry: Entry = queue.entries[queue.count]
+            index: mutable i64 = 0
+            while index * 2 + 1 < queue.count |queue, last_entry, index|:
+                left: i64 = index * 2 + 1
+                right: i64 = left + 1
+                child: i64 = right if right < queue.count and earlier(queue.entries[right], queue.entries[left]) else left
+                next: Entry = queue.entries[child]
+                break if not earlier(next, last_entry)
+                queue.entries[index] <- next
+                index <- child
+            queue.entries[index] <- last_entry
+            return first
+
+    def at(grid: Grid&, x: i64, z: i64) -> Rover::Point:
+        return Rover::Point{x: grid.x + x.f64(), z: grid.z + z.f64()}
+
+    def mark_rock(grid: mutable Grid&, rock: Rover::Rock):
+        can Abort.Panic:
+            reach: f64 = rock.radius + Rover::BODY + 0.9
+            first_x: i64 = (rock.at.x - reach - grid.x).i64() - 1
+            end_x: i64 = (rock.at.x + reach - grid.x).i64() + 2
+            first_z: i64 = (rock.at.z - reach - grid.z).i64() - 1
+            end_z: i64 = (rock.at.z + reach - grid.z).i64() + 2
+            for x in first_x..<end_x |grid, rock, reach, first_z, end_z|:
+                continue if x < 0 or x >= grid.width
+                for z in first_z..<end_z |grid, rock, reach, x|:
+                    continue if z < 0 or z >= grid.length
+                    grid.blocked[x * grid.length + z] <- true if Rover::flag_distance(at(grid, x, z), rock.at) < reach
+
+    def grid(ground: Rover::Ground&) -> Grid:
+        can Memory.Allocate, Abort.Panic:
+            lo_x: mutable f64 = 0.0
+            lo_z: mutable f64 = 0.0
+            hi_x: mutable f64 = 0.0
+            hi_z: mutable f64 = 0.0
+            for i in 0..<ground.level.flags |ground, lo_x, lo_z, hi_x, hi_z|:
+                p: Rover::Point = ground.flags[i.usize()]
+                lo_x <- fmin(lo_x, p.x)
+                lo_z <- fmin(lo_z, p.z)
+                hi_x <- fmax(hi_x, p.x)
+                hi_z <- fmax(hi_z, p.z)
+            x: f64 = lo_x - 12.0
+            z: f64 = lo_z - 12.0
+            width: i64 = (hi_x + 12.0 - x).i64() + 1
+            length: i64 = (hi_z + 12.0 - z).i64() + 1
+            cells: i64 = width * length
+            blocked: mutable darray[bool] = []
+            checked: mutable darray[i64] = []
+            safe: mutable darray[i64] = []
+            best: mutable darray[f64] = []
+            previous: mutable darray[i64] = []
+            _ = blocked.reserve(cells.usize())
+            _ = checked.reserve(cells.usize())
+            _ = safe.reserve(cells.usize())
+            _ = best.reserve((cells * STATES_PER_CELL).usize())
+            _ = previous.reserve((cells * STATES_PER_CELL).usize())
+            for _ in 0..<cells |blocked, checked, safe|:
+                blocked.push(false)
+                checked.push(0)
+                safe.push(0)
+            for _ in 0..<(cells * STATES_PER_CELL) |best, previous|:
+                best.push(INF)
+                previous.push(-1)
+            return Grid{x: x, z: z, width: width, length: length, blocked: blocked,
+                checked: checked, safe: safe, best: best, previous: previous}
+
+    def fine(board: mutable Grid&, ground: Rover::Ground&, source: Target, direction: i64, step_dir: Move) -> bool:
+        can Abort.Panic:
+            return true if ground.level.tip == 0.0
+            mask: i64 = 1 << direction
+            tile: i64 = source.tile
+            if (board.checked[tile] & mask) == 0:
+                p: Rover::Point = at(board, source.x, source.z)
+                start: f64 = Rover::slope(ground, p.x, p.z, step_dir.heading)
+                middle: f64 = Rover::slope(ground, p.x + step_dir.x.f64() / 2.0, p.z + step_dir.z.f64() / 2.0, step_dir.heading)
+                board.checked[tile] <- board.checked[tile] | mask
+                board.safe[tile] <- board.safe[tile] | mask if fmax(start, middle) < ground.level.tip * 0.7
+            return (board.safe[tile] & mask) != 0
+
+    def tile_from_point(board: Grid&, p: Rover::Point) -> Target:
+        can Abort.Panic:
+            x: i64 = py_round_half_even(p.x - board.x)
+            z: i64 = py_round_half_even(p.z - board.z)
+            return Target{x: x, z: z, tile: x * board.length + z}
+
+    def tile_from_index(board: Grid&, index: i64) -> Target:
+        tile: i64 = index / STATES_PER_CELL
+        return Target{x: tile / board.length, z: tile % board.length, tile: tile}
+
+    def find(board: mutable Grid&, ground: Rover::Ground&, queue: mutable Queue&, src: Target, dst: Target) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            for i in 0..<board.best.count |board|:
+                board.best[i] <- INF
+                board.previous[i] <- -1
+            queue.count <- 0
+            start: i64 = src.tile * STATES_PER_CELL
+            board.best[start] <- 0.0
+            push(queue, Entry{estimate: 0.0, cost: 0.0, node: start})
+            directions: Move[8] = moves()
+            while queue.count > 0 |board, ground, queue, dst, directions|:
+                item: Entry = pop(queue)
+                continue if item.cost > board.best[item.node]
+                cell: Target = tile_from_index(board, item.node)
+                return item.node if cell.x >= dst.x - 1 and cell.x <= dst.x + 1 and cell.z >= dst.z - 1 and cell.z <= dst.z + 1
+                before: i64 = item.node % STATES_PER_CELL - 1
+                for direction in 0..<DIRECTIONS |board, ground, queue, dst, directions, item, cell, before|:
+                    step_dir: Move = directions[direction.usize()]
+                    x: i64 = cell.x + step_dir.x
+                    z: i64 = cell.z + step_dir.z
+                    continue if x < 0 or x >= board.width or z < 0 or z >= board.length
+                    tile: i64 = x * board.length + z
+                    continue if board.blocked[tile] or not fine(board, ground, cell, direction, step_dir)
+                    node: i64 = tile * STATES_PER_CELL + direction + 1
+                    cost: f64 = item.cost + step_dir.cost + (0.4 if before != -1 and before != direction else 0.0)
+                    if cost < board.best[node]:
+                        board.best[node] <- cost
+                        board.previous[node] <- item.node
+                        remaining: f64 = py_hypot((dst.x - x).f64(), (dst.z - z).f64())
+                        push(queue, Entry{estimate: cost + remaining, cost: cost, node: node})
+            return -1
+
+    def route(ground: Rover::Ground&) -> darray[Rover::Point]:
+        can Memory.Allocate, Abort.Panic:
+            board: mutable Grid = grid(ground)
+            for i in 0..<ground.level.rocks |ground, board|:
+                mark_rock(&board, ground.rocks[i.usize()])
+            entries: darray[Entry] = []
+            queue: mutable Queue = Queue{entries: entries, count: 0}
+            start: mutable Rover::Point = zeroed
+            path: mutable darray[Rover::Point] = []
+            for i in 0..<ground.level.flags |ground, board, queue, start, path|:
+                goal: Rover::Point = ground.flags[i.usize()]
+                src: Target = tile_from_point(&board, start)
+                dst: Target = tile_from_point(&board, goal)
+                found: i64 = find(&board, ground, &queue, src, dst)
+                if found < 0:
+                    path.clear()
+                    return path
+                node: mutable i64 = found
+                count: mutable i64 = 0
+                begin: i64 = path.count.i64()
+                while board.previous[node] >= 0 |board, path, node, count|:
+                    cell: Target = tile_from_index(&board, node)
+                    path.push(at(&board, cell.x, cell.z))
+                    node <- board.previous[node]
+                    count <- count + 1
+                for j in 0..<(count / 2) |path, begin, count|:
+                    left: i64 = begin + j
+                    right: i64 = begin + count - 1 - j
+                    point: Rover::Point = path[left]
+                    path[left] <- path[right]
+                    path[right] <- point
+                path.push(goal)
+                start <- goal
+            return path
+
+    def ahead(run: Rover::Run&) -> Rover::State:
+        can Abort.Panic:
+            arrive: f64 = run.t + Rover::delay_at(&run.ground, run.t) / 2.0
+            t: mutable f64 = run.t
+            state: mutable Rover::State = run.state
+            while t < arrive - 0.000000001 |run, arrive, t, state|:
+                dt: f64 = fmin(STEP, arrive - t)
+                state <- Rover::advance(run.ground.level, state, Rover::active(run, t, t + dt), dt)
+                t <- t + dt
+            return state
+
+    def wrap(angle: f64) -> f64:
+        delta: f64 = fmod(angle + PI, 2.0 * PI)
+        return (delta + 2.0 * PI if delta < 0.0 else delta) - PI
+
+    def choose(run: Rover::Run&, path: darray[Rover::Point]&, along: mutable i64&) -> i64:
+        can Abort.Panic:
+            return Rover::NEUTRAL if run.result != Rover::LIVE or path.count == 0
+            state: Rover::State = ahead(run)
+            here: Rover::Point = Rover::Point{x: state.x, z: state.z}
+            k: mutable i64 = along[0]
+            while k + 1 < path.count.i64() and Rover::flag_distance(path[k], here) < 2.5 |k, path, here|:
+                k <- k + 1
+            along[0] <- k
+            target: Rover::Point = path[k]
+            err: f64 = wrap(atan2(target.x - state.x, target.z - state.z) - state.heading)
+            top: f64 = 0.7 if fabs(err) > 0.3 else (1.6 if run.ground.level.delay < 1.0 else 1.1)
+            return (Rover::RIGHT if err > 0.0 else Rover::LEFT) if fabs(err) > 0.04 and state.v > 0.2
+            return Rover::DRIVE if state.v < top - 0.05
+            return Rover::BRAKE if state.v > top + 0.15
+            return Rover::NEUTRAL
+
+    def play(ground: Rover::Ground, path: darray[Rover::Point]&, straight: bool) -> i64:
+        can Memory.Allocate, Abort.Panic:
+            run: mutable Rover::Run = Rover::start(ground)
+            along: mutable i64 = 0
+            while run.result == Rover::LIVE |run, path, straight, along|:
+                port: i64 = Rover::DRIVE if straight else choose(&run, path, &along)
+                Rover::step(&run, STEP, port)
+            return run.result
+
+    def screened(level: Rover::Grade, rng: mutable MT19937&) -> bool:
+        can Memory.Allocate, Memory.Release, Abort.Panic:
+            region candidate(33554432):
+                in candidate:
+                    ground: Rover::Ground = Rover::build(level, rng)
+                    path: darray[Rover::Point] = route(&ground)
+                    return path.count > 0 and play(ground, &path, false) == Rover::CLEAR and play(ground, &path, true) != Rover::CLEAR
+            return false
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Rover::Ground:
+        can Memory.Allocate, Memory.Release, Abort.Panic:
+            level: Rover::Grade = Rover::grade(rung)
+            for _ in 0..<60 |level, rng|:
+                # Rebuild the accepted terrain outside the candidate's arena.
+                snapshot: mutable MT19937 = rng[0]
+                if screened(level, rng):
+                    return Rover::build(level, &snapshot)
+            empty: darray[f64] = []
+            return Rover::Ground{level: level, waves: zeroed, rocks: zeroed, flags: zeroed, delays: empty, seconds: 0.0}

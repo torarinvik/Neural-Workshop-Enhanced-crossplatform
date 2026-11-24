@@ -1,0 +1,260 @@
+include "../pyrandom.elisa"
+include "../pymath.elisa"
+
+module Bluff:
+    const STATION: i64 = 0
+    const ROCK: i64 = 1
+    const MANIAC: i64 = 2
+    const SOUND: i64 = 3
+    const ADAPTIVE: i64 = 4
+
+    const OPEN: i64 = 0
+    const CHECK: i64 = 1
+    const BET: i64 = 2
+    const CHECK_BET: i64 = 3
+    const CHECK_CHECK: i64 = 4
+    const BET_CALL: i64 = 5
+    const CHECK_BET_CALL: i64 = 6
+    const BET_FOLD: i64 = 7
+    const CHECK_BET_FOLD: i64 = 8
+
+    struct Grade:
+        rung: i64
+        cards: i64
+        hands: i64
+        kinds: i64[4]
+        kind_count: i64
+        changes: bool
+        allow: f64
+
+    struct Hand:
+        player: i64
+        opponent: i64
+        player_first: bool
+        coins: f64[2]
+
+    struct Deal:
+        level: Grade
+        hands: darray[Hand]
+        first_kind: i64
+        later_kind: i64
+        switch_at: i64
+
+    struct Habits:
+        kind: i64
+        bets: mutable i64
+        bluffs: mutable i64
+        shown: mutable i64
+        folds: mutable i64
+        faced: mutable i64
+
+    struct Record:
+        player_first: bool
+        spot: i64
+        player_card: i64
+        shown: i64
+        won: i64
+        worth: f64
+
+    struct Match:
+        dealt: Deal
+        records: mutable darray[Record]
+        habits: mutable Habits[5]
+        spot: mutable i64
+        coins_used: mutable i64
+        choices: mutable i64[4]
+        chips: mutable i64
+        score: mutable f64
+        correction: mutable f64
+
+    def grade(rung: i64) -> Grade:
+        r: i64 = rung if rung >= 1 else 1
+        kinds: mutable i64[4] = [STATION, ROCK, MANIAC, SOUND]
+        count: mutable i64 = 4
+        if r <= 6:
+            kinds[0] <- STATION if r <= 2 else (ROCK if r <= 4 else MANIAC)
+            count <- 1
+        elif r <= 9:
+            count <- 3
+        elif r >= 14 and r <= 17:
+            kinds[0] <- ADAPTIVE
+            count <- 1
+        elif r >= 18:
+            kinds[3] <- ADAPTIVE
+        return Grade{rung: r, cards: 3 if r < 7 else (5 if r < 14 else (7 if r < 18 else 9)),
+            hands: 20 + r, kinds: kinds, kind_count: count, changes: r >= 18,
+            allow: (21 - r).f64() / 20.0 if r <= 20 else -0.03 * (r - 20).f64()}
+
+    def deal(rung: i64, rng: mutable MT19937&) -> Deal:
+        can Memory.Allocate, Abort.Panic:
+            level: Grade = grade(rung)
+            hands: mutable darray[Hand] = []
+            for index in 0..<level.hands |level, rng, hands|:
+                # CPython samples these small ranges by replacing the first pick with the tail.
+                mine: i64 = py_randbelow(rng, level.cards.u64()).i64()
+                second: i64 = py_randbelow(rng, (level.cards - 1).u64()).i64()
+                theirs: i64 = level.cards - 1 if second == mine else second
+                coins: f64[2] = [py_random(rng), py_random(rng)]
+                hands.push(Hand{player: mine, opponent: theirs, player_first: index % 2 == 0, coins: coins})
+            first_index: i64 = py_randbelow(rng, level.kind_count.u64()).i64()
+            first_kind: i64 = level.kinds[first_index.usize()]
+            later_kind: mutable i64 = first_kind
+            switch_at: mutable i64 = level.hands
+            if level.changes:
+                later_index: i64 = py_randbelow(rng, (level.kind_count - 1).u64()).i64()
+                later_kind <- level.kinds[(later_index + (1 if later_index >= first_index else 0)).usize()]
+                low: i64 = level.hands / 3
+                high: i64 = 2 * level.hands / 3
+                switch_at <- low + py_randbelow(rng, (high - low + 1).u64()).i64()
+            return Deal{level: level, hands: hands, first_kind: first_kind, later_kind: later_kind, switch_at: switch_at}
+
+    def kind_at(dealt: Deal&, hand: i64) -> i64:
+        return dealt.first_kind if hand < dealt.switch_at else dealt.later_kind
+
+    def strength(card: i64, cards: i64) -> f64:
+        return card.f64() / (cards - 1).f64()
+
+    def opening(spot: i64) -> bool:
+        return spot == OPEN or spot == CHECK
+
+    def aggression(habits: Habits, strength: f64, spot: i64) -> f64:
+        if habits.kind == STATION:
+            return (1.0 if strength > 0.8 else 0.0) if opening(spot) else 1.0
+        if habits.kind == ROCK:
+            return 1.0 if strength > (0.85 if opening(spot) else 0.8) else 0.0
+        if habits.kind == MANIAC:
+            return 0.9 if opening(spot) else (1.0 if strength > 0.3 else 0.2)
+        bluff: mutable f64 = 0.33
+        call_from: mutable f64 = 0.45
+        if habits.kind == ADAPTIVE:
+            if habits.shown >= 2:
+                rate: f64 = habits.bluffs.f64() / habits.shown.f64()
+                call_from <- 0.2 if rate > 0.3 else (0.7 if rate < 0.1 else 0.45)
+            bluff <- 0.8 if habits.faced >= 3 and habits.folds.f64() / habits.faced.f64() > 0.5
+        if opening(spot):
+            return 1.0 if strength > 0.74 else (bluff if strength < 0.26 else 0.0)
+        return 1.0 if strength >= call_from + 0.2 else (0.35 if strength >= call_from else 0.0)
+
+    def notice(habits: mutable Habits&, card: i64, cards: i64, player_bet: bool, faced: bool, folded: bool):
+        return if habits.kind != ADAPTIVE
+        if player_bet:
+            habits.bets <- habits.bets + 1
+            if card >= 0:
+                habits.shown <- habits.shown + 1
+                habits.bluffs <- habits.bluffs + 1 if strength(card, cards) < 0.5
+        if faced:
+            habits.faced <- habits.faced + 1
+            habits.folds <- habits.folds + 1 if folded
+
+    def next_spot(spot: i64, aggressive: bool) -> i64:
+        if spot == OPEN:
+            return BET if aggressive else CHECK
+        if spot == CHECK:
+            return CHECK_BET if aggressive else CHECK_CHECK
+        if spot == BET:
+            return BET_CALL if aggressive else BET_FOLD
+        return CHECK_BET_CALL if aggressive else CHECK_BET_FOLD
+
+    def first_actor(spot: i64) -> bool:
+        return spot == OPEN or spot == CHECK_BET
+
+    def won(spot: i64, player_first: bool, mine: i64, theirs: i64) -> i64:
+        if spot >= BET_FOLD:
+            return 1 if (spot == BET_FOLD) == player_first else -1
+        stake: i64 = 1 if spot == CHECK_CHECK else 2
+        return stake if mine > theirs else -stake
+
+    def expected(spot: i64, hand: Hand, theirs: i64, cards: i64, habits: Habits, choices: i64[4]) -> f64:
+        can Abort.Panic:
+            return won(spot, hand.player_first, hand.player, theirs).f64() if spot >= CHECK_CHECK
+            if first_actor(spot) == hand.player_first:
+                choice: i64 = choices[spot.usize()]
+                aggressive: bool = choice == 1 if choice >= 0 else strength(hand.player, cards) >= 0.5
+                return expected(next_spot(spot, aggressive), hand, theirs, cards, habits, choices)
+            p: f64 = aggression(habits, strength(theirs, cards), spot)
+            return (p * expected(next_spot(spot, true), hand, theirs, cards, habits, choices) +
+                (1.0 - p) * expected(next_spot(spot, false), hand, theirs, cards, habits, choices))
+
+    def correction(before: f64, value: f64, after: f64) -> f64:
+        return ((before - after) + value) if fabs(before) >= fabs(value) else ((value - after) + before)
+
+    def worth(hand: Hand, cards: i64, habits: Habits, choices: i64[4]) -> f64:
+        can Abort.Panic:
+            sum: mutable f64 = 0.0
+            fix: mutable f64 = 0.0
+            for theirs in 0..<cards |hand, cards, habits, choices, sum, fix|:
+                continue if theirs == hand.player
+                value: f64 = expected(OPEN, hand, theirs, cards, habits, choices)
+                next: f64 = sum + value
+                fix <- fix + correction(sum, value, next)
+                sum <- next
+            return (sum + fix) / (cards - 1).f64()
+
+    def over(round: Match&) -> bool:
+        return round.records.count >= round.dealt.hands.count
+
+    def value(round: Match&) -> f64:
+        return round.score + round.correction
+
+    def opponent_moves(round: mutable Match&, hand: Hand, kind: i64):
+        can Abort.Panic:
+            p: f64 = aggression(round.habits[kind.usize()], strength(hand.opponent, round.dealt.level.cards), round.spot)
+            coin: usize = (0 if round.coins_used == 0 else 1).usize()
+            round.coins_used <- round.coins_used + 1
+            round.spot <- next_spot(round.spot, hand.coins[coin] < p)
+
+    def start_hand(round: mutable Match&):
+        can Abort.Panic:
+            round.spot <- OPEN
+            round.coins_used <- 0
+            round.choices <- [-1, -1, -1, -1]
+            if not over(round):
+                index: usize = round.records.count
+                hand: Hand = round.dealt.hands[index]
+                if not hand.player_first:
+                    opponent_moves(round, hand, kind_at(&round.dealt, index.i64()))
+
+    def initialize(dealt: Deal) -> Match:
+        can Abort.Panic:
+            habits: mutable Habits[5] = zeroed
+            for kind in 0..<5 |habits|:
+                habits[kind.usize()] <- Habits{kind: kind, bets: 0, bluffs: 0, shown: 0, folds: 0, faced: 0}
+            round: mutable Match = Match{dealt: dealt, records: [], habits: habits, spot: OPEN,
+                coins_used: 0, choices: [-1, -1, -1, -1], chips: 0, score: 0.0, correction: 0.0}
+            start_hand(&round)
+            return round
+
+    def finish(round: mutable Match&, hand: Hand, kind: i64):
+        can Memory.Allocate, Abort.Panic:
+            spot: i64 = round.spot
+            cards: i64 = round.dealt.level.cards
+            gain: i64 = won(spot, hand.player_first, hand.player, hand.opponent)
+            estimate: f64 = worth(hand, cards, round.habits[kind.usize()], round.choices)
+            next: f64 = round.score + estimate
+            round.correction <- round.correction + correction(round.score, estimate, next)
+            round.score <- next
+            round.chips <- round.chips + gain
+            seen: bool = spot < BET_FOLD
+            first_bet: bool = spot == BET_CALL or spot == BET_FOLD
+            player_bet: bool = spot != CHECK_CHECK and first_bet == hand.player_first
+            faced: bool = spot != CHECK_CHECK and not player_bet
+            notice(&round.habits[kind.usize()], hand.player if seen else -1,
+                cards, player_bet, faced, faced and not seen)
+            round.records.push(Record{player_first: hand.player_first, spot: spot,
+                player_card: hand.player, shown: hand.opponent if seen else -1, won: gain, worth: estimate})
+            start_hand(round)
+
+    def act(round: mutable Match&, choice: i64) -> bool:
+        can Memory.Allocate, Abort.Panic:
+            return false if over(round) or choice < 0 or choice > 1
+            index: usize = round.records.count
+            hand: Hand = round.dealt.hands[index]
+            return false if first_actor(round.spot) != hand.player_first
+            round.choices[round.spot.usize()] <- choice
+            round.spot <- next_spot(round.spot, choice == 1)
+            kind: i64 = kind_at(&round.dealt, index.i64())
+            if round.spot < CHECK_CHECK:
+                opponent_moves(round, hand, kind)
+            if round.spot >= CHECK_CHECK:
+                finish(round, hand, kind)
+            return true
