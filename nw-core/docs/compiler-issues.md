@@ -17,7 +17,7 @@ the callee's protocol bound. Stage0 correctly rejected the same program with
 was missing a semantic validation on its inferred-specialization path.
 
 The fix is in the clean durable Stage1 clone
-`/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler-upstream-inferred-bound-fix`,
+`/workspace/Elisa-compiler-upstream-inferred-bound-fix`,
 branch `codex/fix-inferred-protocol-bounds`, at that exact upstream commit.
 `src/semantic/check_generic_interface_bounds.elisa` checks inferred actual
 argument types against callee bounds, and

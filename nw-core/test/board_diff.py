@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Differential harness: Elisa board port vs the original bwaccel/board.py."""
+from pathlib import Path
 import importlib.util
 import subprocess
 import sys
 
-REF = ("/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/"
-       "neural-workshop-enhanced/bwaccel/board.py")
+REF = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced" / "bwaccel/board.py")
 
 spec = importlib.util.spec_from_file_location("ref_board", REF)
 ref = importlib.util.module_from_spec(spec)

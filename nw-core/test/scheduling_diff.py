@@ -5,12 +5,12 @@ Runs the compiled Elisa sweep binary (path in argv[1]) and replays the same
 deterministic input grid through the reference Python module loaded directly
 from the original repo, then diffs the streams line-by-line.
 """
+from pathlib import Path
 import importlib.util
 import subprocess
 import sys
 
-REF = ("/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/"
-       "neural-workshop-enhanced/bwaccel/scheduling.py")
+REF = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced" / "bwaccel/scheduling.py")
 
 spec = importlib.util.spec_from_file_location("ref_scheduling", REF)
 ref = importlib.util.module_from_spec(spec)

@@ -14,6 +14,9 @@ import { decode, Kind } from "../shells/web/display-list.js";
 const WASM = process.env.NWCORE_WASM_PATH ??
     fileURLToPath(new URL("../build/nwcore.wasm", import.meta.url));
 
+const REFERENCE_BWACCEL = fileURLToPath(
+    new URL("../../original-neural-workshop-enhanced/bwaccel/", import.meta.url));
+
 const MS_GRID = [0, 1, 49, 50, 51, 99, 100, 149, 150, 250, 1050, 2500, 60000];
 const TICK_GRID = [0, 1, 10, 50, 100, 250];
 const TRIAL_GRID = [100, 500, 1000, 2200, 3000, 4500];
@@ -52,7 +55,7 @@ import importlib.util, sys
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); return mod
-base = "/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/bwaccel/"
+base = ${JSON.stringify(REFERENCE_BWACCEL)}
 sch = load("sch", base + "scheduling.py")
 out = []
 MS = ${JSON.stringify(MS_GRID)}

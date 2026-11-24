@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Differential harness: Elisa nback port vs the original bwaccel/fallback.py."""
+from pathlib import Path
 import importlib.util
 import math
 import subprocess
 import sys
 
-REF = ("/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/"
-       "neural-workshop-enhanced/bwaccel/fallback.py")
+REF = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced" / "bwaccel/fallback.py")
 
 spec = importlib.util.spec_from_file_location("ref_fallback", REF)
 ref = importlib.util.module_from_spec(spec)

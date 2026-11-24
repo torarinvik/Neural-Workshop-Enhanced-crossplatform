@@ -22,11 +22,11 @@ reference never iterates those sets for order -- it only tests them for
 emptiness and rebuilds them. Encoding the reference's frozenset the same way
 makes that equivalence checkable rather than assumed.
 """
+from pathlib import Path
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/"
-       "Neural-Workshop-Enhanced-crossplatform/original-neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import donkey as ref  # noqa: E402

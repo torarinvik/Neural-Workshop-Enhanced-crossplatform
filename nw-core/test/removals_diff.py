@@ -26,12 +26,12 @@ The ordering traps this module hides:
   * `_spots` takes the FIRST early-enough slot out of the shuffled list and
     `remove`s it (order preserved), then `pop()`s from the END for the rest.
 """
+from pathlib import Path
 import random
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/"
-       "Neural-Workshop-Enhanced-crossplatform/original-neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import removals as ref  # noqa: E402

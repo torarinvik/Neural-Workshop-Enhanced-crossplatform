@@ -18,12 +18,12 @@ fresh_boxes. `places` is `sorted(free[:boxes])` and is then shuffled AGAIN --
 the first shuffle picks which slots, the sort orders them, and the second
 decides which box gets which.
 """
+from pathlib import Path
 import random
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/"
-       "Neural-Workshop-Enhanced-crossplatform/original-neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import custody as ref  # noqa: E402

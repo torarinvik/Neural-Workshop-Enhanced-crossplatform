@@ -22,11 +22,11 @@ Rungs 1-6 only; see the sweep's header for why. The line tables are checked
 separately from the deals, so a wrong table is named directly rather than
 showing up as a mysteriously different board.
 """
+from pathlib import Path
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/"
-       "Neural-Workshop-Enhanced-crossplatform/original-neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import ninarow as ref  # noqa: E402

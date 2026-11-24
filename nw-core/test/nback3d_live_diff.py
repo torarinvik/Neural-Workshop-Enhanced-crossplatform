@@ -21,10 +21,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[2]
-ORIGINAL = Path(
-    "/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/"
-    "neural-workshop-enhanced"
-)
+ORIGINAL = ROOT / "original-neural-workshop-enhanced"
 sys.path.insert(0, str(ORIGINAL))
 
 from neural_workshop import gamemode, runtime, session, state  # noqa: E402

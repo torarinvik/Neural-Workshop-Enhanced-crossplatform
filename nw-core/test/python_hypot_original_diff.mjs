@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { pythonHypot2 } from "../shells/web/python-hypot.js";
 
 const python = process.env.NW_REFERENCE_PYTHON ??
-  "/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/.venv/bin/python3";
+  fileURLToPath(new URL("../../original-neural-workshop-enhanced/.venv/bin/python3", import.meta.url));
 const pairs = [[-5.27654306449275, -4.394853154911779], [0, -0],
   [Number.MIN_VALUE, Number.MIN_VALUE], [Number.MAX_VALUE, Number.MAX_VALUE]];
 for (let exponent = -1074; exponent <= -1020; exponent++) {

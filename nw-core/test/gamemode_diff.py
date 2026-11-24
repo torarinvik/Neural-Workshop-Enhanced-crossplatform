@@ -12,11 +12,11 @@ message catalogue in the tree (``res/i18n`` carries a .po and no .mo), so
 gettext already falls back to the msgids; pinning it makes that independent of
 the machine's locale, and the port carries the msgids for the same reason.
 """
+from pathlib import Path
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/"
-       "neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import gamemode, state  # noqa: E402

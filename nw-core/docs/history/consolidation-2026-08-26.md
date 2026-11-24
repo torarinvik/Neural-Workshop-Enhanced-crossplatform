@@ -45,7 +45,7 @@ regex, uuid, base64, datetime, process, concurrency, utf8, path, iter — plus a
 lexer/parser refactor.
 
 It stays out because **it cannot self-host**, which was measured three ways in
-`INTEGRATION_2026-08-26.md` and is unchanged. Landing it costs `work` its
+`integration-2026-08-26.md` and is unchanged. Landing it costs `work` its
 fixpoint, which is the opposite of a gain.
 
 The cost has since gone UP, and that is new. `work`'s 23 newest commits
@@ -264,7 +264,7 @@ Neither was resolved by guessing:
 
 Both were restored to the landed version, so their tree has NO conflict markers,
 and each was extracted as an apply-ready patch. See
-`docs/ELISA_CORE_WIP_HANDOFF_2026-08-26.md`.
+`elisa-core-wip-handoff-2026-08-26.md`.
 
 **One of their files needed nothing at all**: `llvm_aggregate_abi.go` is now
 byte-identical to their edit, because the same change arrived via
@@ -293,7 +293,7 @@ from the landed tree: current, not stale.
 The first fingerprint attempt got this WRONG in the safe-looking direction. The
 probe was written `elisac ... 2>&1 | head -3; echo rc=$?`, which reports HEAD's
 status, not the compiler's — the same shell trap already recorded in
-INTEGRATION_2026-08-26.md, in its pipeline form. Both probes were rerun without
+integration-2026-08-26.md, in its pipeline form. Both probes were rerun without
 a pipe before anything above was concluded.
 
 ## Branches: core 6 -> 4

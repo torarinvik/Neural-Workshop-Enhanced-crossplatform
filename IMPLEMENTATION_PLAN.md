@@ -1101,7 +1101,7 @@ a2f and is not relabeled. See the final
 before using historical records below. No production arithmetic, tolerance,
 compiler source or original-source change is implied.
 
-**Historical newest Stage1 compiler and artifact checkpoint (2026-09-30):** the selected compiler was `/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler-latest` at `54360bf68398b4da8d63b82a3ad2979667798aa2`. Its content-aware source fingerprint was `8218c14f9ee52b740a3dfa8ae91b8e501da3a73be2df730e916bb911373e3e90`; the fresh `bin/elisac-stage1` product SHA-256 was `9f9085468802edae566cd4992a0e7e9b9c0bbf79755707d3894ab9bfd736954e`, and `nw-core/scripts/stage1_fresh.py` passed. This timestamped record is superseded by the current e287 checkpoint; its historical artifact hashes must not be read as the current production paths' contents.
+**Historical newest Stage1 compiler and artifact checkpoint (2026-09-30):** the selected compiler was `/workspace/Elisa-compiler-latest` at `54360bf68398b4da8d63b82a3ad2979667798aa2`. Its content-aware source fingerprint was `8218c14f9ee52b740a3dfa8ae91b8e501da3a73be2df730e916bb911373e3e90`; the fresh `bin/elisac-stage1` product SHA-256 was `9f9085468802edae566cd4992a0e7e9b9c0bbf79755707d3894ab9bfd736954e`, and `nw-core/scripts/stage1_fresh.py` passed. This timestamped record is superseded by the current e287 checkpoint; its historical artifact hashes must not be read as the current production paths' contents.
 
 The current Stage1 runtime object was rebuilt with `Elisa-compiler/scripts/build_runtime_object.sh` using that product and completed successfully. The port-side `nw-core/scripts/check_stage1_runtime_provenance.sh` now uses exact content hashes for reviewed latest-compiler runtime deltas; it passes while reporting the reviewed `elisacore_std` differences and rejects unreviewed files or hashes. This preserves newer compiler/runtime safety and optimization work without copying the older Stage0 runtime over it or weakening the guard.
 
@@ -1966,7 +1966,7 @@ the fresh current-source seed and isolated artifact build.
 
 The original source checkout was not lost: the repository symlink
 `original-neural-workshop-enhanced` resolves to the clean checkout
-`/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced`
+`/workspace/neural-workshop-enhanced`
 at commit `dcd59a50351d742583e2501235ab1e5f24d63f41`. Run
 `marble_source_play_trace.py` with that checkout's `.venv/bin/python`, not the
 workspace's system Python: the harness imports MuJoCo before adding
@@ -2455,7 +2455,7 @@ JS `4fa2f196748164c5dd3c5f9390cef754691c648f1090d8da3ee8f461fc9d7fef`, WASM
 Production WASM remains `db866c647d2fb3e33c5d7e19678b803a69d1c5b6249f145a3dc1748f7c0466be`.
 The comparator's actual native engine is now identified: its Python 3.13
 MuJoCo package is
-`/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib`,
+`/workspace/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib`,
 loaded through `_functions.cpython-313-darwin.so`. `otool -L` confirms this
 dependency, and ARM64 disassembly of the wheel's `mj_comPos` shows the actual
 inertial transform's `fmadd` sequence. Changing the isolated candidate's
@@ -2543,7 +2543,7 @@ detached clean-source build.
 ## Previous compiler source/product checkpoint — 2026-09-23
 
 The external compiler checkout
-`/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`
+`/workspace/Elisa-compiler`
 is on branch `main` at
 `41b6b7782850ab2de4040a07d019bcbf55139943`, two commits ahead of
 `origin/main@c27443bf9bd32f9ff7bf5081831181036ef09266`. The clean-source
@@ -2600,7 +2600,7 @@ artifact gate before promoting another WASM.
 
 The current compiler boundary is external to this port repository and must be
 treated as an input to every reproducible build. The checked-out compiler is
-`/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`
+`/workspace/Elisa-compiler`
 at `main@c27443bf9bd32f9ff7bf5081831181036ef09266`, equal to `origin/main`.
 The verified source fingerprint is
 `880c67c48e4358200c695422e10b2b7651c04437b833524291e4f41340b5f4f5`; the
@@ -4143,7 +4143,7 @@ the ordinary localhost page serves `nw-core/build/nwcore.wasm`, SHA-256
 It was rebuilt at `-O2` with
 `DEVELOPER_DIR=/Library/Developer/CommandLineTools` from the current external
 Elisa compiler checkout at
-`/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`,
+`/workspace/Elisa-compiler`,
 at compiler commit
 `ee50240f9e0de8046708c7153f320c89b222bbb7`, four commits ahead of and zero
 commits behind its currently fetched `origin/main` at
@@ -4878,12 +4878,12 @@ All paths below are relative to this repository root unless prefixed by a named 
 
 1. This document, particularly sections 2, 4, 5, and the packet for the assigned game.
 2. Any applicable `AGENTS.md` found in the active checkout and its parents.
-3. `nw-core/PORTING.md`, including its later corrections to earlier diagnoses.
-4. `nw-core/ARENA_THREADING.md` and `nw-core/docs/display-list.md`.
+3. `nw-core/docs/porting.md`, including its later corrections to earlier diagnoses.
+4. `nw-core/docs/arena-threading.md` and `nw-core/docs/display-list.md`.
 5. `nw-core/scripts/env.sh`, `check.sh`, `gate.sh`, and the relevant build script.
 6. The exact original task's UI, logic, environment wrapper, options, and tests.
 7. The port's task kernel, scene, exports, shell event routing, and existing tests.
-8. Historical integration documents only as history: `INTEGRATION_2026-08-26.md` and `CONSOLIDATION_2026-08-26.md` are not proof of current compiler behavior.
+8. Historical integration documents only as history: `nw-core/docs/history/integration-2026-08-26.md` and `nw-core/docs/history/consolidation-2026-08-26.md` are not proof of current compiler behavior.
 
 Do not begin a second implementation of a kernel merely because the browser currently supplies fake state. Many real kernels already exist and require orchestration, export, and input integration.
 
@@ -8488,8 +8488,8 @@ temporary directory with explicit compiler paths:
 ```bash
 cd nw-core
 NW_STAGE1_VERIFY_DIR="$(mktemp -d /tmp/nw-stage1-current.XXXXXX)"
-ELISA_STAGE1_ROOT="/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler" \
-ELISA_STAGE1_BIN="/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler/bin/elisac-stage1" \
+ELISA_STAGE1_ROOT="/workspace/Elisa-compiler" \
+ELISA_STAGE1_BIN="/workspace/Elisa-compiler/bin/elisac-stage1" \
 NW_STAGE1_WASM_OBJECT="$NW_STAGE1_VERIFY_DIR/nwcore_stage1.o" \
 NW_STAGE1_WASM_ARTIFACT="$NW_STAGE1_VERIFY_DIR/nwcore.wasm" \
 bash scripts/build_stage1_wasm.sh
@@ -10164,7 +10164,7 @@ preserve the preceding artifact hashes and evidence history.
 ### 2026-09-15 — latest Elisa optimization product promoted
 
 - Re-fetched the Elisa compiler remote before the build. The current external
-  checkout is `/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`,
+  checkout is `/workspace/Elisa-compiler`,
   branch `codex/shared-typed-edir-lowering`, at HEAD
   `c605b3faa516de7b2f4945a9ac4ccb21d78ae2e0`. `origin/main` is
   `fd2cb3cff470319500db362e5fce2833cbe300de` and is two commits behind this
@@ -10205,7 +10205,7 @@ preserve the preceding artifact hashes and evidence history.
   while the Stage1 differential suites, targeted parity smokes, optimizer RSS
   regression, optional self-host fixpoint, optional full semantic differential,
   and final production WASM build all use that same latest Stage1 root/product.
-  Updated the stale-export browser message and `nw-core/PORTING.md` to point
+  Updated the stale-export browser message and `nw-core/docs/porting.md` to point
   developers at this production path.
 - The first broad gate invocation before this wiring change correctly refused
   the stale pinned Stage1 product after all reached Stage0 checks passed. It
@@ -10230,7 +10230,7 @@ preserve the preceding artifact hashes and evidence history.
   `scripts/elisac_stage1.sh --seed` path under its guarded global seed lock;
   the old product was never used for the replacement build.
 - The selected compiler is the sibling checkout
-  `/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`,
+  `/workspace/Elisa-compiler`,
   branch `codex/shared-typed-edir-lowering`, HEAD
   `8d7db0561d0f72c1f548fa6a73d071c86b2fe57f`. After fetching `origin`,
   `origin/main` is `fd2cb3cff470319500db362e5fce2833cbe300de`, 14 commits
@@ -10334,7 +10334,7 @@ preserve the preceding artifact hashes and evidence history.
   evidence are still required.
 - Rebuilt with the latest selected Elisa Stage1 product through
   `nw-core/scripts/build_latest_stage1_wasm.sh`: compiler checkout
-  `/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`,
+  `/workspace/Elisa-compiler`,
   branch `codex/shared-typed-edir-lowering`, HEAD
   `8d7db0561d0f72c1f548fa6a73d071c86b2fe57f`; source fingerprint
   `3faa64471197da94697d83712f0433aa8c443381b0654f80e0f5ecab5feaa17e`; Stage1
@@ -10378,7 +10378,7 @@ preserve the preceding artifact hashes and evidence history.
   and the Space-only result-reset contract. The test and full artifact suite
   pass.
 - Rebuilt with the newest settled Elisa Stage1 product from the sibling
-  checkout `/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`:
+  checkout `/workspace/Elisa-compiler`:
   branch `main`, HEAD
   `10fdfaa663a9aa761833d834b6c31488b75feb2d`, source-tree fingerprint
   `e81857e2e86549ac68db43b63c32c933da560019eca23551c0c79a65843b74ab`, and
@@ -10413,7 +10413,7 @@ preserve the preceding artifact hashes and evidence history.
   `scripts/elisac_stage1.sh --seed` path before rebuilding the port. The seed
   completed successfully; no stale-product escape hatch was used.
 - The selected compiler is
-  `/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`,
+  `/workspace/Elisa-compiler`,
   branch `main`, HEAD
   `565ccb2fd585d03f94457185376f526e1930b1cb`; fetched `origin/main` at audit
   is `45cb0ded70e7e8c8a41d21c63a09939706322ca4`. The checkout remains dirty by
@@ -10653,7 +10653,7 @@ remain open.
 Any production rebuild must continue through
 `nw-core/scripts/build_latest_stage1_wasm.sh`, not the stale pinned Stage1
 shortcut. The selected Elisa compiler is the sibling checkout at
-`/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`,
+`/workspace/Elisa-compiler`,
 `main@565ccb2fd585d03f94457185376f526e1930b1cb`, with source fingerprint
 `9de69658a554a61ac1679e3cd52398ea73800adf700fb0c51d7a636324dceef9`, fresh
 Stage1 product SHA-256
@@ -10970,7 +10970,7 @@ alongside the complete task and Marble tests.
 The production WASM was rebuilt after this semantic change through
 `nw-core/scripts/build_latest_stage1_wasm.sh`, using the clean current Elisa
 Stage1 checkout at
-`/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`:
+`/workspace/Elisa-compiler`:
 
 - compiler branch/head: `main@d6a693c0f724c05f7b71418658dd8bda95ba73b3`;
 - compiler source fingerprint:
@@ -11099,7 +11099,7 @@ The optimization requirement is now tied to a reproducible compiler identity,
 not just to the name of a build script. Before the final browser replay, the
 selected Elisa checkout was inspected directly:
 
-- checkout: `/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`;
+- checkout: `/workspace/Elisa-compiler`;
 - branch: `main`;
 - commit: `d6a693c0f724c05f7b71418658dd8bda95ba73b3`;
 - worktree: clean;
@@ -12061,7 +12061,7 @@ but it may not infer or manufacture any of those facts.
 ### A. Reference contract that was audited before implementation
 
 The source used for this slice is the frozen local reference at
-`/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced BACKUP`.
+`/workspace/neural-workshop-enhanced BACKUP`.
 The relevant files are:
 
 1. `neural_workshop/ui/ncupmonte.py`, which defines the presentation phases,
@@ -12338,7 +12338,7 @@ which WASM owns the targets, clock, score, adaptive timing, and verdict.
 ### A. Reference contract audited before implementation
 
 The frozen original is the local reference checkout at
-`/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced BACKUP`.
+`/workspace/neural-workshop-enhanced BACKUP`.
 The files that define this slice are:
 
 1. `neural_workshop/ui/reflex.py`, for the visible target list, source option
@@ -12633,7 +12633,7 @@ viewport coordinates, and display-list presentation only.
 
 The frozen reference checkout is:
 
-`/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced BACKUP`
+`/workspace/neural-workshop-enhanced BACKUP`
 
 The source contract was audited across the following layers:
 
@@ -13364,8 +13364,8 @@ The production port build was rerun after verifying compiler provenance. The
 wrapper command was:
 
 ```sh
-ELISA_LATEST_STAGE1_ROOT="/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler" \
-ELISA_LATEST_STAGE1_BIN="/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler/bin/elisac-stage1" \
+ELISA_LATEST_STAGE1_ROOT="/workspace/Elisa-compiler" \
+ELISA_LATEST_STAGE1_BIN="/workspace/Elisa-compiler/bin/elisac-stage1" \
 ./scripts/build_latest_stage1_wasm.sh
 ```
 
@@ -13652,8 +13652,8 @@ The active product was built through the explicit latest-product wrapper after
 checking the compiler checkout against fetched `origin/main`:
 
 ```sh
-ELISA_LATEST_STAGE1_ROOT="/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler" \
-ELISA_LATEST_STAGE1_BIN="/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler/bin/elisac-stage1" \
+ELISA_LATEST_STAGE1_ROOT="/workspace/Elisa-compiler" \
+ELISA_LATEST_STAGE1_BIN="/workspace/Elisa-compiler/bin/elisac-stage1" \
 ./scripts/build_latest_stage1_wasm.sh
 ```
 
@@ -15178,8 +15178,8 @@ the older product. The exact seed command was:
 
 ```text
 DEVELOPER_DIR=/Library/Developer/CommandLineTools \
-ELISACORE_BIN="/Users/torarinvikbjarko/Documents/Coding Projects/Go projects/Elisa-core/compiler/bin/elisac" \
-bash "/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler/scripts/elisac_stage1.sh" --seed
+ELISACORE_BIN="/workspace/Elisa-core/compiler/bin/elisac" \
+bash "/workspace/Elisa-compiler/scripts/elisac_stage1.sh" --seed
 ```
 
 The rebuilt product is
@@ -18046,7 +18046,7 @@ Re-queried upstream `main`/`HEAD`: Elisa-compiler is still `f50ecf85b6cb6e8d1c36
 
 **Completed the missing contact-topology gate for the single-component startup-RNE candidate; topology regresses (2026-09-25):** reran the isolated `mju_mulInertVec` component-1 FMA candidate against the unchanged original-source rung-16/run-seed-0/board-seed-827307999 trace with per-frame contact identities enabled. The candidate still fails numeric parity first at event 216 (`marble[0].value[10]`, delta `3.8680252689715644e-7` versus `1e-7`, 105,540 over-tolerance scalar values), and now has an authoritative full-run count of 135 contact-set mismatches (first event 461, last 1966), compared with 104 on the retained baseline. The previous candidate record lacked contact topology; this result fills that missing acceptance dimension and decisively rejects the local RNE improvement under the combined numeric/contact gate. Keep the single-component FMA out of maintained source and vendor assets. Evidence: `/tmp/marble-inertial-comp1-contacts.json` and `/tmp/marble-inertial-comp1-contacts.compare.log`.
 
-**Re-audited Stage1 standard-library false-reject rows against current sources (2026-09-25):** rebuilt the latest Stage0 Go compiler from `/Users/torarinvikbjarko/Documents/Coding Projects/Go projects/Elisa-core/compiler` and reran the individual `driver_acceptance_smoke.sh --one withstd` cases. `catch_subset_exhaustive.neg.elisa` reports `same` on the current pair, so its earlier Stage1 over-rejection is stale and must not drive a new compiler patch. `destroyed_region_allocate.neg.elisa` had appeared as a REJECT-GAP, but isolating its with-stdlib compile showed the cause was not region lifetime analysis: Stage0 accepted the function body while Stage1 failed compiling included `elisacore_std/runtime.elisa:114`, where `ctx_string_view` passed shaped `cstr[shape_in]` directly to `sview(u8&?, ...)`. Made the zero-cost representation cast explicit (`value.cast[u8&]`) inside `trusted Unsafe.PointerCast` in both the authoritative `Go projects/Elisa-core/compiler/runtime/elisacore_std/runtime.elisa` and the Stage1 compiler's mirrored `elisacore_std/runtime.elisa`. The first fresh Stage1 seed attempt was stopped by the default 4 GiB RSS guard at 4,196,048 KiB (it did **not** report an enum-member failure); with host memory checked and a deliberate 6 GiB per-seed cap, the latest Stage0 successfully rebuilt Stage1. Fresh product SHA-256 is `a22e01fe780f7cdc1169edf31961b788baf86030c209be6e1aa9f8dabe432308`, and `scripts/assert_stage1_fresh.sh` passes. With that fresh product and latest Stage0, individual with-stdlib acceptance checks report `same` for both `destroyed_region_allocate.neg.elisa` and `catch_subset_exhaustive.neg.elisa`; `zeroed_reference_safety_smoke.sh` passes, and both runtime-source `git diff --check` checks pass. The narrow acceptance fixes are verified; the rest of Stage1's full acceptance matrix, compiler suite, and the broader port plan remain open. No Marble physics artifact, tolerance, or candidate was changed.
+**Re-audited Stage1 standard-library false-reject rows against current sources (2026-09-25):** rebuilt the latest Stage0 Go compiler from `/workspace/Elisa-core/compiler` and reran the individual `driver_acceptance_smoke.sh --one withstd` cases. `catch_subset_exhaustive.neg.elisa` reports `same` on the current pair, so its earlier Stage1 over-rejection is stale and must not drive a new compiler patch. `destroyed_region_allocate.neg.elisa` had appeared as a REJECT-GAP, but isolating its with-stdlib compile showed the cause was not region lifetime analysis: Stage0 accepted the function body while Stage1 failed compiling included `elisacore_std/runtime.elisa:114`, where `ctx_string_view` passed shaped `cstr[shape_in]` directly to `sview(u8&?, ...)`. Made the zero-cost representation cast explicit (`value.cast[u8&]`) inside `trusted Unsafe.PointerCast` in both the authoritative `Go projects/Elisa-core/compiler/runtime/elisacore_std/runtime.elisa` and the Stage1 compiler's mirrored `elisacore_std/runtime.elisa`. The first fresh Stage1 seed attempt was stopped by the default 4 GiB RSS guard at 4,196,048 KiB (it did **not** report an enum-member failure); with host memory checked and a deliberate 6 GiB per-seed cap, the latest Stage0 successfully rebuilt Stage1. Fresh product SHA-256 is `a22e01fe780f7cdc1169edf31961b788baf86030c209be6e1aa9f8dabe432308`, and `scripts/assert_stage1_fresh.sh` passes. With that fresh product and latest Stage0, individual with-stdlib acceptance checks report `same` for both `destroyed_region_allocate.neg.elisa` and `catch_subset_exhaustive.neg.elisa`; `zeroed_reference_safety_smoke.sh` passes, and both runtime-source `git diff --check` checks pass. The narrow acceptance fixes are verified; the rest of Stage1's full acceptance matrix, compiler suite, and the broader port plan remain open. No Marble physics artifact, tolerance, or candidate was changed.
 **Rejected global fast-math MuJoCo/WASM build; loader's NaN self-test fails (2026-09-25):** to evaluate the broad-backend optimization path without risking maintained source or the shipped browser bundle, copied the retained pinned MuJoCo 3.12.0 diagnostic tree into isolated `/private/tmp/nw-mj-fastmath.6eEBnh` and built its `mujoco_wasm` target with Emscripten 6.0.10 and global C/C++ `-ffast-math`. The build completed, producing candidate JS SHA-256 `f6d6d57b73c4995d933cda408fb774df9838ec7928652220a53af6212073de46` and WASM SHA-256 `d7127126cb90eef1d4415cc4137c2586cc3a8fdb02d1a1da1595376a5d1133a4`. The first generated-play-session model load failed inside MuJoCo with `NaN test does not work for present compiler/options`; fast-math invalidates NaN semantics required by MuJoCo runtime validation, so this candidate is incompatible before any trajectory comparison and must not be promoted or worked around by disabling or weakening validation. The production bundle remains untouched at JS SHA-256 `d9ef82762e323c7a549d4eafaf35395f07aef7265e840e6dc0f9c40460847357` and WASM SHA-256 `2ce3a5933d7174b442c052c691d74e9f3a34075c95ce8f9b44efddbad1146f38`. Continue investigating source-faithful or narrowly scoped backend choices, with loader/runtime integrity first, then the complete strict rung-16 replay and contact-topology gate; build success alone is not parity evidence.
 **Synchronized efc_b and no-slip inputs narrow the event-0 residual to solver-force output, not EFC bias (2026-09-25):** extended only test diagnostics to expose `efc_b` and dense `efc_AR`, and to optionally print decoded no-slip contact traces (`NW_MARBLE_DUMP_NOSLIP_TRACE=1`); no maintained MuJoCo source or shipped JS/WASM artifact changed. Regenerated the deterministic rung-16/run-seed-0/board-seed-827307999 trace using the retained instrumented baseline module and synchronized original-source solver inputs from the exact WASM `fwdAcceleration` snapshot. For the first constrained substep, native and WASM `efc_b` and dense `efc_AR` snapshots agree exactly at `fwdConstraint`, while the no-slip trace's first difference is contact 0 iteration 1: its tangent residual component 3 is `1.6756569455908089e-13` native versus zero WASM, with row bias itself identical (`-4.9679927381240586e-27`). The no-slip trace also shows iterations 0' contact 0 outputs match; iteration 1 force/residual deltas occur after the main primal solver has already produced slightly different cross-contact forces. The same synchronized Newton trace's first arithmetic mismatch remains record 74 / `ellipticCostDif` (`N=-0.7056058704628367` vs `-0.7056058704628363`, `Tsqr=9.072642537012099e-7` vs `9.072642537012472e-7`), so the no-slip residual is downstream evidence, not a separately established EFC-bias or no-slip fix. Dense `efc_AR` is relevant here; the matrix sparse-index backing arrays were found to contain inactive/uninitialized values in this dense model and were excluded from snapshots rather than treated as evidence. Diagnostic files: `/tmp/marble-r16-seed0-efcar.json`, `/tmp/marble-r16-seed0-efcar-fullrecords.log`; the regenerated run also confirms synchronized-input mode is necessary to attribute solver-stage arithmetic. Do not patch no-slip or weaken gates on this evidence. Next return to the strict full Marble replay and investigate the consequential Newton line-search/force difference with input and contact-topology checks; all optimization candidates still require the unmodified 7,601-event gate.
 
@@ -18188,7 +18188,7 @@ Root cause and invariant:
 - `Decl.Extern` intentionally keeps compact ABI metadata, and the general `Symbol.return_type` path must not be filled with the first token of a compound extern return: for `mutable heap void&?`, that token is `mutable`, and publishing it globally caused unrelated runtime calls to become incorrectly typed. The corrected checker leaves normal extern symbol inference untouched and pairs the named extern symbol’s declaration line with the parser’s existing `__extern_return` annotation only for this narrow fallback check.
 - The checker now handles direct indexed casts, parenthesized targets, reference targets, interned return `TypeId`s for ordinary functions, and compact extern return names. It emits the appended `TryFallbackTypeMismatch` diagnostic without weakening the runtime pointer checker or the separate runtime-only zeroed-reference rule.
 
-Verification performed from `/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler` using the fresh Stage1 product:
+Verification performed from `/workspace/Elisa-compiler` using the fresh Stage1 product:
 
 - `DEVELOPER_DIR=/Library/Developer/CommandLineTools EMSDK_PYTHON=/opt/homebrew/bin/python3 ELISA_STAGE1_SEED_MAX_RSS_KB=8388608 bash scripts/elisac_stage1.sh --seed` completed and rebuilt both `bin/elisac-stage1` and `build/runtime/elisacore_runtime.o`.
 - The exact reproducer now reports one diagnostic at the fallback line: `try fallback expects cstr, got u8&`; the acceptance contract intentionally compares error class, while preserving the known compact-extern spelling limitation. No physics source, Marble asset, tolerance, or browser artifact changed.
@@ -18269,7 +18269,7 @@ Tested that narrowly predicted candidate only in the disposable Emscripten build
 
 This closes the specific dense backward-substitution FMA hypothesis as insufficient for the complete port. The active root-cause boundary now includes the earlier event-0 RNE split and the later dense-solve rounding path, but neither may be “fixed” by stacking local FMA substitutions. Next work must find a source-faithful compiler/runtime policy or a complete operation family that predicts all checkpoints, then pass the unchanged 7,601-event numeric, contact-topology, trajectory, successful-tray, terminal-result, and broader-game gates before any production change.
 
-**Reference-library provenance audit qualifies the ARM64 dense-solve evidence (2026-09-26):** the previous `Mgrad`/`Jv` localization used the disposable ARM64 diagnostic dylib at `/private/tmp/nw-mj-solver-baseline-diagnostic/build-native/lib/libmujoco.dylib`. That binary is useful for inspecting a local native compiler, but it is not automatically provenance-matched to the MuJoCo library used by the hard source replay. The installed Python MuJoCo 3.12.0 library at `/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib` is a universal Mach-O binary containing both `x86_64` and `arm64` slices, and the active Python process is `arm64`; the acceptance replay therefore uses its arm64 slice, not an x86_64 wheel under Rosetta.
+**Reference-library provenance audit qualifies the ARM64 dense-solve evidence (2026-09-26):** the previous `Mgrad`/`Jv` localization used the disposable ARM64 diagnostic dylib at `/private/tmp/nw-mj-solver-baseline-diagnostic/build-native/lib/libmujoco.dylib`. That binary is useful for inspecting a local native compiler, but it is not automatically provenance-matched to the MuJoCo library used by the hard source replay. The installed Python MuJoCo 3.12.0 library at `/workspace/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib` is a universal Mach-O binary containing both `x86_64` and `arm64` slices, and the active Python process is `arm64`; the acceptance replay therefore uses its arm64 slice, not an x86_64 wheel under Rosetta.
 
 The arm64 slice of the Python wheel does emit fused `fmsub`/`fmadd` operations in `mju_cholSolve`, so the earlier local FMA observation was directionally plausible. It still cannot be treated as a faithful oracle for the wheel merely because both binaries are arm64: a direct ABI-level comparison of the wheel and the disposable source-built ARM64 dylib over random Cholesky inputs found solve differences up to `3.637978807091713e-12`, and a factor difference of `4.440892098500626e-16` first appeared at seed 13, matrix size 18. The wheel's arm64 `mju_cholFactor` also uses vectorized fused operations and optimized dot reductions that are not reproduced by the local diagnostic build. The local trace therefore remains useful for localization, but its exact last-bit results are not acceptance evidence until build provenance and code generation are matched.
 
@@ -18293,7 +18293,7 @@ That candidate corrected the event-0 component-1 `qfrc_bias` rounding at its syn
 
 **Whole-engine fast-math experiment rejected by MuJoCo’s safety invariant (2026-09-26):** built the disposable pinned-plus-parity diagnostic tree `/private/tmp/nw-mj-solver-baseline-diagnostic` with Emscripten 6.0.10 Release flags `-O3 -DNDEBUG -ffast-math -Wno-nan-infinity-disabled`, leaving the maintained source and browser artifacts untouched. The module compiled, but the first real Marble model load failed inside MuJoCo with `Loading error: Error: NaN test does not work for present compiler/options`. This is a hard engine invariant, not a replay-quality regression: `-ffast-math` changes NaN/Infinity semantics that MuJoCo explicitly checks while parsing models, so it cannot be used as a global substitute for the native wheel’s fused contractions. The scratch output was restored to its pre-experiment diagnostic baseline; production hashes remain `nwcore.wasm=97fa27007ba5d7078353ba6363bcf5aaeb43a9833094b1dc2218c01a9ab2b15a`, `vendor/mujoco.js=d9ef82762e323c7a549d4eafaf35395f07aef7265e840e6dc0f9c40460847357`, and `vendor/mujoco.wasm=2ce3a5933d7174b442c052e691d74e9f3a34075c95ce8f9b44efddbad1146f38`. No compiler flag, MuJoCo source, tolerance, task logic, or shipped artifact changed. Continue from the clean baseline with operation-family-specific or correctly rounded arithmetic diagnostics; do not retry global fast-math or suppress MuJoCo’s NaN check.
 
-**Generated-WASM versus active-wheel `mj_rne` lowering boundary confirmed (2026-09-26):** extracted the complete `$mj_rne` body from the restored, pinned-plus-maintained-parity diagnostic WAT at `/private/tmp/nw-mj-baseline.wat` into `/private/tmp/mj_rne_only.wat` and compared it with the active ARM64 slice of the Python MuJoCo wheel at `/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib`. The WAT’s RNE body contains separately rounded `f64.mul`, `f64.add`, and `f64.sub` instructions throughout the spatial-inertia, cross-force, projection, and accumulation chains; it contains no WebAssembly fused multiply-add instruction or relaxed-SIMD fused operation. The wheel’s `_mj_rne` starts at `0x60ef8` and visibly emits `fmadd`, `fmsub`, `fmla`, `fmls`, and paired SIMD operations in those same chains. This is a direct code-generation fact, not an inference from the trajectory, and it explains why source-level C reassociation can alter the local last bit without reproducing the complete native instruction schedule. It does not authorize a blanket FMA rewrite: the wheel-exact standalone `mju_mulInertVec` lowering corrected the event-0 local subnormal but failed the unchanged 7,601-event hard replay (event 216, 108,453 exceedances, 233 contact mismatches), and the combined RNE FMA chain also failed. Therefore the maintained artifact, parity patch, tolerances, compiler flags, and task logic remain unchanged. Future work must either reproduce a complete wheel-compatible operation family with matched operands and a full hard replay, or explicitly define a cross-platform numerical acceptance policy; do not stack another isolated FMA permutation.
+**Generated-WASM versus active-wheel `mj_rne` lowering boundary confirmed (2026-09-26):** extracted the complete `$mj_rne` body from the restored, pinned-plus-maintained-parity diagnostic WAT at `/private/tmp/nw-mj-baseline.wat` into `/private/tmp/mj_rne_only.wat` and compared it with the active ARM64 slice of the Python MuJoCo wheel at `/workspace/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib`. The WAT’s RNE body contains separately rounded `f64.mul`, `f64.add`, and `f64.sub` instructions throughout the spatial-inertia, cross-force, projection, and accumulation chains; it contains no WebAssembly fused multiply-add instruction or relaxed-SIMD fused operation. The wheel’s `_mj_rne` starts at `0x60ef8` and visibly emits `fmadd`, `fmsub`, `fmla`, `fmls`, and paired SIMD operations in those same chains. This is a direct code-generation fact, not an inference from the trajectory, and it explains why source-level C reassociation can alter the local last bit without reproducing the complete native instruction schedule. It does not authorize a blanket FMA rewrite: the wheel-exact standalone `mju_mulInertVec` lowering corrected the event-0 local subnormal but failed the unchanged 7,601-event hard replay (event 216, 108,453 exceedances, 233 contact mismatches), and the combined RNE FMA chain also failed. Therefore the maintained artifact, parity patch, tolerances, compiler flags, and task logic remain unchanged. Future work must either reproduce a complete wheel-compatible operation family with matched operands and a full hard replay, or explicitly define a cross-platform numerical acceptance policy; do not stack another isolated FMA permutation.
 **Latest-runtime include migration and compiler-quiescence guards (2026-09-27):** the interrupted full gate exposed a reproducibility defect in the port harness rather than a task implementation defect. The port’s Stage0 differential sources still contained hard-coded relative includes into the historical `Go projects/Elisa-core/compiler/runtime/elisacore_std` checkout, while the production WebAssembly entry point already selected the newest adjacent `Elisa-compiler/elisacore_std` runtime. Under the newest Stage1 runtime, those old paths caused the Stage1 differential to compile against the wrong runtime (or to fail when that historical checkout was unavailable); the current runtime also contains reviewed semantic changes such as constructing the arena split value directly instead of attempting to zero-initialize a reference-bearing aggregate. A temporary Stage0 probe using the newest runtime compiled successfully.
 
 The migration rewrote all 356 affected runtime include occurrences across 131 Elisa sources under `nw-core/src` and `nw-core/test`, resolving each path relative to its actual source directory. A repository test, `nw-core/test/runtime_include_provenance_test.py`, now rejects the old historical path, verifies that every runtime include resolves into the selected latest compiler checkout, and verifies that the target file exists. `scripts/gate.sh` runs this test before the differential tiers. The migration has no old-runtime matches, all resolved targets exist, the focused `git diff --check` is clean, and the regression test passes.
@@ -18904,7 +18904,7 @@ native Python test contract.
 ## Verified compiler checkpoint — 2026-09-29
 
 The latest Stage1 compiler worktree used for this port is
-`/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler-latest`,
+`/workspace/Elisa-compiler-latest`,
 based on Elisa compiler commit `54360bf68398b4da8d63b82a3ad2979667798aa2` and containing
 uncommitted, port-relevant compiler fixes. The product was seeded from the newest
 available Stage0 oracle at `-O3`, with `DEVELOPER_DIR=/Library/Developer/CommandLineTools`
@@ -19030,7 +19030,7 @@ downstream topology split.
 
 The port was rebuilt through the newest available Elisa Stage1 compiler before any
 browser artifact was promoted. The selected compiler checkout is
-`/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler-latest`
+`/workspace/Elisa-compiler-latest`
 at commit `54360bf68398b4da8d63b82a3ad2979667798aa2`; its fresh Stage1 product is
 `bin/elisac-stage1` with SHA-256
 `017f7ccac250c6780c7cbd6ada877be81d899b163a37bc7217b1d5ec1240b6b4`, and the
@@ -19684,7 +19684,7 @@ candidate against the unchanged 7,601-event numeric and contact-topology gates.
 The compiler regression work resumed against the latest fetched Stage1 source,
 `Elisa-compiler-remote-main` at `ce52ba2c5261ebced8f5dae9ca1e21f25db8f460`,
 using the canonical Stage0 compiler at
-`/Users/torarinvikbjarko/Documents/Coding Projects/Go projects/Elisa-core/compiler/bin/elisac`.
+`/workspace/Elisa-core/compiler/bin/elisac`.
 The compiler checkout already contained unrelated user changes; those were left
 untouched. Headless macOS builds used
 `DEVELOPER_DIR=/Library/Developer/CommandLineTools` to select the linker that can
@@ -19755,7 +19755,7 @@ zero-gap ratchet or paper over either decline.
 ### Latest repaired Stage1 production-WASM rebuild — 2026-10-01
 
 Rebuilt with the newest local Stage1 compiler checkout,
-`/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler-remote-main`,
+`/workspace/Elisa-compiler-remote-main`,
 at HEAD and `origin/main` `ce52ba2c5261ebced8f5dae9ca1e21f25db8f460`. The compiler
 source fingerprint was `f6f1714ccc8f14a3b394988cbf6e0cc696120b2bafb7e32752d6840bd8bf7470`
 and the freshly seeded `bin/elisac-stage1` product SHA-256 was
@@ -19937,8 +19937,8 @@ variants or identify the first divergence of the unsynchronized hard run.
 Reproduction, from repository root (exit 1 is the expected diagnostic mismatch):
 
 ```sh
-NW_REF_PY='/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/.venv/bin/python3'
-NW_REF_LIB='/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib'
+NW_REF_PY='/workspace/neural-workshop-enhanced/.venv/bin/python3'
+NW_REF_LIB='/workspace/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib'
 "$NW_REF_PY" nw-core/test/marble_cone_update_oracle.py \
   nw-core/test/fixtures/marble_event216_cone_oracle.json \
   --event 0 --reference-library "$NW_REF_LIB"
@@ -20114,7 +20114,7 @@ This is a diagnostic validity correction, not a wider physics acceptance bound.
 
 Added `nw-core/test/marble_constraint_update_oracle.py`, its regression tests,
 and `nw-core/test/fixtures/marble_constraint_update_oracle.json`, SHA-256
-`1f3d155b80aaf364ed268d9e55770504fd942b180893d3a39e59b364779d0fbb`.
+`157ffe35ddb61b257298e4d5dd6cff430a8ed18d24f59b37bedc963bf6552b3c`.
 The reduced fixture preserves source event labels 17, 18, and 216. Each has
 four physics substeps and two warmstart calls: 24 exact-input calls total.
 Reduced array index 0 is source event 17, not source event 0. Interpret event
@@ -20391,7 +20391,7 @@ nw-core/test/repro/marble_initialized_solver_trace.patch
 nw-core/test/repro/marble_constraint_hessian_trace.h
   d0acf3a0b34642cd4b89cca28f5d69943235f4deca3cb31006506631430247a5
 nw-core/test/fixtures/marble_initialized_hessian_oracle.json
-  67ae35ce53bac3ec5e65752b8c6e4146f895d9817faf409811e8daa3f82a3e9d
+  8896fd32ec1f6414272b5fc00208dcae0e3a3162eabd3a64b6326ca543a48087
 ```
 
 The companion `marble_initialized_solver_trace.md` gives source/build/capture
@@ -20511,7 +20511,7 @@ the untouched production runtime. Durable rejection delta/evidence:
 nw-core/test/repro/marble_solver_three_primitives_rejected.patch
   8d995310a5b94a3c13d365f6971f2489e87eb50345659ee4ec38b8f9c1271429
 nw-core/test/fixtures/marble_solver_three_primitives_rejected.json
-  aabda75f2e0b7f9131c249eaf72069aa6b86fb7c3802479776d10bb97bfa9b42
+  0022f427e6445771a08c329841d7f07e5e4bf028918ffde606f781517c3b531e
 ```
 
 That delta applies **after** the full neutral diagnostic patch, not directly
@@ -20920,7 +20920,7 @@ asserted faithful. No unused slot or incoming uninitialized field is compared.
 
 Durable complete fixture:
 `nw-core/test/fixtures/marble_primal_prepare_full_oracle.json`, SHA-256
-`cdfa836a865fe090ff2c625e0c2592b47f40c00e161f5789a45d9c8b6d179890`.
+`60721ce1badd3cd76df9118a14d122f33bbe7f8be21d3b64e69832a836c10b5b`.
 It keeps bounded active captures, exact-input whole-output qualification and
 identity, model summaries, source capture hashes, and schema-2 comparison
 summaries. Raw large iteration/contact arrays remain in hash-identified JSONL
@@ -21100,7 +21100,7 @@ Final verified identities:
 | Neutral diagnostic JS | 76f74a67e0c276073a707f3c7660d8298b1af98a36dd676fc0fdacc58088b676 |
 | Neutral diagnostic WASM | 65f74552c93b1a85999497720fc3da77bda4f669bd03a8fff4de49967b4f9a6a |
 | Final neutral hard trace | a09b951e727317e121b5efdd9392e1ef4438f06af5cdfdff4d79b9ef5f9a83d8 |
-| Full evaluation fixture | 4091bf83521cac28c6a415ee37b63420f1bc839dc757f4be4bf24edec1b2ed22 |
+| Full evaluation fixture | 8929d5b67770d137dbc8a913a0c8605e801afaa18235471f7fff96ce49797482 |
 
 The final trace contains 7,601 events, rung 16/run seed 0/board seed 827307999,
 with initialized phase and Newton captures at events 17, 18 and 216. All event
@@ -21294,7 +21294,7 @@ candidate tree passed. Production vendor sources and artifacts were not edited.
 | Hard trace | coherent-hard-trace.json | coherent-residual-v2-hard-trace.json |
 | Hard trace SHA-256 | 40b4b78c09595466db90acae2bbd0b4791f9c6959104b42aaa8e701b522e2de3 | e9dd0001c861c7c577605cd36b317907f61203a9f5cbcb83c0e95df77940291a |
 | Evidence fixture | marble_solver_preparation_eval_rejected.json | marble_solver_residual_order_rejected.json |
-| Evidence fixture SHA-256 | fa808c9b7696c063085dc6024cd6abed956845f425efaabfc0b176bd5170d0aa | e18c194e88ce4c2c2b6ca8f6f0e60d31f2c3c77e5229f2e464f0f19287e9f636 |
+| Evidence fixture SHA-256 | ccbeada9ff9c77947833cbb406d89483a54fc755430d4b90658e1115479291a2 | 0db25ae5612da75c5c3e94adbdc04db70b8df3ebdd1bfd276de49f8e4f6cf070 |
 
 Fixture paths are under nw-core/test/fixtures. Trace runtime paths describe
 capture time. v1's source dist was overwritten by the v2 private rebuild;
@@ -21525,7 +21525,7 @@ Retained pair in retained-qcqp-dist:
 | mujoco.js | 6726d780462594cd0e747a6c413fed37db53363c79cc06dbe437c8b604161b75 |
 | mujoco.wasm | 56f57be52801e397d91e87360300d00f831e9f4c443ce4602dffef5f94f6017d |
 | qcqp-boundary-hard-trace.json | c382da792a8b7cb36465ce66b2c60f2f644a0b8eab26fc68a8f1dc67180589d3 |
-| durable fixture marble_qcqp_boundary.json | 2db9f2cd25072ae64ffcbb91ead9fee96046ce80419e0fb7e852ec0e4469f425 |
+| durable fixture marble_qcqp_boundary.json | 9368f88a7f4bab8e39e0d0ac53714ed1a5a6ad445b3ab2e181d1e719b0c5ed19 |
 
 The generated held-input run used the unchanged promoted core, rung16/run0,
 board827307999, 7,601 events, contacts enabled, split phase/Newton capture,
@@ -21766,7 +21766,7 @@ twentieth-iteration termination and missing/truncated/invalid data.
 #### First producer split and evidence limits
 
 Receipt: test/fixtures/marble_qcqp_kernel_boundary.json,
-SHAe3ad8f27ffd258323ddf80c5309e7e1505a90c97e9ddf2a27a154022c44e7467.
+SHA509a4a357952bb564c92472d9b566b03f24e22893d7f680e761fffbd71f555bc.
 Generator: test/marble_qcqp_kernel_trace.py with neutral control required.
 99 groups first differ in value;15 have no initialized model difference.
 The original-public-primitive driver's final raw outputs/flags match the
@@ -21873,7 +21873,7 @@ force multiplication. Do not attribute the remaining whole cost differences
 to constraintUpdate impl without new contrary evidence.
 
 Durable receipt: test/fixtures/marble_qcqp_fused_radius_rejected.json,
-SHAee00934f9480a2e4e0c6ad2baa703358c31ad7da289be7fb1279554fa5f75de3.
+SHAa347c2b732467c703e8b86fe8bd7ebd49e3960785528d099760016c2c624a1a2.
 Generator: test/repro/generate_marble_qcqp_rejection_fixture.py.
 It preserves identities, actual compiled proofs, kernel counts, full original
 rejection, all12 qualified whole-output summaries, remaining initialized
@@ -22012,7 +22012,7 @@ The transport placeholders for aref/generalized-force slots are NOT claimed
 captured inputs and are discarded; contact-H placeholders are not compared.
 This excludes Gauss addition, J-transpose multiplication and full trajectory.
 Fixture: test/fixtures/marble_all_primal_updates.json,
-SHA9b1226c35eb40712464d9bc9345e86aa09ddb05000554cd0f78ce93a907d9473.
+SHA31c891b7f23bfac3c549a164764a6167d57b4a3101819e7bd00422a3384e4b1e.
 
 Therefore the SDK27 diagnostic rebuild's remaining S2 constraint-cost splits
 are not evidence of an actual original constraintUpdate defect. Qualification
@@ -22052,7 +22052,7 @@ the fused tail. Original partial sums are reconstructed and final-qualified,
 not private original intermediate captures. The model agrees on1000
 synthetic cases including widths0..34,63,64,65,511,512.
 Fixture test/fixtures/marble_gauss_boundary.json,
-SHA2fdaf1ae8af0305bcecafbda17d23fe92520a763fdd2192448376c661caca114:
+SHA01257138acbf469e528db361fa996da2f4fd0ed973413a5fabb88b3d7472e9f3:
 125 calls;43 actual Gauss/total-cost differences,48 partial-model splits;
 zero constraint-cost or original-model differences. First actual witness is
 event0/substep1/ordinal1: browser1.186725378713119 bits3ff2fcd3c02e7f39,
@@ -22080,7 +22080,7 @@ trajectory improvement or label the arithmetic experiment a neutral observer.
 Ordinary replay remains111077 numeric exceedances,136 contacts443..1966,
 event195/value10 delta8.227014482997674e-7 and timeout120.016667/home0/lost0.
 Receipt test/fixtures/marble_gauss_native_order_rejected.json,
-SHAe982dbbf525a6f4c17e2e6197763c17d051cd3937063e1dbbc19e94d68b81b27;
+SHA14ecb63375ea510aef627ab215a1bc8efe993a4adb45c2e24f47855ae5f753b9;
 generator test/repro/generate_marble_gauss_rejection_fixture.py.
 
 #### Separate two-tangent routine localized and locally corrected
@@ -22101,7 +22101,7 @@ Intermediates remain reconstructions, not original private kernel captures.
 First raw mismatch: event17/substep1/ordinal4. Compare raw with raw; projection
 and retained vectors are different boundaries and must not be substituted.
 Fixture test/fixtures/marble_qcqp2_boundary.json,
-SHA6ae0cb87fdc5cbda3e175e23ca1fdfa9d2923d905f29ee131d477c6a9374e80b.
+SHA1607d5c5994458c2eb73fb44abe0732776dacd7d36ea11aa108422e54422cc0c.
 
 Layer12 changes ONLY guarded QCQP2 arithmetic and adds an actual compiled
 QCQP2 probe/binding; QCQP3 and generic QCQP remain unchanged. Packet11:
@@ -22128,7 +22128,7 @@ delta8.252424372745537e-7 against unchanged1e-7.
 Both timeout120.016667s with home0/lost0. More contact/numeric mismatches than
 the prior candidate are not excused by its locally correct kernel.
 Receipt test/fixtures/marble_qcqp2_native_order_rejected.json,
-SHA1c282a3dbf2586ad4a148bab7f054ed18c801b5b8c9ea6f36d80f6175a63cb61;
+SHAedc4fd43e74a6a2d8159ab55f974ef80cd7627dcdb1ea6f92779044a0beaccbc;
 generator test/repro/generate_marble_qcqp2_rejection_fixture.py.
 
 #### Required next work and acceptance, in order
@@ -22303,7 +22303,7 @@ before/final change differs3 times; restoration flags differ0 and zero actual
 captured calls restore force. Composed final cost/restoration are MODELS,
 not private original captures. JSON-lost zero signs remain unverified.
 Fixture test/fixtures/marble_costchange_boundary.json,
-SHA2ae9cc616d2fbb7f5832d18d23a2790ddcf3fae411ae8c47084d6b670ce83c73.
+SHA094bd8ad60843783c9343780f0d076c063c6e87a9fc412dadd2fac1d7d2daf7c.
 
 #### Narrow private correction and independent rejection
 
@@ -22343,7 +22343,7 @@ contact-continuation reports114869 numeric exceedances and162 contact sets
 443..2536; first numericE195/marble0/value10 delta8.252424372745537e-7 vs1e-7.
 Both timeout120.016667s/home0/lost0. Full-count mode is not an alternate gate.
 Receipt:test/fixtures/marble_quadratic_native_order_rejected.json,
-SHA481262788a6f398cee20d482aed04dbaaeb638237654700284bc75eea17c9adf.
+SHA0ab4a0041adfaa494c8e6dcfb8837e1ab8a46982e0fc6e03ed8c8a9edc2194c7.
 Generator:test/repro/generate_marble_costchange_rejection_fixture.py verifies
 neutrality,old assigned diagnostics,actual original returns,golden/proof/runtime
 identity,current-input regressions and independent ordinary failure logs.
@@ -22406,7 +22406,7 @@ browser zero signs remain unqualified, so this is NOT a bitwise browser-sign
 claim. The remaining statistics are retained, not waived as full equality.
 
 Evidence:test/fixtures/marble_costchange_whole_solver.json,
-SHAc4ccba45e1fea43020ab910804c0324450ccc70980346fb76cbfc6a6a98ab4da.
+SHAf7542040474b8068afceb203927cee9eb512261510d52ee956b555ca5e52517c.
 Generator:test/repro/generate_marble_costchange_whole_solver_fixture.py.
 Original output JSONL SHA5f88a688d28082ea1aec0a21a40ac076d96dabd5a1bbce10c9b6f47cf5df86ad;
 qualified native captures SHAdb9f0bc788a5b2e45984921b6d2b3310326c4803f284b5e1b2358b3e1d79231b;
@@ -22537,7 +22537,7 @@ and smaller error counts do not meet original-game fidelity. Candidate15 is
 REJECTED for complete game promotion; all retained layers remain diagnostic.
 
 Receipt:nw-core/test/fixtures/marble_inertia_native_order_rejected.json,
-SHAd71ad9c90cc97429b9ccc93793c8c2f175aa5baf010a1e4d3137246a4b4d56d9.
+SHA9a8356878e825d0eda8a234cea2f777a8d6ac5852bfa7acc3a136f5db675e739.
 Generator:test/repro/generate_marble_inertia_rejection_fixture.py validates
 actual original before/after returns,full input schedule/runtime identities,
 original compiled golden/proofs,all prior producers and independent failure
@@ -22557,7 +22557,7 @@ not uninterrupted-game acceptance. SDK27 private intermediate identity and
 browser zero signs remain unqualified; unsampled branches are still open.
 
 Fixture:nw-core/test/fixtures/marble_inertia_whole_solver.json,
-SHA96784aebfe9a0474a419df70fb16ba0df5feda0c2daaba7801867436412cf8cf.
+SHA92fd7f33936ac6ecbdd8c5e94d53ab467673221a0422decbb36ac2178c3d87ee.
 Existing whole-solver generator now accepts --candidate-prefix inertia-candidate;
 its default cost-candidate output regenerates byte-exactly, preserving3.13.
 Current output/capture/qualification SHA values:
@@ -22720,7 +22720,7 @@ Both timeout120.016667/home0/lost0. This matches15's failure METRICS,not all
 recorded state bytes. The complete game candidate16 is REJECTED for promotion.
 
 Receipt:nw-core/test/fixtures/marble_rne_bias_family_rejected.json,
-SHAc4a5d3583963b27a6ca2d716e1988d0aaebbc715eecd72b88da9e38b0de55849.
+SHAa2e105dc62aa3b0cb92bbeaec87b67bbb8cd2a0065cffa9680d5b4c4a7a7795f.
 Generator:test/repro/generate_marble_rne_family_rejection_fixture.py rechecks
 both complete original20-return matrices,all1020 native golden returns,
 ownership/assigned outputs/runtime identities,current input schedule,compiled
@@ -22736,7 +22736,7 @@ No non-statistic force/acceleration/state/island output differs. These are
 SYNCHRONIZED diagnostic copies,not uninterrupted acceptance,original private
 intermediate qualification or evidence for unsampled branches.
 Fixture:test/fixtures/marble_rne_family_whole_solver.json,
-SHA3a55ff382665c6f5d15dbabcd5c9aaf6efc2165ab665753ef7ece69b16ad4b19.
+SHAcb57459755764999334603d428b9f8f530679b5fbb826b44c8504d1637599dae.
 Whole generator now accepts --candidate-prefix rne-family-candidate;the old
 cost/inertia defaults remain separately reproducible. Current original output,
 qualified native capture and qualification-log hashes:
@@ -22892,7 +22892,7 @@ original source,compiler source or shipped artifact is changed by this turn.
 #### New durable receipts and fresh exact-input solver matrix
 
 `marble_comvel_family_rejected.json` SHA
-0bb428c956fea0c5fac8cd157b41885f8e3adc4a2846d37be7fea64874adcd88
+519527343ea7511d9fb99399c23bda2334f1dbdd98f8f88d7b4b1a4af4023e71
 is regenerated by `generate_marble_comvel_family_rejection_fixture.py`.
 The generator checks complete runtime pair/configuration/schedule,reruns all
 40 captured actual original calls and all1020 golden original calls,verifies
@@ -22917,7 +22917,7 @@ all non-statistic force/acceleration/state/island fields agree. Browser JSON
 zero signs and diagnostic private intermediates are not original-qualified.
 This synchronized localization is NOT an ordinary trajectory pass.
 `marble_comvel_family_whole_solver.json` SHA
-75154974dec5a65344a9010b7d4e38253c40d8e0e2483dfaa2c3752b18337518;
+e2cbcde367b77aeebfd551ff39822bb208e70c93f38ab1832257bf7e66b4c64a;
 regenerate using the whole generator's --candidate-prefix comvel-family-candidate.
 Original final capture SHA b8bcb2dc842fd000fd9b0c9d813176eb496c433845aa9d16a7a080f45a0b36d4;
 qualified native capture cd8e7a81a710603ffaa8542cf1065912162c489f680d3700f756ad232fcb4f5c;
@@ -22997,7 +22997,7 @@ Stage1 compiler miscompile.
 
 **Geometry invariant now enforced in both source implementations.** The
 original source at
-`/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/neural_workshop/marblemaze.py`
+`/workspace/neural-workshop-enhanced/neural_workshop/marblemaze.py`
 and the port at `nw-core/src/tasks/marblemaze.elisa` define
 `HOLE_WALL_CLEARANCE = MARBLE_RADIUS * 0.20` (= 0.0015 m). For corridor
 half-width `h`, pit radius `r`, hole margin `m`, and marble radius `b`, the
@@ -23541,7 +23541,7 @@ The clean Stage1 clone at `/private/tmp/nw-stage1-compiler-dfaeb45.RXOYGH/repo`
 contains a local Stage1 semantic correction plus two diagnostic fixtures and
 one focused smoke test. After validation it was copied to the durable sibling
 checkout
-`/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler-latest-protocol-bound-fix`.
+`/workspace/Elisa-compiler-latest-protocol-bound-fix`.
 The user's separate, dirty `Elisa-compiler-latest` checkout was not modified.
 The durable compiler is still based on exact upstream HEAD `dfaeb45...`, has
 product SHA-256
@@ -24105,7 +24105,7 @@ feasibility checks; do not patch only the visual mesh.
 
 **Files and responsibilities.** The reference rules live in the original
 Python checkout at
-`/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/neural_workshop/marblemaze.py`.
+`/workspace/neural-workshop-enhanced/neural_workshop/marblemaze.py`.
 The Elisa generator and wall-aware candidate/cup checks live in
 `nw-core/src/tasks/marblemaze.elisa`. Browser and native presentation geometry
 use `nw-core/shells/web/marble-maze-renderer.js` and

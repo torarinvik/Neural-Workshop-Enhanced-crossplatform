@@ -18,12 +18,12 @@ The rule TEXT is compared as an id plus the numbers interpolated into it
 rather than as a formatted string: the text is a pure function of those, so
 this is the same check without making two languages agree on printf.
 """
+from pathlib import Path
 import re
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/"
-       "Neural-Workshop-Enhanced-crossplatform/original-neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import numberology as ref  # noqa: E402

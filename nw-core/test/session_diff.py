@@ -26,12 +26,12 @@ of times. That last number is the real prize: a port that produced the right
 stimuli by luck while drawing a different number of times would pass every trial
 row and fail here.
 """
+from pathlib import Path
 import subprocess
 import sys
 import types
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/"
-       "neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 import random  # noqa: E402

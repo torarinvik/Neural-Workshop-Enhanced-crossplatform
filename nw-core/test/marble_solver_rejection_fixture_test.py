@@ -14,7 +14,7 @@ class RejectedSolverFixtureTests(unittest.TestCase):
     def fixture(self):
         path=FIXTURES/"marble_solver_preparation_eval_rejected.json"
         self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(),
-                         "fa808c9b7696c063085dc6024cd6abed956845f425efaabfc0b176bd5170d0aa")
+                         "ccbeada9ff9c77947833cbb406d89483a54fc755430d4b90658e1115479291a2")
         return json.loads(path.read_text())
 
     def test_complete_local_proofs_do_not_certify_rejected_full_replay(self):
@@ -67,7 +67,7 @@ class RejectedSolverFixtureTests(unittest.TestCase):
     def residual_fixture(self):
         path=FIXTURES/"marble_solver_residual_order_rejected.json"
         self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(),
-                         "e18c194e88ce4c2c2b6ca8f6f0e60d31f2c3c77e5229f2e464f0f19287e9f636")
+                         "0db25ae5612da75c5c3e94adbdc04db70b8df3ebdd1bfd276de49f8e4f6cf070")
         return json.loads(path.read_text())
 
     def test_second_candidate_retains_all_compiled_proofs_but_is_rejected(self):

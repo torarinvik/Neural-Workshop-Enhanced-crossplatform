@@ -5,13 +5,13 @@ Writes the REAL configdefaults.py template to /tmp, has the Elisa side parse it,
 and checks every entry against what Python's eval() produces for the same value
 — which is exactly what neural_workshop/config.py does.
 """
+from pathlib import Path
 import math
 import re
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/"
-       "neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import configdefaults  # noqa: E402

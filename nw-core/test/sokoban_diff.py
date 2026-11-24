@@ -27,12 +27,12 @@ The orderings that had to be right, each found the hard way:
     take the re-insert path and come out reordered. Assuming either path alone
     gets one of the two wrong.
 """
+from pathlib import Path
 import random
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/"
-       "Neural-Workshop-Enhanced-crossplatform/original-neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import sokoban as ref  # noqa: E402

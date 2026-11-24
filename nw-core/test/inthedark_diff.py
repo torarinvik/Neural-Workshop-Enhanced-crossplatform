@@ -19,11 +19,11 @@ trace derives in one backwards pass what belief recomputes by brute force. If
 only the fast one were checked, the derivation would be unverified on both
 sides at once.
 """
+from pathlib import Path
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/"
-       "Neural-Workshop-Enhanced-crossplatform/original-neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import inthedark as ref  # noqa: E402

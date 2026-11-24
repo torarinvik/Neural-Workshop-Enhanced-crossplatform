@@ -17,12 +17,12 @@ is why whole bouts are compared:
 
 Both produce a perfectly legal-looking bout when got wrong.
 """
+from pathlib import Path
 import random
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/"
-       "Neural-Workshop-Enhanced-crossplatform/original-neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import crossedwires as ref  # noqa: E402

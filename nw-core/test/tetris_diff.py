@@ -16,12 +16,12 @@ The other trap is the level-top draw: `[rng.randint(lowest, highest)] * width`
 is ONE value replicated across every column. Drawing per column spends `width`
 values instead of one and gives a top already ragged before the dents are cut.
 """
+from pathlib import Path
 import random
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/"
-       "Neural-Workshop-Enhanced-crossplatform/original-neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import tetris as ref  # noqa: E402

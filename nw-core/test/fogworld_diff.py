@@ -20,12 +20,12 @@ swapping them consumes a different number of bits and desynchronises
 everything after. A square-only test would never catch it, which is why every
 grid below is deliberately non-square.
 """
+from pathlib import Path
 import random
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/"
-       "Neural-Workshop-Enhanced-crossplatform/original-neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import fogworld as ref  # noqa: E402

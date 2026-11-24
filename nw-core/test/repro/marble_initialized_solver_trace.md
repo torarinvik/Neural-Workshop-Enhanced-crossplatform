@@ -129,7 +129,7 @@ tests verify architecture and the exact library hash. Include `/usr/sbin`
 and `/sbin` in PATH when importing the original pyglet application.
 
 `../fixtures/marble_initialized_hessian_oracle.json`, SHA-256
-`67ae35ce53bac3ec5e65752b8c6e4146f895d9817faf409811e8daa3f82a3e9d`,
+`8896fd32ec1f6414272b5fc00208dcae0e3a3162eabd3a64b6326ca543a48087`,
 contains the 29 initialized H updates and twelve first dense-solve inputs/
 stages from events 17, 18, and 216, together with provenance and direct-wheel
 expectations. It is a reduced diagnostic fixture, not a full hard trace.
@@ -412,7 +412,7 @@ separately verified portable dot model give the same comparison results.
 JSON zero-sign fidelity is explicitly not claimed.
 
 Durable fixture: `../fixtures/marble_primal_prepare_full_oracle.json`, SHA-256
-`cdfa836a865fe090ff2c625e0c2592b47f40c00e161f5789a45d9c8b6d179890`.
+`60721ce1badd3cd76df9118a14d122f33bbe7f8be21d3b64e69832a836c10b5b`.
 It contains bounded active captures, whole-output qualification/provenance,
 model comparison summaries, source capture hashes and validity-aware native/
 WASM comparison summaries. Large unrelated iteration/contact arrays remain
@@ -479,7 +479,7 @@ native lib 446aea43c3a11f1a2d6b03439af645fc35401bf48c75c41545cf03c62ec05840
 JS         76f74a67e0c276073a707f3c7660d8298b1af98a36dd676fc0fdacc58088b676
 WASM       65f74552c93b1a85999497720fc3da77bda4f669bd03a8fff4de49967b4f9a6a
 trace      a09b951e727317e121b5efdd9392e1ef4438f06af5cdfdff4d79b9ef5f9a83d8
-fixture    4091bf83521cac28c6a415ee37b63420f1bc839dc757f4be4bf24edec1b2ed22
+fixture    8929d5b67770d137dbc8a913a0c8605e801afaa18235471f7fff96ce49797482
 ~~~
 
 ### Schema and association
@@ -729,7 +729,7 @@ synchronization is injected into this run.
 
 All 7,601 event/physics snapshots pass exact neutrality against REJECTED v2.
 The receipt is saved as fixtures/marble_qcqp_boundary.json, SHA-256
-2db9f2cd25072ae64ffcbb91ead9fee96046ce80419e0fb7e852ec0e4469f425.
+9368f88a7f4bab8e39e0d0ac53714ed1a5a6ad445b3ab2e181d1e719b0c5ed19.
 It contains the complete first retained contact plus bounded raw-difference
 witnesses, direct original output, counts, identities and reconstructed
 original-public-primitive driver steps. The CLI rechecks retained runtime
@@ -1224,8 +1224,8 @@ overwrite existing retained evidence):
 
 ~~~bash
 NW_INERTIA_ROOT=/private/tmp/nw-marble-costchange.7SuZEZYO
-NW_INERTIA_PY='/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/.venv/bin/python3'
-NW_INERTIA_LIB='/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib'
+NW_INERTIA_PY='/workspace/neural-workshop-enhanced/.venv/bin/python3'
+NW_INERTIA_LIB='/workspace/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib'
 
 "$NW_INERTIA_PY" nw-core/test/marble_inertia_original.py \
   "$NW_INERTIA_ROOT/cost-candidate-hard-trace.json" \
@@ -1261,7 +1261,7 @@ numericE195/value10 delta4.996572333659799e-7 vs1e-7. Timeout120.016667/home0/
 lost0 is not acceptance. The complete game candidate is REJECTED,not promoted.
 
 Fixture marble_inertia_native_order_rejected.json
-SHAd71ad9c90cc97429b9ccc93793c8c2f175aa5baf010a1e4d3137246a4b4d56d9.
+SHA9a8356878e825d0eda8a234cea2f777a8d6ac5852bfa7acc3a136f5db675e739.
 Generator requires both original comparison receipts,the full original golden,
 actual compiled proof,four new current-input producer reports,four frozen
 compiled regression logs and both independent replay failures. It rechecks
@@ -1275,7 +1275,7 @@ are compared;three statistic ulps atE17/1,E18/2,E216/2 remain,no other numeric
 force/acceleration/state/island differences. Explicit synchronized localization
 is not ordinary acceptance or private SDK27 intermediate identity. Whole fixture
 marble_inertia_whole_solver.json
-SHA96784aebfe9a0474a419df70fb16ba0df5feda0c2daaba7801867436412cf8cf.
+SHA92fd7f33936ac6ecbdd8c5e94d53ab467673221a0422decbb36ac2178c3d87ee.
 Both new receipts/golden and the old default whole-solver receipt regenerate
 byte-exactly.326 original methods/286 dependency-light methods(32 native skips)
 pass. Options1344,renderer and all16 maintained boards pass. Shipped hashes
@@ -1326,9 +1326,9 @@ Commands from repository root, with outputs redirected to fresh owned paths:
 
 ~~~bash
 NW_RNE_ROOT=/private/tmp/nw-marble-costchange.7SuZEZYO
-NW_RNE_PY='/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/.venv/bin/python3'
-NW_RNE_LIB='/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib'
-NW_RNE_SOURCE='/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced'
+NW_RNE_PY='/workspace/neural-workshop-enhanced/.venv/bin/python3'
+NW_RNE_LIB='/workspace/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib'
+NW_RNE_SOURCE='/workspace/neural-workshop-enhanced'
 
 "$NW_RNE_PY" nw-core/test/marble_rne_original.py \
   "$NW_RNE_ROOT/inertia-candidate-hard-trace.json" \
@@ -1374,9 +1374,9 @@ differences. This synchronized diagnostic is not an uninterrupted-game pass
 and not original private intermediate identity.
 
 Durable rejection fixture marble_rne_bias_family_rejected.json
-SHAc4a5d3583963b27a6ca2d716e1988d0aaebbc715eecd72b88da9e38b0de55849;
+SHAa2e105dc62aa3b0cb92bbeaec87b67bbb8cd2a0065cffa9680d5b4c4a7a7795f;
 whole fixture marble_rne_family_whole_solver.json
-SHA3a55ff382665c6f5d15dbabcd5c9aaf6efc2165ab665753ef7ece69b16ad4b19.
+SHAcb57459755764999334603d428b9f8f530679b5fbb826b44c8504d1637599dae.
 The rejection generator reruns40 captured original returns and all1020 golden
 original calls,checks compiled proofs and both independent ordinary failures.
 Both new fixtures/golden and older default-cost/inertia whole receipts must
@@ -1431,9 +1431,9 @@ Commands from repository root;write outputs only to fresh owned evidence paths:
 
 ~~~bash
 NW_COMVEL_ROOT=/private/tmp/nw-marble-costchange.7SuZEZYO
-NW_COMVEL_PY='/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/.venv/bin/python3'
-NW_COMVEL_LIB='/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib'
-NW_COMVEL_SOURCE='/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced'
+NW_COMVEL_PY='/workspace/neural-workshop-enhanced/.venv/bin/python3'
+NW_COMVEL_LIB='/workspace/neural-workshop-enhanced/.venv/lib/python3.13/site-packages/mujoco/libmujoco.3.12.0.dylib'
+NW_COMVEL_SOURCE='/workspace/neural-workshop-enhanced'
 
 "$NW_COMVEL_PY" nw-core/test/marble_comvel_original.py \
   "$NW_COMVEL_ROOT/rne-family-candidate-hard-trace.json" \
@@ -1467,7 +1467,7 @@ home0/lost0. Contacts improve but numeric counts worsen versus16. Full17
 REJECTED,not promoted. Both independent replay failures must be retained.
 
 Rejection receipt SHA
-0bb428c956fea0c5fac8cd157b41885f8e3adc4a2846d37be7fea64874adcd88;
+519527343ea7511d9fb99399c23bda2334f1dbdd98f8f88d7b4b1a4af4023e71;
 generator reruns all40 captured+1020 golden original calls and verifies complete
 inputs/bits/models/compiled proofs/regressions/runtime/schedule/failure logs.
 Fresh20 whole-solver qualification uses17's inputs,new comvel-family-candidate-
@@ -1475,7 +1475,7 @@ qualified-{outputs,captures}.jsonl and stopE216 with the existing original/nativ
 driver protocol. All21 final fields compare:two statistic ulpsE17/1,E18/2,
 zero other nonzero outputs. SDK27 final returns qualify against actual original;
 private intermediates do not. Whole receipt SHA
-75154974dec5a65344a9010b7d4e38253c40d8e0e2483dfaa2c3752b18337518.
+e2cbcde367b77aeebfd551ff39822bb208e70c93f38ab1832257bf7e66b4c64a.
 Synchronized output equality cannot waive ordinary rejection.
 
 350 focused original methods/310 dependency-light methods(32 native skips)

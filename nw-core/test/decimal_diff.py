@@ -16,13 +16,13 @@ encodes sign, coefficient AND exponent, so 0.1 and 0.10 do not compare equal by
 accident. Failures raised by the reference are scored as `E1` (DivisionByZero /
 ZeroDivisionError), `E2` (InvalidOperation) or `E3` (Overflow) on both sides.
 """
+from pathlib import Path
 import subprocess
 import sys
 import types
 from decimal import Decimal, DivisionByZero, InvalidOperation, Overflow
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/"
-       "neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 import bwaccel  # noqa: E402

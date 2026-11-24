@@ -30,7 +30,7 @@ def main():
     original = OriginalEval(args.reference_library)
     library = ctypes.CDLL(str(original.path))
     if hashlib.sha256(args.rejected_fixture.read_bytes()).hexdigest() != (
-            "fa808c9b7696c063085dc6024cd6abed956845f425efaabfc0b176bd5170d0aa"):
+            "ccbeada9ff9c77947833cbb406d89483a54fc755430d4b90658e1115479291a2"):
         raise ValueError("qualified rejection fixture identity differs")
     fixture = json.loads(args.rejected_fixture.read_text())
     if fixture.get("schema") != "neural-workshop.marble-coherent-solver-rejected.v1":

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Differential harness for the explicit grid context."""
+from pathlib import Path
 import subprocess
 import sys
 import types
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/"
-       "neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import grid, state  # noqa: E402

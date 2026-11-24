@@ -77,7 +77,7 @@ def main():
     path = Path(__file__).resolve().parents[1]/"fixtures/marble_primal_eval_full_oracle.json"
     fixture = json.loads(path.read_text())
     if hashlib.sha256(path.read_bytes()).hexdigest() != (
-            "4091bf83521cac28c6a415ee37b63420f1bc839dc757f4be4bf24edec1b2ed22"):
+            "8929d5b67770d137dbc8a913a0c8605e801afaa18235471f7fff96ce49797482"):
         raise ValueError("saved evaluation fixture identity changed")
     p = fixture["provenance"]
     for entry in fixture["entries"]:

@@ -1732,7 +1732,7 @@ be called identical to the original.
 ### Reference contract
 
 The frozen reference is the local checkout at
-`/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/neural-workshop-enhanced BACKUP`.
+`/workspace/neural-workshop-enhanced BACKUP`.
 The source files audited for this slice are:
 
 - `neural_workshop/ui/reflex.py`: target placement, target lifetime, image
@@ -2496,7 +2496,7 @@ long-run MuJoCo resource behavior.
   bytes). The associated `nwcore_stage1_wasm.o` is 890,292 bytes, SHA-256
   `0b7cdd3a13ff3ffb9a3d0e930247573b8aa1d68b7cb0b23363883557b7c70763`.
 - This current artifact was compiled at `-O2` with the latest available local
-  Elisa Stage1 product in `/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`:
+  Elisa Stage1 product in `/workspace/Elisa-compiler`:
   HEAD `c605b3faa516de7b2f4945a9ac4ccb21d78ae2e0`, working-tree fingerprint
   `f89a1eb3829a1e5c09f0007e8547e2753e8db8d246674a320869a0d607e876de`, product
   `bin/elisac-stage1` SHA-256
@@ -2513,7 +2513,7 @@ long-run MuJoCo resource behavior.
   open. Do not run an unoverridden pinned Stage0 build expecting to preserve
   this artifact.
 - Rebuilt into an isolated `/tmp` directory with explicit
-  `ELISA_STAGE1_ROOT=/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`
+  `ELISA_STAGE1_ROOT=/workspace/Elisa-compiler`
   and matching `ELISA_STAGE1_BIN`, without overwriting `build/nwcore.wasm`.
   `build_stage1_wasm.sh` reproduced the exact active WASM and object hashes and
   reran the full suite successfully. This confirms actual current Stage1 use,
@@ -2671,7 +2671,7 @@ above; retain those earlier entries as build history.
 The current browser artifact has now been rebuilt from the latest available
 Elisa compiler checkout, including its current uncommitted backend/semantic
 optimization changes. The selected checkout is
-`/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`,
+`/workspace/Elisa-compiler`,
 branch `codex/shared-typed-edir-lowering`, at HEAD
 `c605b3faa516de7b2f4945a9ac4ccb21d78ae2e0`. After fetching `origin`, its
 `origin/main` was `fd2cb3cff470319500db362e5fce2833cbe300de`, two commits behind
@@ -2711,7 +2711,7 @@ older than current `.elisa` sources. It was rebuilt using the compiler's
 supported guarded seed path, then the port was rebuilt through
 `scripts/build_latest_stage1_wasm.sh`.
 
-- Compiler checkout: `/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`
+- Compiler checkout: `/workspace/Elisa-compiler`
 - Branch/HEAD: `codex/shared-typed-edir-lowering` /
   `8d7db0561d0f72c1f548fa6a73d071c86b2fe57f`
 - Fetched `origin/main`: `fd2cb3cff470319500db362e5fce2833cbe300de`
@@ -2791,7 +2791,7 @@ so the Stage1 product was explicitly reseeded from the new compiler HEAD with
 the guarded `scripts/elisac_stage1.sh --seed` workflow. The reseed completed
 successfully; the stale-product escape hatch was not used.
 
-- Compiler checkout: `/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler`
+- Compiler checkout: `/workspace/Elisa-compiler`
 - Branch/HEAD: `main` /
   `565ccb2fd585d03f94457185376f526e1930b1cb`
 - Fetched `origin/main`:
@@ -5236,7 +5236,7 @@ next candidate must come from an independent upstream solver arithmetic site.
 
 The port was rebuilt through the newest available Elisa Stage1 compiler before
 promotion. The selected compiler is
-`/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/Elisa-compiler-latest`
+`/workspace/Elisa-compiler-latest`
 at commit `54360bf68398b4da8d63b82a3ad2979667798aa2`; the fresh Stage1 product
 SHA-256 is
 `017f7ccac250c6780c7cbd6ada877be81d899b163a37bc7217b1d5ec1240b6b4`, with source
@@ -6065,7 +6065,7 @@ diagnostic reports110690 numeric breaches/105 contacts463..1966. First
 numeric E195/value10 delta4.996572333659799e-7 vs1e-7. Both timeout120.016667,
 home0/lost0. Smaller counts than14 do not qualify the game;15 remains
 REJECTED for promotion. Receipt marble_inertia_native_order_rejected.json
-SHAd71ad9c90cc97429b9ccc93793c8c2f175aa5baf010a1e4d3137246a4b4d56d9;
+SHA9a8356878e825d0eda8a234cea2f777a8d6ac5852bfa7acc3a136f5db675e739;
 generator generate_marble_inertia_rejection_fixture.py. Original golden and
 receipt regenerate byte-exactly.
 
@@ -6076,7 +6076,7 @@ each,E17/1,E18/2,E216/2. All recorded force/acceleration/state/island outputs
 agree. These are explicitly synchronized copies,NOT uninterrupted-game
 acceptance or qualification of SDK27 private intermediate values.
 Fixture marble_inertia_whole_solver.json
-SHA96784aebfe9a0474a419df70fb16ba0df5feda0c2daaba7801867436412cf8cf;
+SHA92fd7f33936ac6ecbdd8c5e94d53ab467673221a0422decbb36ac2178c3d87ee;
 whole-solver generator --candidate-prefix inertia-candidate. Its default
 cost-candidate output still regenerates the old fixture byte-exactly.
 
@@ -6138,7 +6138,7 @@ retains110690 over-limit values/105 contact sets463..1966,E195/value10 delta
 4.996572333659799e-7 vs1e-7,timeout120.016667/home0/lost0. Candidate16 is
 REJECTED for complete-game promotion. Rejection fixture
 marble_rne_bias_family_rejected.json
-SHAc4a5d3583963b27a6ca2d716e1988d0aaebbc715eecd72b88da9e38b0de55849;
+SHAa2e105dc62aa3b0cb92bbeaec87b67bbb8cd2a0065cffa9680d5b4c4a7a7795f;
 generator generate_marble_rne_family_rejection_fixture.py rechecks original
 returns/golden identities and both independent failure logs,not just summaries.
 
@@ -6147,7 +6147,7 @@ actual original. All21 fields compare:17 are numerically exact;E17/1,E18/2,
 E216/2 retain only one statistic ulp each,no non-stat force/acceleration/state
 splits. Explicit synchronized localization is not ordinary trajectory acceptance.
 Fixture marble_rne_family_whole_solver.json
-SHA3a55ff382665c6f5d15dbabcd5c9aaf6efc2165ab665753ef7ece69b16ad4b19.
+SHAcb57459755764999334603d428b9f8f530679b5fbb826b44c8504d1637599dae.
 
 The historical next action was to qualify current complete mj_comVel/velocity/Jacobian input production
 against actual original owned copied contexts using NAMED before/after phases.
@@ -6213,7 +6213,7 @@ timeout120.016667/home0/lost0. Compared with16,contacts105→103 but numeric
 breaches110690→111510. Full17 is REJECTED,not promoted. No relaxed tolerance.
 
 Durable complete receipt marble_comvel_family_rejected.json SHA
-0bb428c956fea0c5fac8cd157b41885f8e3adc4a2846d37be7fea64874adcd88;
+519527343ea7511d9fb99399c23bda2334f1dbdd98f8f88d7b4b1a4af4023e71;
 generator generate_marble_comvel_family_rejection_fixture.py validates runtime/
 schedule,reruns40 captured+1020 golden actual originals and models,checks
 compiled control/candidate,all six regressions and both ordinary failures.
@@ -6225,7 +6225,7 @@ at20 boundaries. All21 browser fields compare:18 numerically exact boundaries,
 two statistic ulpsE17/1 andE18/2,no non-statistic force/acceleration/state/island
 differences. Synchronized localization is NOT ordinary acceptance or original
 private SDK27 intermediate identity. Whole receipt SHA
-75154974dec5a65344a9010b7d4e38253c40d8e0e2483dfaa2c3752b18337518;
+e2cbcde367b77aeebfd551ff39822bb208e70c93f38ab1832257bf7e66b4c64a;
 generator --candidate-prefix comvel-family-candidate. New receipts/golden and
 all older whole-prefix receipts are required byte-exact reproductions.
 

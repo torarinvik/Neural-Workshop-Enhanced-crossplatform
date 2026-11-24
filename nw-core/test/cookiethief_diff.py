@@ -17,11 +17,11 @@ WHICH beats and the sort decides the order the two choice() draws happen in.
 Drawing in shuffled order consumes exactly as many values and assigns them to
 different decoys.
 """
+from pathlib import Path
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Elisa Projects/"
-       "Neural-Workshop-Enhanced-crossplatform/original-neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import cookiethief as ref  # noqa: E402

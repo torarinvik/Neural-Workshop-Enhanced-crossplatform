@@ -13,12 +13,12 @@ port reimplements slot for slot. The `set` rows compare a real `set`'s
 iteration against the port's table directly, so a divergence there is named
 rather than merely showing up as a different maze twenty steps later.
 """
+from pathlib import Path
 import random
 import subprocess
 import sys
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/"
-       "neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import maze as ref  # noqa: E402

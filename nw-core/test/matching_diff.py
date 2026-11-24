@@ -6,12 +6,12 @@ harness builds stand-ins with exactly the attributes the module touches and
 assigns them onto the imported `state` module. That drives the ACTUAL scoring
 code rather than a transcription of it.
 """
+from pathlib import Path
 import subprocess
 import sys
 import types
 
-APP = ("/Users/torarinvikbjarko/Documents/Coding Projects/Python Projects/"
-       "neural-workshop-enhanced")
+APP = str(Path(__file__).resolve().parents[2] / "original-neural-workshop-enhanced")
 sys.path.insert(0, APP)
 
 from neural_workshop import matching, state  # noqa: E402
